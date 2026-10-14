@@ -21,6 +21,8 @@ from ministack.services.cloudformation.provisioners import (
     _CONDITIONALLY_REPLACING_PROPERTIES,
     _REPLACING_PROPERTIES,
     _RESOURCE_HANDLERS,
+    _reconcile_tag_list,
+    _with_stack_tags,
 )
 from ministack.services.cloudformation.stacks import _diff_resources
 
@@ -12772,6 +12774,7 @@ def test_cfn_apigwv2_stage_updates_in_place(cfn, apigw):
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "CREATE_COMPLETE"
         api_id, stage_ref = _output(stack, "ApiId"), _output(stack, "StageRef")
+        assert stage_ref == "dev"
         before = apigw.get_stage(ApiId=api_id, StageName="dev")
         assert before["AutoDeploy"] is True
         time.sleep(1.1)
@@ -12795,11 +12798,113 @@ def test_cfn_apigwv2_stage_updates_in_place(cfn, apigw):
             auto_deploy=False))
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
-        assert _output(stack, "StageRef") != stage_ref
+        assert _output(stack, "StageRef") == "prod"
         assert apigw.get_stage(ApiId=api_id, StageName="prod")["Description"] == "second"
         assert [s["StageName"] for s in apigw.get_stages(ApiId=api_id)["Items"]] == ["prod"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("stage_name", ["prod", "$default"])
+def test_cfn_apigwv2_stage_ref_returns_stage_name(cfn, apigw, stage_name):
+    stack_name = f"cfn-apigwv2-stage-ref-{_uuid_mod.uuid4().hex[:8]}"
+    template = f"""
+Resources:
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties: {{Name: {stack_name}, ProtocolType: HTTP}}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: {{ApiId: !Ref Api, StageName: '{stage_name}'}}
+Outputs:
+  ApiId: {{Value: !Ref Api}}
+  StageRef: {{Value: !Ref Stage}}
+  StageSub: {{Value: !Sub '${{Stage}}'}}
+"""
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "StageRef") == stage_name
+        assert _output(stack, "StageSub") == stage_name
+        assert apigw.get_stage(ApiId=_output(stack, "ApiId"),
+                               StageName=_output(stack, "StageRef"))["StageName"] == stage_name
+        # Stage drift has no reader yet; changing its identity must preserve
+        # the existing NOT_CHECKED behavior when checking the stack.
+        assert _detect(cfn, stack_name)["StackDriftStatus"] == "IN_SYNC"
+        detail = cfn.describe_stack_resource(StackName=stack_name, LogicalResourceId="Stage")
+        assert detail["StackResourceDetail"]["DriftInformation"]["StackResourceDriftStatus"] == "NOT_CHECKED"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_apigwv2_stage_api_replacement_and_delete(cfn, apigw):
+    """An ApiId change replaces even when Ref stays prod; deleting the stack
+    removes the stage without relying on deletion of its owning API."""
+    stack_name = f"cfn-apigwv2-stage-api-{_uuid_mod.uuid4().hex[:8]}"
+    apis = [apigw.create_api(Name=f"{stack_name}-{i}", ProtocolType="HTTP")["ApiId"] for i in range(2)]
+
+    def template(api_id):
+        return json.dumps({
+            "Resources": {"Stage": {"Type": "AWS::ApiGatewayV2::Stage", "Properties": {
+                "ApiId": api_id, "StageName": "prod", "Description": "stage"}}},
+            "Outputs": {"StageRef": {"Value": {"Ref": "Stage"}}},
+        })
+
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template(apis[0]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "StageRef") == "prod"
+
+        # A later failure must leave the predecessor on the original API.
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_with_failing_resource(template(apis[1]), "Stage"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert apigw.get_stage(ApiId=apis[0], StageName="prod")["Description"] == "stage"
+        _assert_apigwv2_api_not_found(lambda: apigw.get_stage(ApiId=apis[1], StageName="prod"))
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(apis[1]))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "StageRef") == "prod"
+        assert apigw.get_stage(ApiId=apis[1], StageName="prod")["Description"] == "stage"
+        _assert_apigwv2_api_not_found(lambda: apigw.get_stage(ApiId=apis[0], StageName="prod"))
+        _delete_cfn_test_stack(cfn, stack_name)
+        _assert_apigwv2_api_not_found(lambda: apigw.get_stage(ApiId=apis[1], StageName="prod"))
+        assert all(apigw.get_api(ApiId=api)["ApiId"] == api for api in apis)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        for api in apis:
+            apigw.delete_api(ApiId=api)
+
+
+@pytest.mark.parametrize("replacement", [None, {"ApiId": "new-api"}, {"StageName": "beta"}])
+def test_cfn_apigwv2_stage_legacy_physical_id_lifecycle(monkeypatch, replacement):
+    """Old persisted api/name IDs still address the stage for updates and deletes."""
+    from ministack.services import apigateway
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setattr(apigateway, "_stages", {})
+    monkeypatch.setattr(apigateway, "_apis", {"legacy-api": {"apiId": "legacy-api", "protocolType": "HTTP"}})
+    props = {"ApiId": "legacy-api", "StageName": "prod", "Description": "before"}
+    provisioners._apigw_v2_stage_create("Stage", props, "legacy-stack")
+    stage = apigateway._stages["legacy-api"]["prod"]
+    legacy_id = "legacy-api/prod"
+    updated = {**props, "Description": "after"}
+    physical_id, _ = provisioners._apigw_v2_stage_update(legacy_id, props, updated, "legacy-stack")
+    assert physical_id == legacy_id  # Avoid treating migration as replacement cleanup.
+    assert apigateway._stages["legacy-api"]["prod"] is stage
+    assert stage["description"] == "after"
+    if replacement:
+        new_props = {**updated, **replacement}
+        physical_id, _ = provisioners._apigw_v2_stage_update(physical_id, updated, new_props, "legacy-stack")
+        assert physical_id == new_props["StageName"]
+        assert "prod" not in apigateway._stages["legacy-api"]
+        updated = new_props
+    provisioners._apigw_v2_stage_delete(physical_id, updated)
+    assert apigateway._stages[updated["ApiId"]] == {}
 
 
 def test_cfn_apigwv2_full_http_api_stack(cfn, apigw):
@@ -20804,6 +20909,80 @@ def test_cfn_update_iot_topic_rule_in_place(cfn, iot_client):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_iot_republish_rule(rule_name, target):
+    return {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Role": {
+                "Type": "AWS::IAM::Role",
+                "Properties": {"AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"},
+                    "Action": "sts:AssumeRole"}]}},
+            },
+            "Rule": {
+                "Type": "AWS::IoT::TopicRule",
+                "Properties": {
+                    "RuleName": rule_name,
+                    "TopicRulePayload": {
+                        "Sql": "SELECT * FROM 'things/in/#'",
+                        "Actions": [{"Republish": {
+                            "Topic": target,
+                            "RoleArn": {"Fn::GetAtt": ["Role", "Arn"]},
+                        }}],
+                    },
+                },
+            },
+        },
+    }
+
+
+def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_create(cfn, iot_client):
+    """The resource fails with IoT's refusal, the stack rolls back and no rule is stored."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, rule_name = f"cfn-iotrule-self-{suffix}", f"cfn_rule_self_{suffix}"
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "things/in/x")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack_name, "Rule", "CREATE_FAILED") == (
+            "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
+        with pytest.raises(ClientError) as ei:
+            iot_client.get_topic_rule(ruleName=rule_name)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_update(cfn, iot_client):
+    """An update that moves the republish topic inside the filter fails and rolls back to the old rule."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name, rule_name = f"cfn-iotrule-selfup-{suffix}", f"cfn_rule_selfup_{suffix}"
+    try:
+        cfn.create_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "out/topic")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        cfn.update_stack(
+            StackName=stack_name,
+            TemplateBody=json.dumps(_cfn_iot_republish_rule(rule_name, "things/in/x")),
+            Capabilities=["CAPABILITY_IAM"],
+        )
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert _cfn_iot_failure(cfn, stack_name, "Rule", "UPDATE_FAILED") == (
+            "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
+        rule = iot_client.get_topic_rule(ruleName=rule_name)["rule"]
+        assert rule["actions"][0]["republish"]["topic"] == "out/topic"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_update_sns_topic_in_place(cfn, sns):
     """A topic's DisplayName updates in place: the ARN — and a subscription
     created outside the stack — survive."""
@@ -21126,6 +21305,53 @@ def test_cfn_update_logs_log_group_in_place(cfn, logs):
         assert [s["logStreamName"] for s in streams] == ["ext-stream"]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("rename", [False, True], ids=["delete", "rename"])
+def test_cfn_logs_log_group_removal_drops_api_metric_filters(cfn, logs, rename):
+    """A stack delete or a LogGroupName replacement drops the group's API metric filters."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-logs-gone-{uid}"
+    group = f"/cfn/logs-gone-{uid}"
+    namespace = f"CfnGone{uid}"
+
+    def tpl(name):
+        return json.dumps({"Resources": {
+            "Group": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": name}},
+        }})
+
+    def described():
+        return [g for g in logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"]
+                if g["logGroupName"] == group]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=tpl(group))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        logs.put_metric_filter(
+            logGroupName=group, filterName="api", filterPattern='"ERROR"',
+            metricTransformations=[{"metricNamespace": namespace, "metricName": "Errors", "metricValue": "1"}])
+
+        if rename:
+            cfn.update_stack(StackName=stack_name, TemplateBody=tpl(f"{group}-new"))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        else:
+            cfn.delete_stack(StackName=stack_name)
+            _wait_stack(cfn, stack_name)
+        assert described() == []
+        assert logs.describe_metric_filters(
+            metricNamespace=namespace, metricName="Errors")["metricFilters"] == []
+
+        logs.create_log_group(logGroupName=group)
+        assert described()[0]["metricFilterCount"] == 0
+        assert logs.describe_metric_filters(logGroupName=group)["metricFilters"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            logs.delete_log_group(logGroupName=group)
+        except ClientError:
+            pass
 
 
 def test_cfn_update_s3_bucket_policy_in_place(cfn, s3):
@@ -22152,7 +22378,7 @@ def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn,
         if declared:
             props.update({"CallbackURLs": ["https://example.com/cb"],
                           "PreventUserExistenceErrors": "ENABLED",
-                          "RefreshTokenValidity": 10})
+                          "RefreshTokenValidity": 10, "AccessTokenValidity": 2})
         return json.dumps({
             "Resources": {
                 "Pool": {"Type": "AWS::Cognito::UserPool",
@@ -22174,6 +22400,7 @@ def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn,
         assert client["CallbackURLs"] == ["https://example.com/cb"]
         assert client["PreventUserExistenceErrors"] == "ENABLED"
         assert client["RefreshTokenValidity"] == 10
+        assert client["AccessTokenValidity"] == 2
 
         cfn.update_stack(StackName=stack_name, TemplateBody=template(False))
         stack = _wait_stack(cfn, stack_name)
@@ -22185,6 +22412,7 @@ def test_cfn_cognito_user_pool_client_dropped_properties_revert_to_defaults(cfn,
         assert client.get("CallbackURLs", []) == []
         assert client["PreventUserExistenceErrors"] == "LEGACY"
         assert client["RefreshTokenValidity"] == 30
+        assert "AccessTokenValidity" not in client
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
@@ -26836,8 +27064,8 @@ def test_cfn_apigateway_deployment_update_in_place_and_replacement(cfn, apigw_v1
 
 def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_accepted(cfn, iot_client):
     """A parent that does not exist fails the stack with the service's own
-    ResourceNotFoundException; QueryString (dynamic groups) and Tags, which
-    the service does not model, are accepted without effect."""
+    ResourceNotFoundException; QueryString (dynamic groups), which the service
+    does not model, is accepted without effect."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-thing-group-edge-{uid}"
     cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({
@@ -26870,6 +27098,48 @@ def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_
         assert group["thingGroupProperties"]["thingGroupDescription"] == "dynamic on AWS, static here"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_iot_tags_follow_the_template(cfn, iot_client):
+    """The Tags of AWS::IoT::ThingGroup, Policy and TopicRule reach
+    ListTagsForResource; an update applies changed and dropped tags in place,
+    and deleting the stack drops them."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-iot-tags-{uid}"
+    group, policy, rule = f"cfn-tags-group-{uid}", f"cfn-tags-policy-{uid}", f"cfn_tags_rule_{uid}"
+
+    def template(tags):
+        extra = {} if tags is None else {"Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
+        return json.dumps({"Resources": {
+            "Group": {"Type": "AWS::IoT::ThingGroup", "Properties": {"ThingGroupName": group, **extra}},
+            "Policy": {"Type": "AWS::IoT::Policy", "Properties": {
+                "PolicyName": policy, **extra, "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Deny", "Action": "iot:Publish", "Resource": "*"}]}}},
+            "Rule": {"Type": "AWS::IoT::TopicRule", "Properties": {
+                "RuleName": rule, **extra,
+                "TopicRulePayload": {"Sql": "SELECT * FROM 't'", "Actions": [], "RuleDisabled": True}}},
+        }})
+
+    def listed():
+        return [{t["Key"]: t["Value"] for t in iot_client.list_tags_for_resource(resourceArn=arn)["tags"]}
+                for arn in arns]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template({"own": "1"}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arns = [iot_client.describe_thing_group(thingGroupName=group)["thingGroupArn"],
+                iot_client.get_policy(policyName=policy)["policyArn"],
+                iot_client.get_topic_rule(ruleName=rule)["ruleArn"]]
+        assert listed() == [{"own": "1"}] * 3
+        for tags in ({"own": "2", "new": "x"}, None):
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(tags))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert listed() == [tags or {}] * 3
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert listed() == [{}] * 3
 
 
 def test_cfn_kms_alias_target_change_in_place_and_rename_replaces(cfn, kms_client):
@@ -34459,7 +34729,7 @@ def _cfn_apigwv2_domain_template(domain, key):
                 "DomainNameConfigurations": [{"EndpointType": "REGIONAL", "CertificateArn":
                     "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"}]}},
             "Mapping": {"Type": "AWS::ApiGatewayV2::ApiMapping", "DependsOn": ["Stage"], "Properties": {
-                "DomainName": {"Ref": "Domain"}, "ApiId": {"Ref": "Api"}, "Stage": "prod", "ApiMappingKey": key}},
+                "DomainName": {"Ref": "Domain"}, "ApiId": {"Ref": "Api"}, "Stage": {"Ref": "Stage"}, "ApiMappingKey": key}},
         },
         "Outputs": {
             "Domain": {"Value": {"Ref": "Domain"}},
@@ -34487,6 +34757,7 @@ def test_cfn_apigwv2_domain_name_and_api_mapping(cfn, apigw):
         mapping_id = _output(stack, "Mapping")
         assert _output(stack, "MappingId") == mapping_id
         assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v1"
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["Stage"] == "prod"
 
         # ApiMappingKey updates in place.
         cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v2"))
@@ -34806,3 +35077,225 @@ def test_cfn_iam_user_generated_name(cfn, iam):
     finally:
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("custom_bus", [True, False])
+def test_cfn_events_rule_bus_arn_delivery_and_lifecycle(cfn, eb, sqs, custom_bus):
+    """ARN/name aliases share a rule on create, update, delivery, drift and delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-bus-arn-{uid}"
+    rule_name = f"cfn-rule-bus-arn-{uid}"
+    bus_name = f"cfn-rule-bus-arn-{uid}" if custom_bus else "default"
+    url = sqs.create_queue(QueueName=f"cfn-rule-bus-arn-{uid}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    def template(use_arn, description):
+        resources = {}
+        if custom_bus:
+            resources["Bus"] = {"Type": "AWS::Events::EventBus", "Properties": {"Name": bus_name}}
+        bus_ref = {"Fn::GetAtt": ["Bus", "Arn"]} if custom_bus else {
+            "Fn::Sub": "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"}
+        resources["Rule"] = {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": rule_name, "EventBusName": bus_ref if use_arn else bus_name,
+            "Description": description, "EventPattern": {"source": [f"cfn.test.{uid}"]},
+            "Targets": [{"Id": "Q", "Arn": queue_arn}], "Tags": [{"Key": "team", "Value": "test"}]}}
+        return json.dumps({"Resources": resources, "Outputs": {
+            "RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}}})
+
+    def delivered(marker, use_arn):
+        bus_ref = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}" if use_arn else bus_name
+        response = eb.put_events(Entries=[{
+            "EventBusName": bus_ref, "Source": f"cfn.test.{uid}", "DetailType": "demo",
+            "Detail": json.dumps({"marker": marker})}])
+        assert response["FailedEntryCount"] == 0
+        messages = sqs.receive_message(QueueUrl=url, WaitTimeSeconds=2).get("Messages", [])
+        assert len(messages) == 1
+        assert json.loads(messages[0]["Body"])["detail"] == {"marker": marker}
+        sqs.delete_message(QueueUrl=url, ReceiptHandle=messages[0]["ReceiptHandle"])
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True, "first"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        rule = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+        suffix = f"rule/{bus_name}/{rule_name}" if custom_bus else f"rule/{rule_name}"
+        assert rule["Arn"] == f"arn:aws:events:us-east-1:000000000000:{suffix}"
+        assert _output(stack, "RuleArn") == rule["Arn"]
+        assert rule["EventBusName"] == bus_name
+        assert eb.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"][0]["Arn"] == queue_arn
+        delivered("create", False)
+        delivered("arn-publish", True)
+        drift = cfn.detect_stack_resource_drift(StackName=stack_name, LogicalResourceId="Rule")
+        assert drift["StackResourceDrift"]["StackResourceDriftStatus"] == "IN_SYNC"
+        eb.tag_resource(ResourceARN=rule["Arn"], Tags=[{"Key": "outside", "Value": "kept"}])
+
+        # Switching aliases must not move/delete the rule or lose its targets/tags.
+        for use_arn, description in [(False, "by-name"), (True, "by-arn")]:
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(use_arn, description))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+            updated = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+            assert updated["Arn"] == rule["Arn"]
+            assert updated["Description"] == description
+            assert {"Key": "outside", "Value": "kept"} in eb.list_tags_for_resource(ResourceARN=rule["Arn"])["Tags"]
+            delivered(description, False)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError):
+        eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+
+
+@pytest.mark.parametrize("bus_ref", [
+    "arn:aws:events:us-west-2:000000000000:event-bus/default",
+    "arn:aws:events:us-east-1:111111111111:event-bus/default",
+    "arn:aws:sqs:us-east-1:000000000000:default",
+    "arn:broken",
+])
+def test_cfn_events_rule_invalid_bus_arn_is_rejected(cfn, eb, bus_ref):
+    """Reuse EventBridge's ARN checks rather than accepting foreign tenants."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-rule-bad-arn-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps({"Resources": {
+        "Rule": {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": name, "EventBusName": bus_ref, "EventPattern": {"source": ["cfn.test"]}}}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "AWS::Events::Rule EventBusName:" in _stack_event_reasons(cfn, name)
+        assert not any(rule["Name"] == name for rule in eb.list_rules(EventBusName="default")["Rules"])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+_IDENTITY_TAG_TRUST = {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                                 "Action": "sts:AssumeRole"}]}
+
+
+def _identity_tag_map(tags):
+    result = {t["Key"]: t["Value"] for t in tags}
+    assert len(result) == len(tags), f"Duplicate tag keys in response: {tags}"
+    return result
+
+
+def _identity_custom_tag_map(tags):
+    return _identity_tag_map([t for t in tags if not t["Key"].lower().startswith("aws:")])
+
+
+def _identity_template(resource, name, tags, after=False):
+    props = {f"{resource.title()}Name": name, "Tags": tags}
+    if resource == "role":
+        props.update(AssumeRolePolicyDocument=_IDENTITY_TAG_TRUST, Description="After" if after else "Before")
+    else:
+        props["Path"] = "/after/" if after else "/before/"
+    return json.dumps({"Resources": {"Identity": {"Type": f"AWS::IAM::{resource.title()}", "Properties": props}}})
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+@pytest.mark.parametrize("source", ["template", "stack"])
+def test_cfn_iam_identity_tag_case_update_and_removal(cfn, iam, resource, source):
+    name = f"cfn-{resource}-tag-case-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    original_tag = {"Key": "Department", "Value": "Finance"}
+    body = _identity_template(resource, name, [original_tag] if source == "template" else [])
+    cfn.create_stack(StackName=name, TemplateBody=body, Capabilities=["CAPABILITY_NAMED_IAM"],
+                     Tags=[original_tag] if source == "stack" else [])
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+        assert _identity_custom_tag_map(before["Tags"]) == {"Department": "Finance"}
+        # First change only the key's spelling, then change its value too.
+        for value in ["Finance", "HR"]:
+            desired_tags = [{"Key": "department", "Value": value}, {"Key": "Added", "Value": "New"}]
+            body = _identity_template(resource, name, desired_tags if source == "template" else [])
+            cfn.update_stack(StackName=name, TemplateBody=body,
+                             Tags=desired_tags if source == "stack" else [], Capabilities=["CAPABILITY_NAMED_IAM"])
+            assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+            identity = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+            assert identity[f"{resource.title()}Id"] == before[f"{resource.title()}Id"]
+            assert _identity_custom_tag_map(identity["Tags"]) == {"department": value, "Added": "New"}
+        # Change a managed key's spelling externally; do not add unrelated external tags.
+        getattr(iam, f"tag_{resource}")(**params, Tags=[{"Key": "DEPARTMENT", "Value": "ExternalEdit"}])
+        assert _identity_custom_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == {
+            "DEPARTMENT": "ExternalEdit", "Added": "New"}
+        cfn.update_stack(StackName=name, TemplateBody=_identity_template(resource, name, []), Tags=[],
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+        identity = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+        assert identity[f"{resource.title()}Id"] == before[f"{resource.title()}Id"]
+        assert _identity_custom_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == {}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_cfn_iam_identity_stack_tag_differing_only_in_case_fails_the_resource(cfn, iam, resource):
+    """Stack and resource tag keys merge case-sensitively, so IAM receives both spellings and refuses them."""
+    name = f"cfn-{resource}-tag-merge-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=name, Capabilities=["CAPABILITY_NAMED_IAM"],
+                     TemplateBody=_identity_template(resource, name, [{"Key": "department", "Value": "Resource"}]),
+                     Tags=[{"Key": "Department", "Value": "Stack"}])
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Identity" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any("Duplicate tag keys found. Please note that Tag keys are case insensitive." in r
+                   for r in reasons), reasons
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            getattr(iam, f"get_{resource}")(**{f"{resource.title()}Name": name})
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_cfn_iam_identity_duplicate_tag_keys_leave_state_unchanged(cfn, iam, operation, resource):
+    name = f"cfn-{resource}-tag-duplicate-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    before = None
+    if operation == "update":
+        cfn.create_stack(StackName=name, TemplateBody=_identity_template(resource, name, [{"Key": "Department", "Value": "Finance"}]),
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+    try:
+        # Both duplicate forms use the predicate covered by the IAM API tests.
+        tags = [{"Key": "Department", "Value": "HR"}, {"Key": "department", "Value": "HR"}]
+        getattr(cfn, f"{operation}_stack")(StackName=name, TemplateBody=_identity_template(resource, name, tags, after=True),
+                                           Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == (
+            "UPDATE_ROLLBACK_COMPLETE" if operation == "update" else "ROLLBACK_COMPLETE")
+        if before is not None:
+            assert getattr(iam, f"get_{resource}")(**params)[resource.title()] == before
+        else:
+            with pytest.raises(iam.exceptions.NoSuchEntityException):
+                getattr(iam, f"get_{resource}")(**params)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("resource_type", ["AWS::SQS::Queue", "AWS::SSM::Parameter"])
+def test_cfn_other_resource_stack_tag_merge_remains_case_sensitive(resource_type):
+    # Protect the list/map branches of the shared merge without provisioning other services.
+    props = {"Tags": [{"Key": "department", "Value": "Resource"}]} if resource_type == "AWS::SQS::Queue" else {
+        "Tags": {"department": "Resource"}}
+    import copy
+
+    original = copy.deepcopy(props)
+    result = _with_stack_tags(resource_type, props, [{"Key": "Department", "Value": "Stack"}],
+                              "stack-name", "stack-id", "Resource")
+    tags = result["Tags"]
+    actual = tags if isinstance(tags, dict) else _identity_tag_map(tags)
+    assert {k: v for k, v in actual.items() if not k.lower().startswith("aws:")} == {
+        "Department": "Stack", "department": "Resource"}
+    assert props == original
+
+
+def test_cfn_other_resource_tag_reconciliation_remains_case_sensitive():
+    store = [{"Key": "Department", "Value": "External"}, {"Key": "department", "Value": "Before"}]
+    _reconcile_tag_list(store, {"Tags": [{"Key": "department", "Value": "Before"}]},
+                        {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]})
+    assert _identity_tag_map(store) == {"Department": "External", "DEPARTMENT": "After"}
+    _reconcile_tag_list(store, {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]}, {})
+    assert _identity_tag_map(store) == {"Department": "External"}

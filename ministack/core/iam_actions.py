@@ -396,6 +396,8 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
 # Lambda REST path → IAM action
 def _lambda_action(method: str, path: str) -> str | None:
     parts = [p for p in path.split("/") if p]
+    if parts[1:2] == ["tags"]:
+        return {"POST": "TagResource", "DELETE": "UntagResource"}.get(method, "ListTags")
     if "functions" not in parts:
         if "layers" in parts:
             if method == "GET":
@@ -543,8 +545,8 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
     return compiled, specificity, required_query
 
 
-def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, str, int, dict[str, str]]]:
-    """Load a botocore service model and compile its URI routes."""
+def _load_botocore_model(botocore_service: str) -> dict:
+    """Load a botocore service model, or {} when there is none."""
     try:
         import gzip
 
@@ -556,30 +558,33 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
 
     svc_dir = os.path.join(data_dir, botocore_service)
     if not os.path.isdir(svc_dir):
-        return []
+        return {}
 
     versions = sorted(os.listdir(svc_dir))
     if not versions:
-        return []
+        return {}
 
     model_path = os.path.join(svc_dir, versions[-1], "service-2.json.gz")
     if not os.path.exists(model_path):
         model_path = os.path.join(svc_dir, versions[-1], "service-2.json")
         if not os.path.exists(model_path):
-            return []
+            return {}
 
     try:
         if model_path.endswith(".gz"):
             import gzip
             with gzip.open(model_path, "rt") as f:
-                model = json.load(f)
-        else:
-            with open(model_path) as f:
-                model = json.load(f)
+                return json.load(f)
+        with open(model_path) as f:
+            return json.load(f)
     except Exception:
         logger.debug("AUTH: failed to load botocore model for %s", botocore_service)
-        return []
+        return {}
 
+
+def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, str, int, dict[str, str]]]:
+    """Load a botocore service model and compile its URI routes."""
+    model = _load_botocore_model(botocore_service)
     routes = []
     for op_name, op_def in model.get("operations", {}).items():
         http = op_def.get("http", {})
@@ -900,6 +905,8 @@ def extract_resource_arn(service: str, method: str, path: str,
     if service == "lambda":
         # Path: /2015-03-31/functions/{name}/...
         path_parts = [p for p in path.split("/") if p]
+        if path_parts[1:2] == ["tags"] and len(path_parts) > 2:
+            return unquote("/".join(path_parts[2:]))
         if "functions" in path_parts:
             fi = path_parts.index("functions")
             if fi + 1 < len(path_parts):
@@ -1795,6 +1802,20 @@ def dynamodb_transaction_checks(
     return checks
 
 
+def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
+    """The s3:prefix, s3:delimiter and s3:max-keys a ListBucket or ListBucketVersions request sends."""
+    if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
+        return {}
+    context = {}
+    for param in ("prefix", "delimiter", "max-keys"):
+        value = (query_params or {}).get(param)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if value is not None:
+            context[f"s3:{param}"] = value
+    return context
+
+
 def dynamodb_service_context(body: bytes) -> dict:
     """The DynamoDB condition keys a request carries.
 
@@ -1842,6 +1863,60 @@ def dynamodb_service_context(body: bytes) -> dict:
     return context
 
 
+_TAG_MEMBERS = frozenset({"Tags", "tags", "TagKeys"})
+_TAG_OPERATIONS: dict[str, frozenset[str]] = {}
+_QUERY_TAG_RE = re.compile(r"^((?:.+\.)?Tags?(?:\.member)?\.\d+)\.Key$")
+_QUERY_TAG_KEY_RE = re.compile(r"^(?:TagKeys?(?:\.member)?\.\d+|tagKeys)$")
+
+
+def _tag_operations(service: str) -> frozenset[str]:
+    """The operations of *service* whose input carries tags or tag keys."""
+    if service not in _TAG_OPERATIONS:
+        ops = set()
+        for name in _BOTOCORE_SERVICE_MAP.get(service) or [service]:
+            model = _load_botocore_model(name)
+            shapes = model.get("shapes", {})
+            for op_name, op in model.get("operations", {}).items():
+                members = shapes.get(op.get("input", {}).get("shape"), {}).get("members", {})
+                if _TAG_MEMBERS & members.keys():
+                    ops.add(op_name)
+        _TAG_OPERATIONS[service] = frozenset(ops)
+    return _TAG_OPERATIONS[service]
+
+
+def request_tag_context(service: str, iam_action: str, body: bytes, params: dict) -> dict:
+    """aws:RequestTag/<key> for every tag a request sets and aws:TagKeys for every key it sets or removes."""
+    if iam_action.split(":", 1)[-1] not in _tag_operations(service):
+        return {}
+    tags: list[tuple[str, str]] = []
+    keys: list[str] = []
+    try:
+        data = json.loads(body) if body[:1] == b"{" else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if isinstance(data, dict):
+        raw = data.get("Tags", data.get("tags"))
+        if isinstance(raw, dict):
+            tags += [(str(k), str(v)) for k, v in raw.items()]
+        for tag in raw if isinstance(raw, list) else []:
+            if isinstance(tag, dict):
+                key = tag.get("Key", tag.get("TagKey", tag.get("key")))
+                tags.append((str(key), str(tag.get("Value", tag.get("TagValue", tag.get("value", ""))))))
+        if isinstance(data.get("TagKeys"), list):
+            keys += [str(k) for k in data["TagKeys"]]
+    for name, value in params.items():
+        match = _QUERY_TAG_RE.match(name)
+        if match:
+            tags.append((_query_param(params, name), _query_param(params, f"{match.group(1)}.Value")))
+        elif _QUERY_TAG_KEY_RE.match(name):
+            keys += value if isinstance(value, list) else [value]
+    values: dict[str, list[str]] = {}
+    for name, value in tags:
+        values.setdefault(f"aws:RequestTag/{name}".lower(), []).append(value)
+    context: dict = {key: found[0] if len(found) == 1 else found for key, found in values.items()}
+    if tags or keys:
+        context["aws:TagKeys"] = [name for name, _ in tags] + keys
+    return context
 # Authentication failures by the evaluator's code: the Query API code and
 # status (also REST-XML and the query-compatible JSON services), the JSON code,
 # and S3's code, status and message.

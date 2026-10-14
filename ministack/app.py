@@ -218,6 +218,7 @@ from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     find_iam_access_key_account,
+    pin_request_origin,
     pin_signed_body,
     pin_signed_request,
 )
@@ -1777,6 +1778,8 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
             extract_region(headers, query_params), get_account_id(),
             api_id, stage, method, execute_path,
         ),
+        auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+            api_id, stage, error, headers, query_params),
     )
 
 
@@ -2138,12 +2141,20 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks
+        from ministack.core.iam_actions import (
+            _s3_action,
+            extract_resource_arn,
+            s3_additional_checks,
+            s3_service_context,
+        )
 
         s3_action = _s3_action(method, vhost_path, query_params)
         if s3_action:
             s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
-            denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource)
+            denied = _enforce_data_plane(
+                "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
+                service_context=s3_service_context(f"s3:{s3_action}", query_params),
+            )
             if denied:
                 return denied
             # A copy also reads its source, a batch delete is one check per
@@ -2203,7 +2214,7 @@ def _credential_failure(service: str, iam_action: str, request_id: str, denied, 
 
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
-    service_context: dict | None = None,
+    service_context: dict | None = None, auth_error_response=None,
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
@@ -2221,7 +2232,8 @@ def _enforce_data_plane(
                      resource_arn=resource_arn, service_context=service_context)
     if denied:
         if isinstance(denied, AuthError):
-            return _credential_failure(service, iam_action, request_id, denied, headers)
+            response = auth_error_response(denied) if auth_error_response else None
+            return response or _credential_failure(service, iam_action, request_id, denied, headers)
         return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
                                       explicit_deny=denied.decision == "Deny",
                                       resource_policy_arn=denied.resource_policy_arn)
@@ -2596,6 +2608,8 @@ async def _dispatch_service_request(
             extract_iam_action,
             extract_resource_arn,
             logs_service_context,
+            request_tag_context,
+            s3_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2608,7 +2622,9 @@ async def _dispatch_service_request(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
             service_context = (
-                dynamodb_service_context(body) if service == "dynamodb" else None
+                dynamodb_service_context(body) if service == "dynamodb"
+                else s3_service_context(iam_action, query_params) if service == "s3"
+                else None
             )
             if service == "logs":
                 from ministack.services import cloudwatch_logs
@@ -2626,6 +2642,8 @@ async def _dispatch_service_request(
                 service_context = logs_service_context(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
+            service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
             transaction_checks = (
@@ -2853,6 +2871,9 @@ async def app(scope, receive, send):
     # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
     if scope.get("scheme") == "https":
         headers.setdefault("x-forwarded-proto", "https")
+    if AUTH:
+        pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
+                           headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")
 
     request_id = str(uuid.uuid4())
 

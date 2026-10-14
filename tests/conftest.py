@@ -389,6 +389,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_listener_survives_reset",
     "tests/test_iot_data.py::test_mtls_reset_rebinds_with_a_device_connected",
     "tests/test_iot_data.py::test_mtls_shutdown_completes_with_a_device_connected",
+    "tests/test_iot_data.py::test_mtls_auth_evaluates_iot_connect",
 }
 
 

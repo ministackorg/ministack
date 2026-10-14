@@ -2571,6 +2571,116 @@ def test_sfn_aws_sdk_ec2_irregular_set_members_use_sdk_names(sfn_sync, ec2):
         ec2.delete_key_pair(KeyName=f"sdk-key-{suffix}")
 
 
+_SDK_TIMESTAMP = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$"
+
+
+def test_sfn_aws_sdk_sfn_list_executions_nested_shape(sfn_sync):
+    """Nested members of a JSON-protocol result take the SDK's names, timestamps
+    are ISO 8601 and an absent stopDate is left out, as on AWS."""
+    import re
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    with _machine(sfn_sync, "Wait", {"Wait": {"Type": "Wait", "Seconds": 3600, "End": True}}) as target:
+        sfn_sync.start_execution(stateMachineArn=target, name="single-1")
+        result = _run_sdk_task(sfn_sync, f"sdk-list-{suffix}", "sfn:listExecutions",
+                               {"StateMachineArn": target, "StatusFilter": "RUNNING"})
+
+    [execution] = result["Executions"]
+    assert sorted(execution) == ["ExecutionArn", "Name", "StartDate", "StateMachineArn", "Status"]
+    assert execution["Name"] == "single-1"
+    assert execution["Status"] == "RUNNING"
+    assert re.match(_SDK_TIMESTAMP, execution["StartDate"]), execution["StartDate"]
+
+
+def test_sfn_aws_sdk_dynamodb_get_item_keeps_attribute_names(sfn_sync, ddb):
+    """Attribute names are map keys and stay as written at every depth, while the
+    AttributeValue members take the SDK's names. The expected item is what AWS
+    returned for the same put."""
+    table = f"sdk-item-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        ddb.put_item(TableName=table, Item={
+            "pk": {"S": "k"}, "num": {"N": "7"}, "flag": {"BOOL": True}, "nothing": {"NULL": True},
+            "set": {"SS": ["a", "b"]}, "nums": {"NS": ["1"]},
+            "nested": {"M": {"innerKey": {"S": "v"}, "UPPER_key": {"N": "1"}}},
+            "list": {"L": [{"S": "x"}]},
+        })
+        result = _run_sdk_task(sfn_sync, f"{table}-get", "dynamodb:getItem",
+                               {"TableName": table, "Key": {"pk": {"S": "k"}}})
+    finally:
+        ddb.delete_table(TableName=table)
+
+    assert result["Item"] == {
+        "pk": {"S": "k"}, "num": {"N": "7"}, "flag": {"Bool": True}, "nothing": {"Nul": True},
+        "set": {"Ss": ["a", "b"]}, "nums": {"Ns": ["1"]},
+        "nested": {"M": {"innerKey": {"S": "v"}, "UPPER_key": {"N": "1"}}},
+        "list": {"L": [{"S": "x"}]},
+    }
+
+
+def test_sfn_aws_sdk_json_results_rename_nested_members(sfn_sync, sm):
+    """An ARN member nested in a list becomes Arn, map keys such as version ids
+    stay as sent, and tag lists keep their Key/Value members."""
+    import re
+
+    name = f"sdk-secret-{_uuid_mod.uuid4().hex[:8]}"
+    version = sm.create_secret(Name=name, SecretString="x",
+                               Tags=[{"Key": "owner", "Value": "probe"}])["VersionId"]
+    try:
+        result = _run_sdk_task(sfn_sync, f"{name}-list", "secretsmanager:listSecrets",
+                               {"Filters": [{"Key": "name", "Values": [name]}]})
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    [secret] = result["SecretList"]
+    assert secret["Arn"].startswith(f"arn:aws:secretsmanager:us-east-1:000000000000:secret:{name}")
+    assert "ARN" not in secret
+    assert re.match(_SDK_TIMESTAMP, secret["CreatedDate"]), secret["CreatedDate"]
+    assert secret["Tags"] == [{"Key": "owner", "Value": "probe"}]
+    assert secret["SecretVersionsToStages"] == {version: ["AWSCURRENT"]}
+
+
+def test_sfn_aws_sdk_ecs_and_ecr_parameters_reach_the_service(sfn_sync, ecs, ecr):
+    """SDK member names in Parameters reach a camelCase-wire service under its wire names."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    cluster, repo_a, repo_b = f"sdk-cl-{suffix}", f"sdk-repo-a-{suffix}", f"sdk-repo-b-{suffix}"
+    ecs.create_cluster(clusterName=cluster)
+    ecr.create_repository(repositoryName=repo_a)
+    ecr.create_repository(repositoryName=repo_b)
+    try:
+        clusters = _run_sdk_task(sfn_sync, f"sdk-ecs-{suffix}", "ecs:describeClusters", {"Clusters": [cluster]})
+        assert [c["ClusterName"] for c in clusters["Clusters"]] == [cluster]
+        missing = _run_sdk_task(sfn_sync, f"sdk-ecs-miss-{suffix}", "ecs:describeClusters",
+                                {"Clusters": [f"{cluster}-missing"]})
+        [failure] = missing["Failures"]
+        assert failure["Arn"].endswith(f"cluster/{cluster}-missing")
+        repos = _run_sdk_task(sfn_sync, f"sdk-ecr-{suffix}", "ecr:describeRepositories",
+                              {"RepositoryNames": [repo_a]})
+        assert [r["RepositoryName"] for r in repos["Repositories"]] == [repo_a]
+    finally:
+        ecs.delete_cluster(cluster=cluster)
+        ecr.delete_repository(repositoryName=repo_a)
+        ecr.delete_repository(repositoryName=repo_b)
+
+
+def test_sfn_aws_sdk_cloudwatchlogs_tag_keys_keep_their_case(sfn_sync, logs):
+    """Map keys in Parameters are data: tag keys reach the service as written."""
+    group = f"/sdk/tags-{_uuid_mod.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    try:
+        arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"].removesuffix(":*")
+        _run_sdk_task(sfn_sync, f"sdk-logs-tag-{group[-8:]}", "cloudwatchlogs:tagResource",
+                      {"ResourceArn": arn, "Tags": {"Team-Name": "data", "CostCentre": "42"}})
+        assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"Team-Name": "data", "CostCentre": "42"}
+    finally:
+        logs.delete_log_group(logGroupName=group)
+
+
 def test_sfn_aws_sdk_rds_create_and_describe_instance(sfn, sfn_sync):
     """aws-sdk:rds CreateDBInstance + DescribeDBInstances via query-protocol dispatch."""
     import uuid as _uuid
@@ -4697,6 +4807,62 @@ def test_sfn_list_executions_filter(sfn):
     time.sleep(0.5)
     succeeded = sfn.list_executions(stateMachineArn=arn, statusFilter="SUCCEEDED")["executions"]
     assert all(e["status"] == "SUCCEEDED" for e in succeeded)
+
+
+_WAIT_AN_HOUR = {"Wait": {"Type": "Wait", "Seconds": 3600, "End": True}}
+
+
+def test_sfn_list_executions_most_recent_first(sfn):
+    """Running executions sort by startDate and the rest by stopDate, in one
+    ordering, most recent first. The timeline and answers are what AWS gave."""
+    with _machine(sfn, "Wait", _WAIT_AN_HOUR) as arn:
+        prefix = arn.replace(":stateMachine:", ":execution:")
+
+        def listed(**kwargs):
+            executions = sfn.list_executions(stateMachineArn=arn, **kwargs)["executions"]
+            return [e["name"] for e in executions]
+
+        for name in ("x", "y", "w"):
+            sfn.start_execution(stateMachineArn=arn, name=name)
+            time.sleep(0.01)
+        assert listed(statusFilter="RUNNING") == ["w", "y", "x"]
+
+        sfn.stop_execution(executionArn=f"{prefix}:y")
+        time.sleep(0.01)
+        sfn.start_execution(stateMachineArn=arn, name="z")
+        time.sleep(0.01)
+        sfn.stop_execution(executionArn=f"{prefix}:x")
+
+        assert listed(statusFilter="ABORTED") == ["x", "y"]
+        assert listed() == ["x", "z", "y", "w"]
+
+
+def test_sfn_list_executions_token_resumes_after_last_execution(sfn):
+    """The token resumes after the last execution returned, so one started
+    between pages is not repeated."""
+    with _machine(sfn, "Wait", _WAIT_AN_HOUR) as arn:
+        for name in ("a", "b", "c"):
+            sfn.start_execution(stateMachineArn=arn, name=name)
+            time.sleep(0.01)
+
+        first = sfn.list_executions(stateMachineArn=arn, maxResults=1)
+        assert [e["name"] for e in first["executions"]] == ["c"]
+        sfn.start_execution(stateMachineArn=arn, name="d")
+        second = sfn.list_executions(
+            stateMachineArn=arn, maxResults=1, nextToken=first["nextToken"])
+        assert [e["name"] for e in second["executions"]] == ["b"]
+        third = sfn.list_executions(
+            stateMachineArn=arn, maxResults=1, nextToken=second["nextToken"])
+        assert [e["name"] for e in third["executions"]] == ["a"]
+        assert "nextToken" not in third
+
+        everything = sfn.list_executions(stateMachineArn=arn, maxResults=0)
+        assert [e["name"] for e in everything["executions"]] == ["d", "c", "b", "a"]
+        assert "nextToken" not in everything
+
+        with pytest.raises(ClientError) as exc:
+            sfn.list_executions(stateMachineArn=arn, nextToken="not-a-token")
+        assert exc.value.response["Error"]["Code"] == "InvalidToken"
 
 def test_sfn_timestamp_fields_are_sdk_compatible(sfn, sfn_sync):
     """SFN timestamp fields must deserialize as datetimes, not fail as strings."""
@@ -8435,6 +8601,130 @@ def test_sfn_jsonata_tomillis_still_parses_iso(sfn):
         assert json.loads(desc["output"]) == {"v": 1577836800000}
     finally:
         sfn.delete_state_machine(stateMachineArn=sm)
+
+
+_JSONATA_FAIL = {
+    "Type": "Fail",
+    "QueryLanguage": "JSONata",
+    "Error": "{% $states.input.error %}",
+    "Cause": "{% 'value was: ' & $states.input.v %}",
+}
+
+
+def test_sfn_jsonata_fail_evaluates_error_and_cause(sfn_sync):
+    """A JSONata Fail state evaluates its Error and Cause, in a Parallel branch
+    and through TestState too, and refuses a result that is not a string."""
+    payload = json.dumps({"error": "Example.Error", "v": "abc"})
+    evaluated = ("FAILED", "Example.Error", "value was: abc")
+
+    with _machine(sfn_sync, "Stop", {"Stop": _JSONATA_FAIL}) as arn:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=arn, input=payload)
+        assert (resp["status"], resp["error"], resp["cause"]) == evaluated
+
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"error": 42, "v": "abc"}))
+        assert (resp["status"], resp["error"]) == ("FAILED", "States.QueryEvaluationError")
+        assert resp["cause"] == (
+            "The JSONata expression specified for the field 'Error' returned an unexpected "
+            "result type. Expected 'string', but was 'number' for value: 42")
+
+    branch = {"StartAt": "Stop", "States": {"Stop": _JSONATA_FAIL}}
+    with _machine(sfn_sync, "Fan", {
+        "Fan": {"Type": "Parallel", "Branches": [branch], "End": True},
+    }) as arn:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=arn, input=payload)
+        assert (resp["status"], resp["error"], resp["cause"]) == evaluated
+
+    resp = sfn_sync.test_state(
+        definition=json.dumps(_JSONATA_FAIL),
+        input=payload,
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )
+    assert (resp["status"], resp["error"], resp["cause"]) == evaluated
+
+
+def test_sfn_fail_error_path_and_cause_path(sfn_sync):
+    """A JSONPath Fail state takes its error and cause from ErrorPath and
+    CausePath, a reference path or an intrinsic, which must yield a string."""
+    with _machine(sfn_sync, "Stop", {"Stop": {
+        "Type": "Fail",
+        "ErrorPath": "$.error",
+        "CausePath": "States.Format('cause: {}', $.cause)",
+    }}) as arn:
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"error": "Path.Error", "cause": "y"}))
+        assert (resp["status"], resp["error"], resp["cause"]) == (
+            "FAILED", "Path.Error", "cause: y")
+
+        resp = sfn_sync.start_sync_execution(
+            stateMachineArn=arn, input=json.dumps({"error": 42, "cause": "y"}))
+        assert (resp["status"], resp["error"], resp["cause"]) == (
+            "FAILED", "States.Runtime",
+            "The value referenced by ErrorPath must be a string, but the value was: 42")
+
+
+def test_sfn_jsonata_wait_evaluates_seconds(sfn_sync):
+    """A JSONata Wait evaluates a Seconds expression, which must be a
+    non-negative integer, and applies its Output and Assign."""
+    with _machine(sfn_sync, "Pause", {
+        "Pause": {
+            "Type": "Wait",
+            "QueryLanguage": "JSONata",
+            "Seconds": "{% $states.input.s %}",
+            "Output": "{% {'out': $states.input.s} %}",
+            "Assign": {"seen": "{% $states.input.s %}"},
+            "Next": "After",
+        },
+        "After": {
+            "Type": "Pass",
+            "QueryLanguage": "JSONata",
+            "Output": "{% {'input': $states.input, 'seen': $seen} %}",
+            "End": True,
+        },
+    }) as arn:
+        def run(seconds):
+            return sfn_sync.start_sync_execution(
+                stateMachineArn=arn, input=json.dumps({"s": seconds}))
+
+        resp = run(0)
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == {"input": {"out": 0}, "seen": 0}
+
+        for seconds, cause in (
+            (1.5, "The Seconds field cannot be parsed as an integer: 1.5"),
+            (-1, "Seconds cannot be negative but was: -1"),
+            ("1", "The JSONata expression specified for the field 'Seconds' returned an "
+                  "unexpected result type. Expected 'number', but was 'string' for value: \"1\""),
+        ):
+            resp = run(seconds)
+            assert (resp["status"], resp["error"], resp["cause"]) == (
+                "FAILED", "States.QueryEvaluationError", cause)
+
+
+def test_sfn_jsonata_wait_evaluates_timestamp(sfn_sync):
+    """A JSONata Wait evaluates a Timestamp expression, which must be a
+    parsable timestamp string."""
+    with _machine(sfn_sync, "Pause", {"Pause": {
+        "Type": "Wait",
+        "QueryLanguage": "JSONata",
+        "Timestamp": "{% $states.input.t %}",
+        "End": True,
+    }}) as arn:
+        def run(timestamp):
+            return sfn_sync.start_sync_execution(
+                stateMachineArn=arn, input=json.dumps({"t": timestamp}))
+
+        assert run("2020-01-01T00:00:00Z")["status"] == "SUCCEEDED"
+
+        for timestamp, cause in (
+            ("not a time", "The Timestamp field cannot be parsed as an ISO-8601 extended "
+                           "offset date-time format string: not a time"),
+            (5, "The JSONata expression specified for the field 'Timestamp' returned an "
+                "unexpected result type. Expected 'string', but was 'number' for value: 5"),
+        ):
+            resp = run(timestamp)
+            assert (resp["status"], resp["error"], resp["cause"]) == (
+                "FAILED", "States.QueryEvaluationError", cause)
 
 
 def test_sfn_choice_numeric_path_dynamic_batch_loop(sfn):
