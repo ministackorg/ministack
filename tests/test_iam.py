@@ -370,6 +370,93 @@ def test_iam_user_tags_serialized_in_get_user(iam):
     assert tags == {"Team": "core", "Env": "dev"}
     iam.delete_user(UserName=name)
 
+
+_IDENTITY_TAG_TRUST = {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                                 "Action": "sts:AssumeRole"}]}
+
+
+def _identity_tag_map(tags):
+    result = {t["Key"]: t["Value"] for t in tags}
+    assert len(result) == len(tags), f"Duplicate tag keys in response: {tags}"
+    return result
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_iam_identity_tag_keys_ignore_case_and_preserve_spelling(iam, resource):
+    name = f"tag-case-{resource}-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    create_params = {"AssumeRolePolicyDocument": json.dumps(_IDENTITY_TAG_TRUST)} if resource == "role" else {}
+    original = [{"Key": "Department", "Value": "Finance"}, {"Key": "ExternalKey", "Value": "Keep"}]
+    getattr(iam, f"create_{resource}")(**params, **create_params, Tags=original)
+    try:
+        assert _identity_tag_map(getattr(iam, f"get_{resource}")(**params)[resource.title()]["Tags"]) == _identity_tag_map(original)
+        # Untag must match both the original spelling and a subsequently changed spelling.
+        getattr(iam, f"untag_{resource}")(**params, TagKeys=["DEPARTMENT"])
+        assert getattr(iam, f"list_{resource}_tags")(**params)["Tags"] == [original[1]]
+        getattr(iam, f"tag_{resource}")(**params, Tags=[original[0]])
+        # A spelling-only update and a case-sensitive value change must both take effect.
+        for key, value in [("department", "Finance"), ("DEPARTMENT", "finance")]:
+            getattr(iam, f"tag_{resource}")(**params, Tags=[{"Key": key, "Value": value}])
+            expected = {key: value, "ExternalKey": "Keep"}
+            assert _identity_tag_map(getattr(iam, f"get_{resource}")(**params)[resource.title()]["Tags"]) == expected
+            assert _identity_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == expected
+        getattr(iam, f"untag_{resource}")(**params, TagKeys=["DePaRtMeNt", "missing"])
+        assert getattr(iam, f"list_{resource}_tags")(**params)["Tags"] == [original[1]]
+    finally:
+        getattr(iam, f"delete_{resource}")(**params)
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+@pytest.mark.parametrize("operation", ["create", "tag"])
+@pytest.mark.parametrize("second_key", ["Department", "department"])
+def test_iam_identity_duplicate_tag_keys_reject_entire_request(iam, resource, operation, second_key):
+    params = {f"{resource.title()}Name": f"tag-duplicate-{resource}-{_uuid_mod.uuid4().hex[:8]}"}
+    create_params = {"AssumeRolePolicyDocument": json.dumps(_IDENTITY_TAG_TRUST)} if resource == "role" else {}
+    original = [{"Key": "Department", "Value": "Finance"}]
+    if operation == "tag":
+        getattr(iam, f"create_{resource}")(**params, **create_params, Tags=original)
+    try:
+        with pytest.raises(ClientError) as exc:
+            getattr(iam, f"{operation}_{resource}")(**params,
+                **(create_params if operation == "create" else {}), Tags=[
+                    {"Key": "Unrelated", "Value": "MustNotBeAdded"},
+                    {"Key": "Department", "Value": "HR"}, {"Key": second_key, "Value": "HR"},
+                ])
+        assert exc.value.response["Error"]["Code"] == "InvalidInput"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        if operation == "tag":
+            assert getattr(iam, f"list_{resource}_tags")(**params)["Tags"] == original
+        else:
+            with pytest.raises(iam.exceptions.NoSuchEntityException):
+                getattr(iam, f"get_{resource}")(**params)
+    finally:
+        try:
+            getattr(iam, f"delete_{resource}")(**params)
+        except iam.exceptions.NoSuchEntityException:
+            pass
+
+
+@pytest.mark.parametrize("resource", ["policy", "instance_profile"])
+def test_iam_other_resource_tag_keys_remain_case_sensitive(iam, resource):
+    name = f"tag-case-{resource}-{_uuid_mod.uuid4().hex[:8]}"
+    tags = [{"Key": "Costcenter", "Value": "1234"}, {"Key": "costcenter", "Value": "5678"}]
+    if resource == "policy":
+        arn = iam.create_policy(PolicyName=name, PolicyDocument=json.dumps({
+            "Statement": [{"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "*"}],
+        }), Tags=[tags[0]])["Policy"]["Arn"]
+        params = {"PolicyArn": arn}
+    else:
+        iam.create_instance_profile(InstanceProfileName=name, Tags=[tags[0]])
+        params = {"InstanceProfileName": name}
+    try:
+        getattr(iam, f"tag_{resource}")(**params, Tags=[tags[1]])
+        assert _identity_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == _identity_tag_map(tags)
+        getattr(iam, f"untag_{resource}")(**params, TagKeys=["Costcenter"])
+        assert getattr(iam, f"list_{resource}_tags")(**params)["Tags"] == [tags[1]]
+    finally:
+        getattr(iam, f"delete_{resource}")(**params)
+
+
 def test_iam_attach_role_policy(iam):
     policy_arn = "arn:aws:iam::000000000000:policy/iam-test-policy"
     iam.attach_role_policy(RoleName="iam-test-role", PolicyArn=policy_arn)
