@@ -484,6 +484,13 @@ class TestResourceBoundAuthorization:
         assert isinstance(authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS), AuthorizedRdsConnection) is allowed
 
 
+    @pytest.mark.parametrize("user,allowed", [("alice", True), ("bob", False)])
+    def test_policy_conditions_see_the_caller(self, user, allowed):
+        iam._user_inline_policies.set_scoped(ACCOUNT, None, "alice", {
+            "grant": _authz_policy(Condition={"StringEquals": {"aws:username": user}}),
+        })
+        assert isinstance(authorize_rds_iam_token(_authz_token(), **AUTHZ_ARGS), AuthorizedRdsConnection) is allowed
+
     def test_cluster_dictionary_endpoint_uses_advertised_port(self):
         rds._clusters.set_scoped(ACCOUNT, REGION, "database", {
             "Engine": "aurora-mysql", "DbClusterResourceId": "cluster-TEST",

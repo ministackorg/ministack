@@ -1189,18 +1189,10 @@ def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
             own = [{"Key": key, "Value": value} for key, value in own.items()]
         own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
         present = {t["Key"] for t in own_list}
-        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
-            _validate_iam_identity_tag_keys(resource_type, own_list)
-            present = {_iam._identity_tag_key(k) for k in present}
-            extra = {k: v for k, v in extra.items() if _iam._identity_tag_key(k) not in present}
-        else:
-            extra = {k: v for k, v in extra.items() if k not in present}
         merged = own_list + [
             {"Key": key, "Value": value}
-            for key, value in extra.items()
+            for key, value in extra.items() if key not in present
         ]
-        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
-            _validate_iam_identity_tag_keys(resource_type, merged)
     out = dict(props)
     out[prop] = merged
     return out
@@ -2394,9 +2386,9 @@ def _lambda_url_delete(physical_id, props):
 # --- IAM Role ---
 
 def _validate_iam_identity_tag_keys(resource_type, tags):
-    """Validate only user/role key uniqueness, before merging or changing state."""
+    """IAM's refusal of user/role tag keys that repeat without case, before any state changes."""
     if _iam._identity_tags_have_duplicate_keys([{"Key": t.get("Key", "")} for t in tags]):
-        raise ValueError(f"{resource_type} Tags contain duplicate keys (case insensitive)")
+        raise ValueError(_iam.DUPLICATE_IDENTITY_TAG_KEYS)
 
 
 def _iam_role_create(logical_id, props, stack_name):
@@ -3582,9 +3574,19 @@ def _cwlogs_metric_filter_delete(physical_id, props):
 
 # --- EventBridge Rule ---
 
+
+def _eb_rule_bus_name(props):
+    # CloudFormation accepts a name or ARN, while the service stores names.
+    bus, error = _eb._event_bus_name_from_ref(props.get("EventBusName", "default"))
+    if error:
+        code, message = error
+        raise ValueError(f"AWS::Events::Rule EventBusName: {code}: {message}")
+    return bus
+
+
 def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(name, bus)
     # The service's own ARN shape: a default-bus rule has no bus segment.
     arn = _eb._rule_arn(name, bus)
@@ -3638,8 +3640,8 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
     name = new_props.get("Name") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
-    old_bus = old_props.get("EventBusName", "default")
-    new_bus = new_props.get("EventBusName", "default")
+    old_bus = _eb_rule_bus_name(old_props)
+    new_bus = _eb_rule_bus_name(new_props)
     old_key = _eb._rule_key(physical_id, old_bus)
     rule = _eb._rules.get(old_key)
     replaced = _rename_replacement(
@@ -3693,7 +3695,7 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
 
 
 def _eb_rule_delete(physical_id, props):
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(physical_id, bus)
     rule = _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
@@ -10220,8 +10222,9 @@ def _apigw_v2_stage_create(logical_id, props, stack_name):
         **_apigw_v2_stage_props(props),
     }
     _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
-    physical_id = f"{api_id}/{stage_name}"
-    return physical_id, {"StageName": stage_name}
+    # Ref uses the physical ID and AWS returns only the stage name. ApiId
+    # stays in the resolved properties for update and delete, as for v1 stages.
+    return stage_name, {"StageName": stage_name}
 
 
 def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -10235,13 +10238,15 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     through the service's own API. A property the template drops reverts to
     the create's default. ApiId and StageName require replacement: the new
     stage is created before the old one is removed."""
-    api_id, _, stage_name = physical_id.partition("/")
+    api_id = old_props.get("ApiId", "")
+    stage_name = old_props.get("StageName", "$default")
     stage = _apigw_v2._stages.get(api_id, {}).get(stage_name)
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         (new_props.get("ApiId", ""), new_props.get("StageName", "$default")),
         (api_id, stage_name) if stage else None,
         _apigw_v2_stage_create, _apigw_v2_stage_delete,
+        delete_when_id_unchanged=True,
     )
     if replaced is not None:
         return replaced
@@ -10249,15 +10254,16 @@ def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logica
     if resp[0] >= 400:
         raise ValueError(f"AWS::ApiGatewayV2::Stage update failed: {resp[2]!r}")
     _reconcile_tag_map(stage.setdefault("tags", {}), old_props, new_props)
+    # Keep legacy api/name physical IDs on in-place updates: changing the ID
+    # alone would make the engine delete the still-current stage as a predecessor.
     return physical_id, {"StageName": stage_name}
 
 
 def _apigw_v2_stage_delete(physical_id, props):
-    parts = physical_id.split("/", 1)
-    if len(parts) == 2:
-        api_id, stage_name = parts
-        stages = _apigw_v2._stages.get(api_id, {})
-        stages.pop(stage_name, None)
+    api_id = props.get("ApiId", "")
+    stage_name = props.get("StageName", "$default")
+    stages = _apigw_v2._stages.get(api_id, {})
+    stages.pop(stage_name, None)
 
 
 # ---------------------------------------------------------------------------

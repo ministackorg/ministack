@@ -599,6 +599,13 @@ def _restore_state(data):
             data.get("user_pools", {}),
             lambda pool_id, _pool: _region_from_pool_id(pool_id),
         )
+        # Older state stored 60 for an unset validity; 60 hours exceeds AWS's one-day cap.
+        for pool in _user_pools.all_values():
+            for client in (pool.get("_clients") or {}).values():
+                units = client.get("TokenValidityUnits") or {}
+                for kind in ("AccessToken", "IdToken"):
+                    if client.get(f"{kind}Validity") == 60 and not units.get(kind):
+                        client[f"{kind}Validity"] = None
 
         _restore_regional_store(
             _pool_domain_map,
@@ -1096,6 +1103,74 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
         "autoVerifyEmail": bool(response.get("autoVerifyEmail")),
         "autoVerifyPhone": bool(response.get("autoVerifyPhone")),
     }
+
+
+# Token claims Cognito owns; an IdP claim of the same name only becomes a user
+# attribute when AttributeMapping maps it explicitly.
+_FEDERATION_RESERVED_CLAIMS = frozenset(
+    ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"))
+
+
+def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
+    """Registered token claims from InboundFederation output count only when mapped."""
+    mapped = set(attr_mapping.values())
+    return {k: v for k, v in claims.items()
+            if k not in _FEDERATION_RESERVED_CLAIMS or k in mapped}
+
+
+class _InboundFederationRejected(Exception):
+    """Raised when an InboundFederation Lambda trigger fails the federated sign-in."""
+
+
+def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: str,
+                                       provider_name: str, provider_type: str,
+                                       attributes: dict) -> dict:
+    """The InboundFederation Lambda's userAttributesToMap, ``{}`` when unconfigured; a failure raises."""
+    pool = _user_pools.get(pool_id)
+    cfg = ((pool or {}).get("LambdaConfig") or {}).get("InboundFederation")
+    arn = cfg.get("LambdaArn") if isinstance(cfg, dict) else None
+    if not arn:
+        return {}
+
+    event = {
+        "version": "1",
+        "triggerSource": "InboundFederation_ExternalProvider",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+        "request": {
+            "providerName": provider_name,
+            "providerType": provider_type,
+            "attributes": attributes,
+        },
+        "response": {"userAttributesToMap": {}},
+    }
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"InboundFederation Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("InboundFederation Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _InboundFederationRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = result.get("body") or "InboundFederation Lambda rejected the request."
+        logger.info("InboundFederation Lambda rejected sign-in for pool %s user %s: %s",
+                    pool_id, username, reason)
+        raise _InboundFederationRejected(str(reason))
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    to_map = (_extract_trigger_response(payload) or {}).get("userAttributesToMap")
+    if not isinstance(to_map, dict):
+        return {}
+    return {str(k): str(v) for k, v in to_map.items()
+            if isinstance(v, (str, int, float, bool))}
 
 
 def _build_presignup_event(pool_id: str, client_id: str, username: str,
@@ -2041,6 +2116,20 @@ def _oidc_callback_url(pool: dict) -> str:
     return f"{base}/oauth2/idpresponse"
 
 
+def _saml_sso_url_from_metadata(metadata_xml: str) -> str:
+    """The IdP's HTTP-Redirect SingleSignOnService Location, the binding Cognito sends AuthnRequests on; "" if none."""
+    if not metadata_xml:
+        return ""
+    try:
+        root = safe_xml_parse(metadata_xml.strip())
+    except Exception:
+        return ""
+    for el in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}SingleSignOnService"):
+        if el.get("Binding") == "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" and el.get("Location"):
+            return el.get("Location")
+    return ""
+
+
 def _build_saml_authn_request(pool: dict, destination: str) -> str:
     """Build a minimal SAML AuthnRequest, deflate + base64-encode for HTTP-Redirect binding."""
     req = Element("{urn:oasis:names:tc:SAML:2.0:protocol}AuthnRequest")
@@ -2400,11 +2489,40 @@ def _validate_client_secret_hash(action: str, data: dict):
     )
 
 
+# AuthFlow -> (the ExplicitAuthFlows entries that enable it, the refusal without one)
+_PASSWORD_AUTH_FLOWS = {
+    "USER_PASSWORD_AUTH": ({"ALLOW_USER_PASSWORD_AUTH", "USER_PASSWORD_AUTH"},
+                           "USER_PASSWORD_AUTH flow not enabled for this client"),
+    "ADMIN_USER_PASSWORD_AUTH": ({"ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"},
+                                 "Auth flow not enabled for this client"),
+    "ADMIN_NO_SRP_AUTH": ({"ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"},
+                          "Auth flow not enabled for this client"),
+}
+
+
+def _auth_flow_error(action: str, data: dict):
+    """InvalidParameterException for a password flow the app client's ExplicitAuthFlows leaves out, or None."""
+    flow = data.get("AuthFlow")
+    if (not isinstance(flow, str) or not action.endswith("InitiateAuth")
+            or action.startswith("Admin") != flow.startswith("ADMIN_")):
+        return None
+    enabling = _PASSWORD_AUTH_FLOWS.get(flow)
+    if not enabling:
+        return None
+    cid = data.get("ClientId")
+    pool = _user_pools.get(data.get("UserPoolId")) if action.startswith("Admin") else _pool_for_client(cid)[0]
+    flows = set(((pool or {}).get("_clients", {}).get(cid) or {}).get("ExplicitAuthFlows") or [])
+    if flows and not flows & enabling[0]:
+        return error_response_json("InvalidParameterException", enabling[1], 400)
+    return None
+
+
 def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
     from ministack.app import AUTH
-    error = (_validate_client_secret_hash(action, data) or _access_token_error(data)) if AUTH else None
+    error = (_validate_client_secret_hash(action, data) or _auth_flow_error(action, data)
+             or _access_token_error(data) or _confirmation_code_error(action, data)) if AUTH else None
     if error:
         return error
     return handler(data)
@@ -4013,9 +4131,10 @@ def _admin_initiate_auth(data):
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
         client = pool["_clients"].get(cid, {})
-        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
             return error_response_json("InvalidParameterException",
-                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
 
         # Get username
         username = auth_params.get("USERNAME")
@@ -4321,9 +4440,10 @@ def _initiate_auth(data):
     if auth_flow == "CUSTOM_AUTH":
         # Validate ExplicitAuthFlows
         client = pool["_clients"].get(cid, {})
-        if "ALLOW_CUSTOM_AUTH" not in client.get("ExplicitAuthFlows", []):
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
             return error_response_json("InvalidParameterException",
-                    "CUSTOM_AUTH flow not allowed for this client.", 400)
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
 
         # Get username
         username = auth_params.get("USERNAME")
@@ -4639,6 +4759,33 @@ def _sign_up(data):
     return json_response(resp)
 
 
+def _code_error(issued, code):
+    """ExpiredCodeException when no code was issued, CodeMismatchException for another code, else None."""
+    if not issued:
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400)
+    if code != issued:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400)
+    return None
+
+
+def _confirmation_code_error(action: str, data: dict):
+    """The error for a ConfirmSignUp or ConfirmForgotPassword the issued code does not allow, or None."""
+    if action not in ("ConfirmSignUp", "ConfirmForgotPassword"):
+        return None
+    pool, _pid = _pool_for_client(data.get("ClientId"))
+    user = _resolve_user(pool, data.get("Username"))[0] if pool else None
+    if not user:
+        return None
+    if action == "ConfirmForgotPassword":
+        return _code_error(user.get("_reset_code"), data.get("ConfirmationCode"))
+    if user.get("UserStatus") != "UNCONFIRMED":
+        return error_response_json(
+            "NotAuthorizedException", f"User cannot be confirmed. Current status is {user.get('UserStatus')}", 400)
+    return _code_error(user.get("_confirmation_code"), data.get("ConfirmationCode"))
+
+
 def _confirm_sign_up(data):
     cid = data.get("ClientId")
     username = data.get("Username")
@@ -4656,7 +4803,8 @@ def _confirm_sign_up(data):
     if err:
         return err
 
-    # Accept any code in emulation
+    # Codes are checked under AUTH=true (_confirmation_code_error).
+    user.pop("_confirmation_code", None)
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
@@ -4713,10 +4861,11 @@ def _confirm_forgot_password(data):
             )
         return _err
 
-    # Accept any confirmation code in emulation (real AWS validates against issued code)
+    # Codes are checked under AUTH=true (_confirmation_code_error).
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
+    user.pop("_reset_code", None)
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
@@ -5909,11 +6058,16 @@ def _oauth2_authorize_federation(query_params):
     details = provider.get("ProviderDetails", {})
 
     if provider_type == "SAML":
-        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataURL
-        sso_url = details.get("IDPSSOEndpoint") or details.get("MetadataURL", "")
+        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataFile > MetadataURL.
+        # MetadataURL is used verbatim because MiniStack does not fetch remote metadata.
+        sso_url = (details.get("IDPSSOEndpoint")
+                   or _saml_sso_url_from_metadata(details.get("MetadataFile", ""))
+                   or details.get("MetadataURL", ""))
         if not sso_url:
-            return error_response_json("InvalidParameterException",
-                                       "SAML provider has no IDPSSOEndpoint or MetadataURL.", 400)
+            return error_response_json(
+                "InvalidParameterException",
+                "SAML provider has no IDPSSOEndpoint, MetadataFile with an HTTP-Redirect SingleSignOnService, or MetadataURL.",
+                400)
         saml_request = _build_saml_authn_request(pool, sso_url)
         redirect_url = sso_url + ("&" if "?" in sso_url else "?") + urlencode({
             "SAMLRequest": saml_request,
@@ -6061,8 +6215,18 @@ def _saml2_idp_response(body: bytes, query_params):
     # Apply attribute mapping: IdP claim name → Cognito attribute name
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
+    try:
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, f"{provider_name}_{name_id}", provider_name, "SAML",
+            {"samlResponse": saml_data["attributes"]})
+        idp_attrs = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                     else dict(saml_data.get("attributes", {})))
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected SAML sign-in for %s: %s",
+                    name_id, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
     user_attrs = {}
-    for idp_claim, value in saml_data.get("attributes", {}).items():
+    for idp_claim, value in idp_attrs.items():
         cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
         user_attrs[cognito_attr] = value
 
@@ -6285,14 +6449,20 @@ def _oauth2_idp_response(method, body, query_params):
     # as the SAML branch.
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}
+    try:
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, f"{provider_name}_{claims.get('sub') or claims.get('email') or ''}",
+            provider_name, "OIDC", {"idToken": claims})
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
+                    claims.get("sub"), e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    idp_claims = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                  else {k: str(v) for k, v in claims.items()
+                        if k not in _FEDERATION_RESERVED_CLAIMS and isinstance(v, (str, int, float, bool))})
     user_attrs = {}
-    for idp_claim, value in claims.items():
-        if idp_claim in ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"):
-            continue
-        if not isinstance(value, (str, int, float, bool)):
-            continue
-        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
-        user_attrs[cognito_attr] = str(value)
+    for idp_claim, value in idp_claims.items():
+        user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value
 
     # Stable identifier: prefer `sub` from id_token, fall back to `email` or
     # a generated UUID so users can be re-found on subsequent logins.
