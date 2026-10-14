@@ -1341,13 +1341,13 @@ _NOT_FOUND = (404, "ResourceNotFoundException", "CertificateNotFound", "Could no
 ])
 def test_signer_put_profile_refuses_unusable_signing_material_under_auth(monkeypatch, in_process, auth, platform,
                                                                          arn, refusal):
-    """Under AUTH=true PutSigningProfile refuses what AWS refuses; without AUTH every profile is created."""
+    """Under AUTH=true PutSigningProfile refuses what AWS refuses; without AUTH only the Lambda and Notation refusal stays."""
     from ministack import app as app_mod
 
     monkeypatch.setattr(app_mod, "AUTH", auth)
     put, _certificate = in_process
     status, error_type, code, message = put(platform, arn)
-    if auth:
+    if auth or refusal[2] == "InvalidProfileParameters":
         assert (status, error_type, code, message) == (*refusal[:3], refusal[3].format(arn=arn))
     else:
         assert (status, error_type, code, message) == (200, None, None, None)
