@@ -15,6 +15,7 @@ Evaluation order:
 import contextvars
 import datetime as _dt
 import hmac
+import importlib
 import ipaddress
 import json
 import logging
@@ -67,6 +68,7 @@ class EvalResult:
     principal_arn: str = ""
     matched_sid: str = ""
     reason: str = ""
+    resource_policy_arn: str = ""  # set when the resource's own policy denied
 
 
 @dataclass
@@ -681,8 +683,34 @@ def _service_principal_matches(principal: Any, service: str) -> bool:
                if isinstance(s, str))
 
 
+_ACCOUNT_PRINCIPAL = re.compile(r"\d{12}|arn:aws[a-z-]*:iam::\d{12}:root")
+
+
+def _names_caller(principal: Any, caller_arn: str) -> bool:
+    """Whether a statement Principal names the caller itself (its ARN, its role, or ``*``), not only its account."""
+    if isinstance(principal, dict):
+        principal = principal.get("AWS", [])
+    if isinstance(principal, str):
+        principal = [principal]
+    return any(isinstance(p, str) and not _ACCOUNT_PRINCIPAL.fullmatch(p)
+               and _principal_matches({"AWS": p}, caller_arn) for p in principal)
+
+
+def _names_caller_directly(principal: Any, caller_arn: str) -> bool:
+    """Whether a statement Principal names the caller's own IAM user or role-session ARN, which no limit narrows."""
+    if not re.fullmatch(r"arn:aws[a-z-]*:(iam::\d{12}:user/.+|sts::\d{12}:assumed-role/.+)", caller_arn):
+        return False
+    if isinstance(principal, dict):
+        principal = principal.get("AWS", [])
+    if isinstance(principal, str):
+        principal = [principal]
+    return caller_arn in principal
+
+
 def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
-                             service: str | None = None) -> EvalResult:
+                             service: str | None = None,
+                             named_only: bool = False,
+                             direct_only: bool = False) -> EvalResult:
     """Evaluate a resource-based policy for the principal in *ctx*.
 
     Such a document names the principals it applies to, so a statement counts
@@ -707,7 +735,13 @@ def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
         if not isinstance(stmt, dict):
             continue
         principal = stmt.get("Principal", {})
-        if isinstance(principal, dict):
+        if direct_only:
+            if _names_caller_directly(principal, ctx.principal_arn):
+                applicable.append(stmt)
+        elif named_only:
+            if _names_caller(principal, ctx.principal_arn):
+                applicable.append(stmt)
+        elif isinstance(principal, dict):
             if _principal_matches({"AWS": principal.get("AWS", [])},
                                   ctx.principal_arn):
                 applicable.append(stmt)
@@ -716,6 +750,62 @@ def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
         elif _principal_matches(principal, ctx.principal_arn):
             applicable.append(stmt)
     return evaluate(ctx, [parse_policy_document({"Statement": applicable})])
+
+
+def combine_resource_policy(identity: EvalResult, ctx: EvalContext,
+                            policy: str | dict | None, owner_account: str | None,
+                            required: bool = False,
+                            limits: tuple = ()) -> EvalResult:
+    """Combine an identity decision with the resource's own policy: a Deny in either wins."""
+    # In the owner's account an Allow in either suffices, but a resource statement naming
+    # only the account delegates to identity policies; across accounts both must allow.
+    # With *required* (a KMS key policy) the resource policy must allow in the owner's account too.
+    # *limits* (boundary, session policies) narrow a resource Allow unless it names the user or session itself.
+    if identity.decision == "Deny":
+        return identity
+    resource = evaluate_resource_policy(policy, ctx)
+    if resource.decision == "Deny":
+        resource.resource_policy_arn = ctx.resource_arn
+        return resource
+    same_account = owner_account in (None, ctx.principal_account)
+    if identity.decision == "Allow" and (
+            resource.decision == "Allow" or (same_account and not required)):
+        return identity
+    if same_account and resource.decision == "Allow":
+        named = evaluate_resource_policy(policy, ctx, named_only=True)
+        within_limits = all(_first_match(ctx, [stmt for stmts in layer for stmt in stmts], "Allow")
+                            for layer in limits)
+        if named.decision == "Allow" and (
+                within_limits
+                or evaluate_resource_policy(policy, ctx, direct_only=True).decision == "Allow"):
+            return named
+    return resource if identity.decision == "Allow" else identity
+
+
+# Services whose resources carry their own policy: the module and the function
+# returning ``(policy, owner account)`` for a resource ARN, or None.
+_RESOURCE_POLICY_LOOKUPS = {
+    "sqs": ("sqs", "queue_policy_for_arn"),
+    "sns": ("sns", "topic_policy_for_arn"),
+    "s3": ("s3", "bucket_policy_for_arn"),
+    "lambda": ("lambda_svc", "function_policy_for_arn"),
+    "secretsmanager": ("secretsmanager", "secret_policy_for_arn"),
+    "ecr": ("ecr", "repository_policy_for_arn"),
+    "kms": ("kms", "key_policy_for_arn"),
+    "apigateway": ("apigateway_v1", "rest_api_policy_for_arn"),
+}
+
+# A key policy must allow even the owner's own users and roles.
+_POLICY_REQUIRED = frozenset({"kms"})
+
+
+def _resource_policy(service: str, resource_arn: str) -> tuple | None:
+    """The request resource's own policy and owner account, when its service keeps one."""
+    lookup = _RESOURCE_POLICY_LOOKUPS.get(service)
+    if lookup is None or not resource_arn.startswith("arn:"):
+        return None
+    module = importlib.import_module(f"ministack.services.{lookup[0]}")
+    return getattr(module, lookup[1])(resource_arn)
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1427,10 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     )
 
     result = evaluate(ctx, principal.policies, *principal.limits)
+    found = _resource_policy(service, resource_arn)
+    if found is not None:
+        result = combine_resource_policy(result, ctx, *found, required=service in _POLICY_REQUIRED,
+                                         limits=principal.limits)
 
     if result.decision == "Allow":
         return None

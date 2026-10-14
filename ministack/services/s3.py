@@ -834,6 +834,17 @@ def _bucket_owner_account(name: str) -> str | None:
     return None
 
 
+def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The bucket policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    if not resource_arn.startswith("arn:aws:s3:::"):
+        return None
+    bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]
+    owner = get_account_id()
+    if not _buckets.contains_scoped(owner, None, bucket):
+        return None
+    return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
+
+
 def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
                            method: str, query_params: dict, caller: str) -> bool:
     """Whether a caller who does not own the bucket may have this request.

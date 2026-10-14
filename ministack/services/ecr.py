@@ -425,6 +425,14 @@ def _get_authorization_token(data):
     })
 
 
+def repository_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The repository policy and owner account, for the identity check."""
+    name = resource_arn.partition(":repository/")[2]
+    if name not in _repositories:
+        return None
+    return _repo_policies.get(name) or "", get_account_id()
+
+
 def _get_repository_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:

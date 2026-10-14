@@ -1186,6 +1186,28 @@ def test_cfn_iot_principal_attachments(cfn, iot_client):
         iot_client.describe_thing(thingName=thing2)
 
 
+def test_cfn_iot_policy_principal_attachment_unknown_certificate(cfn, iot_client):
+    """A PolicyPrincipalAttachment to an unknown certificate fails the stack and rolls the policy back."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, policy = f"cfn-ppa-{uid}", f"cfn-ppa-{uid}"
+    document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {
+            "Pol": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": policy, "PolicyDocument": document}},
+            "Ppa": {"Type": "AWS::IoT::PolicyPrincipalAttachment", "Properties": {
+                "PolicyName": {"Ref": "Pol"},
+                "Principal": {"Fn::Sub": "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:cert/" + "ab" * 32}}},
+        }}))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "The certificate given in the principal does not exist." in _cfn_iot_failure(
+            cfn, stack, "Ppa", "CREATE_FAILED")
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.get_policy(policyName=policy)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
 def test_cfn_iot_delete_keeps_what_is_attached_outside_the_stack(cfn, iot_client):
     """A certificate with a policy or a thing attached outside the stack is
     deactivated and then fails its delete, as is a thing with an outside
@@ -1608,6 +1630,59 @@ def test_cfn_iot_job_template_existing_id_fails_the_stack(cfn, iot_client):
     finally:
         _delete_cfn_test_stack(cfn, stack)
         iot_client.delete_job_template(jobTemplateId=template_id)
+
+
+def test_cfn_iot_job_template_document_source(cfn, iot_client, s3):
+    """A DocumentSource is read from S3 at create; a missing object fails the stack."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket, stack, failing = f"cfn-jt-doc-{uid}", f"cfn-iot-jobtmpl-src-{uid}", f"cfn-jt-miss-{uid}"
+    template_id = f"cfn-jt-src-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="doc.json", Body='{"operation": "from s3"}')
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(
+            template_id, Document=None, DocumentSource=f"s3://{bucket}/doc.json"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        desc = iot_client.describe_job_template(jobTemplateId=template_id)
+        assert desc["document"] == '{"operation": "from s3"}'
+        assert desc["documentSource"] == f"s3://{bucket}/doc.json"
+
+        cfn.create_stack(StackName=failing, TemplateBody=_cfn_job_template(
+            f"{template_id}-2", Document=None, DocumentSource=f"s3://{bucket}/missing.json"))
+        assert _wait_stack(cfn, failing)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=failing)["StackEvents"]
+                   if e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any(f"Job document located at s3://{bucket}/missing.json is not found."
+                   in reason for reason in reasons), reasons
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        _delete_cfn_test_stack(cfn, failing)
+        s3.delete_object(Bucket=bucket, Key="doc.json")
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_iot_job_template_presigned_url_placeholder(cfn, iot_client):
+    """A Document placeholder needs PresignedUrlConfig.RoleArn; without one the stack fails."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack, failing, template_id = f"cfn-iot-jobtmpl-pre-{uid}", f"cfn-iot-jobtmpl-nor-{uid}", f"cfn-jt-pre-{uid}"
+    document = json.dumps({"fw": "${aws:iot:s3-presigned-url:https://s3.amazonaws.com/b/fw.bin}"})
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=_cfn_job_template(template_id, Document=document))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        assert iot_client.describe_job_template(jobTemplateId=template_id)["document"] == document
+
+        cfn.create_stack(StackName=failing, TemplateBody=_cfn_job_template(
+            f"{template_id}-2", Document=document, PresignedUrlConfig=None))
+        assert _wait_stack(cfn, failing)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in
+                   cfn.describe_stack_events(StackName=failing)["StackEvents"]
+                   if e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any(f"Role must be provided for pre-sign S3 urls in job document of job {template_id}-2."
+                   in reason for reason in reasons), reasons
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        _delete_cfn_test_stack(cfn, failing)
 
 
 def test_cfn_iot_ca_certificate_lifecycle(cfn, iot_client):

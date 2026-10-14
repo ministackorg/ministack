@@ -76,6 +76,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -2845,6 +2846,8 @@ def _handle_policy(method: str, path: str, body: bytes, qp: dict) -> tuple:
             return _get_policy_version(name, version_id)
         if method == "DELETE":
             return _delete_policy_version(name, version_id)
+        if method == "PATCH":
+            return _set_default_policy_version(name, version_id)
 
     # /policies/{name}/version
     if len(parts) == 2 and parts[1] == "version":
@@ -3023,7 +3026,7 @@ def _list_policy_versions(name: str) -> tuple:
                 "isDefaultVersion": v["isDefaultVersion"],
                 "createDate": v.get("createDate"),
             }
-            for vid, v in p["versions"].items()
+            for vid, v in sorted(p["versions"].items(), key=lambda item: int(item[0]), reverse=True)
         ]
     })
 
@@ -3036,13 +3039,38 @@ def _delete_policy_version(name: str, version_id: str) -> tuple:
         return _error_not_found("PolicyVersion", version_id)
     if p["defaultVersionId"] == version_id:
         return error_response_json(
-            "InvalidRequestException",
-            "Cannot delete the default policy version",
-            400,
+            "DeleteConflictException",
+            f"Cannot delete a default policy version (name={name}, versionId={version_id})",
+            409,
         )
     del p["versions"][version_id]
     _policies[name] = p
     return json_response({})
+
+
+def _set_default_policy_version(name: str, version_id: str) -> tuple:
+    """SetDefaultPolicyVersion: 200 with an empty body, also for the current default."""
+    if not version_id.isdigit():
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'policyVersionId' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: [0-9]+",
+            400,
+        )
+    p = _policies.get(name)
+    if p is None:
+        return _error_not_found("Policy", name)
+    if version_id not in p["versions"]:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Policy version does not exist (name={name}, versionId={version_id})",
+            404,
+        )
+    for vid, v in p["versions"].items():
+        v["isDefaultVersion"] = vid == version_id
+    p["defaultVersionId"] = version_id
+    _policies[name] = p
+    return 200, {}, b""
 
 
 # AttachPolicy / DetachPolicy via /target-policies/{policyName}
@@ -3069,12 +3097,13 @@ def _handle_target_policy(method: str, path: str, body: bytes, qp: dict) -> tupl
     )
 
 
-def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tuple:
+def _change_policy_target(name: str, target: str | None, *, attach: bool, principal: bool = False) -> tuple:
     """``AttachPolicy`` / ``DetachPolicy`` over the policy and certificate stores.
 
     The data core behind both the modern ``/target-policies/{policyName}``
     route and the deprecated ``/principal-policies/{policyName}`` one, so
-    neither has to synthesize a request for the other.
+    neither has to synthesize a request for the other. ``principal`` selects
+    the deprecated call's refusals.
     """
     p = _policies.get(name)
     if p is None:
@@ -3083,6 +3112,10 @@ def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tup
         return error_response_json(
             "InvalidRequestException", "target is required", 400
         )
+    if attach:
+        err = _policy_target_error(target, principal=principal)
+        if err:
+            return err
     cert_id = target.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if attach:
@@ -3100,6 +3133,51 @@ def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tup
             cert["attachedPolicies"].remove(name)
             _certificates[cert_id] = cert
     return json_response({})
+
+
+# A Cognito identity id, the one target that is not an ARN.
+_COGNITO_IDENTITY_ID_RE = re.compile(r"[\w-]+:[0-9a-f-]+")
+
+
+def _policy_target_error(target: str, *, principal: bool) -> tuple | None:
+    """AttachPolicy's refusal of ``target`` (AttachPrincipalPolicy's with ``principal``), or ``None``."""
+    if _COGNITO_IDENTITY_ID_RE.fullmatch(target):
+        return None
+    try:
+        spec = parse_arn(target)
+    except ArnParseError:
+        spec = None
+    if spec is None:
+        if principal and target.startswith("arn:"):
+            return error_response_json("InvalidRequestException", "ARN not in proper syntax.", 400)
+        message = "Invalid principal type" if principal else "Invalid Target"
+        return error_response_json("InvalidRequestException", message, 400)
+    kind, _, resource_id = spec.resource.partition("/")
+    if spec.service != "iot" or kind not in (("cert",) if principal else ("cert", "thinggroup")):
+        message = "The given ARN does not represent a cert" if principal else f"Invalid Target: {target}"
+        return error_response_json("InvalidRequestException", message, 400)
+    if spec.account_id != get_account_id():
+        return error_response_json(
+            "AccessDeniedException",
+            "Cross account not allowed. Please check the account of the resource specified.",
+            403,
+        )
+    if spec.region != get_region() and not principal:
+        return error_response_json("InvalidRequestException", "Invalid Target", 400)
+    if kind == "thinggroup":
+        if resource_id in _thing_groups:
+            return None
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Cannot find requested thing group for accountId: {get_account_id()} and thing group name: "
+            f"{resource_id}",
+            404,
+        )
+    if resource_id in _certificates:
+        return None
+    return error_response_json(
+        "ResourceNotFoundException", "The certificate given in the principal does not exist.", 404
+    )
 
 
 def _policy_targets(name: str) -> list | None:
@@ -3160,7 +3238,7 @@ def _handle_principal_policy(method: str, path: str, headers: dict, qp: dict) ->
         return error_response_json(
             "InvalidRequestException", "x-amzn-iot-principal header is required", 400
         )
-    return _change_policy_target(name, principal, attach=method == "PUT")
+    return _change_policy_target(name, principal, attach=method == "PUT", principal=True)
 
 
 def _list_principal_policies(headers: dict, qp: dict) -> tuple:
@@ -4869,6 +4947,9 @@ def delete_topic_rule(name: str) -> None:
 
 def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tuple:
     name = path[len("/rules/"):]
+    if method == "POST" and name.endswith(("/enable", "/disable")):
+        name, _, verb = name.rpartition("/")
+        return _set_topic_rule_disabled(name, verb == "disable")
     if method == "POST":
         return _create_topic_rule(name, _parse_body(body), headers.get("x-amz-tagging"))
     if method == "GET":
@@ -4934,6 +5015,24 @@ def _get_topic_rule(name: str) -> tuple:
     if rule is None:
         return _error_not_found("Rule", name)
     return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
+
+
+def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
+    """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
+    if not _RULE_NAME_RE.match(name):
+        return error_response_json(
+            "InvalidRequestException",
+            f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
+            400,
+        )
+    rule = _topic_rules.get(name)
+    if rule is None:
+        return error_response_json(
+            "UnauthorizedException", f"Access to topic rule '{name}' was denied", 401
+        )
+    rule["ruleDisabled"] = disabled
+    return 200, {}, b""
 
 
 def _delete_topic_rule(name: str) -> tuple:
@@ -5619,6 +5718,103 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
     )
 
 
+# An S3 host: path style without a bucket label, virtual-hosted with one.
+_JOB_DOCUMENT_S3_HOST_RE = re.compile(r"(?:(?P<bucket>.+)\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com")
+_JOB_DOCUMENT_MAX_BYTES = 32768
+
+
+def _job_document_s3_location(source: str) -> tuple[str, str]:
+    """The bucket and key an s3:// or S3 object URL names, empty where it names none."""
+    from urllib.parse import unquote, urlsplit
+
+    bucket = key = ""
+    if isinstance(source, str) and source.startswith("s3://"):
+        bucket, _, key = source[len("s3://"):].partition("/")
+    elif isinstance(source, str) and source.startswith(("https://", "http://")):
+        with contextlib.suppress(ValueError):
+            parts = urlsplit(source)
+            match = _JOB_DOCUMENT_S3_HOST_RE.fullmatch(parts.hostname or "")
+            if match and match.group("bucket"):
+                bucket, key = match.group("bucket"), unquote(parts.path[1:])
+            elif match:
+                bucket, _, key = parts.path[1:].partition("/")
+                key = unquote(key)
+    return bucket, key
+
+
+def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
+    """The job document a documentSource names in this account's S3, or an error."""
+    from ministack.services import s3 as _s3
+
+    bucket, key = _job_document_s3_location(source)
+    if not bucket:
+        return None, error_response_json(
+            "InvalidRequestException", f"Job document source {source} is invalid.", 400
+        )
+    if not key:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Provided S3 url is not valid: {source}. Error: Key cannot be null", 400,
+        )
+    bucket_record = _s3._ensure_bucket(bucket)
+    if bucket_record is None:
+        return None, error_response_json(
+            "InvalidRequestException", f"Bucket specified by url: {source} is not found.", 400
+        )
+    obj = bucket_record["objects"].get(key)
+    if obj is None:
+        return None, error_response_json(
+            "InvalidRequestException", f"Job document located at {source} is not found.", 400
+        )
+    if obj["size"] > _JOB_DOCUMENT_MAX_BYTES:
+        return None, error_response_json(
+            "LimitExceededException",
+            f"Job document from {source} exceeds size limit {_JOB_DOCUMENT_MAX_BYTES} bytes.",
+            410,
+        )
+    try:
+        document = _s3._get_object_data(bucket, key).decode("utf-8")
+        json.loads(document)
+    except ValueError:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Job document located at {source} is an invalid JSON document.",
+            400,
+        )
+    return document, None
+
+
+# ${aws:iot:s3-presigned-url:<url>}; the -v2 form takes the URL encoded.
+_JOB_PRESIGN_RE = re.compile(r"\$\{aws:iot:s3-presigned-url(?P<v2>-v2)?:(?P<url>[^}]*)\}")
+
+
+def _job_presign_error(document: str | None, config: dict | None, job_id: str) -> tuple | None:
+    """AWS's refusal of presigned-URL placeholders without a role or an S3 object URL."""
+    placeholders = list(_JOB_PRESIGN_RE.finditer(document or ""))
+    if not placeholders:
+        return None
+    if not (isinstance(config, dict) and config.get("roleArn")):
+        message = (
+            "presignedUrlConfig role ARN is required to generate an S3 presigned url in job document."
+            if all(m.group("v2") for m in placeholders)
+            else f"Role must be provided for pre-sign S3 urls in job document of job {job_id}."
+        )
+        return error_response_json("InvalidRequestException", message, 400)
+    for m in placeholders:
+        url = m.group("url")
+        bucket, key = _job_document_s3_location(url)
+        if not bucket or (m.group("v2") and re.search(r'[\s"<>\\^`{|}]', url)):
+            return error_response_json(
+                "InvalidRequestException", f"Given S3 url {url} is invalid.", 400
+            )
+        if not key:
+            return error_response_json(
+                "InvalidRequestException",
+                f"Provided S3 url is not valid: {url}. Error: Key cannot be null", 400,
+            )
+    return None
+
+
 async def _create_job(job_id: str, payload: dict) -> tuple:
     if not job_id or not _JOB_ID_RE.match(job_id):
         return error_response_json(
@@ -5629,6 +5825,12 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
     if job_id in _jobs:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
+        )
+    if payload.get("document") and payload.get("documentSource"):
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document and job document source cannot be specified at the same time.",
+            400,
         )
     if payload.get("jobTemplateArn") is not None:
         payload, err = _job_payload_from_template(payload)
@@ -5710,13 +5912,13 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             400,
         )
     if not document and payload.get("documentSource"):
-        # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
-        # serves its CONTENT to devices. MiniStack does not fetch it — it
-        # stands in a placeholder naming the source, so a `documentSource` job
-        # still creates, describes, and runs its whole execution lifecycle.
-        # A device that parses the document therefore sees the URL, not the
-        # payload; pass `document` when the content matters.
-        document = json.dumps({"documentSource": payload["documentSource"]})
+        # The object is read once, here: a later overwrite changes no job.
+        document, err = _job_document_from_source(payload["documentSource"])
+        if err:
+            return err
+    err = _job_presign_error(document, payload.get("presignedUrlConfig"), job_id)
+    if err:
+        return err
     # Captured BEFORE the job record exists: jobs_first_pending_job_id
     # materializes, and once the new job is in the store it would already
     # count as the front of the queue.
@@ -6261,14 +6463,18 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         record["document"] = document
         record["documentSource"] = source
     if source and not document:
-        # Same stand-in as CreateJob's: the S3 object is not fetched.
-        record["document"] = json.dumps({"documentSource": source})
+        record["document"], err = _job_document_from_source(source)
+        if err:
+            return err
     for member in _JOB_TEMPLATE_CONFIG_MEMBERS + (
         "maintenanceWindows", "destinationPackageVersions",
     ):
         if payload.get(member) is not None:
             record[member] = copy.deepcopy(payload[member])
     _job_config_floats(record)
+    err = _job_presign_error(record.get("document"), record.get("presignedUrlConfig"), template_id)
+    if err:
+        return err
     _job_templates[template_id] = record
     _set_created_tags(record["jobTemplateArn"], payload.get("tags"))
     return json_response({
@@ -6809,10 +7015,147 @@ def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
     return dict(_jobs_apply_timeout(execution))
 
 
+# Control characters as AWS escapes them in the document it sends a device; a lone
+# surrogate stays escaped too, since UTF-8 cannot carry it.
+_JOBS_DEVICE_ESCAPES = {
+    **{code: f"\\u{code:04X}" for code in (*range(0x20), *range(0xD800, 0xE000))},
+    0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\",
+}
+
+
+def _jobs_device_float(value: float) -> str:
+    """A float spelled as Java's Double.toString, with a non-finite value as a string."""
+    if not math.isfinite(value):
+        return f'"{json.dumps(value)}"'
+    if value == 0 or 1e-3 <= abs(value) < 1e7:
+        return repr(value)
+    from decimal import Decimal
+
+    sign, digits, exponent = Decimal(repr(value)).normalize().as_tuple()
+    text = "".join(map(str, digits))
+    return f"{'-' * sign}{text[0]}.{text[1:] or '0'}E{len(text) - 1 + exponent}"
+
+
+def _jobs_device_json(value) -> str:
+    """Compact JSON of a job document as AWS sends it to a device: object members that are null are left out."""
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{_jobs_device_json(key)}:{_jobs_device_json(member)}"
+            for key, member in value.items() if member is not None
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(map(_jobs_device_json, value)) + "]"
+    if isinstance(value, str):
+        return '"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"'
+    if isinstance(value, float):
+        return _jobs_device_float(value)
+    return json.dumps(value)
+
+
+# The host a device reached MiniStack on: its presigned URLs name it.
+jobs_device_host: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_iot_jobs_device_host", default=""
+)
+_JOB_PRESIGN_HOST_RE = re.compile(r"[A-Za-z0-9.\-\[\]:_]+")
+# The labels of an IoT endpoint host up to its region; S3 is not routed under them.
+_JOB_PRESIGN_IOT_LABELS_RE = re.compile(r"(?:[^.:]+\.)*?iot\.[a-z0-9-]+\.(?=[^:])")
+# A role session signs an hour of URLs, each valid for its full expiresInSec.
+_JOB_PRESIGN_SESSION_REUSE_SECONDS = 3600
+# (account, role ARN) -> the access key of that role's current session.
+_jobs_presign_sessions: dict[tuple[str, str], str] = {}
+
+
+def _jobs_presign_session(role_arn: str, expires: int) -> tuple[str, dict]:
+    """A session of the presign role, registered with STS, that outlives a URL signed now."""
+    from ministack.services import iam as _iam
+    from ministack.services import sts as _sts
+
+    cache_key = (get_account_id(), role_arn)
+    access_key = _jobs_presign_sessions.get(cache_key, "")
+    session = _sts._sessions.get(access_key)
+    if session is None or session["Expiration"] < time.time() + expires:
+        partition = role_arn.split(":")[1] if _JOB_ROLE_ARN_RE.match(role_arn) else "aws"
+        account = get_account_id()  # the job's account, whatever account the role ARN names
+        name = uuid.uuid4().hex
+        access_key = _iam._gen_session_access_key()
+        session = {
+            "Arn": f"arn:{partition}:sts::{account}:assumed-role/{role_arn.rsplit('/', 1)[-1]}/{name}",
+            "UserId": f"AROA{uuid.uuid4().hex[:17].upper()}:{name}",
+            "SecretAccessKey": _iam._gen_secret(),
+            "SessionToken": _iam._gen_session_token(),
+            "Expiration": time.time() + expires + _JOB_PRESIGN_SESSION_REUSE_SECONDS,
+            "AccountId": account,
+            "PrincipalType": "AssumedRole",
+        }
+        _sts.register_session(access_key, session)
+        _jobs_presign_sessions[cache_key] = access_key
+    return access_key, session
+
+
+def _jobs_presigned_document(job: dict) -> str:
+    """The job document with each placeholder replaced by a presigned GET URL of MiniStack's S3."""
+    document = job.get("document") or "{}"
+    config = job.get("presignedUrlConfig")
+    if "${aws:iot:s3-presigned-url" not in document or not (
+        isinstance(config, dict) and config.get("roleArn")
+    ):
+        return document
+    from ministack.core.sigv4 import (
+        build_canonical_query_string,
+        build_canonical_request,
+        build_string_to_sign,
+        calculate_signature,
+        uri_encode,
+    )
+    from ministack.core.tls import use_ssl_enabled
+
+    expires = config.get("expiresInSec")
+    expires = int(expires) if isinstance(expires, (int, float)) and expires > 0 else 3600
+    access_key, session = _jobs_presign_session(config["roleArn"], expires)
+    host = jobs_device_host.get()
+    if not _JOB_PRESIGN_HOST_RE.fullmatch(host):
+        host = f"{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    elif labels := _JOB_PRESIGN_IOT_LABELS_RE.match(host):
+        host = host[labels.end():]
+    base = f"{'https' if use_ssl_enabled() else 'http'}://{host}"
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    region = get_region()
+    query = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key}/{amz_date[:8]}/{region}/s3/aws4_request",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": str(expires),
+        "X-Amz-Security-Token": session["SessionToken"],
+        "X-Amz-SignedHeaders": "host",
+    }
+    canonical_query = build_canonical_query_string(query)
+
+    def presign(match: re.Match) -> str:
+        bucket, key = _job_document_s3_location(match.group("url"))
+        if not (bucket and key):
+            return match.group(0)
+        path = f"/{bucket}/{key}"
+        string_to_sign = build_string_to_sign(
+            amz_date, amz_date[:8], region, "s3",
+            build_canonical_request("GET", path, {"host": host}, query, "host"),
+        )
+        signature = calculate_signature(
+            session["SecretAccessKey"], amz_date[:8], region, "s3", string_to_sign
+        )
+        return (f"{base}{uri_encode(path, encode_slash=False)}?{canonical_query}"
+                f"&X-Amz-Signature={signature}")
+
+    return _JOB_PRESIGN_RE.sub(presign, document)
+
+
 def jobs_job_document(job_id: str) -> str:
-    """The document a device should run for a job — ``{}`` if there is none."""
+    """The document a device should run for a job, re-serialized as AWS sends it — ``{}`` if there is none."""
     job = _jobs.get(job_id)
-    return (job or {}).get("document") or "{}"
+    document = _jobs_presigned_document(job) if job else "{}"
+    try:
+        return _jobs_device_json(json.loads(document))
+    except (ValueError, RecursionError):
+        return document
 
 
 def _jobs_job_document_object(job_id: str):
@@ -9966,6 +10309,8 @@ async def handle_websocket(
             chosen = proto
             break
 
+    jobs_device_host.set(sub_headers.get("host", ""))
+
     accept: dict = {"type": "websocket.accept"}
     if chosen:
         accept["subprotocol"] = chosen
@@ -10742,6 +11087,10 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
 
     account_token = _request_account_id.set(account_id)
     region_token = _request_region.set(region)
+    # The name the device dialled (its SNI), or the address, on the gateway port.
+    local = str((writer.get_extra_info("sockname") or ("",))[0])
+    dialled = _mtls_server_names.get(ssl_object) if ssl_object is not None else None
+    jobs_device_host.set(f"{dialled or (f'[{local}]' if ':' in local else local)}:{_GATEWAY_PORT}")
     certificate_id = hashlib.sha256(der).hexdigest() if der else None
     session = _WSSession(_tcp_send, account_id, region, certificate_id)
     session.certificate_id = certificate_id

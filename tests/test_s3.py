@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
-from conftest import make_client, patch_endpoint_dns, sqs_policy_allow_s3
+from conftest import iam_user, make_client, patch_endpoint_dns, routed_request, sqs_policy_allow_s3
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -1165,6 +1165,50 @@ def test_s3_bucket_policy(s3):
     stored = json.loads(resp["Policy"])
     assert stored["Version"] == "2012-10-17"
     assert len(stored["Statement"]) == 1
+
+
+def _policy_bucket(effect, principal):
+    """A bucket with one object and a bucket policy statement on s3:GetObject."""
+    bucket = f"rp-{uuid.uuid4().hex[:10]}"
+    assert _lock_call("PUT", f"/{bucket}")[0] == 200
+    assert _lock_call("PUT", f"/{bucket}/k", body=b"x")[0] == 200
+    policy = {"Version": "2012-10-17", "Statement": [{
+        "Effect": effect, "Principal": {"AWS": principal}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*"}]}
+    assert _lock_call("PUT", f"/{bucket}", body=json.dumps(policy).encode(), query={"policy": [""]})[0] == 204
+    return bucket
+
+
+_ALLOW_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+
+
+def test_bucket_policy_naming_the_user_allows_without_identity_policy(auth):
+    key, user = iam_user()
+    bucket = _policy_bucket("Allow", user)
+    assert routed_request(key, "s3", "GET", f"/{bucket}/k")[0] == 200
+
+
+def test_bucket_policy_naming_the_account_needs_an_identity_policy(auth):
+    bucket = _policy_bucket("Allow", "arn:aws:iam::000000000000:root")
+    key, _user = iam_user()
+    status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/k")
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    key, _user = iam_user(_ALLOW_S3)
+    assert routed_request(key, "s3", "GET", f"/{bucket}/k")[0] == 200
+
+
+def test_bucket_policy_deny_beats_an_identity_allow(auth):
+    import xml.etree.ElementTree as ET
+
+    key, user = iam_user(_ALLOW_S3)
+    bucket = _policy_bucket("Deny", user)
+    status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/k")
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    assert ET.fromstring(body).findtext("Message") == (
+        f'User: {user} is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::{bucket}/k" '
+        "with an explicit deny in a resource-based policy")
+    assert routed_request(key, "s3", "PUT", f"/{bucket}/k2", b"y")[0] == 200
+
 
 def test_s3_object_tagging(s3):
     bkt = "intg-s3-objtags"

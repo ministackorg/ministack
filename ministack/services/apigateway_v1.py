@@ -907,6 +907,51 @@ def find_api_scope(api_id):
     return None
 
 
+def rest_api_policy_for_arn(resource_arn):
+    """The REST API's resource policy, ``execute-api:/`` expanded, and owner account, for the identity check."""
+    parts = resource_arn.split(":", 5)
+    if len(parts) < 6 or parts[2] != "execute-api":
+        return None
+    region, account_id, api_id = parts[3], parts[4], parts[5].split("/", 1)[0]
+    home = region
+    api = _rest_apis.get_scoped(account_id, region, api_id)
+    if api is None:
+        # Signed for another region than the API's: its policy still applies, read as the request's ARN.
+        scope = find_api_scope(api_id)
+        if scope is None:
+            return None
+        home = scope[1]
+        api = _rest_apis.get_scoped(account_id, home, api_id) or {}
+    policy = api.get("policy") or ""
+    if not isinstance(policy, str):
+        policy = json.dumps(policy)
+    prefix = f"arn:aws:execute-api:{region}:{account_id}:{api_id}/"
+    policy = policy.replace('"execute-api:/', f'"{prefix}')
+    if home != region:
+        policy = policy.replace(f"arn:aws:execute-api:{home}:{account_id}:{api_id}/", prefix)
+    return policy, account_id
+
+
+def _anonymous_policy_error(api_id, stage_name, method, path, headers, account_id, region):
+    """ACCESS_DENIED for a call without SigV4 that the REST API's resource policy does not allow."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    if not AUTH or _header_ci(headers, "authorization").startswith("AWS4-"):
+        return None
+    arn = execute_api_arn(region, account_id, api_id, stage_name, method, path)
+    policy = (rest_api_policy_for_arn(arn) or ("",))[0]
+    ctx = EvalContext("*", "Anonymous", "", "execute-api:Invoke", arn, region)
+    decision = evaluate_resource_policy(policy, ctx).decision if policy else "Allow"
+    if decision == "Allow":
+        return None
+    reason = ("with an explicit deny in a resource-based policy" if decision == "Deny"
+              else "because no resource-based policy allows the execute-api:Invoke action")
+    shown = arn.replace(f":{account_id}:", f":********{account_id[-4:]}:", 1)
+    return _gw_error("ACCESS_DENIED",
+                     f"User: anonymous is not authorized to perform: execute-api:Invoke on resource: {shown} {reason}")
+
+
 def find_domain_scope(domain_name):
     """Return (account_id, region, stored_name) owning a custom domain within
     the ambient account.
@@ -1892,7 +1937,8 @@ async def _authorize_request_v1(
     """
     auth_type = (method_obj.get("authorizationType") or "NONE").upper()
     if auth_type in ("", "NONE"):
-        return None, None
+        return _anonymous_policy_error(
+            api_id, stage_name, method, request_path, headers, owner_account_id, owner_region), None
     if auth_type == "AWS_IAM":
         # Signatures are verified only under AUTH; here match AWS only to the extent
         # that a request with no Authorization header is rejected as unauthenticated.
