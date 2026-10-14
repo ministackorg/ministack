@@ -3916,7 +3916,46 @@ def _export_integration(integration):
     return {key: value for key, value in result.items() if value is not None}
 
 
-def _export_operation(method_obj, export_type, include_integrations):
+def _export_security_scheme(authorizer, include_authorizers):
+    """Security scheme for a TOKEN or REQUEST authorizer.
+
+    More than one identity source, or one that is not a header or query
+    string, gives the name ``Unused``, as the AWS docs show."""
+    source = authorizer["identitySource"]
+    name = "Unused"
+    location = "header"
+    if "," not in source:
+        if source.startswith("method.request.header."):
+            name = source.removeprefix("method.request.header.")
+        elif source.startswith("method.request.querystring."):
+            name = source.removeprefix("method.request.querystring.")
+            location = "query"
+
+    scheme = {
+        "type": "apiKey",
+        "name": name,
+        "in": location,
+        "x-amazon-apigateway-authtype": authorizer.get("authType") or "custom",
+    }
+    if not include_authorizers:
+        return scheme
+
+    extension = {
+        "type": authorizer["type"].lower(),
+        "authorizerUri": authorizer["authorizerUri"],
+        "authorizerResultTtlInSeconds": authorizer["authorizerResultTtlInSeconds"],
+    }
+    if authorizer["type"] == "REQUEST":
+        extension["identitySource"] = source
+    if authorizer["type"] == "TOKEN" and authorizer.get("identityValidationExpression"):
+        extension["identityValidationExpression"] = authorizer["identityValidationExpression"]
+    if authorizer.get("authorizerCredentials"):
+        extension["authorizerCredentials"] = authorizer["authorizerCredentials"]
+    scheme["x-amazon-apigateway-authorizer"] = extension
+    return scheme
+
+
+def _export_operation(method_obj, export_type, include_integrations, authorizer):
     operation = {"responses": _export_method_responses(method_obj, export_type)}
     if method_obj.get("operationName"):
         operation["operationId"] = method_obj["operationName"]
@@ -3953,8 +3992,14 @@ def _export_operation(method_obj, export_type, include_integrations):
     if export_type == "swagger" and produced_types:
         operation["produces"] = sorted(produced_types)
 
+    # One requirement object: the client must send all these schemes
+    requirement = {}
+    if authorizer:
+        requirement[authorizer["name"]] = []
     if method_obj.get("apiKeyRequired"):
-        operation["security"] = [{"api_key": []}]
+        requirement["api_key"] = []
+    if requirement:
+        operation["security"] = [requirement]
 
     integration = method_obj.get("methodIntegration")
     if include_integrations and integration:
@@ -3980,7 +4025,7 @@ def _get_export_extensions(query_params):
     }
 
 
-def _build_api_export(api_id, stage_name, export_type, include_integrations):
+def _build_api_export(api_id, stage_name, export_type, include_integrations, include_authorizers):
     api = _rest_apis[api_id]
     version = api.get("version") or "1.0"
     info = {"title": api.get("name", "unnamed"), "version": version}
@@ -3990,6 +4035,7 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
     schemas = _export_model_schemas(api_id)
     paths = {}
     has_api_key_method = False
+    used_authorizers = {}
     for resource in _resources.get(api_id, {}).values():
         exported_methods = {}
         for http_method, method_obj in resource.get("resourceMethods", {}).items():
@@ -3998,21 +4044,32 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
                 if http_method.upper() == "ANY"
                 else http_method.lower()
             )
+            authorizer = None
+            if method_obj.get("authorizationType") == "CUSTOM":
+                authorizer = _authorizers_v1.get(api_id, {}).get(method_obj.get("authorizerId"))
+            if authorizer:
+                used_authorizers[authorizer["name"]] = authorizer
             exported_methods[method_key] = _export_operation(
-                method_obj, export_type, include_integrations
+                method_obj, export_type, include_integrations, authorizer
             )
             has_api_key_method = has_api_key_method or bool(method_obj.get("apiKeyRequired"))
         if exported_methods:
             paths[resource.get("path", "/")] = exported_methods
 
+    # AWS exports only the authorizers that methods use
+    security_schemes = {
+        name: _export_security_scheme(authorizer, include_authorizers)
+        for name, authorizer in used_authorizers.items()
+    }
+    if has_api_key_method:
+        security_schemes["api_key"] = {"type": "apiKey", "name": "x-api-key", "in": "header"}
+
     region = get_region()
     execute_url = f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage_name}"
     if export_type == "oas30":
         components = {"schemas": schemas}
-        if has_api_key_method:
-            components["securitySchemes"] = {
-                "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
-            }
+        if security_schemes:
+            components["securitySchemes"] = security_schemes
         return {
             "openapi": "3.0.1",
             "info": info,
@@ -4030,10 +4087,8 @@ def _build_api_export(api_id, stage_name, export_type, include_integrations):
         "paths": paths,
         "definitions": schemas,
     }
-    if has_api_key_method:
-        document["securityDefinitions"] = {
-            "api_key": {"type": "apiKey", "name": "x-api-key", "in": "header"}
-        }
+    if security_schemes:
+        document["securityDefinitions"] = security_schemes
     return document
 
 
@@ -4067,7 +4122,8 @@ def _get_export(api_id, stage_name, export_type, headers, query_params):
 
     export_extensions = _get_export_extensions(query_params)
     include_integrations = bool({"integrations", "apigateway"} & export_extensions)
-    document = _build_api_export(api_id, stage_name, export_type, include_integrations)
+    include_authorizers = bool({"authorizers", "apigateway"} & export_extensions)
+    document = _build_api_export(api_id, stage_name, export_type, include_integrations, include_authorizers)
     if extension == "json":
         body = json.dumps(document, ensure_ascii=False).encode("utf-8")
     else:

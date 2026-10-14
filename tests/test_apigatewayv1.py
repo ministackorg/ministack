@@ -794,6 +794,145 @@ def test_apigatewayv1_get_export_validates_stage_and_format(apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+_AUTHORIZER_URI = (
+    "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+    "arn:aws:lambda:us-east-1:000000000000:function:auth/invocations"
+)
+
+
+def _deploy(apigw_v1, api_id):
+    deployment_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="prod", deploymentId=deployment_id)
+
+
+def _export(apigw_v1, api_id, export_type="oas30", extensions=None):
+    response = apigw_v1.get_export(
+        restApiId=api_id,
+        stageName="prod",
+        exportType=export_type,
+        accepts="application/json",
+        parameters={"extensions": extensions} if extensions else {},
+    )
+    return json.loads(response["body"].read())
+
+
+def test_apigatewayv1_get_export_token_authorizer(apigw_v1):
+    """Methods that use a Lambda authorizer get a security scheme and an operation security field."""
+    api_id = apigw_v1.create_rest_api(name="v1-export-token-auth")["id"]
+    try:
+        root_id = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+        token_auth_id = apigw_v1.create_authorizer(
+            restApiId=api_id,
+            name="TokenAuth",
+            type="TOKEN",
+            authorizerUri=_AUTHORIZER_URI,
+            identitySource="method.request.header.Authorization",
+            authorizerResultTtlInSeconds=300,
+        )["id"]
+        apigw_v1.create_authorizer(
+            restApiId=api_id,
+            name="UnusedAuth",
+            type="TOKEN",
+            authorizerUri=_AUTHORIZER_URI,
+            identitySource="method.request.header.Authorization",
+        )
+        apigw_v1.put_method(
+            restApiId=api_id,
+            resourceId=root_id,
+            httpMethod="GET",
+            authorizationType="CUSTOM",
+            authorizerId=token_auth_id,
+        )
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=root_id, httpMethod="OPTIONS", authorizationType="NONE"
+        )
+        _deploy(apigw_v1, api_id)
+
+        document = _export(apigw_v1, api_id)
+        assert document["components"]["securitySchemes"] == {
+            "TokenAuth": {
+                "type": "apiKey",
+                "name": "Authorization",
+                "in": "header",
+                "x-amazon-apigateway-authtype": "custom",
+            }
+        }
+        assert document["paths"]["/"]["get"]["security"] == [{"TokenAuth": []}]
+        assert "security" not in document["paths"]["/"]["options"]
+
+        document = _export(apigw_v1, api_id, extensions="authorizers")
+        assert document["components"]["securitySchemes"]["TokenAuth"]["x-amazon-apigateway-authorizer"] == {
+            "type": "token",
+            "authorizerUri": _AUTHORIZER_URI,
+            "authorizerResultTtlInSeconds": 300,
+        }
+
+        document = _export(apigw_v1, api_id, export_type="swagger", extensions="apigateway")
+        assert "x-amazon-apigateway-authorizer" in document["securityDefinitions"]["TokenAuth"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigatewayv1_get_export_request_authorizer_with_two_sources(apigw_v1):
+    """A REQUEST authorizer with two identity sources uses the name Unused, as the AWS docs show."""
+    api_id = apigw_v1.create_rest_api(name="v1-export-request-auth")["id"]
+    try:
+        root_id = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+        identity_source = "method.request.header.Auth, method.request.querystring.token"
+        authorizer_id = apigw_v1.create_authorizer(
+            restApiId=api_id,
+            name="RequestAuth",
+            type="REQUEST",
+            authorizerUri=_AUTHORIZER_URI,
+            identitySource=identity_source,
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=api_id,
+            resourceId=root_id,
+            httpMethod="GET",
+            authorizationType="CUSTOM",
+            authorizerId=authorizer_id,
+        )
+        _deploy(apigw_v1, api_id)
+
+        scheme = _export(apigw_v1, api_id, extensions="authorizers")["components"]["securitySchemes"]["RequestAuth"]
+        assert scheme["name"] == "Unused"
+        assert scheme["in"] == "header"
+        assert scheme["x-amazon-apigateway-authorizer"]["type"] == "request"
+        assert scheme["x-amazon-apigateway-authorizer"]["identitySource"] == identity_source
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigatewayv1_get_export_skips_deleted_authorizer(apigw_v1):
+    """A method whose authorizer was deleted is exported without security."""
+    api_id = apigw_v1.create_rest_api(name="v1-export-deleted-auth")["id"]
+    try:
+        root_id = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+        authorizer_id = apigw_v1.create_authorizer(
+            restApiId=api_id,
+            name="TokenAuth",
+            type="TOKEN",
+            authorizerUri=_AUTHORIZER_URI,
+            identitySource="method.request.header.Authorization",
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=api_id,
+            resourceId=root_id,
+            httpMethod="GET",
+            authorizationType="CUSTOM",
+            authorizerId=authorizer_id,
+        )
+        apigw_v1.delete_authorizer(restApiId=api_id, authorizerId=authorizer_id)
+        _deploy(apigw_v1, api_id)
+
+        document = _export(apigw_v1, api_id)
+        assert "security" not in document["paths"]["/"]["get"]
+        assert "securitySchemes" not in document["components"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_update_stage(apigw_v1):
     """UpdateStage (PATCH) updates stage variables."""
     api_id = apigw_v1.create_rest_api(name="v1-stage-update")["id"]
