@@ -1346,3 +1346,33 @@ def test_s3tables_table_subresources_and_rename(s3tables):
     with pytest.raises(ClientError) as exc:
         s3tables.get_table(tableBucketARN=arn, namespace="a", name="t")
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_s3tables_create_table_keeps_iceberg_types(s3tables):
+    bucket = s3tables.create_table_bucket(name=f"types-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    s3tables.create_namespace(tableBucketARN=bucket, namespace=["ns"])
+    primitives = ["decimal(19, 2)", "timestamp", "timestamptz", "time", "uuid", "fixed[16]", "binary", "long"]
+    nested = {"type": "list", "element-id": 3, "element": "string", "element-required": False}
+    try:
+        s3tables.create_table(
+            tableBucketARN=bucket, namespace="ns", name="flat", format="ICEBERG",
+            metadata={"iceberg": {"schema": {"fields": [
+                {"name": f"c{i}", "type": t, "required": False} for i, t in enumerate(primitives)]}}},
+        )
+        s3tables.create_table(
+            tableBucketARN=bucket, namespace="ns", name="nested", format="ICEBERG",
+            metadata={"iceberg": {"schemaV2": {"type": "struct", "fields": [
+                {"id": 1, "name": "amount", "type": "decimal(9,2)", "required": True},
+                {"id": 2, "name": "tags", "type": nested, "required": False}]}}},
+        )
+        prefix = _arn_prefix(bucket)
+        flat = _iceberg_json(f"/iceberg/v1/{prefix}/namespaces/ns/tables/flat")["metadata"]
+        assert [f["type"] for f in flat["schemas"][0]["fields"]] == primitives
+        fields = _iceberg_json(f"/iceberg/v1/{prefix}/namespaces/ns/tables/nested")["metadata"]["schemas"][0]["fields"]
+        assert [f["type"] for f in fields] == ["decimal(9,2)", nested]
+    finally:
+        for name in ("flat", "nested"):
+            with contextlib.suppress(ClientError):
+                s3tables.delete_table(tableBucketARN=bucket, namespace="ns", name=name)
+        s3tables.delete_namespace(tableBucketARN=bucket, namespace="ns")
+        s3tables.delete_table_bucket(tableBucketARN=bucket)

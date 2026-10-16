@@ -186,19 +186,6 @@ def _set_bucket_region_value(store, bucket_arn, key, value):
     store.set_scoped(spec.account_id, spec.region, key, value)
 
 
-def _to_iceberg_type(kind):
-    return {
-        "string": "string",
-        "int": "int",
-        "long": "long",
-        "boolean": "boolean",
-        "date": "date",
-        "timestamp": "timestamptz",
-        "float": "float",
-        "double": "double",
-    }.get(kind, "string")
-
-
 def _initial_iceberg_metadata(table_name, schema_fields, location):
     table_uuid = new_uuid()
     fields = []
@@ -208,7 +195,7 @@ def _initial_iceberg_metadata(table_name, schema_fields, location):
                 "id": i + 1,
                 "name": f["name"],
                 "required": f.get("required", False),
-                "type": _to_iceberg_type(f.get("type", "string")),
+                "type": f.get("type", "string"),
             }
         )
     schema = {"type": "struct", "schema-id": 0, "fields": fields}
@@ -409,7 +396,7 @@ def _create_table(bucket_arn, namespace, data):
                 {
                     "id": f.get("id", i + 1),
                     "name": f["name"],
-                    "type": _to_iceberg_type(f.get("type", "string")) if isinstance(f.get("type"), str) else "string",
+                    "type": f.get("type", "string"),
                     "required": f.get("required", False),
                 }
             )
