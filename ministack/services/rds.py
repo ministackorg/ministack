@@ -5613,9 +5613,90 @@ def _stop_db_instance(p):
 
 
 def _reboot_db_instance(p):
-    return _set_db_instance_status(
-        p, "available", "RebootDBInstanceResponse", "RebootDBInstanceResult",
-    )
+    # Offloaded requests can arrive concurrently; claim rebooting atomically.
+    with _shared_container_lock:
+        return _begin_instance_reboot(p)
+
+
+def _begin_instance_reboot(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+    if instance.get("DBInstanceStatus") != "available":
+        return _error("InvalidDBInstanceState", "DB instance must be available to reboot.", 400)
+    # A local fault-injection setting, not an AWS request parameter. Keep the
+    # engine stopped during this interval so clients experience real downtime.
+    try:
+        downtime = float(os.environ.get("RDS_REBOOT_DOWNTIME_SECONDS", "0"))
+        if not 0 <= downtime <= 3600:
+            raise ValueError
+    except ValueError:
+        return _error("InvalidParameterValue", "RDS_REBOOT_DOWNTIME_SECONDS must be between 0 and 3600.", 400)
+    cluster_id = instance.get("_shared_cluster_id") or instance.get("DBClusterIdentifier")
+    cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
+    if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
+        return switch_error
+    instance["DBInstanceStatus"] = "rebooting"
+    # Serialize the response before starting the worker: a fast local reboot
+    # must not race the response back to available.
+    response = _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
+    context = contextvars.copy_context()
+    threading.Thread(
+        target=context.run, args=(_finish_instance_reboot, instance, cluster, downtime),
+        daemon=True,
+    ).start()
+    return response
+
+
+def _finish_instance_reboot(instance, cluster, downtime):
+    db_id = instance["DBInstanceIdentifier"]
+
+    def current():
+        return _instances.get(db_id) is instance and instance.get("DBInstanceStatus") == "rebooting"
+
+    try:
+        client = _get_docker()
+        container_id = instance.get("_docker_container_id")
+        if client and container_id:
+            container = client.containers.get(container_id)
+            container.stop(timeout=5)
+            if downtime:
+                time.sleep(downtime)
+            if not current():
+                return
+            container.start()
+
+            def alive():
+                if not current():
+                    return False
+                container.reload()
+                return container.status not in ("exited", "dead", "removing")
+
+            endpoint = instance.get("Endpoint", {})
+            host = instance.get("_internal_address") or "127.0.0.1"
+            port = instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port")
+            if not _wait_for_database_ready(
+                host, port, instance.get("Engine", "mysql"),
+                instance.get("MasterUsername", "root"),
+                instance.get("_MasterUserPassword", "password"),
+                instance.get("DBName"), alive,
+            ):
+                raise RuntimeError("database stopped before reboot readiness")
+        elif downtime:
+            time.sleep(downtime)
+        if current():
+            instance["DBInstanceStatus"] = "available"
+    except Exception:
+        logger.exception("RDS: reboot failed for %s", db_id)
+        if current():
+            instance["DBInstanceStatus"] = "failed"
+    finally:
+        if cluster:
+            _end_mysql_global_instance_mutation(cluster)
 
 
 # ---------------------------------------------------------------------------
