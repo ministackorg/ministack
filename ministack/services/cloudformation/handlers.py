@@ -371,7 +371,7 @@ def _create_stack(params):
     _stack_events[stack_id] = []
 
     _add_event(stack_id, stack_name, stack_name,
-               "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS",
+               "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS", "User Initiated",
                physical_id=stack_id)
 
     deploy = _deploy_stack_async(stack_name, stack_id, template,
@@ -1135,7 +1135,7 @@ def _update_stack(params):
         stack["_conditions"] = _evaluate_conditions(template, param_values)
 
         _add_event(stack_id, stack_name, stack_name,
-                   "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS",
+                   "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS", "User Initiated",
                    physical_id=stack_id)
 
         _create_stack_task_in_region(

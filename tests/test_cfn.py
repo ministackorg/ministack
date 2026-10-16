@@ -36413,8 +36413,8 @@ def test_cfn_update_validation_rolls_back_like_aws(cfn, s3):
         cfn.update_stack(StackName=stack_name, TemplateBody=template("Suspended", with_taken=True))
         assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
         events = _events_since_last_update(cfn, stack_name)
-        assert [(e["LogicalResourceId"], e["ResourceStatus"], e.get("ResourceStatusReason", ""))
-                for e in events[1:]] == [
+        assert [(e["LogicalResourceId"], e["ResourceStatus"], e.get("ResourceStatusReason", "")) for e in events] == [
+            (stack_name, "UPDATE_IN_PROGRESS", "User Initiated"),
             (stack_name, "UPDATE_FAILED", _VALIDATION_FAILED_ONE),
             (stack_name, "UPDATE_ROLLBACK_IN_PROGRESS",
              "Validation failure detected. See operation's FAILED event for details."),
