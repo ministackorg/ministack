@@ -24,29 +24,32 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import importlib.util
 import logging
 import warnings
 
 logger = logging.getLogger("x509_utils")
 
-try:
-    from cryptography import x509
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec, rsa
-    from cryptography.x509.oid import NameOID
-
-    HAS_CRYPTO = True
-except ImportError:  # pragma: no cover - exercised only when extras missing
-    HAS_CRYPTO = False
+# Imported on first use: `cryptography` is ~11 MiB that an idle server never needs.
+HAS_CRYPTO = importlib.util.find_spec("cryptography") is not None
+x509 = InvalidSignature = hashes = serialization = ec = rsa = NameOID = None
 
 
 def _require_crypto() -> None:
+    global x509, InvalidSignature, hashes, serialization, ec, rsa, NameOID
     if not HAS_CRYPTO:
         raise RuntimeError(
             "ministack.core.x509_utils requires the `cryptography` package. "
             "Install Ministack with `[full]` extras or add cryptography>=41.0."
         )
+    if x509 is None:
+        from cryptography import x509 as _x509
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa
+        from cryptography.x509.oid import NameOID
+
+        x509 = _x509
 
 
 def generate_ca(
