@@ -145,8 +145,15 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status=400):
-    return _xml(status, "ErrorResponse",
-                f'<Error><Type>Sender</Type><Code>{code}</Code><Message>{message}</Message></Error>')
+    # Query-protocol error envelope per real-AWS captures (17-region
+    # sweep): <Type> inside <Error> (Sender for 4xx, Receiver for 5xx),
+    # <RequestId> as a direct child, and no <?xml?> declaration.
+    fault_type = "Sender" if status < 500 else "Receiver"
+    body = (f'<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">'
+            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>'
+            f'<RequestId>{new_uuid()}</RequestId>'
+            f'</ErrorResponse>').encode("utf-8")
+    return status, {"Content-Type": "application/xml"}, body
 
 
 def _asg_arn(name):
