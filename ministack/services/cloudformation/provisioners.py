@@ -685,6 +685,9 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "Identifier",
         "requires_replacement": _requires_replacement_cognito_resource_server,
     },
+    # Domain is required, so a pool move under the same Domain fails on the
+    # name, as the replacement's CreateUserPoolDomain does.
+    "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -1189,18 +1192,10 @@ def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
             own = [{"Key": key, "Value": value} for key, value in own.items()]
         own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
         present = {t["Key"] for t in own_list}
-        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
-            _validate_iam_identity_tag_keys(resource_type, own_list)
-            present = {_iam._identity_tag_key(k) for k in present}
-            extra = {k: v for k, v in extra.items() if _iam._identity_tag_key(k) not in present}
-        else:
-            extra = {k: v for k, v in extra.items() if k not in present}
         merged = own_list + [
             {"Key": key, "Value": value}
-            for key, value in extra.items()
+            for key, value in extra.items() if key not in present
         ]
-        if resource_type in ("AWS::IAM::User", "AWS::IAM::Role"):
-            _validate_iam_identity_tag_keys(resource_type, merged)
     out = dict(props)
     out[prop] = merged
     return out
@@ -2394,9 +2389,9 @@ def _lambda_url_delete(physical_id, props):
 # --- IAM Role ---
 
 def _validate_iam_identity_tag_keys(resource_type, tags):
-    """Validate only user/role key uniqueness, before merging or changing state."""
+    """IAM's refusal of user/role tag keys that repeat without case, before any state changes."""
     if _iam._identity_tags_have_duplicate_keys([{"Key": t.get("Key", "")} for t in tags]):
-        raise ValueError(f"{resource_type} Tags contain duplicate keys (case insensitive)")
+        raise ValueError(_iam.DUPLICATE_IDENTITY_TAG_KEYS)
 
 
 def _iam_role_create(logical_id, props, stack_name):
@@ -3582,9 +3577,19 @@ def _cwlogs_metric_filter_delete(physical_id, props):
 
 # --- EventBridge Rule ---
 
+
+def _eb_rule_bus_name(props):
+    # CloudFormation accepts a name or ARN, while the service stores names.
+    bus, error = _eb._event_bus_name_from_ref(props.get("EventBusName", "default"))
+    if error:
+        code, message = error
+        raise ValueError(f"AWS::Events::Rule EventBusName: {code}: {message}")
+    return bus
+
+
 def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(name, bus)
     # The service's own ARN shape: a default-bus rule has no bus segment.
     arn = _eb._rule_arn(name, bus)
@@ -3638,8 +3643,8 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
     name = new_props.get("Name") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
-    old_bus = old_props.get("EventBusName", "default")
-    new_bus = new_props.get("EventBusName", "default")
+    old_bus = _eb_rule_bus_name(old_props)
+    new_bus = _eb_rule_bus_name(new_props)
     old_key = _eb._rule_key(physical_id, old_bus)
     rule = _eb._rules.get(old_key)
     replaced = _rename_replacement(
@@ -3693,7 +3698,7 @@ def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=No
 
 
 def _eb_rule_delete(physical_id, props):
-    bus = props.get("EventBusName", "default")
+    bus = _eb_rule_bus_name(props)
     key = _eb._rule_key(physical_id, bus)
     rule = _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
@@ -7142,25 +7147,50 @@ def _cognito_identity_pool_delete(physical_id, props):
 
 # --- Cognito UserPoolDomain ---
 
+def _cognito_user_pool_domain_request(props):
+    """The CreateUserPoolDomain / UpdateUserPoolDomain request a template declares."""
+    request = {"UserPoolId": props.get("UserPoolId", ""), "Domain": props.get("Domain", "")}
+    for key in ("CustomDomainConfig", "Routing"):
+        if key in props:
+            request[key] = props[key]
+    if "ManagedLoginVersion" in props:
+        request["ManagedLoginVersion"] = int(props["ManagedLoginVersion"])
+    return request
+
+
+def _cognito_user_pool_domain_attributes(domain):
+    _, _, body = _cognito._describe_user_pool_domain({"Domain": domain})
+    description = json.loads(body)["DomainDescription"]
+    return {"CloudFrontDistribution": description.get("CloudFrontDistribution", "")}
+
+
 def _cognito_user_pool_domain_create(logical_id, props, stack_name):
     pid = props.get("UserPoolId", "")
     domain = props.get("Domain", "")
     pool = _cognito._user_pools.get(pid)
     if not pool:
         raise ValueError(f"UserPool {pid} not found for UserPoolDomain")
-    pool["Domain"] = domain
-    _cognito._pool_domain_map[domain] = pid
-    phys_id = f"{pid}-domain-{domain}"
-    return phys_id, {}
+    status, _, body = _cognito._create_user_pool_domain(_cognito_user_pool_domain_request(props))
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain create failed: {body!r}")
+    # Ref returns the domain name.
+    return domain, _cognito_user_pool_domain_attributes(domain)
+
+
+def _cognito_user_pool_domain_update(physical_id, old_props, new_props, stack_name):
+    """Apply CustomDomainConfig and ManagedLoginVersion through UpdateUserPoolDomain, which refuses Routing."""
+    request = _cognito_user_pool_domain_request(new_props)
+    status, _, body = _cognito._update_user_pool_domain(request)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain update failed: {body!r}")
+    return physical_id, _cognito_user_pool_domain_attributes(request["Domain"])
 
 
 def _cognito_user_pool_domain_delete(physical_id, props):
     domain = props.get("Domain", "")
-    pid = _cognito._pool_domain_map.pop(domain, None)
-    if pid:
-        pool = _cognito._user_pools.get(pid)
-        if pool:
-            pool["Domain"] = None
+    pid = props.get("UserPoolId", "")
+    if _cognito._pool_domain_map.get(domain) == pid:
+        _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
 # ===========================================================================
@@ -11857,6 +11887,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_hooks(physical_id)
     _asg._delete_group_policies(physical_id)
 
 
@@ -11924,17 +11955,17 @@ def _asg_policy_delete(physical_id, props):
 def _asg_hook_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     hook_name = props.get("LifecycleHookName") or _physical_name(stack_name, logical_id, max_len=255)
-    key = f"{asg_name}/{hook_name}"
-    _asg._hooks[key] = {
-        "LifecycleHookName": hook_name,
-        "AutoScalingGroupName": asg_name,
-        "LifecycleTransition": props.get("LifecycleTransition", "autoscaling:EC2_INSTANCE_LAUNCHING"),
-        "HeartbeatTimeout": int(props.get("HeartbeatTimeout", 3600)),
-        "DefaultResult": props.get("DefaultResult", "ABANDON"),
-        "NotificationTargetARN": props.get("NotificationTargetARN", ""),
-        "RoleARN": props.get("RoleARN", ""),
-    }
+    _asg._hooks[f"{asg_name}/{hook_name}"] = _asg._hook_record(asg_name, hook_name, props)
     return hook_name, {"LifecycleHookName": hook_name}
+
+
+def _asg_hook_update(physical_id, old_props, new_props, stack_name):
+    """AutoScalingGroupName and LifecycleHookName replace; the rest is in place and a dropped member stays."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    key = f"{asg_name}/{physical_id}"
+    current = _asg._hooks.get(key, {})
+    _asg._hooks[key] = _asg._hook_record(asg_name, physical_id, {**current, **new_props})
+    return physical_id, {"LifecycleHookName": physical_id}
 
 
 def _asg_hook_delete(physical_id, props):
@@ -13582,11 +13613,10 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     A TemplateName change is a replacement, handled the way AWS::IoT::Policy's
     rename is: the new template is created and the old one removed, since a
     template no stack still declares is not left behind. TemplateBody is not
-    an UpdateProvisioningTemplate member (AWS stores it as a new version via
-    CreateProvisioningTemplateVersion, which MiniStack does not model), so a
-    changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType requires replacement,
-    which ``_update_resource`` performs before this runs.
+    an UpdateProvisioningTemplate member: a changed body becomes the new
+    default version, after the oldest is deleted at the version limit.
+    TemplateType requires replacement, which ``_update_resource`` performs
+    before this runs.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
@@ -13611,14 +13641,21 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     body = _iot_provisioning_template_body(new_props)
     tmpl = _iot._provisioning_templates.get(name)
-    if tmpl is not None and body and body != tmpl.get("templateBody"):
+    if tmpl is not None and body and body != _iot._provisioning_template_body(tmpl):
         err = _iot._validate_provisioning_template_body(body)
         if err is not None:
             raise ValueError(
                 f"AWS::IoT::ProvisioningTemplate update failed: {err[2]!r}"
             )
-        tmpl["templateBody"] = body
-        _iot._provisioning_templates[name] = tmpl
+        if len(tmpl["versions"]) >= _iot._PROVISIONING_TEMPLATE_VERSIONS_MAX:
+            oldest = min(v["versionId"] for v in tmpl["versions"].values()
+                         if v["versionId"] != tmpl["defaultVersionId"])
+            _iot._delete_provisioning_template_version(name, str(oldest))
+        resp = _iot._create_provisioning_template_version(
+            name, {"templateBody": body}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     _iot_update_tags(_iot._provisioning_template_arn(name), old_props, new_props)
     return name, _iot_provisioning_template_attrs(name)
 
@@ -14199,6 +14236,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::AppSync::GraphQLSchema": ("ApiId",),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
+    "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -14222,6 +14260,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LaunchConfigurationName", "MetadataOptions", "PlacementTenancy", "RamDiskId",
         "SecurityGroups", "SpotPrice", "UserData",
     ),
+    "AWS::AutoScaling::LifecycleHook": ("AutoScalingGroupName", "LifecycleHookName"),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
     "AWS::IAM::User": ("UserName",),
@@ -14776,7 +14815,11 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
         "import": _cognito_identity_pool_import,
     },
-    "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::Cognito::UserPoolDomain": {
+        "create": _cognito_user_pool_domain_create,
+        "update": _cognito_user_pool_domain_update,
+        "delete": _cognito_user_pool_domain_delete,
+    },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,
         "update": _ecr_repo_update,
@@ -15265,7 +15308,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _asg_policy_delete,
     },
-    "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
+    "AWS::AutoScaling::LifecycleHook": {
+        "create": _asg_hook_create,
+        "update": _asg_hook_update,
+        "delete": _asg_hook_delete,
+    },
     "AWS::AutoScaling::ScheduledAction": {
         "create": _asg_scheduled_create,
         "update": _asg_scheduled_update,
