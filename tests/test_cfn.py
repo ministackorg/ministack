@@ -30298,6 +30298,183 @@ def test_cfn_appsync_api_update_keeps_id_and_children(cfn, appsync):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _cfn_appsync_query(api_id, api_key, query):
+    """The data of a query sent to the API's data plane with its API key."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    req = urllib.request.Request(
+        f"{endpoint}/v1/apis/{api_id}/graphql", method="POST",
+        data=json.dumps({"query": query}).encode(),
+        headers={"Content-Type": "application/json", "x-api-key": api_key})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())["data"]
+
+
+def _cfn_appsync_resolvers_template(suffix, table, answer):
+    api_id = {"Fn::GetAtt": ["Api", "ApiId"]}
+    tables = {logical: {"Type": "AWS::DynamoDB::Table", "Properties": {
+        "TableName": f"cfn-asr-{suffix}-{logical.lower()}", "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}]}} for logical in ("First", "Second")}
+    return json.dumps({
+        "Resources": {
+            **tables,
+            "Api": {"Type": "AWS::AppSync::GraphQLApi",
+                    "Properties": {"Name": f"asr_{suffix}", "AuthenticationType": "API_KEY"}},
+            "Key": {"Type": "AWS::AppSync::ApiKey", "Properties": {"ApiId": api_id}},
+            "Schema": {"Type": "AWS::AppSync::GraphQLSchema", "Properties": {
+                "ApiId": api_id,
+                "Definition": "type Item { id: ID! v: String }\ntype Query { item(id: ID!): Item js: String }"}},
+            "Items": {"Type": "AWS::AppSync::DataSource", "Properties": {
+                "ApiId": api_id, "Name": "items", "Type": "AMAZON_DYNAMODB",
+                "ServiceRoleArn": "arn:aws:iam::000000000000:role/appsync-items",
+                "DynamoDBConfig": {"TableName": {"Ref": table}, "AwsRegion": {"Ref": "AWS::Region"}}}},
+            "Nothing": {"Type": "AWS::AppSync::DataSource", "Properties": {
+                "ApiId": api_id, "Name": "nothing", "Type": "NONE"}},
+            "Item": {"Type": "AWS::AppSync::Resolver", "DependsOn": "Schema", "Properties": {
+                "ApiId": api_id, "TypeName": "Query", "FieldName": "item",
+                "DataSourceName": {"Fn::GetAtt": ["Items", "Name"]},
+                "RequestMappingTemplate": '{"version": "2017-02-28", "operation": "GetItem", '
+                                          '"key": {"id": $util.dynamodb.toDynamoDBJson($ctx.args.id)}}',
+                "ResponseMappingTemplate": "$util.toJson($ctx.result)"}},
+            "Js": {"Type": "AWS::AppSync::Resolver", "DependsOn": "Schema", "Properties": {
+                "ApiId": api_id, "TypeName": "Query", "FieldName": "js",
+                "DataSourceName": {"Fn::GetAtt": ["Nothing", "Name"]},
+                "Runtime": {"Name": "APPSYNC_JS", "RuntimeVersion": "1.0.0"},
+                "Code": f"export function request(ctx) {{ return {{ payload: '{answer}' }}; }}\n"
+                        "export function response(ctx) { return ctx.result; }\n"}},
+        },
+        "Outputs": {"ApiId": {"Value": api_id}, "ApiKey": {"Value": {"Fn::GetAtt": ["Key", "ApiKey"]}}},
+    })
+
+
+def test_cfn_appsync_dynamodb_and_js_resolvers_answer_queries(cfn, ddb):
+    """A stack's DynamoDB and APPSYNC_JS resolvers answer queries, also after an update."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-resolve-{suffix}"
+    query = 'query { item(id: "1") { v } js }'
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_appsync_resolvers_template(suffix, "First", "one"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        for logical in ("First", "Second"):
+            ddb.put_item(TableName=f"cfn-asr-{suffix}-{logical.lower()}",
+                         Item={"id": {"S": "1"}, "v": {"S": logical}})
+        api_id = _cfn_output(cfn, stack_name, "ApiId")
+        api_key = _cfn_output(cfn, stack_name, "ApiKey")
+        assert _cfn_appsync_query(api_id, api_key, query) == {"item": {"v": "First"}, "js": "one"}
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_appsync_resolvers_template(suffix, "Second", "two"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert _cfn_appsync_query(api_id, api_key, query) == {"item": {"v": "Second"}, "js": "two"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+_CFN_APPSYNC_ROLE = "arn:aws:iam::000000000000:role/appsync-sources"
+_CFN_APPSYNC_FUNCTION = "arn:aws:lambda:us-east-1:000000000000:function:appsync-batch"
+_CFN_APPSYNC_BUS = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+_CFN_APPSYNC_BATCH = '{"version": "2018-05-29", "operation": "BatchInvoke", "payload": $util.toJson($ctx.args)}'
+_CFN_APPSYNC_PIPE = ("export function request(ctx) { return {}; }\n"
+                     "export function response(ctx) { return ctx.prev.result; }\n")
+
+
+def _cfn_appsync_members_read_back_template(suffix, updated=False, web="web"):
+    api_id = {"Fn::GetAtt": ["Api", "ApiId"]}
+    runtime = {"Name": "APPSYNC_JS", "RuntimeVersion": "1.0.0"}
+    items = {"ApiId": api_id, "Name": "items", "Type": "AMAZON_DYNAMODB", "ServiceRoleArn": _CFN_APPSYNC_ROLE,
+             "DynamoDBConfig": {"TableName": "second" if updated else "first", "AwsRegion": "us-east-1"}}
+    if not updated:
+        items["Description"] = "items"
+
+    def resolver(field, **props):
+        return {"Type": "AWS::AppSync::Resolver",
+                "Properties": {"ApiId": api_id, "TypeName": "Query", "FieldName": field, **props}}
+
+    return json.dumps({"Resources": {
+        "Api": {"Type": "AWS::AppSync::GraphQLApi",
+                "Properties": {"Name": f"asm_{suffix}", "AuthenticationType": "API_KEY"}},
+        "Items": {"Type": "AWS::AppSync::DataSource", "Properties": items},
+        "Events": {"Type": "AWS::AppSync::DataSource", "Properties": {
+            "ApiId": api_id, "Name": "events", "Type": "AMAZON_EVENTBRIDGE", "ServiceRoleArn": _CFN_APPSYNC_ROLE,
+            "EventBridgeConfig": {"EventBusArn": _CFN_APPSYNC_BUS}}},
+        "Fn": {"Type": "AWS::AppSync::DataSource", "Properties": {
+            "ApiId": api_id, "Name": "fn", "Type": "AWS_LAMBDA", "ServiceRoleArn": _CFN_APPSYNC_ROLE,
+            "LambdaConfig": {"LambdaFunctionArn": _CFN_APPSYNC_FUNCTION}}},
+        "Web": {"Type": "AWS::AppSync::DataSource", "Properties": {
+            "ApiId": api_id, "Name": web, "Type": "HTTP", "Description": "web 2" if updated else "web",
+            "HttpConfig": {"Endpoint": "https://example.org" if updated else "https://example.com"}}},
+        "Js": resolver("js", DataSourceName="events", Runtime=runtime, Code="js 2" if updated else "js"),
+        "Batch": resolver("batch", DataSourceName={"Fn::GetAtt": ["Fn", "Name"]},
+                          MaxBatchSize=10 if updated else 5, RequestMappingTemplate=_CFN_APPSYNC_BATCH,
+                          ResponseMappingTemplate="$util.toJson($ctx.result)"),
+        "Pipe": resolver("pipe", Kind="PIPELINE", PipelineConfig={"Functions": ["f1"]},
+                         Runtime=runtime, Code=_CFN_APPSYNC_PIPE),
+    }, "Outputs": {"ApiId": {"Value": api_id}}})
+
+
+def test_cfn_appsync_data_source_and_resolver_members_read_back(cfn, appsync):
+    """Data source and resolver members read back in the API's shape after a create and an update."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-appsync-members-ds-{suffix}"
+    runtime = {"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"}
+
+    def sources(api_id):
+        return {d["name"]: {k: v for k, v in d.items() if k != "dataSourceArn"}
+                for d in appsync.list_data_sources(apiId=api_id)["dataSources"]}
+
+    def resolvers(api_id):
+        return {r["fieldName"]: {k: v for k, v in r.items() if k not in ("resolverArn", "typeName", "fieldName")}
+                for r in appsync.list_resolvers(apiId=api_id, typeName="Query")["resolvers"]}
+
+    def items(table):
+        return {"name": "items", "type": "AMAZON_DYNAMODB", "serviceRoleArn": _CFN_APPSYNC_ROLE,
+                "dynamodbConfig": {"tableName": table, "awsRegion": "us-east-1",
+                                   "useCallerCredentials": False, "versioned": False}}
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_read_back_template(suffix))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        api_id = _cfn_output(cfn, stack_name, "ApiId")
+        events = {"name": "events", "type": "AMAZON_EVENTBRIDGE", "serviceRoleArn": _CFN_APPSYNC_ROLE,
+                  "eventBridgeConfig": {"eventBusArn": _CFN_APPSYNC_BUS}}
+        fn = {"name": "fn", "type": "AWS_LAMBDA", "serviceRoleArn": _CFN_APPSYNC_ROLE,
+              "lambdaConfig": {"lambdaFunctionArn": _CFN_APPSYNC_FUNCTION}}
+        assert sources(api_id) == {
+            "items": {**items("first"), "description": "items"}, "events": events, "fn": fn,
+            "web": {"name": "web", "type": "HTTP", "description": "web",
+                    "httpConfig": {"endpoint": "https://example.com"}}}
+        batch = {"dataSourceName": "fn", "kind": "UNIT", "requestMappingTemplate": _CFN_APPSYNC_BATCH,
+                 "responseMappingTemplate": "$util.toJson($ctx.result)"}
+        pipe = {"kind": "PIPELINE", "pipelineConfig": {"functions": ["f1"]}, "maxBatchSize": 0,
+                "runtime": runtime, "code": _CFN_APPSYNC_PIPE}
+        assert resolvers(api_id) == {
+            "js": {"dataSourceName": "events", "kind": "UNIT", "maxBatchSize": 0, "runtime": runtime,
+                   "code": "js"},
+            "batch": {**batch, "maxBatchSize": 5}, "pipe": pipe}
+
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_appsync_members_read_back_template(suffix, updated=True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert sources(api_id) == {
+            "items": items("second"), "events": events, "fn": fn,
+            "web": {"name": "web", "type": "HTTP", "description": "web 2",
+                    "httpConfig": {"endpoint": "https://example.org"}}}
+        assert resolvers(api_id) == {
+            "js": {"dataSourceName": "events", "kind": "UNIT", "maxBatchSize": 0, "runtime": runtime,
+                   "code": "js 2"},
+            "batch": {**batch, "maxBatchSize": 10}, "pipe": pipe}
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_appsync_members_read_back_template(
+            suffix, updated=True, web="web2"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        assert sorted(sources(api_id)) == ["events", "fn", "items", "web2"]
+        assert "Requested update requires the creation of a new physical resource" in (
+            _stack_event_reasons(cfn, stack_name))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_appsync_api_key_updates_in_place(cfn, appsync):
     """An API key update keeps its key id."""
     suffix = _uuid_mod.uuid4().hex[:8]
