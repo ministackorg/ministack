@@ -5,10 +5,11 @@ STS Service Emulator (AWS-compatible).
 
 Actions:
   GetCallerIdentity, AssumeRole, AssumeRoleWithWebIdentity,
-  GetSessionToken, GetAccessKeyInfo, GetWebIdentityToken.
+  GetSessionToken, GetFederationToken, GetAccessKeyInfo, GetWebIdentityToken.
 """
 
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -22,9 +23,11 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     CredentialResolutionError,
+    _principal_keys,
     find_iam_access_key_account,
     is_root_access_key,
     resolve_credential,
+    validate_policy_document,
 )
 from ministack.core.responses import (
     _account_from_sts_session,
@@ -38,7 +41,17 @@ from ministack.core.router import extract_access_key_id
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
 # and reuses IAM's XML builders and credential generators.
-from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _p, _xml
+from ministack.services.iam import (
+    _error,
+    _extract_tags,
+    _future,
+    _gen_secret,
+    _gen_session_access_key,
+    _gen_session_token,
+    _p,
+    _xml,
+    policy_known,
+)
 
 _sessions: dict[str, dict] = {}
 
@@ -62,6 +75,7 @@ def _session_expired(session) -> bool:
 def register_session(access_key: str, session: dict) -> None:
     """Register a temporary-credential session (AssumeRole, identity pools)."""
     _evict_expired_sessions()
+    session.setdefault("IssuedAt", time.time())
     _sessions[access_key] = session
 
 
@@ -104,6 +118,7 @@ def _caller_identity(
         "principalType": credential.principal_type,
         "principalName": credential.principal_name,
         "isTemporary": credential.session_token is not None,
+        "principalKeys": _principal_keys(credential),
     }
 
 
@@ -171,8 +186,127 @@ def _assumed_role_arn(role_arn: str, session_name: str):
     return f"arn:{spec.partition}:sts::{spec.account_id}:assumed-role/{role_name}/{session_name}", None
 
 
+def _role_id(role_arn: str) -> str:
+    """The RoleId of the role *role_arn* names, or a new one for a role that is not stored."""
+    from ministack.services import iam as iam_svc
+
+    try:
+        spec = parse_arn(role_arn)
+        role = iam_svc._roles.get_scoped(spec.account_id, None, spec.resource.rsplit("/", 1)[-1])
+    except ArnParseError:
+        role = None
+    return (role or {}).get("RoleId") or "AROA" + new_uuid().replace("-", "")[:17].upper()
+
+
+def _session_tags(params: dict, check=True):
+    """The session tags of a request, from the query or the JSON form, or, if *check*, their validation error."""
+    tags = params.get("Tags")
+    if isinstance(tags, list) and tags and isinstance(tags[0], dict):
+        tags = [{"Key": str(t.get("Key")), "Value": str(t.get("Value", ""))} for t in tags]
+    else:
+        tags = _extract_tags(params)
+    if check and len({t["Key"].lower() for t in tags}) < len(tags):
+        return None, _error(400, "InvalidParameterValue",
+                            "Duplicate tag keys found. Please note that Tag keys are case insensitive.", ns="sts")
+    return tags, None
+
+
+def _session_policies(params, account_id=None, check=True):
+    """Policy and PolicyArns of a request, or with *check* its validation error (ARNs must be in ``account_id``)."""
+    policy = _p(params, "Policy")
+    arns = [a.get("arn", "") for a in params.get("PolicyArns", []) if isinstance(a, dict)]
+    while arn := _p(params, f"PolicyArns.member.{len(arns) + 1}.arn"):
+        arns.append(arn)
+    if not check:
+        return {"Policy": policy, "PolicyArns": arns}, None
+    if len(policy) > 2048:
+        return None, _error(400, "ValidationError",
+                            f"1 validation error detected: Value '{escape(policy)}' at 'policy' failed to satisfy "
+                            "constraint: Member must have length less than or equal to 2048", ns="sts")
+    malformed = policy and validate_policy_document(policy)
+    if malformed:
+        return None, _error(400, "MalformedPolicyDocument", escape(malformed), ns="sts")
+    if not all(policy_known(arn, account_id) for arn in arns):
+        return None, _error(400, "ValidationError",
+                            "At least one Policy ARN in the PolicyArns parameter does not match "
+                            "an existing IAM Managed Policy ARN.", ns="sts")
+    return {"Policy": policy, "PolicyArns": arns}, None
+
+
+def _federated_name_error(name):
+    """ValidationError unless ``name`` is a valid GetFederationToken Name."""
+    if name is None:
+        constraint = "Member must not be null"
+    elif len(name) < 2:
+        constraint = "Member must have length greater than or equal to 2"
+    elif len(name) > 32:
+        constraint = "Member must have length less than or equal to 32"
+    elif not re.fullmatch(r"[\w+=,.@-]*", name, re.ASCII):
+        constraint = "Member must satisfy regular expression pattern: [\\w+=,.@-]*"
+    else:
+        return None
+    value = "null" if name is None else f"'{escape(name)}'"
+    return _error(400, "ValidationError",
+                  f"1 validation error detected: Value {value} at 'name' failed to satisfy constraint: {constraint}",
+                  ns="sts")
+
+
+def _session_caller_refused(caller, action):
+    """AccessDenied for temporary credentials under AUTH, or None."""
+    from ministack.app import AUTH
+    if AUTH and caller["isTemporary"]:
+        return _error(403, "AccessDenied", f"Cannot call {action} with session credentials", ns="sts")
+    return None
+
+
 def _invalid_role_arn(role_arn: str):
     return _error(400, "ValidationError", f"Invalid RoleArn: {role_arn}", ns="sts")
+
+
+_WELL_KNOWN_WEB_IDENTITY_PROVIDERS = {
+    "accounts.google.com", "cognito-identity.amazonaws.com", "graph.facebook.com", "www.amazon.com",
+}
+
+
+def _web_identity_principal(token: str, provider_id: str, role_arn: str):
+    """The Federated principal a web identity token names, with its condition keys."""
+    from ministack.services.cognito import _decode_id_token_unverified
+
+    try:
+        claims = _decode_id_token_unverified(token)
+    except (ValueError, TypeError):
+        claims = {}
+    if not isinstance(claims, dict):
+        claims = {}
+    host = str(claims.get("iss") or provider_id or "").split("://", 1)[-1].rstrip("/")
+    principal = host
+    if host and host not in _WELL_KNOWN_WEB_IDENTITY_PROVIDERS:
+        parts = role_arn.split(":")
+        principal = f"arn:{parts[1]}:iam::{parts[4]}:oidc-provider/{host}"
+    return principal, {f"{host}:{k}".lower(): claims[k] for k in ("aud", "sub", "amr") if k in claims}
+
+
+def _web_identity_trust_denied(role_arn: str, params: dict, use_json: bool):
+    """AccessDenied unless the role's trust policy lets the token's provider assume it."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_trust_policy
+    from ministack.services import iam as iam_svc
+
+    account = role_arn.split(":")[4]
+    role = iam_svc._roles.get_scoped(account, None, role_arn.rsplit("/", 1)[-1])
+    provider, keys = _web_identity_principal(
+        _p(params, "WebIdentityToken"), _p(params, "ProviderId"), role_arn)
+    trust_context = EvalContext(
+        principal_arn=provider, principal_type="WebIdentityUser", principal_account=account,
+        action="sts:AssumeRoleWithWebIdentity", resource_arn=role_arn, region=get_region(),
+        service_context=keys,
+    )
+    if role is not None and evaluate_trust_policy(
+            role.get("AssumeRolePolicyDocument", "{}"), provider, trust_context):
+        return None
+    message = "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+    if use_json:
+        return error_response_json("AccessDenied", message, 403)
+    return _error(403, "AccessDenied", message, ns="sts")
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -226,12 +360,18 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session_name)
         if validation_error:
             return validation_error
+        from ministack.app import AUTH
+        session_tags, validation_error = _session_tags(params, check=AUTH)
+        if validation_error:
+            return validation_error
+        session_policies, validation_error = _session_policies(params, role_arn.split(":")[4], check=AUTH)
+        if validation_error:
+            return validation_error
         caller = _caller_identity(headers, query_params)
         if isinstance(caller, CredentialResolutionError):
             return _credential_error_response(caller)
 
         # When AUTH=true, validate role exists and trust policy permits the caller
-        from ministack.app import AUTH
         if AUTH:
             from ministack.core.iam_evaluator import EvalContext, evaluate_trust_policy
             from ministack.services import iam as iam_svc
@@ -272,10 +412,19 @@ async def handle_request(method, path, headers, body, query_params):
                     "sts:externalid": _p(params, "ExternalId", None),
                     "sts:rolesessionname": _p(params, "RoleSessionName", None),
                 },
+                principal_keys=caller["principalKeys"],
+                request_tags={t["Key"]: t["Value"] for t in session_tags},
+                tag_keys=[t["Key"] for t in session_tags],
             )
+            denied_action = None
             if not evaluate_trust_policy(trust_doc, caller_arn, trust_context):
+                denied_action = "sts:AssumeRole"
+            elif session_tags and not evaluate_trust_policy(
+                    trust_doc, caller_arn, dataclasses.replace(trust_context, action="sts:TagSession")):
+                denied_action = "sts:TagSession"
+            if denied_action:
                 message = (f"User: {caller_arn} is not authorized to perform: "
-                           f"sts:AssumeRole on resource: {role_arn}")
+                           f"{denied_action} on resource: {role_arn}")
                 if use_json:
                     return error_response_json("AccessDenied", message, 403)
                 return _error(403, "AccessDenied", message, ns="sts")
@@ -285,7 +434,7 @@ async def handle_request(method, path, headers, body, query_params):
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        role_id = _role_id(role_arn)
         register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session_name}",
@@ -296,6 +445,8 @@ async def handle_request(method, path, headers, body, query_params):
             "PrincipalType": "AssumedRole",
             "SourceAccessKeyId": caller["accessKey"],
             "SourcePrincipalArn": caller["userArn"],
+            "SessionTags": session_tags,
+            "SessionPolicies": session_policies if any(session_policies.values()) else None,
         })
         if use_json:
             return json_response({
@@ -325,11 +476,16 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session)
         if validation_error:
             return validation_error
+        from ministack.app import AUTH
+        if AUTH:
+            denied = _web_identity_trust_denied(role_arn, params, use_json)
+            if denied:
+                return denied
         duration = int(_p(params, "DurationSeconds") or 3600)
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+        role_id = _role_id(role_arn)
         register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session}",
@@ -375,14 +531,9 @@ async def handle_request(method, path, headers, body, query_params):
         caller = _caller_identity(headers, query_params)
         if isinstance(caller, CredentialResolutionError):
             return _credential_error_response(caller)
-        from ministack.app import AUTH
-        if AUTH and caller["isTemporary"]:
-            return _error(
-                403,
-                "AccessDenied",
-                "Cannot call GetSessionToken with session credentials",
-                ns="sts",
-            )
+        refused = _session_caller_refused(caller, action)
+        if refused:
+            return refused
         register_session(access_key, {
             "Arn": caller["userArn"],
             "UserId": caller["userId"],
@@ -408,6 +559,66 @@ async def handle_request(method, path, headers, body, query_params):
                     f"<Expiration>{expiration}</Expiration>"
                     f"</Credentials>"
                     f"</GetSessionTokenResult>",
+                    ns="sts")
+
+    if action == "GetFederationToken":
+        name = _p(params, "Name", None)
+        validation_error = _federated_name_error(name)
+        if validation_error:
+            return validation_error
+        session_tags, validation_error = _session_tags(params)
+        if validation_error:
+            return validation_error
+        session_policies, validation_error = _session_policies(params)
+        if validation_error:
+            return validation_error
+        caller = _caller_identity(headers, query_params)
+        if isinstance(caller, CredentialResolutionError):
+            return _credential_error_response(caller)
+        refused = _session_caller_refused(caller, action)
+        if refused:
+            return refused
+        duration = int(_p(params, "DurationSeconds") or 43200)
+        access_key = _gen_session_access_key()
+        secret_key = _gen_secret()
+        session_token = _gen_session_token()
+        federated_arn = f"arn:aws:sts::{caller['accountId']}:federated-user/{name}"
+        federated_id = f"{caller['accountId']}:{name}"
+        register_session(access_key, {
+            "Arn": federated_arn,
+            "UserId": federated_id,
+            "SecretAccessKey": secret_key,
+            "SessionToken": session_token,
+            "Expiration": time.time() + duration,
+            "AccountId": caller["accountId"],
+            "PrincipalType": "FederatedUser",
+            "PrincipalName": caller["principalName"],
+            "SourceAccessKeyId": caller["accessKey"],
+            "SourcePrincipalArn": caller["userArn"],
+            "SessionTags": session_tags,
+            "SessionPolicies": session_policies,
+        })
+        if use_json:
+            return json_response({
+                "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key,
+                                "SessionToken": session_token, "Expiration": int(time.time() + duration)},
+                "FederatedUser": {"FederatedUserId": federated_id, "Arn": federated_arn},
+                "PackedPolicySize": 0,
+            })
+        return _xml(200, "GetFederationTokenResponse",
+                    f"<GetFederationTokenResult>"
+                    f"<Credentials>"
+                    f"<AccessKeyId>{access_key}</AccessKeyId>"
+                    f"<SecretAccessKey>{secret_key}</SecretAccessKey>"
+                    f"<SessionToken>{session_token}</SessionToken>"
+                    f"<Expiration>{_future(duration)}</Expiration>"
+                    f"</Credentials>"
+                    f"<FederatedUser>"
+                    f"<FederatedUserId>{federated_id}</FederatedUserId>"
+                    f"<Arn>{federated_arn}</Arn>"
+                    f"</FederatedUser>"
+                    f"<PackedPolicySize>0</PackedPolicySize>"
+                    f"</GetFederationTokenResult>",
                     ns="sts")
 
     if action == "GetAccessKeyInfo":

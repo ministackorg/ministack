@@ -27,6 +27,8 @@ from botocore.exceptions import ClientError
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 _DOCUMENT = json.dumps({"operation": "reboot", "when": "now"})
+# Devices get the document re-serialized without spaces.
+_DEVICE_DOCUMENT = '{"operation":"reboot","when":"now"}'
 
 # A syntactically plausible SigV4 header whose credential scope routes the
 # request to the iot-jobs-data service in the default account and region
@@ -176,34 +178,430 @@ def test_iot_jobs_get_job_document(iot_client):
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
-def test_iot_jobs_document_source_serves_a_placeholder_and_is_not_fetched(
-    iot_client, iot_jobs_data
-):
-    """Documented divergence: AWS fetches `documentSource` from S3 and serves
-    its CONTENT to devices. MiniStack does not fetch it — it serves a
-    placeholder naming the source, so a `documentSource` job still creates,
-    describes, and runs its whole execution lifecycle locally. This test pins
-    that choice; changing it means changing README + CHANGELOG too."""
-    thing = _unique("jobs-thing")
-    job_id = _unique("job")
-    source = "https://ministack-jobs.s3.us-east-1.amazonaws.com/reboot.json"
+def _delete_bucket(s3_client, bucket):
+    try:
+        for obj in s3_client.list_objects_v2(Bucket=bucket).get("Contents", []):
+            s3_client.delete_object(Bucket=bucket, Key=obj["Key"])
+        s3_client.delete_bucket(Bucket=bucket)
+    except ClientError:
+        pass
+
+
+def test_iot_jobs_document_source_reads_the_s3_object(iot_client, iot_jobs_data, s3):
+    """CreateJob reads a documentSource object once, at creation, from any S3 URL form."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    content = json.dumps({"operation": "reboot", "v": 1})
+    jobs = []
+
+    def create(source):
+        jobs.append(_unique("job"))
+        iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], documentSource=source)
+        return jobs[-1]
+
     try:
         thing_arn = _create_thing(iot_client, thing)
-        iot_client.create_job(
-            jobId=job_id, targets=[thing_arn], documentSource=source
-        )
-        # The control plane echoes the source it was handed...
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="doc.json", Body=content)
+        source = f"https://s3.us-east-1.amazonaws.com/{bucket}/doc.json"
+        job_id = create(source)
         assert iot_client.describe_job(jobId=job_id)["documentSource"] == source
-        # ...and both document reads serve the placeholder, never S3 content.
-        assert json.loads(iot_client.get_job_document(jobId=job_id)["document"]) == {
-            "documentSource": source
-        }
+        assert iot_client.get_job_document(jobId=job_id)["document"] == content
         execution = iot_jobs_data.describe_job_execution(
-            jobId=job_id, thingName=thing
+            jobId=job_id, thingName=thing, includeJobDocument=True
         )["execution"]
-        assert json.loads(execution["jobDocument"]) == {"documentSource": source}
+        assert execution["jobDocument"] == '{"operation":"reboot","v":1}'
+
+        # Overwriting the object changes no job made from it.
+        s3.put_object(Bucket=bucket, Key="doc.json", Body='{"v": 2}')
+        assert iot_client.get_job_document(jobId=job_id)["document"] == content
+        for source in (
+            f"s3://{bucket}/doc.json",
+            f"https://{bucket}.s3.us-east-1.amazonaws.com/doc.json",
+            f"https://{bucket}.s3.amazonaws.com/doc.json",
+            f"https://s3.amazonaws.com/{bucket}/doc.json",
+            f"https://s3-us-east-1.amazonaws.com/{bucket}/doc.json",
+            f"http://s3.eu-west-1.amazonaws.com/{bucket}/doc.json",
+        ):
+            document = iot_client.get_job_document(jobId=create(source))["document"]
+            assert document == '{"v": 2}', source
+
+        # An http(s) path is percent-decoded; an s3:// key is taken as written.
+        s3.put_object(Bucket=bucket, Key="dir/a b+c.json", Body="[1, 2]")
+        for source in (
+            f"https://s3.amazonaws.com/{bucket}/dir/a%20b%2Bc.json",
+            f"https://s3.amazonaws.com/{bucket}/dir/a b+c.json",
+            f"s3://{bucket}/dir/a b+c.json",
+        ):
+            assert iot_client.get_job_document(jobId=create(source))["document"] == "[1, 2]"
+        limit = json.dumps({"pad": "x" * 32757})
+        s3.put_object(Bucket=bucket, Key="limit.json", Body=limit)
+        job_id = create(f"s3://{bucket}/limit.json")
+        assert iot_client.get_job_document(jobId=job_id)["document"] == limit
     finally:
-        _cleanup(iot_client, jobs=[job_id], things=[thing])
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_device_gets_the_document_reserialized(iot_client, iot_jobs_data, s3):
+    """Devices get the document compact, without null members; GetJobDocument keeps it as stored."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    stored = (
+        '{ "z": 1, "a": [ 1 , 2.50, 1E2, 1e-7, -0, 12345678901234567890, 12345678.9, 1E400 ],\n'
+        '  "s": "caf\\u00e9 \\/ \\u001f\\u0041", "n": null, "o": {"n": null, "k": [null]}, "z": 2 }'
+    )
+    device = (
+        '{"z":2,"a":[1,2.5,100.0,1.0E-7,0,12345678901234567890,1.23456789E7,"Infinity"],'
+        '"s":"caf\u00e9 / \\u001FA","o":{"k":[null]}}'
+    )
+    jobs = []
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="doc.json", Body=stored)
+        for source in ({"document": stored}, {"documentSource": f"s3://{bucket}/doc.json"}):
+            jobs.append(_unique("job"))
+            iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], **source)
+            assert iot_client.get_job_document(jobId=jobs[-1])["document"] == stored
+            execution = iot_jobs_data.describe_job_execution(
+                jobId=jobs[-1], thingName=thing, includeJobDocument=True
+            )["execution"]
+            assert execution["jobDocument"] == device
+            started = iot_jobs_data.start_next_pending_job_execution(thingName=thing)
+            assert started["execution"]["jobDocument"] == device
+            updated = iot_jobs_data.update_job_execution(
+                jobId=jobs[-1], thingName=thing, status="SUCCEEDED", includeJobDocument=True
+            )
+            assert updated["jobDocument"] == device
+        # UTF-8 cannot carry a lone surrogate: it stays escaped.
+        jobs.append(_unique("job"))
+        iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], document='["\\ud83d"]')
+        execution = iot_jobs_data.describe_job_execution(
+            jobId=jobs[-1], thingName=thing, includeJobDocument=True
+        )["execution"]
+        assert execution["jobDocument"] == '["\\uD83D"]'
+    finally:
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_source_refusals(iot_client, s3):
+    """A documentSource that names no readable JSON object refuses the job."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="text.txt", Body="not json")
+        s3.put_object(Bucket=bucket, Key="empty.json", Body="")
+        s3.put_object(Bucket=bucket, Key="big.json", Body=json.dumps({"pad": "x" * 32758}))
+        s3.put_object(Bucket=bucket, Key="dir/a b.json", Body="{}")
+        invalid = "InvalidRequestException"
+        cases = [
+            (f"https://example.com/{bucket}/doc.json", 400, invalid,
+             "Job document source {} is invalid."),
+            (f"s3://{bucket}", 400, invalid,
+             "Provided S3 url is not valid: {}. Error: Key cannot be null"),
+            (f"s3://{bucket}/", 400, invalid,
+             "Provided S3 url is not valid: {}. Error: Key cannot be null"),
+            (f"https://s3.us-east-1.amazonaws.com/{bucket}", 400, invalid,
+             "Provided S3 url is not valid: {}. Error: Key cannot be null"),
+            (f"s3://{bucket}-none/doc.json", 400, invalid,
+             "Bucket specified by url: {} is not found."),
+            (f"https://s3.us-east-1.amazonaws.com/{bucket}/missing.json", 400, invalid,
+             "Job document located at {} is not found."),
+            (f"s3://{bucket}/dir/a%20b.json", 400, invalid,
+             "Job document located at {} is not found."),
+            (f"s3://{bucket}/text.txt", 400, invalid,
+             "Job document located at {} is an invalid JSON document."),
+            (f"s3://{bucket}/empty.json", 400, invalid,
+             "Job document located at {} is an invalid JSON document."),
+            (f"s3://{bucket}/big.json", 410, "LimitExceededException",
+             "Job document from {} exceeds size limit 32768 bytes."),
+        ]
+        for source, status, code, message in cases:
+            job_id = _unique("job")
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job(
+                    jobId=job_id, targets=[thing_arn], documentSource=source
+                )
+            assert _error(ei) == (status, code, message.format(source)), source
+            with pytest.raises(ClientError) as ei:
+                iot_client.describe_job(jobId=job_id)
+            assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        status, body = _raw(
+            _IOT_AUTH, "PUT", f"/jobs/{_unique('job')}", {"targets": [thing_arn], "documentSource": 123}
+        )
+        assert (status, body.get("message")) == (400, "Job document source 123 is invalid.")
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job(
+                jobId=_unique("job"), targets=[thing_arn], document=_DOCUMENT,
+                documentSource=f"s3://{bucket}/missing.json",
+            )
+        assert _error(ei) == (
+            400, invalid,
+            "Job document and job document source cannot be specified at the same time.",
+        )
+    finally:
+        _cleanup(iot_client, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_source_is_read_in_the_callers_account():
+    """The bucket is looked up in the caller's account, in any of its regions."""
+    owner_s3 = _account_client("s3", "111111111111")
+    owner_eu = _account_client("iot", "111111111111", region="eu-west-1")
+    stranger = _account_client("iot", "222222222222")
+    thing, bucket, job_id = _unique("jobs-thing"), _unique("jobs-doc"), _unique("job")
+    try:
+        owner_s3.create_bucket(Bucket=bucket)
+        owner_s3.put_object(Bucket=bucket, Key="doc.json", Body=_DOCUMENT)
+        owner_eu.create_job(jobId=job_id, targets=[_create_thing(owner_eu, thing)],
+                            documentSource=f"s3://{bucket}/doc.json")
+        assert owner_eu.get_job_document(jobId=job_id)["document"] == _DOCUMENT
+        with pytest.raises(ClientError) as ei:
+            stranger.create_job(jobId=_unique("job"),
+                                targets=[_create_thing(stranger, thing)],
+                                documentSource=f"s3://{bucket}/doc.json")
+        assert _error(ei) == (
+            400, "InvalidRequestException",
+            f"Bucket specified by url: s3://{bucket}/doc.json is not found.",
+        )
+    finally:
+        _cleanup(owner_eu, jobs=[job_id], things=[thing])
+        _cleanup(stranger, things=[thing])
+        _delete_bucket(owner_s3, bucket)
+
+
+def _presign_role(iam, bucket):
+    """A role IoT may assume that reads the bucket's objects: (name, ARN)."""
+    name = _unique("presign")
+    trust = {"Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"},
+             "Action": "sts:AssumeRole"}
+    arn = iam.create_role(
+        RoleName=name,
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [trust]}),
+    )["Role"]["Arn"]
+    read = {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*"}
+    iam.put_role_policy(
+        RoleName=name, PolicyName="read",
+        PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [read]}),
+    )
+    return name, arn
+
+
+def _delete_presign_role(iam, name):
+    try:
+        iam.delete_role_policy(RoleName=name, PolicyName="read")
+        iam.delete_role(RoleName=name)
+    except ClientError:
+        pass
+
+
+def _presigned_get(url):
+    """A presigned URL's netloc, path and query, and the body a GET of it returns."""
+    from urllib.parse import parse_qs, urlsplit
+
+    parts = urlsplit(url)
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return parts.netloc, parts.path, parse_qs(parts.query), resp.read()
+
+
+def _presign(url, v2=True):
+    return "${aws:iot:s3-presigned-url" + ("-v2" if v2 else "") + ":" + url + "}"
+
+
+def test_iot_jobs_presigned_url_placeholders_reach_the_device(
+    iot_client, iot_jobs_data, s3, iam
+):
+    """The device gets each placeholder as a presigned GET URL of MiniStack's S3 on the host it called."""
+    from urllib.parse import urlsplit
+
+    thing, bucket, role = _unique("jobs-thing"), _unique("jobs-presign"), None
+    jobs = [_unique("job"), _unique("job")]
+    netloc = ENDPOINT.split("://", 1)[1]
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="fw.bin", Body=b"firmware")
+        s3.put_object(Bucket=bucket, Key="dir/fw 1.bin", Body=b"spaced")
+        role, role_arn = _presign_role(iam, bucket)
+        url = f"https://s3.us-east-1.amazonaws.com/{bucket}"
+        document = json.dumps({
+            "classic": _presign(f"{url}/fw.bin", v2=False),
+            "v2": _presign(f"{url}/fw.bin"),
+            "classicRaw": _presign(f"{url}/dir/fw 1.bin", v2=False),
+            "v2Encoded": _presign(f"{url}/dir/fw%201.bin"),
+            "hosted": _presign(f"https://{bucket}.s3.us-east-1.amazonaws.com/fw.bin"),
+            "s3": _presign(f"s3://{bucket}/fw.bin"),
+            "inText": f"get {_presign(f'{url}/fw.bin')} now",
+        })
+        iot_client.create_job(jobId=jobs[0], targets=[thing_arn], document=document,
+                              presignedUrlConfig={"roleArn": role_arn, "expiresInSec": 300})
+        assert iot_client.get_job_document(jobId=jobs[0])["document"] == document
+
+        served = json.loads(iot_jobs_data.describe_job_execution(
+            jobId=jobs[0], thingName=thing, includeJobDocument=True
+        )["execution"]["jobDocument"])
+        bodies = {"classic": b"firmware", "v2": b"firmware", "classicRaw": b"spaced",
+                  "v2Encoded": b"spaced", "hosted": b"firmware", "s3": b"firmware"}
+        for member, body in bodies.items():
+            key = "dir/fw%201.bin" if body == b"spaced" else "fw.bin"
+            got_netloc, path, query, got = _presigned_get(served[member])
+            assert (got_netloc, path, got) == (netloc, f"/{bucket}/{key}", body), member
+            assert sorted(query) == [
+                "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+                "X-Amz-Security-Token", "X-Amz-Signature", "X-Amz-SignedHeaders",
+            ]
+            assert query["X-Amz-Expires"] == ["300"]
+            assert query["X-Amz-SignedHeaders"] == ["host"]
+            assert query["X-Amz-Credential"][0].startswith("ASIA")
+            assert query["X-Amz-Credential"][0].endswith("/us-east-1/s3/aws4_request")
+        before, _, rest = served["inText"].partition("http://")
+        assert (before, rest.endswith(" now")) == ("get ", True)
+
+        execution = iot_jobs_data.start_next_pending_job_execution(thingName=thing)["execution"]
+        assert _presigned_get(json.loads(execution["jobDocument"])["v2"])[3] == b"firmware"
+        updated = iot_jobs_data.update_job_execution(
+            jobId=jobs[0], thingName=thing, status="IN_PROGRESS", includeJobDocument=True
+        )
+        assert _presigned_get(json.loads(updated["jobDocument"])["v2"])[3] == b"firmware"
+
+        # The device's host names the URL; an IoT endpoint host loses its IoT labels.
+        port = netloc.rsplit(":", 1)[1]
+        for host, expected in ((f"a1b2c3.jobs.iot.us-east-1.{netloc}", netloc),
+                               (f"ministack:{port}", f"ministack:{port}")):
+            request = urllib.request.Request(
+                f"{ENDPOINT}/things/{quote(thing)}/jobs/{jobs[0]}?includeJobDocument=true",
+                headers={"Host": host, "Authorization": _JOBS_DATA_AUTH},
+            )
+            with urllib.request.urlopen(request, timeout=5) as resp:
+                document = json.loads(json.loads(resp.read())["execution"]["jobDocument"])
+            signed = urlsplit(document["v2"])
+            fetch = urllib.request.Request(f"{ENDPOINT}{signed.path}?{signed.query}",
+                                           headers={"Host": signed.netloc})
+            with urllib.request.urlopen(fetch, timeout=5) as resp:
+                assert (signed.netloc, resp.read()) == (expected, b"firmware"), host
+
+        # Without expiresInSec a URL lasts an hour.
+        iot_client.cancel_job(jobId=jobs[0], force=True)
+        iot_client.create_job(jobId=jobs[1], targets=[thing_arn],
+                              document=json.dumps({"v2": _presign(f"{url}/fw.bin")}),
+                              presignedUrlConfig={"roleArn": role_arn})
+        execution = iot_jobs_data.describe_job_execution(
+            jobId=jobs[1], thingName=thing, includeJobDocument=True)["execution"]
+        assert _presigned_get(json.loads(execution["jobDocument"])["v2"])[2][
+            "X-Amz-Expires"] == ["3600"]
+    finally:
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+        if role:
+            _delete_presign_role(iam, role)
+
+
+def test_iot_jobs_presigned_url_signs_in_the_jobs_account():
+    """A role ARN of another account signs in the job's account: the URL reaches none of its objects."""
+    owner_s3, owner_iam = _account_client("s3", "111111111111"), _account_client("iam", "111111111111")
+    stranger = _account_client("iot", "222222222222")
+    stranger_jobs = _account_client("iot-jobs-data", "222222222222")
+    thing, bucket, job_id, role = _unique("jobs-thing"), _unique("jobs-presign"), _unique("job"), None
+    try:
+        owner_s3.create_bucket(Bucket=bucket)
+        owner_s3.put_object(Bucket=bucket, Key="fw.bin", Body=b"firmware")
+        role, role_arn = _presign_role(owner_iam, bucket)
+        stranger.create_job(jobId=job_id, targets=[_create_thing(stranger, thing)],
+                            document=json.dumps({"fw": _presign(f"s3://{bucket}/fw.bin")}),
+                            presignedUrlConfig={"roleArn": role_arn})
+        url = json.loads(stranger_jobs.describe_job_execution(
+            jobId=job_id, thingName=thing, includeJobDocument=True)["execution"]["jobDocument"])["fw"]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _presigned_get(url)
+        assert ei.value.code == 403
+    finally:
+        _cleanup(stranger, jobs=[job_id], things=[thing])
+        _delete_bucket(owner_s3, bucket)
+        if role:
+            _delete_presign_role(owner_iam, role)
+
+
+@pytest.mark.parametrize("host, expected", [
+    ("ministack:4566", "ministack:4566"),
+    ("host.docker.internal:4566", "host.docker.internal:4566"),
+    ("a1b2c3-ats.iot.us-east-1.localhost:4566", "localhost:4566"),
+    ("a1b2c3.jobs.iot.us-east-1.localhost:4566", "localhost:4566"),
+    ("iot.eu-west-1.ministack:4566", "ministack:4566"),
+    ("", None),
+    ('bad"host', None),
+])
+def test_iot_jobs_presigned_url_host(host, expected):
+    """The URL names the device's host, an IoT endpoint host without its IoT labels, else the configured one."""
+    from urllib.parse import urlsplit
+
+    from ministack.services import iot
+
+    job = {"document": json.dumps({"fw": _presign("s3://bucket/fw.bin")}),
+           "presignedUrlConfig": {"roleArn": "arn:aws:iam::000000000000:role/presign"}}
+    token = iot.jobs_device_host.set(host)
+    try:
+        url = json.loads(iot._jobs_presigned_document(job))["fw"]
+    finally:
+        iot.jobs_device_host.reset(token)
+    assert urlsplit(url).netloc == (expected or f"{iot._MINISTACK_HOST}:{iot._GATEWAY_PORT}")
+
+
+def test_iot_jobs_presigned_url_placeholders_refusals(iot_client, s3):
+    """A placeholder without presignedUrlConfig.roleArn, or naming no S3 object, refuses the job."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-presign")
+    url = "https://s3.us-east-1.amazonaws.com/bucket/fw.bin"
+    classic, v2 = _presign(url, v2=False), _presign(url)
+    role_message = "Role must be provided for pre-sign S3 urls in job document of job {}."
+    v2_message = (
+        "presignedUrlConfig role ARN is required to generate an S3 presigned url in job document."
+    )
+    role = {"roleArn": "arn:aws:iam::000000000000:role/presign"}
+    spaced, keyless = (
+        "https://s3.us-east-1.amazonaws.com/bucket/fw 1.bin",
+        "https://s3.us-east-1.amazonaws.com/bucket",
+    )
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="doc.json", Body=json.dumps({"a": classic}))
+        cases = [
+            ({"document": json.dumps({"a": classic})}, role_message),
+            ({"document": json.dumps({"a": v2})}, v2_message),
+            ({"document": json.dumps({"a": v2, "b": classic})}, role_message),
+            ({"document": json.dumps({"a": classic}),
+              "presignedUrlConfig": {"expiresInSec": 300}}, role_message),
+            ({"document": json.dumps({"a": v2}),
+              "presignedUrlConfig": {"expiresInSec": 300}}, v2_message),
+            ({"documentSource": f"s3://{bucket}/doc.json"}, role_message),
+            ({"document": json.dumps({"a": _presign("https://example.com/fw.bin", v2=False)}),
+              "presignedUrlConfig": role}, "Given S3 url https://example.com/fw.bin is invalid."),
+            ({"document": json.dumps({"a": _presign(spaced)}), "presignedUrlConfig": role},
+             f"Given S3 url {spaced} is invalid."),
+            ({"document": json.dumps({"a": _presign(keyless)}), "presignedUrlConfig": role},
+             f"Provided S3 url is not valid: {keyless}. Error: Key cannot be null"),
+        ]
+        for kwargs, message in cases:
+            job_id = _unique("job")
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job(jobId=job_id, targets=[thing_arn], **kwargs)
+            assert _error(ei) == (400, "InvalidRequestException", message.format(job_id)), kwargs
+            with pytest.raises(ClientError) as ei:
+                iot_client.describe_job(jobId=job_id)
+            assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        # A raw space is fine in the classic form, and no placeholder needs no role.
+        job_ids = [_unique("job"), _unique("job")]
+        iot_client.create_job(jobId=job_ids[0], targets=[thing_arn], presignedUrlConfig=role,
+                              document=json.dumps({"a": _presign(spaced, v2=False)}))
+        iot_client.create_job(jobId=job_ids[1], targets=[thing_arn],
+                              document=json.dumps({"a": url}))
+        _cleanup(iot_client, jobs=job_ids)
+    finally:
+        _cleanup(iot_client, things=[thing])
+        _delete_bucket(s3, bucket)
 
 
 def test_iot_jobs_create_duplicate_and_unknown_target_rejected(iot_client):
@@ -589,6 +987,84 @@ def test_iot_job_template_from_a_job(iot_client):
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
+def test_iot_job_template_document_source_reads_the_s3_object(iot_client, s3):
+    """CreateJobTemplate reads its documentSource once; jobs made from it keep that content."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    template_id, from_job = _unique("tmpl"), _unique("tmpl-job")
+    plain, own_source = _unique("job"), _unique("job")
+    source = f"s3://{bucket}/tmpl.json"
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="tmpl.json", Body='{"v": 1}')
+        template_arn = iot_client.create_job_template(
+            jobTemplateId=template_id, description="d", documentSource=source
+        )["jobTemplateArn"]
+        s3.put_object(Bucket=bucket, Key="tmpl.json", Body='{"v": 2}')
+        desc = iot_client.describe_job_template(jobTemplateId=template_id)
+        assert (desc["document"], desc["documentSource"]) == ('{"v": 1}', source)
+
+        job_arn = iot_client.create_job(
+            jobId=plain, targets=[thing_arn], jobTemplateArn=template_arn
+        )["jobArn"]
+        assert iot_client.describe_job(jobId=plain)["documentSource"] == source
+        assert iot_client.get_job_document(jobId=plain)["document"] == '{"v": 1}'
+        iot_client.create_job(jobId=own_source, targets=[thing_arn],
+                              jobTemplateArn=template_arn, documentSource=source)
+        assert iot_client.get_job_document(jobId=own_source)["document"] == '{"v": 2}'
+        iot_client.create_job_template(
+            jobTemplateId=from_job, description="d", jobArn=job_arn
+        )
+        desc = iot_client.describe_job_template(jobTemplateId=from_job)
+        assert (desc["document"], desc["documentSource"]) == ('{"v": 1}', source)
+
+        for missing, message in (
+            (f"s3://{bucket}/missing.json", "Job document located at {} is not found."),
+            (f"s3://{bucket}-none/doc.json", "Bucket specified by url: {} is not found."),
+        ):
+            missing_id = _unique("tmpl")
+            with pytest.raises(ClientError) as ei:
+                iot_client.create_job_template(
+                    jobTemplateId=missing_id, description="d", documentSource=missing
+                )
+            assert _error(ei) == (400, "InvalidRequestException", message.format(missing))
+            with pytest.raises(ClientError):
+                iot_client.describe_job_template(jobTemplateId=missing_id)
+    finally:
+        _delete_templates(iot_client, template_id, from_job)
+        _cleanup(iot_client, jobs=[plain, own_source], things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_job_template_presigned_url_placeholders(iot_client, iot_jobs_data):
+    """CreateJobTemplate needs a role for a placeholder; a job made from the template hands out URLs."""
+    thing, template_id, refused, job_id = (
+        _unique("jobs-thing"), _unique("tmpl"), _unique("tmpl"), _unique("job")
+    )
+    document = json.dumps({"fw": _presign("s3://bucket/fw.bin", v2=False)})
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job_template(jobTemplateId=refused, description="d", document=document)
+        assert _error(ei) == (
+            400, "InvalidRequestException",
+            f"Role must be provided for pre-sign S3 urls in job document of job {refused}.",
+        )
+        template_arn = iot_client.create_job_template(
+            jobTemplateId=template_id, description="d", document=document,
+            presignedUrlConfig={"roleArn": "arn:aws:iam::000000000000:role/presign",
+                                "expiresInSec": 120},
+        )["jobTemplateArn"]
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], jobTemplateArn=template_arn)
+        execution = iot_jobs_data.describe_job_execution(
+            jobId=job_id, thingName=thing, includeJobDocument=True)["execution"]
+        url = json.loads(execution["jobDocument"])["fw"]
+        assert url.startswith(f"{ENDPOINT}/bucket/fw.bin?") and "&X-Amz-Expires=120&" in url
+    finally:
+        _delete_templates(iot_client, template_id, refused)
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
 def test_iot_job_template_rejects_what_aws_rejects(iot_client):
     template_id = _unique("tmpl")
     try:
@@ -786,7 +1262,7 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         assert execution["jobId"] == job_id
         assert execution["status"] == "IN_PROGRESS"
         assert execution["versionNumber"] == 2  # start bumped it from 1
-        assert execution["jobDocument"] == _DOCUMENT
+        assert execution["jobDocument"] == _DEVICE_DOCUMENT
         _assert_epoch_seconds(execution["startedAt"])
 
         pending = iot_jobs_data.get_pending_job_executions(thingName=thing)
@@ -985,6 +1461,272 @@ def test_iot_jobs_fleet_completes_only_when_every_execution_is_terminal(
         _cleanup(iot_client, jobs=[job_id], things=[first, second])
 
 
+def _abort_config(*criteria):
+    return {"criteriaList": [
+        {"failureType": failure_type, "action": "CANCEL",
+         "thresholdPercentage": threshold, "minNumberOfExecutedThings": minimum}
+        for failure_type, threshold, minimum in criteria
+    ]}
+
+
+def _abort_comment(failure_type, threshold, completed, failed):
+    return (
+        f"Abort criteria for failure type {failure_type} with threshold {threshold} met. "
+        f"Total completed executions: {completed}, total {failure_type} executions: {failed}"
+    )
+
+
+def test_iot_jobs_abort_config_cancels_the_job_and_its_queued_executions(
+    iot_client, iot_jobs_data
+):
+    """FAILED 30 % after 2: the second FAILED cancels the job and its QUEUED executions; IN_PROGRESS runs on."""
+    things = [_unique("jobs-thing") for _ in range(5)]
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 30, 2)))
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[0], status="IN_PROGRESS")
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[1], status="FAILED")
+        assert iot_client.describe_job(jobId=job_id)["job"]["status"] == "IN_PROGRESS"
+
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[2], status="FAILED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["reasonCode"] == "ABORT_CANCEL"
+        assert job["comment"] == _abort_comment("FAILED", "30.00%", 2, 2)
+        assert job["forceCanceled"] is False
+        assert [
+            iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]["status"]
+            for thing in things
+        ] == ["IN_PROGRESS", "FAILED", "FAILED", "CANCELED", "CANCELED"]
+
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[0], status="SUCCEEDED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["jobProcessDetails"]["numberOfSucceededThings"] == 1
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+@pytest.mark.parametrize("criteria, reports, comment", [
+    # A SUCCEEDED counts as completed, and its report runs the check.
+    ([("FAILED", 50, 3)], ["FAILED", "FAILED", "SUCCEEDED"], ("FAILED", "50.00%", 3, 2)),
+    # The threshold is a minimum.
+    ([("FAILED", 50, 2)], ["SUCCEEDED", "FAILED"], ("FAILED", "50.00%", 2, 1)),
+    # REJECTED counts REJECTED executions only.
+    ([("REJECTED", 33.33, 2)], ["FAILED", "SUCCEEDED", "REJECTED"], ("REJECTED", "33.33%", 3, 1)),
+    # ALL counts FAILED and REJECTED alike.
+    ([("ALL", 60, 3)], ["FAILED", "REJECTED", "SUCCEEDED"], ("ALL", "60.00%", 3, 2)),
+    # Of two criteria met at once, the first in the list cancels.
+    ([("ALL", 40, 1), ("FAILED", 50, 1)], ["FAILED"], ("ALL", "40.00%", 1, 1)),
+    ([("FAILED", 50, 1), ("ALL", 40, 1)], ["FAILED"], ("FAILED", "50.00%", 1, 1)),
+    # A canceled execution counts as completed, and CancelJobExecution runs the check.
+    ([("FAILED", 40, 2)], ["FAILED", "CANCEL"], ("FAILED", "40.00%", 2, 1)),
+])
+def test_iot_jobs_abort_config_counts_completed_executions(
+    iot_client, iot_jobs_data, criteria, reports, comment
+):
+    """Each report completes one more of four executions; only the last one meets a criterion."""
+    things = [_unique("jobs-thing") for _ in range(4)]
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(*criteria))
+        for thing, report in zip(things, reports):
+            assert iot_client.describe_job(jobId=job_id)["job"]["status"] == "IN_PROGRESS"
+            if report == "CANCEL":
+                iot_client.cancel_job_execution(jobId=job_id, thingName=thing)
+            else:
+                iot_jobs_data.update_job_execution(jobId=job_id, thingName=thing, status=report)
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["comment"] == _abort_comment(*comment)
+        execution = iot_client.describe_job_execution(jobId=job_id, thingName=things[-1])
+        assert execution["execution"]["status"] == "CANCELED"
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+def test_iot_jobs_abort_config_counts_removed_executions(iot_client, iot_jobs_data):
+    """A thing leaving a CONTINUOUS job's group completes its execution as REMOVED."""
+    things = [_unique("jobs-thing") for _ in range(3)]
+    group = _unique("jobs-group")
+    job_id = _unique("job")
+    try:
+        group_arn = iot_client.create_thing_group(thingGroupName=group)["thingGroupArn"]
+        for thing in things:
+            _create_thing(iot_client, thing)
+            iot_client.add_thing_to_thing_group(thingGroupName=group, thingName=thing)
+        iot_client.create_job(jobId=job_id, targets=[group_arn], document=_DOCUMENT,
+                              targetSelection="CONTINUOUS",
+                              abortConfig=_abort_config(("FAILED", 40, 2)))
+        iot_client.remove_thing_from_thing_group(thingGroupName=group, thingName=things[0])
+        iot_jobs_data.update_job_execution(jobId=job_id, thingName=things[1], status="FAILED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["comment"] == _abort_comment("FAILED", "40.00%", 2, 1)
+        assert job["jobProcessDetails"]["numberOfRemovedThings"] == 1
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things, groups=[group])
+
+
+def test_iot_jobs_abort_config_last_execution_completes_the_job(iot_client, iot_jobs_data):
+    """A report that finishes the job's last open execution completes the job, whatever the criteria."""
+    things = [_unique("jobs-thing") for _ in range(2)]
+    job_id = _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 50, 2)))
+        for thing in things:
+            iot_jobs_data.update_job_execution(jobId=job_id, thingName=thing, status="FAILED")
+        job = iot_client.describe_job(jobId=job_id)["job"]
+        assert job["status"] == "COMPLETED"
+        assert "reasonCode" not in job
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=things)
+
+
+def test_iot_jobs_abort_config_ignores_deleted_executions(iot_client, iot_jobs_data):
+    """A deleted execution no longer counts, and DeleteJobExecution runs the check."""
+    things = [_unique("jobs-thing") for _ in range(4)]
+    kept, deleted = _unique("job"), _unique("job")
+    try:
+        arns = [_create_thing(iot_client, thing) for thing in things]
+        iot_client.create_job(jobId=kept, targets=arns[:3], document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 50, 2)))
+        iot_jobs_data.update_job_execution(jobId=kept, thingName=things[0], status="FAILED")
+        iot_client.delete_job_execution(jobId=kept, thingName=things[0], executionNumber=1)
+        iot_jobs_data.update_job_execution(jobId=kept, thingName=things[1], status="SUCCEEDED")
+        assert iot_client.describe_job(jobId=kept)["job"]["status"] == "IN_PROGRESS"
+
+        iot_client.create_job(jobId=deleted, targets=arns, document=_DOCUMENT,
+                              abortConfig=_abort_config(("FAILED", 40, 2)))
+        for thing, status in zip(things, ["SUCCEEDED", "SUCCEEDED", "FAILED"]):
+            iot_jobs_data.update_job_execution(jobId=deleted, thingName=thing, status=status)
+        assert iot_client.describe_job(jobId=deleted)["job"]["status"] == "IN_PROGRESS"
+        iot_client.delete_job_execution(jobId=deleted, thingName=things[0], executionNumber=1)
+        job = iot_client.describe_job(jobId=deleted)["job"]
+        assert job["status"] == "CANCELED"
+        assert job["comment"] == _abort_comment("FAILED", "40.00%", 2, 1)
+        execution = iot_client.describe_job_execution(jobId=deleted, thingName=things[3])
+        assert execution["execution"]["status"] == "CANCELED"
+    finally:
+        _cleanup(iot_client, jobs=[kept, deleted], things=things)
+
+
+_TIMEOUT_0 = "Provide valid timeout value, inProgressTimeoutInMinutes cannot be 0."
+
+
+def test_iot_jobs_abort_config_rejects_what_aws_rejects(iot_client):
+    """CreateJob, CreateJobTemplate and UpdateJob refuse the same abortConfig values."""
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    thing = _unique("jobs-thing")
+    job_id, other = _unique("job"), _unique("job")
+    template_id = _unique("tmpl")
+
+    def criterion(failure_type="FAILED", threshold=50, **over):
+        return {"failureType": failure_type, "action": "CANCEL",
+                "thresholdPercentage": threshold, "minNumberOfExecutedThings": 1, **over}
+
+    def without(member):
+        return {"criteriaList": [{k: v for k, v in criterion().items() if k != member}]}
+
+    def constraint(value, member, rule):
+        shown = "null" if value is None else f"'{value}'"
+        return (f"1 validation error detected: Value {shown} at "
+                f"'abortConfig.criteriaList{member}' failed to satisfy constraint: Member must {rule}")
+
+    duplicate = "Multiple AbortCriteria cannot have the same failure type"
+    decimals = "Abort thresholdPercentage must have two or less decimal digits"
+    positive = "ThresholdPercentage value 0.0 for AbortCriteria must have value greater than 0"
+    cases = [
+        *[(without(member), constraint(None, f".1.member.{member}", "not be null"))
+          for member in ("failureType", "action", "thresholdPercentage",
+                         "minNumberOfExecutedThings")],
+        ({}, constraint(None, "", "not be null")),
+        ({"criteriaList": [criterion(threshold=100.01)]},
+         constraint(100.01, ".1.member.thresholdPercentage", "have value less than or equal to 100")),
+        ({"criteriaList": [criterion(), criterion("ALL", action="BAD")]},
+         constraint("BAD", ".2.member.action", "satisfy enum value set: [CANCEL]")),
+        # The model constraints come first.
+        ({"criteriaList": [criterion("BAD", 0)]},
+         constraint("BAD", ".1.member.failureType",
+                    "satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]")),
+        ({"criteriaList": [criterion(threshold=0)]}, positive),
+        ({"criteriaList": [criterion(threshold=-0.001)]},
+         "ThresholdPercentage value -0.001 for AbortCriteria must have value greater than 0"),
+        ({"criteriaList": [criterion(threshold=10.999)]}, decimals),
+        ({"criteriaList": [criterion(), criterion(threshold=20)]}, duplicate),
+        # Criterion by criterion: a duplicate is refused before its own threshold.
+        ({"criteriaList": [criterion(threshold=10.999), criterion("ALL", 0)]}, decimals),
+        ({"criteriaList": [criterion(), criterion(threshold=0)]}, duplicate),
+        ({"criteriaList": [criterion(threshold=10.999), criterion(threshold=20)]}, decimals),
+    ]
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        for abort, message in cases:
+            for call in (
+                lambda: raw.create_job(jobId=other, targets=[thing_arn], document=_DOCUMENT,
+                                       abortConfig=abort),
+                lambda: raw.create_job_template(jobTemplateId=template_id, description="d",
+                                                document=_DOCUMENT, abortConfig=abort),
+                lambda: raw.update_job(jobId=job_id, abortConfig=abort),
+            ):
+                with pytest.raises(ClientError) as ei:
+                    call()
+                assert _error(ei) == (400, "InvalidRequestException", message), abort
+        assert "abortConfig" not in iot_client.describe_job(jobId=job_id)["job"]
+
+        # A bad timeout answers before the criteria checks, both before the id is looked up.
+        iot_client.create_job_template(jobTemplateId=template_id, description="d",
+                                       document=_DOCUMENT)
+        zero = {"criteriaList": [criterion(threshold=0)]}
+        timeout = {"timeoutConfig": {"inProgressTimeoutInMinutes": 0}}
+        for call, message in [
+            (lambda: raw.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT,
+                                    abortConfig=zero), positive),
+            (lambda: raw.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT,
+                                    **timeout), _TIMEOUT_0),
+            (lambda: raw.create_job(jobId=other, targets=[thing_arn], document=_DOCUMENT,
+                                    abortConfig=zero, **timeout), _TIMEOUT_0),
+            (lambda: raw.create_job_template(jobTemplateId=template_id, description="d",
+                                             document=_DOCUMENT, abortConfig=zero), positive),
+            (lambda: raw.create_job_template(jobTemplateId=other, description="d",
+                                             document=_DOCUMENT, abortConfig=zero, **timeout),
+             _TIMEOUT_0),
+            (lambda: raw.create_job_template(jobTemplateId=other, document=_DOCUMENT,
+                                             abortConfig={"criteriaList": [criterion("BAD")]}),
+             "2 validation errors detected: Value null at 'description' failed to satisfy "
+             "constraint: Member must not be null; Value 'BAD' at "
+             "'abortConfig.criteriaList.1.member.failureType' failed to satisfy constraint: "
+             "Member must satisfy enum value set: [ALL, TIMED_OUT, FAILED, REJECTED]"),
+            (lambda: raw.update_job(jobId=other, abortConfig=zero), positive),
+            (lambda: raw.update_job(jobId=job_id, abortConfig=zero, **timeout), _TIMEOUT_0),
+        ]:
+            with pytest.raises(ClientError) as ei:
+                call()
+            assert _error(ei) == (400, "InvalidRequestException", message)
+
+        # Two decimals, and one criterion per failure type, are accepted.
+        accepted = {"criteriaList": [criterion(t, 10.99) for t in
+                                     ("FAILED", "REJECTED", "TIMED_OUT", "ALL")]}
+        iot_client.create_job(jobId=other, targets=[thing_arn], document=_DOCUMENT,
+                              abortConfig=accepted)
+        assert iot_client.describe_job(jobId=other)["job"]["abortConfig"] == accepted
+    finally:
+        try:
+            iot_client.delete_job_template(jobTemplateId=template_id)
+        except ClientError:
+            pass
+        _cleanup(iot_client, jobs=[job_id, other], things=[thing])
+
+
 # ---------------------------------------------------------------------------
 # Routing: the jobs routes must not shadow thing CRUD
 # ---------------------------------------------------------------------------
@@ -1137,7 +1879,7 @@ def test_iot_jobs_next_sentinel_peek_then_start(iot_client, iot_jobs_data):
         assert peeked["jobId"] == job_id
         assert peeked["status"] == "QUEUED"
         assert peeked["versionNumber"] == 1
-        assert peeked["jobDocument"] == _DOCUMENT
+        assert peeked["jobDocument"] == _DEVICE_DOCUMENT
 
         # PUT $next starts it.
         started = iot_jobs_data.start_next_pending_job_execution(thingName=thing)
@@ -2215,6 +2957,7 @@ def test_iot_jobs_cancel_job_without_force_leaves_in_progress(
 
         job = iot_client.describe_job(jobId=job_id)["job"]
         assert job["status"] == "CANCELED"
+        assert job["forceCanceled"] is False
         execution = iot_client.describe_job_execution(
             jobId=job_id, thingName=thing
         )["execution"]
@@ -2973,6 +3716,30 @@ def test_jobs_mqtt_start_next_of_first_job_is_silent(iot_client, iot_data_client
     _assert_epoch_seconds(execution["startedAt"])
 
 
+def test_jobs_mqtt_abort_config_notifies_the_things_it_cancels(iot_client, iot_data_client):
+    """A FAILED over MQTT that meets abortConfig notifies the thing whose QUEUED execution it canceled."""
+    reporter, waiting = _unique("jobs-mqtt-ab"), _unique("jobs-mqtt-ab")
+    job_id = _unique("job")
+    arns = [_create_thing(iot_client, thing) for thing in (reporter, waiting)]
+    iot_client.create_job(jobId=job_id, targets=arns, document=_DOCUMENT,
+                          abortConfig=_abort_config(("FAILED", 50, 1)))
+    base = f"$aws/things/{waiting}/jobs"
+    received = _collect_shadow_frames(
+        f"{base}/#",
+        lambda: _mqtt_publish(
+            topic=f"$aws/things/{reporter}/jobs/{job_id}/update",
+            payload=json.dumps({"status": "FAILED"}).encode(),
+        ),
+        want=2,
+    )
+    frames = _frames_by_topic(received)
+    assert frames[f"{base}/notify"]["jobs"] == {}
+    assert set(frames[f"{base}/notify-next"]) == {"timestamp"}
+    job = iot_client.describe_job(jobId=job_id)["job"]
+    assert job["status"] == "CANCELED"
+    assert job["comment"] == _abort_comment("FAILED", "50.00%", 1, 1)
+
+
 def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     iot_client, iot_data_client
 ):
@@ -3053,6 +3820,42 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     assert topics.index(f"{base}/{job_id}/update/accepted") < topics.index(
         f"{base}/notify"
     ) < topics.index(f"{base}/notify-next")
+
+
+def test_jobs_mqtt_presigned_urls(iot_client, iot_data_client, s3, iam):
+    """Over MQTT the document carries presigned URLs too, on the broker host without its IoT labels."""
+    thing, bucket, job_id = _unique("jobs-mqtt-url"), _unique("jobs-presign"), _unique("job")
+    base, role = f"$aws/things/{thing}/jobs", None
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="fw.bin", Body=b"firmware")
+        role, role_arn = _presign_role(iam, bucket)
+        received = _collect_shadow_frames(
+            f"{base}/notify-next",
+            lambda: iot_client.create_job(
+                jobId=job_id, targets=[thing_arn], presignedUrlConfig={"roleArn": role_arn},
+                document=json.dumps({"fw": _presign(f"s3://{bucket}/fw.bin")}),
+            ),
+            want=1,
+        )
+        url = _frames_by_topic(received)[f"{base}/notify-next"]["execution"]["jobDocument"]["fw"]
+        assert _presigned_get(url)[3] == b"firmware"
+
+        received = _collect_shadow_frames(
+            f"{base}/{job_id}/get/accepted",
+            lambda: _mqtt_publish(topic=f"{base}/{job_id}/get", payload=b"{}"),
+            want=1,
+        )
+        url = _frames_by_topic(received)[f"{base}/{job_id}/get/accepted"]["execution"][
+            "jobDocument"]["fw"]
+        netloc, _path, _query, body = _presigned_get(url)
+        assert (netloc, body) == (ENDPOINT.split("://", 1)[1], b"firmware")
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+        _delete_bucket(s3, bucket)
+        if role:
+            _delete_presign_role(iam, role)
 
 
 def test_jobs_mqtt_leaving_continuous_job_group_notifies(iot_client, iot_data_client):
@@ -3256,6 +4059,27 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
     doc = _frames_by_topic(received)[f"{base}/get/accepted"]
     assert [q["jobId"] for q in doc["queuedJobs"]] == [job_id]
     assert doc["inProgressJobs"] == []
+
+
+def test_jobs_mqtt_job_document_leaves_out_null_members(iot_client, iot_data_client):
+    """The jobDocument object over MQTT is the device's document: no null members, Infinity as a string."""
+    thing = _unique("jobs-mqtt-doc")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    iot_client.create_job(
+        jobId=job_id,
+        targets=[thing_arn],
+        document='{"n": null, "o": {"n": null, "k": [null]}, "f": [1E400, 2.50]}',
+    )
+    base = f"$aws/things/{thing}/jobs"
+
+    received = _collect_shadow_frames(
+        f"{base}/{job_id}/get/accepted",
+        lambda: _mqtt_publish(topic=f"{base}/{job_id}/get", payload=b"{}"),
+        want=1,
+    )
+    execution = _frames_by_topic(received)[f"{base}/{job_id}/get/accepted"]["execution"]
+    assert execution["jobDocument"] == {"o": {"k": [None]}, "f": ["Infinity", 2.5]}
 
 
 def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):

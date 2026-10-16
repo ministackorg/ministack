@@ -649,7 +649,9 @@ def _batch_get_secret_value(data, access_key=None):
                 "Message": (
                     f"User: {principal} is not authorized to perform: "
                     f"secretsmanager:GetSecretValue on resource: {sid} "
-                    + ("with an explicit deny in an identity-based policy"
+                    + ("with an explicit deny in a resource-based policy"
+                       if getattr(denied, "resource_policy_arn", "") else
+                       "with an explicit deny in an identity-based policy"
                        if getattr(denied, "decision", "") == "Deny" else
                        "because no identity-based policy allows the secretsmanager:GetSecretValue action")
                 ),
@@ -1304,6 +1306,14 @@ def _replicate_secret_to_regions(data):
 # ---------------------------------------------------------------------------
 # Resource policies
 # ---------------------------------------------------------------------------
+
+def secret_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The secret's resource policy and owner account, for the identity check."""
+    secret = _secrets.get(resource_arn.partition(":secret:")[2][:-7])
+    if not secret or secret["ARN"] != resource_arn:
+        return None
+    return _resource_policies.get(resource_arn) or "", get_account_id()
+
 
 def _put_resource_policy(data):
     secret_id = data.get("SecretId")

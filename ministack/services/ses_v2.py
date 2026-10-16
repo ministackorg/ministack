@@ -5,7 +5,13 @@ SES v2 Service Emulator.
 REST/JSON API via path /v2/email/...
 Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           ListEmailIdentities, CreateConfigurationSet, GetConfigurationSet,
-          DeleteConfigurationSet, ListConfigurationSets, CreateEmailTemplate,
+          DeleteConfigurationSet, ListConfigurationSets,
+          PutConfigurationSetTrackingOptions, PutConfigurationSetDeliveryOptions,
+          PutConfigurationSetReputationOptions, PutConfigurationSetSendingOptions,
+          PutConfigurationSetSuppressionOptions, PutConfigurationSetVdmOptions,
+          PutConfigurationSetArchivingOptions, CreateConfigurationSetEventDestination,
+          GetConfigurationSetEventDestinations, UpdateConfigurationSetEventDestination,
+          DeleteConfigurationSetEventDestination, CreateEmailTemplate,
           GetEmailTemplate, UpdateEmailTemplate, DeleteEmailTemplate,
           ListEmailTemplates, GetAccount, ListSuppressedDestinations,
           PutAccountSuppressionAttributes, TagResource, UntagResource,
@@ -615,6 +621,166 @@ def _tenant_request(method, sub, data):
     return json_response({})
 
 
+# Configuration set options by the path of their Put call, as GetConfigurationSet returns them.
+_CONFIG_SET_OPTIONS = {
+    "tracking-options": "TrackingOptions",
+    "delivery-options": "DeliveryOptions",
+    "reputation-options": "ReputationOptions",
+    "sending": "SendingOptions",
+    "suppression-options": "SuppressionOptions",
+    "vdm-options": "VdmOptions",
+    "archiving-options": "ArchivingOptions",
+}
+_CONFIG_SET_OPTION_MEMBERS = {
+    "TrackingOptions": ("CustomRedirectDomain", "HttpsPolicy"),
+    "DeliveryOptions": ("TlsPolicy", "SendingPoolName", "MaxDeliverySeconds"),
+    "SuppressionOptions": ("SuppressedReasons", "ValidationOptions"),
+    "VdmOptions": ("DashboardOptions", "GuardianOptions"),
+    "ArchivingOptions": ("ArchiveArn",),
+}
+_CONFIG_SET_DEFAULTS = {
+    "ReputationOptions": {"ReputationMetricsEnabled": True},
+    "SendingOptions": {"SendingEnabled": True},
+}
+_EVENT_TYPES = (
+    "SEND", "REJECT", "BOUNCE", "COMPLAINT", "DELIVERY", "OPEN", "CLICK",
+    "RENDERING_FAILURE", "DELIVERY_DELAY", "SUBSCRIPTION",
+)
+_EVENT_DESTINATION_TARGETS = (
+    "KinesisFirehoseDestination", "CloudWatchDestination", "SnsDestination",
+    "EventBridgeDestination", "PinpointDestination",
+)
+
+
+def _missing_config_set(name):
+    return _json_err("NotFoundException", f"Configuration set <{name}> does not exist.", 404)
+
+
+def _put_config_set_option(rec, key, value):
+    """Apply one option the way its Put call does: a member left out is cleared."""
+    if key == "ReputationOptions":
+        rec[key] = {**rec.get(key, {}), "ReputationMetricsEnabled": bool(value.get("ReputationMetricsEnabled"))}
+    elif key == "SendingOptions":
+        enabled = bool(value.get("SendingEnabled"))
+        if enabled and not rec.get(key, _CONFIG_SET_DEFAULTS[key])["SendingEnabled"]:
+            # Sending enabled again gives the reputation metrics a fresh start.
+            rec["ReputationOptions"] = {
+                **rec.get("ReputationOptions", _CONFIG_SET_DEFAULTS["ReputationOptions"]),
+                "LastFreshStart": int(time.time()),
+            }
+        rec[key] = {"SendingEnabled": enabled}
+    else:
+        members = {k: value[k] for k in _CONFIG_SET_OPTION_MEMBERS[key] if value.get(k) is not None}
+        if members:
+            rec[key] = members
+        else:
+            rec.pop(key, None)
+
+
+def _create_config_set(name, data):
+    """Store a configuration set from CreateConfigurationSet members."""
+    rec = {"ConfigurationSetName": name, "Tags": list(data.get("Tags") or []), **copy.deepcopy(_CONFIG_SET_DEFAULTS)}
+    for key in _CONFIG_SET_OPTIONS.values():
+        if isinstance(data.get(key), dict):
+            _put_config_set_option(rec, key, data[key])
+    _config_sets[name] = rec
+    _ses_tags[_resource_arn("configuration-set", name)] = list(rec["Tags"])
+    return rec
+
+
+def _config_set_view(name, rec):
+    out = {"ConfigurationSetName": name}
+    for key in _CONFIG_SET_OPTIONS.values():
+        value = rec.get(key, _CONFIG_SET_DEFAULTS.get(key))
+        if value is not None:
+            out[key] = copy.deepcopy(value)
+    out["Tags"] = _ses_tags.get(_resource_arn("configuration-set", name), rec.get("Tags", []))
+    return out
+
+
+def _event_destination(definition):
+    """The stored form of an EventDestinationDefinition, or an error response."""
+    types = definition.get("MatchingEventTypes") or []
+    if not types:
+        return None, _json_err("BadRequestException", "At least one event type must be specified.")
+    if any(t not in _EVENT_TYPES for t in types):
+        return None, _json_err("BadRequestException", "The event destination contains an invalid event type.")
+    targets = {k: definition[k] for k in _EVENT_DESTINATION_TARGETS if definition.get(k)}
+    if not targets:
+        return None, _json_err("BadRequestException", "Event destination is not provided.")
+    if len(targets) > 1:
+        return None, _json_err(
+            "BadRequestException",
+            "Please provide only one destination with each request. Either a Firehose Destination or a "
+            "Cloudwatch Destination or an SNS Destination or an EventBridge Destination.",
+        )
+    dimensions = (targets.get("CloudWatchDestination") or {}).get("DimensionConfigurations") or []
+    if any(d.get("DimensionValueSource") not in ("MESSAGE_TAG", "EMAIL_HEADER", "LINK_TAG") for d in dimensions):
+        return None, _json_err("BadRequestException", "invalid CloudWatch dimension source")
+    return {"Enabled": bool(definition.get("Enabled")), "MatchingEventTypes": sorted(set(types)), **targets}, None
+
+
+def _put_event_destination(name, dest_name, definition, *, create):
+    """Create or replace one event destination; an error response or None."""
+    rec = _config_sets.get(name)
+    if rec is None:
+        return _missing_config_set(name)
+    destinations = rec.get("EventDestinations") or {}
+    if create and not re.fullmatch(r"[A-Za-z0-9_-]+", dest_name):
+        return _json_err(
+            "BadRequestException",
+            f"Invalid event destination name <{dest_name}>: "
+            "only alphanumeric ASCII characters, '_', and '-' are allowed.",
+        )
+    if create and dest_name in destinations:
+        return _json_err(
+            "AlreadyExistsException",
+            f"An event destination with name <{dest_name}> already exists for configuration set <{name}>.",
+        )
+    if not create and dest_name not in destinations:
+        return _missing_event_destination(name, dest_name)
+    stored, err = _event_destination(definition if isinstance(definition, dict) else {})
+    if err:
+        return err
+    # An updated destination is listed last.
+    destinations.pop(dest_name, None)
+    destinations[dest_name] = stored
+    rec["EventDestinations"] = destinations
+    return None
+
+
+def _missing_event_destination(name, dest_name):
+    return _json_err(
+        "NotFoundException",
+        f"An event destination with name <{dest_name}> does not exist for configuration set <{name}>.",
+        404,
+    )
+
+
+def _event_destinations_request(method, name, dest_name, data):
+    rec = _config_sets.get(name)
+    if rec is None:
+        return _missing_config_set(name)
+    destinations = rec.get("EventDestinations") or {}
+    if dest_name is None and method == "GET":
+        if not destinations:
+            return json_response({})
+        return json_response({"EventDestinations": [{"Name": n, **copy.deepcopy(d)} for n, d in destinations.items()]})
+    if dest_name is None and method == "POST":
+        err = _put_event_destination(name, data.get("EventDestinationName", ""), data.get("EventDestination"),
+                                     create=True)
+        return err or json_response({})
+    if dest_name is not None and method == "PUT":
+        err = _put_event_destination(name, dest_name, data.get("EventDestination"), create=False)
+        return err or json_response({})
+    if dest_name is not None and method == "DELETE":
+        if dest_name not in destinations:
+            return _missing_event_destination(name, dest_name)
+        destinations.pop(dest_name)
+        return json_response({})
+    return None
+
+
 async def handle_request(method, path, headers, body, query_params):
     # The SES dispatcher also accepts unprefixed REST paths when selected by
     # a SESv2 target header. Preserve those paths and trailing-slash handling
@@ -919,8 +1085,9 @@ async def handle_request(method, path, headers, body, query_params):
         name = data.get("ConfigurationSetName", "")
         if not name:
             return _json_err("BadRequestException", "ConfigurationSetName is required")
-        _config_sets[name] = {"ConfigurationSetName": name, "Tags": data.get("Tags", [])}
-        _ses_tags[_resource_arn("configuration-set", name)] = list(data.get("Tags", []))
+        if name in _config_sets:
+            return _json_err("AlreadyExistsException", f"Configuration set <{name}> already exists.")
+        _create_config_set(name, data)
         return json_response({})
 
     # ListConfigurationSets: GET /v2/email/configuration-sets, or
@@ -939,6 +1106,26 @@ async def handle_request(method, path, headers, body, query_params):
             out["NextToken"] = next_token
         return json_response(out)
 
+    # PUT /v2/email/configuration-sets/{name}/{option}  (PutConfigurationSet*Options)
+    m = re.match(r"^/configuration-sets/([^/]+)/([a-z-]+)$", sub)
+    if m and method == "PUT" and m.group(2) in _CONFIG_SET_OPTIONS:
+        name, option = m.groups()
+        rec = _config_sets.get(name)
+        if rec is None:
+            return _missing_config_set(name)
+        value = (data.get("VdmOptions") or {}) if option == "vdm-options" else data
+        if option == "tracking-options" and value.get("HttpsPolicy") and not value.get("CustomRedirectDomain"):
+            return _json_err("BadRequestException", "CustomRedirectDomain must be specified.")
+        _put_config_set_option(rec, _CONFIG_SET_OPTIONS[option], value)
+        return json_response({})
+
+    # /v2/email/configuration-sets/{name}/event-destinations[/{destination}]
+    m = re.match(r"^/configuration-sets/([^/]+)/event-destinations(?:/([^/]+))?$", sub)
+    if m:
+        result = _event_destinations_request(method, m.group(1), m.group(2), data)
+        if result is not None:
+            return result
+
     # GET/DELETE /v2/email/configuration-sets/{name}
     m = re.match(r"^/configuration-sets/([^/]+)$", sub)
     if m:
@@ -946,8 +1133,8 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             rec = _config_sets.get(name)
             if not rec:
-                return _json_err("NotFoundException", f"ConfigurationSet {name} not found", 404)
-            return json_response(rec)
+                return _missing_config_set(name)
+            return json_response(_config_set_view(name, rec))
         if method == "DELETE":
             arn = _resource_arn("configuration-set", name)
             blocked = _tenant_delete_block(arn)
