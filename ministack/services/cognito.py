@@ -25,6 +25,7 @@ User Pools operations:
   AdminResetUserPassword, AdminUserGlobalSignOut,
   GlobalSignOut, RevokeToken,
   CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain,
+  UpdateUserPoolDomain,
   CreateIdentityProvider, DescribeIdentityProvider, UpdateIdentityProvider,
   DeleteIdentityProvider, ListIdentityProviders, GetIdentityProviderByIdentifier,
   AdminLinkProviderForUser, AdminDisableProviderForUser,
@@ -599,6 +600,13 @@ def _restore_state(data):
             data.get("user_pools", {}),
             lambda pool_id, _pool: _region_from_pool_id(pool_id),
         )
+        # Older state stored 60 for an unset validity; 60 hours exceeds AWS's one-day cap.
+        for pool in _user_pools.all_values():
+            for client in (pool.get("_clients") or {}).values():
+                units = client.get("TokenValidityUnits") or {}
+                for kind in ("AccessToken", "IdToken"):
+                    if client.get(f"{kind}Validity") == 60 and not units.get(kind):
+                        client[f"{kind}Validity"] = None
 
         _restore_regional_store(
             _pool_domain_map,
@@ -758,18 +766,62 @@ def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
     return int(value) * _VALIDITY_UNIT_SECONDS.get(unit, 3600)
 
 
+_API_TOKEN_SCOPE = "aws.cognito.signin.user.admin"
+
+
+def _aws_scope_order(scopes: list[str], presized: bool = True) -> list[str]:
+    """Scopes in the iteration order of a Java HashSet built from them, the order AWS lists them in."""
+    # The token's set is sized for the scopes up front, the trigger event's grows as they are added
+    limit = len(scopes) / 0.75
+    if presized:
+        limit = int(limit) + 1
+    size = 16
+    while size < limit:
+        size *= 2
+
+    def bucket(scope):
+        h = 0
+        for ch in scope:
+            h = (31 * h + ord(ch)) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (size - 1)
+
+    return sorted(scopes, key=bucket)
+
+
+def _granted_scopes(client: dict | None, requested: str | None, grant: str = "authorization_code") -> str | None:
+    """The scopes a token-endpoint grant carries: the requested ones the client allows, or all it allows."""
+    listed = (client or {}).get("AllowedOAuthScopes") or []
+    if not listed and not requested:
+        # Nothing to grant from: keep the API sign-in scope
+        return None
+    # client_credentials grants only resource-server scopes
+    allowed = sorted(s for s in listed if "/" in s or grant != "client_credentials")
+    wanted = requested.split() if requested else allowed
+    if listed:
+        wanted = [s for s in wanted if s in allowed]
+    return " ".join(dict.fromkeys(wanted))
+
+
+def _id_token_granted(scope: str | None) -> bool:
+    """Whether a grant gets an ID token: API sign-ins always, OAuth grants only with openid."""
+    return scope is None or "openid" in scope.split()
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
                  nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication",
-                 client_metadata: dict | None = None, origin_jti: str = "") -> str:
+                 client_metadata: dict | None = None, origin_jti: str = "",
+                 scope: str | None = None) -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
-    Refresh tokens are opaque in AWS and skip the trigger.
+    Refresh tokens are opaque in AWS and skip the trigger. ``scope`` is the
+    grant's scopes; None for API sign-ins.
     """
+    granted = _API_TOKEN_SCOPE if scope is None else scope
     now = int(time.time())
     origin_jti = origin_jti or new_uuid()
     claims = {
@@ -816,7 +868,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["client_id"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
-        claims["scope"] = "aws.cognito.signin.user.admin"
+        claims["scope"] = " ".join(_aws_scope_order(granted.split()))
         if username:
             claims["username"] = username
         if groups:
@@ -825,6 +877,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         # RefreshToken — opaque in real AWS, but we use a JWT stub for simplicity
         claims["client_id"] = client_id
         claims["origin_jti"] = origin_jti
+        if scope is not None:
+            claims["scope"] = scope
 
     if token_type in ("access", "id"):
         claims = _apply_pretoken_trigger(
@@ -837,6 +891,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             user_attrs=user_attrs or {},
             groups=groups or [],
             client_metadata=client_metadata,
+            scope=granted,
         )
     return _signed_jwt(claims)
 
@@ -864,7 +919,8 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
                              trigger_source: str, client_id: str,
                              username: str, user_attrs: dict,
                              groups: list[str],
-                             client_metadata: dict | None = None) -> dict:
+                             client_metadata: dict | None = None,
+                             scope: str = _API_TOKEN_SCOPE) -> dict:
     """Invoke the user pool's PreTokenGeneration Lambda and apply its overrides.
 
     Honours both V1_0 (``LambdaConfig.PreTokenGeneration`` — id token only,
@@ -903,6 +959,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         trigger_source=trigger_source,
         version=v2_version if use_v2 else "V1_0",
         client_metadata=client_metadata,
+        scope=scope,
     )
 
     strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
@@ -970,7 +1027,8 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
 def _build_pretoken_event(pool_id: str, client_id: str, username: str,
                            user_attrs: dict, groups: list[str],
                            trigger_source: str, version: str,
-                           client_metadata: dict | None = None) -> dict:
+                           client_metadata: dict | None = None,
+                           scope: str = _API_TOKEN_SCOPE) -> dict:
     """Construct the event payload AWS sends to a PreTokenGeneration Lambda.
 
     Shape from the Cognito Developer Guide
@@ -987,7 +1045,7 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
         "clientMetadata": client_metadata or {},
     }
     if version.startswith("V2") or version.startswith("V3"):
-        request_block["scopes"] = ["aws.cognito.signin.user.admin"]
+        request_block["scopes"] = _aws_scope_order(scope.split(), presized=False)
 
     response_block = (
         {"claimsAndScopeOverrideDetails": None}
@@ -1096,6 +1154,74 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
         "autoVerifyEmail": bool(response.get("autoVerifyEmail")),
         "autoVerifyPhone": bool(response.get("autoVerifyPhone")),
     }
+
+
+# Token claims Cognito owns; an IdP claim of the same name only becomes a user
+# attribute when AttributeMapping maps it explicitly.
+_FEDERATION_RESERVED_CLAIMS = frozenset(
+    ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"))
+
+
+def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
+    """Registered token claims from InboundFederation output count only when mapped."""
+    mapped = set(attr_mapping.values())
+    return {k: v for k, v in claims.items()
+            if k not in _FEDERATION_RESERVED_CLAIMS or k in mapped}
+
+
+class _InboundFederationRejected(Exception):
+    """Raised when an InboundFederation Lambda trigger fails the federated sign-in."""
+
+
+def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: str,
+                                       provider_name: str, provider_type: str,
+                                       attributes: dict) -> dict:
+    """The InboundFederation Lambda's userAttributesToMap, ``{}`` when unconfigured; a failure raises."""
+    pool = _user_pools.get(pool_id)
+    cfg = ((pool or {}).get("LambdaConfig") or {}).get("InboundFederation")
+    arn = cfg.get("LambdaArn") if isinstance(cfg, dict) else None
+    if not arn:
+        return {}
+
+    event = {
+        "version": "1",
+        "triggerSource": "InboundFederation_ExternalProvider",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+        "request": {
+            "providerName": provider_name,
+            "providerType": provider_type,
+            "attributes": attributes,
+        },
+        "response": {"userAttributesToMap": {}},
+    }
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"InboundFederation Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("InboundFederation Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _InboundFederationRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = result.get("body") or "InboundFederation Lambda rejected the request."
+        logger.info("InboundFederation Lambda rejected sign-in for pool %s user %s: %s",
+                    pool_id, username, reason)
+        raise _InboundFederationRejected(str(reason))
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    to_map = (_extract_trigger_response(payload) or {}).get("userAttributesToMap")
+    if not isinstance(to_map, dict):
+        return {}
+    return {str(k): str(v) for k, v in to_map.items()
+            if isinstance(v, (str, int, float, bool))}
 
 
 def _build_presignup_event(pool_id: str, client_id: str, username: str,
@@ -2041,6 +2167,20 @@ def _oidc_callback_url(pool: dict) -> str:
     return f"{base}/oauth2/idpresponse"
 
 
+def _saml_sso_url_from_metadata(metadata_xml: str) -> str:
+    """The IdP's HTTP-Redirect SingleSignOnService Location, the binding Cognito sends AuthnRequests on; "" if none."""
+    if not metadata_xml:
+        return ""
+    try:
+        root = safe_xml_parse(metadata_xml.strip())
+    except Exception:
+        return ""
+    for el in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}SingleSignOnService"):
+        if el.get("Binding") == "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" and el.get("Location"):
+            return el.get("Location")
+    return ""
+
+
 def _build_saml_authn_request(pool: dict, destination: str) -> str:
     """Build a minimal SAML AuthnRequest, deflate + base64-encode for HTTP-Redirect binding."""
     req = Element("{urn:oasis:names:tc:SAML:2.0:protocol}AuthnRequest")
@@ -2513,6 +2653,7 @@ async def _dispatch_idp(action: str, data: dict):
         "CreateUserPoolDomain": _create_user_pool_domain,
         "DeleteUserPoolDomain": _delete_user_pool_domain,
         "DescribeUserPoolDomain": _describe_user_pool_domain,
+        "UpdateUserPoolDomain": _update_user_pool_domain,
         # Identity Providers
         "CreateIdentityProvider": _create_identity_provider,
         "DescribeIdentityProvider": _describe_identity_provider,
@@ -3858,7 +3999,8 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
-                        client_metadata: dict | None = None, origin_jti: str = "") -> dict:
+                        client_metadata: dict | None = None, origin_jti: str = "",
+                        scope: str | None = None) -> dict:
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -3870,12 +4012,12 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
                                     trigger_source=trigger_source,
-                                    client_metadata=client_metadata, origin_jti=origin_jti),
+                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
                                trigger_source=trigger_source,
-                               client_metadata=client_metadata, origin_jti=origin_jti),
-        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti),
+                               client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
+        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope),
         "TokenType": "Bearer",
         "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
@@ -4267,8 +4409,10 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
     if err:
         return None, err
+    claims = _token_claims(refresh_token)
     result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
-                                origin_jti=_token_claims(refresh_token).get("origin_jti", ""))
+                                origin_jti=claims.get("origin_jti", ""),
+                                scope=claims.get("scope"))
     result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None
 
@@ -4968,6 +5112,11 @@ def _cloudfront_domain(domain: str) -> str:
     return f"d{hashlib.sha256(domain.encode()).hexdigest()[:13]}.cloudfront.net"
 
 
+def _managed_login_version(requested, current):
+    """The domain's managed login version: a value other than 1 or 2 keeps the current one."""
+    return requested if requested in (1, 2) else current
+
+
 def _create_user_pool_domain(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -4983,6 +5132,9 @@ def _create_user_pool_domain(data):
     # expands to {prefix}.auth.{region}.amazoncognito.com. A pool may hold one of
     # each, so they are stored in separate fields.
     custom_config = data.get("CustomDomainConfig")
+    if custom_config is None and pool.get("Domain"):
+        return error_response_json(
+            "InvalidParameterException", "User pool already has a domain configured.", 400)
     if custom_config is not None:
         if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
             return error_response_json(
@@ -4997,7 +5149,59 @@ def _create_user_pool_domain(data):
         # CNAME to, so AWS returns a null CloudFrontDomain for it — omit it.
         cloudfront = None
     _pool_domain_map[domain] = pid
-    return json_response({"CloudFrontDomain": cloudfront} if cloudfront else {})
+    version = _managed_login_version(data.get("ManagedLoginVersion"), 1)
+    pool.setdefault("_managed_login_versions", {})[domain] = version
+    resp = {"ManagedLoginVersion": version}
+    if cloudfront:
+        resp["CloudFrontDomain"] = cloudfront
+    return json_response(resp)
+
+
+def _update_user_pool_domain(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    domain = data.get("Domain")
+    owner = _pool_domain_map.get(domain)
+    if owner is None:
+        return error_response_json("ResourceNotFoundException", "User pool domain was not found.", 400)
+    if owner != pid:
+        return error_response_json(
+            "InvalidParameterException", "The domain is not configured for this user pool.", 400)
+    is_custom = pool.get("CustomDomain") == domain
+    custom_config = data.get("CustomDomainConfig")
+    if custom_config is not None:
+        if not is_custom:
+            return error_response_json(
+                "InvalidParameterException", "Cannot convert prefix domain to custom domain.", 400)
+        if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
+            return error_response_json(
+                "InvalidParameterException",
+                "CustomDomainConfig must specify a CertificateArn.", 400)
+    versions = pool.setdefault("_managed_login_versions", {})
+    version = _managed_login_version(data.get("ManagedLoginVersion"), versions.get(domain, 1))
+    routing = data.get("Routing")
+    if routing:
+        if version != 2:
+            return error_response_json(
+                "InvalidParameterException", "Routing field is not supported for Hosted UI (classic)", 400)
+        # Failover routes to a replica region, and no user pool here has one.
+        region = (routing.get("Failover") or {}).get("SecondaryRegion")
+        if region == _pool_region(pid):
+            return error_response_json(
+                "InvalidParameterException",
+                "Routing field can only be configured when replica status is one of: "
+                "ACTIVE, CREATING, INACTIVE. Current status: null", 400)
+        return error_response_json(
+            "InvalidParameterException", f"Region {region} is not active for the user pool", 400)
+    versions[domain] = version
+    resp = {"ManagedLoginVersion": version}
+    if is_custom:
+        if custom_config is not None:
+            pool["_custom_domain_config"] = custom_config
+        resp["CloudFrontDomain"] = _cloudfront_domain(domain)
+    return json_response(resp)
 
 
 def _delete_user_pool_domain(data):
@@ -5007,6 +5211,7 @@ def _delete_user_pool_domain(data):
         return err
     domain = data.get("Domain")
     _pool_domain_map.pop(domain, None)
+    pool.get("_managed_login_versions", {}).pop(domain, None)
     if domain and pool.get("CustomDomain") == domain:
         pool["CustomDomain"] = None
         pool.pop("_custom_domain_config", None)
@@ -5035,6 +5240,7 @@ def _describe_user_pool_domain(data):
             "Version": "1",
             "Status": "ACTIVE",
             "CustomDomainConfig": pool.get("_custom_domain_config", {}) if is_custom else {},
+            "ManagedLoginVersion": pool.get("_managed_login_versions", {}).get(domain, 1),
         }
     })
 
@@ -5969,11 +6175,16 @@ def _oauth2_authorize_federation(query_params):
     details = provider.get("ProviderDetails", {})
 
     if provider_type == "SAML":
-        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataURL
-        sso_url = details.get("IDPSSOEndpoint") or details.get("MetadataURL", "")
+        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataFile > MetadataURL.
+        # MetadataURL is used verbatim because MiniStack does not fetch remote metadata.
+        sso_url = (details.get("IDPSSOEndpoint")
+                   or _saml_sso_url_from_metadata(details.get("MetadataFile", ""))
+                   or details.get("MetadataURL", ""))
         if not sso_url:
-            return error_response_json("InvalidParameterException",
-                                       "SAML provider has no IDPSSOEndpoint or MetadataURL.", 400)
+            return error_response_json(
+                "InvalidParameterException",
+                "SAML provider has no IDPSSOEndpoint, MetadataFile with an HTTP-Redirect SingleSignOnService, or MetadataURL.",
+                400)
         saml_request = _build_saml_authn_request(pool, sso_url)
         redirect_url = sso_url + ("&" if "?" in sso_url else "?") + urlencode({
             "SAMLRequest": saml_request,
@@ -6121,8 +6332,18 @@ def _saml2_idp_response(body: bytes, query_params):
     # Apply attribute mapping: IdP claim name → Cognito attribute name
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
+    try:
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, f"{provider_name}_{name_id}", provider_name, "SAML",
+            {"samlResponse": saml_data["attributes"]})
+        idp_attrs = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                     else dict(saml_data.get("attributes", {})))
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected SAML sign-in for %s: %s",
+                    name_id, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
     user_attrs = {}
-    for idp_claim, value in saml_data.get("attributes", {}).items():
+    for idp_claim, value in idp_attrs.items():
         cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
         user_attrs[cognito_attr] = value
 
@@ -6345,14 +6566,20 @@ def _oauth2_idp_response(method, body, query_params):
     # as the SAML branch.
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}
+    try:
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, f"{provider_name}_{claims.get('sub') or claims.get('email') or ''}",
+            provider_name, "OIDC", {"idToken": claims})
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
+                    claims.get("sub"), e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    idp_claims = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                  else {k: str(v) for k, v in claims.items()
+                        if k not in _FEDERATION_RESERVED_CLAIMS and isinstance(v, (str, int, float, bool))})
     user_attrs = {}
-    for idp_claim, value in claims.items():
-        if idp_claim in ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"):
-            continue
-        if not isinstance(value, (str, int, float, bool)):
-            continue
-        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
-        user_attrs[cognito_attr] = str(value)
+    for idp_claim, value in idp_claims.items():
+        user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value
 
     # Stable identifier: prefer `sub` from id_token, fall back to `email` or
     # a generated UUID so users can be re-found on subsequent logins.
@@ -6786,6 +7013,8 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         "token_type": "Bearer",
         "expires_in": 3600,
     }
+    if not _id_token_granted(claims.get("scope")):
+        del resp["id_token"]
     return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
 
@@ -6857,8 +7086,9 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if not user:
                 return _oauth2_error("server_error", "User not found.")
 
+            scope = _granted_scopes(client, entry.get("scope"))
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
-                                         trigger_source="TokenGeneration_HostedAuth")
+                                         trigger_source="TokenGeneration_HostedAuth", scope=scope)
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -6874,6 +7104,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 "token_type": "Bearer",
                 "expires_in": result["ExpiresIn"],
             }
+            if not _id_token_granted(scope):
+                del resp["id_token"]
             return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
         # Try SAML/OIDC federation auth codes
@@ -6893,6 +7125,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             user_attrs = {}
             groups = []
             origin_jti = new_uuid()
+            scope = _granted_scopes(_find_pool_by_client_id(effective_client_id)[2], code_data.get("scopes"))
             pool = _get_pool_unscoped(pool_id)
             if pool:
                 user = pool["_users"].get(username)
@@ -6903,19 +7136,24 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
             access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
                                         user_attrs=user_attrs, groups=groups,
-                                        trigger_source="TokenGeneration_HostedAuth", origin_jti=origin_jti)
+                                        trigger_source="TokenGeneration_HostedAuth", origin_jti=origin_jti,
+                                        scope=scope)
             id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
                                     groups=groups, trigger_source="TokenGeneration_HostedAuth",
-                                    nonce=code_data.get("nonce", ""), origin_jti=origin_jti)
-            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti)
+                                    nonce=code_data.get("nonce", ""), origin_jti=origin_jti, scope=scope)
+            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti,
+                                        scope=scope)
 
-            return json_response({
+            resp = {
                 "id_token": id_token,
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "token_type": "Bearer",
                 "expires_in": _token_validity(pool_id, effective_client_id, "access"),
-            })
+            }
+            if not _id_token_granted(scope):
+                del resp["id_token"]
+            return json_response(resp)
 
         return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
@@ -6943,15 +7181,21 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         attrs = _attr_list_to_dict(user.get("Attributes", []))
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
-        origin_jti = _token_claims(refresh_val).get("origin_jti", "")
+        refresh_claims = _token_claims(refresh_val)
+        origin_jti = refresh_claims.get("origin_jti", "")
+        scope = refresh_claims.get("scope")
         resp = {
             "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
-                                         trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
+                                         trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
+                                         scope=scope),
             "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
-                                     trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti),
+                                     trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
+                                     scope=scope),
             "token_type": "Bearer",
             "expires_in": _token_validity(pool_id, client_id, "access"),
         }
+        if not _id_token_granted(scope):
+            del resp["id_token"]
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
     # ── client_credentials ──
@@ -6981,7 +7225,8 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
         access_token = _fake_token(cid, pool_id, cid, "access",
                                     trigger_source="TokenGeneration_ClientCredentials",
-                                    client_metadata=client_metadata)
+                                    client_metadata=client_metadata,
+                                    scope=_granted_scopes(client, form.get("scope"), "client_credentials"))
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",

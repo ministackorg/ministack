@@ -12,6 +12,7 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
             PutDashboard, GetDashboard, DeleteDashboards, ListDashboards.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -1142,13 +1143,41 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
 # ---------------------------------------------------------------------------
 
 
+def _max_records_error(raw):
+    """ValidationError message for a MaxRecords outside 1..100, else None."""
+    if raw in (None, ""):
+        return None
+    value = int(raw)
+    if value < 1:
+        bound = "greater than or equal to 1"
+    elif value > 100:
+        bound = "less than or equal to 100"
+    else:
+        return None
+    return (f"1 validation error detected: Value '{value}' at 'maxRecords' failed to satisfy constraint: "
+            f"Member must have value {bound}")
+
+
+def _encode_page_token(position):
+    return base64.urlsafe_b64encode(position.encode()).decode().rstrip("=")
+
+
+def _decode_page_token(token):
+    """Position carried by a token from _encode_page_token, or None for any other string."""
+    try:
+        return base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+    except ValueError:
+        return None
+
+
 def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         names = cbor_data.get("AlarmNames", [])
         prefix = cbor_data.get("AlarmNamePrefix")
         state = cbor_data.get("StateValue")
-        alarm_types = cbor_data.get("AlarmTypes", ["MetricAlarm", "CompositeAlarm"])
-        max_records = cbor_data.get("MaxRecords", 100)
+        alarm_types = cbor_data.get("AlarmTypes") or ["MetricAlarm"]
+        max_records = cbor_data.get("MaxRecords")
+        next_token = cbor_data.get("NextToken")
     else:
         names = [
             _p(params, f"AlarmNames.member.{i}")
@@ -1161,8 +1190,14 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
             _p(params, f"AlarmTypes.member.{i}")
             for i in range(1, 11)
             if _p(params, f"AlarmTypes.member.{i}")
-        ] or ["MetricAlarm", "CompositeAlarm"]
-        max_records = int(_p(params, "MaxRecords") or "100")
+        ] or ["MetricAlarm"]
+        max_records = _p(params, "MaxRecords")
+        next_token = _p(params, "NextToken")
+
+    invalid = _max_records_error(max_records)
+    if invalid:
+        return _error("ValidationError", invalid, 400, use_json=is_json, use_cbor=is_cbor)
+    max_records = int(max_records or 50)
 
     metric_alarms = []
     composite_results = []
@@ -1187,19 +1222,33 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
                 continue
             composite_results.append(alarm)
 
-    metric_alarms = metric_alarms[:max_records]
+    # One listing in name order across both types; MaxRecords counts them together.
+    listing = sorted(
+        [(a["AlarmName"], 0, a) for a in metric_alarms] + [(a["AlarmName"], 1, a) for a in composite_results],
+        key=lambda entry: entry[:2],
+    )
+    # As on AWS, the token is the name of the next page's first alarm and a page starts at the first name at or
+    # after it, so any string is a valid token and alarms created or deleted between pages shift nothing.
+    if next_token:
+        listing = [entry for entry in listing if entry[0] >= next_token]
+    page = listing[:max_records]
+    token = listing[max_records][0] if len(listing) > max_records else None
+    metric_alarms = [a for _, kind, a in page if kind == 0]
+    composite_results = [a for _, kind, a in page if kind == 1]
 
     if is_cbor:
-        return _cbor_ok(
-            {
-                "MetricAlarms": [_cbor_alarm(a) for a in metric_alarms],
-                "CompositeAlarms": [_cbor_alarm(a) for a in composite_results],
-            }
-        )
+        result = {
+            "MetricAlarms": [_cbor_alarm(a) for a in metric_alarms],
+            "CompositeAlarms": [_cbor_alarm(a) for a in composite_results],
+        }
+        if token:
+            result["NextToken"] = token
+        return _cbor_ok(result)
     if is_json:
-        return _json_ok(
-            {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
-        )
+        result = {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
+        if token:
+            result["NextToken"] = token
+        return _json_ok(result)
 
     metric_members = "".join(
         f"<member><AlarmName>{a['AlarmName']}</AlarmName><AlarmArn>{a['AlarmArn']}</AlarmArn>"
@@ -1225,6 +1274,7 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
         f"<DescribeAlarmsResult>"
         f"<MetricAlarms>{metric_members}</MetricAlarms>"
         f"<CompositeAlarms>{comp_members}</CompositeAlarms>"
+        f"{f'<NextToken>{token}</NextToken>' if token else ''}"
         f"</DescribeAlarmsResult>",
     )
 
@@ -1277,29 +1327,60 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         history_type = cbor_data.get("HistoryItemType")
         start_date = _parse_ts(cbor_data.get("StartDate"))
         end_date = _parse_ts(cbor_data.get("EndDate"))
-        max_records = int(cbor_data.get("MaxRecords", 100))
+        max_records = cbor_data.get("MaxRecords")
+        next_token = cbor_data.get("NextToken")
+        scan_by = cbor_data.get("ScanBy")
     else:
         alarm_name = _p(params, "AlarmName")
         history_type = _p(params, "HistoryItemType")
         start_date = _parse_ts(_p(params, "StartDate"))
         end_date = _parse_ts(_p(params, "EndDate"))
-        max_records = int(_p(params, "MaxRecords") or "100")
+        max_records = _p(params, "MaxRecords")
+        next_token = _p(params, "NextToken")
+        scan_by = _p(params, "ScanBy")
 
-    items = list(_history_entries())
+    items = list(enumerate(_history_entries()))
     if alarm_name:
-        items = [h for h in items if h["AlarmName"] == alarm_name]
+        items = [(i, h) for i, h in items if h["AlarmName"] == alarm_name]
     if history_type:
-        items = [h for h in items if h["HistoryItemType"] == history_type]
+        items = [(i, h) for i, h in items if h["HistoryItemType"] == history_type]
     if start_date is not None:
-        items = [h for h in items if _parse_ts(h["Timestamp"]) >= start_date]
+        items = [(i, h) for i, h in items if _parse_ts(h["Timestamp"]) >= start_date]
     if end_date is not None:
-        items = [h for h in items if _parse_ts(h["Timestamp"]) <= end_date]
-    items = items[:max_records]
+        items = [(i, h) for i, h in items if _parse_ts(h["Timestamp"]) <= end_date]
+
+    invalid = _max_records_error(max_records)
+    if invalid:
+        return _error("ValidationError", invalid, 400, use_json=is_json, use_cbor=is_cbor)
+    max_records = int(max_records or 50)
+    start = None
+    if next_token:
+        start = _decode_page_token(next_token)
+        if start is None or not start.isdigit():
+            return _error("InvalidNextToken", f"Invalid NextToken : {next_token}", 400,
+                          use_json=is_json, use_cbor=is_cbor)
+        start = int(start)
+
+    # Entries are stored oldest first and only appended; ScanBy defaults to TimestampDescending.
+    # The token holds the stored index of the next entry, so new entries do not shift a scan.
+    descending = scan_by != "TimestampAscending"
+    if descending:
+        items.reverse()
+    if start is not None:
+        items = [(i, h) for i, h in items if (i <= start if descending else i >= start)]
+    token = _encode_page_token(str(items[max_records][0])) if len(items) > max_records else None
+    items = [h for _, h in items[:max_records]]
 
     if is_cbor:
-        return _cbor_ok({"AlarmHistoryItems": [_cbor_history_item(i) for i in items]})
+        result = {"AlarmHistoryItems": [_cbor_history_item(i) for i in items]}
+        if token:
+            result["NextToken"] = token
+        return _cbor_ok(result)
     if is_json:
-        return _json_ok({"AlarmHistoryItems": items})
+        result = {"AlarmHistoryItems": items}
+        if token:
+            result["NextToken"] = token
+        return _json_ok(result)
 
     members = "".join(
         f"<member><AlarmName>{h['AlarmName']}</AlarmName>"
@@ -1312,6 +1393,7 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         200,
         "DescribeAlarmHistoryResponse",
         f"<DescribeAlarmHistoryResult><AlarmHistoryItems>{members}</AlarmHistoryItems>"
+        f"{f'<NextToken>{token}</NextToken>' if token else ''}"
         f"</DescribeAlarmHistoryResult>",
     )
 
@@ -1853,10 +1935,13 @@ def _error(code, message, status, use_json=False, use_cbor=False):
             {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": code},
             json.dumps({"__type": code, "message": message}).encode(),
         )
+    # Query-protocol error envelope per real-AWS captures (17-region
+    # sweep): <Type> inside <Error> (Sender for 4xx, Receiver for 5xx)
+    # and no <?xml?> declaration.
+    fault_type = "Sender" if status < 500 else "Receiver"
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<ErrorResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
-        f"    <Error><Code>{code}</Code><Message>{message}</Message></Error>\n"
+        f"    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>\n"
         f"    <RequestId>{new_uuid()}</RequestId>\n"
         f"</ErrorResponse>"
     ).encode("utf-8")

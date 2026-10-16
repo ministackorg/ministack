@@ -155,6 +155,113 @@ def test_cloudwatch_describe_alarms_v2(cw):
     for i in range(3):
         assert f"cw-da-v2-{i}" in names
 
+
+def _put_paging_alarm(cw, name):
+    cw.put_metric_alarm(
+        AlarmName=name, MetricName="M", Namespace="N", Statistic="Sum", Period=60,
+        EvaluationPeriods=1, Threshold=1.0, ComparisonOperator="GreaterThanThreshold",
+    )
+
+
+def test_cloudwatch_describe_alarms_pages_both_types_in_name_order(cw):
+    prefix = f"cw-page-{_uuid_mod.uuid4().hex[:8]}-"
+    metric = [f"{prefix}m-{i}" for i in (3, 0, 4, 1, 2)]
+    for name in metric + [f"{prefix}A-upper"]:
+        _put_paging_alarm(cw, name)
+    for name in (f"{prefix}c-1", f"{prefix}z-2"):
+        cw.put_composite_alarm(AlarmName=name, AlarmRule=f'ALARM("{metric[0]}")')
+    try:
+        pages, token = [], None
+        while True:
+            kwargs = {"NextToken": token} if token else {}
+            resp = cw.describe_alarms(AlarmNamePrefix=prefix, AlarmTypes=["MetricAlarm", "CompositeAlarm"],
+                                      MaxRecords=3, **kwargs)
+            pages.append(([a["AlarmName"][len(prefix):] for a in resp["MetricAlarms"]],
+                          [a["AlarmName"][len(prefix):] for a in resp["CompositeAlarms"]]))
+            token = resp.get("NextToken")
+            if not token:
+                break
+        # One byte-ordered listing across both types; MaxRecords counts both.
+        assert pages == [
+            (["A-upper", "m-0"], ["c-1"]),
+            (["m-1", "m-2", "m-3"], []),
+            (["m-4"], ["z-2"]),
+        ]
+
+        paginated = cw.get_paginator("describe_alarms").paginate(
+            AlarmNamePrefix=prefix, AlarmTypes=["MetricAlarm", "CompositeAlarm"], PaginationConfig={"PageSize": 2})
+        assert len(paginated.build_full_result()["MetricAlarms"]) == 6
+    finally:
+        for name in (f"{prefix}c-1", f"{prefix}z-2"):
+            cw.delete_alarms(AlarmNames=[name])
+        cw.delete_alarms(AlarmNames=metric + [f"{prefix}A-upper"])
+
+
+def test_cloudwatch_describe_alarms_next_token_survives_changes_between_pages(cw):
+    prefix = f"cw-page-chg-{_uuid_mod.uuid4().hex[:8]}-"
+    names = [f"{prefix}m-{i}" for i in range(6)]
+    for name in names:
+        _put_paging_alarm(cw, name)
+    try:
+        first = cw.describe_alarms(AlarmNamePrefix=prefix, MaxRecords=2)
+        assert [a["AlarmName"] for a in first["MetricAlarms"]] == names[:2]
+        assert first["NextToken"] == names[2]
+        # Delete the alarm the token names and the page before it, add one alarm on each side of the token.
+        cw.delete_alarms(AlarmNames=names[:3])
+        _put_paging_alarm(cw, f"{prefix}m-1a")
+        _put_paging_alarm(cw, f"{prefix}m-2a")
+        second = cw.describe_alarms(AlarmNamePrefix=prefix, MaxRecords=2, NextToken=first["NextToken"])
+        assert [a["AlarmName"] for a in second["MetricAlarms"]] == [f"{prefix}m-2a", names[3]]
+        third = cw.describe_alarms(AlarmNamePrefix=prefix, MaxRecords=2, NextToken=second["NextToken"])
+        assert [a["AlarmName"] for a in third["MetricAlarms"]] == names[4:6]
+        assert "NextToken" not in third
+    finally:
+        cw.delete_alarms(AlarmNames=names + [f"{prefix}m-1a", f"{prefix}m-2a"])
+
+
+def test_cloudwatch_describe_alarms_defaults_to_50_metric_alarms(cw):
+    prefix = f"cw-page-def-{_uuid_mod.uuid4().hex[:8]}-"
+    names = [f"{prefix}{i:02d}" for i in range(52)]
+    for name in names:
+        _put_paging_alarm(cw, name)
+    cw.put_composite_alarm(AlarmName=f"{prefix}comp", AlarmRule=f'ALARM("{names[0]}")')
+    try:
+        first = cw.describe_alarms(AlarmNamePrefix=prefix)
+        assert [a["AlarmName"] for a in first["MetricAlarms"]] == names[:50]
+        assert first["CompositeAlarms"] == []
+        second = cw.describe_alarms(AlarmNamePrefix=prefix, NextToken=first["NextToken"])
+        assert [a["AlarmName"] for a in second["MetricAlarms"]] == names[50:]
+        assert "NextToken" not in second
+    finally:
+        cw.delete_alarms(AlarmNames=[f"{prefix}comp"])
+        cw.delete_alarms(AlarmNames=names)
+
+
+def test_cloudwatch_describe_alarms_max_records_bounds_and_any_token():
+    from conftest import make_client
+
+    raw = make_client("cloudwatch", {"parameter_validation": False})
+    for value, bound in ((0, "greater than or equal to 1"), (101, "less than or equal to 100")):
+        with pytest.raises(ClientError) as exc:
+            raw.describe_alarms(MaxRecords=value)
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == (
+            f"1 validation error detected: Value '{value}' at 'maxRecords' failed to satisfy constraint: "
+            f"Member must have value {bound}"
+        )
+    prefix = f"cw-page-tok-{_uuid_mod.uuid4().hex[:8]}-"
+    names = [f"{prefix}{i}" for i in range(2)]
+    for name in names:
+        _put_paging_alarm(raw, name)
+    try:
+        # Any string is a name to start from: one after every name gives an empty page, one before them the first.
+        resp = raw.describe_alarms(AlarmNamePrefix=prefix, NextToken="zzzz")
+        assert resp["MetricAlarms"] == [] and "NextToken" not in resp
+        resp = raw.describe_alarms(AlarmNamePrefix=prefix, NextToken="aaaa")
+        assert [a["AlarmName"] for a in resp["MetricAlarms"]] == names
+    finally:
+        raw.delete_alarms(AlarmNames=names)
+
 def test_cloudwatch_delete_alarms_v2(cw):
     cw.put_metric_alarm(
         AlarmName="cw-del-v2",
@@ -522,6 +629,50 @@ def test_cloudwatch_describe_alarm_history(cw):
     assert "AlarmHistoryItems" in resp
     cw.delete_alarms(AlarmNames=[alarm_name])
 
+
+def test_cloudwatch_describe_alarm_history_pages_newest_first(cw):
+    alarm_name = f"intg-hist-page-{_uuid_mod.uuid4().hex[:8]}"
+    _put_paging_alarm(cw, alarm_name)
+    for state in ("ALARM", "OK", "ALARM"):
+        cw.set_alarm_state(AlarmName=alarm_name, StateValue=state, StateReason="paging")
+    try:
+        query = {"AlarmName": alarm_name, "HistoryItemType": "StateUpdate"}
+        everything = cw.describe_alarm_history(**query)["AlarmHistoryItems"]
+        assert [h["HistorySummary"] for h in everything[:3]] == [
+            "Alarm updated from OK to ALARM",
+            "Alarm updated from ALARM to OK",
+            "Alarm updated from INSUFFICIENT_DATA to ALARM",
+        ]
+        ascending = cw.describe_alarm_history(ScanBy="TimestampAscending", **query)["AlarmHistoryItems"]
+        assert ascending == everything[::-1]
+
+        first = cw.describe_alarm_history(MaxRecords=2, **query)
+        assert first["AlarmHistoryItems"] == everything[:2]
+        # A state change between pages adds a newer entry; the scan goes on where it stopped.
+        cw.set_alarm_state(AlarmName=alarm_name, StateValue="OK", StateReason="paging")
+        second = cw.describe_alarm_history(MaxRecords=2, NextToken=first["NextToken"], **query)
+        assert second["AlarmHistoryItems"] == everything[2:4]
+        everything = cw.describe_alarm_history(**query)["AlarmHistoryItems"]
+        paginated = cw.get_paginator("describe_alarm_history").paginate(
+            PaginationConfig={"PageSize": 2}, **query)
+        assert paginated.build_full_result()["AlarmHistoryItems"] == everything
+    finally:
+        cw.delete_alarms(AlarmNames=[alarm_name])
+
+
+def test_cloudwatch_describe_alarm_history_max_records_bounds_and_unknown_token():
+    from conftest import make_client
+
+    raw = make_client("cloudwatch", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw.describe_alarm_history(MaxRecords=101)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert "Member must have value less than or equal to 100" in exc.value.response["Error"]["Message"]
+    with pytest.raises(ClientError) as exc:
+        raw.describe_alarm_history(NextToken="bogus-token")
+    assert exc.value.response["Error"]["Code"] == "InvalidNextToken"
+    assert exc.value.response["Error"]["Message"] == "Invalid NextToken : bogus-token"
+
 def test_cloudwatch_get_metric_data_time_range(cw):
     """GetMetricData respects StartTime/EndTime filtering."""
     import datetime
@@ -827,6 +978,48 @@ def test_cloudwatch_describe_alarms_cbor_omits_absent_optional_fields():
         assert not _cbor_has_nil(decoded)
     finally:
         _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
+
+
+def test_cloudwatch_describe_alarms_next_token_over_cbor_and_query():
+    import re as _re
+
+    import cbor2
+
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    prefix = f"wire-page-{_uuid_mod.uuid4().hex[:8]}-"
+    names = [f"{prefix}{i}" for i in range(3)]
+    try:
+        for name in names:
+            _cw._put_metric_alarm({}, {
+                "AlarmName": name, "ComparisonOperator": "GreaterThanThreshold", "EvaluationPeriods": 1,
+                "MetricName": "Errors", "Namespace": "AWS/Lambda", "Period": 300, "Statistic": "Sum",
+                "Threshold": 1,
+            }, is_cbor=True)
+
+        _, _, body = _cw._describe_alarms({}, {"AlarmNamePrefix": prefix, "MaxRecords": 2}, is_cbor=True)
+        decoded = cbor2.loads(body)
+        assert [a["AlarmName"] for a in decoded["MetricAlarms"]] == names[:2]
+        _, _, body = _cw._describe_alarms(
+            {}, {"AlarmNamePrefix": prefix, "MaxRecords": 2, "NextToken": decoded["NextToken"]}, is_cbor=True)
+        decoded = cbor2.loads(body)
+        assert [a["AlarmName"] for a in decoded["MetricAlarms"]] == names[2:]
+        assert "NextToken" not in decoded
+
+        _, _, body = _cw._describe_alarms({"AlarmNamePrefix": [prefix], "MaxRecords": ["2"]}, {}, is_cbor=False)
+        token = _re.search(r"<NextToken>([^<]+)</NextToken>", body.decode()).group(1)
+        _, _, body = _cw._describe_alarms(
+            {"AlarmNamePrefix": [prefix], "MaxRecords": ["2"], "NextToken": [token]}, {}, is_cbor=False)
+        assert _re.findall(r"<AlarmName>([^<]+)</AlarmName>", body.decode()) == names[2:]
+        assert "<NextToken>" not in body.decode()
+    finally:
+        for name in names:
+            _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
         _resp._request_region.reset(region_tok)
         _resp._request_account_id.reset(acct_tok)
 

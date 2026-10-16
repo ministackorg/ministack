@@ -309,6 +309,23 @@ def test_aws_shaped_hosts_route_as_before(host, expected):
 
 
 @pytest.mark.parametrize("host", [
+    "abcd1234.appsync-api.eu-central-1.amazonaws.com",
+    "abcd1234.appsync-api.us-east-1.localhost:4566",
+    "abcd1234.appsync-api.localhost:4566",
+])
+@pytest.mark.parametrize("signed", [False, True])
+def test_appsync_api_hosts_route_graphql_to_appsync_and_event_to_events(host, signed):
+    headers = {"host": host}
+    if signed:
+        headers["authorization"] = (
+            "AWS4-HMAC-SHA256 Credential=test/20261012/us-east-1/appsync/aws4_request, "
+            "SignedHeaders=host, Signature=x"
+        )
+    assert detect_service("POST", "/graphql", headers, {}) == "appsync"
+    assert detect_service("POST", "/event", headers, {}) == "appsync-events"
+
+
+@pytest.mark.parametrize("host", [
     "probe.iot.example.com",
     "logs.example.com",
     "email.corp.example",

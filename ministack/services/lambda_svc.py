@@ -6129,6 +6129,15 @@ def _remove_permission(
     return 204, {}, b""
 
 
+def function_policy_for_arn(resource_arn: str) -> tuple[dict, str] | None:
+    """The function's resource policy and owner account, for the identity check."""
+    _, sep, ref = resource_arn.partition(":function:")
+    func = _functions.get(_resolve_request_scoped_name(unquote(ref))) if sep else None
+    if func is None:
+        return None
+    return func["policy"], get_account_id()
+
+
 def _get_policy(
     func_name: str,
     query_params: dict | None = None,

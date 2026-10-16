@@ -711,6 +711,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # win before credential-scope routing.
     if method == "POST" and path == "/event" and re.search(r"\.appsync-api\.", host):
         return "appsync-events"
+    # GraphQL requests use the same host family with the fixed "/graphql" path.
+    if method == "POST" and path == "/graphql" and re.search(r"\.appsync-api\.", host):
+        return "appsync"
 
     # 2. Check Authorization header for service name in credential scope
     if auth:
@@ -961,6 +964,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateRoleDescription": "iam",
             "PutRolePermissionsBoundary": "iam",
             "DeleteRolePermissionsBoundary": "iam",
+            "PutUserPermissionsBoundary": "iam",
+            "DeleteUserPermissionsBoundary": "iam",
             "AttachUserPolicy": "iam",
             "DetachUserPolicy": "iam",
             "ListAttachedUserPolicies": "iam",
@@ -976,6 +981,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "GetCallerIdentity": "sts",
             "AssumeRole": "sts",
             "GetSessionToken": "sts",
+            "GetFederationToken": "sts",
             "AssumeRoleWithWebIdentity": "sts",
             "AssumeRoleWithSAML": "sts",
             # CloudWatch actions

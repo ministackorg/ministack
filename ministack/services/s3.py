@@ -769,10 +769,13 @@ _ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/Authenticated
 # The permissions that answer a read and a write, FULL_CONTROL covering both.
 _ACL_READ_PERMS = ("READ", "FULL_CONTROL")
 _ACL_WRITE_PERMS = ("WRITE", "FULL_CONTROL")
+_ACL_READ_ACP_PERMS = ("READ_ACP", "FULL_CONTROL")
+# Object reads an object ACL grants nothing for: READ covers the data, READ_ACP the ACL.
+_ACL_UNGRANTED_OBJECT_READS = ("uploadId", "annotation", "tagging", "retention", "legal-hold", "attributes")
 
 
-def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
-    """``(group URI, permission)`` for every Group grant in a stored ACL."""
+def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str, str]]:
+    """``(grantee, permission)`` for every grant in a stored ACL naming a group ``URI`` or a canonical ``ID``."""
     if not stored_xml:
         return []
     try:
@@ -783,14 +786,14 @@ def _acl_group_grants(stored_xml: str | None) -> list[tuple[str, str]]:
     for grant in root.iter():
         if not grant.tag.endswith("Grant"):
             continue
-        uri = permission = ""
+        value = permission = ""
         for child in grant.iter():
-            if child.tag.endswith("URI") and child.text:
-                uri = child.text.strip()
+            if child.tag.rsplit("}", 1)[-1] == grantee and child.text:
+                value = child.text.strip()
             elif child.tag.endswith("Permission") and child.text:
                 permission = child.text.strip()
-        if uri and permission:
-            grants.append((uri, permission))
+        if value and permission:
+            grants.append((value, permission))
     return grants
 
 
@@ -834,26 +837,42 @@ def _bucket_owner_account(name: str) -> str | None:
     return None
 
 
+def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The bucket policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    if not resource_arn.startswith("arn:aws:s3:::"):
+        return None
+    bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]
+    owner = get_account_id()
+    if not _buckets.contains_scoped(owner, None, bucket):
+        return None
+    return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
+
+
 def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
                            method: str, query_params: dict, caller: str) -> bool:
     """Whether a caller who does not own the bucket may have this request.
 
     The owner's grants decide it: a Group grant on the bucket or the object
-    ACL, or an allow in the bucket policy. Nothing granted means the request
-    is denied, which is S3's default for a bucket nobody has opened up.
+    ACL, a grant to the caller's canonical ID on the object ACL, or an allow
+    in the bucket policy. Nothing granted means the request is denied, which
+    is S3's default for a bucket nobody has opened up.
     """
+    object_acl, object_wants = _foreign_object_acl(owner_account, bucket_name, key, method, query_params)
+    caller_id = _canonical_owner_id(caller) if caller else ""
+    if any(grantee == caller_id and permission in object_wants
+           for grantee, permission in _acl_grants(object_acl, "ID")):
+        # A grant to one account is not public, so Block Public Access leaves it alone.
+        return True
     if _public_access_blocked(owner_account, bucket_name):
         return False
     wants = _ACL_READ_PERMS if method in ("GET", "HEAD") else _ACL_WRITE_PERMS
     groups = [_ACL_GROUP_ALL_USERS] if not caller else [
         _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
 
-    acls = [_bucket_acl.get_scoped(owner_account, None, bucket_name)]
-    if key:
-        acls.append(_object_acl.get_scoped(owner_account, None, (bucket_name, key, "")))
-    for stored in acls:
-        for uri, permission in _acl_group_grants(stored):
-            if uri in groups and permission in wants:
+    for stored, granted in ((_bucket_acl.get_scoped(owner_account, None, bucket_name), wants),
+                            (object_acl, object_wants)):
+        for uri, permission in _acl_grants(stored):
+            if uri in groups and permission in granted:
                 return True
 
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
@@ -873,6 +892,20 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
         if evaluate_resource_policy(policy, ctx).decision == "Allow":
             return True
     return False
+
+
+def _foreign_object_acl(owner_account: str, bucket_name: str, key: str, method: str,
+                        query_params: dict) -> tuple[str | None, tuple[str, ...]]:
+    """The stored ACL of the object version a read addresses, and the permissions that grant the read."""
+    if not key or method not in ("GET", "HEAD") or any(q in query_params for q in _ACL_UNGRANTED_OBJECT_READS):
+        return None, ()
+    bucket = _buckets.get_scoped(owner_account, None, bucket_name)
+    if bucket is None or _bucket_owner_enforced(bucket):
+        # BucketOwnerEnforced disables ACLs: only policies grant access.
+        return None, ()
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    wants = _ACL_READ_ACP_PERMS if "acl" in query_params else _ACL_READ_PERMS
+    return _object_acl.get_scoped(owner_account, None, (bucket_name, key, version_id)), wants
 
 
 def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
@@ -1659,6 +1692,30 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
 # ---------------------------------------------------------------------------
 
 
+_PRESIGN_MAX_EXPIRES = 604800
+
+
+def _presign_time_error(amz_date: str, expires: str, path: str) -> tuple | None:
+    """Under AUTH=true, refuse a presign with a malformed time, a lifetime over a week or a date in the future."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    try:
+        signed_at = _dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return _error("AuthorizationQueryParametersError",
+                      "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"", 400, path)
+    if expires and not expires.isdigit():
+        return _error("AuthorizationQueryParametersError", "X-Amz-Expires should be a number", 400, path)
+    if expires and int(expires) > _PRESIGN_MAX_EXPIRES:
+        return _error("AuthorizationQueryParametersError",
+                      "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires "
+                      f"must be less than {_PRESIGN_MAX_EXPIRES} seconds", 400, path)
+    if signed_at > _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=15):
+        return _error("AccessDenied", "Request is not yet valid", 403, path)
+    return None
+
+
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
@@ -1695,6 +1752,9 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     # Expiry: a presigned URL past X-Amz-Date + X-Amz-Expires is rejected by S3
     # with 403 AccessDenied "Request has expired", independent of the signature.
     expires = _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", "")
+    time_error = _presign_time_error(amz_date, expires, path)
+    if time_error:
+        return time_error
     if expires:
         try:
             if presigned_request_is_expired(amz_date, expires):
@@ -2088,14 +2148,14 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
 # ---------------------------------------------------------------------------
 
 
-def _canonical_owner_id() -> str:
-    """The S3 canonical user ID for the current account.
+def _canonical_owner_id(account_id: str = "") -> str:
+    """The S3 canonical user ID for *account_id*, the current account by default.
 
     Real S3 reports an opaque 64-character hex canonical ID (not the account
     ID) and returns the same value from every Owner / CanonicalUser field
     (ListBuckets, GetBucketAcl, GetObjectAcl, object listings). MiniStack
     derives a stable one from the account so those fields agree (#1459)."""
-    return hashlib.sha256(get_account_id().encode()).hexdigest()
+    return hashlib.sha256((account_id or get_account_id()).encode()).hexdigest()
 
 
 def _list_buckets(query_params=None):
