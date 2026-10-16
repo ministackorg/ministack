@@ -138,8 +138,6 @@ def _get_topic(topic_arn: str, action: str | None = None):
     arn = _normalize_arn(topic_arn)
     topic = _topic_by_arn_any_scope(arn)
     if topic is None:
-        if not_found_error is not None:
-            return None, not_found_error
         return None, _error("NotFound", f"Topic does not exist: {arn}", 404)
     if action is not None:
         denied = _enforce_topic_policy(topic, action)
