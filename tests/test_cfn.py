@@ -16583,6 +16583,66 @@ def test_cfn_restapi_openapi_body_security_definitions(cfn, apigw_v1, cognito_id
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
+def test_cfn_restapi_body_from_export_keeps_authorizer(cfn, apigw_v1):
+    """An export with extensions=authorizers, used as a RestApi Body, creates the same authorizer."""
+    authorizer_uri = (
+        "arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+        "arn:aws:lambda:us-east-1:000000000000:function:auth/invocations"
+    )
+    source_id = apigw_v1.create_rest_api(name="cfn-export-source")["id"]
+    stack_name = f"intg-cfn-export-roundtrip-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        root_id = apigw_v1.get_resources(restApiId=source_id)["items"][0]["id"]
+        authorizer_id = apigw_v1.create_authorizer(
+            restApiId=source_id,
+            name="TokenAuth",
+            type="TOKEN",
+            authorizerUri=authorizer_uri,
+            identitySource="method.request.header.X-Token",
+        )["id"]
+        apigw_v1.put_method(
+            restApiId=source_id,
+            resourceId=root_id,
+            httpMethod="GET",
+            authorizationType="CUSTOM",
+            authorizerId=authorizer_id,
+        )
+        deployment_id = apigw_v1.create_deployment(restApiId=source_id)["id"]
+        apigw_v1.create_stage(restApiId=source_id, stageName="prod", deploymentId=deployment_id)
+        body = json.loads(apigw_v1.get_export(
+            restApiId=source_id,
+            stageName="prod",
+            exportType="oas30",
+            accepts="application/json",
+            parameters={"extensions": "authorizers"},
+        )["body"].read())
+
+        template = json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Body": body}}},
+            "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+        })
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        api_id = stack["Outputs"][0]["OutputValue"]
+
+        [authorizer] = apigw_v1.get_authorizers(restApiId=api_id)["items"]
+        assert authorizer["name"] == "TokenAuth"
+        assert authorizer["type"] == "TOKEN"
+        assert authorizer["authorizerUri"] == authorizer_uri
+        assert authorizer["identitySource"] == "method.request.header.X-Token"
+
+        root_id = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+        method = apigw_v1.get_method(restApiId=api_id, resourceId=root_id, httpMethod="GET")
+        assert method["authorizationType"] == "CUSTOM"
+        assert method["authorizerId"] == authorizer["id"]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        apigw_v1.delete_rest_api(restApiId=source_id)
+
+
 def test_cfn_restapi_openapi_body_document_level_security(cfn, apigw_v1):
     """A document-level security block applies to every operation that does not
     override it, and an operation's empty security list opts back out."""
