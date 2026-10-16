@@ -685,6 +685,9 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "Identifier",
         "requires_replacement": _requires_replacement_cognito_resource_server,
     },
+    # Domain is required, so a pool move under the same Domain fails on the
+    # name, as the replacement's CreateUserPoolDomain does.
+    "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -1151,6 +1154,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::DocDB::DBInstance": ("Tags", "list"),
     "AWS::DocDB::DBSubnetGroup": ("Tags", "list"),
     "AWS::DocDB::DBClusterParameterGroup": ("Tags", "list"),
+    "AWS::SES::ConfigurationSet": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
     "AWS::SSM::Parameter": ("Tags", "map"),
@@ -6320,22 +6324,28 @@ def _appsync_api_delete(physical_id, props):
     _appsync._delete_graphql_api(physical_id)
 
 
+# The DataSource properties and the CreateDataSource members they become.
+_APPSYNC_DS_MEMBERS = {
+    "Description": "description", "ServiceRoleArn": "serviceRoleArn",
+    "DynamoDBConfig": "dynamodbConfig", "LambdaConfig": "lambdaConfig",
+    "ElasticsearchConfig": "elasticsearchConfig", "OpenSearchServiceConfig": "openSearchServiceConfig",
+    "HttpConfig": "httpConfig", "RelationalDatabaseConfig": "relationalDatabaseConfig",
+    "EventBridgeConfig": "eventBridgeConfig", "MetricsConfig": "metricsConfig",
+}
+
+
 def _appsync_ds_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     name = props.get("Name") or logical_id
-    ds_type = props.get("Type", "NONE")
-    body = {"name": name, "type": ds_type}
-    if props.get("DynamoDBConfig"):
-        body["dynamodbConfig"] = props["DynamoDBConfig"]
-    if props.get("LambdaConfig"):
-        body["lambdaConfig"] = props["LambdaConfig"]
-    if props.get("ServiceRoleArn"):
-        body["serviceRoleArn"] = props["ServiceRoleArn"]
-    _appsync._data_sources.setdefault(api_id, {})[name] = {
-        "name": name, "type": ds_type, **body,
-        "dataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}",
-    }
-    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/datasources/{name}"}
+    body = {"name": name, "type": props.get("Type", "NONE")}
+    for prop, member in _APPSYNC_DS_MEMBERS.items():
+        if props.get(prop) not in (None, ""):
+            body[member] = _pascal_to_camel(props[prop])
+    resp = _appsync._create_data_source(api_id, body)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::DataSource create failed: {resp[2]!r}")
+    arn = _appsync._data_sources[api_id][name]["dataSourceArn"]
+    return f"{api_id}/{name}", {"Name": name, "DataSourceArn": arn}
 
 
 def _appsync_ds_delete(physical_id, props):
@@ -6378,22 +6388,29 @@ def _appsync_function_delete(physical_id, props):
     pass
 
 
+# The Resolver properties that become CreateResolver members.
+_APPSYNC_RESOLVER_MEMBERS = (
+    "DataSourceName", "RequestMappingTemplate", "ResponseMappingTemplate", "Kind",
+    "PipelineConfig", "CachingConfig", "SyncConfig", "MaxBatchSize", "Runtime", "Code",
+    "MetricsConfig",
+)
+
+
 def _appsync_resolver_create(logical_id, props, stack_name):
     api_id = props.get("ApiId", "")
     type_name = props.get("TypeName", "Query")
     field_name = props.get("FieldName", logical_id)
-    ds_name = props.get("DataSourceName", "")
-    resolver = {
-        "typeName": type_name, "fieldName": field_name,
-        "dataSourceName": ds_name,
-        "resolverArn": f"arn:aws:appsync:{get_region()}:{get_account_id()}:apis/{api_id}/types/{type_name}/resolvers/{field_name}",
-    }
-    if props.get("RequestMappingTemplate"):
-        resolver["requestMappingTemplate"] = props["RequestMappingTemplate"]
-    if props.get("ResponseMappingTemplate"):
-        resolver["responseMappingTemplate"] = props["ResponseMappingTemplate"]
-    _appsync._resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = resolver
-    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": resolver["resolverArn"]}
+    body = {"fieldName": field_name}
+    for prop in _APPSYNC_RESOLVER_MEMBERS:
+        if props.get(prop) not in (None, ""):
+            body[prop[:1].lower() + prop[1:]] = _pascal_to_camel(props[prop])
+    if "maxBatchSize" in body:
+        body["maxBatchSize"] = int(body["maxBatchSize"])
+    resp = _appsync._create_resolver(api_id, type_name, body)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::AppSync::Resolver create failed: {resp[2]!r}")
+    arn = _appsync._resolvers[api_id][type_name][field_name]["resolverArn"]
+    return f"{api_id}/{type_name}/{field_name}", {"ResolverArn": arn}
 
 
 def _appsync_resolver_delete(physical_id, props):
@@ -7131,25 +7148,50 @@ def _cognito_identity_pool_delete(physical_id, props):
 
 # --- Cognito UserPoolDomain ---
 
+def _cognito_user_pool_domain_request(props):
+    """The CreateUserPoolDomain / UpdateUserPoolDomain request a template declares."""
+    request = {"UserPoolId": props.get("UserPoolId", ""), "Domain": props.get("Domain", "")}
+    for key in ("CustomDomainConfig", "Routing"):
+        if key in props:
+            request[key] = props[key]
+    if "ManagedLoginVersion" in props:
+        request["ManagedLoginVersion"] = int(props["ManagedLoginVersion"])
+    return request
+
+
+def _cognito_user_pool_domain_attributes(domain):
+    _, _, body = _cognito._describe_user_pool_domain({"Domain": domain})
+    description = json.loads(body)["DomainDescription"]
+    return {"CloudFrontDistribution": description.get("CloudFrontDistribution", "")}
+
+
 def _cognito_user_pool_domain_create(logical_id, props, stack_name):
     pid = props.get("UserPoolId", "")
     domain = props.get("Domain", "")
     pool = _cognito._user_pools.get(pid)
     if not pool:
         raise ValueError(f"UserPool {pid} not found for UserPoolDomain")
-    pool["Domain"] = domain
-    _cognito._pool_domain_map[domain] = pid
-    phys_id = f"{pid}-domain-{domain}"
-    return phys_id, {}
+    status, _, body = _cognito._create_user_pool_domain(_cognito_user_pool_domain_request(props))
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain create failed: {body!r}")
+    # Ref returns the domain name.
+    return domain, _cognito_user_pool_domain_attributes(domain)
+
+
+def _cognito_user_pool_domain_update(physical_id, old_props, new_props, stack_name):
+    """Apply CustomDomainConfig and ManagedLoginVersion through UpdateUserPoolDomain, which refuses Routing."""
+    request = _cognito_user_pool_domain_request(new_props)
+    status, _, body = _cognito._update_user_pool_domain(request)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolDomain update failed: {body!r}")
+    return physical_id, _cognito_user_pool_domain_attributes(request["Domain"])
 
 
 def _cognito_user_pool_domain_delete(physical_id, props):
     domain = props.get("Domain", "")
-    pid = _cognito._pool_domain_map.pop(domain, None)
-    if pid:
-        pool = _cognito._user_pools.get(pid)
-        if pool:
-            pool["Domain"] = None
+    pid = props.get("UserPoolId", "")
+    if _cognito._pool_domain_map.get(domain) == pid:
+        _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
 # ===========================================================================
@@ -10653,51 +10695,120 @@ def _ses_email_identity_update(physical_id, old_props, new_props, stack_name,
 # SES ConfigurationSet
 # ---------------------------------------------------------------------------
 
+def _ses_configuration_set_members(props):
+    """The SES v2 CreateConfigurationSet members of a template's properties."""
+    members = {k: copy.deepcopy(props[k]) for k in _ses_v2._CONFIG_SET_OPTIONS.values()
+               if isinstance(props.get(k), dict)}
+    for key, member in (("ReputationOptions", "ReputationMetricsEnabled"), ("SendingOptions", "SendingEnabled")):
+        if member in members.get(key, {}):
+            members[key][member] = _cfn_bool(members[key][member])
+    members["Tags"] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
+    return members
+
+
 def _ses_configuration_set_create(logical_id, props, stack_name):
-    # AWS::SES::ConfigurationSet Ref returns the configuration set name; when the
-    # template omits Name, CloudFormation generates one from the stack/logical id.
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    """Ref is the set name; a generated name is <LogicalId>- + 12 random letters and digits."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    name = props.get("Name") or f"{logical_id[:51]}-{suffix}"
     # Register with both the classic (v1) and v2 SES stores so DescribeConfigurationSet
     # (Query API) and GetConfigurationSet (v2 REST API) both see the set.
     _ses._configuration_sets[name] = {
         "Name": name,
         "CreatedTimestamp": _ses._iso_now(),
     }
-    _ses_v2._config_sets[name] = {"ConfigurationSetName": name, "Tags": []}
+    _ses_v2._create_config_set(name, _ses_configuration_set_members(props))
     # Real AWS AWS::SES::ConfigurationSet supports Ref (the set name) only; it
     # exposes no Fn::GetAtt attributes, so return none.
     return name, {}
 
 
+def _ses_configuration_set_update(physical_id, old_props, new_props, stack_name):
+    """Put every option again, a removed one as a new set has it; a Name change replaces the set."""
+    rec = _ses_v2._config_sets.get(physical_id)
+    if rec is None:
+        return _ses_configuration_set_create(None, {**new_props, "Name": physical_id}, stack_name)
+    members = _ses_configuration_set_members(new_props)
+    for key in _ses_v2._CONFIG_SET_OPTIONS.values():
+        _ses_v2._put_config_set_option(rec, key, members.get(key) or _ses_v2._CONFIG_SET_DEFAULTS.get(key, {}))
+    rec["Tags"] = members["Tags"]
+    _ses_v2._ses_tags[_ses_v2._resource_arn("configuration-set", physical_id)] = list(members["Tags"])
+    return physical_id, {}
+
+
 def _ses_configuration_set_delete(physical_id, props):
     _ses._configuration_sets.pop(physical_id, None)
     _ses_v2._config_sets.pop(physical_id, None)
+    _ses_v2._ses_tags.pop(_ses_v2._resource_arn("configuration-set", physical_id), None)
 
 
 # ---------------------------------------------------------------------------
 # SES ConfigurationSetEventDestination
 # ---------------------------------------------------------------------------
 
+def _ses_v2_enum(value):
+    """A v1 camelCase name as its SES v2 enum value: renderingFailure is RENDERING_FAILURE."""
+    return re.sub(r"([a-z])([A-Z])", r"\1_\2", str(value)).upper()
+
+
+def _ses_event_destination_definition(destination):
+    """The SES v2 EventDestinationDefinition of a template's EventDestination."""
+    definition = {
+        "Enabled": _cfn_bool(destination.get("Enabled", False)),
+        "MatchingEventTypes": [_ses_v2_enum(t) for t in destination.get("MatchingEventTypes") or []],
+    }
+    cloudwatch = destination.get("CloudWatchDestination")
+    if isinstance(cloudwatch, dict):
+        definition["CloudWatchDestination"] = {"DimensionConfigurations": [
+            {**d, "DimensionValueSource": _ses_v2_enum(d.get("DimensionValueSource", ""))}
+            for d in cloudwatch.get("DimensionConfigurations") or []
+        ]}
+    firehose = destination.get("KinesisFirehoseDestination")
+    if isinstance(firehose, dict):
+        definition["KinesisFirehoseDestination"] = {
+            "IamRoleArn": firehose.get("IAMRoleARN"), "DeliveryStreamArn": firehose.get("DeliveryStreamARN")}
+    if isinstance(destination.get("SnsDestination"), dict):
+        definition["SnsDestination"] = {"TopicArn": destination["SnsDestination"].get("TopicARN")}
+    if isinstance(destination.get("EventBridgeDestination"), dict):
+        definition["EventBridgeDestination"] = {
+            "EventBusArn": destination["EventBridgeDestination"].get("EventBusArn")}
+    return definition
+
+
+def _ses_event_destination_put(config_set, dest_name, props, *, create):
+    if config_set not in _ses_v2._config_sets:
+        # A set the v2 store does not know: the destination is not recorded.
+        return
+    err = _ses_v2._put_event_destination(
+        config_set, dest_name, _ses_event_destination_definition(props.get("EventDestination") or {}),
+        create=create)
+    if err:
+        raise ValueError(json.loads(err[2])["message"])
+
+
 def _ses_configuration_set_event_destination_create(logical_id, props, stack_name):
     config_set = props.get("ConfigurationSetName", "")
     destination = props.get("EventDestination", {}) or {}
     dest_name = destination.get("Name") or _physical_name(
         stack_name, logical_id, max_len=64)
-    # Record the event destination against its configuration set (if present) so
-    # the set round-trips with its destinations; the emulator does not deliver
-    # SES events, this is CFN provisioning fidelity only.
-    record = _ses._configuration_sets.get(config_set)
-    if record is not None:
-        record.setdefault("EventDestinations", {})[dest_name] = destination
+    # Recorded through the SES v2 API; the emulator does not deliver SES events.
+    _ses_event_destination_put(config_set, dest_name, props, create=True)
     # The physical id encodes both names so delete can locate the destination.
     return f"{config_set}|{dest_name}", {"Id": dest_name}
 
 
+def _ses_configuration_set_event_destination_update(physical_id, old_props, new_props, stack_name):
+    """Replace the destination's content in place; the physical id keeps its name, as on AWS."""
+    config_set, _, dest_name = physical_id.partition("|")
+    destinations = (_ses_v2._config_sets.get(config_set) or {}).get("EventDestinations") or {}
+    _ses_event_destination_put(config_set, dest_name, new_props, create=dest_name not in destinations)
+    return physical_id, {"Id": dest_name}
+
+
 def _ses_configuration_set_event_destination_delete(physical_id, props):
     config_set, _, dest_name = physical_id.partition("|")
-    record = _ses._configuration_sets.get(config_set)
+    record = _ses_v2._config_sets.get(config_set)
     if record is not None:
-        record.get("EventDestinations", {}).pop(dest_name, None)
+        (record.get("EventDestinations") or {}).pop(dest_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -11846,6 +11957,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_hooks(physical_id)
     _asg._delete_group_policies(physical_id)
 
 
@@ -11913,17 +12025,17 @@ def _asg_policy_delete(physical_id, props):
 def _asg_hook_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     hook_name = props.get("LifecycleHookName") or _physical_name(stack_name, logical_id, max_len=255)
-    key = f"{asg_name}/{hook_name}"
-    _asg._hooks[key] = {
-        "LifecycleHookName": hook_name,
-        "AutoScalingGroupName": asg_name,
-        "LifecycleTransition": props.get("LifecycleTransition", "autoscaling:EC2_INSTANCE_LAUNCHING"),
-        "HeartbeatTimeout": int(props.get("HeartbeatTimeout", 3600)),
-        "DefaultResult": props.get("DefaultResult", "ABANDON"),
-        "NotificationTargetARN": props.get("NotificationTargetARN", ""),
-        "RoleARN": props.get("RoleARN", ""),
-    }
+    _asg._hooks[f"{asg_name}/{hook_name}"] = _asg._hook_record(asg_name, hook_name, props)
     return hook_name, {"LifecycleHookName": hook_name}
+
+
+def _asg_hook_update(physical_id, old_props, new_props, stack_name):
+    """AutoScalingGroupName and LifecycleHookName replace; the rest is in place and a dropped member stays."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    key = f"{asg_name}/{physical_id}"
+    current = _asg._hooks.get(key, {})
+    _asg._hooks[key] = _asg._hook_record(asg_name, physical_id, {**current, **new_props})
+    return physical_id, {"LifecycleHookName": physical_id}
 
 
 def _asg_hook_delete(physical_id, props):
@@ -13571,11 +13683,10 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     A TemplateName change is a replacement, handled the way AWS::IoT::Policy's
     rename is: the new template is created and the old one removed, since a
     template no stack still declares is not left behind. TemplateBody is not
-    an UpdateProvisioningTemplate member (AWS stores it as a new version via
-    CreateProvisioningTemplateVersion, which MiniStack does not model), so a
-    changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType requires replacement,
-    which ``_update_resource`` performs before this runs.
+    an UpdateProvisioningTemplate member: a changed body becomes the new
+    default version, after the oldest is deleted at the version limit.
+    TemplateType requires replacement, which ``_update_resource`` performs
+    before this runs.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
@@ -13600,14 +13711,21 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     body = _iot_provisioning_template_body(new_props)
     tmpl = _iot._provisioning_templates.get(name)
-    if tmpl is not None and body and body != tmpl.get("templateBody"):
+    if tmpl is not None and body and body != _iot._provisioning_template_body(tmpl):
         err = _iot._validate_provisioning_template_body(body)
         if err is not None:
             raise ValueError(
                 f"AWS::IoT::ProvisioningTemplate update failed: {err[2]!r}"
             )
-        tmpl["templateBody"] = body
-        _iot._provisioning_templates[name] = tmpl
+        if len(tmpl["versions"]) >= _iot._PROVISIONING_TEMPLATE_VERSIONS_MAX:
+            oldest = min(v["versionId"] for v in tmpl["versions"].values()
+                         if v["versionId"] != tmpl["defaultVersionId"])
+            _iot._delete_provisioning_template_version(name, str(oldest))
+        resp = _iot._create_provisioning_template_version(
+            name, {"templateBody": body}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     _iot_update_tags(_iot._provisioning_template_arn(name), old_props, new_props)
     return name, _iot_provisioning_template_attrs(name)
 
@@ -14183,8 +14301,12 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DocDB::DBClusterParameterGroup": ("Description", "Family", "Name"),
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
+    "AWS::AppSync::DataSource": ("ApiId", "Name"),
+    "AWS::AppSync::Resolver": ("ApiId", "TypeName", "FieldName"),
+    "AWS::AppSync::GraphQLSchema": ("ApiId",),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
+    "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -14208,6 +14330,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LaunchConfigurationName", "MetadataOptions", "PlacementTenancy", "RamDiskId",
         "SecurityGroups", "SpotPrice", "UserData",
     ),
+    "AWS::AutoScaling::LifecycleHook": ("AutoScalingGroupName", "LifecycleHookName"),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
     "AWS::IAM::User": ("UserName",),
@@ -14228,6 +14351,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::CertificateManager::Certificate": _ACM_REPLACEMENT_PROPERTIES,
     "AWS::CloudFront::Function": ("Name",),
     "AWS::SSM::Parameter": ("Name",),
+    "AWS::SES::ConfigurationSet": ("Name",),
+    "AWS::SES::ConfigurationSetEventDestination": ("ConfigurationSetName",),
     "AWS::SQS::Queue": ("QueueName", "FifoQueue"),
     "AWS::SNS::Topic": ("TopicName", "FifoTopic"),
     "AWS::Signer::SigningProfile": ("ProfileName", "PlatformId", "SignatureValidityPeriod"),
@@ -14762,7 +14887,11 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
         "import": _cognito_identity_pool_import,
     },
-    "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::Cognito::UserPoolDomain": {
+        "create": _cognito_user_pool_domain_create,
+        "update": _cognito_user_pool_domain_update,
+        "delete": _cognito_user_pool_domain_delete,
+    },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,
         "update": _ecr_repo_update,
@@ -14999,8 +15128,16 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _ses_email_identity_delete,
     },
-    "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
-    "AWS::SES::ConfigurationSetEventDestination": {"create": _ses_configuration_set_event_destination_create, "delete": _ses_configuration_set_event_destination_delete},
+    "AWS::SES::ConfigurationSet": {
+        "create": _ses_configuration_set_create,
+        "update": _ses_configuration_set_update,
+        "delete": _ses_configuration_set_delete,
+    },
+    "AWS::SES::ConfigurationSetEventDestination": {
+        "create": _ses_configuration_set_event_destination_create,
+        "update": _ses_configuration_set_event_destination_update,
+        "delete": _ses_configuration_set_event_destination_delete,
+    },
     "AWS::Signer::SigningProfile": {
         "create": _signer_signing_profile_create,
         "update": _signer_signing_profile_update,
@@ -15251,7 +15388,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _asg_policy_delete,
     },
-    "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
+    "AWS::AutoScaling::LifecycleHook": {
+        "create": _asg_hook_create,
+        "update": _asg_hook_update,
+        "delete": _asg_hook_delete,
+    },
     "AWS::AutoScaling::ScheduledAction": {
         "create": _asg_scheduled_create,
         "update": _asg_scheduled_update,

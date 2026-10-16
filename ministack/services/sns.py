@@ -92,11 +92,6 @@ def _enforce_topic_policy(topic: dict, iam_action: str):
     every call passes, like the rest of the identity layer. Same-account
     callers then pass unless the Policy carries an explicit Deny for them;
     cross-account callers need an explicit Allow, like real SNS.
-
-    Known boundary under AUTH=true: a caller with no identity Allow whose
-    access comes from this Policy alone is denied by the app-level identity
-    check before this resource check runs, where real SNS would allow the
-    union (same caveat as the queue check).
     """
     from ministack.app import AUTH
     if not AUTH:
@@ -124,8 +119,15 @@ def _enforce_topic_policy(topic: dict, iam_action: str):
                   f"{iam_action} on resource: {topic_arn}", 403)
 
 
-def _get_topic(topic_arn: str, action: str | None = None, *,
-               not_found_error=None):
+def topic_policy_for_arn(topic_arn: str) -> tuple[str, str] | None:
+    """The topic's Policy and owner account, for the identity check."""
+    topic = _topic_by_arn_any_scope(_normalize_arn(topic_arn))
+    if topic is None:
+        return None
+    return topic.get("attributes", {}).get("Policy") or "", _topic_owner(topic)
+
+
+def _get_topic(topic_arn: str, action: str | None = None):
     """Resolve a topic by ARN, enforcing its Policy when *action* is given.
 
     Returns ``(topic, None)`` on success or ``(None, error_tuple)`` with a

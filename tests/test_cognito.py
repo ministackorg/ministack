@@ -636,6 +636,92 @@ def test_cognito_domain_crud(cognito_idp):
     desc2 = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
     assert desc2["DomainDescription"] == {}
 
+def test_cognito_update_user_pool_domain_managed_login_version(cognito_idp):
+    """ManagedLoginVersion defaults to 1; a value other than 1 or 2, or none, keeps the current one."""
+    pid = cognito_idp.create_user_pool(PoolName="DomainVersionPool")["UserPool"]["Id"]
+    domain = f"mlv-{pid.split('_', 1)[1].lower()}"
+
+    def version():
+        return cognito_idp.describe_user_pool_domain(
+            Domain=domain)["DomainDescription"]["ManagedLoginVersion"]
+
+    def update(**kwargs):
+        resp = cognito_idp.update_user_pool_domain(UserPoolId=pid, Domain=domain, **kwargs)
+        assert "CloudFrontDomain" not in resp
+        return resp["ManagedLoginVersion"]
+
+    created = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=domain)
+    assert created["ManagedLoginVersion"] == 1
+    assert version() == 1
+    assert update(ManagedLoginVersion=2) == 2
+    assert version() == 2
+    assert update() == 2
+    assert update(ManagedLoginVersion=3) == 2
+    assert update(ManagedLoginVersion=0) == 2
+    assert version() == 2
+    assert update(ManagedLoginVersion=1) == 1
+    assert version() == 1
+
+    for requested, expected in ((2, 2), (3, 1)):
+        other = cognito_idp.create_user_pool(PoolName="DomainVersionPool")["UserPool"]["Id"]
+        other_domain = f"mlv-{other.split('_', 1)[1].lower()}"
+        created = cognito_idp.create_user_pool_domain(
+            UserPoolId=other, Domain=other_domain, ManagedLoginVersion=requested)
+        assert created["ManagedLoginVersion"] == expected
+        assert cognito_idp.describe_user_pool_domain(
+            Domain=other_domain)["DomainDescription"]["ManagedLoginVersion"] == expected
+
+
+def test_cognito_update_user_pool_domain_refusals(cognito_idp):
+    """UpdateUserPoolDomain refuses these requests and changes nothing."""
+    pid = cognito_idp.create_user_pool(PoolName="DomainRefusalPool")["UserPool"]["Id"]
+    other = cognito_idp.create_user_pool(PoolName="DomainRefusalPool")["UserPool"]["Id"]
+    domain = f"refuse-{pid.split('_', 1)[1].lower()}"
+    cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=domain)
+
+    def refused(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.update_user_pool_domain(**{"UserPoolId": pid, "Domain": domain, **kwargs})
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    def failover(region):
+        return {"Failover": {"SecondaryRegion": region,
+                             "PrimaryRoute53HealthCheckId": "00000000-0000-0000-0000-000000000000"}}
+
+    assert refused(Domain=f"{domain}-none", ManagedLoginVersion=2) == (
+        "ResourceNotFoundException", "User pool domain was not found.")
+    assert refused(UserPoolId=other, ManagedLoginVersion=2) == (
+        "InvalidParameterException", "The domain is not configured for this user pool.")
+    assert refused(CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN}) == (
+        "InvalidParameterException", "Cannot convert prefix domain to custom domain.")
+    assert refused(Routing=failover("eu-west-1")) == (
+        "InvalidParameterException", "Routing field is not supported for Hosted UI (classic)")
+    assert refused(ManagedLoginVersion=2, Routing=failover("eu-west-1")) == (
+        "InvalidParameterException", "Region eu-west-1 is not active for the user pool")
+    assert refused(ManagedLoginVersion=2, Routing=failover(pid.split("_", 1)[0])) == (
+        "InvalidParameterException",
+        "Routing field can only be configured when replica status is one of: "
+        "ACTIVE, CREATING, INACTIVE. Current status: null")
+
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["ManagedLoginVersion"] == 1
+    assert dd["CustomDomainConfig"] == {}
+
+
+def test_cognito_managed_login_version_survives_warm_boot(_enable_persistence):
+    """The domain's ManagedLoginVersion lives on the pool record and survives a restart."""
+    mod = _cognito_module()
+    mod.reset()
+    _, _, body = mod._create_user_pool({"PoolName": "MlvPersistPool"})
+    pid = json.loads(body)["UserPool"]["Id"]
+    mod._create_user_pool_domain({"UserPoolId": pid, "Domain": "mlv-persist", "ManagedLoginVersion": 2})
+
+    _cognito_round_trip(mod)
+
+    _, _, body = mod._describe_user_pool_domain({"Domain": "mlv-persist"})
+    assert json.loads(body)["DomainDescription"]["ManagedLoginVersion"] == 2
+    mod.reset()
+
 def test_cognito_mfa_config(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="MfaPool")["UserPool"]["Id"]
     resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
@@ -8695,6 +8781,29 @@ def test_cognito_custom_domain_create_and_describe(cognito_idp):
     assert not pool.get("Domain")
 
 
+def test_cognito_update_custom_domain_certificate(cognito_idp):
+    """UpdateUserPoolDomain replaces a custom domain's certificate and answers its CloudFront target."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomDomainUpdatePool")["UserPool"]["Id"]
+    domain = _pool_unique_domain(pid, "renew")
+    created = cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=domain,
+        CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN},
+    )
+    renewed = _CUSTOM_CERT_ARN.replace("555555555555", "666666666666")
+
+    resp = cognito_idp.update_user_pool_domain(
+        UserPoolId=pid, Domain=domain,
+        CustomDomainConfig={"CertificateArn": renewed}, ManagedLoginVersion=2,
+    )
+    assert resp["CloudFrontDomain"] == created["CloudFrontDomain"]
+    assert resp["ManagedLoginVersion"] == 2
+
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["CustomDomainConfig"] == {"CertificateArn": renewed}
+    assert dd["ManagedLoginVersion"] == 2
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"].get("CustomDomain") == domain
+
+
 def test_cognito_prefix_domain_unchanged_by_custom_domain_support(cognito_idp):
     """Regression: no CustomDomainConfig still means a prefix domain that expands."""
     pid = cognito_idp.create_user_pool(PoolName="PrefixDomainPool")["UserPool"]["Id"]
@@ -8742,6 +8851,21 @@ def test_cognito_custom_domain_requires_certificate_arn(cognito_idp):
     # Nothing was registered, so the domain is still free.
     assert cognito_idp.describe_user_pool_domain(
         Domain=_pool_unique_domain(pid, "nocert"))["DomainDescription"] == {}
+
+
+def test_cognito_second_prefix_domain_is_refused(cognito_idp):
+    """A pool holds one prefix domain: a second one is refused and the first stays."""
+    pid = cognito_idp.create_user_pool(PoolName="SecondPrefixPool")["UserPool"]["Id"]
+    suffix = pid.split("_", 1)[1].lower()
+    cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"first-{suffix}")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"second-{suffix}")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "User pool already has a domain configured."
+
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["Domain"] == f"first-{suffix}"
+    assert cognito_idp.describe_user_pool_domain(Domain=f"second-{suffix}")["DomainDescription"] == {}
 
 
 def test_cognito_pool_holds_prefix_and_custom_domain_independently(cognito_idp):

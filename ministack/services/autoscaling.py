@@ -370,10 +370,7 @@ def _delete_asg(p):
     name = _p(p, "AutoScalingGroupName")
     _asgs.pop(name, None)
     _tags.pop(name, None)
-    # Remove associated hooks
-    keys_to_del = [k for k in _hooks if k.startswith(f"{name}/")]
-    for k in keys_to_del:
-        del _hooks[k]
+    _delete_group_hooks(name)
     _delete_group_policies(name)
     return _xml(200, "DeleteAutoScalingGroupResponse", "<DeleteAutoScalingGroupResult/>")
 
@@ -710,6 +707,13 @@ def _delete_group_policies(asg_name):
             _delete_policy_alarms(_policies.pop(k, None))
 
 
+def _delete_group_hooks(asg_name):
+    """Delete the lifecycle hooks of a group."""
+    for k, hook in list(_hooks.items()):
+        if hook.get("AutoScalingGroupName") == asg_name:
+            _hooks.pop(k, None)
+
+
 def _member_xml(value):
     """A stored member as query-protocol XML."""
     if isinstance(value, dict):
@@ -750,19 +754,28 @@ def _delete_policy(p):
 # Lifecycle Hook
 # ---------------------------------------------------------------------------
 
+def _hook_record(asg_name, hook_name, fields):
+    """A lifecycle hook record, from API members or template properties."""
+    return {
+        "LifecycleHookName": hook_name,
+        "AutoScalingGroupName": asg_name,
+        "LifecycleTransition": fields.get("LifecycleTransition") or "autoscaling:EC2_INSTANCE_LAUNCHING",
+        "HeartbeatTimeout": int(fields.get("HeartbeatTimeout") or 3600),
+        "DefaultResult": fields.get("DefaultResult") or "ABANDON",
+        "NotificationTargetARN": fields.get("NotificationTargetARN") or "",
+        "RoleARN": fields.get("RoleARN") or "",
+        "NotificationMetadata": fields.get("NotificationMetadata") or "",
+    }
+
+
 def _put_lifecycle_hook(p):
     asg_name = _p(p, "AutoScalingGroupName")
     hook_name = _p(p, "LifecycleHookName")
     key = f"{asg_name}/{hook_name}"
-    _hooks[key] = {
-        "LifecycleHookName": hook_name,
-        "AutoScalingGroupName": asg_name,
-        "LifecycleTransition": _p(p, "LifecycleTransition") or "autoscaling:EC2_INSTANCE_LAUNCHING",
-        "HeartbeatTimeout": int(_p(p, "HeartbeatTimeout") or 3600),
-        "DefaultResult": _p(p, "DefaultResult") or "ABANDON",
-        "NotificationTargetARN": _p(p, "NotificationTargetARN") or "",
-        "RoleARN": _p(p, "RoleARN") or "",
-    }
+    _hooks[key] = _hook_record(asg_name, hook_name, {
+        member: _p(p, member) for member in (
+            "LifecycleTransition", "HeartbeatTimeout", "DefaultResult",
+            "NotificationTargetARN", "RoleARN", "NotificationMetadata")})
     return _xml(200, "PutLifecycleHookResponse", "<PutLifecycleHookResult/>")
 
 
@@ -772,10 +785,13 @@ def _describe_lifecycle_hooks(p):
     for key, hook in _hooks.items():
         if hook["AutoScalingGroupName"] != asg_name:
             continue
+        metadata = hook.get("NotificationMetadata")
+        metadata_xml = f"<NotificationMetadata>{escape(metadata)}</NotificationMetadata>" if metadata else ""
         members += (f"<member>"
                     f"<LifecycleHookName>{hook['LifecycleHookName']}</LifecycleHookName>"
                     f"<AutoScalingGroupName>{hook['AutoScalingGroupName']}</AutoScalingGroupName>"
                     f"<LifecycleTransition>{hook['LifecycleTransition']}</LifecycleTransition>"
+                    f"{metadata_xml}"
                     f"<HeartbeatTimeout>{hook['HeartbeatTimeout']}</HeartbeatTimeout>"
                     f"<DefaultResult>{hook['DefaultResult']}</DefaultResult>"
                     f"</member>")
