@@ -1555,10 +1555,44 @@ async def _handle_post_body_shortcuts(
 # ---------------------------------------------------------------------------
 
 
-async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str):
+_S3_CONTROL_MRAP_PREFIXES = ("/v20180820/mrap/", "/v20180820/async-requests/mrap/")
+
+
+def _s3control_mrap_arn(s3, path: str) -> str:
+    """IAM resource for an MRAP request: ``arn:aws:s3::<account>:accesspoint/<alias>``
+    for an existing MRAP named in the path, else the account's wildcard."""
+    from ministack.core.responses import get_account_id
+
+    account = get_account_id()
+    ref = unquote(path).rstrip("/").removeprefix("/v20180820/mrap/instances").strip("/")
+    ref = ref.removesuffix("/routes").removesuffix("/policy")
+    record = s3.find_mrap(ref) if ref and not path.startswith("/v20180820/async-requests/") else None
+    return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
+
+
+async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,
+                                     headers: dict | None = None):
     """Handle S3 Control operations addressed via the /v20180820 path prefix."""
     if not path.startswith(_S3_CONTROL_PREFIX):
         return None
+
+    if path.startswith(_S3_CONTROL_MRAP_PREFIXES) or path.rstrip("/") == "/v20180820/mrap/instances":
+        s3 = _get_module("s3")
+        headers = headers or {}
+        if AUTH:
+            from ministack.core.iam_actions import s3control_action
+
+            action = s3control_action(method, path)
+            if action:
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id,
+                                             resource_arn=_s3control_mrap_arn(s3, path))
+                if denied:
+                    return denied
+        status, resp_headers, resp_body = (
+            s3.s3control_account_error(headers)
+            or s3.handle_mrap_control(method, path, headers, body, query_params)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
@@ -2112,7 +2146,8 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             }
         mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
         return await _get_module("s3").handle_request(
-            method, mrap_path, headers, body, query_params, signed_path=path
+            method, mrap_path, headers, body, query_params, signed_path=path,
+            enforce_bucket_region=False,
         )
 
     bucket = _extract_s3_vhost_bucket(host)
@@ -2298,7 +2333,7 @@ async def _handle_special_data_plane_request(
         except Exception as e:
             logger.exception("Error in Iceberg REST catalog: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
-    if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
+    if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
     if response := await _handle_rds_data_request(method, path, headers, body, query_params):
         return response

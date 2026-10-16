@@ -1416,31 +1416,22 @@ def _s3_mrap_create(logical_id, props, stack_name):
         if isinstance(r, dict) and r.get("Bucket")
     ]
 
-    for existing in _s3._mraps.values():
-        if existing.get("Name") == name:
-            return existing["Alias"], {"Alias": existing["Alias"],
-                                       "CreatedAt": existing["CreatedAt"]}
+    existing = _s3.find_mrap(name)
+    if existing is not None and existing.get("Name") == name:
+        return existing["Alias"], {"Alias": existing["Alias"],
+                                   "CreatedAt": existing["CreatedAt"]}
 
-    alias = _s3.new_mrap_alias()
-    created_at = now_iso()
-    _s3._mraps[alias] = {
-        "Name": name,
-        "Alias": alias,
-        "Regions": buckets,
-        "CreatedAt": created_at,
-        "PublicAccessBlockConfiguration": props.get("PublicAccessBlockConfiguration") or {},
-    }
+    # strict=False: the provisioner has never applied the S3 Control bucket checks.
+    record = _s3.create_mrap(name, buckets, props.get("PublicAccessBlockConfiguration") or {}, strict=False)
     logger.info("Created MultiRegionAccessPoint %s alias=%s over %d bucket(s)",
-                name, alias, len(buckets))
+                name, record["Alias"], len(buckets))
     # The physical id is the NAME (what DeleteMultiRegionAccessPoint takes);
     # `Alias` is the attribute a distribution origin is built from.
-    return name, {"Alias": alias, "CreatedAt": created_at}
+    return name, {"Alias": record["Alias"], "CreatedAt": record["CreatedAt"]}
 
 
 def _s3_mrap_delete(physical_id, props):
-    for alias, record in list(_s3._mraps.items()):
-        if record.get("Name") == physical_id:
-            _s3._mraps.pop(alias, None)
+    _s3.delete_mrap(physical_id)
 
 
 def _s3_attrs(name):
@@ -1452,8 +1443,32 @@ def _s3_attrs(name):
     }
 
 
+# AWS fails CreateStack when an AWS::S3::Bucket names a bucket that already
+# exists. MiniStack adopts an own existing bucket by default, which keeps S3
+# data usable when it outlives the CloudFormation state (S3 persistence with a
+# fresh stack store); 0 gives AWS's behaviour.
+CFN_S3_ADOPT_EXISTING_BUCKET = os.environ.get("CFN_S3_ADOPT_EXISTING_BUCKET", "1") == "1"
+
+
+def s3_bucket_name_conflict(name: str) -> str | None:
+    """The NAME_CONFLICT_VALIDATION message for a bucket name the stack can't
+    take, or None. Another account's bucket is never taken; an own bucket only
+    when CFN_S3_ADOPT_EXISTING_BUCKET is off."""
+    owner = _s3._bucket_owner_account(name)
+    if owner is None or (owner == get_account_id() and CFN_S3_ADOPT_EXISTING_BUCKET):
+        return None
+    return f"Resource of type 'AWS::S3::Bucket' with identifier '{name}' already exists."
+
+
 def _s3_create(logical_id, props, stack_name):
+    if not props.get("BucketName") and not CFN_S3_ADOPT_EXISTING_BUCKET and not _NAME_SEED.get():
+        # AWS draws a new auto-name for each stack instance; the seed travels
+        # on the resource record, so updates keep the name.
+        _NAME_SEED.set(new_uuid()[:8])
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    conflict = s3_bucket_name_conflict(name)
+    if conflict:
+        raise ValueError(conflict)
     _s3._buckets.setdefault(name, {
         "created": now_iso(),
         "objects": {},
@@ -2159,6 +2174,9 @@ def _lambda_create(logical_id, props, stack_name):
     #    fetch fails.
     code_zip = _zip_inline(code.get("ZipFile"), handler, runtime)
     if code_zip is None and code.get("S3Bucket") and code.get("S3Key"):
+        region_error = _lambda_svc.s3_code_region_message(code["S3Bucket"])
+        if region_error:
+            raise ValueError(region_error)
         code_zip = _lambda_svc._fetch_code_from_s3(
             code["S3Bucket"],
             code["S3Key"],
@@ -8761,6 +8779,10 @@ def _lambda_layer_create(logical_id, props, stack_name):
     content = props.get("Content", {})
     s3_bucket = content.get("S3Bucket", "")
     s3_key = content.get("S3Key", "")
+    if s3_bucket and s3_key:
+        region_error = _lambda_svc.s3_code_region_message(s3_bucket, layer=True)
+        if region_error:
+            raise ValueError(region_error)
 
     if layer_name not in _lambda_svc._layers:
         _lambda_svc._layers[layer_name] = {"versions": [], "next_version": 1}

@@ -266,6 +266,37 @@ _S3_VERSIONED_ACTIONS: dict[str, str] = {
 }
 
 
+_S3CONTROL_MRAP_ASYNC_ACTIONS = {
+    "create": "s3:CreateMultiRegionAccessPoint",
+    "delete": "s3:DeleteMultiRegionAccessPoint",
+    "put-policy": "s3:PutMultiRegionAccessPointPolicy",
+}
+
+
+def s3control_action(method: str, path: str) -> str | None:
+    """IAM action for an S3 Control Multi-Region Access Point request, or None."""
+    from urllib.parse import unquote
+
+    path = unquote(path).rstrip("/")
+    async_prefix = "/v20180820/async-requests/mrap/"
+    instances = "/v20180820/mrap/instances"
+    if path.startswith(async_prefix):
+        tail = path[len(async_prefix):]
+        if method == "POST":
+            return _S3CONTROL_MRAP_ASYNC_ACTIONS.get(tail)
+        return "s3:DescribeMultiRegionAccessPointOperation" if method == "GET" else None
+    if path == instances:
+        return "s3:ListMultiRegionAccessPoints" if method == "GET" else None
+    if path.startswith(instances + "/"):
+        if path.endswith("/routes"):
+            return {"GET": "s3:GetMultiRegionAccessPointRoutes",
+                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}.get(method)
+        if path.endswith("/policy"):
+            return "s3:GetMultiRegionAccessPointPolicy" if method == "GET" else None
+        return "s3:GetMultiRegionAccessPoint" if method == "GET" else None
+    return None
+
+
 def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     parts = [p for p in path.split("/") if p]
     depth = min(len(parts), 2)

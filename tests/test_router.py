@@ -585,3 +585,54 @@ def test_cfn_signal_prefix_matches_wait_conditions():
     from ministack.services.cloudformation import wait_conditions
 
     assert wait_conditions.SIGNAL_PATH == "/_ministack/cfn-signal/"
+
+
+_SIGV4_AUTH = (
+    "AWS4-HMAC-SHA256 Credential=AKID/20261012/{region}/s3/aws4_request, "
+    "SignedHeaders=host, Signature=abc"
+)
+_SIGV4A_AUTH = (
+    "AWS4-ECDSA-P256-SHA256 Credential=AKID/20261012/s3/aws4_request, "
+    "SignedHeaders=host;x-amz-region-set, Signature=abc"
+)
+
+
+@pytest.mark.parametrize("headers,query,expected", [
+    ({"authorization": _SIGV4_AUTH.format(region="eu-west-1")}, None, "eu-west-1"),
+    ({}, {"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/ap-south-1/s3/aws4_request"]}, "ap-south-1"),
+    ({}, {"X-Amz-Credential": ["AKID/20261012/us-west-2/appsync/aws4_request"]}, "us-west-2"),
+    ({}, {"X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}, None),
+    ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "eu-west-1"}, None, "eu-west-1"),
+    ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}, None, None),
+    ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "us-east-1,eu-west-1"}, None, None),
+    ({"authorization": _SIGV4A_AUTH}, None, None),
+    ({}, {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"],
+          "X-Amz-Region-Set": ["us-west-2"]}, "us-west-2"),
+    ({}, {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"],
+          "X-Amz-Region-Set": ["*"]}, None),
+    ({"authorization": "AWS AKID:signature"}, None, None),
+    ({}, {"AWSAccessKeyId": ["AKID"], "Signature": ["x"]}, None),
+    ({}, None, None),
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=AKID/20261012/s3/aws4_request"}, None, None),
+])
+def test_extract_signed_region(headers, query, expected):
+    from ministack.core.router import extract_signed_region
+
+    assert extract_signed_region(headers, query) == expected
+
+
+def test_extract_region_never_returns_the_service_for_sigv4a(monkeypatch):
+    """A SigV4a scope has no region segment; it used to yield region "s3"."""
+    from ministack.core.router import extract_region
+
+    monkeypatch.delenv("MINISTACK_REGION", raising=False)
+    assert extract_region({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}) == "us-east-1"
+    query = {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+             "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}
+    assert extract_region({}, query) == "us-east-1"
+    monkeypatch.setenv("MINISTACK_REGION", "eu-central-1")
+    assert extract_region({}, query) == "eu-central-1"
+    assert extract_region({"authorization": _SIGV4_AUTH.format(region="sa-east-1")}) == "sa-east-1"

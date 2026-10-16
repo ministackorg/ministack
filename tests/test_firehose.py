@@ -1075,3 +1075,27 @@ def test_firehose_partition_keys_from_lambda(fh, s3, lam):
     finally:
         fh.delete_delivery_stream(DeliveryStreamName=name)
         lam.delete_function(FunctionName=fn)
+
+
+def test_firehose_region_delivery_into_regional_bucket():
+    """A stream in eu-west-1 delivers into an eu-west-1 bucket; the internal
+    S3 write is unsigned, so the bucket home-region check doesn't apply."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, name = f"fh-euw1-{suffix}", f"fh-euw1-{suffix}"
+    fh, s3 = _regional_client("firehose", "eu-west-1"), _regional_client("s3", "eu-west-1")
+    s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    fh.create_delivery_stream(DeliveryStreamName=name, DeliveryStreamType="DirectPut",
+                              ExtendedS3DestinationConfiguration={
+                                  "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                                  "BucketARN": f"arn:aws:s3:::{bucket}", "Prefix": "out/",
+                                  "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 1}})
+    try:
+        fh.put_record(DeliveryStreamName=name, Record={"Data": b"regional"})
+        objs = _wait_objects(s3, bucket, "out/")
+        assert len(objs) == 1, objs
+        assert s3.get_object(Bucket=bucket, Key=objs[0]["Key"])["Body"].read() == b"regional"
+    finally:
+        fh.delete_delivery_stream(DeliveryStreamName=name)
+        for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+            s3.delete_object(Bucket=bucket, Key=obj["Key"])
+        s3.delete_bucket(Bucket=bucket)

@@ -14723,6 +14723,38 @@ def test_cfn_s3_multi_region_access_point(cfn, s3):
     assert ei.value.code in (403, 404)
 
 
+def test_cfn_s3_mrap_visible_through_s3control(cfn, s3):
+    """A stack-provisioned MRAP is the same record the S3 Control API reads,
+    and its routes can fail traffic over like one created through S3 Control."""
+    from conftest import patch_endpoint_dns
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, name = f"cfn-mrap-ctl-{uid}", f"cfn-mrap-ctl-{uid}"
+    one, two = _mrap_buckets(s3, uid)
+    template = json.dumps({
+        "Resources": {"Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
+                               "Properties": {"Name": name, "Regions": [{"Bucket": one}, {"Bucket": two}]}}},
+        "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    ctl = boto3.client("s3control", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                       region_name="us-west-2", aws_access_key_id="test", aws_secret_access_key="test")
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        alias = _output(stack, "Alias")
+        with patch_endpoint_dns():
+            ap = ctl.get_multi_region_access_point(AccountId="000000000000", Name=name)["AccessPoint"]
+            assert (ap["Alias"], [r["Bucket"] for r in ap["Regions"]]) == (alias, [one, two])
+            assert _mrap_get(alias, "who.txt") == (200, one)
+            ctl.submit_multi_region_access_point_routes(
+                AccountId="000000000000", Mrap=f"arn:aws:s3::000000000000:accesspoint/{alias}",
+                RouteUpdates=[{"Bucket": one, "TrafficDialPercentage": 0}])
+            assert _mrap_get(alias, "who.txt") == (200, two)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_s3_mrap_alias_matches_the_documented_pattern():
     # In-process: the generator alone. A digit-only draw was possible before
     # (uuid hex prefix), which is outside ^[a-z][a-z0-9]*[.]mrap$.
@@ -19765,6 +19797,10 @@ def test_cfn_signer_signing_profile_platform_outside_the_schema_enum(cfn, signer
              "Validation failure detected. See the operation's FAILED event for details.", None),
             ("ROLLBACK_COMPLETE", "", None),
         ]
+        errors = [e for e in cfn.describe_events(StackName=stack_name)["OperationEvents"]
+                  if e["EventType"] == "VALIDATION_ERROR"]
+        assert sorted((e["LogicalResourceId"], e["ValidationPath"]) for e in errors) == [
+            ("Bogus", "/Resources/Bogus/Properties/PlatformId"), ("Iot", "/Resources/Iot/Properties/PlatformId")]
         assert cfn.describe_stack_resources(StackName=stack_name)["StackResources"] == []
         with pytest.raises(ClientError):
             signer.get_signing_profile(profileName=stack_name.replace("-", "_"))
@@ -36190,6 +36226,196 @@ def test_cfn_iam_user_generated_name(cfn, iam):
     finally:
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("resource", ["function", "layer"])
+def test_cfn_lambda_s3_code_region(s3, resource):
+    """S3 code in another region fails the resource with Lambda's message
+    (observed on AWS 2026-10-12 through the Lambda API)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket, stack_name = f"cfn-code-use1-{uid}", f"cfn-code-region-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="fn.zip", Body=b"PK\x05\x06" + b"\x00" * 18)
+    euw1 = boto3.client("cloudformation", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                        region_name="eu-west-1", aws_access_key_id="test", aws_secret_access_key="test")
+    if resource == "function":
+        res = {"Type": "AWS::Lambda::Function", "Properties": {
+            "Runtime": "python3.12", "Handler": "index.handler", "Role": _CR_LAMBDA_ROLE,
+            "Code": {"S3Bucket": bucket, "S3Key": "fn.zip"}}}
+        s3_part = ("The bucket you are attempting to access must be addressed using the specified endpoint. "
+                   "Please send all future requests to this endpoint.")
+    else:
+        res = {"Type": "AWS::Lambda::LayerVersion", "Properties": {
+            "Content": {"S3Bucket": bucket, "S3Key": "fn.zip"}}}
+        s3_part = "The bucket is in this region: us-east-1. Please use this region to retry the request"
+    euw1.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Code": res}}))
+    try:
+        stack = _wait_stack(euw1, stack_name)
+        assert stack["StackStatus"] in ("ROLLBACK_COMPLETE", "CREATE_FAILED")
+        assert ("Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+                + s3_part) in _stack_event_reasons(euw1, stack_name)
+    finally:
+        _delete_cfn_test_stack(euw1, stack_name)
+        s3.delete_object(Bucket=bucket, Key="fn.zip")
+        s3.delete_bucket(Bucket=bucket)
+
+
+# ---------------------------------------------------------------------------
+# AWS::S3::Bucket and the global bucket namespace (#2158)
+# ---------------------------------------------------------------------------
+
+_NAME_EXISTS = "Resource of type 'AWS::S3::Bucket' with identifier '{}' already exists."
+
+
+@pytest.fixture
+def foreign_bucket():
+    """A bucket another account owns, placed straight into the in-process store."""
+    from ministack.services import s3 as s3_svc
+
+    name = f"cfn-foreign-{_uuid_mod.uuid4().hex[:8]}"
+    s3_svc._buckets.set_scoped("111122223333", None, name, {"created": "", "objects": {}, "region": "us-east-1"})
+    yield name
+    s3_svc._buckets.pop_scoped("111122223333", None, name, None)
+
+
+def test_cfn_s3_bucket_other_account_name_is_refused(foreign_bucket, monkeypatch):
+    from ministack.services import s3 as s3_svc
+    from ministack.services.cloudformation import provisioners
+
+    for adopt in (True, False):
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", adopt)
+        with pytest.raises(ValueError) as exc:
+            provisioners._s3_create("B", {"BucketName": foreign_bucket}, "stack")
+        assert str(exc.value) == _NAME_EXISTS.format(foreign_bucket)
+        # Rename on update and recreate go through the same check.
+        with pytest.raises(ValueError):
+            provisioners._s3_update("old-name", {"BucketName": "old-name"}, {"BucketName": foreign_bucket}, "stack")
+    assert s3_svc._buckets.get(foreign_bucket) is None
+
+
+def test_cfn_s3_bucket_adopt_existing_setting(monkeypatch):
+    import contextvars
+
+    from ministack.services import s3 as s3_svc
+    from ministack.services.cloudformation import provisioners
+
+    name = f"cfn-own-{_uuid_mod.uuid4().hex[:8]}"
+    s3_svc._buckets[name] = {"created": "", "objects": {"k": {}}, "region": "us-east-1"}
+    try:
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", True)
+        assert provisioners._s3_create("B", {"BucketName": name}, "stack")[0] == name
+        assert s3_svc._buckets[name]["objects"] == {"k": {}}
+
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", False)
+        with pytest.raises(ValueError) as exc:
+            provisioners._s3_create("B", {"BucketName": name}, "stack")
+        assert str(exc.value) == _NAME_EXISTS.format(name)
+    finally:
+        s3_svc._buckets.pop(name, None)
+
+    def create_auto_named():
+        return provisioners._s3_create("Assets", {}, "seeded-stack")[0]
+
+    created = []
+    try:
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", True)
+        first, again = (contextvars.copy_context().run(create_auto_named) for _ in range(2))
+        assert first == again  # adoption keeps the deterministic name
+        created.append(first)
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", False)
+        one, two = (contextvars.copy_context().run(create_auto_named) for _ in range(2))
+        created += [one, two]
+        assert len({first, one, two}) == 3  # a fresh name per stack instance
+        assert one.startswith("seeded-stack-assets-")
+    finally:
+        for bucket in created:
+            s3_svc._buckets.pop(bucket, None)
+
+
+_VALIDATION_FAILED_ONE = (
+    "Validation failed with 1 error(s). Call DescribeEvents to retrieve the full list of issues with "
+    "resource and property details, resolve each error, then retry the operation.")
+
+
+@pytest.fixture
+def other_account_bucket():
+    other = boto3.client("s3", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                         region_name="us-east-1", aws_access_key_id="111122223333", aws_secret_access_key="test")
+    name = f"cfn-taken-{_uuid_mod.uuid4().hex[:8]}"
+    other.create_bucket(Bucket=name)
+    yield name
+    other.delete_bucket(Bucket=name)
+
+
+def _stack_level_events(cfn, stack_name):
+    events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+    return list(reversed(events))
+
+
+@pytest.mark.parametrize("disable_rollback", [False, True])
+def test_cfn_s3_name_conflict_validation(cfn, other_account_bucket, disable_rollback):
+    """A BucketName another account owns fails pre-deployment validation the
+    way AWS reports it (observed 2026-10-12): stack events, no resource event,
+    and the error itself through DescribeEvents."""
+    stack_name = f"cfn-name-conflict-{_uuid_mod.uuid4().hex[:8]}"
+    template = {"Resources": {"Bucket": {"Type": "AWS::S3::Bucket",
+                                         "Properties": {"BucketName": other_account_bucket}}}}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template), DisableRollback=disable_rollback)
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        events = _stack_level_events(cfn, stack_name)
+        assert all(e["LogicalResourceId"] == stack_name for e in events)
+        failed = [e for e in events if e["ResourceStatus"] == "CREATE_FAILED"]
+        assert failed[0]["ResourceStatusReason"] == _VALIDATION_FAILED_ONE
+        assert failed[0]["DetailedStatus"] == "VALIDATION_FAILED"
+        if disable_rollback:
+            assert stack["StackStatus"] == "CREATE_FAILED"
+            assert [e["ResourceStatusReason"] for e in failed[1:]] == [
+                "Validation failure detected. See the operation's FAILED event for details."]
+        else:
+            assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+
+        ops = cfn.describe_events(StackName=stack_name)["OperationEvents"]
+        errors = [e for e in ops if e["EventType"] == "VALIDATION_ERROR"]
+        assert len(errors) == 1
+        error = errors[0]
+        assert (error["OperationType"], error["LogicalResourceId"], error["ResourceType"]) == (
+            "CREATE_STACK", "Bucket", "AWS::S3::Bucket")
+        assert (error["ValidationFailureMode"], error["ValidationName"], error["ValidationStatus"]) == (
+            "FAIL", "NAME_CONFLICT_VALIDATION", "FAILED")
+        assert error["ValidationStatusReason"] == _NAME_EXISTS.format(other_account_bucket)
+        assert error["ValidationPath"] == "/Resources/Bucket"
+        assert any(e["EventType"] == "PROVISIONING_ERROR" and e["LogicalResourceId"] == stack_name for e in ops)
+        assert {e["OperationId"] for e in ops} == {error["OperationId"]}
+        failed_only = cfn.describe_events(StackName=stack_name, Filters={"FailedEvents": True})["OperationEvents"]
+        assert error["EventId"] in {e["EventId"] for e in failed_only}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_s3_name_conflict_own_bucket_when_adoption_is_off(monkeypatch):
+    """In-process: with CFN_S3_ADOPT_EXISTING_BUCKET=0, an own existing name
+    is a NAME_CONFLICT_VALIDATION error too."""
+    from ministack.services import s3 as s3_svc
+    from ministack.services.cloudformation import _stack_events, provisioners, stacks
+
+    name = f"cfn-own-conflict-{_uuid_mod.uuid4().hex[:8]}"
+    s3_svc._buckets[name] = {"created": "", "objects": {}, "region": "us-east-1"}
+    stack_id = f"arn:aws:cloudformation:us-east-1:000000000000:stack/own-conflict/{name}"
+    resources = {"B": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": name}}}
+    stack = {"StackId": stack_id, "StackName": "own-conflict"}
+    try:
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", True)
+        assert not stacks._fail_property_validation(stack, stack_id, "own-conflict", resources, ["B"], {}, {}, {},
+                                                    True)
+        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", False)
+        assert stacks._fail_property_validation(stack, stack_id, "own-conflict", resources, ["B"], {}, {}, {}, True)
+        assert stack["StackStatus"] == "CREATE_FAILED"
+        [error] = [e for e in stack["_operation_events"] if e["EventType"] == "VALIDATION_ERROR"]
+        assert error["ValidationStatusReason"] == _NAME_EXISTS.format(name)
+    finally:
+        s3_svc._buckets.pop(name, None)
+        _stack_events.pop(stack_id, None)
 
 
 @pytest.mark.parametrize("custom_bus", [True, False])
