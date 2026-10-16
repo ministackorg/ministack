@@ -9026,9 +9026,24 @@ def test_s3_mrap_end_to_end_routing_failover_and_replication(s3control_dns, mrap
     try:
         for region in ("us-east-1", "eu-west-1", None):
             assert _mrap_get(alias, "who.txt", region=region) == (200, "use1")
-# IAM contracts: real HTTP against the server mode selected by CI.
-# Evidence: existing IAM/action extraction tests and local MiniStack SDK calls;
-# these tests are not observations from a real AWS account.
+
+        routes_ctl.submit_multi_region_access_point_routes(
+            AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": use1_bucket, "TrafficDialPercentage": 0}])
+        assert _mrap_get(alias, "who.txt") == (200, "euw1")
+        with pytest.raises(ClientError):
+            routes_ctl.submit_multi_region_access_point_routes(
+                AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": euw1_bucket, "TrafficDialPercentage": 0}])
+        assert _mrap_get(alias, "who.txt") == (200, "euw1")
+
+        assert _mrap_request(alias, "PUT", "data/new.txt", b"through mrap")[0] == 200
+        assert euw1.get_object(Bucket=euw1_bucket, Key="data/new.txt")["ReplicationStatus"] == "COMPLETED"
+        assert use1.get_object(Bucket=use1_bucket, Key="data/new.txt")["Body"].read() == b"through mrap"
+    finally:
+        _mrap_delete(ctl, name)
+    assert _mrap_request(alias, "GET", "who.txt")[0] in (403, 404)
+
+
+# IAM contracts, run by CI with AUTH=false and AUTH=true.
 @pytest.fixture
 def auth_s3_objects(s3):
     """Two private buckets with one source object; isolate and clean every test."""
