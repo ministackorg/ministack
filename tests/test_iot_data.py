@@ -1094,6 +1094,35 @@ def test_iot_disabled_rule_does_not_fire(iot_client, iot_data_client, lam, sqs):
     iot_client.delete_topic_rule(ruleName=rule)
 
 
+def test_iot_disable_topic_rule_stops_the_rule(iot_client, iot_data_client, sqs, iam):
+    """DisableTopicRule stops both the topic filter and Basic Ingest; EnableTopicRule restarts them."""
+    queue = sqs.create_queue(QueueName=_unique("toggled-sink"))["QueueUrl"]
+    rule = _unique("toggled").replace("-", "_")
+    role = _rule_role(iam)
+    iot_client.create_topic_rule(
+        ruleName=rule,
+        topicRulePayload={
+            "sql": "SELECT * FROM 'sensors/+/toggled'",
+            "actions": [{"sqs": {"queueUrl": queue, "roleArn": role["Arn"]}}],
+        },
+    )
+
+    def publish(n):
+        for topic in ("sensors/a1/toggled", f"$aws/rules/{rule}"):
+            iot_data_client.publish(topic=topic, payload=json.dumps({"n": n}).encode())
+
+    try:
+        iot_client.disable_topic_rule(ruleName=rule)
+        publish(1)
+        assert _poll_body(sqs, queue, timeout=2) is None
+        iot_client.enable_topic_rule(ruleName=rule)
+        publish(2)
+        assert _take_bodies(sqs, queue, 2) == [{"n": 2}, {"n": 2}]
+    finally:
+        iot_client.delete_topic_rule(ruleName=rule)
+        iam.delete_role(RoleName=role["RoleName"])
+
+
 # Every byte value: not valid UTF-8, so it survives the rule path only if the
 # payload is never text-decoded.
 _BINARY_PAYLOAD = bytes(range(256))
@@ -2941,7 +2970,7 @@ def test_mqtt5_publisher_reaches_mqtt311_subscriber():
 
 
 def test_mqtt5_qos1_puback_carries_reason_code():
-    """QoS 1 PUBACK reports Success with a subscriber, No matching subscribers without."""
+    """QoS 1 PUBACK reports Success with a subscriber and without one."""
     topic = _unique("v5/qos1")
 
     async def scenario():
@@ -2964,7 +2993,7 @@ def test_mqtt5_qos1_puback_carries_reason_code():
                 return lonely, matched
 
     lonely, matched = _run(scenario())
-    assert lonely == b"\x00\x07\x10\x00", "packet id 7, No matching subscribers, no properties"
+    assert lonely == b"\x00\x07\x00\x00", "packet id 7, Success, no properties"
     assert matched == b"\x00\x08\x00\x00", "packet id 8, Success, no properties"
 
 
@@ -3256,9 +3285,7 @@ def test_mqtt5_no_local_withholds_a_publisher_its_own_message():
 
     (pkt_type, _flags, puback), delivered = _run(scenario())
     assert pkt_type == PKT_PUBACK, "the publisher's own message must not come back"
-    assert puback == b"\x00\x07\x10\x00", (
-        "No matching subscribers: the only subscription was the publisher's own"
-    )
+    assert puback == b"\x00\x07\x00\x00", "packet id 7, Success, no properties"
     assert _parse_publish(delivered, MQTT_5)[1] == b"theirs"
 
 
@@ -3974,6 +4001,30 @@ def test_mtls_publish_principal_is_the_certificate_id(broker, tmp_path):
         broker.client("iam").delete_role(RoleName=role["RoleName"])
 
 
+def test_mtls_job_document_urls_name_the_dialled_host(broker, tmp_path):
+    """Presigned URLs a device gets over TLS name the host it dialled, on the gateway port."""
+    iot = broker.client("iot")
+    thing, job_id = _unique("mtls-jobs"), _unique("job")
+    iot.create_job(
+        jobId=job_id, targets=[iot.create_thing(thingName=thing)["thingArn"]],
+        document=json.dumps({"fw": "${aws:iot:s3-presigned-url-v2:s3://bucket/fw.bin}"}),
+        presignedUrlConfig={"roleArn": "arn:aws:iam::000000000000:role/presign"},
+    )
+    port = int(os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566")))
+    topic = f"$aws/things/{thing}/jobs/{job_id}/get"
+    for server_name, host in (("localhost", "localhost"), (None, "127.0.0.1")):
+        peer = _Peer(_mtls_connect(broker, None, None, tmp_path, server_name=server_name))
+        try:
+            _assert_connack(peer.connect(_unique("device")))
+            peer.subscribe(f"{topic}/accepted")
+            peer.send(_make_publish(topic, b"{}"))
+            _topic, payload = peer.next_publish()
+            url = urlparse(json.loads(payload)["execution"]["jobDocument"]["fw"])
+            assert (url.hostname, url.port, url.path) == (host, port, "/bucket/fw.bin")
+        finally:
+            peer.close()
+
+
 def test_mtls_no_client_cert_uses_default_account(broker, tmp_path):
     """No client certificate connects fine, exactly like the WebSocket path,
     and the session runs under the default account."""
@@ -4075,6 +4126,65 @@ def test_mtls_inactive_cert_refused(broker, tmp_path):
         _assert_connack(peer.connect(_unique("reactivated")))
     finally:
         peer.close()
+
+
+def test_mtls_auth_refusal_closes_without_connack(tmp_path):
+    """With AUTH=true a refused client certificate's CONNECT is closed without a CONNACK, the log names the reason."""
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    log_path = tmp_path / "auth.log"
+    proc = _spawn(
+        {"AUTH": "true", "IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port, log_path=log_path
+    )
+    try:
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
+        private = _Broker(http_port, mqtt_port, log_path)
+        iot = private.client("iot")
+        policy = _unique("connect")
+        iot.create_policy(policyName=policy, policyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}],
+        }))
+        certs = {name: _new_cert(private) for name in ("active", "inactive", "revoked", "deleted")}
+        for name in ("active", "inactive", "revoked"):
+            arn = iot.describe_certificate(certificateId=certs[name][0])["certificateDescription"]["certificateArn"]
+            iot.attach_policy(policyName=policy, target=arn)
+        iot.update_certificate(certificateId=certs["inactive"][0], newStatus="INACTIVE")
+        iot.update_certificate(certificateId=certs["revoked"][0], newStatus="REVOKED")
+        iot.update_certificate(certificateId=certs["deleted"][0], newStatus="INACTIVE")
+        iot.delete_certificate(certificateId=certs["deleted"][0])
+
+        def answer(cert, protocol_level):
+            """The packet answering a CONNECT, or "closed" when the broker hangs up without one."""
+            peer = _Peer(_mtls_connect(private, cert[1], cert[2], tmp_path))
+            try:
+                peer.send(_make_connect(_unique("device"), protocol_level=protocol_level))
+                pkt = peer.next_packet(timeout=5.0)
+                if pkt is None:
+                    return "closed" if peer.wait_disconnected(timeout=1.0) else "open"
+                return pkt[0], pkt[2][1]
+            finally:
+                peer.close()
+
+        assert answer(certs["active"], MQTT_311) == (PKT_CONNACK, 0)
+        for level in (MQTT_311, MQTT_5):
+            for name in ("inactive", "revoked", "deleted"):
+                assert answer(certs[name], level) == "closed", (name, level)
+
+        _cert_id, active_pem, _key_pem = certs["active"]
+        private.client("iot", access_key="222222222222").register_certificate(
+            certificatePem=active_pem, setAsActive=True
+        )
+        for level in (MQTT_311, MQTT_5):
+            assert answer(certs["active"], level) == "closed", level
+
+        for name, reason in (
+            ("inactive", "status 'INACTIVE'"), ("revoked", "status 'REVOKED'"),
+            ("deleted", "not registered"), ("active", "owner is ambiguous"),
+        ):
+            refusals = [line for line in private.log().splitlines() if certs[name][0] in line]
+            assert refusals and reason in refusals[-1], (name, refusals)
+    finally:
+        _terminate(proc)
 
 
 def test_mtls_ambiguous_cert_is_refused(broker, tmp_path):
@@ -4231,6 +4341,276 @@ def test_mtls_registered_ca_chain_connects(broker, tmp_path):
     peer = _Peer(_mtls_connect(broker, leaf_pem, leaf_key, tmp_path))
     try:
         _assert_connack(peer.connect(_unique("registered-ca-device")))
+    finally:
+        peer.close()
+
+
+def test_mtls_provisioning_claim_connects_and_provisions(broker, tmp_path):
+    """A claim certificate connects over mTLS and provisions a thing whose new certificate then connects."""
+    iot = broker.client("iot")
+    name, serial = _unique("fleet"), _unique("device")
+    iot.create_policy(
+        policyName=f"{name}-device",
+        policyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]}),
+    )
+    iot.create_provisioning_template(
+        templateName=name,
+        templateBody=json.dumps({
+            "Parameters": {"SerialNumber": {"Type": "String"}},
+            "Resources": {
+                "thing": {"Type": "AWS::IoT::Thing",
+                          "Properties": {"ThingName": {"Ref": "SerialNumber"}}},
+                "certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "ACTIVE"}},
+                "policy": {"Type": "AWS::IoT::Policy",
+                           "Properties": {"PolicyName": f"{name}-device"}},
+            },
+        }),
+        enabled=True,
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+    )
+    claim = iot.create_provisioning_claim(templateName=name)
+    create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+
+    peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("claim")))
+        peer.subscribe(f"{create}/+", packet_id=1)
+        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.send(_make_publish(create, b"", qos=1, packet_id=3))
+        topic, payload = peer.next_publish()
+        assert topic == f"{create}/accepted"
+        created = json.loads(payload)
+        peer.send(_make_publish(provision, json.dumps({
+            "certificateOwnershipToken": created["certificateOwnershipToken"],
+            "parameters": {"SerialNumber": serial},
+        }).encode(), qos=1, packet_id=4))
+        assert peer.next_publish() == (
+            f"{provision}/accepted",
+            json.dumps({"deviceConfiguration": {}, "thingName": serial}).encode(),
+        )
+    finally:
+        peer.close()
+
+    device = _Peer(_mtls_connect(broker, created["certificatePem"], created["privateKey"], tmp_path))
+    try:
+        _assert_connack(device.connect(serial))
+    finally:
+        device.close()
+
+
+def test_mtls_auth_provisioning_claim_is_held_to_its_templates_topics(tmp_path):
+    """With AUTH=true a claim provisions on its template's topics and is refused anything else, as on AWS."""
+    pytest.importorskip("cryptography")
+    http_port, mqtt_port = _free_port(), _free_port()
+    proc = _spawn({"AUTH": "true", "IOT_MTLS_ENABLED": "1", "IOT_MTLS_PORT": str(mqtt_port)}, http_port)
+    try:
+        _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
+        private = _Broker(http_port, mqtt_port)
+        iot = private.client("iot")
+        name = _unique("fleet")
+        iot.create_provisioning_template(
+            templateName=name,
+            templateBody=json.dumps({"Resources": {"certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "ACTIVE"}}}}),
+            enabled=True,
+            provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+        )
+        claim = iot.create_provisioning_claim(templateName=name)
+        create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+        other, unrelated = "$aws/provisioning-templates/other/provision/json", "devices/telemetry"
+
+        def claim_peer(protocol_level=MQTT_311):
+            peer = _Peer(_mtls_connect(private, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+            peer.send(_make_connect(_unique("claim"), protocol_level=protocol_level))
+            _assert_connack(peer.next_packet())
+            return peer
+
+        peer = claim_peer()
+        try:
+            for packet_id, topic in enumerate((f"{create}/accepted", f"{provision}/accepted"), start=1):
+                assert peer.subscribe(topic, packet_id=packet_id)[2][2:] == b"\x00", topic
+            peer.send(_make_publish(create, b"", qos=1, packet_id=3))
+            topic, payload = peer.next_publish()
+            assert topic == f"{create}/accepted"
+            request = json.dumps({"certificateOwnershipToken": json.loads(payload)["certificateOwnershipToken"]})
+            peer.send(_make_publish(provision, request.encode(), qos=1, packet_id=4))
+            assert peer.next_publish() == (f"{provision}/accepted", b'{"deviceConfiguration": {}}')
+        finally:
+            peer.close()
+
+        # MQTT 3.1.1: any refused SUBSCRIBE or PUBLISH closes the connection.
+        for packet in (
+            _make_subscribe(1, unrelated),
+            _make_subscribe(1, f"{other}/accepted"),
+            _make_publish(unrelated, b"{}", qos=1, packet_id=1),
+            _make_publish(other, b"{}", qos=1, packet_id=1),
+        ):
+            peer = claim_peer()
+            try:
+                peer.send(packet)
+                assert peer.wait_disconnected(), packet
+            finally:
+                peer.close()
+
+        # MQTT 5: SUBACK 0x87 for the refused filter and PUBACK 0x87, the connection stays.
+        peer = claim_peer(MQTT_5)
+        try:
+            for packet_id, (topic, code) in enumerate(
+                ((f"{create}/rejected", 0x00), (unrelated, 0x87), (f"{other}/accepted", 0x87)), start=1
+            ):
+                peer.send(_make_subscribe(packet_id, topic, protocol_level=MQTT_5))
+                ptype, _flags, body = peer.next_packet()
+                assert (ptype, body[3:]) == (PKT_SUBACK, bytes([code])), topic
+            for packet_id, topic in enumerate((unrelated, other), start=4):
+                peer.send(_make_publish(topic, b"{}", qos=1, packet_id=packet_id, protocol_level=MQTT_5))
+                ptype, _flags, body = peer.next_packet()
+                assert (ptype, body[2]) == (PKT_PUBACK, 0x87), topic
+        finally:
+            peer.close()
+    finally:
+        _terminate(proc)
+
+
+# Names the thing after its certificate and keeps the device's thing type.
+_PROVISIONING_HOOK_HANDLER = (
+    "def handler(event, context):\n"
+    "    return {'allowProvisioning': True, 'parameterOverrides': {\n"
+    "        'ThingName': 'dev-' + event['certificateId'][:12],\n"
+    "        'ThingTypeName': event['parameters']['ThingTypeName']}}\n"
+)
+
+
+def test_mtls_provisioning_hook_names_the_thing(broker, tmp_path):
+    """A pre-provisioning hook Lambda names the thing that the device did not name."""
+    iot, lam = broker.client("iot"), broker.client("lambda")
+    name = _unique("fleet")
+    iot.create_thing_type(thingTypeName=f"{name}-type")
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.py", _PROVISIONING_HOOK_HANDLER)
+    role = broker.client("iam").create_role(RoleName=f"{name}-hook", AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}))
+    hook = lam.create_function(
+        FunctionName=f"{name}-hook", Runtime="python3.12", Handler="index.handler",
+        Role=role["Role"]["Arn"], Code={"ZipFile": buf.getvalue()},
+    )["FunctionArn"]
+    lam.add_permission(
+        FunctionName=f"{name}-hook", StatementId="iot", Action="lambda:InvokeFunction",
+        Principal="iot.amazonaws.com",
+    )
+    iot.create_provisioning_template(
+        templateName=name,
+        templateBody=json.dumps({
+            "Parameters": {"ThingName": {"Type": "String"}, "ThingTypeName": {"Type": "String"}},
+            "Resources": {
+                "thing": {"Type": "AWS::IoT::Thing", "OverrideSettings": {
+                    "AttributePayload": "DO_NOTHING", "ThingGroups": "DO_NOTHING",
+                    "ThingTypeName": "DO_NOTHING"}, "Properties": {
+                    "ThingName": {"Ref": "ThingName"}, "ThingTypeName": {"Ref": "ThingTypeName"},
+                    "AttributePayload": {}, "ThingGroups": []}},
+                "certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "Active"}},
+            },
+        }),
+        enabled=True,
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+        preProvisioningHook={"targetArn": hook},
+    )
+    claim = iot.create_provisioning_claim(templateName=name)
+    create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+
+    peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+    try:
+        _assert_connack(peer.connect(_unique("claim")))
+        peer.subscribe(f"{create}/+", packet_id=1)
+        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.send(_make_publish(create, b"", qos=1, packet_id=3))
+        topic, payload = peer.next_publish()
+        assert topic == f"{create}/accepted"
+        created = json.loads(payload)
+        peer.send(_make_publish(provision, json.dumps({
+            "certificateOwnershipToken": created["certificateOwnershipToken"],
+            "parameters": {"ThingTypeName": f"{name}-type"},
+        }).encode(), qos=1, packet_id=4))
+        thing = "dev-" + created["certificateId"][:12]
+        assert peer.next_publish(timeout=10) == (
+            f"{provision}/accepted",
+            json.dumps({"deviceConfiguration": {}, "thingName": thing}).encode(),
+        )
+    finally:
+        peer.close()
+    assert iot.describe_thing(thingName=thing)["thingTypeName"] == f"{name}-type"
+
+
+@pytest.mark.parametrize("hook", [False, True], ids=["plain", "hook"])
+def test_mtls_provisioning_applies_the_default_template_version(broker, tmp_path, hook):
+    """RegisterThing applies the default version of the template, after its hook if it has one."""
+    iot = broker.client("iot")
+    name = _unique("fleet")
+    extra = {}
+    if hook:
+        buf = _io.BytesIO()
+        with _zipfile.ZipFile(buf, "w") as z:
+            z.writestr("index.py", "def handler(event, context):\n    return {'allowProvisioning': True}\n")
+        role = broker.client("iam").create_role(RoleName=f"{name}-hook", AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                    "Principal": {"Service": "lambda.amazonaws.com"}}]}))
+        lam = broker.client("lambda")
+        extra["preProvisioningHook"] = {"targetArn": lam.create_function(
+            FunctionName=f"{name}-hook", Runtime="python3.12", Handler="index.handler",
+            Role=role["Role"]["Arn"], Code={"ZipFile": buf.getvalue()},
+        )["FunctionArn"]}
+        lam.add_permission(
+            FunctionName=f"{name}-hook", StatementId="iot", Action="lambda:InvokeFunction",
+            Principal="iot.amazonaws.com",
+        )
+
+    def body(version):
+        return json.dumps({
+            "Parameters": {"SerialNumber": {"Type": "String"}},
+            "Resources": {
+                "thing": {"Type": "AWS::IoT::Thing", "Properties": {
+                    "ThingName": {"Fn::Join": ["", [f"{name}-{version}-", {"Ref": "SerialNumber"}]]}}},
+                "certificate": {"Type": "AWS::IoT::Certificate", "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"}, "Status": "ACTIVE"}},
+            },
+            "DeviceConfiguration": {"version": version},
+        })
+
+    iot.create_provisioning_template(
+        templateName=name, templateBody=body("v1"), enabled=True,
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning", **extra,
+    )
+    claim = iot.create_provisioning_claim(templateName=name)
+    create, provision = "$aws/certificates/create/json", f"$aws/provisioning-templates/{name}/provision/json"
+    peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
+    packet_ids = iter(range(3, 100))
+
+    def register(serial, version):
+        peer.send(_make_publish(create, b"", qos=1, packet_id=next(packet_ids)))
+        topic, payload = peer.next_publish()
+        assert topic == f"{create}/accepted"
+        peer.send(_make_publish(provision, json.dumps({
+            "certificateOwnershipToken": json.loads(payload)["certificateOwnershipToken"],
+            "parameters": {"SerialNumber": serial},
+        }).encode(), qos=1, packet_id=next(packet_ids)))
+        assert peer.next_publish(timeout=10) == (f"{provision}/accepted", json.dumps({
+            "deviceConfiguration": {"version": version}, "thingName": f"{name}-{version}-{serial}",
+        }).encode())
+
+    try:
+        _assert_connack(peer.connect(_unique("claim")))
+        peer.subscribe(f"{create}/+", packet_id=1)
+        peer.subscribe(f"{provision}/+", packet_id=2)
+        iot.create_provisioning_template_version(templateName=name, templateBody=body("v2"))
+        register("a", "v1")
+        iot.update_provisioning_template(templateName=name, defaultVersionId=2)
+        register("b", "v2")
+        iot.create_provisioning_template_version(templateName=name, templateBody=body("v3"), setAsDefault=True)
+        register("c", "v3")
     finally:
         peer.close()
 
