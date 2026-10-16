@@ -1412,12 +1412,14 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status, error_type="", fields=None):
-    type_xml = f"<Type>{error_type}</Type>" if error_type else ""
+    # Query-protocol error envelope per real-AWS captures (17-region
+    # sweep): <Type> inside <Error> (Sender for 4xx, Receiver for 5xx —
+    # callers may pin an explicit value) and no <?xml?> declaration.
+    error_type = error_type or ("Sender" if status < 500 else "Receiver")
     message_xml = f"<Message>{_esc(message)}</Message>" if message is not None else ""
     message_xml += "".join(f"<{k}>{_esc(v)}</{k}>" for k, v in (fields or {}).items())
-    body = (f'<?xml version="1.0" encoding="UTF-8"?>'
-            f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
-            f'<Error>{type_xml}<Code>{code}</Code>{message_xml}</Error>'
+    body = (f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
+            f'<Error><Type>{error_type}</Type><Code>{code}</Code>{message_xml}</Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body

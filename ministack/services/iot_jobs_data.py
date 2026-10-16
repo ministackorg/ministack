@@ -71,6 +71,7 @@ async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     """Route a device-plane request, then publish the job events it raised."""
+    _iot_module.jobs_device_host.set(headers.get("host", ""))
     async with _iot_module.publishing_events():
         return await _route_request(method, path, body, query_params)
 
@@ -256,4 +257,5 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         await _iot_module.jobs_notify_thing(
             get_account_id(), get_region(), thing, prev_next
         )
+        await _iot_module.jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return json_response(response)

@@ -314,8 +314,12 @@ def _xml_response(root_tag: str, builder_fn, status: int = 200, extra_headers: d
 
 
 def _error(code: str, message: str, status: int) -> tuple:
+    # rest-xml error envelope per real-AWS captures (17-region sweep):
+    # <?xml?> declaration present and <Type> inside <Error> (Sender for
+    # 4xx, Receiver for 5xx).
     root = Element("ErrorResponse", xmlns=NS)
     err = SubElement(root, "Error")
+    SubElement(err, "Type").text = "Sender" if status < 500 else "Receiver"
     SubElement(err, "Code").text = code
     SubElement(err, "Message").text = message
     SubElement(root, "RequestId").text = new_uuid()
