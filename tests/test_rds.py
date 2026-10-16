@@ -4846,6 +4846,8 @@ def test_rds_reboot_db_instance(rds):
 
         desc = rds.describe_db_instances(DBInstanceIdentifier="reboot-test")
         assert desc["DBInstances"][0]["DBInstanceStatus"] == "available"
+        events = rds.describe_events(SourceIdentifier="reboot-test", SourceType="db-instance")["Events"]
+        assert any(event["Message"] == "DB instance restarted." for event in events)
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="reboot-test", SkipFinalSnapshot=True)
 
@@ -5006,6 +5008,104 @@ def test_rds_reboot_does_not_resurrect_a_replaced_instance(monkeypatch, reboot_i
     _imm_rds._finish_instance_reboot(reboot_instance, None)
     assert _imm_rds._instances["reboot-test"] is replacement
     assert reboot_instance["DBInstanceStatus"] == "rebooting"
+
+
+@pytest.fixture
+def clean_rds_events():
+    saved = dict(_imm_rds._events.items())
+    for key in list(_imm_rds._events):
+        del _imm_rds._events[key]
+    yield
+    for key in list(_imm_rds._events):
+        del _imm_rds._events[key]
+    _imm_rds._events.update(saved)
+
+
+def _describe_rds_events(**params):
+    """In-process DescribeEvents, parsed with botocore's Query parser."""
+    import botocore.session
+    from botocore.parsers import QueryParser
+
+    status, headers, body = _imm_rds._describe_events(params)
+    shape = botocore.session.get_session().get_service_model("rds").operation_model("DescribeEvents").output_shape
+    return status, QueryParser().parse({"status_code": status, "headers": headers, "body": body}, shape)
+
+
+def _record_rds_reboot_event(name="example"):
+    _imm_rds._record_reboot_event({"DBInstanceIdentifier": name,
+                                   "DBInstanceArn": f"arn:aws:rds:us-east-1:000000000000:db:{name}"})
+
+
+def test_rds_reboot_event_wire_shape_and_filters(clean_rds_events):
+    _record_rds_reboot_event("example")
+    _record_rds_reboot_event("other")
+    status, result = _describe_rds_events(SourceIdentifier="example", SourceType="db-instance")
+    assert status == 200
+    event, = result["Events"]
+    assert event["Message"] == "DB instance restarted."
+    assert event["EventCategories"] == ["availability"]
+    assert event["SourceArn"].endswith(":db:example")
+    assert abs(event["Date"].timestamp() - time.time()) < 2
+    assert _describe_rds_events(SourceType="db-cluster")[1]["Events"] == []
+    assert _describe_rds_events(SourceType="db-shard-group")[0] == 200
+    assert _describe_rds_events(**{"EventCategories.member.1": "failure"})[1]["Events"] == []
+    assert _describe_rds_events(StartTime="2100-01-01T00:00:00Z", EndTime="2100-01-02T00:00:00Z")[1]["Events"] == []
+
+
+def test_rds_events_pagination_has_no_duplicates(clean_rds_events):
+    for i in range(23):
+        _record_rds_reboot_event(str(i))
+    _, first = _describe_rds_events(MaxRecords="20")
+    _, second = _describe_rds_events(MaxRecords="20", Marker=first["Marker"])
+    assert len(first["Events"]) == 20
+    assert len(second["Events"]) == 3
+    assert "Marker" not in second
+    assert len({e["SourceIdentifier"] for e in first["Events"] + second["Events"]}) == 23
+
+
+@pytest.mark.parametrize("params", [{"SourceIdentifier": "x"}, {"MaxRecords": "19"}, {"MaxRecords": "101"},
+                                    {"Duration": "bad"}, {"Marker": "missing"}, {"StartTime": "bad"}])
+def test_rds_events_invalid_requests(clean_rds_events, params):
+    assert _describe_rds_events(**params)[0] == 400
+
+
+def test_rds_events_survive_persistence_and_are_region_scoped(clean_rds_events):
+    from ministack.core.responses import get_region, set_request_region
+
+    region = get_region()
+    _record_rds_reboot_event()
+    snapshot = _imm_rds.get_state()
+    try:
+        set_request_region("eu-north-1" if region != "eu-north-1" else "us-east-2")
+        assert _describe_rds_events()[1]["Events"] == []
+    finally:
+        set_request_region(region)
+    for key in list(_imm_rds._events):
+        del _imm_rds._events[key]
+    _imm_rds.load_persisted_state(snapshot)
+    assert len(_describe_rds_events()[1]["Events"]) == 1
+
+
+def test_rds_reboot_event_recorded_only_after_success(clean_rds_events, monkeypatch):
+    instance = {"DBInstanceIdentifier": "event-reboot", "DBInstanceStatus": "rebooting"}
+    _imm_rds._instances["event-reboot"] = instance
+    try:
+        monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+        _imm_rds._finish_instance_reboot(instance, None)
+        assert len(_describe_rds_events()[1]["Events"]) == 1
+        instance["DBInstanceStatus"] = "rebooting"
+        instance["_docker_container_id"] = "missing"
+
+        def fail(_):
+            raise RuntimeError("missing container")
+
+        monkeypatch.setattr(_imm_rds, "_get_docker",
+                            lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=fail)))
+        _imm_rds._finish_instance_reboot(instance, None)
+        assert len(_describe_rds_events()[1]["Events"]) == 1
+        assert instance["DBInstanceStatus"] == "failed"
+    finally:
+        _imm_rds._instances.pop("event-reboot", None)
 
 
 def test_rds_restore_from_snapshot(rds):

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **RDS — `DescribeEvents` with reboot events** — `DescribeEvents` returns the `availability` event `DB instance restarted.` once a `RebootDBInstance` has finished, filtered by source, source type, category and time, paged with `Marker` and kept for 14 days; other RDS lifecycle events are not recorded yet. Contributed by @jayjanssen.
+
 ### Changed
 - **RDS — real instance reboot** — `RebootDBInstance` now returns `rebooting`, stops and starts its backing database container, and waits for SQL readiness before reporting `available`. Data and endpoint bindings are preserved. An instance that is not `available` answers `InvalidDBInstanceState`, and a Docker failure reports `failed` rather than a successful reboot. Contributed by @jayjanssen.
 

@@ -108,6 +108,7 @@ RDS_PG_CLUSTER_REPLICATION = os.environ.get(
 ).lower() in ("1", "true", "yes")
 
 _instances = AccountRegionScopedDict()
+_events = AccountRegionScopedDict()
 _clusters = AccountRegionScopedDict()
 _subnet_groups = AccountRegionScopedDict()
 _param_groups = AccountRegionScopedDict()
@@ -338,6 +339,7 @@ def get_state():
         clusters = copy.deepcopy(_clusters)
         state = {
             "instances": instances,
+            "events": copy.deepcopy(_events),
             "clusters": clusters,
             "subnet_groups": copy.deepcopy(_subnet_groups),
             "param_groups": copy.deepcopy(_param_groups),
@@ -374,6 +376,7 @@ def load_persisted_state(data) -> None:
 def _restore_state(data, *, resume_runtime=False):
     if not data:
         return
+    _events.update(data.get("events", {}))
     _clusters.update(data.get("clusters", {}))
     for key in list(_clusters._data):
         cluster = _clusters._data[key]
@@ -5649,6 +5652,72 @@ def _begin_instance_reboot(p):
     return response
 
 
+def _record_reboot_event(instance):
+    now = time.time()
+    with _shared_container_lock:
+        for key, event in list(_events.items()):
+            if event["Date"] < now - 14 * 86400:
+                del _events[key]
+        _events[new_uuid()] = {
+            "SourceIdentifier": instance["DBInstanceIdentifier"],
+            "SourceType": "db-instance", "SourceArn": instance.get("DBInstanceArn", ""),
+            "Message": "DB instance restarted.", "Date": now,
+            "EventCategories": ["availability"],
+        }
+
+
+def _describe_events(p):
+    now = time.time()
+    source = _p(p, "SourceIdentifier")
+    kind = _p(p, "SourceType")
+    if source and not kind:
+        return _error("InvalidParameterCombination", "SourceIdentifier requires SourceType.", 400)
+    if kind and kind not in ("db-instance", "db-parameter-group", "db-security-group", "db-snapshot", "db-cluster",
+                             "db-cluster-snapshot", "custom-engine-version", "db-proxy", "blue-green-deployment",
+                             "db-shard-group", "zero-etl"):
+        return _error("InvalidParameterValue", "Invalid SourceType.", 400)
+    def timestamp(value, default):
+        if not value:
+            return default
+        date = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=datetime.timezone.utc)
+        return date.timestamp()
+    try:
+        limit = int(_p(p, "MaxRecords", "100"))
+        duration = int(_p(p, "Duration", "60"))
+        start = timestamp(_p(p, "StartTime"), now - duration * 60)
+        end = timestamp(_p(p, "EndTime"), now)
+        if not 20 <= limit <= 100 or not 0 <= duration <= 20160 or start > end:
+            raise ValueError
+    except (ValueError, OverflowError):
+        return _error("InvalidParameterValue", "Invalid event time range, duration or MaxRecords.", 400)
+    categories = _parse_member_list(p, "EventCategories")
+    with _shared_container_lock:
+        events = sorted(
+            ((key, dict(event)) for key, event in _events.items()
+             if max(start, now - 14 * 86400) <= event["Date"] <= end
+             and (not source or event["SourceIdentifier"] == source)
+             and (not kind or event["SourceType"] == kind)
+             and (not categories or set(categories).intersection(event["EventCategories"]))),
+            key=lambda pair: (pair[1]["Date"], pair[0]),
+        )
+    marker = _p(p, "Marker")
+    if marker:
+        positions = [i for i, (key, _) in enumerate(events) if key == marker]
+        if not positions:
+            return _error("InvalidParameterValue", "Invalid event Marker.", 400)
+        events = events[positions[0] + 1:]
+    page = events[:limit]
+    members = ""
+    for _, event in page:
+        fields = "".join(f"<{field}>{_esc(event[field])}</{field}>" for field in ("SourceIdentifier", "SourceType", "SourceArn", "Message"))
+        categories_xml = "".join(f"<EventCategory>{_esc(category)}</EventCategory>" for category in event["EventCategories"])
+        members += f"<Event>{fields}<Date>{_format_time(event['Date'])}</Date><EventCategories>{categories_xml}</EventCategories></Event>"
+    next_marker = f"<Marker>{page[-1][0]}</Marker>" if len(events) > limit else ""
+    return _xml(200, "DescribeEventsResponse", f"<DescribeEventsResult><Events>{members}</Events>{next_marker}</DescribeEventsResult>")
+
+
 def _finish_instance_reboot(instance, cluster):
     db_id = instance["DBInstanceIdentifier"]
 
@@ -5682,6 +5751,7 @@ def _finish_instance_reboot(instance, cluster):
             ):
                 raise RuntimeError("database stopped before reboot readiness")
         if current():
+            _record_reboot_event(instance)
             instance["DBInstanceStatus"] = "available"
     except Exception:
         logger.exception("RDS: reboot failed for %s", db_id)
@@ -11348,6 +11418,7 @@ _ACTION_MAP = {
     "StartDBInstance": _start_db_instance,
     "StopDBInstance": _stop_db_instance,
     "RebootDBInstance": _reboot_db_instance,
+    "DescribeEvents": _describe_events,
     "CreateDBInstanceReadReplica": _create_read_replica,
     "RestoreDBInstanceFromDBSnapshot": _restore_from_snapshot,
     "CreateDBCluster": _create_db_cluster,
@@ -11470,6 +11541,7 @@ def reset():
                             e,
                         )
         _instances.clear()
+        _events.clear()
         _clusters.clear()
         _subnet_groups.clear()
         _param_groups.clear()
