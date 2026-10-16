@@ -52,6 +52,7 @@ from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _service_model,
     error_response_json,
     get_account_id,
     get_region,
@@ -749,7 +750,35 @@ def _describe_execution(data):
     return json_response(result)
 
 
+def _execution_sort_key(execution):
+    """AWS lists the most recent execution first: a running one by its
+    startDate, the rest by stopDate. The ARN breaks ties, so the order is
+    total and a token can resume it."""
+    return (execution["stopDate"] or execution["startDate"], execution["executionArn"])
+
+
+def _encode_execution_token(execution):
+    """Tokens carry the sort position of the last execution returned, not an
+    index, as AWS's do: with an offset, an execution started between pages
+    would repeat one."""
+    raw = json.dumps(list(_execution_sort_key(execution))).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_execution_token(token):
+    try:
+        moment, arn = json.loads(base64.urlsafe_b64decode(token.encode("ascii")))
+        return (str(moment), str(arn))
+    except Exception:
+        return None
+
+
 def _list_executions(data):
+    cursor = None
+    if data.get("nextToken"):
+        cursor = _decode_execution_token(data["nextToken"])
+        if cursor is None:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
     sm_arn = data.get("stateMachineArn")
     status_filter = data.get("statusFilter")
     all_execs = []
@@ -766,18 +795,14 @@ def _list_executions(data):
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
         })
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
-    start = 0
-    if next_token:
-        try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_execs[start:start + max_results]
+    all_execs.sort(key=_execution_sort_key, reverse=True)
+    if cursor is not None:
+        all_execs = [e for e in all_execs if _execution_sort_key(e) < cursor]
+    max_results = int(data.get("maxResults") or 1000)
+    page = all_execs[:max_results]
     resp = {"executions": page}
-    if start + max_results < len(all_execs):
-        resp["nextToken"] = str(start + max_results)
+    if len(all_execs) > max_results:
+        resp["nextToken"] = _encode_execution_token(page[-1])
     return json_response(resp)
 
 
@@ -1252,11 +1277,8 @@ def _test_state(data):
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
 
         elif state_type == "Fail":
-            result = {
-                "status": "FAILED",
-                "error": state_def.get("Error", "States.Fail"),
-                "cause": state_def.get("Cause", ""),
-            }
+            error, cause = _fail_state_error(state_def, input_data, ctx)
+            result = {"status": "FAILED", "error": error, "cause": cause}
 
         elif state_type == "Task":
             effective = _apply_input_path(state_def, input_data, ctx)
@@ -1552,9 +1574,7 @@ def _run_execution(exec_arn):
                 continue
 
             if state_type == "Fail":
-                raise _ExecutionError(
-                    state_def.get("Error", "States.Fail"),
-                    state_def.get("Cause", ""))
+                raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
             handler_fn = {
                 "Pass": _execute_pass,
@@ -2157,6 +2177,17 @@ def _evaluate_rule(rule, data, ctx=None):
 # ---------------------------------------------------------------------------
 
 def _execute_wait(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        # JSONata Wait: Seconds and Timestamp may be expressions, and Output
+        # and Assign replace the JSONPath chain, as for Pass.
+        if "Seconds" in state_def:
+            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx))
+        elif "Timestamp" in state_def:
+            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx))
+        output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        _apply_state_assign(state_def, raw_input, ctx)
+        return output, _next_or_end(state_def)
+
     effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
@@ -2176,6 +2207,29 @@ def _execute_wait(state_def, raw_input, ctx=None):
     return output, _next_or_end(state_def)
 
 
+def _jsonata_wait_seconds(state_def, raw_input, ctx):
+    seconds = _jsonata_state_field(state_def, "Seconds", "number", raw_input, ctx)
+    if not float(seconds).is_integer():
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The Seconds field cannot be parsed as an integer: {json.dumps(seconds)}")
+    if seconds < 0:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"Seconds cannot be negative but was: {json.dumps(seconds)}")
+    return seconds
+
+
+def _jsonata_wait_timestamp(state_def, raw_input, ctx):
+    timestamp = _jsonata_state_field(state_def, "Timestamp", "string", raw_input, ctx)
+    if _parse_ts(timestamp) is None:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            "The Timestamp field cannot be parsed as an ISO-8601 extended offset "
+            f"date-time format string: {timestamp}")
+    return timestamp
+
+
 def _scaled_sleep(seconds):
     scaled = seconds * _SFN_WAIT_SCALE
     if scaled > 0:
@@ -2190,6 +2244,34 @@ def _sleep_until(iso_ts):
             _scaled_sleep(delta)
     except (ValueError, TypeError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Fail state
+# ---------------------------------------------------------------------------
+
+def _fail_state_error(state_def, raw_input, ctx=None):
+    """The error and cause a Fail state ends with. JSONata states may give
+    either as an expression; JSONPath states may select either from the
+    input with ErrorPath or CausePath. Both must be strings."""
+    return (_fail_state_field(state_def, "Error", "States.Fail", raw_input, ctx),
+            _fail_state_field(state_def, "Cause", "", raw_input, ctx))
+
+
+def _fail_state_field(state_def, field, default, raw_input, ctx):
+    if field in state_def and _state_query_language(state_def, ctx) == "JSONata":
+        return _jsonata_state_field(state_def, field, "string", raw_input, ctx)
+    path = state_def.get(f"{field}Path")
+    if path is None:
+        return state_def.get(field, default)
+    value = (_evaluate_intrinsic(path, raw_input, ctx) if path.startswith("States.")
+             else _resolve_path_or_ctx(path, raw_input, ctx))
+    if not isinstance(value, str):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The value referenced by {field}Path must be a string, "
+            f"but the value was: {json.dumps(value)}")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -2361,9 +2443,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
             return _apply_output_path(state_def,
                                       _apply_input_path(state_def, current_input, ctx), ctx)
         if state_type == "Fail":
-            raise _ExecutionError(
-                state_def.get("Error", "States.Fail"),
-                state_def.get("Cause", ""))
+            raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
         handler_fn = {
             "Pass": _execute_pass,
@@ -2508,6 +2588,32 @@ def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_outpu
             for item in value
         ]
     return value
+
+
+def _jsonata_state_field(state_def, field, expected, raw_input, ctx):
+    """A state field that may be a JSONata expression, evaluated and held to
+    the JSON type AWS requires of it."""
+    value = _apply_jsonata_template(state_def[field], raw_input, ctx)
+    if _json_type(value) != expected:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The JSONata expression specified for the field '{field}' returned an "
+            f"unexpected result type. Expected '{expected}', but was "
+            f"'{_json_type(value)}' for value: {json.dumps(value)}")
+    return value
+
+
+def _json_type(value):
+    """The JSON type name AWS reports for a JSONata result."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if _is_num(value):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
 
 
 def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):
@@ -3603,10 +3709,7 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    if service_info.get("param_case") == "lower-camel":
-        wire_data = _convert_keys_to_camel(input_data or {})
-    else:
-        wire_data = input_data
+    wire_data = _sdk_json_params(service_info, service_key, pascal_action, input_data)
     # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
     # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
     # without changing the state input or guessing whether the text is base64.
@@ -3647,11 +3750,73 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             and isinstance(result, dict) and "SecretBinary" in result):
         result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
-    # For JSON-protocol services, only convert top-level keys to avoid
-    # mangling user-defined data (e.g. DynamoDB attribute names).
-    if isinstance(result, dict):
-        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
-    return result
+    return _sdk_json_result(service_key, pascal_action, result)
+
+
+# The AWS SDK for Java v2 renames a member it cannot use as named, and Step
+# Functions returns that name: DynamoDB's NULL attribute value is Nul.
+_SDK_MEMBER_NAME_OVERRIDES = {("AttributeValue", "NULL"): "Nul"}
+
+
+def _sdk_json_result(service_key, action, result):
+    """A JSON-protocol aws-sdk result shaped by the operation's output model, as Step Functions returns it."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).output_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if isinstance(result, dict):
+            return {_api_name_to_sfn_key(k): v for k, v in result.items()}
+        return result
+    return _sdk_json_value(result, shape)
+
+
+def _sdk_json_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {
+            _SDK_MEMBER_NAME_OVERRIDES.get((shape.name, key), _api_name_to_sfn_key(key)):
+                _sdk_json_value(item, shape.members[key]) if key in shape.members else item
+            for key, item in value.items() if item is not None
+        }
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_value(item, shape.value) for key, item in value.items()}
+    if shape.type_name == "timestamp" and _is_num(value):
+        moment = datetime.fromtimestamp(value, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value
+
+
+_SDK_PARAM_NAME_OVERRIDES = {(shape, sdk): wire for (shape, wire), sdk in _SDK_MEMBER_NAME_OVERRIDES.items()}
+
+
+def _sdk_json_params(service_info, service_key, action, input_data):
+    """aws-sdk Parameters on the wire, renamed by the operation's input model; map keys are data."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).input_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if service_info.get("param_case") == "lower-camel":
+            return _convert_keys_to_camel(input_data or {})
+        return input_data
+    return _sdk_json_param_value(input_data or {}, shape)
+
+
+def _sdk_json_param_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict) and not getattr(shape, "is_document_type", False):
+        by_sdk_name = {_api_name_to_sfn_key(name): name for name in shape.members}
+        renamed = {}
+        for key, item in value.items():
+            name = (key if key in shape.members
+                    else _SDK_PARAM_NAME_OVERRIDES.get((shape.name, key)) or by_sdk_name.get(key, key))
+            member = shape.members.get(name)
+            renamed[name] = _sdk_json_param_value(item, member) if member is not None else item
+        return renamed
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_param_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_param_value(item, shape.value) for key, item in value.items()}
+    return value
 
 
 def _flatten_query_params(data, prefix=""):
@@ -3985,17 +4150,14 @@ def _api_name_to_sfn_key(name):
     SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
     (acronyms) are lowered except the last one when followed by a lowercase char.
     Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
-              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled,
+              SS -> Ss
     """
     if not name:
         return name
     result = []
     i = 0
     while i < len(name):
-        if i == 0:
-            result.append(name[i].upper())
-            i += 1
-            continue
         if name[i].isupper():
             j = i
             while j < len(name) and name[j].isupper():
@@ -4014,7 +4176,8 @@ def _api_name_to_sfn_key(name):
         else:
             result.append(name[i])
             i += 1
-    return "".join(result)
+    key = "".join(result)
+    return key[0].upper() + key[1:]
 
 
 def _convert_keys_to_sfn_convention(obj):

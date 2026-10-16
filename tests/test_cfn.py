@@ -21,6 +21,8 @@ from ministack.services.cloudformation.provisioners import (
     _CONDITIONALLY_REPLACING_PROPERTIES,
     _REPLACING_PROPERTIES,
     _RESOURCE_HANDLERS,
+    _reconcile_tag_list,
+    _with_stack_tags,
 )
 from ministack.services.cloudformation.stacks import _diff_resources
 
@@ -35231,3 +35233,225 @@ def test_cfn_iam_user_generated_name(cfn, iam):
     finally:
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("custom_bus", [True, False])
+def test_cfn_events_rule_bus_arn_delivery_and_lifecycle(cfn, eb, sqs, custom_bus):
+    """ARN/name aliases share a rule on create, update, delivery, drift and delete."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-rule-bus-arn-{uid}"
+    rule_name = f"cfn-rule-bus-arn-{uid}"
+    bus_name = f"cfn-rule-bus-arn-{uid}" if custom_bus else "default"
+    url = sqs.create_queue(QueueName=f"cfn-rule-bus-arn-{uid}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    def template(use_arn, description):
+        resources = {}
+        if custom_bus:
+            resources["Bus"] = {"Type": "AWS::Events::EventBus", "Properties": {"Name": bus_name}}
+        bus_ref = {"Fn::GetAtt": ["Bus", "Arn"]} if custom_bus else {
+            "Fn::Sub": "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"}
+        resources["Rule"] = {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": rule_name, "EventBusName": bus_ref if use_arn else bus_name,
+            "Description": description, "EventPattern": {"source": [f"cfn.test.{uid}"]},
+            "Targets": [{"Id": "Q", "Arn": queue_arn}], "Tags": [{"Key": "team", "Value": "test"}]}}
+        return json.dumps({"Resources": resources, "Outputs": {
+            "RuleArn": {"Value": {"Fn::GetAtt": ["Rule", "Arn"]}}}})
+
+    def delivered(marker, use_arn):
+        bus_ref = f"arn:aws:events:us-east-1:000000000000:event-bus/{bus_name}" if use_arn else bus_name
+        response = eb.put_events(Entries=[{
+            "EventBusName": bus_ref, "Source": f"cfn.test.{uid}", "DetailType": "demo",
+            "Detail": json.dumps({"marker": marker})}])
+        assert response["FailedEntryCount"] == 0
+        messages = sqs.receive_message(QueueUrl=url, WaitTimeSeconds=2).get("Messages", [])
+        assert len(messages) == 1
+        assert json.loads(messages[0]["Body"])["detail"] == {"marker": marker}
+        sqs.delete_message(QueueUrl=url, ReceiptHandle=messages[0]["ReceiptHandle"])
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(True, "first"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        rule = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+        suffix = f"rule/{bus_name}/{rule_name}" if custom_bus else f"rule/{rule_name}"
+        assert rule["Arn"] == f"arn:aws:events:us-east-1:000000000000:{suffix}"
+        assert _output(stack, "RuleArn") == rule["Arn"]
+        assert rule["EventBusName"] == bus_name
+        assert eb.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)["Targets"][0]["Arn"] == queue_arn
+        delivered("create", False)
+        delivered("arn-publish", True)
+        drift = cfn.detect_stack_resource_drift(StackName=stack_name, LogicalResourceId="Rule")
+        assert drift["StackResourceDrift"]["StackResourceDriftStatus"] == "IN_SYNC"
+        eb.tag_resource(ResourceARN=rule["Arn"], Tags=[{"Key": "outside", "Value": "kept"}])
+
+        # Switching aliases must not move/delete the rule or lose its targets/tags.
+        for use_arn, description in [(False, "by-name"), (True, "by-arn")]:
+            cfn.update_stack(StackName=stack_name, TemplateBody=template(use_arn, description))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+            updated = eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+            assert updated["Arn"] == rule["Arn"]
+            assert updated["Description"] == description
+            assert {"Key": "outside", "Value": "kept"} in eb.list_tags_for_resource(ResourceARN=rule["Arn"])["Tags"]
+            delivered(description, False)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        sqs.delete_queue(QueueUrl=url)
+    with pytest.raises(ClientError):
+        eb.describe_rule(Name=rule_name, EventBusName=bus_name)
+
+
+@pytest.mark.parametrize("bus_ref", [
+    "arn:aws:events:us-west-2:000000000000:event-bus/default",
+    "arn:aws:events:us-east-1:111111111111:event-bus/default",
+    "arn:aws:sqs:us-east-1:000000000000:default",
+    "arn:broken",
+])
+def test_cfn_events_rule_invalid_bus_arn_is_rejected(cfn, eb, bus_ref):
+    """Reuse EventBridge's ARN checks rather than accepting foreign tenants."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-rule-bad-arn-{uid}"
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps({"Resources": {
+        "Rule": {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": name, "EventBusName": bus_ref, "EventPattern": {"source": ["cfn.test"]}}}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert "AWS::Events::Rule EventBusName:" in _stack_event_reasons(cfn, name)
+        assert not any(rule["Name"] == name for rule in eb.list_rules(EventBusName="default")["Rules"])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+_IDENTITY_TAG_TRUST = {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                                 "Action": "sts:AssumeRole"}]}
+
+
+def _identity_tag_map(tags):
+    result = {t["Key"]: t["Value"] for t in tags}
+    assert len(result) == len(tags), f"Duplicate tag keys in response: {tags}"
+    return result
+
+
+def _identity_custom_tag_map(tags):
+    return _identity_tag_map([t for t in tags if not t["Key"].lower().startswith("aws:")])
+
+
+def _identity_template(resource, name, tags, after=False):
+    props = {f"{resource.title()}Name": name, "Tags": tags}
+    if resource == "role":
+        props.update(AssumeRolePolicyDocument=_IDENTITY_TAG_TRUST, Description="After" if after else "Before")
+    else:
+        props["Path"] = "/after/" if after else "/before/"
+    return json.dumps({"Resources": {"Identity": {"Type": f"AWS::IAM::{resource.title()}", "Properties": props}}})
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+@pytest.mark.parametrize("source", ["template", "stack"])
+def test_cfn_iam_identity_tag_case_update_and_removal(cfn, iam, resource, source):
+    name = f"cfn-{resource}-tag-case-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    original_tag = {"Key": "Department", "Value": "Finance"}
+    body = _identity_template(resource, name, [original_tag] if source == "template" else [])
+    cfn.create_stack(StackName=name, TemplateBody=body, Capabilities=["CAPABILITY_NAMED_IAM"],
+                     Tags=[original_tag] if source == "stack" else [])
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+        assert _identity_custom_tag_map(before["Tags"]) == {"Department": "Finance"}
+        # First change only the key's spelling, then change its value too.
+        for value in ["Finance", "HR"]:
+            desired_tags = [{"Key": "department", "Value": value}, {"Key": "Added", "Value": "New"}]
+            body = _identity_template(resource, name, desired_tags if source == "template" else [])
+            cfn.update_stack(StackName=name, TemplateBody=body,
+                             Tags=desired_tags if source == "stack" else [], Capabilities=["CAPABILITY_NAMED_IAM"])
+            assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+            identity = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+            assert identity[f"{resource.title()}Id"] == before[f"{resource.title()}Id"]
+            assert _identity_custom_tag_map(identity["Tags"]) == {"department": value, "Added": "New"}
+        # Change a managed key's spelling externally; do not add unrelated external tags.
+        getattr(iam, f"tag_{resource}")(**params, Tags=[{"Key": "DEPARTMENT", "Value": "ExternalEdit"}])
+        assert _identity_custom_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == {
+            "DEPARTMENT": "ExternalEdit", "Added": "New"}
+        cfn.update_stack(StackName=name, TemplateBody=_identity_template(resource, name, []), Tags=[],
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_COMPLETE"
+        identity = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+        assert identity[f"{resource.title()}Id"] == before[f"{resource.title()}Id"]
+        assert _identity_custom_tag_map(getattr(iam, f"list_{resource}_tags")(**params)["Tags"]) == {}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_cfn_iam_identity_stack_tag_differing_only_in_case_fails_the_resource(cfn, iam, resource):
+    """Stack and resource tag keys merge case-sensitively, so IAM receives both spellings and refuses them."""
+    name = f"cfn-{resource}-tag-merge-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=name, Capabilities=["CAPABILITY_NAMED_IAM"],
+                     TemplateBody=_identity_template(resource, name, [{"Key": "department", "Value": "Resource"}]),
+                     Tags=[{"Key": "Department", "Value": "Stack"}])
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Identity" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any("Duplicate tag keys found. Please note that Tag keys are case insensitive." in r
+                   for r in reasons), reasons
+        with pytest.raises(iam.exceptions.NoSuchEntityException):
+            getattr(iam, f"get_{resource}")(**{f"{resource.title()}Name": name})
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("resource", ["user", "role"])
+def test_cfn_iam_identity_duplicate_tag_keys_leave_state_unchanged(cfn, iam, operation, resource):
+    name = f"cfn-{resource}-tag-duplicate-{_uuid_mod.uuid4().hex[:8]}"
+    params = {f"{resource.title()}Name": name}
+    before = None
+    if operation == "update":
+        cfn.create_stack(StackName=name, TemplateBody=_identity_template(resource, name, [{"Key": "Department", "Value": "Finance"}]),
+                         Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        before = getattr(iam, f"get_{resource}")(**params)[resource.title()]
+    try:
+        # Both duplicate forms use the predicate covered by the IAM API tests.
+        tags = [{"Key": "Department", "Value": "HR"}, {"Key": "department", "Value": "HR"}]
+        getattr(cfn, f"{operation}_stack")(StackName=name, TemplateBody=_identity_template(resource, name, tags, after=True),
+                                           Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == (
+            "UPDATE_ROLLBACK_COMPLETE" if operation == "update" else "ROLLBACK_COMPLETE")
+        if before is not None:
+            assert getattr(iam, f"get_{resource}")(**params)[resource.title()] == before
+        else:
+            with pytest.raises(iam.exceptions.NoSuchEntityException):
+                getattr(iam, f"get_{resource}")(**params)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.parametrize("resource_type", ["AWS::SQS::Queue", "AWS::SSM::Parameter"])
+def test_cfn_other_resource_stack_tag_merge_remains_case_sensitive(resource_type):
+    # Protect the list/map branches of the shared merge without provisioning other services.
+    props = {"Tags": [{"Key": "department", "Value": "Resource"}]} if resource_type == "AWS::SQS::Queue" else {
+        "Tags": {"department": "Resource"}}
+    import copy
+
+    original = copy.deepcopy(props)
+    result = _with_stack_tags(resource_type, props, [{"Key": "Department", "Value": "Stack"}],
+                              "stack-name", "stack-id", "Resource")
+    tags = result["Tags"]
+    actual = tags if isinstance(tags, dict) else _identity_tag_map(tags)
+    assert {k: v for k, v in actual.items() if not k.lower().startswith("aws:")} == {
+        "Department": "Stack", "department": "Resource"}
+    assert props == original
+
+
+def test_cfn_other_resource_tag_reconciliation_remains_case_sensitive():
+    store = [{"Key": "Department", "Value": "External"}, {"Key": "department", "Value": "Before"}]
+    _reconcile_tag_list(store, {"Tags": [{"Key": "department", "Value": "Before"}]},
+                        {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]})
+    assert _identity_tag_map(store) == {"Department": "External", "DEPARTMENT": "After"}
+    _reconcile_tag_list(store, {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]}, {})
+    assert _identity_tag_map(store) == {"Department": "External"}
