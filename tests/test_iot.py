@@ -1486,6 +1486,103 @@ def test_iot_policy_versions(iot_client):
     iot_client.delete_policy(policyName=name)
 
 
+def _connect_policy(client_id: str) -> str:
+    return json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{client_id}"}]})
+
+
+def test_iot_set_default_policy_version(iot_client):
+    name = _unique("policy")
+    iot_client.create_policy(policyName=name, policyDocument=_POLICY_DOC)
+    v2_doc = _connect_policy("other")
+    iot_client.create_policy_version(policyName=name, policyDocument=v2_doc, setAsDefault=False)
+
+    def versions():
+        return {v["versionId"]: v["isDefaultVersion"]
+                for v in iot_client.list_policy_versions(policyName=name)["policyVersions"]}
+
+    try:
+        # Newest version first.
+        assert list(versions().items()) == [("2", False), ("1", True)]
+        # Setting the current default again is accepted as well; both answer 200 with no body.
+        for _ in range(2):
+            resp = iot_client.set_default_policy_version(policyName=name, policyVersionId="2")
+            assert resp.pop("ResponseMetadata")["HTTPStatusCode"] == 200
+            assert resp == {}
+            got = iot_client.get_policy(policyName=name)
+            assert (got["defaultVersionId"], got["policyDocument"]) == ("2", v2_doc)
+            assert versions() == {"1": False, "2": True}
+            for vid, default in (("1", False), ("2", True)):
+                assert iot_client.get_policy_version(
+                    policyName=name, policyVersionId=vid)["isDefaultVersion"] is default
+
+        # The new default cannot be deleted, the old one can.
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_policy_version(policyName=name, policyVersionId="2")
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            409, "DeleteConflictException", f"Cannot delete a default policy version (name={name}, versionId=2)")
+        iot_client.delete_policy_version(policyName=name, policyVersionId="1")
+        assert versions() == {"2": True}
+    finally:
+        for vid, default in versions().items():
+            if not default:
+                iot_client.delete_policy_version(policyName=name, policyVersionId=vid)
+        iot_client.delete_policy(policyName=name)
+
+
+def test_iot_set_default_policy_version_refusals(iot_client):
+    name = _unique("policy")
+    iot_client.create_policy(policyName=name, policyDocument=_POLICY_DOC)
+    try:
+        for version, status, code, message in (
+            ("9", 404, "ResourceNotFoundException", f"Policy version does not exist (name={name}, versionId=9)"),
+            ("abc", 400, "InvalidRequestException", "1 validation error detected: Value at 'policyVersionId' failed "
+             "to satisfy constraint: Member must satisfy regular expression pattern: [0-9]+"),
+        ):
+            with pytest.raises(ClientError) as ei:
+                iot_client.set_default_policy_version(policyName=name, policyVersionId=version)
+            err = ei.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                status, code, message)
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.set_default_policy_version(policyName=_unique("nope"), policyVersionId="1")
+        assert iot_client.get_policy(policyName=name)["defaultVersionId"] == "1"
+    finally:
+        iot_client.delete_policy(policyName=name)
+
+
+def test_iot_default_policy_version_persists():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _unique("policy")
+
+    async def _call(method, path, payload=None):
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        body = json.dumps(payload).encode() if payload else b""
+        return await iot_module.handle_request(method, path, {}, body, {})
+
+    async def _run():
+        assert (await _call("POST", f"/policies/{name}", {"policyDocument": _POLICY_DOC}))[0] == 200
+        assert (await _call("POST", f"/policies/{name}/version", {"policyDocument": _connect_policy("a")}))[0] == 200
+        status, _headers, answer = await _call("PATCH", f"/policies/{name}/version/2")
+        assert (status, answer) == (200, b"")
+        saved = iot_module.get_state()
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        _status, _headers, body = await _call("GET", f"/policies/{name}")
+        return json.loads(body)["defaultVersionId"]
+
+    try:
+        assert asyncio.run(_run()) == "2"
+    finally:
+        iot_module.reset()
+
+
 def test_iot_attach_detach_policy(iot_client):
     pytest.importorskip("cryptography")
     name = _unique("policy")
@@ -1503,6 +1600,57 @@ def test_iot_attach_detach_policy(iot_client):
 
     iot_client.delete_policy(policyName=name)
     iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
+def test_iot_attach_policy_refuses_unknown_targets(iot_client):
+    """AttachPolicy takes only a certificate or thing group of this account and region, or a Cognito identity id."""
+    pytest.importorskip("cryptography")
+    name, group = _unique("policy"), _unique("group")
+    iot_client.create_policy(policyName=name, policyDocument=_POLICY_DOC)
+    iot_client.create_thing_group(thingGroupName=group)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_arn, cert_id = cert["certificateArn"], cert["certificateId"]
+    region, account = cert_arn.split(":")[3:5]
+    prefix = f"arn:aws:iot:{region}:{account}"
+    cognito = f"{region}:00000000-0000-0000-0000-000000000000"
+    no_cert = (404, "ResourceNotFoundException", "The certificate given in the principal does not exist.")
+    refused = {
+        f"{prefix}:cert/{'ab' * 32}": no_cert,
+        f"{prefix}:cert/abc": no_cert,
+        f"arn:aws:iot:eu-central-1:{account}:cert/{cert_id}": (400, "InvalidRequestException", "Invalid Target"),
+        f"arn:aws:iot:{region}:111122223333:cert/{cert_id}": (
+            403, "AccessDeniedException",
+            "Cross account not allowed. Please check the account of the resource specified."),
+        "not-an-arn": (400, "InvalidRequestException", "Invalid Target"),
+        f"{region}:not-a-uuid": (400, "InvalidRequestException", "Invalid Target"),
+        f"{prefix}:thinggroup/nogroup": (
+            404, "ResourceNotFoundException",
+            f"Cannot find requested thing group for accountId: {account} and thing group name: nogroup"),
+        f"{prefix}:thing/t1": (400, "InvalidRequestException", f"Invalid Target: {prefix}:thing/t1"),
+        f"{prefix}:policy/{name}": (400, "InvalidRequestException", f"Invalid Target: {prefix}:policy/{name}"),
+        f"arn:aws:iam::{account}:user/u1": (
+            400, "InvalidRequestException", f"Invalid Target: arn:aws:iam::{account}:user/u1"),
+    }
+    try:
+        for target, expected in refused.items():
+            with pytest.raises(ClientError) as ei:
+                iot_client.attach_policy(policyName=name, target=target)
+            err = ei.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                expected), target
+        allowed = [cert_arn, f"{prefix}:thinggroup/{group}", cognito]
+        for target in allowed:
+            iot_client.attach_policy(policyName=name, target=target)
+        assert sorted(iot_client.list_targets_for_policy(policyName=name)["targets"]) == sorted(allowed)
+        for target in [f"{prefix}:cert/{'ab' * 32}", f"{prefix}:thinggroup/nogroup", *allowed]:
+            iot_client.detach_policy(policyName=name, target=target)
+        assert iot_client.list_targets_for_policy(policyName=name)["targets"] == []
+    finally:
+        for target in iot_client.list_targets_for_policy(policyName=name)["targets"]:
+            iot_client.detach_policy(policyName=name, target=target)
+        iot_client.delete_policy(policyName=name)
+        iot_client.delete_thing_group(thingGroupName=group)
+        iot_client.delete_certificate(certificateId=cert_id)
 
 
 def test_iot_delete_policy_refused_while_versioned_or_attached(iot_client):
@@ -1612,6 +1760,49 @@ def test_iot_legacy_principal_policy_family(iot_client):
     iot_client.delete_certificate(certificateId=cert["certificateId"])
 
 
+def test_iot_legacy_attach_principal_policy_refuses_unknown_principals(iot_client):
+    """AttachPrincipalPolicy takes only a certificate of this account, in any region, or a Cognito identity id."""
+    pytest.importorskip("cryptography")
+    name, group = _unique("policy"), _unique("group")
+    iot_client.create_policy(policyName=name, policyDocument=_POLICY_DOC)
+    iot_client.create_thing_group(thingGroupName=group)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    cert_arn, cert_id = cert["certificateArn"], cert["certificateId"]
+    region, account = cert_arn.split(":")[3:5]
+    prefix = f"arn:aws:iot:{region}:{account}"
+    not_a_cert = (400, "InvalidRequestException", "The given ARN does not represent a cert")
+    refused = {
+        f"{prefix}:cert/{'ab' * 32}": (
+            404, "ResourceNotFoundException", "The certificate given in the principal does not exist."),
+        f"arn:aws:iot:{region}:111122223333:cert/{cert_id}": (
+            403, "AccessDeniedException",
+            "Cross account not allowed. Please check the account of the resource specified."),
+        "not-an-arn": (400, "InvalidRequestException", "Invalid principal type"),
+        "foo:bar": (400, "InvalidRequestException", "Invalid principal type"),
+        "arn:aws:iot:cert/none": (400, "InvalidRequestException", "ARN not in proper syntax."),
+        f"{prefix}:thinggroup/{group}": not_a_cert,
+        f"{prefix}:thing/t1": not_a_cert,
+    }
+    try:
+        for principal, expected in refused.items():
+            with pytest.raises(ClientError) as ei:
+                iot_client.attach_principal_policy(policyName=name, principal=principal)
+            err = ei.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                expected), principal
+        allowed = [cert_arn, f"arn:aws:iot:eu-central-1:{account}:cert/{cert_id}",
+                   f"{region}:00000000-0000-0000-0000-000000000000"]
+        for principal in allowed:
+            iot_client.attach_principal_policy(policyName=name, principal=principal)
+        assert sorted(iot_client.list_policy_principals(policyName=name)["principals"]) == sorted(allowed)
+    finally:
+        for principal in iot_client.list_policy_principals(policyName=name)["principals"]:
+            iot_client.detach_principal_policy(policyName=name, principal=principal)
+        iot_client.delete_policy(policyName=name)
+        iot_client.delete_thing_group(thingGroupName=group)
+        iot_client.delete_certificate(certificateId=cert_id)
+
+
 def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
     with pytest.raises(ClientError) as ei:
         iot_client.attach_principal_policy(
@@ -1621,7 +1812,7 @@ def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
     
     
 # ---------------------------------------------------------------------------
-# Provisioning templates (storage + CRUD — no fleet-provisioning MQTT workflow)
+# Provisioning templates and fleet provisioning by claim
 # ---------------------------------------------------------------------------
 
 
@@ -1760,11 +1951,35 @@ def test_iot_provisioning_template_update_unknown_404(iot_client):
     )
 
 
-def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client):
+def _hook_function_arn(lam, iam, permission: dict | None = None) -> str:
+    """The ARN of a new hook function; ``permission`` grants iot.amazonaws.com the invoke, with its extra arguments."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return {'allowProvisioning': True}\n")
+    name = _unique("provhook")
+    role = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}))
+    arn = lam.create_function(
+        FunctionName=name, Runtime="python3.12", Role=role["Role"]["Arn"],
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )["FunctionArn"]
+    if permission is not None:
+        lam.add_permission(
+            FunctionName=name, StatementId="iot", Action="lambda:InvokeFunction",
+            Principal="iot.amazonaws.com", **permission,
+        )
+    return arn
+
+
+def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client, lam, iam):
     name = _unique("provtemplate")
     hook = {
         "payloadVersion": "2020-04-01",
-        "targetArn": "arn:aws:lambda:us-east-1:000000000000:function:hook",
+        "targetArn": _hook_function_arn(lam, iam, {}),
     }
     iot_client.create_provisioning_template(
         templateName=name,
@@ -1791,6 +2006,882 @@ def test_iot_provisioning_template_pre_provisioning_hook_roundtrip(iot_client):
         )["preProvisioningHook"] == hook
     finally:
         iot_client.delete_provisioning_template(templateName=name)
+
+
+def test_iot_provisioning_template_pre_provisioning_hook_validation(iot_client, lam, iam):
+    """Create and Update refuse a hook iot.amazonaws.com may not invoke for this template; payloadVersion defaults."""
+    name = _unique("provtemplate")
+    template_arn = f"arn:aws:iot:us-east-1:000000000000:provisioningtemplate/{name}"
+    allowed = _hook_function_arn(lam, iam, {})
+    own_source = _hook_function_arn(lam, iam, {"SourceArn": template_arn})
+    no_permission = _hook_function_arn(lam, iam)
+    other_source = _hook_function_arn(lam, iam, {"SourceArn": f"{template_arn}-other"})
+    missing = f"{allowed}-missing"
+    denied = "Access denied during lambda validation: "
+    invalid = "Invalid arguments in the call"
+    unsupported = (
+        "The hook version cannot be supported by AWS Iot, the supported versions are: [2020-04-01]"
+    )
+    common = {
+        "templateName": name, "templateBody": _provisioning_template_body(),
+        "provisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+    }
+    for hook, extra, message in (
+        ({"targetArn": missing}, {}, denied + missing),
+        ({"targetArn": "not-an-arn"}, {}, invalid),
+        ({"targetArn": allowed.rsplit(":", 1)[1]}, {}, invalid),
+        ({"targetArn": "arn:aws:sns:us-east-1:000000000000:hook"}, {}, invalid),
+        ({"targetArn": allowed, "payloadVersion": "2019-01-01"}, {}, unsupported),
+        ({"targetArn": allowed, "payloadVersion": "abcdefghij"}, {},
+         "1 validation error detected: Value at 'preProvisioningHook.payloadVersion' failed to "
+         "satisfy constraint: Member must satisfy regular expression pattern: ^[0-9-]+$"),
+        ({"targetArn": allowed}, {"type": "JITP"},
+         "Provisioning hook is not supported for template type: JITP"),
+        ({"targetArn": no_permission}, {}, denied + no_permission),
+        ({"targetArn": other_source}, {}, denied + other_source),
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_provisioning_template(**common, **extra, preProvisioningHook=hook)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == message
+    with pytest.raises(ClientError) as ei:
+        iot_client.describe_provisioning_template(templateName=name)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    iot_client.create_provisioning_template(**common, preProvisioningHook={"targetArn": allowed})
+    try:
+        stored = {"payloadVersion": "2020-04-01", "targetArn": allowed}
+        assert iot_client.describe_provisioning_template(
+            templateName=name
+        )["preProvisioningHook"] == stored
+        for hook, message in (
+            ({"targetArn": missing}, denied + missing),
+            ({"targetArn": no_permission}, denied + no_permission),
+            ({"targetArn": allowed, "payloadVersion": "2019-01-01"}, unsupported),
+        ):
+            with pytest.raises(ClientError) as ei:
+                iot_client.update_provisioning_template(
+                    templateName=name, description="changed", preProvisioningHook=hook
+                )
+            assert ei.value.response["Error"]["Message"] == message
+        desc = iot_client.describe_provisioning_template(templateName=name)
+        assert desc["preProvisioningHook"] == stored
+        assert "description" not in desc
+        iot_client.update_provisioning_template(
+            templateName=name, preProvisioningHook={"targetArn": own_source}
+        )
+        assert iot_client.describe_provisioning_template(
+            templateName=name
+        )["preProvisioningHook"] == {"payloadVersion": "2020-04-01", "targetArn": own_source}
+    finally:
+        iot_client.delete_provisioning_template(templateName=name)
+
+
+def test_iot_create_provisioning_claim(iot_client):
+    """A claim certificate expires in five minutes and stays out of the registry; an unknown template is 404."""
+    from cryptography import x509
+
+    name = _unique("provtemplate")
+    iot_client.create_provisioning_template(
+        templateName=name,
+        templateBody=_provisioning_template_body(),
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+    )
+    try:
+        claim = iot_client.create_provisioning_claim(templateName=name)
+        assert set(claim) - {"ResponseMetadata"} == {
+            "certificateId", "certificatePem", "keyPair", "expiration",
+        }
+        assert set(claim["keyPair"]) == {"PublicKey", "PrivateKey"}
+        expiration = claim["expiration"].timestamp()
+        assert 290 <= expiration - time.time() <= 300
+        leaf = x509.load_pem_x509_certificate(claim["certificatePem"].encode())
+        assert leaf.not_valid_after_utc.timestamp() == expiration
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_certificate(certificateId=claim["certificateId"])
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        listed = {c["certificateId"] for c in iot_client.list_certificates()["certificates"]}
+        assert claim["certificateId"] not in listed
+
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_provisioning_claim(templateName=f"{name}-x")
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Message"] == f"Unable to find template named {name}-x"
+    finally:
+        iot_client.delete_provisioning_template(templateName=name)
+
+
+# Fleet provisioning over MQTT, driven in-process through a broker session.
+
+_FLEET_ACCOUNT = "123456789012"
+_FLEET_REGION = "us-east-1"
+_FLEET_CREATE = "$aws/certificates/create/json"
+_FLEET_ROLE = "arn:aws:iam::123456789012:role/provisioning"
+_FLEET_REQUEST_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+def _fleet_template(**overrides) -> dict:
+    """A required parameter, one with a default, Fn::Join and a device configuration."""
+    return {
+        "Parameters": {
+            "SerialNumber": {"Type": "String"},
+            "Color": {"Type": "String", "Default": "red"},
+        },
+        "Resources": {
+            "thing": {
+                "Type": "AWS::IoT::Thing",
+                "Properties": {
+                    "ThingName": {"Fn::Join": ["", ["fleet-", {"Ref": "SerialNumber"}]]},
+                    "AttributePayload": {
+                        "serial": {"Ref": "SerialNumber"},
+                        "color": {"Ref": "Color"},
+                    },
+                },
+            },
+            "certificate": {
+                "Type": "AWS::IoT::Certificate",
+                "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"},
+                    "Status": "ACTIVE",
+                },
+            },
+            "policy": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": "fleet-device"}},
+        },
+        "DeviceConfiguration": {"greeting": "hello"},
+        **overrides,
+    }
+
+
+def _fleet_cdk_template(override_settings=None, status="Active") -> dict:
+    """The shape a CDK-deployed fleet template has: every value from a parameter."""
+    thing = {
+        "Type": "AWS::IoT::Thing",
+        "Properties": {
+            "ThingName": {"Ref": "ThingName"},
+            "ThingTypeName": {"Ref": "ThingTypeName"},
+            "AttributePayload": {},
+            "ThingGroups": [{"Ref": "ThingGroup"}],
+        },
+    }
+    if override_settings is not None:
+        thing["OverrideSettings"] = override_settings
+    return {
+        "Parameters": {
+            "ThingName": {"Type": "String"},
+            "ThingTypeName": {"Type": "String"},
+            "ThingGroup": {"Type": "String"},
+            "AWS::IoT::Certificate::Id": {"Type": "String"},
+        },
+        "Resources": {
+            "thing": thing,
+            "certificate": {
+                "Type": "AWS::IoT::Certificate",
+                "Properties": {
+                    "CertificateId": {"Ref": "AWS::IoT::Certificate::Id"},
+                    "Status": status,
+                },
+            },
+            "policy_1": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": "fleet-device"}},
+            "policy_2": {"Type": "AWS::IoT::Policy", "Properties": {"PolicyName": "fleet-extra"}},
+        },
+    }
+
+
+async def _fleet_request(method, path, body=None, account=_FLEET_ACCOUNT, region=_FLEET_REGION):
+    """One in-process control-plane call: (status, decoded body)."""
+    from ministack.services import iot as iot_module
+
+    with iot_module.request_scope(account, region):
+        status, _headers, raw = await iot_module.handle_request(
+            method, path, {}, json.dumps(body).encode() if body is not None else b"", {}
+        )
+    return status, json.loads(raw) if raw else {}
+
+
+async def _fleet_setup(templates: dict, account=_FLEET_ACCOUNT, region=_FLEET_REGION):
+    """The two policies the templates attach, and each template, enabled."""
+    for policy in ("fleet-device", "fleet-extra"):
+        await _fleet_request(
+            "POST", f"/policies/{policy}",
+            {"policyDocument": json.dumps({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"}]})},
+            account, region,
+        )
+    for name, body in templates.items():
+        status, _ = await _fleet_request(
+            "POST", "/provisioning-templates",
+            {"templateName": name, "templateBody": json.dumps(body), "enabled": True,
+             "provisioningRoleArn": _FLEET_ROLE},
+            account, region,
+        )
+        assert status == 200
+
+
+async def _fleet_client(
+    client_id, templates=(), account=_FLEET_ACCOUNT, region=_FLEET_REGION, certificate_id=None
+):
+    """A session subscribed to the replies of CreateKeysAndCertificate and of each template."""
+    send, sent = _mock_send()
+    session = _IoTWSSession(send, account, region, certificate_id)
+    await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
+    filters = [f"{_FLEET_CREATE}/+"] + [
+        f"$aws/provisioning-templates/{t}/provision/json/+" for t in templates
+    ]
+    await session.handle_packet(
+        PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(f, 1) for f in filters])
+    )
+    sent.clear()
+    return session, sent
+
+
+async def _fleet_publish(session, sent, topic, payload):
+    """PUBLISH at QoS 1; the one reply this session got, as (topic, document), or None."""
+    sent.clear()
+    await session.handle_packet(
+        PKT_PUBLISH, 0x02, _encode_string(topic) + struct.pack("!H", 9) + payload
+    )
+    replies = [
+        (reply_topic, json.loads(body))
+        for reply_topic, body, _qos, _pid, _dup in _extract_publish_frames(sent)
+        if reply_topic.startswith(f"{topic}/")
+    ]
+    assert len(replies) <= 1
+    return replies[0] if replies else None
+
+
+async def _fleet_certificate(session, sent):
+    """CreateKeysAndCertificate over MQTT: the accepted document."""
+    topic, created = await _fleet_publish(session, sent, _FLEET_CREATE, b"")
+    assert topic == f"{_FLEET_CREATE}/accepted"
+    return created
+
+
+def _fleet_register(token, **parameters) -> bytes:
+    return json.dumps({"certificateOwnershipToken": token, "parameters": parameters}).encode()
+
+
+def _fleet_provision_topic(template: str) -> str:
+    return f"$aws/provisioning-templates/{template}/provision/json"
+
+
+def _fleet_rejection(template, code, message):
+    return (
+        f"{_fleet_provision_topic(template)}/rejected",
+        {"statusCode": 400, "errorCode": code, "errorMessage": message},
+    )
+
+
+def _assert_provisioning_failed(reply, template, message):
+    """A ProvisioningFailed rejection carrying ``message`` and AWS's registry suffix."""
+    topic, doc = reply
+    assert topic == f"{_fleet_provision_topic(template)}/rejected"
+    assert (doc["statusCode"], doc["errorCode"]) == (400, "ProvisioningFailed")
+    assert re.fullmatch(
+        re.escape(f"{message} (Service: AWSIot; Status Code: 400; Error Code: "
+                  "ResourceRegistrationFailureException; Request ID: ")
+        + _FLEET_REQUEST_ID + re.escape("; Proxy: null)"),
+        doc["errorMessage"],
+    ), doc["errorMessage"]
+
+
+async def _fleet_certificate_state(cert_id):
+    """(status, attached policy names, attached thing names) of a registry certificate."""
+    _status, desc = await _fleet_request("GET", f"/certificates/{cert_id}")
+    arn = desc["certificateDescription"]["certificateArn"]
+    _status, policies = await _fleet_request("POST", f"/attached-policies/{arn}")
+    from ministack.services import iot as iot_module
+
+    with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+        things = iot_module._list_principal_things({"x-amzn-principal": arn}, {})
+    return (
+        desc["certificateDescription"]["status"],
+        sorted(p["policyName"] for p in policies["policies"]),
+        json.loads(things[2])["things"],
+    )
+
+
+async def _fleet_thing(name):
+    """(attributes, thing type, sorted groups) of a thing, or None."""
+    status, thing = await _fleet_request("GET", f"/things/{name}")
+    if status != 200:
+        return None
+    _status, groups = await _fleet_request("GET", f"/things/{name}/thing-groups")
+    return (
+        thing["attributes"],
+        thing.get("thingTypeName"),
+        sorted(g["groupName"] for g in groups["thingGroups"]),
+    )
+
+
+def test_fleet_provisioning_create_keys_and_certificate_answers_the_requester_only():
+    """CreateKeysAndCertificate over MQTT makes a PENDING_ACTIVATION certificate and answers only the requester."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+
+    async def _run():
+        session, sent = await _fleet_client("fleet-claim")
+        other, other_sent = await _fleet_client("fleet-observer")
+        created = await _fleet_certificate(session, sent)
+        assert set(created) == {
+            "certificateId", "certificatePem", "privateKey", "certificateOwnershipToken",
+        }
+        assert created["privateKey"].startswith("-----BEGIN RSA PRIVATE KEY-----")
+        assert _extract_publish_frames(other_sent) == []
+        status, _cert, _things = await _fleet_certificate_state(created["certificateId"])
+        assert status == "PENDING_ACTIVATION"
+        # A client that did not subscribe to the replies gets none.
+        quiet_send, quiet_sent = _mock_send()
+        quiet = _IoTWSSession(quiet_send, _FLEET_ACCOUNT, _FLEET_REGION)
+        await quiet.handle_packet(PKT_CONNECT, 0, _build_connect_body("fleet-quiet"))
+        assert await _fleet_publish(quiet, quiet_sent, _FLEET_CREATE, b"") is None
+        for s in (session, other, quiet):
+            await s.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_register_thing_applies_the_template():
+    """RegisterThing checks the token and parameters first, then applies the template; the token registers again."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        created = await _fleet_certificate(session, sent)
+        token, provision = created["certificateOwnershipToken"], _fleet_provision_topic("fleet")
+
+        reply = await _fleet_publish(session, sent, provision, _fleet_register("made-up"))
+        assert reply == _fleet_rejection(
+            "fleet", "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
+        )
+        reply = await _fleet_publish(session, sent, provision, b"not json")
+        assert reply == _fleet_rejection("fleet", "InvalidPayload", "Message cannot be parsed")
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token))
+        assert reply == _fleet_rejection(
+            "fleet", "InvalidParameters", "Cannot resolve reference value: SerialNumber"
+        )
+        assert await _fleet_thing("fleet-SN1") is None
+
+        accepted = (
+            f"{provision}/accepted",
+            {"deviceConfiguration": {"greeting": "hello"}, "thingName": "fleet-SN1"},
+        )
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token, SerialNumber="SN1"))
+        assert reply == accepted
+        assert await _fleet_thing("fleet-SN1") == ({"serial": "SN1", "color": "red"}, None, [])
+        assert await _fleet_certificate_state(created["certificateId"]) == (
+            "ACTIVE", ["fleet-device"], ["fleet-SN1"],
+        )
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token, SerialNumber="SN1"))
+        assert reply == accepted
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_register_thing_refusals_change_nothing():
+    """A refused RegisterThing leaves the certificate PENDING_ACTIVATION and creates no thing."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    no_policy = _fleet_template()
+    no_policy["Resources"]["policy"]["Properties"]["PolicyName"] = "fleet-none"
+    sub = _fleet_template()
+    sub["Resources"]["thing"]["Properties"]["ThingName"] = {"Fn::Sub": "fleet-${SerialNumber}"}
+    templates = {
+        "fleet": _fleet_template(), "fleet-cdk": _fleet_cdk_template({}),
+        "fleet-nopol": no_policy, "fleet-sub": sub,
+    }
+
+    async def _run():
+        await _fleet_setup(templates)
+        await _fleet_request("POST", "/thing-types/fleet-type", {})
+        await _fleet_request("POST", "/thing-groups/fleet-group", {})
+        await _fleet_request(
+            "PATCH", "/provisioning-templates/fleet", {"enabled": False}
+        )
+        session, sent = await _fleet_client("fleet-claim", [*templates, "fleet-none"])
+        created = await _fleet_certificate(session, sent)
+        token = created["certificateOwnershipToken"]
+
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-none"), _fleet_register(token)
+        )
+        assert reply == _fleet_rejection(
+            "fleet-none", "InvalidTemplate", "Template with name fleet-none does not exist."
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"), _fleet_register(token, SerialNumber="SN2")
+        )
+        assert reply == _fleet_rejection("fleet", "InvalidTemplate", "Template fleet is not enabled.")
+        cdk = _fleet_provision_topic("fleet-cdk")
+        reply = await _fleet_publish(session, sent, cdk, _fleet_register(
+            token, ThingName="fleet-c", ThingTypeName="fleet-notype", ThingGroup="fleet-group"))
+        _assert_provisioning_failed(
+            reply, "fleet-cdk",
+            "Register thing workflow execution terminates due to: "
+            f"Thing Type {_FLEET_ACCOUNT}:fleet-notype not found.",
+        )
+        reply = await _fleet_publish(session, sent, cdk, _fleet_register(
+            token, ThingName="fleet-c", ThingTypeName="fleet-type", ThingGroup="fleet-nogroup"))
+        _assert_provisioning_failed(
+            reply, "fleet-cdk",
+            "Register thing workflow execution terminates due to: "
+            f"ThingGroup {_FLEET_ACCOUNT}:fleet-nogroup not found.",
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-nopol"),
+            _fleet_register(token, SerialNumber="SN3"),
+        )
+        _assert_provisioning_failed(
+            reply, "fleet-nopol",
+            "Register thing workflow execution terminates due to: Policy default version not found",
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-sub"),
+            _fleet_register(token, SerialNumber="SN4"),
+        )
+        assert reply == _fleet_rejection(
+            "fleet-sub", "InvalidTemplate",
+            "Template fleet-sub uses Fn::Sub, which MiniStack does not resolve.",
+        )
+        for name in ("fleet-c", "fleet-SN2", "fleet-SN3", "fleet-SN4"):
+            assert await _fleet_thing(name) is None
+        assert await _fleet_certificate_state(created["certificateId"]) == (
+            "PENDING_ACTIVATION", [], [],
+        )
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_existing_thing_follows_override_settings():
+    """An existing thing that differs from the template fails unless OverrideSettings allow it; FAIL is no setting."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    templates = {
+        "fleet": _fleet_template(),
+        "fleet-cdk": _fleet_cdk_template(
+            {"AttributePayload": "DO_NOTHING", "ThingGroups": "DO_NOTHING",
+             "ThingTypeName": "DO_NOTHING"}),
+        "fleet-plain": _fleet_cdk_template(status="ACTIVE"),
+        "fleet-ovr": _fleet_cdk_template(
+            {"AttributePayload": "MERGE", "ThingTypeName": "REPLACE", "ThingGroups": "MERGE"},
+            status="ACTIVE"),
+        "fleet-fail": _fleet_cdk_template(
+            {"AttributePayload": "FAIL", "ThingTypeName": "FAIL", "ThingGroups": "FAIL"},
+            status="ACTIVE"),
+    }
+    for name in ("fleet-ovr", "fleet-fail"):
+        templates[name]["Resources"]["thing"]["Properties"]["AttributePayload"] = {
+            "color": "green"}
+
+    async def _run():
+        await _fleet_setup(templates)
+        for kind, name in (("thing-types", "fleet-type"), ("thing-types", "fleet-type2"),
+                           ("thing-groups", "fleet-group"), ("thing-groups", "fleet-group2")):
+            await _fleet_request("POST", f"/{kind}/{name}", {})
+        session, sent = await _fleet_client("fleet-claim", list(templates))
+
+        first = await _fleet_certificate(session, sent)
+        await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(first["certificateOwnershipToken"], SerialNumber="SN1"),
+        )
+        second = await _fleet_certificate(session, sent)
+        token = second["certificateOwnershipToken"]
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1", Color="blue"),
+        )
+        _assert_provisioning_failed(
+            reply, "fleet",
+            "Existing AttributePayload: {color=red, serial=SN1} conflicts with "
+            "AttributePayload: {color=blue, serial=SN1} in Template.",
+        )
+        assert await _fleet_certificate_state(second["certificateId"]) == (
+            "PENDING_ACTIVATION", [], [],
+        )
+
+        # DO_NOTHING keeps everything; "Active" activates the certificate.
+        cdk = {"ThingTypeName": "fleet-type", "ThingGroup": "fleet-group"}
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-cdk"),
+            _fleet_register(token, ThingName="fleet-SN1", **cdk),
+        )
+        assert reply == (
+            f"{_fleet_provision_topic('fleet-cdk')}/accepted",
+            {"deviceConfiguration": {}, "thingName": "fleet-SN1"},
+        )
+        assert await _fleet_thing("fleet-SN1") == ({"serial": "SN1", "color": "red"}, None, [])
+        assert await _fleet_certificate_state(second["certificateId"]) == (
+            "ACTIVE", ["fleet-device", "fleet-extra"], ["fleet-SN1"],
+        )
+
+        third = await _fleet_certificate(session, sent)
+        token = third["certificateOwnershipToken"]
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-cdk"),
+            _fleet_register(token, ThingName="fleet-b", **cdk),
+        )
+        assert reply[0].endswith("/accepted")
+        assert await _fleet_thing("fleet-b") == ({}, "fleet-type", ["fleet-group"])
+
+        plain = _fleet_provision_topic("fleet-plain")
+        reply = await _fleet_publish(
+            session, sent, plain, _fleet_register(token, ThingName="fleet-b", **cdk))
+        assert reply[0] == f"{plain}/accepted"
+        reply = await _fleet_publish(session, sent, plain, _fleet_register(
+            token, ThingName="fleet-b", ThingTypeName="fleet-type2", ThingGroup="fleet-group"))
+        _assert_provisioning_failed(
+            reply, "fleet-plain",
+            "Existing ThingType: fleet-type conflicts with ThingType: fleet-type2 in Template.",
+        )
+        reply = await _fleet_publish(session, sent, plain, _fleet_register(
+            token, ThingName="fleet-b", ThingTypeName="fleet-type", ThingGroup="fleet-group2"))
+        group_arn = f"arn:aws:iot:{_FLEET_REGION}:{_FLEET_ACCOUNT}:thinggroup/fleet-group"
+        _assert_provisioning_failed(
+            reply, "fleet-plain",
+            f"Existing ThingGroups: [{{GroupName: fleet-group,GroupArn: {group_arn}}}] "
+            "conflict with ThingGroups: [fleet-group2] in Template.",
+        )
+        assert await _fleet_thing("fleet-b") == ({}, "fleet-type", ["fleet-group"])
+
+        changed = {"ThingName": "fleet-b", "ThingTypeName": "fleet-type2", "ThingGroup": "fleet-group2"}
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-ovr"), _fleet_register(token, **changed))
+        assert reply[0].endswith("/accepted")
+        assert await _fleet_thing("fleet-b") == (
+            {"color": "green"}, "fleet-type2", ["fleet-group", "fleet-group2"],
+        )
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-fail"), _fleet_register(token, **changed))
+        _assert_provisioning_failed(
+            reply, "fleet-fail",
+            f"Existing ThingGroups: [{{GroupName: fleet-group,GroupArn: {group_arn}}}, "
+            f"{{GroupName: fleet-group2,GroupArn: {group_arn}2}}] "
+            "conflict with ThingGroups: [fleet-group2] in Template.",
+        )
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+_FLEET_HOOK_ARN = f"arn:aws:lambda:{_FLEET_REGION}:{_FLEET_ACCOUNT}:function:fleet-hook"
+_FLEET_CLAIM_ID = "c1" * 32
+
+
+def _fleet_hook(monkeypatch, answers: dict) -> list:
+    """A hook function answering ``answers[Mode]`` for the request's Mode parameter; the events it gets."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    events = []
+
+    def _execute(_func, event):
+        events.append(event)
+        answer = answers[event["parameters"].get("Mode")]
+        return answer() if callable(answer) else answer
+
+    monkeypatch.setattr(lambda_svc, "_execute_function_with_config_scope", _execute)
+    lambda_svc._functions.clear()
+    with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+        lambda_svc._functions["fleet-hook"] = {
+            "config": {"FunctionName": "fleet-hook", "FunctionArn": _FLEET_HOOK_ARN},
+            "aliases": {}, "versions": {},
+            "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        }
+        lambda_svc._add_permission("fleet-hook", {
+            "StatementId": "iot", "Action": "lambda:InvokeFunction", "Principal": "iot.amazonaws.com",
+        })
+    return events
+
+
+async def _fleet_hook_templates(*names):
+    for name in names:
+        status, _ = await _fleet_request(
+            "PATCH", f"/provisioning-templates/{name}",
+            {"preProvisioningHook": {"targetArn": _FLEET_HOOK_ARN}},
+        )
+        assert status == 200
+
+
+def test_fleet_provisioning_hook_gets_the_request_and_overrides_its_parameters(monkeypatch):
+    """The hook gets the device's parameters before the template is resolved, and its overrides win."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    iot_module.reset()
+    reset()
+    events = _fleet_hook(monkeypatch, {
+        "override": {"body": {"allowProvisioning": True, "parameterOverrides": {
+            "ThingName": "fleet-o", "ThingTypeName": "fleet-type"}}},
+        "supply": {"body": {"allowProvisioning": True, "parameterOverrides": {
+            "SerialNumber": 7, "Color": True}}},
+    })
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template(), "fleet-cdk": _fleet_cdk_template(
+            {"AttributePayload": "DO_NOTHING", "ThingGroups": "DO_NOTHING",
+             "ThingTypeName": "DO_NOTHING"})})
+        await _fleet_request("POST", "/thing-types/fleet-type", {})
+        await _fleet_request("POST", "/thing-groups/fleet-group", {})
+        await _fleet_hook_templates("fleet", "fleet-cdk")
+        session, sent = await _fleet_client(
+            "fleet-claim", ["fleet", "fleet-cdk"], certificate_id=_FLEET_CLAIM_ID
+        )
+        created = await _fleet_certificate(session, sent)
+        token = created["certificateOwnershipToken"]
+
+        parameters = {"ThingName": "fleet-x", "ThingTypeName": "fleet-other",
+                      "ThingGroup": "fleet-group", "Mode": "override"}
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-cdk"), _fleet_register(token, **parameters)
+        )
+        assert reply == (
+            f"{_fleet_provision_topic('fleet-cdk')}/accepted",
+            {"deviceConfiguration": {}, "thingName": "fleet-o"},
+        )
+        assert events == [{
+            "claimCertificateId": _FLEET_CLAIM_ID,
+            "clientId": "fleet-claim",
+            "certificateId": created["certificateId"],
+            "certificatePem": created["certificatePem"],
+            "templateArn": f"arn:aws:iot:{_FLEET_REGION}:{_FLEET_ACCOUNT}:provisioningtemplate/fleet-cdk",
+            "parameters": parameters,
+        }]
+        assert await _fleet_thing("fleet-o") == ({}, "fleet-type", ["fleet-group"])
+        assert await _fleet_thing("fleet-x") is None
+
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"), _fleet_register(token, Mode="supply")
+        )
+        assert reply[1]["thingName"] == "fleet-7"
+        assert events[-1]["parameters"] == {"Mode": "supply"}
+        assert await _fleet_thing("fleet-7") == ({"serial": "7", "color": "true"}, None, [])
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        lambda_svc._functions.clear()
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_hook_answers(monkeypatch):
+    """Each hook answer gets its reply; a rejected request creates nothing, and the token is checked first."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    iot_module.reset()
+    reset()
+    invalid = (400, "InvalidResult", "Provisioning hook result is in an invalid format.")
+    denied = (403, "AccessDenied", "Access Denied")
+    cases = {
+        "deny": ({"allowProvisioning": False}, denied),
+        "string-false": ({"allowProvisioning": "false"}, denied),
+        "zero": ({"allowProvisioning": 0}, denied),
+        "no-allow": ({"parameterOverrides": {"Color": "blue"}}, invalid),
+        "yes": ({"allowProvisioning": "yes"}, invalid),
+        "http": ({"statusCode": 400, "body": "{}"}, invalid),
+        "string": ("allow", invalid),
+        "overrides-string": ({"allowProvisioning": True, "parameterOverrides": "Color=blue"}, invalid),
+        "overrides-nested": (
+            {"allowProvisioning": True, "parameterOverrides": {"Color": {"a": "b"}}}, invalid),
+        "null": (None, (400, "InvalidResult", "The provisioning hook did not return a response.")),
+        "null-override": ({"allowProvisioning": True, "parameterOverrides": {"Color": None}},
+                          (400, "InvalidParameters", "Cannot resolve reference value: Color")),
+    }
+    answers = {mode: {"body": answer} for mode, (answer, _reply) in cases.items()}
+    answers["raise"] = {"body": {"errorMessage": "boom", "errorType": "RuntimeError"}, "error": True}
+    answers["raw"] = {"body": b'"allow"'}
+    for mode, answer in (("true", "true"), ("upper", "TRUE"), ("one", 1)):
+        answers[mode] = {"body": {"allowProvisioning": answer}}
+    answers["extra"] = {"body": {"allowProvisioning": True, "extra": 1}}
+    events = _fleet_hook(monkeypatch, answers)
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        await _fleet_hook_templates("fleet")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        created = await _fleet_certificate(session, sent)
+        token, provision = created["certificateOwnershipToken"], _fleet_provision_topic("fleet")
+
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register("made-up", SerialNumber="SN0", Mode="deny"))
+        assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        assert events == []
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(token, Mode="deny"))
+        assert reply == (f"{provision}/rejected",
+                         {"statusCode": 403, "errorCode": "AccessDenied", "errorMessage": "Access Denied"})
+        expected = {
+            **{mode: reply for mode, (_answer, reply) in cases.items()},
+            "raise": (400, "InvocationError", "The provisioning hook was not executed successfully."),
+            "raw": invalid,
+        }
+        for mode, (status, code, message) in expected.items():
+            reply = await _fleet_publish(
+                session, sent, provision, _fleet_register(token, SerialNumber=f"SN-{mode}", Mode=mode))
+            assert reply == (f"{provision}/rejected",
+                             {"statusCode": status, "errorCode": code, "errorMessage": message}), mode
+            assert await _fleet_thing(f"fleet-SN-{mode}") is None
+        assert await _fleet_certificate_state(created["certificateId"]) == (
+            "PENDING_ACTIVATION", [], [],
+        )
+        for mode in ("true", "upper", "one", "extra"):
+            reply = await _fleet_publish(
+                session, sent, provision, _fleet_register(token, SerialNumber=f"SN-{mode}", Mode=mode))
+            assert reply == (f"{provision}/accepted",
+                             {"deviceConfiguration": {"greeting": "hello"}, "thingName": f"fleet-SN-{mode}"})
+        assert len(events) == len(expected) + 5
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        lambda_svc._functions.clear()
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_hook_time_limit_and_permission(monkeypatch):
+    """A slow hook fails the request without holding up the broker; one that may not be invoked is not."""
+    from ministack.services import iot as iot_module
+    from ministack.services import lambda_svc
+
+    iot_module.reset()
+    reset()
+    monkeypatch.setattr(iot_module, "_PROVISIONING_HOOK_SECONDS", 0.2)
+
+    def _slow():
+        time.sleep(0.6)
+        return {"body": {"allowProvisioning": True}}
+
+    events = _fleet_hook(monkeypatch, {"slow": _slow})
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        await _fleet_hook_templates("fleet")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        token = (await _fleet_certificate(session, sent))["certificateOwnershipToken"]
+        provision = _fleet_provision_topic("fleet")
+
+        started = time.monotonic()
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register(token, SerialNumber="SN1", Mode="slow"))
+        assert time.monotonic() - started < 0.5
+        assert reply == (f"{provision}/rejected", {
+            "statusCode": 400, "errorCode": "InvocationError",
+            "errorMessage": "A failure occurred while invoking the provisioning hook.",
+        })
+        assert await _fleet_thing("fleet-SN1") is None
+
+        refused = (f"{provision}/rejected", {
+            "statusCode": 400, "errorCode": "InvocationError",
+            "errorMessage": "Access denied while invoking Lambda function",
+        })
+        with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+            lambda_svc._remove_permission("fleet-hook", "iot", {})
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register(token, SerialNumber="SN2", Mode="slow"))
+        assert reply == refused
+        lambda_svc._functions.clear()
+        reply = await _fleet_publish(
+            session, sent, provision, _fleet_register(token, SerialNumber="SN3", Mode="slow"))
+        assert reply == refused
+        assert len(events) == 1
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        lambda_svc._functions.clear()
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_claims_and_tokens_are_scoped_persisted_and_expire():
+    """Claims and ownership tokens are scoped to one account and region, persist, expire, and go with reset()."""
+    import ssl as _ssl
+
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    other_account = "210987654321"
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        await _fleet_setup({"fleet": _fleet_template()}, account=other_account)
+        _status, claim = await _fleet_request("POST", "/provisioning-templates/fleet/provisioning-claim")
+        der = _ssl.PEM_cert_to_DER_cert(claim["certificatePem"])
+        assert iot_module._mtls_resolve_identity(der) == (_FLEET_ACCOUNT, _FLEET_REGION, "fleet")
+
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        token = (await _fleet_certificate(session, sent))["certificateOwnershipToken"]
+        await session.cleanup()
+        other, other_sent = await _fleet_client("fleet-claim", ["fleet"], account=other_account)
+        reply = await _fleet_publish(
+            other, other_sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1"),
+        )
+        assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        await other.cleanup()
+
+        saved = iot_module.get_state()
+        iot_module.reset()
+        assert iot_module._mtls_resolve_identity(der) is None
+        iot_module.load_persisted_state(saved)
+        assert iot_module._mtls_resolve_identity(der) == (_FLEET_ACCOUNT, _FLEET_REGION, "fleet")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1"),
+        )
+        assert reply[0].endswith("/accepted")
+
+        for store in (iot_module._provisioning_claims, iot_module._ownership_tokens):
+            for record in store._data.values():
+                record["expiration"] = time.time() - 1
+        assert iot_module._mtls_resolve_identity(der) is None
+        reply = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet"),
+            _fleet_register(token, SerialNumber="SN1"),
+        )
+        assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
 
 
 # ---------------------------------------------------------------------------
@@ -2392,6 +3483,81 @@ def test_iot_replace_topic_rule(iot_client):
     )
     assert iot_client.get_topic_rule(ruleName=name)["rule"]["sql"] == "SELECT * FROM 'b'"
     iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_enable_disable_topic_rule(iot_client):
+    name = _rule_name()
+    iot_client.create_topic_rule(
+        ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+    )
+    created_at = iot_client.get_topic_rule(ruleName=name)["rule"]["createdAt"]
+    try:
+        for call, disabled in (
+            (iot_client.disable_topic_rule, True),
+            (iot_client.enable_topic_rule, False),
+        ):
+            # Repeating the call changes nothing and still answers 200.
+            for _ in range(2):
+                assert call(ruleName=name)["ResponseMetadata"]["HTTPStatusCode"] == 200
+            rule = iot_client.get_topic_rule(ruleName=name)["rule"]
+            assert rule["ruleDisabled"] is disabled
+            assert rule["createdAt"] == created_at
+            listed = [r for r in iot_client.list_topic_rules()["rules"] if r["ruleName"] == name]
+            assert [r["ruleDisabled"] for r in listed] == [disabled]
+        # ReplaceTopicRule without ruleDisabled enables a disabled rule.
+        iot_client.disable_topic_rule(ruleName=name)
+        iot_client.replace_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        )
+        assert iot_client.get_topic_rule(ruleName=name)["rule"]["ruleDisabled"] is False
+    finally:
+        iot_client.delete_topic_rule(ruleName=name)
+
+
+def test_iot_enable_disable_topic_rule_refusals(iot_client):
+    missing = _rule_name("missing")
+    pattern = (
+        "1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    )
+    for call in (iot_client.enable_topic_rule, iot_client.disable_topic_rule):
+        with pytest.raises(ClientError) as ei:
+            call(ruleName=missing)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        with pytest.raises(ClientError) as ei:
+            call(ruleName="bad-name")
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == pattern
+
+
+def test_iot_disabled_topic_rule_persists():
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _rule_name()
+
+    async def _call(method, path, body=b""):
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        return await iot_module.handle_request(method, path, {}, body, {})
+
+    async def _disabled():
+        _status, _headers, body = await _call("GET", f"/rules/{name}")
+        return json.loads(body)["rule"]["ruleDisabled"]
+
+    async def _run():
+        body = json.dumps({"sql": "SELECT * FROM 'a'", "actions": []}).encode()
+        assert (await _call("POST", f"/rules/{name}", body))[0] == 200
+        status, _headers, answer = await _call("POST", f"/rules/{name}/disable")
+        assert (status, answer) == (200, b"")
+        saved = iot_module.get_state()
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        assert await _disabled() is True
+
+    asyncio.run(_run())
 
 
 def test_iot_create_topic_rule_garbage_sql_rejected(iot_client):
@@ -7366,6 +8532,47 @@ def test_mqtt_connect_evaluates_certificate_policies(monkeypatch):
         (client_id, "AUTHORIZATION_FAILED", certs[cert], keys)
         for client_id, cert in (("bare", "bare"), ("bare", "bare"), ("other", "only"), ("blocked", "denied"))
     ]
+
+
+def test_mqtt_connect_follows_the_default_policy_version(monkeypatch):
+    """Under AUTH=true iot:Connect is evaluated on the version SetDefaultPolicyVersion made the default."""
+    import ministack.app as _app
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(_app, "AUTH", True)
+    name = _unique("policy")
+
+    def doc(client_id):
+        return json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"{_POLICY_ARN}:client/{client_id}"}]})
+
+    async def _connects(cert_id, client_id):
+        session, sent, keep = await _policy_connect(cert_id, client_id)
+        await session.cleanup()
+        return keep
+
+    async def _run():
+        cert_id = await _policy_device(iot_module)
+        arn = f"{_POLICY_ARN}:cert/{cert_id}"
+        for method, path, payload in (
+            ("POST", f"/policies/{name}", {"policyDocument": doc("dev")}),
+            ("POST", f"/policies/{name}/version", {"policyDocument": doc("other")}),
+            ("PUT", f"/target-policies/{name}", {"target": arn}),
+        ):
+            assert (await iot_module.handle_request(method, path, {}, json.dumps(payload).encode(), {}))[0] == 200
+        outcomes = []
+        for version in ("2", "1"):
+            assert (await iot_module.handle_request("PATCH", f"/policies/{name}/version/{version}", {}, b"", {}))[
+                0] == 200
+            outcomes.append((version, await _connects(cert_id, "dev"), await _connects(cert_id, "other")))
+        return outcomes
+
+    try:
+        outcomes = asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        iot_module.broker_reset()
+    assert outcomes == [("2", False, True), ("1", True, False)]
 
 
 def test_mqtt_connect_resolves_policy_variables(monkeypatch):
