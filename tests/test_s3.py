@@ -831,28 +831,96 @@ def test_s3_get_bucket_location_us_east_1_is_none(s3):
     loc = s3.get_bucket_location(Bucket=bkt)
     assert loc["LocationConstraint"] is None
 
-def test_s3_get_bucket_location_defaults_to_signing_region(s3):
-    """A bucket created WITHOUT CreateBucketConfiguration lands in the region
-    the request was signed for — GetBucketLocation must echo that region."""
-    import boto3
-    from botocore.config import Config
+def _create_bucket_error(client, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        client.create_bucket(**kwargs)
+    return exc.value.response
 
-    west_s3 = boto3.client(
-        "s3",
-        endpoint_url=ENDPOINT,
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
-        region_name="eu-west-1",
-        config=Config(
-            region_name="eu-west-1",
-            retries={"mode": "standard"},
-            max_pool_connections=50,
-        ),
-    )
+
+def test_s3_location_constraint_required_outside_us_east_1(s3):
+    """A regional endpoint other than us-east-1 refuses CreateBucket without a
+    LocationConstraint naming its own region (observed on AWS 2026-10-12)."""
+    euw1 = _regional_client("s3", "eu-west-1")
     bkt = f"intg-s3-loc-signing-{_uuid_mod.uuid4().hex[:8]}"
-    west_s3.create_bucket(Bucket=bkt)
-    loc = west_s3.get_bucket_location(Bucket=bkt)
-    assert loc["LocationConstraint"] == "eu-west-1"
+    resp = _create_bucket_error(euw1, Bucket=bkt)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+    assert resp["Error"]["Message"] == ("The unspecified location constraint is incompatible for the "
+                                        "region specific endpoint this request was sent to.")
+
+    resp = _create_bucket_error(euw1, Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+    assert resp["Error"]["Message"] == ("The us-west-2 location constraint is incompatible for the "
+                                        "region specific endpoint this request was sent to.")
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+    euw1.create_bucket(Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    try:
+        assert euw1.get_bucket_location(Bucket=bkt)["LocationConstraint"] == "eu-west-1"
+        # The constraint check precedes BucketAlreadyOwnedByYou.
+        resp = _create_bucket_error(euw1, Bucket=bkt)
+        assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+        resp = _create_bucket_error(euw1, Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+        assert resp["Error"]["Code"] == "BucketAlreadyOwnedByYou"
+        assert resp["Error"]["BucketName"] == bkt
+    finally:
+        euw1.delete_bucket(Bucket=bkt)
+
+
+def test_s3_location_constraint_us_east_1_is_invalid(s3):
+    bkt = f"intg-s3-loc-use1-{_uuid_mod.uuid4().hex[:8]}"
+    for client in (s3, _regional_client("s3", "eu-west-1")):
+        resp = _create_bucket_error(client, Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "us-east-1"})
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert resp["Error"]["Code"] == "InvalidLocationConstraint"
+        assert resp["Error"]["Message"] == "The specified location-constraint is not valid"
+        assert resp["Error"]["LocationConstraint"] == "us-east-1"
+
+
+def test_s3_location_constraint_internal_callers_unchanged():
+    """Internal callers (Glue warehouse, Transcribe) pass no endpoint region and
+    keep landing the bucket in the request region without a constraint."""
+    import contextvars
+
+    from ministack.core.responses import set_request_region
+    from ministack.services import s3 as s3_svc
+
+    name = f"intg-s3-loc-internal-{_uuid_mod.uuid4().hex[:8]}"
+
+    def create_in_eu_west_1():
+        set_request_region("eu-west-1")
+        try:
+            assert s3_svc._create_bucket(name, b"", {})[0] == 200
+            assert s3_svc.bucket_region(name) == "eu-west-1"
+        finally:
+            s3_svc._buckets.pop(name, None)
+
+    contextvars.copy_context().run(create_in_eu_west_1)
+
+
+def test_s3_location_constraint_bucket_already_exists_names_bucket(s3):
+    import boto3
+
+    other = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1",
+                         aws_access_key_id="111122223333", aws_secret_access_key="test")
+    bkt = f"intg-s3-loc-taken-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    try:
+        resp = _create_bucket_error(other, Bucket=bkt)
+        assert resp["Error"]["Code"] == "BucketAlreadyExists"
+        assert resp["Error"]["BucketName"] == bkt
+    finally:
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_location_constraint_us_east_1_endpoint_accepts_any_region(s3):
+    bkt = f"intg-s3-loc-any-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "ap-southeast-2"})
+    try:
+        assert s3.get_bucket_location(Bucket=bkt)["LocationConstraint"] == "ap-southeast-2"
+    finally:
+        _regional_client("s3", "ap-southeast-2").delete_bucket(Bucket=bkt)
 
 def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
     """A CreateBucket with no tags must not create an empty tag set — a
@@ -5208,6 +5276,99 @@ def test_s3_put_object_canned_acl_versioned(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def _grant_object_acl(client, bucket, key, grants, **kwargs):
+    """Replace an object's ACL with the owner's FULL_CONTROL plus ``(canonical ID, permission)`` grants."""
+    owner_id = client.list_buckets()["Owner"]["ID"]
+    client.put_object_acl(Bucket=bucket, Key=key, **kwargs, AccessControlPolicy={
+        "Owner": {"ID": owner_id},
+        "Grants": [{"Grantee": {"Type": "CanonicalUser", "ID": grantee}, "Permission": permission}
+                   for grantee, permission in [(owner_id, "FULL_CONTROL"), *grants]],
+    })
+
+
+def _acl_enabled_bucket(client, bucket):
+    """A bucket with ACLs enabled (BucketOwnerPreferred), so object ACLs take effect."""
+    client.create_bucket(Bucket=bucket)
+    client.put_bucket_ownership_controls(
+        Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]})
+
+
+def _denied(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"] in ("AccessDenied", "403")
+
+
+def test_s3_object_acl_grant_opens_reads_to_another_account(s3):
+    """Another account's READ grant opens GetObject and HeadObject only; BucketOwnerEnforced drops it."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"acl-xacct-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one")
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+
+        _grant_object_acl(owner, bucket, "k", [(reader.list_buckets()["Owner"]["ID"], "READ")])
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+        assert reader.head_object(Bucket=bucket, Key="k")["ContentLength"] == 3
+        assert _denied(reader.get_object_acl, Bucket=bucket, Key="k")
+        assert _denied(reader.get_object_tagging, Bucket=bucket, Key="k")
+        assert _denied(reader.put_object, Bucket=bucket, Key="k", Body=b"two")
+
+        owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={
+            "BlockPublicAcls": True, "IgnorePublicAcls": True,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": True})
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_bucket_ownership_controls(
+            Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="k")
+        owner.delete_bucket(Bucket=bucket)
+
+
+def test_s3_object_acl_grant_to_another_account_follows_the_version(s3):
+    """The grant stays on the version current when it was set; READ_ACP opens that version's ACL."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    reader_id = reader.list_buckets()["Owner"]["ID"]
+    bucket = f"acl-xacct-ver-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        v1 = owner.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+        _grant_object_acl(owner, bucket, "k", [(reader_id, "READ")])
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_object(Bucket=bucket, Key="k", Body=b"two")
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+        assert reader.get_object(Bucket=bucket, Key="k", VersionId=v1)["Body"].read() == b"one"
+        assert _denied(reader.get_object_acl, Bucket=bucket, Key="k", VersionId=v1)
+
+        _grant_object_acl(owner, bucket, "k", [(reader_id, "READ_ACP")], VersionId=v1)
+        grants = reader.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)["Grants"]
+        assert {(g["Grantee"]["ID"], g["Permission"]) for g in grants} >= {(reader_id, "READ_ACP")}
+    finally:
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_public_read_object_acl_opens_reads_to_another_account(s3):
+    """A public-read object ACL answers another account's read until IgnorePublicAcls is set."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"acl-xacct-pub-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one", ACL="public-read")
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_public_access_block(
+            Bucket=bucket, PublicAccessBlockConfiguration={"IgnorePublicAcls": True})
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="k")
+        owner.delete_bucket(Bucket=bucket)
+
+
 def test_s3_post_object_acl_field(s3):
     """The POST form names its canned-ACL field `acl`; it applies to the
     uploaded object like x-amz-acl does on PutObject."""
@@ -6945,11 +7106,13 @@ def _mrap_get(alias, key, region=None):
 
 def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
     """The MRAP hostname resolved nowhere — it is not a bucket name and matched
-    no virtual-host rule. It now lands on the existing vhost path, and the
-    member whose *stored* bucket region matches the request region is served
-    rather than whichever is listed first. The buckets are created through the
-    S3 API (one per region, like a real MRAP's members) and only the access
-    point comes from the stack."""
+    no virtual-host rule. It now lands on the existing vhost path. AWS routes
+    by network proximity, not by the signing region (observed 2026-10-12:
+    us-east-1 and eu-west-1 clients in one location were served by the same
+    member), so MiniStack serves the member homed in its own MINISTACK_REGION
+    (us-east-1 for the test server) whatever region the request names. The
+    buckets are created through the S3 API (one per region, like a real MRAP's
+    members) and only the access point comes from the stack."""
     us_bucket, eu_bucket = "mrap-serve-us-app", "mrap-serve-eu-app"
     s3.create_bucket(Bucket=us_bucket)  # the client's own region, us-east-1
     s3.create_bucket(Bucket=eu_bucket, CreateBucketConfiguration={
@@ -6958,8 +7121,8 @@ def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {"Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
                                "Properties": {"Name": "serve-mrap-app",
-                                              "Regions": [{"Bucket": us_bucket},
-                                                          {"Bucket": eu_bucket}]}}},
+                                              "Regions": [{"Bucket": eu_bucket},
+                                                          {"Bucket": us_bucket}]}}},
         "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
     })
     cfn.create_stack(StackName="cfn-s3-mrap-serve", TemplateBody=template)
@@ -6971,15 +7134,10 @@ def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
         s3.put_object(Bucket=us_bucket, Key="who.txt", Body=b"US BUCKET")
         s3.put_object(Bucket=eu_bucket, Key="who.txt", Body=b"EU BUCKET")
 
-        # us-east-1 is listed first, so serving the eu-west-1 member proves the
+        # eu-west-1 is listed first, so serving the us-east-1 member proves the
         # member is chosen by its stored region rather than taken off the front.
-        assert _mrap_get(alias, "who.txt", region="eu-west-1") == (200, "EU BUCKET")
-        assert _mrap_get(alias, "who.txt", region="us-east-1") == (200, "US BUCKET")
-
-        # A request whose credential scope names a region with no member falls
-        # back to the first member rather than failing (SigV4A carries no
-        # region at all and lands the same way).
-        assert _mrap_get(alias, "who.txt", region="ap-south-1") == (200, "US BUCKET")
+        for region in ("eu-west-1", "us-east-1", "ap-south-1", None):
+            assert _mrap_get(alias, "who.txt", region=region) == (200, "US BUCKET")
     finally:
         cfn.delete_stack(StackName="cfn-s3-mrap-serve")
         _wait_stack(cfn, "cfn-s3-mrap-serve")
@@ -7482,14 +7640,20 @@ RETENTION = "Access Denied because object protected by object lock retention."
 LEGAL_HOLD = "Access Denied because object protected by object lock legal hold."
 
 
+_ROOT_AUTHORIZATION = (
+    "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake"
+)
+
+
 def _lock_call(method, path, headers=None, body=b"", query=None):
     import asyncio
 
     from ministack.core.responses import request_scope
     from ministack.services import s3 as s3mod
 
+    headers = {"authorization": _ROOT_AUTHORIZATION, **(headers or {})}
     with request_scope("000000000000", "us-east-1"):
-        return asyncio.run(s3mod.handle_request(method, path, headers or {}, body, query or {}))
+        return asyncio.run(s3mod.handle_request(method, path, headers, body, query or {}))
 
 
 def _locked_in_process(**lock_headers):
@@ -8064,7 +8228,9 @@ def test_s3_create_owned_bucket_again(s3):
         with pytest.raises(ClientError) as exc:
             s3.create_bucket(Bucket=west, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
         assert exc.value.response["Error"]["Code"] == "BucketAlreadyOwnedByYou"
-        assert exc.value.response["Error"]["Message"] == "The bucket you tried to create already exists, and you own it."
+        assert exc.value.response["Error"]["Message"] == (
+            "Your previous request to create the named bucket succeeded and you already own it.")
+        assert exc.value.response["Error"]["BucketName"] == west
         assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
     finally:
         s3.delete_bucket(Bucket=east)

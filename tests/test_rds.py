@@ -4829,7 +4829,7 @@ def test_rds_create_read_replica_source_not_found(rds):
 
 
 def test_rds_reboot_db_instance(rds):
-    """RebootDBInstance sets the instance status back to available."""
+    """RebootDBInstance returns rebooting, then converges to available."""
     rds.create_db_instance(
         DBInstanceIdentifier="reboot-test",
         DBInstanceClass="db.t3.micro",
@@ -4839,11 +4839,15 @@ def test_rds_reboot_db_instance(rds):
         AllocatedStorage=10,
     )
     try:
+        rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier="reboot-test", WaiterConfig={"Delay": 1, "MaxAttempts": 120})
         resp = rds.reboot_db_instance(DBInstanceIdentifier="reboot-test")
-        assert resp["DBInstance"]["DBInstanceStatus"] == "available"
+        assert resp["DBInstance"]["DBInstanceStatus"] == "rebooting"
+        rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier="reboot-test", WaiterConfig={"Delay": 1, "MaxAttempts": 120})
 
         desc = rds.describe_db_instances(DBInstanceIdentifier="reboot-test")
         assert desc["DBInstances"][0]["DBInstanceStatus"] == "available"
+        events = rds.describe_events(SourceIdentifier="reboot-test", SourceType="db-instance")["Events"]
+        assert any(event["Message"] == "DB instance restarted" for event in events)
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="reboot-test", SkipFinalSnapshot=True)
 

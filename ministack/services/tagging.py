@@ -80,8 +80,12 @@ def _normalise_ecs(tag_list):
 
 def _collect_s3():
     import ministack.services.s3 as svc
+    region = get_region()
     for name, tags in svc._bucket_tags.items():
-        yield f"arn:aws:s3:::{name}", _normalise_flat(tags)
+        # Bucket ARNs carry no region, but GetResources only lists buckets
+        # homed in the region it is called in.
+        if svc.bucket_region(name) == region:
+            yield f"arn:aws:s3:::{name}", _normalise_flat(tags)
 
 
 def _collect_lambda():
