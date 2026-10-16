@@ -13572,11 +13572,10 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     A TemplateName change is a replacement, handled the way AWS::IoT::Policy's
     rename is: the new template is created and the old one removed, since a
     template no stack still declares is not left behind. TemplateBody is not
-    an UpdateProvisioningTemplate member (AWS stores it as a new version via
-    CreateProvisioningTemplateVersion, which MiniStack does not model), so a
-    changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType requires replacement,
-    which ``_update_resource`` performs before this runs.
+    an UpdateProvisioningTemplate member: a changed body becomes the new
+    default version, after the oldest is deleted at the version limit.
+    TemplateType requires replacement, which ``_update_resource`` performs
+    before this runs.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
@@ -13601,14 +13600,21 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     body = _iot_provisioning_template_body(new_props)
     tmpl = _iot._provisioning_templates.get(name)
-    if tmpl is not None and body and body != tmpl.get("templateBody"):
+    if tmpl is not None and body and body != _iot._provisioning_template_body(tmpl):
         err = _iot._validate_provisioning_template_body(body)
         if err is not None:
             raise ValueError(
                 f"AWS::IoT::ProvisioningTemplate update failed: {err[2]!r}"
             )
-        tmpl["templateBody"] = body
-        _iot._provisioning_templates[name] = tmpl
+        if len(tmpl["versions"]) >= _iot._PROVISIONING_TEMPLATE_VERSIONS_MAX:
+            oldest = min(v["versionId"] for v in tmpl["versions"].values()
+                         if v["versionId"] != tmpl["defaultVersionId"])
+            _iot._delete_provisioning_template_version(name, str(oldest))
+        resp = _iot._create_provisioning_template_version(
+            name, {"templateBody": body}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     _iot_update_tags(_iot._provisioning_template_arn(name), old_props, new_props)
     return name, _iot_provisioning_template_attrs(name)
 

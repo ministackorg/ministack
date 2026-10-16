@@ -1463,6 +1463,38 @@ def test_cfn_iot_provisioning_template_rename_replaces(cfn, iot_client):
         iot_client.describe_provisioning_template(templateName="cfn-provtemplate-new")
 
 
+def test_cfn_iot_provisioning_template_body_update_adds_a_version(cfn, iot_client):
+    """A TemplateBody change adds a new default version, dropping the oldest past five; other changes add none."""
+
+    def template(description, marker):
+        return json.dumps({"Resources": {"PT": {"Type": "AWS::IoT::ProvisioningTemplate", "Properties": {
+            "TemplateName": "cfn-provtemplate-ver",
+            "Description": description,
+            "ProvisioningRoleArn": "arn:aws:iam::000000000000:role/provisioning",
+            "TemplateBody": _cfn_provisioning_template_body(marker)}}}})
+
+    def versions():
+        return [(v["versionId"], v["isDefaultVersion"]) for v in iot_client.list_provisioning_template_versions(
+            templateName="cfn-provtemplate-ver")["versions"]]
+
+    cfn.create_stack(StackName="cfn-iot-provtmpl-ver", TemplateBody=template("one", "m1"))
+    assert _wait_stack(cfn, "cfn-iot-provtmpl-ver")["StackStatus"] == "CREATE_COMPLETE"
+    cfn.update_stack(StackName="cfn-iot-provtmpl-ver", TemplateBody=template("two", "m1"))
+    assert _wait_stack(cfn, "cfn-iot-provtmpl-ver")["StackStatus"] == "UPDATE_COMPLETE"
+    assert versions() == [(1, True)]
+    for n in range(2, 7):
+        cfn.update_stack(StackName="cfn-iot-provtmpl-ver", TemplateBody=template("two", f"m{n}"))
+        assert _wait_stack(cfn, "cfn-iot-provtmpl-ver")["StackStatus"] == "UPDATE_COMPLETE"
+    assert versions() == [(2, False), (3, False), (4, False), (5, False), (6, True)]
+    desc = iot_client.describe_provisioning_template(templateName="cfn-provtemplate-ver")
+    assert (desc["defaultVersionId"], desc["templateBody"]) == (6, _cfn_provisioning_template_body("m6"))
+
+    cfn.delete_stack(StackName="cfn-iot-provtmpl-ver")
+    _wait_stack(cfn, "cfn-iot-provtmpl-ver")
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_provisioning_template(templateName="cfn-provtemplate-ver")
+
+
 def test_cfn_iot_provisioning_template_generated_name(cfn, iot_client):
     """TemplateName is optional in the CloudFormation schema: an omitted one
     gets a generated physical name that satisfies the 36-char template-name

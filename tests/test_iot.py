@@ -1924,6 +1924,7 @@ def test_iot_provisioning_template_body_must_carry_certificate_resource(iot_clie
             templateName=name, templateBody="not json{", provisioningRoleArn=role
         )
     assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == "The template body is invalid"
 
     with pytest.raises(ClientError):
         iot_client.describe_provisioning_template(templateName=name)
@@ -1949,6 +1950,161 @@ def test_iot_provisioning_template_update_unknown_404(iot_client):
     assert ei.value.response["Error"]["Message"] == (
         f"Unable to find template named {name}"
     )
+
+
+def _versioned_template_body(marker: str) -> str:
+    return json.dumps({**json.loads(_provisioning_template_body()), "DeviceConfiguration": {"v": marker}})
+
+
+def test_iot_provisioning_template_versions(iot_client):
+    """Version ids count up and are never reused, the default cannot be deleted, and a template keeps five."""
+    name = _unique("provtemplate")
+    iot_client.create_provisioning_template(
+        templateName=name, templateBody=_versioned_template_body("1"),
+        provisioningRoleArn="arn:aws:iam::000000000000:role/provisioning",
+    )
+
+    def listed():
+        return [(v["versionId"], v["isDefaultVersion"])
+                for v in iot_client.list_provisioning_template_versions(templateName=name)["versions"]]
+
+    def describe():
+        desc = iot_client.describe_provisioning_template(templateName=name)
+        return desc["defaultVersionId"], json.loads(desc["templateBody"])["DeviceConfiguration"]["v"]
+
+    assert listed() == [(1, True)]
+    v1 = iot_client.describe_provisioning_template_version(templateName=name, versionId=1)
+    assert (v1["versionId"], v1["isDefaultVersion"], v1["templateBody"]) == (1, True, _versioned_template_body("1"))
+    assert "creationDate" in v1
+
+    created = iot_client.create_provisioning_template_version(
+        templateName=name, templateBody=_versioned_template_body("2"))
+    assert created["templateName"] == name
+    assert created["templateArn"].endswith(f":provisioningtemplate/{name}")
+    assert (created["versionId"], created["isDefaultVersion"]) == (2, False)
+    assert describe() == (1, "1")
+    modified = iot_client.describe_provisioning_template(templateName=name)["lastModifiedDate"]
+    created = iot_client.create_provisioning_template_version(
+        templateName=name, templateBody=_versioned_template_body("3"), setAsDefault=True)
+    assert (created["versionId"], created["isDefaultVersion"]) == (3, True)
+    assert describe() == (3, "3")
+    assert iot_client.describe_provisioning_template(templateName=name)["lastModifiedDate"] > modified
+    assert listed() == [(1, False), (2, False), (3, True)]
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_provisioning_template_version(templateName=name, versionId=3)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert ei.value.response["Error"]["Message"] == (
+        "Unable to delete template version 3, it is the default version")
+
+    iot_client.update_provisioning_template(templateName=name, defaultVersionId=2)
+    assert describe() == (2, "2")
+    iot_client.delete_provisioning_template_version(templateName=name, versionId=1)
+    for missing in (1, 99):  # deleted, never created
+        with pytest.raises(ClientError) as ei:
+            iot_client.update_provisioning_template(templateName=name, defaultVersionId=missing)
+        assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+        assert ei.value.response["Error"]["Message"] == (
+            f"Unable to set version {missing} as the default, version does not exist")
+        with pytest.raises(ClientError) as ei:
+            iot_client.describe_provisioning_template_version(templateName=name, versionId=missing)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Message"] == (
+            f"Unable to find a template version with ID {missing} for template {name}")
+        with pytest.raises(ClientError) as ei:
+            iot_client.delete_provisioning_template_version(templateName=name, versionId=missing)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Message"] == f"Unable to find template version {missing}"
+
+    for version_id in (4, 5, 6):
+        assert iot_client.create_provisioning_template_version(
+            templateName=name, templateBody=_versioned_template_body(str(version_id)))["versionId"] == version_id
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_provisioning_template_version(
+            templateName=name, templateBody=_versioned_template_body("7"), setAsDefault=True)
+    assert ei.value.response["Error"]["Code"] == "VersionsLimitExceededException"
+    assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert ei.value.response["Error"]["Message"] == (
+        f"Can't create a template version for the template {name}, "
+        "the maximum number of template versions has been reached")
+    assert describe() == (2, "2")
+    iot_client.delete_provisioning_template_version(templateName=name, versionId=6)
+    assert iot_client.create_provisioning_template_version(
+        templateName=name, templateBody=_versioned_template_body("7"))["versionId"] == 7
+    # All of them in one page, whatever maxResults asks for.
+    page = iot_client.list_provisioning_template_versions(templateName=name, maxResults=2)
+    assert [v["versionId"] for v in page["versions"]] == [2, 3, 4, 5, 7]
+    assert "nextToken" not in page
+
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_provisioning_template_version(templateName=name, templateBody="not json")
+    assert ei.value.response["Error"]["Message"] == "The template body is invalid"
+    iot_client.delete_provisioning_template(templateName=name)
+
+
+def test_iot_provisioning_template_versions_of_an_unknown_template(iot_client):
+    name = _unique("provtemplate")
+    calls = (
+        (iot_client.list_provisioning_template_versions, {}, f"Template named {name} not found"),
+        (iot_client.describe_provisioning_template_version, {"versionId": 1},
+         f"Unable to find a template named {name}"),
+        (iot_client.create_provisioning_template_version, {"templateBody": _provisioning_template_body()},
+         f"Unable to find template named {name}"),
+        (iot_client.delete_provisioning_template_version, {"versionId": 1},
+         f"Unable to find template named {name}"),
+    )
+    for call, extra, message in calls:
+        with pytest.raises(ClientError) as ei:
+            call(templateName=name, **extra)
+        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Message"] == message
+
+
+def test_iot_provisioning_template_versions_persist():
+    """Versions survive a state reload, and a template saved by older state comes back as version 1."""
+    import asyncio
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import iot as iot_module
+
+    name = _unique("provtemplate")
+
+    async def _call(method, path, payload=None, qp=None):
+        set_request_account_id("123456789012")
+        set_request_region("eu-west-1")
+        body = json.dumps(payload).encode() if payload is not None else b""
+        status, _headers, out = await iot_module.handle_request(method, path, {}, body, qp or {})
+        return status, json.loads(out) if out else {}
+
+    async def _run():
+        assert (await _call("POST", "/provisioning-templates", {
+            "templateName": name, "templateBody": _versioned_template_body("1"),
+            "provisioningRoleArn": "arn:aws:iam::123456789012:role/provisioning",
+        }))[0] == 200
+        assert (await _call("POST", f"/provisioning-templates/{name}/versions",
+                            {"templateBody": _versioned_template_body("2")}, {"setAsDefault": "true"}))[0] == 200
+        saved = iot_module.get_state()
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        _status, out = await _call("GET", f"/provisioning-templates/{name}/versions")
+        assert [(v["versionId"], v["isDefaultVersion"]) for v in out["versions"]] == [(1, False), (2, True)]
+        _status, out = await _call("GET", f"/provisioning-templates/{name}")
+        assert out["templateBody"] == _versioned_template_body("2")
+
+        # What older versions saved: the body on the record and no versions.
+        record = saved["provisioning_templates"].get_scoped("123456789012", "eu-west-1", name)
+        record.update(templateBody=_versioned_template_body("1"), defaultVersionId=1)
+        del record["versions"], record["lastVersionId"]
+        iot_module.reset()
+        iot_module.load_persisted_state(saved)
+        _status, out = await _call("GET", f"/provisioning-templates/{name}")
+        assert (out["defaultVersionId"], out["templateBody"]) == (1, _versioned_template_body("1"))
+        assert "versions" not in out
+        _status, out = await _call("POST", f"/provisioning-templates/{name}/versions",
+                                   {"templateBody": _versioned_template_body("2")})
+        assert out["versionId"] == 2
+
+    asyncio.run(_run())
 
 
 def _hook_function_arn(lam, iam, permission: dict | None = None) -> str:
