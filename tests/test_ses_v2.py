@@ -259,6 +259,30 @@ def test_ses_v2_configuration_set_tag_resource_uses_parser_backed_resource_arn(s
     ]
 
 
+def test_ses_v2_configuration_set_options_and_destinations_survive_persistence(ses_v2):
+    from ministack.core.persistence import _json_default, _json_object_hook
+
+    path = "/v2/email/configuration-sets"
+    assert _call(ses_v2, "POST", path, body={
+        "ConfigurationSetName": "persisted", "SendingOptions": {"SendingEnabled": False},
+        "DeliveryOptions": {"TlsPolicy": "REQUIRE"}})[0] == 200
+    assert _call(ses_v2, "PUT", f"{path}/persisted/sending", body={"SendingEnabled": True})[0] == 200
+    destination = {"MatchingEventTypes": ["SEND"], "SnsDestination": {"TopicArn": "arn:aws:sns:x"}}
+    assert _call(ses_v2, "POST", f"{path}/persisted/event-destinations",
+                 body={"EventDestinationName": "sns", "EventDestination": destination})[0] == 200
+    before = (_call(ses_v2, "GET", f"{path}/persisted")[1],
+              _call(ses_v2, "GET", f"{path}/persisted/event-destinations")[1])
+    assert "LastFreshStart" in before[0]["ReputationOptions"]
+    assert before[1]["EventDestinations"][0]["Name"] == "sns"
+
+    saved = json.loads(json.dumps(ses_v2.get_state(), default=_json_default), object_hook=_json_object_hook)
+    ses_v2.reset()
+    assert _call(ses_v2, "GET", f"{path}/persisted")[0] == 404
+    ses_v2.load_persisted_state(saved)
+    assert (_call(ses_v2, "GET", f"{path}/persisted")[1],
+            _call(ses_v2, "GET", f"{path}/persisted/event-destinations")[1]) == before
+
+
 @pytest.mark.parametrize(
     "bad_arn",
     [
