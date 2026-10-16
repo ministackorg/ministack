@@ -81,6 +81,15 @@ _LAMBDA_CODE_V2 = 'def handler(event, context):\n    return {"statusCode": 200, 
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
+
+@pytest.fixture(autouse=True)
+def _lambda_role(iam):
+    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server: AUTH=true needs it to exist."""
+    with contextlib.suppress(iam.exceptions.EntityAlreadyExistsException):
+        iam.create_role(RoleName="lambda-role", AssumeRolePolicyDocument=json.dumps({"Statement": [{
+            "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+
+
 _NODE_CODE = (
     "exports.handler = async (event, context) => {"
     " return { statusCode: 200, body: JSON.stringify({ hello: event.name || 'world' }) }; };"
@@ -14902,3 +14911,64 @@ exports.handler = async () => {
     assert json.loads(payload) == {"ok": True}
     expected_logs = ["invoke-console-message", "invoke-stderr-message"]
     assert base64.b64decode(headers["X-Amz-Log-Result"]).decode().splitlines() == expected_logs
+
+
+def _regional(service, region):
+    return boto3.client(service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                        region_name=region, aws_access_key_id="test", aws_secret_access_key="test")
+
+
+_S3_CODE_REDIRECT = ("Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+                     "The bucket you are attempting to access must be addressed using the specified endpoint. "
+                     "Please send all future requests to this endpoint.")
+
+
+@pytest.fixture
+def use1_code_bucket(s3):
+    bucket = f"code-use1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="fn.zip", Body=_make_zip("def handler(e, c):\n    return 1\n"))
+    yield bucket
+    s3.delete_object(Bucket=bucket, Key="fn.zip")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_lambda_s3_code_region_create_and_update(lam, use1_code_bucket):
+    """S3 code must come from a bucket in the function's region (observed on
+    AWS 2026-10-12: eu-west-1 function, us-east-1 bucket)."""
+    euw1 = _regional("lambda", "eu-west-1")
+    name = f"s3-code-region-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        euw1.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                             Code={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    assert exc.value.response["Error"]["Message"] == _S3_CODE_REDIRECT
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    euw1.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                         Code={"ZipFile": _make_zip("def handler(e, c):\n    return 0\n")})
+    try:
+        with pytest.raises(ClientError) as exc:
+            euw1.update_function_code(FunctionName=name, S3Bucket=use1_code_bucket, S3Key="fn.zip")
+        assert exc.value.response["Error"]["Message"] == _S3_CODE_REDIRECT
+        # A same-region bucket still works.
+        lam.create_function(FunctionName=f"{name}-use1", Runtime="python3.12", Role=_LAMBDA_ROLE,
+                            Handler="index.handler", Code={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+        lam.delete_function(FunctionName=f"{name}-use1")
+    finally:
+        euw1.delete_function(FunctionName=name)
+
+
+def test_lambda_s3_code_region_publish_layer_version(use1_code_bucket):
+    euw1 = _regional("lambda", "eu-west-1")
+    layer = f"s3-code-region-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        euw1.publish_layer_version(LayerName=layer, Content={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    assert exc.value.response["Error"]["Message"] == (
+        "Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+        "The bucket is in this region: us-east-1. Please use this region to retry the request")
+    # The refused publish didn't consume a version number.
+    published = euw1.publish_layer_version(LayerName=layer, Content={"ZipFile": _make_zip("x = 1\n")})
+    assert published["Version"] == 1
+    euw1.delete_layer_version(LayerName=layer, VersionNumber=1)

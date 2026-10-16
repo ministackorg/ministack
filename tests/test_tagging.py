@@ -75,6 +75,26 @@ def test_tagging_get_resources_s3_tags_returned(tagging, s3):
     assert tag_map["team"] == "platform"
 
 
+def test_tagging_get_resources_s3_follows_bucket_region(tagging):
+    """GetResources lists only buckets homed in the API's region, while
+    TagResources still tags a bucket in another region (observed on AWS
+    2026-10-12)."""
+    name = f"tg-s3-usw2-{_uid()}"
+    usw2_s3 = _regional_client("s3", "us-west-2")
+    usw2_s3.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    try:
+        arn = f"arn:aws:s3:::{name}"
+        tagging.tag_resources(ResourceARNList=[arn], Tags={_TAG_KEY: "s3-region"})
+        filters = [{"Key": _TAG_KEY, "Values": ["s3-region"]}]
+        listed = [r["ResourceARN"] for r in tagging.get_resources(TagFilters=filters)["ResourceTagMappingList"]]
+        assert arn not in listed
+        usw2 = _regional_client("resourcegroupstaggingapi", "us-west-2")
+        listed = [r["ResourceARN"] for r in usw2.get_resources(TagFilters=filters)["ResourceTagMappingList"]]
+        assert arn in listed
+    finally:
+        usw2_s3.delete_bucket(Bucket=name)
+
+
 # ========== SQS ==========
 
 def test_tagging_get_resources_sqs(tagging, sqs):

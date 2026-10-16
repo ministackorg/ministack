@@ -600,6 +600,45 @@ def _describe_stack_events(params):
                 f"{next_token_xml}</DescribeStackEventsResult>")
 
 
+# --- DescribeEvents ---
+
+_OPERATION_EVENT_FIELDS = (
+    "EventId", "StackId", "OperationId", "OperationType", "OperationStatus", "EventType",
+    "LogicalResourceId", "PhysicalResourceId", "ResourceType", "Timestamp", "ResourceStatus",
+    "ResourceStatusReason", "DetailedStatus", "ValidationFailureMode", "ValidationName",
+    "ValidationStatus", "ValidationStatusReason", "ValidationPath",
+)
+
+
+def _describe_events(params):
+    """The operation events of a stack. MiniStack records them for a create
+    that fails pre-deployment validation, the case the stack event tells the
+    caller to call DescribeEvents for; change-set events are not recorded."""
+    stack_name = _p(params, "StackName")
+    if not stack_name:
+        return _error("ValidationError", "StackName is required")
+    stack = _resolve_stack(stack_name)
+    if not stack:
+        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+    events = list(stack.get("_operation_events") or [])
+    operation_id = _p(params, "OperationId")
+    if operation_id:
+        events = [e for e in events if e.get("OperationId") == operation_id]
+    if _p(params, "Filters.FailedEvents").lower() == "true":
+        events = [e for e in events if e.get("OperationStatus") == "FAILED"]
+    events, next_token_xml, err = _page(events, params, "DescribeEvents")
+    if err:
+        return err
+    members = "".join(
+        "<member>" + "".join(f"<{f}>{_esc(str(e[f]))}</{f}>" for f in _OPERATION_EVENT_FIELDS if e.get(f))
+        + "</member>"
+        for e in events
+    )
+    return _xml(200, "DescribeEventsResponse",
+                f"<DescribeEventsResult><OperationEvents>{members}</OperationEvents>"
+                f"{next_token_xml}</DescribeEventsResult>")
+
+
 # --- DescribeStackResource ---
 
 def _resource_status_reason_xml(res):
@@ -1709,6 +1748,7 @@ _ACTION_HANDLERS = {
     "DeleteStack": _delete_stack,
     "UpdateStack": _update_stack,
     "DescribeStackEvents": _describe_stack_events,
+    "DescribeEvents": _describe_events,
     "DescribeStackResource": _describe_stack_resource,
     "DescribeStackResources": _describe_stack_resources,
     "ListStackResources": _list_stack_resources,
