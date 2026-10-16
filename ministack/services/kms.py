@@ -1500,7 +1500,7 @@ def _stamp_alias(alias_arn, created):
 # ---- Grants ----
 #
 # Grants are stored and listed, but MiniStack does not evaluate them when
-# authorizing other calls, the same way key policies are not evaluated.
+# authorizing other calls.
 
 _GRANT_OPERATIONS = {
     "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
@@ -1744,6 +1744,14 @@ def _get_key_rotation_status(data):
 
 
 # ---- Key Policy ----
+
+
+def key_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The key policy and owner account, for the identity check."""
+    rec = _resolve_key(resource_arn)
+    if not rec:
+        return None
+    return rec.get("Policy") or "", get_account_id()
 
 
 def _get_key_policy(data):
