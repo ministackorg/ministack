@@ -45,11 +45,11 @@ Behaviour that follows the live service (measured 2026-08-26 unless noted):
     `signingParameters`, and `signatureExpiresAt` = createdAt plus the
     profile's `signatureValidityPeriod` (default 135 months, per the
     PutSigningProfile reference).
-  * Under AUTH=true, PutSigningProfile on the IoT and FreeRTOS platforms
+  * PutSigningProfile on the Lambda and Notation platforms refuses any
+    `signingMaterial`. Under AUTH=true, on the IoT and FreeRTOS platforms it
     refuses a profile without `signingMaterial` and a certificate ARN that
     is malformed, in another region or account, unknown to ACM or not
-    issued; on the Lambda and Notation platforms it refuses any
-    `signingMaterial`. Without AUTH all of these are accepted.
+    issued; without AUTH those are accepted.
 
 Deliberate divergences from AWS, each pinned by a test:
 
@@ -304,14 +304,14 @@ def _validate_signing_material(material):
     return None
 
 
-def _signing_material_problem(platform_id, material):
-    """The refusal of signingMaterial the platform cannot use, checked before the profile name."""
+def _signing_material_problem(platform_id, material, auth):
+    """The refusal of signingMaterial the platform cannot use, checked before the profile name; the ARN checks need AUTH."""
     if platform_id in _SIGNER_KEY_PLATFORMS:
         if material is None:
             return None
         return _coded_error(400, "ValidationException", "InvalidProfileParameters",
                             f"Signing material should not be present when using {platform_id} platform.")
-    if platform_id not in _ACM_SIGNED_PLATFORMS:
+    if not auth or platform_id not in _ACM_SIGNED_PLATFORMS:
         return None
     if material is None:
         return _coded_error(400, "ValidationException", "ValidationException",
@@ -863,7 +863,7 @@ def _put_signing_profile(name, body):
             return problem
     from ministack.app import AUTH
     platform_id, material = body["platformId"], body.get("signingMaterial")
-    problem = _signing_material_problem(platform_id, material) if AUTH else None
+    problem = _signing_material_problem(platform_id, material, AUTH)
     if problem is not None:
         return problem
     if name in _profiles:
@@ -1072,7 +1072,7 @@ def _cancel_signing_profile(name):
     if profile.get("status") == "Active" and profile.get("policy"):
         profile["policy"] = dict(profile["policy"], revisionId=str(uuid.uuid4()))
     profile["status"] = "Canceled"
-    return json_response({})
+    return 204, {"Content-Type": REST_JSON_CONTENT_TYPE}, b""
 
 
 # ---------------------------------------------------------------------------
