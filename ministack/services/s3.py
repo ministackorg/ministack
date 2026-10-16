@@ -958,10 +958,14 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
     groups = [_ACL_GROUP_ALL_USERS] if not caller else [
         _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
 
-    for stored, granted in ((_bucket_acl.get_scoped(owner_account, None, bucket_name), wants),
-                            (object_acl, object_wants)):
-        for uri, permission in _acl_grants(stored):
-            if uri in groups and permission in granted:
+    acls = [_bucket_acl.get_scoped(owner_account, None, bucket_name)]
+    record = _buckets.get_scoped(owner_account, None, bucket_name)
+    if key and record is not None:
+        version_id = _resolve_subresource_version(query_params, record, key)
+        acls.append(_object_acl.get_scoped(owner_account, None, (bucket_name, key, version_id)))
+    for stored in acls:
+        for uri, permission in _acl_group_grants(stored):
+            if uri in groups and permission in wants:
                 return True
 
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
@@ -1111,17 +1115,29 @@ def _check_bucket_region(method: str, bucket: str, key: str, headers: dict, quer
 
 
 def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
-                        query_params: dict, body: bytes = b""):
+                        query_params: dict, body: bytes = b"", internal: bool = False):
     """Resolve the request's bucket in the global namespace and gate it.
 
     A bucket name identifies one bucket whoever asks, so a request for a name
     another account owns is answered by that bucket — if its owner granted the
     access. The scope is pinned to the owner for the rest of the request, so
     every account-scoped lookup behind this reads the right tenant's state.
+
+    Under AUTH=true a request without credentials is anonymous, as on AWS: only
+    the owner's public grants let it in, whichever account owns the bucket. An
+    ``internal`` call another service makes in process is never anonymous.
     """
     if not bucket:
         return None
     owner = _bucket_owner_account(bucket)
+    if owner is None:
+        return None
+    from ministack.app import AUTH
+    if AUTH and not internal and not _request_access_key(method, key, headers, query_params, body):
+        if not _foreign_bucket_allows(owner, bucket, key, method, query_params, ""):
+            return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+        set_request_account_id(owner)
+        return None
     caller = get_account_id()
     if owner is None or owner == caller:
         return None
@@ -2090,7 +2106,7 @@ async def handle_request(
     body: bytes,
     query_params: dict,
     signed_path: str | None = None,
-    enforce_bucket_region: bool = True,
+    internal: bool = False,
 ) -> tuple:
     bucket, key = _parse_bucket_key(path, headers)
 
@@ -2111,10 +2127,7 @@ async def handle_request(
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
 
-    denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body)
-    if denied is None and enforce_bucket_region:
-        # After the scope is pinned, so the owner's record names the home region.
-        denied = _check_bucket_region(method, bucket, key, headers, query_params)
+    denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
     if denied is not None:
         status, resp_headers, resp_body = denied
         resp_headers.setdefault("x-amz-request-id", new_uuid())
