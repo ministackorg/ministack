@@ -1169,6 +1169,14 @@ def test_signer_cancel_profile_keeps_the_name_and_freezes_permissions(signer):
                                   f"Signing Profile with name {ghost} does not exist.")
 
 
+def test_signer_cancel_profile_answers_204_with_an_empty_body(signer):
+    name, _put, _account = _permissions_profile(signer)
+    meta = signer.cancel_signing_profile(profileName=name)["ResponseMetadata"]
+    assert meta["HTTPStatusCode"] == 204
+    assert meta["HTTPHeaders"]["content-type"] == "application/json"
+    assert meta["HTTPHeaders"].get("content-length", "0") == "0"
+
+
 @pytest.mark.parametrize("name", ["fw-profile", "p" * 65])
 def test_signer_profile_name_outside_documented_pattern_is_refused(
     signer, s3, buckets, name
@@ -1341,13 +1349,13 @@ _NOT_FOUND = (404, "ResourceNotFoundException", "CertificateNotFound", "Could no
 ])
 def test_signer_put_profile_refuses_unusable_signing_material_under_auth(monkeypatch, in_process, auth, platform,
                                                                          arn, refusal):
-    """Under AUTH=true PutSigningProfile refuses what AWS refuses; without AUTH every profile is created."""
+    """Under AUTH=true PutSigningProfile refuses what AWS refuses; without AUTH only the Lambda and Notation refusal stays."""
     from ministack import app as app_mod
 
     monkeypatch.setattr(app_mod, "AUTH", auth)
     put, _certificate = in_process
     status, error_type, code, message = put(platform, arn)
-    if auth:
+    if auth or refusal[2] == "InvalidProfileParameters":
         assert (status, error_type, code, message) == (*refusal[:3], refusal[3].format(arn=arn))
     else:
         assert (status, error_type, code, message) == (200, None, None, None)

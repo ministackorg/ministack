@@ -964,6 +964,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateRoleDescription": "iam",
             "PutRolePermissionsBoundary": "iam",
             "DeleteRolePermissionsBoundary": "iam",
+            "PutUserPermissionsBoundary": "iam",
+            "DeleteUserPermissionsBoundary": "iam",
             "AttachUserPolicy": "iam",
             "DetachUserPolicy": "iam",
             "ListAttachedUserPolicies": "iam",
@@ -979,6 +981,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "GetCallerIdentity": "sts",
             "AssumeRole": "sts",
             "GetSessionToken": "sts",
+            "GetFederationToken": "sts",
             "AssumeRoleWithWebIdentity": "sts",
             "AssumeRoleWithSAML": "sts",
             # CloudWatch actions

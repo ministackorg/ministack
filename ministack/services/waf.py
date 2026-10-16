@@ -6,6 +6,8 @@ JSON-based API via X-Amz-Target: AWSWAF_20190729.
 Supports: CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs,
           AssociateWebACL, DisassociateWebACL, GetWebACLForResource, ListResourcesForWebACL,
           CreateIPSet, GetIPSet, UpdateIPSet, DeleteIPSet, ListIPSets,
+          CreateRegexPatternSet, GetRegexPatternSet, UpdateRegexPatternSet,
+          DeleteRegexPatternSet, ListRegexPatternSets,
           CreateRuleGroup, GetRuleGroup, UpdateRuleGroup, DeleteRuleGroup, ListRuleGroups,
           TagResource, UntagResource, ListTagsForResource,
           CheckCapacity, DescribeManagedRuleGroup.
@@ -35,6 +37,7 @@ CLOUDFRONT_HOME_REGION = "us-east-1"
 
 _web_acls = AccountRegionScopedDict()       # id -> webacl
 _ip_sets = AccountRegionScopedDict()        # id -> ipset
+_regex_pattern_sets = AccountRegionScopedDict()  # id -> regexpatternset
 _rule_groups = AccountRegionScopedDict()    # id -> rulegroup
 # AssociateWebACL is for regional application resources; CloudFront uses the
 # distribution configuration path. Keep this request-region scoped even though
@@ -45,6 +48,7 @@ _waf_tags = AccountScopedDict()       # resource_arn -> [tags]
 _WAF_RESOURCE_SCOPES = {
     "webacl": {"regional", "cloudfront", "global"},
     "ipset": {"regional", "global"},
+    "regexpatternset": {"regional", "global"},
     "rulegroup": {"regional", "global"},
 }
 
@@ -53,6 +57,7 @@ def get_state():
     return {
         "_web_acls": copy.deepcopy(_web_acls),
         "_ip_sets": copy.deepcopy(_ip_sets),
+        "_regex_pattern_sets": copy.deepcopy(_regex_pattern_sets),
         "_rule_groups": copy.deepcopy(_rule_groups),
         "_associations": copy.deepcopy(_associations),
         "_waf_tags": copy.deepcopy(_waf_tags),
@@ -69,6 +74,9 @@ def _restore_state(data):
     arn_rewrites = {}
     _restore_resource_store(_web_acls, data.get("_web_acls", {}), "webacl", arn_rewrites)
     _restore_resource_store(_ip_sets, data.get("_ip_sets", {}), "ipset", arn_rewrites)
+    _restore_resource_store(
+        _regex_pattern_sets, data.get("_regex_pattern_sets", {}), "regexpatternset", arn_rewrites
+    )
     _restore_resource_store(_rule_groups, data.get("_rule_groups", {}), "rulegroup", arn_rewrites)
     _rewrite_nested_resource_arns(arn_rewrites)
     _restore_associations(data.get("_associations", {}), arn_rewrites)
@@ -258,6 +266,7 @@ def _resource_store(resource_type):
     return {
         "webacl": _web_acls,
         "ipset": _ip_sets,
+        "regexpatternset": _regex_pattern_sets,
         "rulegroup": _rule_groups,
     }[resource_type]
 
@@ -320,6 +329,10 @@ def _ipset_arn(name, uid, scope="REGIONAL"):
     return _resource_arn("ipset", name, uid, scope)
 
 
+def _regex_pattern_set_arn(name, uid, scope="REGIONAL"):
+    return _resource_arn("regexpatternset", name, uid, scope)
+
+
 def _rg_arn(name, uid, scope="REGIONAL"):
     return _resource_arn("rulegroup", name, uid, scope)
 
@@ -356,7 +369,7 @@ def _parse_local_waf_arn(arn, allowed_types):
     return resource_type, (spec.account_id, region, uid), None
 
 
-def _resolve_local_waf_resource_arn(arn, allowed_types=("webacl", "ipset", "rulegroup")):
+def _resolve_local_waf_resource_arn(arn, allowed_types=("webacl", "ipset", "regexpatternset", "rulegroup")):
     resource_type, scoped_key, err = _parse_local_waf_arn(arn, allowed_types)
     if err:
         return None, err
@@ -406,6 +419,11 @@ async def handle_request(method, path, headers, body, query_params):
         "UpdateIPSet": _update_ip_set,
         "DeleteIPSet": _delete_ip_set,
         "ListIPSets": _list_ip_sets,
+        "CreateRegexPatternSet": _create_regex_pattern_set,
+        "GetRegexPatternSet": _get_regex_pattern_set,
+        "UpdateRegexPatternSet": _update_regex_pattern_set,
+        "DeleteRegexPatternSet": _delete_regex_pattern_set,
+        "ListRegexPatternSets": _list_regex_pattern_sets,
         "CreateRuleGroup": _create_rule_group,
         "GetRuleGroup": _get_rule_group,
         "UpdateRuleGroup": _update_rule_group,
@@ -599,6 +617,84 @@ def _list_ip_sets(data):
 
 
 # ---------------------------------------------------------------------------
+# RegexPatternSet
+# ---------------------------------------------------------------------------
+
+def _regex_pattern_set_body(rps):
+    return {
+        "ARN": rps["ARN"], "Id": rps["Id"], "Name": rps["Name"],
+        "Description": rps.get("Description", ""),
+        "RegularExpressionList": rps.get("RegularExpressionList", []),
+    }
+
+
+def _create_regex_pattern_set(data):
+    name = data.get("Name", "")
+    scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    uid = new_uuid()
+    lock_token = new_uuid()
+    arn = _regex_pattern_set_arn(name, uid, scope)
+    _regex_pattern_sets.set_scoped(get_account_id(), _scope_home_region(scope), uid, {
+        "ARN": arn, "Id": uid, "Name": name,
+        "Description": data.get("Description", ""),
+        "RegularExpressionList": data.get("RegularExpressionList", []),
+        "LockToken": lock_token,
+        "Scope": scope,
+    })
+    _waf_tags[arn] = data.get("Tags", [])
+    return json_response({"Summary": {"ARN": arn, "Id": uid, "Name": name,
+                                      "Description": data.get("Description", ""),
+                                      "LockToken": lock_token}})
+
+
+def _get_regex_pattern_set(data):
+    uid = data.get("Id", "")
+    rps = _resource_from_scope(_regex_pattern_sets, uid, data.get("Scope", "REGIONAL"))
+    if not rps:
+        return _waf_err("WAFNonexistentItemException", f"RegexPatternSet {uid} not found")
+    return json_response({"RegexPatternSet": _regex_pattern_set_body(rps), "LockToken": rps["LockToken"]})
+
+
+def _update_regex_pattern_set(data):
+    uid = data.get("Id", "")
+    rps = _resource_from_scope(_regex_pattern_sets, uid, data.get("Scope", "REGIONAL"))
+    if not rps:
+        return _waf_err("WAFNonexistentItemException", f"RegexPatternSet {uid} not found")
+    if data.get("LockToken", "") != rps["LockToken"]:
+        return _waf_err("WAFOptimisticLockException",
+                        "The resource you are trying to update has been modified by another request.")
+    rps["Description"] = data.get("Description", rps.get("Description", ""))
+    rps["RegularExpressionList"] = data.get("RegularExpressionList", rps["RegularExpressionList"])
+    rps["LockToken"] = new_uuid()
+    return json_response({"NextLockToken": rps["LockToken"]})
+
+
+def _delete_regex_pattern_set(data):
+    uid = data.get("Id", "")
+    scope = data.get("Scope", "REGIONAL")
+    rps = _resource_from_scope(_regex_pattern_sets, uid, scope)
+    if not rps:
+        return _waf_err("WAFNonexistentItemException", f"RegexPatternSet {uid} not found")
+    if data.get("LockToken", "") != rps["LockToken"]:
+        return _waf_err("WAFOptimisticLockException",
+                        "The resource you are trying to delete has been modified by another request.")
+    arn = rps["ARN"]
+    _regex_pattern_sets.pop_scoped(get_account_id(), _scope_home_region(scope), uid, None)
+    _waf_tags.pop(arn, None)
+    return json_response({})
+
+
+def _list_regex_pattern_sets(data):
+    scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    sets = [
+        {"ARN": r["ARN"], "Id": r["Id"], "Name": r["Name"],
+         "Description": r.get("Description", ""), "LockToken": r["LockToken"]}
+        for r in _values_for_scope(_regex_pattern_sets, scope) if r.get("Scope", "REGIONAL") == scope
+    ]
+    return json_response({"RegexPatternSets": sets, "NextMarker": None})
+
+
+# ---------------------------------------------------------------------------
 # RuleGroup
 # ---------------------------------------------------------------------------
 
@@ -719,6 +815,7 @@ def _describe_managed_rule_group(data):
 def reset():
     _web_acls.clear()
     _ip_sets.clear()
+    _regex_pattern_sets.clear()
     _rule_groups.clear()
     _associations.clear()
     _waf_tags.clear()

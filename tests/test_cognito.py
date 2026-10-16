@@ -636,6 +636,92 @@ def test_cognito_domain_crud(cognito_idp):
     desc2 = cognito_idp.describe_user_pool_domain(Domain="my-test-domain")
     assert desc2["DomainDescription"] == {}
 
+def test_cognito_update_user_pool_domain_managed_login_version(cognito_idp):
+    """ManagedLoginVersion defaults to 1; a value other than 1 or 2, or none, keeps the current one."""
+    pid = cognito_idp.create_user_pool(PoolName="DomainVersionPool")["UserPool"]["Id"]
+    domain = f"mlv-{pid.split('_', 1)[1].lower()}"
+
+    def version():
+        return cognito_idp.describe_user_pool_domain(
+            Domain=domain)["DomainDescription"]["ManagedLoginVersion"]
+
+    def update(**kwargs):
+        resp = cognito_idp.update_user_pool_domain(UserPoolId=pid, Domain=domain, **kwargs)
+        assert "CloudFrontDomain" not in resp
+        return resp["ManagedLoginVersion"]
+
+    created = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=domain)
+    assert created["ManagedLoginVersion"] == 1
+    assert version() == 1
+    assert update(ManagedLoginVersion=2) == 2
+    assert version() == 2
+    assert update() == 2
+    assert update(ManagedLoginVersion=3) == 2
+    assert update(ManagedLoginVersion=0) == 2
+    assert version() == 2
+    assert update(ManagedLoginVersion=1) == 1
+    assert version() == 1
+
+    for requested, expected in ((2, 2), (3, 1)):
+        other = cognito_idp.create_user_pool(PoolName="DomainVersionPool")["UserPool"]["Id"]
+        other_domain = f"mlv-{other.split('_', 1)[1].lower()}"
+        created = cognito_idp.create_user_pool_domain(
+            UserPoolId=other, Domain=other_domain, ManagedLoginVersion=requested)
+        assert created["ManagedLoginVersion"] == expected
+        assert cognito_idp.describe_user_pool_domain(
+            Domain=other_domain)["DomainDescription"]["ManagedLoginVersion"] == expected
+
+
+def test_cognito_update_user_pool_domain_refusals(cognito_idp):
+    """UpdateUserPoolDomain refuses these requests and changes nothing."""
+    pid = cognito_idp.create_user_pool(PoolName="DomainRefusalPool")["UserPool"]["Id"]
+    other = cognito_idp.create_user_pool(PoolName="DomainRefusalPool")["UserPool"]["Id"]
+    domain = f"refuse-{pid.split('_', 1)[1].lower()}"
+    cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=domain)
+
+    def refused(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.update_user_pool_domain(**{"UserPoolId": pid, "Domain": domain, **kwargs})
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    def failover(region):
+        return {"Failover": {"SecondaryRegion": region,
+                             "PrimaryRoute53HealthCheckId": "00000000-0000-0000-0000-000000000000"}}
+
+    assert refused(Domain=f"{domain}-none", ManagedLoginVersion=2) == (
+        "ResourceNotFoundException", "User pool domain was not found.")
+    assert refused(UserPoolId=other, ManagedLoginVersion=2) == (
+        "InvalidParameterException", "The domain is not configured for this user pool.")
+    assert refused(CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN}) == (
+        "InvalidParameterException", "Cannot convert prefix domain to custom domain.")
+    assert refused(Routing=failover("eu-west-1")) == (
+        "InvalidParameterException", "Routing field is not supported for Hosted UI (classic)")
+    assert refused(ManagedLoginVersion=2, Routing=failover("eu-west-1")) == (
+        "InvalidParameterException", "Region eu-west-1 is not active for the user pool")
+    assert refused(ManagedLoginVersion=2, Routing=failover(pid.split("_", 1)[0])) == (
+        "InvalidParameterException",
+        "Routing field can only be configured when replica status is one of: "
+        "ACTIVE, CREATING, INACTIVE. Current status: null")
+
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["ManagedLoginVersion"] == 1
+    assert dd["CustomDomainConfig"] == {}
+
+
+def test_cognito_managed_login_version_survives_warm_boot(_enable_persistence):
+    """The domain's ManagedLoginVersion lives on the pool record and survives a restart."""
+    mod = _cognito_module()
+    mod.reset()
+    _, _, body = mod._create_user_pool({"PoolName": "MlvPersistPool"})
+    pid = json.loads(body)["UserPool"]["Id"]
+    mod._create_user_pool_domain({"UserPoolId": pid, "Domain": "mlv-persist", "ManagedLoginVersion": 2})
+
+    _cognito_round_trip(mod)
+
+    _, _, body = mod._describe_user_pool_domain({"Domain": "mlv-persist"})
+    assert json.loads(body)["DomainDescription"]["ManagedLoginVersion"] == 2
+    mod.reset()
+
 def test_cognito_mfa_config(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="MfaPool")["UserPool"]["Id"]
     resp = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
@@ -1720,6 +1806,30 @@ def test_cognito_token_lifetimes_follow_client_validity(cognito_idp):
         assert refresh_claims["exp"] - refresh_claims["iat"] == 30 * 86400
 
 
+def test_cognito_restore_drops_the_old_default_token_validity():
+    """State saved before validities were honoured stored 60 for unset ones; a 60 with a unit stays."""
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    account, region, pid = "111111111111", "eu-central-1", "eu-central-1_old"
+    clients = {
+        "unset": {"AccessTokenValidity": 60, "IdTokenValidity": 60, "TokenValidityUnits": {}},
+        "minutes": {"AccessTokenValidity": 60, "IdTokenValidity": 60,
+                    "TokenValidityUnits": {"AccessToken": "minutes", "IdToken": "minutes"}},
+        "set": {"AccessTokenValidity": 2, "IdTokenValidity": 3, "TokenValidityUnits": {}},
+    }
+    saved = AccountRegionScopedDict()
+    saved.set_scoped(account, region, pid, {"Id": pid, "_clients": clients})
+    try:
+        mod.reset()
+        mod.load_persisted_state({"user_pools": saved})
+        restored = mod._user_pools.get_scoped(account, region, pid)["_clients"]
+        assert {cid: (c["AccessTokenValidity"], c["IdTokenValidity"]) for cid, c in restored.items()} == {
+            "unset": (None, None), "minutes": (60, 60), "set": (2, 3)}
+    finally:
+        mod.reset()
+
+
 def test_cognito_describe_identity(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="DescribeIdPool",
@@ -2521,6 +2631,60 @@ def test_cognito_oauth2_authorize_saml_redirect(cognito_idp):
         assert "RelayState=" in location
 
 
+def test_cognito_oauth2_authorize_saml_metadata_file(cognito_idp):
+    """MetadataFile only: SSO URL resolves from SingleSignOnService, preferring HTTP-Redirect."""
+    pid, cid = _setup_saml_pool(cognito_idp)
+    metadata = (
+        '<?xml version="1.0"?>'
+        '<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com/e">'
+        '<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+        ' Location="https://post.example.com/sso"/>'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"'
+        ' Location="https://redirect.example.com/sso"/>'
+        '</IDPSSODescriptor></EntityDescriptor>'
+    )
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="MetaSAML", ProviderType="SAML",
+        ProviderDetails={"MetadataFile": metadata},
+    )
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=MetaSAML&state=xyz123&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect, got 200"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302, f"Expected 302, got {e.code}"
+        location = e.headers.get("Location", "")
+        assert location.startswith("https://redirect.example.com/sso?")
+        assert "SAMLRequest=" in location
+
+
+def test_cognito_oauth2_authorize_saml_metadata_file_without_redirect_binding(cognito_idp):
+    pid, cid = _setup_saml_pool(cognito_idp)
+    metadata = (
+        '<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com/e">'
+        '<IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+        '<SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+        ' Location="https://post.example.com/sso"/>'
+        '</IDPSSODescriptor></EntityDescriptor>'
+    )
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="PostOnlySAML", ProviderType="SAML",
+        ProviderDetails={"MetadataFile": metadata},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback&identity_provider=PostOnlySAML&scope=openid")
+    assert exc.value.code == 400
+    assert "HTTP-Redirect SingleSignOnService" in exc.value.read().decode()
+
+
 def test_cognito_oauth2_authorize_invalid_client(cognito_idp):
     """GET /oauth2/authorize with unknown client_id returns 400."""
     url = f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id=nonexistent&redirect_uri=http://x&identity_provider=X"
@@ -2858,7 +3022,7 @@ def _start_fake_oidc_idp(claims):
     return token_url, recorded, stop
 
 
-def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None):
+def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mapping=None):
     pid = cognito_idp.create_user_pool(
         PoolName="OIDCFedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
@@ -2882,7 +3046,7 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None):
             "client_secret": "oidc-client-secret",
             "authorize_scopes": "openid email profile",
         },
-        AttributeMapping={"email": "email", "name": "name"},
+        AttributeMapping=attribute_mapping or {"email": "email", "name": "name"},
     )
     return pid, client["ClientId"]
 
@@ -4429,6 +4593,129 @@ def test_oauth2_token_refresh_token():
     assert 'id_token' in resp2
 
 
+def _scoped_code_client(cognito_idp, scopes):
+    """A pool with testuser and a code-flow client allowing *scopes* (resource servers api and zeta)."""
+    pool_id, _ = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    for identifier, names in (('api', ('read', 'write', 'admin', *(f's{i}' for i in range(1, 9)))), ('zeta', ('x',))):
+        cognito_idp.create_resource_server(
+            UserPoolId=pool_id, Identifier=identifier, Name=identifier,
+            Scopes=[{'ScopeName': n, 'ScopeDescription': n} for n in names],
+        )
+    return cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='scoped', AllowedOAuthFlows=['code'], AllowedOAuthScopes=scopes,
+        AllowedOAuthFlowsUserPoolClient=True, CallbackURLs=['http://localhost:3000/callback'],
+        ExplicitAuthFlows=['ALLOW_ADMIN_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+    )['UserPoolClient']
+
+
+def _code_grant_tokens(cognito_idp, client_id, scope):
+    code = _do_login_and_get_code(cognito_idp, client_id, {'scope': scope})
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code', 'code': code,
+        'redirect_uri': 'http://localhost:3000/callback', 'client_id': client_id,
+    })
+    assert status == 200, body
+    return json.loads(body)
+
+
+_SCOPED_CLIENT_SCOPES = ['profile', 'api/read', 'openid', 'email', 'aws.cognito.signin.user.admin', 'phone',
+                         'api/write']
+
+
+@pytest.mark.parametrize('requested,scope', [
+    ('openid email profile aws.cognito.signin.user.admin', 'aws.cognito.signin.user.admin openid profile email'),
+    ('email openid', 'openid email'),
+    ('phone api/write openid api/read', 'phone openid api/write api/read'),
+    ('openid openid email', 'openid email'),
+    ('api/read', 'api/read'),
+    # No scope parameter: every scope the client allows
+    ('', 'aws.cognito.signin.user.admin phone openid profile api/write email api/read'),
+])
+def test_oauth2_token_authorization_code_carries_granted_scopes(requested, scope):
+    """The access token lists the granted scopes in AWS's order."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    tokens = _code_grant_tokens(cognito_idp, client['ClientId'], requested)
+    assert _decode_jwt_claims(tokens['access_token'])['scope'] == scope
+
+
+_TWELVE_SCOPES = 'openid email phone profile ' + ' '.join(f'api/s{i}' for i in range(1, 9))
+
+
+@pytest.mark.parametrize('requested,scope', [
+    # Scopes of one hash bucket keep the order of the request
+    ('phone zeta/x api/s3', 'phone zeta/x api/s3'),
+    ('api/s3 zeta/x phone', 'api/s3 zeta/x phone'),
+    (_TWELVE_SCOPES, 'openid profile api/s1 api/s2 phone api/s3 api/s4 api/s5 api/s6 api/s7 api/s8 email'),
+    (_TWELVE_SCOPES + ' aws.cognito.signin.user.admin',
+     'aws.cognito.signin.user.admin openid profile api/s1 api/s2 phone api/s3 api/s4 api/s5 api/s6 api/s7 '
+     'api/s8 email'),
+    ('', 'aws.cognito.signin.user.admin openid profile api/read api/s1 api/s2 api/s3 phone zeta/x api/s4 api/s5 '
+         'api/s6 api/s7 api/s8 api/write email'),
+])
+def test_oauth2_token_scope_order_with_many_scopes(requested, scope):
+    """Many granted scopes keep AWS's order."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, ['zeta/x', *(f'api/s{i}' for i in range(8, 0, -1)), 'phone', 'openid',
+                                               'email', 'profile', 'aws.cognito.signin.user.admin', 'api/read',
+                                               'api/write'])
+    tokens = _code_grant_tokens(cognito_idp, client['ClientId'], requested)
+    assert _decode_jwt_claims(tokens['access_token'])['scope'] == scope
+
+
+def test_oauth2_token_authorization_code_drops_scopes_the_client_does_not_allow():
+    """A scope the client does not allow is left out of the token; AWS refuses it at /oauth2/authorize."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, ['email', 'openid'])
+    tokens = _code_grant_tokens(cognito_idp, client['ClientId'], 'openid email profile api/read')
+    assert _decode_jwt_claims(tokens['access_token'])['scope'] == 'openid email'
+
+
+def test_oauth2_refreshed_tokens_keep_the_granted_scopes():
+    """Both refresh paths keep the code grant's scopes; API sign-ins keep the admin scope."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    client_id = client['ClientId']
+    tokens = _code_grant_tokens(cognito_idp, client_id, 'phone api/write openid api/read')
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'refresh_token', 'refresh_token': tokens['refresh_token'], 'client_id': client_id,
+    })
+    assert status == 200, body
+    assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == 'phone openid api/write api/read'
+    refreshed = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow='REFRESH_TOKEN_AUTH',
+        AuthParameters={'REFRESH_TOKEN': tokens['refresh_token']},
+    )['AuthenticationResult']
+    assert _decode_jwt_claims(refreshed['AccessToken'])['scope'] == 'phone openid api/write api/read'
+
+    admin = cognito_idp.admin_initiate_auth(
+        UserPoolId=client['UserPoolId'], ClientId=client_id, AuthFlow='ADMIN_USER_PASSWORD_AUTH',
+        AuthParameters={'USERNAME': 'testuser', 'PASSWORD': 'TestPass1!'},
+    )['AuthenticationResult']
+    assert _decode_jwt_claims(admin['AccessToken'])['scope'] == 'aws.cognito.signin.user.admin'
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'refresh_token', 'refresh_token': admin['RefreshToken'], 'client_id': client_id,
+    })
+    assert status == 200, body
+    assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == 'aws.cognito.signin.user.admin'
+
+
+def test_oauth2_token_issues_no_id_token_without_openid():
+    """The token endpoint returns no id_token when openid was not granted."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    tokens = _code_grant_tokens(cognito_idp, client['ClientId'], 'api/read')
+    assert sorted(tokens) == ['access_token', 'expires_in', 'refresh_token', 'token_type']
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'refresh_token', 'refresh_token': tokens['refresh_token'], 'client_id': client['ClientId'],
+    })
+
+    assert status == 200, body
+    assert sorted(json.loads(body)) == ['access_token', 'expires_in', 'token_type']
+
+
 def test_oauth2_token_client_credentials():
     cognito_idp = make_client('cognito-idp')
     pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
@@ -4470,6 +4757,37 @@ def test_oauth2_token_client_credentials_expires_with_the_client():
     resp = json.loads(body)
     claims = _decode_jwt_claims(resp['access_token'])
     assert resp['expires_in'] == claims['exp'] - claims['iat'] == 300
+
+
+@pytest.mark.parametrize('requested,scope', [
+    (None, 'zeta/x api/write api/read'),
+    ('api/read', 'api/read'),
+    ('api/read api/write zeta/x', 'zeta/x api/write api/read'),
+    ('api/read api/read', 'api/read'),
+    ('api/read bogus/x', 'api/read'),
+])
+def test_oauth2_token_client_credentials_carries_granted_scopes(requested, scope):
+    """No scope parameter grants every scope the client allows."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _setup_pool_with_user(cognito_idp)
+    for identifier, names in (('api', ('read', 'write', 'admin')), ('zeta', ('x',))):
+        cognito_idp.create_resource_server(
+            UserPoolId=pool_id, Identifier=identifier, Name=identifier,
+            Scopes=[{'ScopeName': n, 'ScopeDescription': n} for n in names],
+        )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='m2m', GenerateSecret=True, AllowedOAuthFlows=['client_credentials'],
+        AllowedOAuthScopes=['zeta/x', 'api/write', 'api/read'], AllowedOAuthFlowsUserPoolClient=True,
+    )['UserPoolClient']
+    form = {'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+            'client_secret': client['ClientSecret']}
+    if requested is not None:
+        form['scope'] = requested
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', form)
+
+    assert status == 200, body
+    assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == scope
 
 
 def test_oauth2_token_client_auth_basic():
@@ -5236,6 +5554,48 @@ def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     assert status2 == 200, body2
     resp2 = json.loads(body2)
     assert _decode_jwt_claims(resp2["access_token"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
+
+
+def test_cognito_pretoken_v2_event_carries_the_granted_scopes(cognito_idp, lam):
+    """request.scopes holds the access token's scopes."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {'accessTokenGeneration': {\n"
+        "        'claimsToAddOrOverride': {'event_scopes': ' '.join(event['request']['scopes'])}}}\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-pretoken-scopes"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    cognito_idp.update_user_pool(
+        UserPoolId=client["UserPoolId"],
+        LambdaConfig={"PreTokenGenerationConfig": {"LambdaArn": fn_arn, "LambdaVersion": "V2_0"}},
+    )
+
+    access = _decode_jwt_claims(_code_grant_tokens(cognito_idp, client["ClientId"], "email openid")["access_token"])
+    cognito_idp.update_user_pool_client(
+        UserPoolId=client["UserPoolId"], ClientId=client["ClientId"], AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email", "phone", "profile", *(f"api/s{i}" for i in range(1, 9))],
+        AllowedOAuthFlowsUserPoolClient=True, CallbackURLs=["http://localhost:3000/callback"],
+        ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )
+    twelve = _decode_jwt_claims(_code_grant_tokens(cognito_idp, client["ClientId"], _TWELVE_SCOPES)["access_token"])
+    admin = cognito_idp.admin_initiate_auth(
+        UserPoolId=client["UserPoolId"], ClientId=client["ClientId"], AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+    )["AuthenticationResult"]
+
+    assert access["event_scopes"] == access["scope"] == "openid email"
+    # Twelve scopes fill the event's set without growing it, while the token's is sized larger
+    assert twelve["event_scopes"] == (
+        "api/s1 api/s2 phone api/s3 openid api/s4 profile api/s5 api/s6 api/s7 api/s8 email")
+    assert _decode_jwt_claims(admin["AccessToken"])["event_scopes"] == "aws.cognito.signin.user.admin"
 
 
 def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
@@ -8617,6 +8977,29 @@ def test_cognito_custom_domain_create_and_describe(cognito_idp):
     assert not pool.get("Domain")
 
 
+def test_cognito_update_custom_domain_certificate(cognito_idp):
+    """UpdateUserPoolDomain replaces a custom domain's certificate and answers its CloudFront target."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomDomainUpdatePool")["UserPool"]["Id"]
+    domain = _pool_unique_domain(pid, "renew")
+    created = cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=domain,
+        CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN},
+    )
+    renewed = _CUSTOM_CERT_ARN.replace("555555555555", "666666666666")
+
+    resp = cognito_idp.update_user_pool_domain(
+        UserPoolId=pid, Domain=domain,
+        CustomDomainConfig={"CertificateArn": renewed}, ManagedLoginVersion=2,
+    )
+    assert resp["CloudFrontDomain"] == created["CloudFrontDomain"]
+    assert resp["ManagedLoginVersion"] == 2
+
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["CustomDomainConfig"] == {"CertificateArn": renewed}
+    assert dd["ManagedLoginVersion"] == 2
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"].get("CustomDomain") == domain
+
+
 def test_cognito_prefix_domain_unchanged_by_custom_domain_support(cognito_idp):
     """Regression: no CustomDomainConfig still means a prefix domain that expands."""
     pid = cognito_idp.create_user_pool(PoolName="PrefixDomainPool")["UserPool"]["Id"]
@@ -8664,6 +9047,21 @@ def test_cognito_custom_domain_requires_certificate_arn(cognito_idp):
     # Nothing was registered, so the domain is still free.
     assert cognito_idp.describe_user_pool_domain(
         Domain=_pool_unique_domain(pid, "nocert"))["DomainDescription"] == {}
+
+
+def test_cognito_second_prefix_domain_is_refused(cognito_idp):
+    """A pool holds one prefix domain: a second one is refused and the first stays."""
+    pid = cognito_idp.create_user_pool(PoolName="SecondPrefixPool")["UserPool"]["Id"]
+    suffix = pid.split("_", 1)[1].lower()
+    cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"first-{suffix}")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"second-{suffix}")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "User pool already has a domain configured."
+
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["Domain"] == f"first-{suffix}"
+    assert cognito_idp.describe_user_pool_domain(Domain=f"second-{suffix}")["DomainDescription"] == {}
 
 
 def test_cognito_pool_holds_prefix_and_custom_domain_independently(cognito_idp):
@@ -10616,3 +11014,217 @@ def test_cognito_secret_hash_no_secret_refresh_ignores_supplied_hash(cognito_idp
     initiate = cognito_idp.admin_initiate_auth if admin else cognito_idp.initiate_auth
     result = initiate(**kwargs)["AuthenticationResult"]
     assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "canonical-user"
+
+
+_INBOUND_EMAIL_CLAIM = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
+
+
+def _create_inbound_federation_lambda(lam, fn_name, handler):
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    return lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+
+def _saml_idpresponse(cid, saml_resp):
+    """Run the SAML authorize + idpresponse legs; return (status, Location or body)."""
+    try:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestSAML&state=s&scope=openid")
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["RelayState"][0]
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse",
+        data=_urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect or 400"
+    except urllib.error.HTTPError as e:
+        return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
+
+
+def test_cognito_inbound_federation_trigger_feeds_attribute_mapping(cognito_idp, lam):
+    """userAttributesToMap supplies the AttributeMapping input the IdP did not send under that name."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['triggerSource'] == 'InboundFederation_ExternalProvider'\n"
+        "    assert event['request']['providerType'] == 'SAML'\n"
+        "    assert event['request']['providerName'] == 'TestSAML'\n"
+        f"    assert event['request']['attributes']['samlResponse'] == {{'{_INBOUND_EMAIL_CLAIM}': 'raw@example.com'}}\n"
+        f"    event['response']['userAttributesToMap'] = {{'{_INBOUND_EMAIL_CLAIM}': 'mapped@example.com'}}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-map", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["LambdaConfig"]["InboundFederation"]["LambdaArn"] == fn_arn
+
+    status, _ = _saml_idpresponse(
+        cid, _build_mock_saml_response(name_id="opaque-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com"}))
+    assert status == 302
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_opaque-name-id")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "mapped@example.com"
+
+
+def test_cognito_inbound_federation_trigger_failure_fails_saml_sign_in(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-reject", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+
+    status, body = _saml_idpresponse(cid, _build_mock_saml_response(name_id="blocked@example.com"))
+    assert status == 400
+    assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_blocked@example.com")
+
+
+def test_cognito_inbound_federation_trigger_feeds_oidc_attribute_mapping(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['request']['providerType'] == 'OIDC'\n"
+        "    assert event['request']['attributes']['idToken']['sub'] == 'oidc-sub'\n"
+        "    event['response']['userAttributesToMap'] = {'auth_time': '1700000000', 'email': 'oidc-mapped@example.com'}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc", handler)
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "oidc-sub"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}},
+                                  attribute_mapping={"email": "email", "updated_at": "auth_time"})
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-sub")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert attrs["email"] == "oidc-mapped@example.com"
+        assert attrs["updated_at"] == "1700000000"
+        assert "auth_time" not in attrs
+    finally:
+        stop()
+
+
+def test_cognito_inbound_federation_trigger_registered_claims_do_not_override_id_token(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['userAttributesToMap'] = {\n"
+        "        k: str(v) for k, v in event['request']['attributes']['idToken'].items()}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reserved", handler)
+    token_url, _recorded, stop = _start_fake_oidc_idp({
+        "sub": "oidc-sub", "email": "r@example.com", "iss": "https://idp.example.com",
+        "aud": "oidc-client-id", "exp": 1791852598, "iat": 1791852298, "jti": "idp-jti"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+        status, location = _oidc_idpresponse(cid)
+        assert status == 302
+        code = _parse_qs(urlparse(location).query)["code"][0]
+        req = urllib.request.Request(
+            f"{ENDPOINT}/oauth2/token",
+            data=(f"grant_type=authorization_code&code={code}&client_id={cid}"
+                  f"&redirect_uri=http://localhost:3000/callback").encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            claims = _decode_jwt_claims(json.loads(resp.read())["id_token"])
+        assert isinstance(claims["exp"], int) and isinstance(claims["iat"], int)
+        assert claims["iss"].startswith("https://cognito-idp.")
+        assert claims["aud"] == cid
+        assert claims["jti"] != "idp-jti"
+        assert claims["email"] == "r@example.com"
+    finally:
+        stop()
+
+
+def _oidc_idpresponse(cid):
+    """Run the OIDC authorize + idpresponse legs; return (status, Location or body)."""
+    try:
+        _no_redirect_opener.open(
+            f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+            f"&redirect_uri=http://localhost:3000/callback"
+            f"&identity_provider=TestOIDC&state=s&scope=openid")
+        assert False, "Expected 302"
+    except urllib.error.HTTPError as e:
+        relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["state"][0]
+    try:
+        _no_redirect_opener.open(f"{ENDPOINT}/oauth2/idpresponse?code=idp-code&state={relay_state}")
+        assert False, "Expected redirect or 400"
+    except urllib.error.HTTPError as e:
+        return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
+
+
+def test_cognito_inbound_federation_trigger_failure_fails_oidc_sign_in(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reject", handler)
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "oidc-blocked"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+        status, body = _oidc_idpresponse(cid)
+        assert status == 400
+        assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
+        with pytest.raises(ClientError):
+            cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-blocked")
+    finally:
+        stop()
+
+
+def test_cognito_inbound_federation_trigger_missing_function_fails_sign_in(cognito_idp):
+    missing_arn = "arn:aws:lambda:us-east-1:000000000000:function:ministack-inbound-fed-missing"
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": missing_arn}})
+
+    status, body = _saml_idpresponse(cid, _build_mock_saml_response(name_id="missing-fn@example.com"))
+    assert status == 400
+    assert "UserLambdaValidationException" in json.loads(body).get("__type", "")
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_missing-fn@example.com")
+
+
+def test_cognito_inbound_federation_trigger_map_replaces_idp_attributes(cognito_idp, lam):
+    handler = (
+        "def handler(event, ctx):\n"
+        "    assert event['userName'] == 'TestSAML_replace-name-id', event['userName']\n"
+        "    event['response']['userAttributesToMap'] = {'given_name': 'Kept'}\n"
+        "    return event\n"
+    )
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-replace", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="replace-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "family_name": "Dropped"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_replace-name-id")["UserAttributes"]}
+    assert attrs["given_name"] == "Kept"
+    assert "family_name" not in attrs
+    assert attrs.get("email", "") != "raw@example.com"
+
+
+def test_cognito_inbound_federation_trigger_empty_map_keeps_idp_attributes(cognito_idp, lam):
+    handler = "def handler(event, ctx):\n    return event\n"
+    fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-noop", handler)
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"InboundFederation": {"LambdaVersion": "V1_0", "LambdaArn": fn_arn}})
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="noop-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "family_name": "Kept"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_noop-name-id")["UserAttributes"]}
+    assert attrs["email"] == "raw@example.com"
+    assert attrs["family_name"] == "Kept"
+
+
+def test_cognito_inbound_federation_trigger_unconfigured_pool_keeps_idp_attributes(cognito_idp):
+    pid, cid = _setup_saml_pool(cognito_idp)
+
+    status, _ = _saml_idpresponse(
+        cid, _build_mock_saml_response(name_id="plain-name-id", attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com"}))
+    assert status == 302
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_plain-name-id")
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs["email"] == "raw@example.com"

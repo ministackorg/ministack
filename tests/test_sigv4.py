@@ -9,7 +9,9 @@ from ministack.core.sigv4 import (
     build_string_to_sign,
     calculate_signature,
     derive_signing_key,
+    parse_header_signature,
     presigned_request_is_expired,
+    request_time_failure,
     signatures_match,
     uri_encode,
 )
@@ -155,3 +157,66 @@ def test_presigned_request_expiry_rejects_malformed_values(amz_date, expires):
 def test_signatures_match_accepts_only_equal_values():
     assert signatures_match("abc123", "abc123")
     assert not signatures_match("abc123", "abc124")
+
+
+_SCOPE = "AKIAIOSFODNN7EXAMPLE/20260930/eu-central-1/sts/aws4_request"
+
+
+@pytest.mark.parametrize(
+    "authorization, code, message",
+    [
+        (
+            f"AWS4-HMAC-SHA256 Credential={_SCOPE}, Signature=abc",
+            "MissingAuthorizationParameter",
+            "Authorization header requires 'SignedHeaders' parameter. (Hashed with SHA-256 and encoded with Base64) "
+            "Authorization=NfAZ3F0AUnKOtT3DAo6CWylCcBLuRNI5BHzk96CvGwM=",
+        ),
+        (
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/eu-central-1/sts/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=abc",
+            "IncompleteSignature",
+            "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
+            "got 'AKIAIOSFODNN7EXAMPLE/eu-central-1/sts/aws4_request'",
+        ),
+    ],
+)
+def test_parse_header_signature_names_the_missing_part_as_aws_does(authorization, code, message):
+    headers = {"authorization": authorization, "x-amz-date": "20260930T120000Z"}
+
+    assert parse_header_signature(headers) == (code, message)
+
+
+def test_parse_header_signature_takes_the_date_header_when_x_amz_date_is_absent():
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={_SCOPE}, SignedHeaders=date;host, Signature=abc",
+        "date": "Wed, 30 Sep 2026 12:00:00 GMT",
+    }
+
+    parsed = parse_header_signature(headers)
+
+    assert (parsed.access_key_id, parsed.service, parsed.amz_date) == (
+        "AKIAIOSFODNN7EXAMPLE", "sts", "20260930T120000Z")
+
+
+@pytest.mark.parametrize(
+    "service, amz_date, expected",
+    [
+        ("kms", "20260930T120500Z", None),
+        ("kms", "20260930T120501Z", "Signature not yet current: 20260930T120501Z is still later than "
+                                    "20260930T120500Z (20260930T120000Z + 5 min.)"),
+        ("sts", "20260930T114500Z", None),
+        ("sts", "20260930T114459Z", "Signature expired: 20260930T114459Z is now earlier than "
+                                    "20260930T114500Z (20260930T120000Z - 15 min.)"),
+    ],
+)
+def test_request_time_failure_uses_the_services_window(service, amz_date, expected):
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/{amz_date[:8]}/us-east-1/{service}/aws4_request, "
+                         "SignedHeaders=host;x-amz-date, Signature=abc",
+        "x-amz-date": amz_date,
+    }
+    now = dt.datetime(2026, 9, 30, 12, 0, tzinfo=dt.timezone.utc)
+
+    failure = request_time_failure(parse_header_signature(headers), now=now)
+
+    assert failure == (expected and ("RequestTimeTooSkewed", expected))

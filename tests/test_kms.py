@@ -10,6 +10,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError, ParamValidationError
+from conftest import iam_user, routed_request
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -1031,6 +1032,79 @@ def test_kms_get_put_key_policy(kms_client):
     got = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
     assert got["Policy"] == custom
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.fixture
+def auth_key(monkeypatch):
+    """Create keys in-process, optionally with a key policy, under AUTH=true."""
+    import ministack.app as app_mod
+    from ministack.services import kms as _kms
+
+    created = []
+
+    def make(*statements):
+        data = {"KeySpec": "SYMMETRIC_DEFAULT", "KeyUsage": "ENCRYPT_DECRYPT"}
+        if statements:
+            data["Policy"] = json.dumps({"Version": "2012-10-17", "Statement": [
+                {"Effect": effect, "Principal": {"AWS": principal}, "Action": action, "Resource": "*"}
+                for effect, principal, action in statements]})
+        status, _headers, body = _kms._create_key(data)
+        assert status == 200
+        created.append(json.loads(body)["KeyMetadata"]["KeyId"])
+        return created[-1]
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    yield make
+    for key_id in created:
+        _kms._keys.pop(key_id, None)
+
+
+def _kms_call(access_key, operation, key_id, field="__type"):
+    params = {"KeyId": key_id}
+    if operation == "Encrypt":
+        params["Plaintext"] = base64.b64encode(b"hi").decode()
+    else:
+        params["KeySpec"] = "AES_256"
+    status, _headers, body = routed_request(
+        access_key, "kms", "POST", "/", json.dumps(params).encode(),
+        {"content-type": "application/x-amz-json-1.1", "x-amz-target": f"TrentService.{operation}"})
+    return status, json.loads(body).get(field)
+
+
+_ALLOW_KMS = {"Statement": [{"Effect": "Allow", "Action": "kms:*", "Resource": "*"}]}
+_DENIED = (403, "AccessDeniedException")
+
+
+def test_key_policy_naming_the_user_allows_without_identity_policy(auth_key):
+    access_key, user = iam_user()
+    key_id = auth_key(("Allow", user, "kms:Encrypt"))
+    assert _kms_call(access_key, "Encrypt", key_id) == (200, None)
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+
+
+def test_key_policy_that_names_neither_user_nor_account_denies_an_identity_allow(auth_key):
+    access_key, user = iam_user(_ALLOW_KMS)
+    key_id = auth_key(("Allow", "arn:aws:iam::000000000000:user/someone-else", "kms:*"))
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+
+
+def test_default_key_policy_hands_the_decision_to_identity_policies(auth_key):
+    key_id = auth_key()
+    access_key, _user = iam_user()
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+    access_key, _user = iam_user(_ALLOW_KMS)
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == (200, None)
+
+
+def test_key_policy_deny_beats_an_identity_allow(auth_key):
+    access_key, user = iam_user(_ALLOW_KMS)
+    key_id = auth_key(("Allow", "arn:aws:iam::000000000000:root", "kms:*"), ("Deny", user, "kms:GenerateDataKey"))
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+    assert _kms_call(access_key, "GenerateDataKey", key_id, "message") == (403, (
+        f"User: {user} is not authorized to perform: kms:GenerateDataKey on resource: "
+        f"arn:aws:kms:us-east-1:000000000000:key/{key_id} with an explicit deny in a resource-based policy"))
+    assert _kms_call(access_key, "Encrypt", key_id) == (200, None)
+
 
 def test_kms_tag_untag_list_v2(kms_client):
     """TagResource / UntagResource / ListResourceTags."""

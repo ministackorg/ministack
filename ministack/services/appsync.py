@@ -355,8 +355,6 @@ def _create_data_source(api_id, body):
 
     name = body.get("name", "")
     ds_type = body.get("type", "NONE")
-    description = body.get("description", "")
-    service_role_arn = body.get("serviceRoleArn", "")
 
     arn = f"{_apis[api_id]['arn']}/datasources/{name}"
 
@@ -364,14 +362,17 @@ def _create_data_source(api_id, body):
         "dataSourceArn": arn,
         "name": name,
         "type": ds_type,
-        "description": description,
-        "serviceRoleArn": service_role_arn,
         "createdAt": _now(),
         "lastUpdatedAt": _now(),
     }
+    # Members the caller left out are absent from the data source.
+    for member in ("description", "serviceRoleArn", "metricsConfig"):
+        if body.get(member):
+            record[member] = body[member]
 
     if ds_type == "AMAZON_DYNAMODB":
-        record["dynamodbConfig"] = body.get("dynamodbConfig", {})
+        record["dynamodbConfig"] = {"useCallerCredentials": False, "versioned": False,
+                                    **body.get("dynamodbConfig", {})}
     elif ds_type == "AWS_LAMBDA":
         record["lambdaConfig"] = body.get("lambdaConfig", {})
     elif ds_type == "AMAZON_ELASTICSEARCH" or ds_type == "AMAZON_OPENSEARCH_SERVICE":
@@ -380,6 +381,8 @@ def _create_data_source(api_id, body):
         record["httpConfig"] = body.get("httpConfig", {})
     elif ds_type == "RELATIONAL_DATABASE":
         record["relationalDatabaseConfig"] = body.get("relationalDatabaseConfig", {})
+    elif ds_type == "AMAZON_EVENTBRIDGE":
+        record["eventBridgeConfig"] = body.get("eventBridgeConfig", {})
 
     _data_sources.setdefault(api_id, {})[name] = record
     return _json(200, {"dataSource": record})
@@ -441,12 +444,15 @@ def _create_resolver(api_id, type_name, body):
         "fieldName": field_name,
         "dataSourceName": data_source_name,
         "resolverArn": arn,
-        "requestMappingTemplate": request_template,
-        "responseMappingTemplate": response_template,
         "kind": kind,
+        "maxBatchSize": body.get("maxBatchSize", 0),
         "createdAt": _now(),
         "lastUpdatedAt": _now(),
     }
+    if request_template:
+        record["requestMappingTemplate"] = request_template
+    if response_template:
+        record["responseMappingTemplate"] = response_template
     if pipeline_config:
         record["pipelineConfig"] = pipeline_config
     if caching_config:
@@ -455,6 +461,9 @@ def _create_resolver(api_id, type_name, body):
         record["runtime"] = runtime
     if code:
         record["code"] = code
+    for optional in ("syncConfig", "metricsConfig"):
+        if body.get(optional) is not None:
+            record[optional] = body[optional]
 
     _resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = record
     return _json(200, {"resolver": record})

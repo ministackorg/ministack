@@ -1626,14 +1626,16 @@ def _put_destination_policy(data):
 
 
 def _format_resource_policy(policy):
-    return {
-        "policyName": policy["policyName"],
+    formatted = {
         "policyDocument": policy["policyDocument"],
         "lastUpdatedTime": policy["lastUpdatedTime"],
         "policyScope": policy.get("policyScope", "ACCOUNT"),
         "resourceArn": policy.get("resourceArn"),
         "revisionId": policy["revisionId"],
     }
+    if policy.get("policyName"):
+        formatted["policyName"] = policy["policyName"]
+    return formatted
 
 
 def _revision_mismatch():
@@ -1643,15 +1645,22 @@ def _revision_mismatch():
     )
 
 
+def _policy_target_missing(action):
+    return error_response_json(
+        "InvalidParameterException", f"{action} request must contain policy name or resource arn.", 400)
+
+
 def _put_resource_policy(data):
     name = data.get("policyName")
     document = data.get("policyDocument")
-    if not name or not document:
+    resource_arn = data.get("resourceArn")
+    if not name and not resource_arn:
+        return _policy_target_missing("PutResourcePolicy")
+    if not document:
         return error_response_json(
             "InvalidParameterException",
             "policyName and policyDocument are required.", 400,
         )
-    resource_arn = data.get("resourceArn")
     expected_revision = data.get("expectedRevisionId")
     policy = {
         "policyName": name,
@@ -1660,15 +1669,21 @@ def _put_resource_policy(data):
         "revisionId": new_uuid(),
     }
     if resource_arn:
-        # RESOURCE scope: one policy per existing log group, guarded by its revision.
+        # RESOURCE scope: one policy per existing log group, its revision a counter.
         group = _resolve_group_by_arn(resource_arn)
         if group is None:
             return error_response_json(
                 "ResourceNotFoundException", "The specified log group does not exist.", 400)
         existing = _log_group_policies.get(group)
-        if (existing["revisionId"] if existing else None) != expected_revision:
-            return _revision_mismatch()
-        policy.update(policyScope="RESOURCE", resourceArn=resource_arn)
+        if (existing is None) != (expected_revision is None):
+            return error_response_json(
+                "OperationAbortedException",
+                "A conflicting operation is currently in progress against this resource. Please try again.", 400)
+        if existing and existing["revisionId"] != expected_revision:
+            return error_response_json("InvalidParameterException", "Invalid ExpectedRevisionId", 400)
+        current = existing["revisionId"] if existing else ""
+        revision = str(int(current) + 1) if current.isdigit() else "1"
+        policy.update(policyScope="RESOURCE", resourceArn=resource_arn, revisionId=revision)
         _log_group_policies[group] = policy
     else:
         existing = _resource_policies.get(name)
@@ -1681,8 +1696,10 @@ def _put_resource_policy(data):
                 f"{_MAX_ACCOUNT_RESOURCE_POLICIES} resource policies.", 400)
         policy["policyScope"] = "ACCOUNT"
         _resource_policies[name] = policy
-    return json_response({"resourcePolicy": _format_resource_policy(policy),
-                          "revisionId": policy["revisionId"]})
+    formatted = _format_resource_policy(policy)
+    if resource_arn:
+        del formatted["revisionId"]  # a log group's policy carries it only at the top level
+    return json_response({"resourcePolicy": formatted, "revisionId": policy["revisionId"]})
 
 
 def _describe_resource_policies(data):
@@ -1690,7 +1707,9 @@ def _describe_resource_policies(data):
     scope = data.get("policyScope") or "ACCOUNT"
     if scope not in ("ACCOUNT", "RESOURCE"):
         return error_response_json(
-            "InvalidParameterException", f"Invalid policyScope: {scope}", 400)
+            "InvalidParameterException",
+            "1 validation error detected: Value at 'policyScope' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [ACCOUNT, RESOURCE]", 400)
     if resource_arn:
         group = _resolve_group_by_arn(resource_arn)
         found = _log_group_policies.get(group) if group else None
@@ -1705,21 +1724,22 @@ def _describe_resource_policies(data):
 def _delete_resource_policy(data):
     name = data.get("policyName")
     resource_arn = data.get("resourceArn")
+    if not name and not resource_arn:
+        return _policy_target_missing("DeleteResourcePolicy")
     if resource_arn:
         group = _resolve_group_by_arn(resource_arn)
         existing = _log_group_policies.get(group) if group else None
         if existing is None:
             return error_response_json(
-                "ResourceNotFoundException",
-                f"The specified resource policy does not exist: {name}", 400)
+                "ResourceNotFoundException", "No policy found for ResourceArn", 400)
         if data.get("expectedRevisionId") != existing["revisionId"]:
-            return _revision_mismatch()
+            return error_response_json("InvalidParameterException", "Invalid ExpectedRevisionId", 400)
         del _log_group_policies[group]
         return json_response({})
-    if not name or name not in _resource_policies:
+    if name not in _resource_policies:
         return error_response_json(
             "ResourceNotFoundException",
-            f"The specified resource policy does not exist: {name}", 400,
+            f"Policy with name [{name}] does not exist.", 400,
         )
     del _resource_policies[name]
     return json_response({})

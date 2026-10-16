@@ -1176,6 +1176,35 @@ def test_appsync_update_data_source_and_resolver():
     assert got["kind"] == "PIPELINE"
 
 
+def test_appsync_data_source_and_resolver_read_back_only_the_members_set():
+    """Unset members are absent; EventBridge config, DynamoDB defaults and maxBatchSize read back."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="members-api", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    appsync.start_schema_creation(apiId=api_id, definition=SDL.encode())
+    role = "arn:aws:iam::000000000000:role/appsync"
+    bus = {"eventBusArn": "arn:aws:events:us-east-1:000000000000:event-bus/default"}
+    appsync.create_data_source(apiId=api_id, name="none", type="NONE")
+    appsync.create_data_source(apiId=api_id, name="bus", type="AMAZON_EVENTBRIDGE",
+                               serviceRoleArn=role, eventBridgeConfig=bus)
+    appsync.create_data_source(apiId=api_id, name="ddb", type="AMAZON_DYNAMODB", serviceRoleArn=role,
+                               dynamodbConfig={"tableName": "items", "awsRegion": "us-east-1"})
+    sources = {d["name"]: d for d in appsync.list_data_sources(apiId=api_id)["dataSources"]}
+    assert "description" not in sources["none"] and "serviceRoleArn" not in sources["none"]
+    assert sources["bus"]["eventBridgeConfig"] == bus
+    assert sources["ddb"]["dynamodbConfig"] == {"tableName": "items", "awsRegion": "us-east-1",
+                                                "useCallerCredentials": False, "versioned": False}
+
+    appsync.create_resolver(apiId=api_id, typeName="Query", fieldName="hello", dataSourceName="none",
+                            runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+                            code="export function request(ctx) { return {}; }\n"
+                                 "export function response(ctx) { return 'hi'; }\n")
+    got = appsync.get_resolver(apiId=api_id, typeName="Query", fieldName="hello")["resolver"]
+    assert "requestMappingTemplate" not in got and "responseMappingTemplate" not in got
+    assert got["kind"] == "UNIT" and got["maxBatchSize"] == 0
+
+
 def test_appsync_update_api_key():
     """UpdateApiKey changes the description without minting a new key."""
     from conftest import make_client
