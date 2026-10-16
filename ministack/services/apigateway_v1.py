@@ -3963,11 +3963,9 @@ def _export_integration(integration):
 
 
 def _export_security_scheme(authorizer, include_authorizers):
-    """Security scheme for a TOKEN or REQUEST authorizer.
-
-    More than one identity source, or one that is not a header or query
-    string, gives the name ``Unused``, as the AWS docs show."""
-    source = authorizer["identitySource"]
+    """Security scheme for a TOKEN or REQUEST authorizer."""
+    source = authorizer.get("identitySource") or ""
+    authorizer_type = authorizer.get("type") or "TOKEN"
     name = "Unused"
     location = "header"
     if "," not in source:
@@ -3987,13 +3985,15 @@ def _export_security_scheme(authorizer, include_authorizers):
         return scheme
 
     extension = {
-        "type": authorizer["type"].lower(),
-        "authorizerUri": authorizer["authorizerUri"],
-        "authorizerResultTtlInSeconds": authorizer["authorizerResultTtlInSeconds"],
+        "type": authorizer_type.lower(),
+        "authorizerUri": authorizer.get("authorizerUri", ""),
+        "authorizerResultTtlInSeconds": authorizer.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
     }
-    if authorizer["type"] == "REQUEST":
+    if authorizer_type == "REQUEST":
         extension["identitySource"] = source
-    if authorizer["type"] == "TOKEN" and authorizer.get("identityValidationExpression"):
+    if authorizer_type == "TOKEN" and authorizer.get("identityValidationExpression"):
         extension["identityValidationExpression"] = authorizer["identityValidationExpression"]
     if authorizer.get("authorizerCredentials"):
         extension["authorizerCredentials"] = authorizer["authorizerCredentials"]
