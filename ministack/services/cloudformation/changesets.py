@@ -808,6 +808,7 @@ def _create_change_set(params):
         "_resources_to_import": resources_to_import,
         "_import_existing": {e["LogicalResourceId"]: e["ResourceIdentifier"] for e in existing},
         "ImportExistingResources": import_existing,
+        "_disable_validation": _p(params, "DisableValidation", "false").lower() == "true",
     }
     _change_sets[cs_id] = change_set
 
@@ -1022,6 +1023,7 @@ def _execute_change_set(params):
     status_prefix = "UPDATE" if is_update else "CREATE"
     if not is_update:
         stack["DisableRollback"] = disable_rollback
+    stack["_disable_validation"] = cs.get("_disable_validation", False)
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body

@@ -5033,18 +5033,20 @@ def _replication_destination(bucket_name: str, key: str, rule: dict, role: str):
 
 
 def _maybe_replicate_delete_marker(bucket_name: str, key: str) -> None:
-    """Replicate a delete marker the way AWS does: only for a V2 rule (one with
-    ``Filter``) that has ``DeleteMarkerReplication`` Enabled and no tag filter.
-    Called only for deletes without a version id; version-id deletes never
-    replicate. Replica markers are not re-replicated, so two-way setups don't
-    loop."""
+    """Replicate a delete marker the way AWS does: always for a V1 rule (no
+    ``Filter``), and for a V2 rule only with ``DeleteMarkerReplication`` Enabled
+    and no tag filter. Called only for deletes without a version id; version-id
+    deletes never replicate. Replica markers are not re-replicated, so two-way
+    setups don't loop."""
     config = _bucket_replication.get(bucket_name)
     if not config or _bucket_versioning.get(bucket_name) != "Enabled":
         return
     rule = next((r for r in config.get("Rules", [])
                  if r.get("Status") == "Enabled" and key.startswith(_replication_rule_prefix(r))), None)
-    if (rule is None or "Filter" not in rule or _replication_rule_tags(rule)
-            or (rule.get("DeleteMarkerReplication") or {}).get("Status") != "Enabled"):
+    if rule is None:
+        return
+    if "Filter" in rule and (_replication_rule_tags(rule)
+                             or (rule.get("DeleteMarkerReplication") or {}).get("Status") != "Enabled"):
         return
     target = _replication_destination(bucket_name, key, rule, config.get("Role", ""))
     if target is None:

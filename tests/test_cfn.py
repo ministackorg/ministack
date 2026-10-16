@@ -36278,22 +36278,20 @@ def foreign_bucket():
     s3_svc._buckets.pop_scoped("111122223333", None, name, None)
 
 
-def test_cfn_s3_bucket_other_account_name_is_refused(foreign_bucket, monkeypatch):
+def test_cfn_s3_bucket_other_account_name_is_refused(foreign_bucket):
     from ministack.services import s3 as s3_svc
     from ministack.services.cloudformation import provisioners
 
-    for adopt in (True, False):
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", adopt)
-        with pytest.raises(ValueError) as exc:
-            provisioners._s3_create("B", {"BucketName": foreign_bucket}, "stack")
-        assert str(exc.value) == _NAME_EXISTS.format(foreign_bucket)
-        # Rename on update and recreate go through the same check.
-        with pytest.raises(ValueError):
-            provisioners._s3_update("old-name", {"BucketName": "old-name"}, {"BucketName": foreign_bucket}, "stack")
+    with pytest.raises(ValueError) as exc:
+        provisioners._s3_create("B", {"BucketName": foreign_bucket}, "stack")
+    assert str(exc.value) == f"{foreign_bucket} already exists"
+    # Rename on update and recreate go through the same check.
+    with pytest.raises(ValueError):
+        provisioners._s3_update("old-name", {"BucketName": "old-name"}, {"BucketName": foreign_bucket}, "stack")
     assert s3_svc._buckets.get(foreign_bucket) is None
 
 
-def test_cfn_s3_bucket_adopt_existing_setting(monkeypatch):
+def test_cfn_s3_bucket_existing_own_name_is_refused_and_auto_names_are_fresh():
     import contextvars
 
     from ministack.services import s3 as s3_svc
@@ -36302,30 +36300,19 @@ def test_cfn_s3_bucket_adopt_existing_setting(monkeypatch):
     name = f"cfn-own-{_uuid_mod.uuid4().hex[:8]}"
     s3_svc._buckets[name] = {"created": "", "objects": {"k": {}}, "region": "us-east-1"}
     try:
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", True)
-        assert provisioners._s3_create("B", {"BucketName": name}, "stack")[0] == name
-        assert s3_svc._buckets[name]["objects"] == {"k": {}}
-
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", False)
         with pytest.raises(ValueError) as exc:
             provisioners._s3_create("B", {"BucketName": name}, "stack")
-        assert str(exc.value) == _NAME_EXISTS.format(name)
+        assert str(exc.value) == f"{name} already exists"
+        assert s3_svc._buckets[name]["objects"] == {"k": {}}
     finally:
         s3_svc._buckets.pop(name, None)
 
-    def create_auto_named():
-        return provisioners._s3_create("Assets", {}, "seeded-stack")[0]
-
     created = []
     try:
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", True)
-        first, again = (contextvars.copy_context().run(create_auto_named) for _ in range(2))
-        assert first == again  # adoption keeps the deterministic name
-        created.append(first)
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", False)
-        one, two = (contextvars.copy_context().run(create_auto_named) for _ in range(2))
+        one, two = (contextvars.copy_context().run(provisioners._s3_create, "Assets", {}, "seeded-stack")[0]
+                    for _ in range(2))
         created += [one, two]
-        assert len({first, one, two}) == 3  # a fresh name per stack instance
+        assert one != two  # a fresh name per stack instance
         assert one.startswith("seeded-stack-assets-")
     finally:
         for bucket in created:
@@ -36389,15 +36376,72 @@ def test_cfn_s3_name_conflict_validation(cfn, other_account_bucket, disable_roll
         assert {e["OperationId"] for e in ops} == {error["OperationId"]}
         failed_only = cfn.describe_events(StackName=stack_name, Filters={"FailedEvents": True})["OperationEvents"]
         assert error["EventId"] in {e["EventId"] for e in failed_only}
+        # Every DescribeEvents member is optional: the operation id alone finds the same events.
+        by_operation = cfn.describe_events(OperationId=error["OperationId"])["OperationEvents"]
+        assert {e["EventId"] for e in by_operation} == {e["EventId"] for e in ops}
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
 
-def test_cfn_s3_name_conflict_own_bucket_when_adoption_is_off(monkeypatch):
-    """In-process: with CFN_S3_ADOPT_EXISTING_BUCKET=0, an own existing name
-    is a NAME_CONFLICT_VALIDATION error too."""
+def _events_since_last_update(cfn, stack_name):
+    events = _stack_level_events(cfn, stack_name)
+    start = max(i for i, e in enumerate(events)
+                if e["LogicalResourceId"] == stack_name and e["ResourceStatus"] == "UPDATE_IN_PROGRESS")
+    return events[start:]
+
+
+def test_cfn_update_validation_rolls_back_like_aws(cfn, s3):
+    """An update that fails pre-deployment validation rolls back without touching a resource; the stack's
+    own bucket is not a conflict; DisableValidation moves the refusal to the resource (AWS 2026-10-16)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, own, taken = f"cfn-upd-val-{uid}", f"cfn-upd-own-{uid}", f"cfn-upd-taken-{uid}"
+
+    def template(versioning, with_taken=False):
+        resources = {"Own": {"Type": "AWS::S3::Bucket", "Properties": {
+            "BucketName": own, "VersioningConfiguration": {"Status": versioning}}}}
+        if with_taken:
+            resources["Taken"] = {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": taken}}
+        return json.dumps({"Resources": resources})
+
+    s3.create_bucket(Bucket=taken)
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("Enabled"))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("Suspended"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("Suspended", with_taken=True))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        events = _events_since_last_update(cfn, stack_name)
+        assert [(e["LogicalResourceId"], e["ResourceStatus"], e.get("ResourceStatusReason", ""))
+                for e in events[1:]] == [
+            (stack_name, "UPDATE_FAILED", _VALIDATION_FAILED_ONE),
+            (stack_name, "UPDATE_ROLLBACK_IN_PROGRESS",
+             "Validation failure detected. See operation's FAILED event for details."),
+            (stack_name, "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", ""),
+            (stack_name, "UPDATE_ROLLBACK_COMPLETE", ""),
+        ]
+        assert events[1]["DetailedStatus"] == "VALIDATION_FAILED"
+        [error] = [e for e in cfn.describe_events(StackName=stack_name)["OperationEvents"]
+                   if e["EventType"] == "VALIDATION_ERROR"]
+        assert (error["OperationType"], error["LogicalResourceId"], error["ValidationName"]) == (
+            "UPDATE_STACK", "Taken", "NAME_CONFLICT_VALIDATION")
+        assert "Taken" not in json.dumps(cfn.get_template(StackName=stack_name)["TemplateBody"])
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("Suspended", with_taken=True),
+                         DisableValidation=True)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert f"{taken} already exists" in _stack_event_reasons(cfn, stack_name)
+        s3.head_bucket(Bucket=taken)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        s3.delete_bucket(Bucket=taken)
+
+
+def test_cfn_s3_name_conflict_own_bucket():
+    """In-process: an own existing name is a NAME_CONFLICT_VALIDATION error too."""
     from ministack.services import s3 as s3_svc
-    from ministack.services.cloudformation import _stack_events, provisioners, stacks
+    from ministack.services.cloudformation import _stack_events, stacks
 
     name = f"cfn-own-conflict-{_uuid_mod.uuid4().hex[:8]}"
     s3_svc._buckets[name] = {"created": "", "objects": {}, "region": "us-east-1"}
@@ -36405,10 +36449,6 @@ def test_cfn_s3_name_conflict_own_bucket_when_adoption_is_off(monkeypatch):
     resources = {"B": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": name}}}
     stack = {"StackId": stack_id, "StackName": "own-conflict"}
     try:
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", True)
-        assert not stacks._fail_property_validation(stack, stack_id, "own-conflict", resources, ["B"], {}, {}, {},
-                                                    True)
-        monkeypatch.setattr(provisioners, "CFN_S3_ADOPT_EXISTING_BUCKET", False)
         assert stacks._fail_property_validation(stack, stack_id, "own-conflict", resources, ["B"], {}, {}, {}, True)
         assert stack["StackStatus"] == "CREATE_FAILED"
         [error] = [e for e in stack["_operation_events"] if e["EventType"] == "VALIDATION_ERROR"]
@@ -36416,6 +36456,23 @@ def test_cfn_s3_name_conflict_own_bucket_when_adoption_is_off(monkeypatch):
     finally:
         s3_svc._buckets.pop(name, None)
         _stack_events.pop(stack_id, None)
+
+
+def test_cfn_s3_name_conflict_with_validation_disabled_fails_the_resource(cfn, s3):
+    """DisableValidation skips pre-deployment validation; the bucket's create still refuses the name."""
+    name = f"cfn-own-disabled-{_uuid_mod.uuid4().hex[:8]}"
+    stack_name = f"cfn-novalidate-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=name)
+    template = {"Resources": {"Bucket": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": name}}}}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template), DisableValidation=True)
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert f"{name} already exists" in _stack_event_reasons(cfn, stack_name)
+        assert cfn.describe_events(StackName=stack_name)["OperationEvents"] == []
+        s3.head_bucket(Bucket=name)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        s3.delete_bucket(Bucket=name)
 
 
 @pytest.mark.parametrize("custom_bus", [True, False])

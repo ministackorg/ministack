@@ -1443,32 +1443,22 @@ def _s3_attrs(name):
     }
 
 
-# AWS fails CreateStack when an AWS::S3::Bucket names a bucket that already
-# exists. MiniStack adopts an own existing bucket by default, which keeps S3
-# data usable when it outlives the CloudFormation state (S3 persistence with a
-# fresh stack store); 0 gives AWS's behaviour.
-CFN_S3_ADOPT_EXISTING_BUCKET = os.environ.get("CFN_S3_ADOPT_EXISTING_BUCKET", "1") == "1"
-
-
 def s3_bucket_name_conflict(name: str) -> str | None:
-    """The NAME_CONFLICT_VALIDATION message for a bucket name the stack can't
-    take, or None. Another account's bucket is never taken; an own bucket only
-    when CFN_S3_ADOPT_EXISTING_BUCKET is off."""
-    owner = _s3._bucket_owner_account(name)
-    if owner is None or (owner == get_account_id() and CFN_S3_ADOPT_EXISTING_BUCKET):
+    """The NAME_CONFLICT_VALIDATION message for a bucket name that already exists, or None."""
+    if _s3._bucket_owner_account(name) is None:
         return None
     return f"Resource of type 'AWS::S3::Bucket' with identifier '{name}' already exists."
 
 
 def _s3_create(logical_id, props, stack_name):
-    if not props.get("BucketName") and not CFN_S3_ADOPT_EXISTING_BUCKET and not _NAME_SEED.get():
+    if not props.get("BucketName") and not _NAME_SEED.get():
         # AWS draws a new auto-name for each stack instance; the seed travels
         # on the resource record, so updates keep the name.
         _NAME_SEED.set(new_uuid()[:8])
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
-    conflict = s3_bucket_name_conflict(name)
-    if conflict:
-        raise ValueError(conflict)
+    if _s3._bucket_owner_account(name) is not None:
+        # Reached with DisableValidation: the resource handler refuses the existing name.
+        raise ValueError(f"{name} already exists")
     _s3._buckets.setdefault(name, {
         "created": now_iso(),
         "objects": {},

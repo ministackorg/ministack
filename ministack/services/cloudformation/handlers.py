@@ -358,6 +358,7 @@ def _create_stack(params):
         "Outputs": [],
         "DisableRollback": disable_rollback,
         "EnableTerminationProtection": termination_protection,
+        "_disable_validation": _p(params, "DisableValidation", "false").lower() == "true",
         "_stack_policy": stack_policy or "",
         "_region": get_region(),
         "_resources": {},
@@ -615,12 +616,17 @@ def _describe_events(params):
     that fails pre-deployment validation, the case the stack event tells the
     caller to call DescribeEvents for; change-set events are not recorded."""
     stack_name = _p(params, "StackName")
-    if not stack_name:
-        return _error("ValidationError", "StackName is required")
-    stack = _resolve_stack(stack_name)
-    if not stack:
-        return _error("ValidationError", f"Stack [{stack_name}] does not exist")
-    events = list(stack.get("_operation_events") or [])
+    if stack_name:
+        stack = _resolve_stack(stack_name)
+        if not stack:
+            return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+        events = list(stack.get("_operation_events") or [])
+    elif _p(params, "ChangeSetName"):
+        events = []
+    else:
+        # Every member is optional; an OperationId alone names its stack's events.
+        from ministack.services.cloudformation import _stacks
+        events = [e for s in _stacks.values() for e in s.get("_operation_events") or []]
     operation_id = _p(params, "OperationId")
     if operation_id:
         events = [e for e in events if e.get("OperationId") == operation_id]
@@ -1114,6 +1120,7 @@ def _update_stack(params):
 
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
+    stack["_disable_validation"] = _p(params, "DisableValidation", "false").lower() == "true"
     stack["_template_body"] = template_body
     # The capabilities a stack reports are the ones its last operation
     # acknowledged, so an update replaces them rather than adding to them.

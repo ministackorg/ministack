@@ -1589,7 +1589,7 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
                 if denied:
                     return denied
         status, resp_headers, resp_body = (
-            s3.s3control_account_error(headers)
+            (AUTH and s3.s3control_account_error(headers))
             or s3.handle_mrap_control(method, path, headers, body, query_params)
         )
         return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body

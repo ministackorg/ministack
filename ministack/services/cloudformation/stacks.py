@@ -606,6 +606,8 @@ _VALIDATION_FAILED = (
     "full list of issues with resource and property details, resolve each error, "
     "then retry the operation.")
 _VALIDATION_ROLLBACK = "Validation failure detected. See the operation's FAILED event for details."
+# The update wording, observed on AWS 2026-10-16.
+_UPDATE_VALIDATION_ROLLBACK = "Validation failure detected. See operation's FAILED event for details."
 
 
 def _static_property(raw, resources_defs, param_values, conditions, mappings, stack_name, stack_id):
@@ -616,10 +618,12 @@ def _static_property(raw, resources_defs, param_values, conditions, mappings, st
     return _resolve_refs(copy.deepcopy(raw), {}, param_values, conditions, mappings, stack_name, stack_id)
 
 
-def _validation_errors(resources_defs, ordered, param_values, conditions, mappings, stack_name, stack_id):
+def _validation_errors(resources_defs, ordered, param_values, conditions, mappings, stack_name, stack_id,
+                       owned_buckets=frozenset()):
     """Pre-deployment validation errors as ``(logical_id, type, validation name,
     path, reason)``: properties outside their schema enum, and AWS::S3::Bucket
-    names the stack can't take (NAME_CONFLICT_VALIDATION, observed on AWS)."""
+    names the stack can't take (NAME_CONFLICT_VALIDATION, observed on AWS); a
+    bucket the stack already owns is not a conflict for its update."""
     from ministack.services.cloudformation.provisioners import s3_bucket_name_conflict
 
     errors = []
@@ -642,33 +646,41 @@ def _validation_errors(resources_defs, ordered, param_values, conditions, mappin
         if rtype == "AWS::S3::Bucket" and raw_props.get("BucketName"):
             name = _static_property(raw_props["BucketName"], resources_defs, param_values, conditions,
                                     mappings, stack_name, stack_id)
-            conflict = s3_bucket_name_conflict(name) if isinstance(name, str) else None
+            conflict = (s3_bucket_name_conflict(name)
+                        if isinstance(name, str) and name not in owned_buckets else None)
             if conflict:
                 errors.append((logical_id, rtype, "NAME_CONFLICT_VALIDATION", f"/Resources/{logical_id}", conflict))
     return errors
 
 
-def _operation_event(stack_id, operation_id, event_type, **fields):
+def _operation_event(stack_id, operation_id, event_type, operation_type="CREATE_STACK", **fields):
     return {"EventId": new_uuid(), "StackId": stack_id, "OperationId": operation_id,
-            "OperationType": "CREATE_STACK", "OperationStatus": "FAILED", "EventType": event_type,
+            "OperationType": operation_type, "OperationStatus": "FAILED", "EventType": event_type,
             "Timestamp": now_iso(), **fields}
 
 
 def _fail_property_validation(stack, stack_id, stack_name, resources_defs, ordered,
-                              param_values, conditions, mappings, disable_rollback):
-    """Fail a create that doesn't pass pre-deployment validation before
-    provisioning anything. The errors themselves are kept on the stack for
-    DescribeEvents, which the stack event points the caller to."""
+                              param_values, conditions, mappings, disable_rollback,
+                              previous_stack=None):
+    """Fail a create or update that doesn't pass pre-deployment validation
+    before provisioning anything. The errors themselves are kept on the stack
+    for DescribeEvents, which the stack event points the caller to. A failed
+    update rolls back to ``previous_stack`` (observed on AWS 2026-10-16)."""
+    is_update = previous_stack is not None
+    owned = {r.get("PhysicalResourceId") for r in (previous_stack or {}).get("_resources", {}).values()
+             if r.get("ResourceType") == "AWS::S3::Bucket"}
     errors = _validation_errors(resources_defs, ordered, param_values, conditions, mappings,
-                                stack_name, stack_id)
+                                stack_name, stack_id, frozenset(owned))
     if not errors:
         return False
     operation_id = new_uuid()
+    operation_type = "UPDATE_STACK" if is_update else "CREATE_STACK"
     operation_events = []
     for logical_id, rtype, validation_name, path, reason in errors:
         logger.warning("Stack %s validation: %s: %s", stack_name, path, reason)
         operation_events.append(_operation_event(
-            stack_id, operation_id, "VALIDATION_ERROR", LogicalResourceId=logical_id, ResourceType=rtype,
+            stack_id, operation_id, "VALIDATION_ERROR", operation_type,
+            LogicalResourceId=logical_id, ResourceType=rtype,
             ValidationFailureMode="FAIL", ValidationName=validation_name, ValidationStatus="FAILED",
             ValidationStatusReason=reason, ValidationPath=path))
 
@@ -676,10 +688,25 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
         _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack", status, reason, stack_id,
                    detailed_status=detailed_status)
         operation_events.append(_operation_event(
-            stack_id, operation_id, "PROVISIONING_ERROR", LogicalResourceId=stack_name,
+            stack_id, operation_id, "PROVISIONING_ERROR", operation_type, LogicalResourceId=stack_name,
             PhysicalResourceId=stack_id, ResourceType="AWS::CloudFormation::Stack", ResourceStatus=status,
             ResourceStatusReason=reason, **({"DetailedStatus": detailed_status} if detailed_status else {})))
 
+    if is_update:
+        stack_event("UPDATE_FAILED", _VALIDATION_FAILED.format(count=len(errors)), "VALIDATION_FAILED")
+        for key in ("_template", "_resolved_params", "_template_body", "Parameters", "Tags", "Outputs",
+                    "_conditions"):
+            if key in previous_stack:
+                stack[key] = previous_stack[key]
+        if disable_rollback:
+            stack["StackStatus"] = "UPDATE_FAILED"
+        else:
+            stack_event("UPDATE_ROLLBACK_IN_PROGRESS", _UPDATE_VALIDATION_ROLLBACK)
+            stack_event("UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", "")
+            stack_event("UPDATE_ROLLBACK_COMPLETE", "")
+            stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
+        stack["_operation_events"] = operation_events
+        return True
     stack_event("CREATE_FAILED", _VALIDATION_FAILED.format(count=len(errors)), "VALIDATION_FAILED")
     if disable_rollback:
         stack_event("CREATE_FAILED", _VALIDATION_ROLLBACK)
@@ -730,9 +757,10 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                    str(exc), stack_id)
         return
 
-    if not is_update and _fail_property_validation(
+    if not stack.get("_disable_validation") and _fail_property_validation(
             stack, stack_id, stack_name, resources_defs, ordered, param_values,
-            conditions, mappings, disable_rollback):
+            conditions, mappings, disable_rollback,
+            previous_stack=(previous_stack or {}) if is_update else None):
         return
 
     provisioned_resources: dict = stack.get("_resources", {})

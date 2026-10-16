@@ -8564,6 +8564,15 @@ def test_s3_delete_marker_replication_enabled_v2_rule(crr_pair):
         assert exc.value.response["Error"]["Code"] == "NoSuchKey"
 
 
+def test_s3_delete_marker_replication_v1_rule(crr_pair):
+    """A rule without Filter is V1, which replicates delete markers from user deletes."""
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Prefix="")
+    use1.put_object(Bucket=src, Key="v1.txt", Body=b"x")
+    use1.delete_object(Bucket=src, Key="v1.txt")
+    assert len(_delete_markers(euw1, dst, "v1.txt")) == 1
+
+
 def test_s3_delete_marker_replication_version_id_delete_stays_local(crr_pair):
     use1, src, euw1, dst = crr_pair
     _replicate(use1, src, dst, Filter={"Prefix": ""}, DeleteMarkerReplication={"Status": "Enabled"})
@@ -8575,9 +8584,8 @@ def test_s3_delete_marker_replication_version_id_delete_stays_local(crr_pair):
 
 @pytest.mark.parametrize("rule", [
     {"Filter": {"Prefix": ""}, "DeleteMarkerReplication": {"Status": "Disabled"}},
-    {"Prefix": ""},
     {"Filter": {"Tag": {"Key": "keep", "Value": "yes"}}, "DeleteMarkerReplication": {"Status": "Enabled"}},
-], ids=["disabled", "v1-rule", "tag-filter"])
+], ids=["disabled", "tag-filter"])
 def test_s3_delete_marker_replication_not_replicated(crr_pair, rule):
     use1, src, euw1, dst = crr_pair
     _replicate(use1, src, dst, **rule)
@@ -8861,13 +8869,24 @@ def test_s3_mrap_control_region_rules(s3control_dns, mrap_members):
             "ap-northeast-1, eu-west-1 and us-east-1. Make sure to send all future requests to a supported Region.")
         for region in ("us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1", "ap-southeast-2"):
             _regional_client("s3control", region).get_multi_region_access_point_routes(AccountId=_ACCOUNT, Mrap=arn)
-
-        with pytest.raises(ClientError) as exc:
-            ctl.get_multi_region_access_point(AccountId="111122223333", Name=name)
-        assert exc.value.response["Error"]["Code"] == "AccessDenied"
-        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
     finally:
         _mrap_delete(ctl, name)
+
+
+def test_s3_mrap_control_account_check_only_under_auth(monkeypatch):
+    """x-amz-account-id must name the caller's account; that is an authorization check, so AUTH=true only."""
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.services import s3 as s3_svc
+
+    headers = {"x-amz-account-id": "111122223333"}
+    status, _, body = s3_svc.s3control_account_error(headers)
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    status, _, _ = asyncio.run(app_mod._handle_s3_control_request(
+        "/v20180820/mrap/instances", "GET", b"", {}, "rid", headers))
+    assert status == 200
 
 
 def _mrap_request(alias, method, key, body=b""):
