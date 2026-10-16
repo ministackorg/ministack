@@ -71,6 +71,7 @@ async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     """Route a device-plane request, then publish the job events it raised."""
+    _iot_module.jobs_device_host.set(headers.get("host", ""))
     async with _iot_module.publishing_events():
         return await _route_request(method, path, body, query_params)
 
