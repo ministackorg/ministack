@@ -6,7 +6,10 @@ import uuid as _uuid_mod
 
 import boto3
 import pytest
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.config import Config
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 
 from ministack import app as _app_mod
@@ -1138,6 +1141,79 @@ def test_logs_resource_scoped_policy_lives_on_its_log_group(logs):
         logs.delete_log_group(logGroupName=group)
 
 
+def test_logs_resource_scoped_policy_takes_resource_arn_alone(logs):
+    """A log group's policy named by resourceArn alone has no name and a counter revision."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    group = f"/intg/resource-policy-arn/{uid}"
+    logs.create_log_group(logGroupName=group)
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+    try:
+        first = logs.put_resource_policy(policyDocument="{}", resourceArn=arn)
+        assert first["revisionId"] == "1"
+        assert first["resourcePolicy"]["policyScope"] == "RESOURCE"
+        assert "policyName" not in first["resourcePolicy"]
+        assert "revisionId" not in first["resourcePolicy"]
+        second = logs.put_resource_policy(policyDocument="{}", resourceArn=arn, expectedRevisionId="1")
+        assert second["revisionId"] == "2"
+        listed = logs.describe_resource_policies(resourceArn=arn, policyScope="RESOURCE")["resourcePolicies"]
+        assert [(p.get("policyName"), p["revisionId"]) for p in listed] == [(None, "2")]
+        logs.delete_resource_policy(resourceArn=arn, expectedRevisionId="2")
+        assert logs.put_resource_policy(policyDocument="{}", resourceArn=arn)["revisionId"] == "1"
+    finally:
+        logs.delete_log_group(logGroupName=group)
+
+
+def test_logs_resource_scoped_policy_revision_checks(logs):
+    """A log group's policy is written and deleted against its current revision only."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    group = f"/intg/resource-policy-rev/{uid}"
+    logs.create_log_group(logGroupName=group)
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+
+    def refused(call, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(resourceArn=arn, **kwargs)
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    conflict = ("OperationAbortedException",
+                "A conflicting operation is currently in progress against this resource. Please try again.")
+    invalid = ("InvalidParameterException", "Invalid ExpectedRevisionId")
+    try:
+        assert refused(logs.put_resource_policy, policyDocument="{}", expectedRevisionId="1") == conflict
+        assert refused(logs.delete_resource_policy) == (
+            "ResourceNotFoundException", "No policy found for ResourceArn")
+        logs.put_resource_policy(policyDocument="{}", resourceArn=arn)
+        assert refused(logs.put_resource_policy, policyDocument="{}") == conflict
+        assert refused(logs.put_resource_policy, policyDocument="{}", expectedRevisionId="7") == invalid
+        assert refused(logs.delete_resource_policy) == invalid
+        assert refused(logs.delete_resource_policy, expectedRevisionId="7") == invalid
+    finally:
+        logs.delete_log_group(logGroupName=group)
+
+
+@pytest.mark.parametrize("call, action", [
+    ("put_resource_policy", "PutResourcePolicy"),
+    ("delete_resource_policy", "DeleteResourcePolicy"),
+])
+def test_logs_resource_policy_needs_name_or_resource_arn(logs, call, action):
+    kwargs = {"policyDocument": "{}"} if call == "put_resource_policy" else {}
+    with pytest.raises(ClientError) as exc:
+        getattr(logs, call)(**kwargs)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == f"{action} request must contain policy name or resource arn."
+
+
+def test_logs_resource_policy_error_messages(logs):
+    with pytest.raises(ClientError) as exc:
+        logs.delete_resource_policy(policyName="does-not-exist")
+    assert exc.value.response["Error"]["Message"] == "Policy with name [does-not-exist] does not exist."
+    with pytest.raises(ClientError) as exc:
+        logs.describe_resource_policies(policyScope="OTHER")
+    assert exc.value.response["Error"]["Message"] == (
+        "1 validation error detected: Value at 'policyScope' failed to satisfy constraint: "
+        "Member must satisfy enum value set: [ACCOUNT, RESOURCE]")
+
+
 @pytest.mark.serial
 def test_logs_account_resource_policies_are_limited_to_ten(logs):
     existing = len(logs.describe_resource_policies()["resourcePolicies"])
@@ -2170,16 +2246,15 @@ def logs_auth(monkeypatch):
         async def send(message):
             sent.append(message)
 
+        host = f"_logs_svc.{request_region}.amazonaws.com"
+        request = AWSRequest(method="POST", url=f"https://{host}/", data=body, headers={
+            "x-amz-target": f"Logs_20140328.{action}", "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(Credentials(account if root else key, "test"), "logs", request_region).add_auth(request)
         scope = {
             "type": "http", "method": "POST", "path": "/", "query_string": b"",
-            "headers": [
-                (b"host", f"_logs_svc.{request_region}.amazonaws.com".encode()),
-                (b"x-amz-target", f"Logs_20140328.{action}".encode()),
-                (b"content-type", b"application/x-amz-json-1.1"),
-                (b"authorization", (
-                    f"AWS4-HMAC-SHA256 Credential={account if root else key}"
-                    f"/20261006/{request_region}/logs/aws4_request"
-                ).encode()),
+            "headers": [(b"host", host.encode())] + [
+                (name.lower().encode(), value.encode()) for name, value in request.headers.items()
             ],
         }
         asyncio.run(_app_mod.app(scope, receive, send))
@@ -2437,7 +2512,7 @@ def test_invalid_tag_arn_precedes_policy_denial_but_preserves_credential_errors(
     assert b"x-amzn-errortype" not in headers
     _iam_svc._access_keys.get_scoped(account, None, "AKIALOGSTAGCONTEXT")["Status"] = "Inactive"
     status, body = call("UntagResource", resourceArn=arn + ":*", tagKeys=["protect"])
-    assert status == 403 and body["__type"] == "InvalidClientTokenId"
+    assert status == 400 and body["__type"] == "UnrecognizedClientException"
 
 
 @pytest.mark.parametrize("auth", [False, True])
