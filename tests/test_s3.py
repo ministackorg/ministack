@@ -5206,6 +5206,99 @@ def test_s3_put_object_canned_acl_versioned(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def _grant_object_acl(client, bucket, key, grants, **kwargs):
+    """Replace an object's ACL with the owner's FULL_CONTROL plus ``(canonical ID, permission)`` grants."""
+    owner_id = client.list_buckets()["Owner"]["ID"]
+    client.put_object_acl(Bucket=bucket, Key=key, **kwargs, AccessControlPolicy={
+        "Owner": {"ID": owner_id},
+        "Grants": [{"Grantee": {"Type": "CanonicalUser", "ID": grantee}, "Permission": permission}
+                   for grantee, permission in [(owner_id, "FULL_CONTROL"), *grants]],
+    })
+
+
+def _acl_enabled_bucket(client, bucket):
+    """A bucket with ACLs enabled (BucketOwnerPreferred), so object ACLs take effect."""
+    client.create_bucket(Bucket=bucket)
+    client.put_bucket_ownership_controls(
+        Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]})
+
+
+def _denied(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"] in ("AccessDenied", "403")
+
+
+def test_s3_object_acl_grant_opens_reads_to_another_account(s3):
+    """Another account's READ grant opens GetObject and HeadObject only; BucketOwnerEnforced drops it."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"acl-xacct-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one")
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+
+        _grant_object_acl(owner, bucket, "k", [(reader.list_buckets()["Owner"]["ID"], "READ")])
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+        assert reader.head_object(Bucket=bucket, Key="k")["ContentLength"] == 3
+        assert _denied(reader.get_object_acl, Bucket=bucket, Key="k")
+        assert _denied(reader.get_object_tagging, Bucket=bucket, Key="k")
+        assert _denied(reader.put_object, Bucket=bucket, Key="k", Body=b"two")
+
+        owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={
+            "BlockPublicAcls": True, "IgnorePublicAcls": True,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": True})
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_bucket_ownership_controls(
+            Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="k")
+        owner.delete_bucket(Bucket=bucket)
+
+
+def test_s3_object_acl_grant_to_another_account_follows_the_version(s3):
+    """The grant stays on the version current when it was set; READ_ACP opens that version's ACL."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    reader_id = reader.list_buckets()["Owner"]["ID"]
+    bucket = f"acl-xacct-ver-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        v1 = owner.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+        _grant_object_acl(owner, bucket, "k", [(reader_id, "READ")])
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_object(Bucket=bucket, Key="k", Body=b"two")
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+        assert reader.get_object(Bucket=bucket, Key="k", VersionId=v1)["Body"].read() == b"one"
+        assert _denied(reader.get_object_acl, Bucket=bucket, Key="k", VersionId=v1)
+
+        _grant_object_acl(owner, bucket, "k", [(reader_id, "READ_ACP")], VersionId=v1)
+        grants = reader.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)["Grants"]
+        assert {(g["Grantee"]["ID"], g["Permission"]) for g in grants} >= {(reader_id, "READ_ACP")}
+    finally:
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_public_read_object_acl_opens_reads_to_another_account(s3):
+    """A public-read object ACL answers another account's read until IgnorePublicAcls is set."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"acl-xacct-pub-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one", ACL="public-read")
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_public_access_block(
+            Bucket=bucket, PublicAccessBlockConfiguration={"IgnorePublicAcls": True})
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="k")
+        owner.delete_bucket(Bucket=bucket)
+
+
 def test_s3_post_object_acl_field(s3):
     """The POST form names its canned-ACL field `acl`; it applies to the
     uploaded object like x-amz-acl does on PutObject."""
