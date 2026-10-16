@@ -8282,8 +8282,19 @@ def test_anonymous_request_to_a_private_bucket_is_denied_under_auth(monkeypatch)
     assert (status, resp) == (200, b"secret")
 
 
+def test_s3_create_bucket_object_ownership_header(s3):
+    name = f"own-hdr-{uuid.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=name, ObjectOwnership="ObjectWriter")
+    try:
+        rules = s3.get_bucket_ownership_controls(Bucket=name)["OwnershipControls"]["Rules"]
+        assert rules == [{"ObjectOwnership": "ObjectWriter"}]
+    finally:
+        s3.delete_bucket(Bucket=name)
+
+
 def test_anonymous_request_reads_a_public_object_under_auth(monkeypatch):
-    bucket = _anonymous_bucket(monkeypatch)
+    # Object ACLs only count on a bucket with ACLs enabled (not BucketOwnerEnforced).
+    bucket = _anonymous_bucket(monkeypatch, **{"x-amz-object-ownership": "BucketOwnerPreferred"})
     assert _lock_call("PUT", f"/{bucket}/pub", {"x-amz-acl": "public-read"}, b"open")[0] == 200
     status, _, resp = _anonymous_call("GET", f"/{bucket}/pub")
     assert (status, resp) == (200, b"open")
