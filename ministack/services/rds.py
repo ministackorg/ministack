@@ -5627,15 +5627,12 @@ def _begin_instance_reboot(p):
             return invalid_arn
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
     if instance.get("DBInstanceStatus") != "available":
-        return _error("InvalidDBInstanceState", "DB instance must be available to reboot.", 400)
-    # A local fault-injection setting, not an AWS request parameter. Keep the
-    # engine stopped during this interval so clients experience real downtime.
-    try:
-        downtime = float(os.environ.get("RDS_REBOOT_DOWNTIME_SECONDS", "0"))
-        if not 0 <= downtime <= 3600:
-            raise ValueError
-    except ValueError:
-        return _error("InvalidParameterValue", "RDS_REBOOT_DOWNTIME_SECONDS must be between 0 and 3600.", 400)
+        return _error(
+            "InvalidDBInstanceState",
+            f"DBInstance {db_id} is in {instance.get('DBInstanceStatus')} state but expected "
+            "it to be one of available.",
+            400,
+        )
     cluster_id = instance.get("_shared_cluster_id") or instance.get("DBClusterIdentifier")
     cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
     if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
@@ -5646,13 +5643,13 @@ def _begin_instance_reboot(p):
     response = _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
     context = contextvars.copy_context()
     threading.Thread(
-        target=context.run, args=(_finish_instance_reboot, instance, cluster, downtime),
+        target=context.run, args=(_finish_instance_reboot, instance, cluster),
         daemon=True,
     ).start()
     return response
 
 
-def _finish_instance_reboot(instance, cluster, downtime):
+def _finish_instance_reboot(instance, cluster):
     db_id = instance["DBInstanceIdentifier"]
 
     def current():
@@ -5664,8 +5661,6 @@ def _finish_instance_reboot(instance, cluster, downtime):
         if client and container_id:
             container = client.containers.get(container_id)
             container.stop(timeout=5)
-            if downtime:
-                time.sleep(downtime)
             if not current():
                 return
             container.start()
@@ -5686,8 +5681,6 @@ def _finish_instance_reboot(instance, cluster, downtime):
                 instance.get("DBName"), alive,
             ):
                 raise RuntimeError("database stopped before reboot readiness")
-        elif downtime:
-            time.sleep(downtime)
         if current():
             instance["DBInstanceStatus"] = "available"
     except Exception:
