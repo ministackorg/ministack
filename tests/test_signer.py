@@ -1169,6 +1169,14 @@ def test_signer_cancel_profile_keeps_the_name_and_freezes_permissions(signer):
                                   f"Signing Profile with name {ghost} does not exist.")
 
 
+def test_signer_cancel_profile_answers_204_with_an_empty_body(signer):
+    name, _put, _account = _permissions_profile(signer)
+    meta = signer.cancel_signing_profile(profileName=name)["ResponseMetadata"]
+    assert meta["HTTPStatusCode"] == 204
+    assert meta["HTTPHeaders"]["content-type"] == "application/json"
+    assert meta["HTTPHeaders"].get("content-length", "0") == "0"
+
+
 @pytest.mark.parametrize("name", ["fw-profile", "p" * 65])
 def test_signer_profile_name_outside_documented_pattern_is_refused(
     signer, s3, buckets, name

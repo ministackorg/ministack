@@ -897,6 +897,69 @@ def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
     )
 
 
+def test_cloudfront_function_development_status_follows_publish_and_association(cloudfront):
+    """The DEVELOPMENT stage reports UNPUBLISHED only while it holds changes that
+    were never published, then UNASSOCIATED, or ASSOCIATED while a cache
+    behavior references the function. Terraform's aws_cloudfront_function.status
+    reads this stage."""
+    name = f"fn-status-{_uuid_mod.uuid4().hex[:8]}"
+
+    def dev_status():
+        return cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]["Status"]
+
+    def listed_dev_status():
+        items = cloudfront.list_functions(Stage="DEVELOPMENT")["FunctionList"].get("Items", [])
+        return next(it["Status"] for it in items if it["Name"] == name)
+
+    cr = cloudfront.create_function(
+        Name=name,
+        FunctionConfig={"Comment": "v1", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; }",
+    )
+    assert cr["FunctionSummary"]["Status"] == "UNPUBLISHED"
+    assert dev_status() == "UNPUBLISHED"
+
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(cr))
+    assert dev_status() == "UNASSOCIATED"
+    assert listed_dev_status() == "UNASSOCIATED"
+
+    upd = cloudfront.update_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+        FunctionConfig={"Comment": "v2", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; } // v2",
+    )
+    assert upd["FunctionSummary"]["Status"] == "UNPUBLISHED"
+    assert dev_status() == "UNPUBLISHED"
+    assert listed_dev_status() == "UNPUBLISHED"
+
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(upd))
+    assert dev_status() == "UNASSOCIATED"
+
+    fn_arn = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+    cfg = copy.deepcopy(_CF_DIST_CONFIG)
+    cfg["CallerReference"] = f"cf-fn-status-{_uuid_mod.uuid4().hex[:12]}"
+    cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {
+        "Quantity": 1,
+        "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}],
+    }
+    dist = cloudfront.create_distribution(DistributionConfig=cfg)
+    assert dev_status() == "ASSOCIATED"
+    assert listed_dev_status() == "ASSOCIATED"
+
+    dist_id = dist["Distribution"]["Id"]
+    cfg["Enabled"] = False
+    cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {"Quantity": 0}
+    upd_dist = cloudfront.update_distribution(Id=dist_id, IfMatch=dist["ETag"], DistributionConfig=cfg)
+    assert dev_status() == "UNASSOCIATED"
+
+    cloudfront.delete_distribution(Id=dist_id, IfMatch=upd_dist["ETag"])
+    cloudfront.delete_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+    )
+
+
 def test_cloudfront_function_duplicate_name(cloudfront):
     name = f"fn-dup-{_uuid_mod.uuid4().hex[:8]}"
     cloudfront.create_function(

@@ -1244,6 +1244,26 @@ def _rewrite_host_for_container(url: str) -> str:
     return url
 
 
+def s3_code_region_message(bucket: str, layer: bool = False) -> str | None:
+    """Lambda reads S3 code from the function's own region. For a bucket homed
+    elsewhere, the message AWS returns (observed 2026-10-12); layers word the
+    S3 part differently from functions. None when the bucket is local or absent."""
+    from ministack.services import s3 as s3_svc
+
+    home = s3_svc.bucket_region(bucket)
+    if home is None or home == get_region():
+        return None
+    s3_message = (f"The bucket is in this region: {home}. Please use this region to retry the request" if layer
+                  else "The bucket you are attempting to access must be addressed using the specified endpoint. "
+                       "Please send all future requests to this endpoint.")
+    return f"Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: {s3_message}"
+
+
+def _s3_code_region_error(bucket: str, layer: bool = False):
+    message = s3_code_region_message(bucket, layer)
+    return error_response_json("InvalidParameterValueException", message, 400) if message else None
+
+
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service.
 
@@ -2306,6 +2326,9 @@ def _create_function(data: dict):
     elif "ZipFile" in code_data:
         code_zip = base64.b64decode(code_data["ZipFile"])
     elif "S3Bucket" in code_data and "S3Key" in code_data:
+        err = _s3_code_region_error(code_data["S3Bucket"])
+        if err is not None:
+            return err
         code_zip = _fetch_code_from_s3(
             code_data["S3Bucket"],
             code_data["S3Key"],
@@ -2763,6 +2786,9 @@ def _update_code(name: str, data: dict):
     elif "ZipFile" in data:
         code_zip = base64.b64decode(data["ZipFile"])
     elif "S3Bucket" in data and "S3Key" in data:
+        err = _s3_code_region_error(data["S3Bucket"])
+        if err is not None:
+            return err
         code_zip = _fetch_code_from_s3(
             data["S3Bucket"],
             data["S3Key"],
@@ -6129,6 +6155,15 @@ def _remove_permission(
     return 204, {}, b""
 
 
+def function_policy_for_arn(resource_arn: str) -> tuple[dict, str] | None:
+    """The function's resource policy and owner account, for the identity check."""
+    _, sep, ref = resource_arn.partition(":function:")
+    func = _functions.get(_resolve_request_scoped_name(unquote(ref))) if sep else None
+    if func is None:
+        return None
+    return func["policy"], get_account_id()
+
+
 def _get_policy(
     func_name: str,
     query_params: dict | None = None,
@@ -6293,6 +6328,11 @@ def _publish_layer_version(layer_name: str, data: dict):
             "CompatibleArchitectures list length exceeds maximum allowed length of 2.",
             400,
         )
+    content = data.get("Content", {})
+    if "S3Bucket" in content and "S3Key" in content:
+        err = _s3_code_region_error(content["S3Bucket"], layer=True)
+        if err is not None:
+            return err
 
     if layer_name not in _layers:
         _layers[layer_name] = {"versions": [], "next_version": 1}

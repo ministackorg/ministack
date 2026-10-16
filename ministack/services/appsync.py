@@ -118,6 +118,37 @@ def _select_api_region(api_id):
     return True
 
 
+# {apiId}.appsync-api[.{region}].{host}, the endpoint uris.GRAPHQL reports.
+_GRAPHQL_HOST_RE = re.compile(r"^([a-z0-9]+)\.appsync-api(?:\.([a-z0-9]+(?:-[a-z0-9]+)+-\d+))?(?:[.:]|$)")
+
+
+def _api_from_graphql_host(headers, query_params):
+    """Return the API named by the request host's first label and select its region, or None."""
+    m = _GRAPHQL_HOST_RE.match(str(headers.get("host") or "").lower())
+    if not m:
+        return None
+    api_id, host_region = m.groups()
+    if _has_sigv4_credentials(headers, query_params):
+        return api_id if api_id in _apis else None
+    if host_region is None:
+        return api_id if _select_api_region(api_id) else None
+    account_id = get_account_id()
+    for (stored_account, region, stored_api_id), _api in _apis.all_items():
+        if stored_account == account_id and region == host_region and stored_api_id == api_id:
+            set_request_region(region)
+            return api_id
+    return None
+
+
+def _graphql_host_names_event_api(headers):
+    """Whether the request host's first label is an AppSync Events API of this account."""
+    m = _GRAPHQL_HOST_RE.match(str(headers.get("host") or "").lower())
+    if not m:
+        return False
+    from ministack.services import appsync_events
+    return appsync_events._discover_api_scope(m.group(1), get_account_id()) is not None
+
+
 def _has_sigv4_credentials(headers, query_params):
     """Return whether the data request carries an explicit SigV4 region."""
     query_params = query_params or {}
@@ -324,8 +355,6 @@ def _create_data_source(api_id, body):
 
     name = body.get("name", "")
     ds_type = body.get("type", "NONE")
-    description = body.get("description", "")
-    service_role_arn = body.get("serviceRoleArn", "")
 
     arn = f"{_apis[api_id]['arn']}/datasources/{name}"
 
@@ -333,14 +362,17 @@ def _create_data_source(api_id, body):
         "dataSourceArn": arn,
         "name": name,
         "type": ds_type,
-        "description": description,
-        "serviceRoleArn": service_role_arn,
         "createdAt": _now(),
         "lastUpdatedAt": _now(),
     }
+    # Members the caller left out are absent from the data source.
+    for member in ("description", "serviceRoleArn", "metricsConfig"):
+        if body.get(member):
+            record[member] = body[member]
 
     if ds_type == "AMAZON_DYNAMODB":
-        record["dynamodbConfig"] = body.get("dynamodbConfig", {})
+        record["dynamodbConfig"] = {"useCallerCredentials": False, "versioned": False,
+                                    **body.get("dynamodbConfig", {})}
     elif ds_type == "AWS_LAMBDA":
         record["lambdaConfig"] = body.get("lambdaConfig", {})
     elif ds_type == "AMAZON_ELASTICSEARCH" or ds_type == "AMAZON_OPENSEARCH_SERVICE":
@@ -349,6 +381,8 @@ def _create_data_source(api_id, body):
         record["httpConfig"] = body.get("httpConfig", {})
     elif ds_type == "RELATIONAL_DATABASE":
         record["relationalDatabaseConfig"] = body.get("relationalDatabaseConfig", {})
+    elif ds_type == "AMAZON_EVENTBRIDGE":
+        record["eventBridgeConfig"] = body.get("eventBridgeConfig", {})
 
     _data_sources.setdefault(api_id, {})[name] = record
     return _json(200, {"dataSource": record})
@@ -410,12 +444,15 @@ def _create_resolver(api_id, type_name, body):
         "fieldName": field_name,
         "dataSourceName": data_source_name,
         "resolverArn": arn,
-        "requestMappingTemplate": request_template,
-        "responseMappingTemplate": response_template,
         "kind": kind,
+        "maxBatchSize": body.get("maxBatchSize", 0),
         "createdAt": _now(),
         "lastUpdatedAt": _now(),
     }
+    if request_template:
+        record["requestMappingTemplate"] = request_template
+    if response_template:
+        record["responseMappingTemplate"] = response_template
     if pipeline_config:
         record["pipelineConfig"] = pipeline_config
     if caching_config:
@@ -424,6 +461,9 @@ def _create_resolver(api_id, type_name, body):
         record["runtime"] = runtime
     if code:
         record["code"] = code
+    for optional in ("syncConfig", "metricsConfig"):
+        if body.get(optional) is not None:
+            record[optional] = body[optional]
 
     _resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = record
     return _json(200, {"resolver": record})
@@ -1022,11 +1062,15 @@ async def handle_request(method, path, headers, body, query_params):
 
     # GraphQL data plane: POST /graphql or POST /v1/apis/{apiId}/graphql
     if path == "/graphql" and method == "POST":
-        api_key = headers.get("x-api-key", "")
-        api_id = _resolve_api_by_key(
-            api_key,
-            allow_cross_region=not _has_sigv4_credentials(headers, query_params),
-        )
+        api_id = _api_from_graphql_host(headers, query_params)
+        if not api_id and _graphql_host_names_event_api(headers):
+            return _json(404, {"errors": [{
+                "errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}]})
+        if not api_id:
+            api_id = _resolve_api_by_key(
+                headers.get("x-api-key", ""),
+                allow_cross_region=not _has_sigv4_credentials(headers, query_params),
+            )
         if not api_id:
             return error_response_json("UnauthorizedException", "Valid API key required", 401)
         data = json.loads(body) if body else {}

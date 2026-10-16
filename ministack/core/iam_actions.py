@@ -266,6 +266,37 @@ _S3_VERSIONED_ACTIONS: dict[str, str] = {
 }
 
 
+_S3CONTROL_MRAP_ASYNC_ACTIONS = {
+    "create": "s3:CreateMultiRegionAccessPoint",
+    "delete": "s3:DeleteMultiRegionAccessPoint",
+    "put-policy": "s3:PutMultiRegionAccessPointPolicy",
+}
+
+
+def s3control_action(method: str, path: str) -> str | None:
+    """IAM action for an S3 Control Multi-Region Access Point request, or None."""
+    from urllib.parse import unquote
+
+    path = unquote(path).rstrip("/")
+    async_prefix = "/v20180820/async-requests/mrap/"
+    instances = "/v20180820/mrap/instances"
+    if path.startswith(async_prefix):
+        tail = path[len(async_prefix):]
+        if method == "POST":
+            return _S3CONTROL_MRAP_ASYNC_ACTIONS.get(tail)
+        return "s3:DescribeMultiRegionAccessPointOperation" if method == "GET" else None
+    if path == instances:
+        return "s3:ListMultiRegionAccessPoints" if method == "GET" else None
+    if path.startswith(instances + "/"):
+        if path.endswith("/routes"):
+            return {"GET": "s3:GetMultiRegionAccessPointRoutes",
+                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}.get(method)
+        if path.endswith("/policy"):
+            return "s3:GetMultiRegionAccessPointPolicy" if method == "GET" else None
+        return "s3:GetMultiRegionAccessPoint" if method == "GET" else None
+    return None
+
+
 def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     parts = [p for p in path.split("/") if p]
     depth = min(len(parts), 2)
@@ -769,6 +800,9 @@ _SERVICE_PROTOCOL: dict[str, str] = {
     # Everything else defaults to JSON
 }
 
+# Services that name an authorization failure with their own code.
+_DENIED_CODES: dict[str, str] = {"sns": "AuthorizationError"}
+
 # Services whose Query API also answers JSON / smithy-rpc-v2-cbor, where the
 # error has to come back in the encoding the request arrived in.
 _CBOR_CAPABLE = frozenset({"monitoring"})
@@ -907,7 +941,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         if "functions" in path_parts:
             fi = path_parts.index("functions")
             if fi + 1 < len(path_parts):
-                func_name = path_parts[fi + 1]
+                func_name = unquote(path_parts[fi + 1])
+                if func_name.startswith("arn:"):
+                    return func_name
                 return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
         if "layers" in path_parts:
             li = path_parts.index("layers")
@@ -930,11 +966,13 @@ def extract_resource_arn(service: str, method: str, path: str,
             # POST /{account_id}/{queue_name}
             parts = [p for p in path.split("/") if p]
             if len(parts) >= 2 and parts[-2].isdigit():
-                queue_url = parts[-1]
+                queue_url = "/".join(parts[-2:])
         if queue_url:
-            queue_name = queue_url.rstrip("/").split("/")[-1]
-            if queue_name:
-                return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+            # The queue belongs to the account its URL names, not always the caller's.
+            parts = queue_url.rstrip("/").split("/")
+            owner = parts[-2] if len(parts) >= 2 and re.fullmatch(r"\d{12}", parts[-2]) else account_id
+            if parts[-1]:
+                return f"arn:aws:sqs:{region}:{owner}:{parts[-1]}"
         # QueueName param (CreateQueue, GetQueueUrl)
         queue_name = _param(body, query_params, "QueueName")
         if queue_name:
@@ -1530,11 +1568,10 @@ def extract_resource_arn(service: str, method: str, path: str,
         parts = [p for p in path.split("/") if p]
         # Publish and the retained-message calls take everything after the
         # prefix as the topic, and a topic is multi-level: the ARN is
-        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
-        # percent-encoded from the SDK, which is why iot_data._publish unquotes
-        # as well.
+        # topic/sensors/a/temperature, not topic/sensors. The path is already
+        # decoded, so a %41 left in it is part of the topic name.
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
-            topic = unquote("/".join(parts[1:]))
+            topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
         _IOT_RESOURCES = {
             "things": "thing",
@@ -1974,10 +2011,27 @@ def _auth_failure(service: str, code: str, message: str, headers: dict) -> tuple
     return json_code, 400 if headers.get("x-amz-target") else 403, message
 
 
+def _resource_policy_denial(service: str, action: str, principal_arn: str, resource_arn: str) -> str:
+    """A denial's message when an explicit Deny in the resource's own policy decided, in the service's spelling."""
+    prefix, _, name = action.partition(":")
+    if service == "sqs":
+        action = f"{prefix}:{name.lower()}"
+    elif service == "sns":
+        action = f"SNS:{name}"
+    elif service == "s3":
+        resource_arn = f'"{resource_arn}"'
+    elif service == "apigateway":
+        account = resource_arn.split(":")[4]
+        resource_arn = resource_arn.replace(f":{account}:", f":********{account[-4:]}:", 1)
+    return (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
+            "with an explicit deny in a resource-based policy")
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
-                           resource_arn: str = "*", explicit_deny: bool = False) -> tuple:
+                           resource_arn: str = "*", explicit_deny: bool = False,
+                           resource_policy_arn: str = "") -> tuple:
     """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
@@ -2000,13 +2054,15 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
+    if not message and explicit_deny and resource_policy_arn:
+        message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
     if not message:
         reason = (
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
         message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
-    code = error_code or "AccessDenied"
+    code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
     if code in _AUTH_FAILURES:
         code, status, message = _auth_failure(service, code, message, headers or {})
@@ -2059,9 +2115,10 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         return status, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "query-xml":
+        # Query-protocol error envelopes carry no <?xml?> declaration on
+        # the real AWS wire (17-region capture sweep, 0/85 declarations).
         ns = _QUERY_XML_NS.get(service, "https://iam.amazonaws.com/doc/2010-05-08/")
         body = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<ErrorResponse xmlns="{ns}">'
             f"<Error><Type>Sender</Type><Code>{_esc_code}</Code>"
             f"<Message>{_esc_msg}</Message></Error>"
@@ -2075,11 +2132,11 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         "__type": json_type,
         "message": message,
     })
-    return (
-        status,
-        {
-            "Content-Type": "application/x-amz-json-1.0",
-            "x-amzn-errortype": json_type,
-        },
-        body.encode(),
-    )
+    reply_headers = {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-errortype": json_type,
+    }
+    if service == "sqs":
+        # awsQueryCompatible: SDKs report the legacy code from this header.
+        reply_headers["x-amzn-query-error"] = f"{code};Sender"
+    return status, reply_headers, body.encode()

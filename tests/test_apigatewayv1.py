@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 from botocore.exceptions import ClientError
+from conftest import iam_user, routed_request
 
 from ministack.core.responses import set_request_region
 from ministack.services import apigateway_v1
@@ -1350,6 +1351,92 @@ def test_apigwv1_execute_aws_iam_requires_auth_header(apigw_v1, lam):
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         lam.delete_function(FunctionName=fname)
+
+
+def _policy_api(policy, region="us-east-1"):
+    """A deployed REST API with GET /iam (AWS_IAM) and GET /open (NONE), both MOCK, and *policy*."""
+    set_request_region(region)
+    data = {"name": f"rp-{_uuid_mod.uuid4().hex[:8]}"}
+    if policy:
+        data["policy"] = json.dumps(policy)
+    api_id = json.loads(apigateway_v1._create_rest_api(data)[2])["id"]
+    root_id = next(r["id"] for r in apigateway_v1._resources[api_id].values() if r["path"] == "/")
+    for part, auth in (("iam", "AWS_IAM"), ("open", "NONE")):
+        resource_id = json.loads(apigateway_v1._create_resource(api_id, root_id, {"pathPart": part})[2])["id"]
+        apigateway_v1._put_method(api_id, resource_id, "GET", {"authorizationType": auth})
+        apigateway_v1._put_integration(api_id, resource_id, "GET", {
+            "type": "MOCK", "requestTemplates": {"application/json": '{"statusCode": 200}'}})
+        apigateway_v1._put_method_response(api_id, resource_id, "GET", "200", {})
+        apigateway_v1._put_integration_response(api_id, resource_id, "GET", "200", {})
+    apigateway_v1._create_deployment(api_id, {"stageName": "s"})
+    return api_id
+
+
+def _invoke(api_id, path, key=None, headers=None):
+    """GET /s/<path> through the app, SigV4-signed with *key* or sent unsigned with *headers*."""
+    return routed_request(key, "execute-api", "GET", f"/s/{path}", headers=headers,
+                          host=f"{api_id}.execute-api.localhost:4566")
+
+
+def _api_policy(*statements):
+    return {"Version": "2012-10-17", "Statement": [
+        {"Effect": effect, "Principal": principal, "Action": "execute-api:Invoke", "Resource": "execute-api:/*"}
+        for effect, principal in statements]}
+
+
+_ACCOUNT = {"AWS": "arn:aws:iam::000000000000:root"}
+_ALLOW_INVOKE = {"Statement": [{"Effect": "Allow", "Action": "execute-api:Invoke", "Resource": "*"}]}
+
+
+def test_api_policy_naming_the_user_allows_without_identity_policy(auth):
+    key, user = iam_user()
+    api_id = _policy_api(_api_policy(("Allow", {"AWS": user})))
+    assert _invoke(api_id, "iam", key)[0] == 200
+
+
+def test_api_policy_naming_the_account_needs_an_identity_policy(auth):
+    api_id = _policy_api(_api_policy(("Allow", _ACCOUNT)))
+    key, _user = iam_user()
+    assert _invoke(api_id, "iam", key)[0] == 403
+    key, _user = iam_user(_ALLOW_INVOKE)
+    assert _invoke(api_id, "iam", key)[0] == 200
+
+
+def test_api_policy_deny_beats_an_identity_allow(auth):
+    key, user = iam_user(_ALLOW_INVOKE)
+    api_id = _policy_api(_api_policy(("Allow", _ACCOUNT), ("Deny", {"AWS": user})))
+    status, _headers, body = _invoke(api_id, "iam", key)
+    assert status == 403
+    assert json.loads(body)["message"] == (
+        f"User: {user} is not authorized to perform: execute-api:Invoke on resource: "
+        f"arn:aws:execute-api:us-east-1:********0000:{api_id}/s/GET/iam "
+        "with an explicit deny in a resource-based policy")
+
+
+def test_api_policy_applies_to_a_call_signed_for_another_region(auth):
+    key, user = iam_user(_ALLOW_INVOKE)
+    try:
+        api_id = _policy_api(_api_policy(("Allow", _ACCOUNT), ("Deny", {"AWS": user})), region="eu-west-1")
+    finally:
+        set_request_region("us-east-1")
+    assert _invoke(api_id, "iam", key)[0] == 403
+
+
+def test_api_policy_applies_to_an_unsigned_call_on_a_method_without_authorization(auth):
+    api_id = _policy_api(_api_policy(("Allow", _ACCOUNT)))
+    status, headers, body = _invoke(api_id, "open")
+    assert (status, headers["x-amzn-errortype"]) == (403, "AccessDeniedException")
+    assert json.loads(body)["Message"] == (
+        "User: anonymous is not authorized to perform: execute-api:Invoke on resource: "
+        f"arn:aws:execute-api:us-east-1:********0000:{api_id}/s/GET/open "
+        "because no resource-based policy allows the execute-api:Invoke action")
+    assert _invoke(_policy_api(_api_policy(("Allow", "*"))), "open")[0] == 200
+    assert _invoke(_policy_api(None), "open")[0] == 200
+
+
+def test_api_policy_treats_a_bearer_token_on_a_method_without_authorization_as_anonymous(auth):
+    api_id = _policy_api(_api_policy(("Allow", _ACCOUNT)))
+    assert _invoke(api_id, "open", headers={"authorization": "Bearer abc.def.ghi"})[0] == 403
 
 
 def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):

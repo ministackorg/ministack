@@ -226,6 +226,7 @@ from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
     fix_error_content_type,
+    fix_success_content_type,
     set_request_account_id,
     set_request_region,
 )
@@ -1477,6 +1478,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
+            # Registered so request hooks such as CloudTrail recording see the module.
+            _loaded_modules.setdefault(mod_name, mod)
             if key in (
                 "stepfunctions._SFN_WAIT_SCALE",
                 "translate._JOB_RUN_SECONDS",
@@ -1552,10 +1555,44 @@ async def _handle_post_body_shortcuts(
 # ---------------------------------------------------------------------------
 
 
-async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str):
+_S3_CONTROL_MRAP_PREFIXES = ("/v20180820/mrap/", "/v20180820/async-requests/mrap/")
+
+
+def _s3control_mrap_arn(s3, path: str) -> str:
+    """IAM resource for an MRAP request: ``arn:aws:s3::<account>:accesspoint/<alias>``
+    for an existing MRAP named in the path, else the account's wildcard."""
+    from ministack.core.responses import get_account_id
+
+    account = get_account_id()
+    ref = unquote(path).rstrip("/").removeprefix("/v20180820/mrap/instances").strip("/")
+    ref = ref.removesuffix("/routes").removesuffix("/policy")
+    record = s3.find_mrap(ref) if ref and not path.startswith("/v20180820/async-requests/") else None
+    return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
+
+
+async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,
+                                     headers: dict | None = None):
     """Handle S3 Control operations addressed via the /v20180820 path prefix."""
     if not path.startswith(_S3_CONTROL_PREFIX):
         return None
+
+    if path.startswith(_S3_CONTROL_MRAP_PREFIXES) or path.rstrip("/") == "/v20180820/mrap/instances":
+        s3 = _get_module("s3")
+        headers = headers or {}
+        if AUTH:
+            from ministack.core.iam_actions import s3control_action
+
+            action = s3control_action(method, path)
+            if action:
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id,
+                                             resource_arn=_s3control_mrap_arn(s3, path))
+                if denied:
+                    return denied
+        status, resp_headers, resp_body = (
+            s3.s3control_account_error(headers)
+            or s3.handle_mrap_control(method, path, headers, body, query_params)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
@@ -2109,7 +2146,8 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             }
         mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
         return await _get_module("s3").handle_request(
-            method, mrap_path, headers, body, query_params, signed_path=path
+            method, mrap_path, headers, body, query_params, signed_path=path,
+            enforce_bucket_region=False,
         )
 
     bucket = _extract_s3_vhost_bucket(host)
@@ -2235,7 +2273,8 @@ def _enforce_data_plane(
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
         return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
-                                      explicit_deny=denied.decision == "Deny")
+                                      explicit_deny=denied.decision == "Deny",
+                                      resource_policy_arn=denied.resource_policy_arn)
     return None
 
 
@@ -2294,7 +2333,7 @@ async def _handle_special_data_plane_request(
         except Exception as e:
             logger.exception("Error in Iceberg REST catalog: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
-    if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
+    if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
     if response := await _handle_rds_data_request(method, path, headers, body, query_params):
         return response
@@ -2557,8 +2596,9 @@ def _unknown_query_error(body: bytes, request_id: str):
         else "The requested action is not valid for this web service."
     )
     msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Query-protocol error envelopes carry no <?xml?> declaration on the
+    # real AWS wire (17-region capture sweep, 0/85 declarations).
     xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
         f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"
         f"<RequestId>{request_id}</RequestId></ErrorResponse>"
@@ -2725,6 +2765,7 @@ async def _dispatch_service_request(
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                    resource_policy_arn=denied.resource_policy_arn,
                 )
 
     handler = SERVICE_HANDLERS.get(service)
@@ -2745,10 +2786,12 @@ async def _dispatch_service_request(
             json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
         )
 
-    # Real AWS picks an error's Content-Type from the service's protocol —
-    # normalize any generic envelope the service emitted to the wire value
-    # (evidence: diffs against committed real-AWS wire captures).
+    # Real AWS picks a response envelope's Content-Type from the service's
+    # protocol — normalize any generic envelope the service emitted to the
+    # wire value (evidence: diffs against committed real-AWS wire captures;
+    # multi-region for the success path).
     fix_error_content_type(service, status, resp_headers)
+    fix_success_content_type(service, status, resp_headers)
 
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 

@@ -745,6 +745,29 @@ def test_put_and_describe_lifecycle_hook(autoscaling):
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
 
 
+def test_put_lifecycle_hook_notification_metadata_reads_back(autoscaling):
+    asg = _uid("asg-hmeta")
+    hook = _uid("hmeta")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg,
+        MinSize=0,
+        MaxSize=1,
+        AvailabilityZones=["us-east-1a"],
+        LaunchConfigurationName="dummy-lc",
+    )
+    try:
+        autoscaling.put_lifecycle_hook(
+            AutoScalingGroupName=asg,
+            LifecycleHookName=hook,
+            LifecycleTransition="autoscaling:EC2_INSTANCE_TERMINATING",
+            NotificationMetadata='{"drain": "<all> & wait"}',
+        )
+        [found] = autoscaling.describe_lifecycle_hooks(AutoScalingGroupName=asg)["LifecycleHooks"]
+        assert found["NotificationMetadata"] == '{"drain": "<all> & wait"}'
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
 def test_describe_lifecycle_hooks_empty(autoscaling):
     asg = _uid("asg-nohook")
     autoscaling.create_auto_scaling_group(

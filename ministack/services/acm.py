@@ -208,7 +208,7 @@ def _cert_shape(cert):
         "Type": cert.get("Type", "AMAZON_ISSUED"),
         "KeyAlgorithm": "RSA_2048",
         "SignatureAlgorithm": "SHA256WITHRSA",
-        "InUseBy": cert.get("InUseBy", []),
+        "InUseBy": cert.get("InUseBy", []) + _signing_profiles_using(cert["CertificateArn"]),
         "CreatedAt": _epoch(cert["CreatedAt"]),
         "IssuedAt": _epoch(cert.get("IssuedAt", cert["CreatedAt"])),
         "NotBefore": _epoch(cert.get("NotBefore", cert["CreatedAt"])),
@@ -311,10 +311,22 @@ def _list_certificates(data):
     return json_response({"CertificateSummaryList": summaries})
 
 
+def _signing_profiles_using(arn):
+    """ARNs of the Active Signer signing profiles whose signing material is this certificate."""
+    from ministack.services import signer
+
+    return [profile["arn"] for profile in signer._profiles.values()
+            if profile.get("status") == "Active"
+            and (profile.get("signingMaterial") or {}).get("certificateArn") == arn]
+
+
 def _delete_certificate(data):
     arn = data.get("CertificateArn", "")
     if _get_local_certificate(arn) is None:
         return _certificate_not_found(arn)
+    if _signing_profiles_using(arn):
+        return error_response_json(
+            "ResourceInUseException", f"Certificate {arn} in account {get_account_id()} is in use.", 400)
     del _certificates[arn]
     return json_response({})
 
@@ -356,6 +368,12 @@ def _get_certificate(data):
 
 
 def _import_certificate(data):
+    if not data.get("PrivateKey"):
+        constraint = ("Member must not be null" if data.get("PrivateKey") is None
+                      else "Member must have length greater than or equal to 1")
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value at 'privateKey' failed to satisfy constraint: {constraint}", 400)
     arn = data.get("CertificateArn") or _cert_arn()
     if data.get("CertificateArn") and not _is_local_certificate_arn(arn):
         return _certificate_not_found(arn)

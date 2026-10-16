@@ -1354,6 +1354,59 @@ class TestCustomerManagedPolicyResolution:
             assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
 
 
+class TestCombineResourcePolicy:
+    """An identity decision combined with the policy of the resource the request addresses."""
+
+    _USER = "arn:aws:iam::000000000000:user/u"
+
+    def _decide(self, identity, principal, effect="Allow", owner="000000000000", caller=_USER, limits=()):
+        from ministack.core.iam_evaluator import combine_resource_policy
+
+        ctx = EvalContext(principal_arn=caller, principal_type="User", principal_account="000000000000",
+                          action="sqs:SendMessage", resource_arn=f"arn:aws:sqs:us-east-1:{owner}:q",
+                          region="us-east-1")
+        policy = {"Statement": [{"Effect": effect, "Principal": {"AWS": principal},
+                                 "Action": "sqs:*", "Resource": "*"}]}
+        return combine_resource_policy(EvalResult(identity, caller), ctx, policy, owner, limits=limits).decision
+
+    @pytest.mark.parametrize("identity,principal,effect,owner,expected", [
+        ("ImplicitDeny", _USER, "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "*", "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "ImplicitDeny"),
+        ("ImplicitDeny", "000000000000", "Allow", "000000000000", "ImplicitDeny"),
+        ("Allow", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "Allow"),
+        ("Allow", _USER, "Deny", "000000000000", "Deny"),
+        ("Allow", "arn:aws:iam::000000000000:user/other", "Deny", "000000000000", "Allow"),
+        ("ImplicitDeny", _USER, "Allow", "111111111111", "ImplicitDeny"),
+        ("Allow", "000000000000", "Allow", "111111111111", "Allow"),
+        ("Allow", "arn:aws:iam::111111111111:root", "Allow", "111111111111", "ImplicitDeny"),
+    ])
+    def test_decision(self, identity, principal, effect, owner, expected):
+        assert self._decide(identity, principal, effect, owner) == expected
+
+    def test_a_statement_naming_the_role_names_its_sessions(self):
+        session = "arn:aws:sts::000000000000:assumed-role/r/s"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/app/r", caller=session) == "Allow"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/x", caller=session) == "ImplicitDeny"
+
+    _SESSION = "arn:aws:sts::000000000000:assumed-role/r/s"
+
+    @pytest.mark.parametrize("caller,principal,limit_action,expected", [
+        (_USER, _USER, "sqs:ListQueues", "Allow"),
+        (_USER, "*", "sqs:ListQueues", "ImplicitDeny"),
+        (_SESSION, _SESSION, "sqs:ListQueues", "Allow"),
+        (_SESSION, "arn:aws:iam::000000000000:role/r", "sqs:ListQueues", "ImplicitDeny"),
+        (_SESSION, "arn:aws:iam::000000000000:role/r", "sqs:SendMessage", "Allow"),
+        ("arn:aws:sts::000000000000:federated-user/f", "arn:aws:sts::000000000000:federated-user/f",
+         "sqs:ListQueues", "ImplicitDeny"),
+    ])
+    def test_limits_narrow_a_resource_allow_unless_it_names_the_user_or_session(
+            self, caller, principal, limit_action, expected):
+        from ministack.core.iam_evaluator import parse_policy_document
+
+        limit = [parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": limit_action, "Resource": "*"}]})]
+        assert self._decide("ImplicitDeny", principal, caller=caller, limits=(limit,)) == expected
 @contextlib.contextmanager
 def _iam_user(name, tags=()):
     """A stored IAM user with one access key; yields the key and a setter for its inline policy."""
@@ -1954,6 +2007,12 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
 
+    def test_lambda_function_named_by_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        path = "/2015-03-31/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Amy-func/invocations"
+        assert extract_resource_arn(
+            "lambda", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:lambda:us-east-1:123:function:my-func"
     @pytest.mark.parametrize("arn", [
         "arn:aws:lambda:us-east-1:123:function:f", "arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Af"])
     @pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
@@ -1964,7 +2023,13 @@ class TestResourceArn:
 
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
-        assert extract_resource_arn("sqs", "POST", "/", {}, b"", {"QueueUrl": ["http://localhost:4566/000000000000/my-queue"]}, "us-east-1", "123") == "arn:aws:sqs:us-east-1:123:my-queue"
+        url = "http://localhost:4566/000000000000/my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": [url]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:000000000000:my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": ["my-queue"]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:123:my-queue"
 
     def test_sqs_create_queue(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -2288,6 +2353,14 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
 
+    def test_iot_provisioning_claim(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/provisioning-templates/fleet/provisioning-claim"
+        assert extract_iam_action("iot", "POST", path, {}, b"", {}) == "iot:CreateProvisioningClaim"
+        assert extract_resource_arn(
+            "iot", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
+
     def test_iot_job_template(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn(
@@ -2363,22 +2436,23 @@ class TestResourceArn:
             service, "POST", path, headers, b"", {}, "eu-central-1", "123"
         ) == "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
 
-    def test_publish_resolves_the_same_topic_however_the_sdk_sent_it(self):
-        """Publish's URI label is non-greedy, so botocore percent-encodes the
-        separators and the ASGI server hands them back decoded. Both spellings
-        have to name one resource, or the grant matches on one path only."""
+    def test_publish_topic_arn_keeps_a_literal_percent_sequence(self):
+        """A %41 or %2F left in the decoded Publish path is part of the topic name and stays in the ARN."""
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
         from ministack.core.router import detect_service
 
         headers = _sigv4_headers("iotdata", "data-ats.iot.eu-central-1.amazonaws.com")
-        expected = "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
-        for path in ("/topics/sensors/rack-1/temperature",
-                     "/topics/sensors%2Frack-1%2Ftemperature"):
-            service = detect_service("POST", path, headers, {})
-            assert extract_iam_action(service, "POST", path, headers, b"", {}) == "iot:Publish"
+        for method, path, action, topic in (
+            ("POST", "/topics/sensors/p%41q", "iot:Publish", "sensors/p%41q"),
+            ("POST", "/topics/sensors/p%2Fq", "iot:Publish", "sensors/p%2Fq"),
+            ("GET", "/retainedMessage/sensors/p%25q", "iot:GetRetainedMessage", "sensors/p%25q"),
+        ):
+            service = detect_service(method, path, headers, {})
+            assert service == "iot-data"
+            assert extract_iam_action(service, method, path, headers, b"", {}) == action
             assert extract_resource_arn(
-                service, "POST", path, headers, b"", {}, "eu-central-1", "123"
-            ) == expected
+                service, method, path, headers, b"", {}, "eu-central-1", "123"
+            ) == f"arn:aws:iot:eu-central-1:123:topic/{topic}"
 
     def test_create_job_resolves_through_the_router(self):
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
@@ -3845,6 +3919,11 @@ class TestExtractResourceArn:
         # Query-protocol callers address the queue by path.
         assert self._arn("sqs", path="/000000000000/my-queue") == (
             "arn:aws:sqs:us-east-1:000000000000:my-queue")
+
+    def test_sqs_queue_in_another_account_keeps_its_owner(self):
+        body = json.dumps({"QueueUrl": "http://localhost:4566/111111111111/my-queue"}).encode()
+        assert self._arn("sqs", body=body) == "arn:aws:sqs:us-east-1:111111111111:my-queue"
+        assert self._arn("sqs", path="/111111111111/my-queue") == "arn:aws:sqs:us-east-1:111111111111:my-queue"
 
     def test_sqs_without_a_queue_falls_back_to_star(self):
         assert self._arn("sqs", body=json.dumps({"MaxResults": 10}).encode()) == "*"
@@ -5531,6 +5610,63 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
     assert bool(dispatched) == (expected == 200)
     if expected == 403:
         assert f"apigateway:{method}" in json.loads(body)["message"]
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("POST", "/v20180820/async-requests/mrap/create", "s3:CreateMultiRegionAccessPoint"),
+    ("POST", "/v20180820/async-requests/mrap/delete", "s3:DeleteMultiRegionAccessPoint"),
+    ("POST", "/v20180820/async-requests/mrap/put-policy", "s3:PutMultiRegionAccessPointPolicy"),
+    ("GET", "/v20180820/async-requests/mrap/arn%3Aaws%3As3%3Aus-west-2%3A000000000000%3Aasync-request/mrap/create/t",
+     "s3:DescribeMultiRegionAccessPointOperation"),
+    ("GET", "/v20180820/mrap/instances", "s3:ListMultiRegionAccessPoints"),
+    ("GET", "/v20180820/mrap/instances/m1", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policy", "s3:GetMultiRegionAccessPointPolicy"),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
+     "s3:GetMultiRegionAccessPointRoutes"),
+    ("PATCH", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
+     "s3:SubmitMultiRegionAccessPointRoutes"),
+])
+def test_s3control_mrap_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+def test_s3control_mrap_denied_without_the_action(monkeypatch):
+    """Under AUTH=true an S3 Control MRAP call needs its own IAM action."""
+    import ministack.app as app
+    from ministack.services import iam as iam_svc
+
+    fake_key = "AKIATESTMRAPCTL0001"
+    iam_svc._access_keys[fake_key] = {
+        "UserName": "mrap-user", "AccessKeyId": fake_key,
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    iam_svc._users["mrap-user"] = {
+        "UserName": "mrap-user", "Arn": "arn:aws:iam::000000000000:user/mrap-user",
+        "UserId": "AIDAMRAP1", "CreateDate": "2024-01-01", "Path": "/",
+        "AttachedPolicies": [], "Tags": [],
+    }
+    iam_svc._user_inline_policies["mrap-user"] = {"p": json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": "s3:ListMultiRegionAccessPoints", "Resource": "*"}]})}
+    monkeypatch.setattr(app, "AUTH", True)
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={fake_key}/20261012/us-west-2/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "x-amz-account-id": "000000000000",
+    }
+    try:
+        listed = asyncio.run(app._handle_s3_control_request(
+            "/v20180820/mrap/instances", "GET", b"", {}, "rid", headers))
+        denied = asyncio.run(app._handle_s3_control_request(
+            "/v20180820/mrap/instances/nope", "GET", b"", {}, "rid", headers))
+    finally:
+        iam_svc._access_keys.pop(fake_key, None)
+        iam_svc._users.pop("mrap-user", None)
+        iam_svc._user_inline_policies.pop("mrap-user", None)
+    assert listed[0] == 200
+    assert denied[0] == 403
+    assert b"s3:GetMultiRegionAccessPoint" in denied[2]
 
 
 @pytest.mark.parametrize("addressing", ["path", "virtual"])
