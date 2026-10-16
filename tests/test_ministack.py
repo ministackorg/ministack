@@ -1061,7 +1061,9 @@ def test_drop_containers_logs_the_ids_it_could_not_remove(caplog):
 
 from ministack.core.responses import (  # noqa: E402
     expected_error_content_type,
+    expected_success_content_type,
     fix_error_content_type,
+    fix_success_content_type,
 )
 from ministack.core.router import detect_service  # noqa: E402
 
@@ -1122,8 +1124,7 @@ def test_fix_error_content_type_scopes():
     fix_error_content_type("kinesis", 400, headers)
     assert headers["Content-Type"] == "application/x-amz-json-1.1"
 
-    # success responses are never rewritten — an S3 object that happens to
-    # be JSON must keep its real content type.
+    # success responses are never rewritten by the error path
     headers = {"Content-Type": "application/json"}
     fix_error_content_type("s3", 200, headers)
     assert headers["Content-Type"] == "application/json"
@@ -1135,6 +1136,82 @@ def test_fix_error_content_type_scopes():
     headers = {"Content-Type": "application/xml"}
     fix_error_content_type("not-a-service", 400, headers)
     assert headers["Content-Type"] == "application/xml"
+
+
+@pytest.mark.parametrize("service,emitted,expected", [
+    # query successes answer text/xml; ec2 adds charset.
+    ("iam", "application/xml", "text/xml"),
+    ("sns", "application/xml", "text/xml"),
+    ("cloudformation", "application/xml", "text/xml"),
+    ("elasticloadbalancing", "application/xml", "text/xml"),
+    ("ec2", "application/xml", "text/xml;charset=UTF-8"),
+    # json successes follow the model's jsonVersion.
+    ("dynamodb", "application/json", "application/x-amz-json-1.0"),
+    ("dynamodb", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("kinesis", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("sqs", "application/json", "application/x-amz-json-1.0"),
+    # rest-json answers application/json.
+    ("lambda", "application/x-amz-json-1.0", "application/json"),
+    ("apigateway", "application/x-amz-json-1.0", "application/json"),
+    # sesv2's x-amz-json-1.1 override is error-path evidence only — its
+    # successes get the rest-json model value like any other service.
+    ("sesv2", "application/x-amz-json-1.0", "application/json"),
+    ("sesv2", "application/json", "application/json"),
+    # monitoring serves a query-compatible JSON mode AWS answers as
+    # x-amz-json-1.0 (success override); its XML query path still maps
+    # to the model's text/xml below.
+    ("monitoring", "application/json", "application/x-amz-json-1.0"),
+    ("monitoring", "application/xml", "text/xml"),
+    # rest-xml answers text/xml — except S3, which keeps application/xml.
+    ("route53", "application/xml", "text/xml"),
+    ("cloudfront", "application/xml", "text/xml"),
+    ("s3", "application/xml", "application/xml"),
+])
+def test_expected_success_content_type(service, emitted, expected):
+    assert expected_success_content_type(service, emitted) == expected
+
+
+@pytest.mark.parametrize("service,emitted", [
+    # An emitted text/xml is already wire-final: correct on API envelopes
+    # (route53/cloudfront/alb) and payload on e.g. a stored S3 object.
+    ("s3", "text/xml"),
+    ("route53", "text/xml"),
+    ("iam", "text/xml"),
+    ("ec2", "text/xml"),
+    # A stored S3 object's JSON or binary Content-Type is payload.
+    ("s3", "application/json"),
+    ("s3", "application/octet-stream"),
+    ("dynamodb", "application/octet-stream"),
+    ("iam", "text/plain"),
+    # Unknown service — nothing evidence-backed to enforce.
+    ("not-a-service", "application/xml"),
+    # An XML body from a json-protocol service has no modeled answer.
+    ("sqs", "application/xml"),
+])
+def test_expected_success_content_type_untouched(service, emitted):
+    assert expected_success_content_type(service, emitted) is None
+
+
+def test_fix_success_content_type_scopes():
+    headers = {"Content-Type": "application/xml"}
+    fix_success_content_type("iam", 200, headers)
+    assert headers["Content-Type"] == "text/xml"
+
+    # errors are never rewritten by the success path
+    headers = {"Content-Type": "application/xml"}
+    fix_success_content_type("iam", 400, headers)
+    assert headers["Content-Type"] == "application/xml"
+
+    # a stored S3 object's text/xml payload is not corrupted to the
+    # envelope value
+    headers = {"Content-Type": "text/xml"}
+    fix_success_content_type("s3", 200, headers)
+    assert headers["Content-Type"] == "text/xml"
+
+    # non-envelope payloads are untouched
+    headers = {"Content-Type": "application/octet-stream"}
+    fix_success_content_type("dynamodb", 200, headers)
+    assert headers["Content-Type"] == "application/octet-stream"
 
 
 @pytest.mark.parametrize("scope", ["glacier", "pinpoint", "route53resolver"])
