@@ -35,7 +35,7 @@ import logging
 import os
 import re
 import time
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -184,6 +184,42 @@ def _namespace_name(value):
 def _set_bucket_region_value(store, bucket_arn, key, value):
     spec = parse_arn(bucket_arn)
     store.set_scoped(spec.account_id, spec.region, key, value)
+
+
+_ICEBERG_V2_PRIMITIVES = {
+    "boolean", "int", "long", "float", "double", "date", "time", "timestamp", "timestamptz", "string", "uuid", "binary",
+}
+_DECIMAL_TYPE_RE = re.compile(r"decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+_FIXED_TYPE_RE = re.compile(r"fixed\[\s*(\d+)\s*\]")
+
+
+def _iceberg_field_type(kind):
+    """An Iceberg v2 type as the table metadata stores it; ValueError when invalid."""
+    if isinstance(kind, dict):
+        nested = dict(kind)
+        if kind.get("type") == "struct" and isinstance(kind.get("fields"), list):
+            nested["fields"] = [{**f, "type": _iceberg_field_type(f.get("type"))} for f in kind["fields"]]
+        elif kind.get("type") == "list" and "element" in kind:
+            nested["element"] = _iceberg_field_type(kind["element"])
+        elif kind.get("type") == "map" and "key" in kind and "value" in kind:
+            nested["key"] = _iceberg_field_type(kind["key"])
+            nested["value"] = _iceberg_field_type(kind["value"])
+        else:
+            raise ValueError(kind)
+        return nested
+    if not isinstance(kind, str):
+        raise ValueError(kind)
+    lowered = kind.strip().lower()
+    if lowered in _ICEBERG_V2_PRIMITIVES:
+        return lowered
+    if match := _DECIMAL_TYPE_RE.fullmatch(lowered):
+        precision, scale = int(match.group(1)), int(match.group(2))
+        if precision > 38:
+            raise ValueError(kind)
+        return f"decimal({precision}, {scale})"
+    if match := _FIXED_TYPE_RE.fullmatch(lowered):
+        return f"fixed[{int(match.group(1))}]"
+    raise ValueError(kind)
 
 
 def _initial_iceberg_metadata(table_name, schema_fields, location):
@@ -372,8 +408,12 @@ def _create_table(bucket_arn, namespace, data):
     metadata = data.get("metadata", {})
     iceberg_meta = metadata.get("iceberg", {})
     schema_def = iceberg_meta.get("schema", iceberg_meta.get("schemaV2", {}))
-    for f in schema_def.get("field", schema_def.get("fields", [])):
-        schema_fields.append({"name": f["name"], "type": f.get("type", "string"), "required": f.get("required", False)})
+    try:
+        for f in schema_def.get("field", schema_def.get("fields", [])):
+            schema_fields.append({"name": f["name"], "type": _iceberg_field_type(f.get("type", "string")),
+                                  "required": f.get("required", False)})
+    except ValueError:
+        return error_response_json("BadRequestException", "The specified metadata is not valid", 400)
     logger.debug(
         "S3Tables: create_table %s/%s schema_fields=%d metadata_keys=%s",
         namespace,
@@ -396,7 +436,7 @@ def _create_table(bucket_arn, namespace, data):
                 {
                     "id": f.get("id", i + 1),
                     "name": f["name"],
-                    "type": f.get("type", "string"),
+                    "type": schema_fields[i]["type"],
                     "required": f.get("required", False),
                 }
             )
@@ -526,6 +566,9 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
 # ── Iceberg REST catalog (data plane for Spark) ───────────
 
 
+_TABLE_BUCKET_ARN_RE = re.compile(r"arn:aws[\w-]*:s3tables:[\w-]+:\d{12}:bucket/[a-z0-9-]+")
+
+
 def _iceberg_config(query_params=None, headers=None):
     warehouse = ""
     if query_params:
@@ -545,8 +588,19 @@ def _iceberg_config(query_params=None, headers=None):
         "s3.path-style-access": "true",
     }
     overrides = {}
-    if warehouse:
+    if ":s3tablescatalog/" in warehouse:
         overrides["prefix"] = warehouse
+    elif _TABLE_BUCKET_ARN_RE.fullmatch(warehouse):
+        defaults.update({
+            "write.object-storage.partitioned-paths": "false",
+            "s3.delete-enabled": "false",
+            "io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+            "write.object-storage.enabled": "true",
+            "prefix": quote(warehouse, safe=""),
+            "rest-metrics-reporting-enabled": "false",
+        })
+    else:
+        return _iceberg_error("The specified table bucket ARN is not valid.", "bad_request", 400)
     return json_response({"defaults": defaults, "overrides": overrides})
 
 
@@ -1044,6 +1098,10 @@ def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=Non
 # ── Iceberg REST router ───────────────────────────────────
 
 
+def _unknown_operation():
+    return 404, {"Content-Type": "application/xml"}, b"<UnknownOperationException/>"
+
+
 async def _handle_iceberg_request(method, path, headers, body, query_params):
     parts = [p for p in path.strip("/").split("/") if p]
     allow_cross_region = _iceberg_allows_cross_region(headers)
@@ -1062,7 +1120,9 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     if parts[1] == "v1" and method == "POST" and "transactions" in parts[2:]:
         data = json.loads(body) if body else {}
         tx_idx = parts.index("transactions", 2)
-        tx_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:tx_idx]))) if tx_idx > 2 else None
+        if tx_idx == 2:
+            return _unknown_operation()
+        tx_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:tx_idx])))
         for change in data.get("table-changes", []):
             ident = change.get("identifier", {})
             ns = ident.get("namespace", [""])
@@ -1076,18 +1136,8 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     if len(parts) < 3:
         return None
 
-    # Support two URL formats:
-    #   Standard Iceberg REST: /iceberg/v1/{prefix}/namespaces/...
-    #   S3 Tables (no prefix): /iceberg/v1/namespaces/...  (warehouse in query param)
-    #
-    # The prefix carries the warehouse value from /v1/config, which for S3
-    # Tables is ``{account}:s3tablescatalog/{bucket-name}``. Extract the
-    # bucket name to scope table lookups -- without it, tables with the same
-    # name in different buckets collide and the wrong schema is returned.
-    # The prefix from /v1/config can contain ``/`` (e.g.
-    # ``000000000000:s3tablescatalog/bucket-name``), which splits into
-    # multiple URL segments. Scan for ``namespaces`` and treat everything
-    # between ``v1`` and ``namespaces`` as the prefix.
+    # Every route but /v1/config takes the {prefix}, which "for S3 Tables is
+    # always your url-encoded table bucket ARN"; it can span several segments.
     bucket_filter = None
     ns_idx = None
     for i in range(2, len(parts)):
@@ -1096,8 +1146,9 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
             break
     if ns_idx is None:
         return None
-    if ns_idx > 2:
-        bucket_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:ns_idx])))
+    if ns_idx == 2:
+        return _unknown_operation()
+    bucket_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:ns_idx])))
 
     rest = parts[ns_idx + 1 :]  # segments after "namespaces"
 

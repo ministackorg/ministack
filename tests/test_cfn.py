@@ -18523,7 +18523,7 @@ def test_cfn_s3tables_table_schema_from_iceberg_metadata(cfn, s3tables):
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
 
-    resp = _cfn_iceberg_json("/iceberg/v1/namespaces/myns/tables/mytable")
+    resp = _cfn_iceberg_json("/iceberg/v1/arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fcfn-s3tables-schema-test/namespaces/myns/tables/mytable")
     fields = resp.get("metadata", {}).get("schemas", [{}])[0].get("fields", [])
     field_names = {f["name"] for f in fields}
     assert field_names == {"id", "value"}, f"expected columns id/value, got {field_names}"

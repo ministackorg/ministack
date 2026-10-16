@@ -12342,10 +12342,14 @@ def _s3tables_table_create(logical_id, props, stack_name):
     schema_field_list = (
         props.get("IcebergMetadata", {}).get("IcebergSchema", {}).get("SchemaFieldList", [])
     )
-    schema_fields = [
-        {"name": f["Name"], "type": f.get("Type", "string"), "required": f.get("Required", False)}
-        for f in schema_field_list
-    ]
+    try:
+        schema_fields = [
+            {"name": f["Name"], "type": _s3tables._iceberg_field_type(f.get("Type", "string")),
+             "required": f.get("Required", False)}
+            for f in schema_field_list
+        ]
+    except ValueError:
+        raise ValueError("The specified metadata is not valid") from None
     iceberg_metadata = _s3tables._initial_iceberg_metadata(table_name, schema_fields, location)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     table_arn = _s3tables._table_arn(bucket_arn, namespace, table_name)
