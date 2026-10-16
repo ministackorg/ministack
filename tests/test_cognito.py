@@ -11114,6 +11114,7 @@ def test_cognito_inbound_federation_trigger_feeds_attribute_mapping(cognito_idp,
     handler = (
         "def handler(event, ctx):\n"
         "    assert event['triggerSource'] == 'InboundFederation_ExternalProvider'\n"
+        "    assert event['userName'] == 'opaque-name-id'\n"
         "    assert event['request']['providerType'] == 'SAML'\n"
         "    assert event['request']['providerName'] == 'TestSAML'\n"
         f"    assert event['request']['attributes']['samlResponse'] == {{'{_INBOUND_EMAIL_CLAIM}': 'raw@example.com'}}\n"
@@ -11148,6 +11149,7 @@ def test_cognito_inbound_federation_trigger_failure_fails_saml_sign_in(cognito_i
 def test_cognito_inbound_federation_trigger_feeds_oidc_attribute_mapping(cognito_idp, lam):
     handler = (
         "def handler(event, ctx):\n"
+        "    assert event['userName'] == 'oidc-sub', event['userName']\n"
         "    assert event['request']['providerType'] == 'OIDC'\n"
         "    assert event['request']['attributes']['idToken']['sub'] == 'oidc-sub'\n"
         "    event['response']['userAttributesToMap'] = {'auth_time': '1700000000', 'email': 'oidc-mapped@example.com'}\n"
@@ -11248,7 +11250,7 @@ def test_cognito_inbound_federation_trigger_missing_function_fails_sign_in(cogni
 def test_cognito_inbound_federation_trigger_map_replaces_idp_attributes(cognito_idp, lam):
     handler = (
         "def handler(event, ctx):\n"
-        "    assert event['userName'] == 'TestSAML_replace-name-id', event['userName']\n"
+        "    assert event['userName'] == 'replace-name-id', event['userName']\n"
         "    event['response']['userAttributesToMap'] = {'given_name': 'Kept'}\n"
         "    return event\n"
     )

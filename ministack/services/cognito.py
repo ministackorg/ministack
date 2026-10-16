@@ -6347,7 +6347,7 @@ def _saml2_idp_response(body: bytes, query_params):
     reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
     try:
         to_map = _apply_inbound_federation_trigger(
-            pool_id, client_id, f"{provider_name}_{name_id}", provider_name, "SAML",
+            pool_id, client_id, name_id, provider_name, "SAML",
             {"samlResponse": saml_data["attributes"]})
         idp_attrs = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
                      else dict(saml_data.get("attributes", {})))
@@ -6581,7 +6581,7 @@ def _oauth2_idp_response(method, body, query_params):
     reverse_mapping = {v: k for k, v in attr_mapping.items()}
     try:
         to_map = _apply_inbound_federation_trigger(
-            pool_id, client_id, f"{provider_name}_{claims.get('sub') or claims.get('email') or ''}",
+            pool_id, client_id, claims.get('sub') or claims.get('email') or '',
             provider_name, "OIDC", {"idToken": claims})
     except _InboundFederationRejected as e:
         logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
