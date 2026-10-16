@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import pytest
 import yaml
 from botocore.exceptions import ClientError
-from conftest import iam_user, routed_request
+from conftest import inprocess_iam_user, routed_request
 
 from ministack.core.responses import set_request_region
 from ministack.services import apigateway_v1
@@ -1389,21 +1389,21 @@ _ALLOW_INVOKE = {"Statement": [{"Effect": "Allow", "Action": "execute-api:Invoke
 
 
 def test_api_policy_naming_the_user_allows_without_identity_policy(auth):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     api_id = _policy_api(_api_policy(("Allow", {"AWS": user})))
     assert _invoke(api_id, "iam", key)[0] == 200
 
 
 def test_api_policy_naming_the_account_needs_an_identity_policy(auth):
     api_id = _policy_api(_api_policy(("Allow", _ACCOUNT)))
-    key, _user = iam_user()
+    key, _user = inprocess_iam_user()
     assert _invoke(api_id, "iam", key)[0] == 403
-    key, _user = iam_user(_ALLOW_INVOKE)
+    key, _user = inprocess_iam_user(_ALLOW_INVOKE)
     assert _invoke(api_id, "iam", key)[0] == 200
 
 
 def test_api_policy_deny_beats_an_identity_allow(auth):
-    key, user = iam_user(_ALLOW_INVOKE)
+    key, user = inprocess_iam_user(_ALLOW_INVOKE)
     api_id = _policy_api(_api_policy(("Allow", _ACCOUNT), ("Deny", {"AWS": user})))
     status, _headers, body = _invoke(api_id, "iam", key)
     assert status == 403
@@ -1414,7 +1414,7 @@ def test_api_policy_deny_beats_an_identity_allow(auth):
 
 
 def test_api_policy_applies_to_a_call_signed_for_another_region(auth):
-    key, user = iam_user(_ALLOW_INVOKE)
+    key, user = inprocess_iam_user(_ALLOW_INVOKE)
     try:
         api_id = _policy_api(_api_policy(("Allow", _ACCOUNT), ("Deny", {"AWS": user})), region="eu-west-1")
     finally:

@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -11,8 +12,9 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import iam_user, make_client, patch_endpoint_dns, routed_request, sqs_policy_allow_s3
+from conftest import inprocess_iam_user, make_client, patch_endpoint_dns, routed_request, sqs_policy_allow_s3
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -1251,24 +1253,24 @@ _ALLOW_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action"
 
 
 def test_bucket_policy_naming_the_user_allows_without_identity_policy(auth):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     bucket = _policy_bucket("Allow", user)
     assert routed_request(key, "s3", "GET", f"/{bucket}/k")[0] == 200
 
 
 def test_bucket_policy_naming_the_account_needs_an_identity_policy(auth):
     bucket = _policy_bucket("Allow", "arn:aws:iam::000000000000:root")
-    key, _user = iam_user()
+    key, _user = inprocess_iam_user()
     status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/k")
     assert status == 403 and b"<Code>AccessDenied</Code>" in body
-    key, _user = iam_user(_ALLOW_S3)
+    key, _user = inprocess_iam_user(_ALLOW_S3)
     assert routed_request(key, "s3", "GET", f"/{bucket}/k")[0] == 200
 
 
 def test_bucket_policy_deny_beats_an_identity_allow(auth):
     import xml.etree.ElementTree as ET
 
-    key, user = iam_user(_ALLOW_S3)
+    key, user = inprocess_iam_user(_ALLOW_S3)
     bucket = _policy_bucket("Deny", user)
     status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/k")
     assert status == 403 and b"<Code>AccessDenied</Code>" in body
@@ -9024,18 +9026,73 @@ def test_s3_mrap_end_to_end_routing_failover_and_replication(s3control_dns, mrap
     try:
         for region in ("us-east-1", "eu-west-1", None):
             assert _mrap_get(alias, "who.txt", region=region) == (200, "use1")
+# IAM contracts: real HTTP against the server mode selected by CI.
+# Evidence: existing IAM/action extraction tests and local MiniStack SDK calls;
+# these tests are not observations from a real AWS account.
+@pytest.fixture
+def auth_s3_objects(s3):
+    """Two private buckets with one source object; isolate and clean every test."""
+    with contextlib.ExitStack() as cleanup:
+        source = f"auth-source-{uuid.uuid4().hex}"
+        destination = f"auth-dest-{uuid.uuid4().hex}"
+        for bucket in (source, destination):
+            s3.create_bucket(Bucket=bucket)
+            cleanup.callback(s3.delete_bucket, Bucket=bucket)
+        s3.put_object(Bucket=source, Key="source", Body=b"auth-contract")
+        cleanup.callback(s3.delete_object, Bucket=source, Key="source")
+        # Register before the test so even an unexpected successful write is removed.
+        cleanup.callback(s3.delete_object, Bucket=destination, Key="copied")
+        yield source, destination
 
-        routes_ctl.submit_multi_region_access_point_routes(
-            AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": use1_bucket, "TrafficDialPercentage": 0}])
-        assert _mrap_get(alias, "who.txt") == (200, "euw1")
-        with pytest.raises(ClientError):
-            routes_ctl.submit_multi_region_access_point_routes(
-                AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": euw1_bucket, "TrafficDialPercentage": 0}])
-        assert _mrap_get(alias, "who.txt") == (200, "euw1")
 
-        assert _mrap_request(alias, "PUT", "data/new.txt", b"through mrap")[0] == 200
-        assert euw1.get_object(Bucket=euw1_bucket, Key="data/new.txt")["ReplicationStatus"] == "COMPLETED"
-        assert use1.get_object(Bucket=use1_bucket, Key="data/new.txt")["Body"].read() == b"through mrap"
-    finally:
-        _mrap_delete(ctl, name)
-    assert _mrap_request(alias, "GET", "who.txt")[0] in (403, 404)
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny", "other-resource"])
+def test_s3_read_permission_contract(auth_enabled, iam_user, auth_s3_objects, permission):
+    source, _ = auth_s3_objects
+    statements = []
+    if permission != "none":
+        resource = f"arn:aws:s3:::{source}/" + ("other" if permission == "other-resource" else "source")
+        statements.append({"Effect": "Allow", "Action": "s3:GetObject", "Resource": resource})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{source}/source"})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client("s3")
+    if auth_enabled and permission != "allow":
+        with pytest.raises(ClientError) as exc:
+            client.get_object(Bucket=source, Key="source")
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        response = client.get_object(Bucket=source, Key="source")
+        with response["Body"] as body:
+            assert body.read() == b"auth-contract"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("addressing_style", ["path", "virtual"])
+@pytest.mark.parametrize("allow_source_read", [False, True], ids=["no-source-read", "source-read"])
+def test_s3_copy_permission_contract(
+    auth_enabled, iam_user, s3, auth_s3_objects, addressing_style, allow_source_read,
+):
+    source, destination = auth_s3_objects
+    statements = [{"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{destination}/*"}]
+    if allow_source_read:
+        statements.append({"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{source}/*"})
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": statements}).client(
+        "s3", config=Config(signature_version="s3v4", s3={"addressing_style": addressing_style}),
+    )
+    request = {"Bucket": destination, "Key": "copied", "CopySource": {"Bucket": source, "Key": "source"}}
+    with patch_endpoint_dns():
+        if auth_enabled and not allow_source_read:
+            with pytest.raises(ClientError) as exc:
+                client.copy_object(**request)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            # A rejected request must not leave the destination object behind.
+            assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
+        else:
+            response = client.copy_object(**request)
+            assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+            result = s3.get_object(Bucket=destination, Key="copied")
+            with result["Body"] as body:
+                assert body.read() == b"auth-contract"

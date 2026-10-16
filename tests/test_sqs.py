@@ -12,7 +12,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import REGION, iam_user, routed_request, sqs_policy_allow_s3, sqs_policy_allow_sns
+from conftest import REGION, inprocess_iam_user, routed_request, sqs_policy_allow_s3, sqs_policy_allow_sns
 
 from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 from ministack.core.responses import get_account_id, request_scope
@@ -2233,25 +2233,25 @@ class TestIdentityAndResourcePolicy:
     """Same-account cases run in the default account, where IAM users live."""
 
     def test_queue_policy_naming_the_user_allows_without_identity_policy(self, auth):
-        key, user = iam_user()
+        key, user = inprocess_iam_user()
         name = _uniq("rp-q")
         url = _make_queue(HOME, name, _grant("Allow", user, "sqs:SendMessage", _qarn(HOME, name)))
         assert _routed_send(key, url, "granted")[0] == 200
         assert _queue_bodies(_qarn(HOME, name)) == ["granted"]
 
     def test_queue_policy_naming_the_account_needs_an_identity_policy(self, auth):
-        key, _user = iam_user()
+        key, _user = inprocess_iam_user()
         name = _uniq("rp-q")
         url = _make_queue(HOME, name, _grant("Allow", f"arn:aws:iam::{HOME}:root",
                                              "sqs:SendMessage", _qarn(HOME, name)))
         status, headers, _body = _routed_send(key, url)
         assert status == 403
         assert headers["x-amzn-query-error"] == "AccessDenied;Sender"
-        key, _user = iam_user(_ALLOW_MESSAGING)
+        key, _user = inprocess_iam_user(_ALLOW_MESSAGING)
         assert _routed_send(key, url)[0] == 200
 
     def test_queue_policy_deny_beats_an_identity_allow(self, auth):
-        key, user = iam_user(_ALLOW_MESSAGING)
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
         name = _uniq("rp-q")
         url = _make_queue(HOME, name, _grant("Deny", user, "sqs:SendMessage", _qarn(HOME, name)))
         status, headers, body = _routed_send(key, url)
@@ -2263,21 +2263,21 @@ class TestIdentityAndResourcePolicy:
         assert _queue_bodies(_qarn(HOME, name)) == []
 
     def test_topic_policy_naming_the_user_allows_without_identity_policy(self, auth):
-        key, user = iam_user()
+        key, user = inprocess_iam_user()
         arn = _make_topic(HOME, _uniq("rp-t"))
         _set_topic_policy(HOME, arn, _grant("Allow", user, "sns:Publish", arn))
         assert _resp_code(_routed_publish(key, arn)) == (200, "")
 
     def test_topic_policy_naming_the_account_needs_an_identity_policy(self, auth):
-        key, _user = iam_user()
+        key, _user = inprocess_iam_user()
         arn = _make_topic(HOME, _uniq("rp-t"))
         _set_topic_policy(HOME, arn, _grant("Allow", HOME, "sns:Publish", arn))
         assert _resp_code(_routed_publish(key, arn)) == (403, "AuthorizationError")
-        key, _user = iam_user(_ALLOW_MESSAGING)
+        key, _user = inprocess_iam_user(_ALLOW_MESSAGING)
         assert _resp_code(_routed_publish(key, arn)) == (200, "")
 
     def test_topic_policy_deny_beats_an_identity_allow(self, auth):
-        key, user = iam_user(_ALLOW_MESSAGING)
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
         arn = _make_topic(HOME, _uniq("rp-t"))
         _set_topic_policy(HOME, arn, _grant("Deny", user, "sns:Publish", arn))
         assert _resp_detail(_routed_publish(key, arn)) == (403, "AuthorizationError", (
@@ -2285,27 +2285,27 @@ class TestIdentityAndResourcePolicy:
             "with an explicit deny in a resource-based policy"))
 
     def test_default_topic_policy_grants_nothing_to_a_user(self, auth):
-        key, _user = iam_user()
+        key, _user = inprocess_iam_user()
         arn = _make_topic(HOME, _uniq("rp-t"))
         assert _resp_code(_routed_publish(key, arn)) == (403, "AuthorizationError")
 
     def test_cross_account_needs_both_policies(self, auth):
         name = _uniq("rp-q")
-        key, user = iam_user()
+        key, user = inprocess_iam_user()
         url = _make_queue(ACCT_A, name, _grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))
         assert _routed_send(key, url)[0] == 403
-        key, user = iam_user(_ALLOW_MESSAGING)
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
         _as(ACCT_A, sqs_svc._act_set_queue_attributes, {"QueueUrl": url, "Attributes": {
             "Policy": json.dumps(_grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))}}, url)
         assert _routed_send(key, url)[0] == 200
 
     def test_cross_account_ignores_a_same_named_queue_of_the_caller(self, auth):
         name = _uniq("rp-q")
-        key, user = iam_user()
+        key, user = inprocess_iam_user()
         home = _make_queue(HOME, name, _grant("Allow", user, "sqs:SendMessage", _qarn(HOME, name)))
         url = _make_queue(ACCT_A, name, _grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))
         assert _routed_send(key, url)[0] == 403
-        key, user = iam_user(_ALLOW_MESSAGING)
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
         _as(HOME, sqs_svc._act_set_queue_attributes, {"QueueUrl": home, "Attributes": {
             "Policy": json.dumps(_grant("Deny", user, "sqs:SendMessage", _qarn(HOME, name)))}}, home)
         _as(ACCT_A, sqs_svc._act_set_queue_attributes, {"QueueUrl": url, "Attributes": {

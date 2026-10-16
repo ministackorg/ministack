@@ -7,7 +7,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import iam_user, routed_request
+from conftest import inprocess_iam_user, routed_request
 
 
 def _regional_sm(region_name):
@@ -1012,20 +1012,20 @@ _ALLOW_SECRETS = {"Statement": [{"Effect": "Allow", "Action": "secretsmanager:*"
 
 
 def test_secret_policy_naming_the_user_allows_without_identity_policy(auth):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     assert _get_secret_value(key, _policy_secret("Allow", user)) == (200, None)
 
 
 def test_secret_policy_naming_the_account_needs_an_identity_policy(auth):
     arn = _policy_secret("Allow", "arn:aws:iam::000000000000:root")
-    key, _user = iam_user()
+    key, _user = inprocess_iam_user()
     assert _get_secret_value(key, arn) == (403, "AccessDeniedException")
-    key, _user = iam_user(_ALLOW_SECRETS)
+    key, _user = inprocess_iam_user(_ALLOW_SECRETS)
     assert _get_secret_value(key, arn) == (200, None)
 
 
 def test_secret_policy_deny_beats_an_identity_allow(auth):
-    key, user = iam_user(_ALLOW_SECRETS)
+    key, user = inprocess_iam_user(_ALLOW_SECRETS)
     arn = _policy_secret("Deny", user)
     status, _headers, body = routed_request(
         key, "secretsmanager", "POST", "/", json.dumps({"SecretId": arn}).encode(),

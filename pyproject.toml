@@ -103,6 +103,7 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "--dist=loadfile"
 markers = [
+    "auth_contract: SDK/HTTP permission contracts run against both server AUTH modes",
     "serial: tests that mutate global server state and must run alone",
     "data_plane: tests that require live Docker-backed service behavior",
 ]

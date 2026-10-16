@@ -882,6 +882,7 @@ def _handle_health_request(path: str, request_id: str):
         json.dumps(
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
+                "auth": "enabled" if AUTH else "disabled",
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
                 "version": _version(),
                 "iot_mtls": _iot_mtls_state,

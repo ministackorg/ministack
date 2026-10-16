@@ -3633,8 +3633,6 @@ class TestS3EnforcementSites:
         "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/a.txt"}]}
     _EVERY_KEY = {"Statement": [{
         "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/*"}]}
-    _WRITE_ONLY = {"Statement": [{
-        "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::iam-sites-dst/*"}]}
 
     def test_vhost_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
@@ -3650,15 +3648,6 @@ class TestS3EnforcementSites:
         assert status != 403
         assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
 
-    def test_vhost_copy_without_read_on_the_source_is_denied(self, monkeypatch):
-        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
-        status, _headers, body = self._vhost(
-            "iam-sites-dst", "/k", "PUT", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
-        assert status == 403
-        assert b"AccessDenied" in body
-        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
-                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
-
     def test_path_style_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
         status, _headers, body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
@@ -3672,15 +3661,6 @@ class TestS3EnforcementSites:
         status, _headers, _body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
         assert status != 403
         assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
-
-    def test_path_style_copy_without_read_on_the_source_is_denied(self, monkeypatch):
-        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
-        status, _headers, body = self._path_style(
-            "PUT", "/iam-sites-dst/k", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
-        assert status == 403
-        assert b"AccessDenied" in body
-        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
-                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
 
     def test_a_primary_denial_stops_before_the_extra_checks(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, {"Statement": [

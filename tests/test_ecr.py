@@ -7,7 +7,7 @@ import boto3
 import pytest
 import requests
 from botocore.exceptions import ClientError
-from conftest import iam_user, routed_request
+from conftest import inprocess_iam_user, routed_request
 
 from ministack.core.responses import (
     get_account_id,
@@ -174,20 +174,20 @@ _ALLOW_ECR = {"Statement": [{"Effect": "Allow", "Action": "ecr:*", "Resource": "
 
 
 def test_repository_policy_naming_the_user_allows_without_identity_policy(auth):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     assert _list_images(key, _policy_repository("Allow", user)) == (200, None)
 
 
 def test_repository_policy_naming_the_account_needs_an_identity_policy(auth):
     name = _policy_repository("Allow", "arn:aws:iam::000000000000:root")
-    key, _user = iam_user()
+    key, _user = inprocess_iam_user()
     assert _list_images(key, name) == (403, "AccessDeniedException")
-    key, _user = iam_user(_ALLOW_ECR)
+    key, _user = inprocess_iam_user(_ALLOW_ECR)
     assert _list_images(key, name) == (200, None)
 
 
 def test_repository_policy_deny_beats_an_identity_allow(auth):
-    key, user = iam_user(_ALLOW_ECR)
+    key, user = inprocess_iam_user(_ALLOW_ECR)
     name = _policy_repository("Deny", user)
     assert _list_images(key, name) == (403, "AccessDeniedException")
     assert _list_images(key, name, "message") == (403, (

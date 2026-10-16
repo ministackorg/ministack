@@ -26,7 +26,7 @@ from conftest import (
     ENDPOINT,
     LoopProbe,
     concurrent_burst,
-    iam_user,
+    inprocess_iam_user,
     make_probe_lambda,
     patch_endpoint_dns,
     routed_request,
@@ -4995,7 +4995,7 @@ def granted_function(monkeypatch):
 
 
 def test_function_policy_naming_the_user_allows_without_identity_policy(granted_function):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     name = granted_function(user)
     assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
     status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}/configuration")
@@ -5003,7 +5003,7 @@ def test_function_policy_naming_the_user_allows_without_identity_policy(granted_
 
 
 def test_function_policy_applies_to_a_call_naming_the_function_by_arn(granted_function):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     name = granted_function(user)
     arn = quote(f"arn:aws:lambda:us-east-1:000000000000:function:{name}", safe="")
     assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{arn}")[0] == 200
@@ -5011,10 +5011,10 @@ def test_function_policy_applies_to_a_call_naming_the_function_by_arn(granted_fu
 
 def test_function_policy_naming_the_account_needs_an_identity_policy(granted_function):
     name = granted_function("000000000000")
-    key, _user = iam_user()
+    key, _user = inprocess_iam_user()
     status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")
     assert (status, json.loads(body)["__type"]) == (403, "AccessDeniedException")
-    key, _user = iam_user({"Statement": [{"Effect": "Allow", "Action": "lambda:GetFunction", "Resource": "*"}]})
+    key, _user = inprocess_iam_user({"Statement": [{"Effect": "Allow", "Action": "lambda:GetFunction", "Resource": "*"}]})
     assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
 
 

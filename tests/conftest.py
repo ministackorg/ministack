@@ -14,6 +14,7 @@ import time
 import urllib.request
 import uuid
 import zipfile
+from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
 import boto3
@@ -62,8 +63,10 @@ def patch_endpoint_dns():
         return _real_getaddrinfo(host, port, *args, **kwargs)
 
     socket.getaddrinfo = _patched
-    yield
-    socket.getaddrinfo = _real_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = _real_getaddrinfo
 
 
 def make_client(service, additional_config_kwargs=None):
@@ -113,7 +116,78 @@ def iot_test_ca(registration_code, common_name="ministack-test-ca"):
     return ca_pem, ca_key_pem, verification_pem
 
 
-def iam_user(identity_policy=None):
+@pytest.fixture(scope="session")
+def auth_enabled():
+    """Verify the running server's IAM mode before exercising auth contracts."""
+    expected = os.environ.get("AUTH", "false").lower()
+    if expected not in {"true", "false"}:
+        pytest.fail("Auth contracts require AUTH=true or AUTH=false.", pytrace=False)
+    try:
+        with urllib.request.urlopen(f"{ENDPOINT.rstrip('/')}/_ministack/health", timeout=5) as response:
+            actual = json.load(response).get("auth")
+    except (OSError, ValueError) as exc:
+        pytest.fail(f"Cannot read MiniStack auth mode at {ENDPOINT}: {exc}", pytrace=False)
+    if actual not in ("enabled", "disabled"):
+        pytest.fail("MiniStack health response lacks auth=enabled/disabled; restart with current code.", pytrace=False)
+    expected_state = "enabled" if expected == "true" else "disabled"
+    if actual != expected_state:
+        pytest.fail(
+            f"Auth mode mismatch: tests expect AUTH={expected}, but {ENDPOINT} reports "
+            f"auth={actual}. Restart the server with the expected mode.",
+            pytrace=False,
+        )
+    return actual == "enabled"
+
+
+@pytest.fixture(autouse=True)
+def _verify_auth_contract_mode(request):
+    # Verify even marked tests that don't need different expectations per mode.
+    if request.node.get_closest_marker("auth_contract"):
+        request.getfixturevalue("auth_enabled")
+
+
+@pytest.fixture
+def iam_user(auth_enabled):
+    """Factory for API-created IAM users; no permissions unless explicitly supplied.
+
+    Returns an object with name, arn, and client(service, region=..., config=...).
+    Only this fixture's users, keys, policies, and clients are cleaned up.
+    """
+    with contextlib.ExitStack() as cleanup:
+        admin = make_client("iam")
+        cleanup.callback(admin.close)
+
+        def create(*, policy=None):
+            name = f"auth-user-{uuid.uuid4().hex}"
+            user = admin.create_user(UserName=name)["User"]
+            cleanup.callback(admin.delete_user, UserName=name)
+            key = admin.create_access_key(UserName=name)["AccessKey"]
+            cleanup.callback(admin.delete_access_key, UserName=name, AccessKeyId=key["AccessKeyId"])
+            if policy is not None:
+                admin.put_user_policy(UserName=name, PolicyName="test-policy", PolicyDocument=json.dumps(policy))
+                cleanup.callback(admin.delete_user_policy, UserName=name, PolicyName="test-policy")
+
+            session = boto3.Session(
+                aws_access_key_id=key["AccessKeyId"],
+                aws_secret_access_key=key["SecretAccessKey"],
+                region_name=REGION,
+            )
+
+            def client(service, *, region=REGION, config=None):
+                defaults = Config(retries={"total_max_attempts": 1}, connect_timeout=5, read_timeout=10)
+                result = session.client(
+                    service, endpoint_url=ENDPOINT, region_name=region,
+                    config=defaults.merge(config) if config is not None else defaults,
+                )
+                cleanup.callback(result.close)
+                return result
+
+            return SimpleNamespace(name=name, arn=user["Arn"], client=client)
+
+        yield create
+
+
+def inprocess_iam_user(identity_policy=None):
     """An in-process IAM user with an access key in the default account: ``((key id, secret), arn)``."""
     from ministack.core.responses import get_account_id, request_scope
     from ministack.services import iam as iam_svc

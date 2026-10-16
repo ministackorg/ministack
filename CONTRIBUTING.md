@@ -183,18 +183,91 @@ pip install boto3 pytest pytest-xdist duckdb docker cbor2
 pytest tests/ -v
 
 # Control-plane parallel lane: excludes serial and live-container tests
-pytest tests/ -v -n 4 --dist=loadfile -m "not serial and not data_plane"
+pytest tests/ -v -n 4 --dist=loadfile -m "not serial and not data_plane and not auth_contract"
 
 # Control-plane serial/global-state lane
-pytest tests/ -v -m "serial and not data_plane"
+pytest tests/ -v -m "serial and not data_plane and not auth_contract"
 
 # Docker-backed data-plane lane (requires a Docker daemon and network)
 DOCKER_NETWORK=ministack-data-local LAMBDA_EXECUTOR=docker \
-pytest tests/ -v -m data_plane
+pytest tests/ -v -m "data_plane and not auth_contract"
 
 # Run a specific service
 pytest tests/ -v -k "cognito"
 ```
+
+---
+
+## Testing Permission Behavior
+
+When testing whether an AWS operation is allowed or denied, write an SDK/HTTP
+integration test in `tests/test_<service>.py` and mark it `auth_contract`.
+CI runs the same marked tests against fresh servers with `AUTH=false` and
+`AUTH=true`; the existing control-plane and data-plane jobs exclude them.
+The initial authorization matrix runs without Docker.
+
+Use the shared `iam_user` factory to create users through IAM APIs. It grants
+no permissions by default. Pass `policy={...}` to attach an explicit inline
+policy, then use `user.client("service")` for the request under test. Existing
+service fixtures such as `s3` use admin credentials for resource setup and
+cleanup. The user factory removes its users, keys, policies, and clients after
+each test, including after failures. Service resources need their own cleanup.
+
+```python
+import pytest
+from botocore.exceptions import ClientError
+
+
+@pytest.mark.auth_contract
+def test_list_buckets_without_permission(auth_enabled, iam_user):
+    client = iam_user().client("s3")
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_buckets()
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        assert "Buckets" in client.list_buckets()
+```
+
+Every marked test verifies that the server's health response reports the expected
+mode, even if it doesn't request `auth_enabled` explicitly. The fixture observes
+configuration; it never changes the server's mode. A mismatch fails the test.
+Health reports `auth` as `enabled` or `disabled`; `auth_enabled` exposes that
+state as a boolean to tests.
+
+For local runs, start the server in one terminal:
+
+```bash
+AUTH=false DOCKER_HOST=unix:///no-existent/docker.sock IOT_MTLS_ENABLED=0 \
+python -m hypercorn ministack.app:app --bind 127.0.0.1:4566 --keep-alive 75
+```
+
+Run the contracts in another terminal with the same mode:
+
+```bash
+AUTH=false pytest tests/ -m auth_contract -v
+# Or focus on one service:
+AUTH=false pytest tests/test_s3.py -m auth_contract -v
+```
+
+Stop the server, restart it with `AUTH=true`, and rerun with `AUTH=true` in the
+test command. Set `MINISTACK_ENDPOINT` for pytest if using another address.
+CI also checks a separate server started with `AUTH` unset to protect the
+permissive default.
+
+Permission changes should assert both enforcement and permissive compatibility:
+a valid request lacking permission succeeds with `AUTH=false` and is denied
+with `AUTH=true`. Include a permitted case as a control, and verify error codes,
+HTTP status, and relevant resource state. Input validation and service-specific
+authentication requirements may still apply in permissive mode.
+
+Keep focused evaluator unit tests for policy logic. Existing tests that patch
+`app.AUTH` should migrate when they test externally observable behavior; remove
+redundant patched tests once the replacement covers their behavior. The legacy
+`inprocess_iam_user` helper supports remaining internal tests, not new permission
+contracts. More involved scenarios, such as role sessions and Docker-backed
+execution roles, can add shared fixtures and CI support when exercised.
 
 ---
 

@@ -61,6 +61,13 @@ before changing a service; it has the contribution process and examples.
   require the server at `localhost:4566`.
 - Run the relevant test file, then `pytest tests/` when routing, registry, or
   service behavior changed. Run `ruff check ministack/`, the CI lint gate.
+- Test AWS permission behavior with SDK/HTTP clients in the service's test
+  file, marked `@pytest.mark.auth_contract`. Use `iam_user(policy=...)` for
+  caller credentials and `auth_enabled` for mode-dependent assertions. CI runs
+  these contracts with both `AUTH=false` and `AUTH=true`; permission changes
+  need strict enforcement and permissive compatibility assertions. Do not
+  patch `app.AUTH` or IAM enforcement in new permission contracts. Keep focused
+  evaluator unit tests for policy logic. See `CONTRIBUTING.md` for local runs.
 - Tests that alter global server state or depend on ordering belong in
   `_SERIAL_TESTS` in `tests/conftest.py`; keep them out of parallel runs.
 
