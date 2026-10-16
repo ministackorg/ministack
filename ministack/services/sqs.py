@@ -118,12 +118,6 @@ def _enforce_queue_policy(q: dict, iam_action: str) -> None:
     Policy carries an explicit Deny for them. Cross-account callers need an
     explicit Allow in the Policy, exactly like real SQS, which answers
     AccessDenied (403) otherwise.
-
-    Known boundary under AUTH=true: a caller with no identity Allow whose
-    access comes from this Policy alone is denied by the app-level identity
-    check before this resource check runs, where real SQS would allow the
-    union. Lifting that needs the identity layer to defer to the resource
-    layer, which no AUTH=true server harness here can verify.
     """
     from ministack.app import AUTH
     if not AUTH:
@@ -149,6 +143,14 @@ def _enforce_queue_policy(q: dict, iam_action: str) -> None:
                                   owner is None or owner == caller):
         raise _Err("AccessDenied",
                    f"Access to the resource https://sqs.{get_region()}.amazonaws.com/ is denied.", 403)
+
+
+def queue_policy_for_arn(queue_arn: str) -> tuple[str, str] | None:
+    """The queue's Policy and owner account, for the identity check."""
+    q = _queue_by_arn(queue_arn)
+    if q is None:
+        return None
+    return q["attributes"].get("Policy") or "", _owner_from_queue_arn(queue_arn)[0]
 
 
 def queue_policy_allows(queue_arn: str, service: str,
