@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito Identity — identities merge on a login another identity holds under `AUTH=true`** — `GetCredentialsForIdentity` and `GetOpenIdToken` answered for the calling identity when its `Logins` belonged to another identity, `GetId` returned only one of two identities holding its logins, and an identity with a login took a call that carried none of its own; with `AUTH=true` an identity without a login now gives way to the login's identity, an identity with a login takes the other identity's logins, the merged-away identity is disabled (`DescribeIdentity` and `ListIdentities` list `DISABLED`, `HideDisabled` leaves it out, calls with its old login answer for the identity it merged into) and a call with none of the identity's own logins answers `NotAuthorizedException`. Contributed by @iot-rocket.
+- **Cognito Identity — `GetId` and `GetCredentialsForIdentity` check `Logins` under `AUTH=true`** — both calls took any token in `Logins`, `GetCredentialsForIdentity` vended authenticated credentials from the stored login when the request carried none, `GetId` created a new identity for a login that already had one, and a login given to an identity without one was not kept; with `AUTH=true` both calls refuse the tokens `GetOpenIdToken` refuses with the same `NotAuthorizedException` messages (and a Google login that is no JWT), `GetCredentialsForIdentity` refuses a request without `Logins` for an identity with a login, `GetId` returns the identity that holds the login, and `GetCredentialsForIdentity` and `GetOpenIdToken` link the login to an identity that had none, as AWS does. Contributed by @iot-rocket.
+- **Cognito Identity — `GetOpenIdToken` checks `Logins` under `AUTH=true`** — the call issued a token for an identity with a login when the request carried no `Logins`, and for any token in `Logins`; with `AUTH=true` it now answers `NotAuthorizedException` as AWS does, with `Access to Identity '<identity id>' is forbidden.` without `Logins` and, for a user pool login, when the token is no ID token of a trusted app client, has a bad signature, expired more than five minutes ago or belongs to another user than the identity's login. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

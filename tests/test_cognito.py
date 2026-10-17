@@ -1313,6 +1313,263 @@ def test_cognito_get_open_id_token_unknown_identity(cognito_identity):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     assert exc.value.response["Error"]["Message"] == f"Identity '{unknown}' not found."
 
+
+def _identity_logins(cognito_idp, cognito_identity):
+    """User pools A and B, an identity pool trusting A's first client, its identities and the users' tokens."""
+    from types import SimpleNamespace
+
+    def pool_with_users(*usernames):
+        pid = cognito_idp.create_user_pool(PoolName="IdentityLogins")["UserPool"]["Id"]
+        cid = cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+            IdTokenValidity=5, TokenValidityUnits={"IdToken": "minutes"})["UserPoolClient"]["ClientId"]
+        for name in usernames:
+            cognito_idp.admin_create_user(UserPoolId=pid, Username=name, MessageAction="SUPPRESS")
+            cognito_idp.admin_set_user_password(UserPoolId=pid, Username=name, Password="Passw0rd!", Permanent=True)
+        return pid, cid
+
+    def sign_in(cid, name):
+        return cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+            "USERNAME": name, "PASSWORD": "Passw0rd!"})["AuthenticationResult"]
+
+    pid, cid = pool_with_users("u1", "u2", "u3", "u4", "u5")
+    other_cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="other", ExplicitAuthFlows=[
+        "ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    pid_b, cid_b = pool_with_users("u4", "u5", "u6")
+    u1 = sign_in(cid, "u1")
+    tokens = {
+        "u1": u1["IdToken"], "u1 access": u1["AccessToken"], "u2": sign_in(cid, "u2")["IdToken"],
+        "u3": sign_in(cid, "u3")["IdToken"], "u4": sign_in(cid, "u4")["IdToken"], "u5": sign_in(cid, "u5")["IdToken"],
+        "b": sign_in(cid_b, "u4")["IdToken"], "b5": sign_in(cid_b, "u5")["IdToken"],
+        "b6": sign_in(cid_b, "u6")["IdToken"],
+        "u1 other client": sign_in(other_cid, "u1")["IdToken"],
+    }
+    provider = f"cognito-idp.us-east-1.amazonaws.com/{pid}"
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="IdentityLogins", AllowUnauthenticatedIdentities=True,
+        CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": cid}],
+        SupportedLoginProviders={"accounts.google.com": "app.apps.googleusercontent.com"})["IdentityPoolId"]
+
+    def call(action, **data):
+        """The result of a cognito-identity call, or its (code, message)."""
+        try:
+            return getattr(cognito_identity, action)(**data)
+        except ClientError as e:
+            return e.response["Error"]["Code"], e.response["Error"]["Message"]
+
+    return SimpleNamespace(
+        call=call, tokens=tokens, provider=provider, provider_b=f"cognito-idp.us-east-1.amazonaws.com/{pid_b}",
+        client=cid, client_b=cid_b, pool=iid,
+        unauth=cognito_identity.get_id(IdentityPoolId=iid)["IdentityId"],
+        u1=cognito_identity.get_id(IdentityPoolId=iid, Logins={provider: tokens["u1"]})["IdentityId"],
+    )
+
+
+@pytest.mark.auth_contract
+def test_cognito_get_open_id_token_checks_logins(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, tokens = ctx.provider, ctx.tokens
+    head, payload, sig = tokens["u1"].split(".")
+    unsupported = "Token is not from a supported provider of this identity pool."
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    for logins, message in [
+        (None, f"Access to Identity '{ctx.u1}' is forbidden."),
+        ({provider: tokens["u3"]}, mismatch),
+        ({provider: tokens["u2"]}, mismatch),
+        ({provider: tokens["u1 other client"]}, unsupported),
+        ({provider: tokens["b"]}, "Invalid login token. Issuer doesn't match providerName"),
+        ({ctx.provider_b: tokens["b"]}, unsupported),
+        ({provider: tokens["u1 access"]}, "Invalid login token. Missing a required claim: aud"),
+        ({provider: f"{head}.{payload}.{sig[::-1]}"}, "Invalid login token. Token signature invalid."),
+        ({provider: "not-a-token"}, "Invalid login token. Not a valid OpenId Connect identity token."),
+    ]:
+        result = ctx.call("get_open_id_token", IdentityId=ctx.u1, **({"Logins": logins} if logins else {}))
+        if auth_enabled:
+            assert result == ("NotAuthorizedException", message)
+        else:
+            assert result["IdentityId"] == ctx.u1
+
+    def amr(**data):
+        return _decode_jwt_claims(ctx.call("get_open_id_token", **data)["Token"])["amr"]
+
+    assert amr(IdentityId=ctx.unauth) == ["unauthenticated"]
+    assert amr(IdentityId=ctx.u1, Logins={provider: tokens["u1"]})[:2] == ["authenticated", provider]
+    # An identity without a login takes one.
+    assert amr(IdentityId=ctx.unauth, Logins={provider: tokens["u2"]})[:2] == ["authenticated", provider]
+
+
+@pytest.mark.auth_contract
+def test_cognito_get_credentials_for_identity_checks_logins(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, tokens = ctx.provider, ctx.tokens
+    head, payload, sig = tokens["u1"].split(".")
+    unsupported = "Token is not from a supported provider of this identity pool."
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
+    for logins, message in [
+        (None, f"Access to Identity '{ctx.u1}' is forbidden."),
+        ({provider: tokens["u3"]}, mismatch),
+        ({provider: tokens["u2"]}, mismatch),
+        ({provider: tokens["u1 other client"]}, unsupported),
+        ({provider: tokens["b"]}, "Invalid login token. Issuer doesn't match providerName"),
+        ({ctx.provider_b: tokens["b"]}, unsupported),
+        ({provider: tokens["u1 access"]}, "Invalid login token. Missing a required claim: aud"),
+        ({provider: f"{head}.{payload}.{sig[::-1]}"}, "Invalid login token. Token signature invalid."),
+        ({provider: "not-a-token"}, not_oidc),
+        ({"accounts.google.com": "not-a-token"}, not_oidc),
+    ]:
+        result = ctx.call("get_credentials_for_identity", IdentityId=ctx.u1, **({"Logins": logins} if logins else {}))
+        if auth_enabled:
+            assert result == ("NotAuthorizedException", message)
+        else:
+            assert result["IdentityId"] == ctx.u1
+    google = ctx.call("get_open_id_token", IdentityId=ctx.u1, Logins={"accounts.google.com": "not-a-token"})
+    assert google == ("NotAuthorizedException", not_oidc) if auth_enabled else "Token" in google
+    matching = ctx.call("get_credentials_for_identity", IdentityId=ctx.u1, Logins={provider: tokens["u1"]})
+    assert matching["IdentityId"] == ctx.u1
+
+
+@pytest.mark.auth_contract
+def test_cognito_get_id_checks_logins(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, tokens = ctx.provider, ctx.tokens
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
+    for logins, message in [
+        ({provider: "not-a-token"}, not_oidc),
+        ({provider: tokens["u1 access"]}, "Invalid login token. Missing a required claim: aud"),
+        ({provider: tokens["u1 other client"]}, "Token is not from a supported provider of this identity pool."),
+        ({"accounts.google.com": "not-a-token"}, not_oidc),
+    ]:
+        result = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins=logins)
+        assert result == ("NotAuthorizedException", message) if auth_enabled else "IdentityId" in result
+    # With AUTH a login that has an identity gets that identity back; without it every GetId makes a new one.
+    found = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens["u1"]})["IdentityId"]
+    assert (found == ctx.u1) == auth_enabled
+
+
+@pytest.mark.auth_contract
+def test_cognito_identity_without_login_takes_one(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, tokens = ctx.provider, ctx.tokens
+    for action, user in (("get_credentials_for_identity", "u4"), ("get_open_id_token", "u5")):
+        identity_id = ctx.call("get_id", IdentityPoolId=ctx.pool)["IdentityId"]
+        assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})["IdentityId"] == identity_id
+        logins = ctx.call("describe_identity", IdentityId=identity_id).get("Logins", [])
+        found = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens[user]})["IdentityId"]
+        without_logins = ctx.call("get_credentials_for_identity", IdentityId=identity_id)
+        if auth_enabled:
+            assert (logins, found) == ([provider], identity_id)
+            assert without_logins == ("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
+        else:
+            assert (logins, without_logins["IdentityId"]) == ([], identity_id)
+            assert found != identity_id
+
+
+@pytest.mark.auth_contract
+def test_cognito_identity_without_login_merges_into_the_logins_identity(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, tokens = ctx.provider, ctx.tokens
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    for action, user in (("get_credentials_for_identity", "u3"), ("get_open_id_token", "u4")):
+        holder = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens[user]})["IdentityId"]
+        identity_id = ctx.call("get_id", IdentityPoolId=ctx.pool)["IdentityId"]
+        result = ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})
+        logins = ctx.call("describe_identity", IdentityId=identity_id)["Logins"]
+        if not auth_enabled:
+            assert (result["IdentityId"], logins) == (identity_id, [])
+            continue
+        # The call answers for the identity that holds the login and disables the caller's.
+        assert (result["IdentityId"], logins) == (holder, ["DISABLED", "us-east-1"])
+        if action == "get_open_id_token":
+            assert _decode_jwt_claims(result["Token"])["sub"] == holder
+        assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})["IdentityId"] == holder
+        assert ctx.call(action, IdentityId=identity_id) == (
+            "NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
+        assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens["u2"]}) == (
+            "NotAuthorizedException", mismatch)
+        listed = {hide: [i["IdentityId"] for i in ctx.call(
+            "list_identities", IdentityPoolId=ctx.pool, MaxResults=60, HideDisabled=hide)["Identities"]]
+            for hide in (False, True)}
+        assert (identity_id in listed[False], identity_id in listed[True]) == (True, False)
+
+
+@pytest.mark.auth_contract
+def test_cognito_identity_merges_the_identities_holding_its_logins(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, provider_b, tokens = ctx.provider, ctx.provider_b, ctx.tokens
+    cognito_identity.update_identity_pool(
+        IdentityPoolId=ctx.pool, IdentityPoolName="IdentityLogins", AllowUnauthenticatedIdentities=True,
+        CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": ctx.client},
+                                  {"ProviderName": provider_b, "ClientId": ctx.client_b}])
+
+    def get_id(logins):
+        return ctx.call("get_id", IdentityPoolId=ctx.pool, Logins=logins)["IdentityId"]
+
+    def logins_of(identity_id):
+        return sorted(ctx.call("describe_identity", IdentityId=identity_id)["Logins"])
+
+    held_b = get_id({provider_b: tokens["b"]})
+    result = ctx.call("get_credentials_for_identity", IdentityId=ctx.u1,
+                      Logins={provider: tokens["u1"], provider_b: tokens["b"]})
+    assert result["IdentityId"] == ctx.u1
+    u3 = get_id({provider: tokens["u3"]})
+    only_new_login = ctx.call("get_credentials_for_identity", IdentityId=u3, Logins={provider_b: tokens["b5"]})
+    u5, b6 = get_id({provider: tokens["u5"]}), get_id({provider_b: tokens["b6"]})
+    both_held = get_id({provider: tokens["u5"], provider_b: tokens["b6"]})
+    if not auth_enabled:
+        assert (logins_of(ctx.u1), logins_of(held_b)) == ([provider], [provider_b])
+        assert only_new_login["IdentityId"] == u3
+        assert both_held not in (u5, b6)
+        return
+    # The caller keeps its identity, takes the other identity's logins and disables it.
+    assert (logins_of(ctx.u1), logins_of(held_b)) == (sorted([provider, provider_b]), ["DISABLED", "us-east-1"])
+    assert get_id({provider_b: tokens["b"]}) == ctx.u1
+    assert ctx.call("get_credentials_for_identity", IdentityId=held_b,
+                    Logins={provider_b: tokens["b"]})["IdentityId"] == ctx.u1
+    # An identity with a login needs one of its own; a new login next to it is linked.
+    assert only_new_login == (
+        "NotAuthorizedException",
+        "Logins don't match. Please include at least one valid login for this identity or identity pool.")
+    result = ctx.call("get_credentials_for_identity", IdentityId=u3,
+                      Logins={provider: tokens["u3"], provider_b: tokens["b5"]})
+    assert (result["IdentityId"], logins_of(u3)) == (u3, sorted([provider, provider_b]))
+    # GetId keeps one of two identities holding its logins and disables the other.
+    assert both_held in (u5, b6)
+    other = b6 if both_held == u5 else u5
+    assert (logins_of(both_held), logins_of(other)) == (sorted([provider, provider_b]), ["DISABLED", "us-east-1"])
+
+
+def test_cognito_get_open_id_token_expired_login_under_auth(monkeypatch):
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod, call = _idp_in_process(monkeypatch, auth=True)
+    monkeypatch.setattr(mod, "_identity_pools", AccountRegionScopedDict())
+
+    def identity(action, **data):
+        status, _, body = asyncio.run(mod._dispatch_identity(action, data))
+        result = json.loads(body) if body else {}
+        return (result["__type"].split("#")[-1], result["message"]) if status != 200 else result
+
+    pid, cid, sign_in = _password_client_with_users(
+        call, "u1", IdTokenValidity=5, TokenValidityUnits={"IdToken": "minutes"})
+    provider = f"cognito-idp.us-east-1.amazonaws.com/{pid}"
+    iid = identity("CreateIdentityPool", IdentityPoolName="ExpiredLogins", AllowUnauthenticatedIdentities=True,
+                   CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": cid}])["IdentityPoolId"]
+    u1 = identity("GetId", IdentityPoolId=iid, Logins={provider: sign_in("u1")["IdToken"]})["IdentityId"]
+    now = int(time.time())
+    with monkeypatch.context() as m:
+        # ID tokens of this client live 300 s; AWS accepts them for 300 s more.
+        m.setattr(mod.time, "time", lambda: now - 599)
+        late = sign_in("u1")["IdToken"]
+        m.setattr(mod.time, "time", lambda: now - 600)
+        expired = sign_in("u1")["IdToken"]
+        m.setattr(mod.time, "time", lambda: now)
+        assert "Token" in identity("GetOpenIdToken", IdentityId=u1, Logins={provider: late})
+        for action in ("GetOpenIdToken", "GetCredentialsForIdentity"):
+            assert identity(action, IdentityId=u1, Logins={provider: expired}) == (
+                "NotAuthorizedException", f"Invalid login token. Token expired: {now - 300} >= {now - 300}")
+
+
 def test_cognito_signup_always_unconfirmed(cognito_idp):
     """SignUp always returns UNCONFIRMED regardless of AutoVerifiedAttributes."""
     # Pool with AutoVerifiedAttributes — user still starts UNCONFIRMED
