@@ -660,6 +660,16 @@ def _sign(data):
     else:
         message = message_b64
 
+    if algorithm not in rec.get("SigningAlgorithms", []):
+        known_algorithm = _signing_params(algorithm)[1] is not None or algorithm in (
+            "ED25519_SHA_512", "ED25519_PH_SHA_512",
+        )
+        return error_response_json(
+            "InvalidKeyUsageException" if known_algorithm else "ValidationException",
+            f"Signing algorithm {algorithm} is not supported for key spec {rec['KeySpec']}.",
+            400,
+        )
+
     if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
         if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
             return error_response_json(
@@ -700,6 +710,13 @@ def _sign(data):
         return error_response_json(
             "UnsupportedOperationException",
             f"Signing algorithm {algorithm} is not supported",
+            400,
+        )
+
+    if message_type == "DIGEST" and len(message) != hash_algo.digest_size:
+        return error_response_json(
+            "ValidationException",
+            f"Message length must be {hash_algo.digest_size} bytes for {algorithm} with MessageType DIGEST.",
             400,
         )
 
