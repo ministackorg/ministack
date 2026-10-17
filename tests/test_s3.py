@@ -9184,3 +9184,56 @@ def test_s3_post_permission_contract(
         assert response.status_code == 204, response.text
         with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
             assert body.read() == b"post-auth-contract"
+
+
+@pytest.mark.parametrize("protection", ["COMPLIANCE", "GOVERNANCE", "LEGAL_HOLD"])
+@pytest.mark.parametrize("batch", [False, True])
+def test_s3_locked_version_survives_plain_delete_marker(s3, protection, batch):
+    from datetime import timedelta, timezone
+
+    bucket = f"lock-marker-{uuid.uuid4().hex[:16]}"
+    s3.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+    params = {"ObjectLockLegalHoldStatus": "ON"} if protection == "LEGAL_HOLD" else {
+        "ObjectLockMode": protection,
+        "ObjectLockRetainUntilDate": datetime.now(timezone.utc) + timedelta(days=1),
+    }
+    version = s3.put_object(Bucket=bucket, Key="locked", Body=b"protected", **params)["VersionId"]
+    if batch:
+        result = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": "locked"}]})
+        assert not result.get("Errors")
+        deleted = result["Deleted"][0]
+        assert deleted["DeleteMarker"] is True
+        marker = deleted["DeleteMarkerVersionId"]
+    else:
+        result = s3.delete_object(Bucket=bucket, Key="locked")
+        assert result["ResponseMetadata"]["HTTPStatusCode"] == 204
+        assert result["DeleteMarker"] is True
+        assert result["ResponseMetadata"]["HTTPHeaders"]["x-amz-delete-marker"] == "true"
+        marker = result["VersionId"]
+        assert result["ResponseMetadata"]["HTTPHeaders"]["x-amz-version-id"] == marker
+    assert marker != version
+    assert s3.get_object(Bucket=bucket, Key="locked", VersionId=version)["Body"].read() == b"protected"
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="locked")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    versions = s3.list_object_versions(Bucket=bucket)
+    assert any(v["VersionId"] == version for v in versions["Versions"])
+    assert any(v["VersionId"] == marker and v["IsLatest"] for v in versions["DeleteMarkers"])
+    # A marker must not hide the protected version from lock enforcement.
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bucket, Key="locked", VersionId=version)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    denied = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": "locked", "VersionId": version}]})
+    assert denied["Errors"][0]["Code"] == "AccessDenied"
+    # Delete markers themselves have no retention or legal hold.
+    removed = s3.delete_object(Bucket=bucket, Key="locked", VersionId=marker)
+    assert removed["DeleteMarker"] is True
+    assert s3.get_object(Bucket=bucket, Key="locked")["Body"].read() == b"protected"
+    if protection == "GOVERNANCE":
+        assert s3.delete_object(Bucket=bucket, Key="locked", VersionId=version,
+                                BypassGovernanceRetention=True)["ResponseMetadata"]["HTTPStatusCode"] == 204
+    else:
+        with pytest.raises(ClientError) as exc:
+            s3.delete_object(Bucket=bucket, Key="locked", VersionId=version, BypassGovernanceRetention=True)
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
