@@ -2870,3 +2870,48 @@ def test_kms_create_grant_rejects_primary_pending_replica_deletion():
         assert east.list_grants(KeyId=key_id)["Grants"] == []
     finally:
         west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("key_spec,algorithm,error", [
+    ("ECC_NIST_P256", "RSASSA_PSS_SHA_256", "InvalidKeyUsageException"),
+    ("RSA_2048", "ECDSA_SHA_256", "InvalidKeyUsageException"),
+    ("RSA_2048", "NOT_A_SIGNING_ALGORITHM", "ValidationException"),
+])
+def test_kms_sign_rejects_invalid_algorithm(kms_client, key_spec, algorithm, error):
+    key_id = kms_client.create_key(KeySpec=key_spec, KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            kms_client.sign(KeyId=key_id, Message=b"message", SigningAlgorithm=algorithm)
+        assert exc.value.response["Error"]["Code"] == error
+        assert exc.value.response["Error"]["Message"]
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["ResponseMetadata"]["RetryAttempts"] == 0
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("key_spec,algorithm,length", [
+    ("ECC_NIST_P256", "ECDSA_SHA_256", 32),
+    ("ECC_NIST_P384", "ECDSA_SHA_384", 48),
+    ("ECC_NIST_P521", "ECDSA_SHA_512", 64),
+    ("RSA_2048", "RSASSA_PSS_SHA_256", 32),
+    ("RSA_2048", "RSASSA_PKCS1_V1_5_SHA_384", 48),
+    ("RSA_2048", "RSASSA_PSS_SHA_512", 64),
+])
+@pytest.mark.parametrize("offset", [-1, 1])
+def test_kms_sign_rejects_wrong_digest_length(kms_client, key_spec, algorithm, length, offset):
+    key_id = kms_client.create_key(KeySpec=key_spec, KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            kms_client.sign(KeyId=key_id, Message=b"x" * (length + offset),
+                            MessageType="DIGEST", SigningAlgorithm=algorithm)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert exc.value.response["Error"]["Message"]
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["ResponseMetadata"]["RetryAttempts"] == 0
+        signature = kms_client.sign(KeyId=key_id, Message=b"x" * length,
+                                    MessageType="DIGEST", SigningAlgorithm=algorithm)["Signature"]
+        assert kms_client.verify(KeyId=key_id, Message=b"x" * length, MessageType="DIGEST",
+                                 SigningAlgorithm=algorithm, Signature=signature)["SignatureValid"]
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
