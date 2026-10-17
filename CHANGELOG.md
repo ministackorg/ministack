@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — Block Public Access settings and public bucket ACL grants** — any one of the four Block Public Access settings shut off every public grant on a bucket, none refused setting a public ACL, and a public bucket ACL opened every read and write in the bucket. `BlockPublicAcls` now refuses a call that sets a public ACL on a bucket with ACLs enabled (403 `AccessDenied`) and leaves the grants in place, `IgnorePublicAcls` drops public ACL grants and `RestrictPublicBuckets` the bucket policy. A bucket ACL grants what its permission covers: `READ` the listings, `WRITE` adding and removing objects, `READ_ACP` and `WRITE_ACP` the bucket ACL. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
