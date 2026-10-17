@@ -1298,8 +1298,16 @@ def _signature_valid(token: str) -> bool:
     return True
 
 
+def _token_owner(claims: dict):
+    """The user named by a token's iss and username, False if the pool lacks it, None without either."""
+    pool = _user_pools.get(str(claims.get("iss", "")).rsplit("/", 1)[-1])
+    if not pool or not claims.get("username"):
+        return None
+    return pool["_users"].get(claims["username"]) or False
+
+
 def _access_token_error(data: dict):
-    """The NotAuthorizedException for an AccessToken AWS would not accept, or None."""
+    """The error for an AccessToken AWS would not accept, or None."""
     token = data.get("AccessToken")
     if not token or not isinstance(token, str):
         return None
@@ -1312,6 +1320,10 @@ def _access_token_error(data: dict):
         message = "Could not verify signature for Access Token"
     elif not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]:
         message = "Access Token has expired"
+    elif (user := _token_owner(claims)) is False:
+        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    elif user and not user.get("Enabled", True):
+        message = "User is disabled."
     elif claims.get("origin_jti") in _revoked_tokens:
         message = "Access Token has been revoked"
     elif _API_TOKEN_SCOPE not in str(claims.get("scope", _API_TOKEN_SCOPE)).split():
@@ -3825,6 +3837,13 @@ def _admin_disable_user(data):
         return err
     user["Enabled"] = False
     user["UserLastModifiedDate"] = _now_epoch()
+    from ministack.app import AUTH
+    if AUTH:
+        # Every session ends: its tokens stay revoked after AdminEnableUser.
+        _revoked_tokens.update(user.pop("_origin_jtis", []))
+        for tok in [t for t, e in _refresh_tokens.items()
+                    if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
+            del _refresh_tokens[tok]
     return json_response({})
 
 
@@ -4416,7 +4435,10 @@ def _refresh_auth_user(pool, pid, cid, refresh_token):
     if not user:
         return None, error_response_json("NotAuthorizedException",
                                          "The user has been deleted for the associated refresh token", 400)
-    if _refresh_token_revoked(refresh_token, user):
+    from ministack.app import AUTH
+    if AUTH and not user.get("Enabled", True):
+        return None, error_response_json("NotAuthorizedException", "User is disabled.", 400)
+    if _refresh_token_revoked(refresh_token, user) or (AUTH and claims.get("origin_jti") in _revoked_tokens):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
     return user, None

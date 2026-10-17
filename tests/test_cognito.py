@@ -1755,6 +1755,93 @@ def test_cognito_sign_out_and_revoke_token_revoke_access_tokens_under_auth(monke
     assert call("GetUser", AccessToken=other["AccessToken"])["Username"] == "bob"
 
 
+def _disable_user_pool(cognito_idp):
+    """testuser and erin in a pool with a public client; returns (pool id, client id, sign-in, GetUser, refresh)."""
+    client = _scoped_code_client(cognito_idp, ["openid", "aws.cognito.signin.user.admin"])
+    pid, cid = client["UserPoolId"], client["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="erin", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="erin", Password="TestPass1!", Permanent=True)
+
+    def outcome(call, **kwargs):
+        try:
+            return call(**kwargs)
+        except ClientError as e:
+            return e.response["Error"]["Code"], e.response["Error"]["Message"]
+
+    def sign_in(username):
+        return cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": username, "PASSWORD": "TestPass1!"})["AuthenticationResult"]
+
+    def get_user(token):
+        result = outcome(cognito_idp.get_user, AccessToken=token)
+        return result["Username"] if isinstance(result, dict) else result
+
+    def refresh(token):
+        """REFRESH_TOKEN_AUTH, GetTokensFromRefreshToken and the token endpoint's refresh grant: "OK" or the error."""
+        outcomes = [outcome(cognito_idp.initiate_auth, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                            AuthParameters={"REFRESH_TOKEN": token}),
+                    outcome(cognito_idp.get_tokens_from_refresh_token, ClientId=cid, RefreshToken=token)]
+        status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+            "grant_type": "refresh_token", "client_id": cid, "refresh_token": token})
+        return ["OK" if isinstance(o, dict) else o for o in outcomes] + [
+            "OK" if status == 200 else json.loads(body)["error"]]
+
+    return pid, cid, sign_in, get_user, refresh
+
+
+@pytest.mark.auth_contract
+def test_cognito_disable_user_revokes_tokens(auth_enabled, cognito_idp):
+    pid, cid, sign_in, get_user, refresh = _disable_user_pool(cognito_idp)
+    bob, erin = sign_in("testuser"), sign_in("erin")
+    hosted = _code_grant_tokens(cognito_idp, cid, "openid aws.cognito.signin.user.admin")
+    refreshed = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={
+        "REFRESH_TOKEN": bob["RefreshToken"]})["AuthenticationResult"]["AccessToken"]
+    access_tokens = (bob["AccessToken"], refreshed, hosted["access_token"])
+    refresh_tokens = (bob["RefreshToken"], hosted["refresh_token"])
+    assert refresh(hosted["refresh_token"]) == ["OK"] * 3
+
+    # While disabled every token of the user is refused as disabled, refresh tokens too.
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="testuser")
+    disabled = ("NotAuthorizedException", "User is disabled.")
+    for token in access_tokens:
+        assert get_user(token) == (disabled if auth_enabled else "testuser")
+    update = {"AccessToken": bob["AccessToken"], "UserAttributes": [{"Name": "name", "Value": "Bob"}]}
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.update_user_attributes(**update)
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == disabled
+    else:
+        cognito_idp.update_user_attributes(**update)
+    for token in refresh_tokens:
+        assert refresh(token) == ([disabled, disabled, "invalid_grant"] if auth_enabled else ["OK"] * 3)
+    assert get_user(erin["AccessToken"]) == "erin"
+
+    # AdminEnableUser lets the user sign in again; the sessions from before stay revoked.
+    cognito_idp.admin_enable_user(UserPoolId=pid, Username="testuser")
+    revoked = ("NotAuthorizedException", "Access Token has been revoked")
+    for token in access_tokens:
+        assert get_user(token) == (revoked if auth_enabled else "testuser")
+    refresh_revoked = ("NotAuthorizedException", "Refresh Token has been revoked")
+    for token in refresh_tokens:
+        assert refresh(token) == ([refresh_revoked, refresh_revoked, "invalid_grant"] if auth_enabled else ["OK"] * 3)
+    later = sign_in("testuser")
+    assert get_user(later["AccessToken"]) == "testuser"
+    assert refresh(later["RefreshToken"]) == ["OK"] * 3
+
+
+@pytest.mark.auth_contract
+def test_cognito_deleted_user_access_token(auth_enabled, cognito_idp):
+    pid, _, sign_in, get_user, _ = _disable_user_pool(cognito_idp)
+    old = sign_in("erin")["AccessToken"]
+    cognito_idp.admin_delete_user(UserPoolId=pid, Username="erin")
+    invalid = ("NotAuthorizedException", "Invalid access token.")
+    assert get_user(old) == (("UserNotFoundException", "User does not exist.") if auth_enabled else invalid)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="erin", MessageAction="SUPPRESS")
+    # The same username belongs to another user now.
+    assert get_user(old) == invalid
+
+
 def test_cognito_expired_access_token_refused_under_auth(monkeypatch):
     mod, call = _idp_in_process(monkeypatch, auth=True)
     _, cid, sign_in = _password_client_with_users(

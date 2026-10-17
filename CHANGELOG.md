@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `AdminDisableUser` revokes the user's tokens under `AUTH=true`** — a disabled user's access and refresh tokens kept working, also after `AdminEnableUser`; with `AUTH=true` they are now refused with `User is disabled.` while the user is disabled, and the sessions from before stay revoked once the user is enabled again (`Access Token has been revoked`, `Refresh Token has been revoked`, `invalid_grant` at `/oauth2/token`), as AWS does, and the access token of a deleted user gets `UserNotFoundException: User does not exist.` Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
