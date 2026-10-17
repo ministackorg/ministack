@@ -2870,3 +2870,36 @@ def test_kms_create_grant_rejects_primary_pending_replica_deletion():
         assert east.list_grants(KeyId=key_id)["Grants"] == []
     finally:
         west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("days", [1, 6, 31])
+@pytest.mark.parametrize("multi_region", [False, True])
+def test_kms_deletion_window_rejects_out_of_range_without_mutation(kms_client, days, multi_region):
+    key_id = kms_client.create_key(MultiRegion=multi_region)["KeyMetadata"]["KeyId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+        assert meta["KeyState"] == "Enabled"
+        assert meta["Enabled"] is True
+        assert "DeletionDate" not in meta
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("days", [7, 30, None])
+def test_kms_deletion_window_boundaries_and_default(kms_client, days):
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    before = time.time()
+    result = kms_client.schedule_key_deletion(KeyId=key_id, **({"PendingWindowInDays": days} if days else {}))
+    after = time.time()
+    assert result["KeyState"] == "PendingDeletion"
+    deletion_time = result["DeletionDate"].timestamp()
+    assert before + (days or 30) * 86400 - 1 <= deletion_time <= after + (days or 30) * 86400
+    kms_client.cancel_key_deletion(KeyId=key_id)
+    meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeyState"] == "Disabled"
+    assert "DeletionDate" not in meta
+    kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
