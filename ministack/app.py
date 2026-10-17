@@ -2255,7 +2255,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
             denied = _enforce_data_plane(
                 "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
-                service_context=s3_service_context(f"s3:{s3_action}", query_params),
+                service_context=s3_service_context(f"s3:{s3_action}", query_params, vhost_path, headers),
             )
             if denied:
                 return denied
@@ -2736,7 +2736,7 @@ async def _dispatch_service_request(
             )
             service_context = (
                 dynamodb_service_context(body) if service == "dynamodb"
-                else s3_service_context(iam_action, query_params) if service == "s3"
+                else s3_service_context(iam_action, query_params, path, headers) if service == "s3"
                 else None
             )
             if service == "logs":

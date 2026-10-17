@@ -1872,8 +1872,11 @@ def dynamodb_transaction_checks(
     return checks
 
 
-def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
-    """The s3:prefix, s3:delimiter and s3:max-keys a ListBucket or ListBucketVersions request sends."""
+def s3_service_context(iam_action: str, query_params: dict | None, path: str = "",
+                       headers: dict | None = None) -> dict:
+    """The S3 condition keys a request carries: listing keys, a write's encryption and ACL, a read's object tags."""
+    if iam_action in ("s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"):
+        return _s3_object_context(iam_action, query_params or {}, path, headers or {})
     if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
         return {}
     context = {}
@@ -1883,6 +1886,28 @@ def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
             value = value[0] if value else None
         if value is not None:
             context[f"s3:{param}"] = value
+    return context
+
+
+def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
+    """s3:x-amz-server-side-encryption and s3:x-amz-acl of a write, s3:ExistingObjectTag/<key> of a read."""
+    from ministack.services import s3 as s3_svc
+
+    bucket, _, key = path.lstrip("/").partition("/")
+    context: dict = {}
+    if not key:
+        return context
+    if iam_action == "s3:PutObject":
+        # A part and the completion carry no headers: the upload's own request decides.
+        upload_id = _query_param(query_params, "uploadId")
+        sse = s3_svc.upload_encryption_header(upload_id) if upload_id else headers.get("x-amz-server-side-encryption")
+        if sse:
+            context["s3:x-amz-server-side-encryption"] = sse
+        if not upload_id and headers.get("x-amz-acl"):
+            context["s3:x-amz-acl"] = headers["x-amz-acl"]
+    else:
+        for name, value in s3_svc.object_tags_for_condition(bucket, key, query_params).items():
+            context[f"s3:ExistingObjectTag/{name}"] = value
     return context
 
 

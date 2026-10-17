@@ -1066,6 +1066,20 @@ def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
 
 
+def object_tags_for_condition(bucket_name: str, key: str, query_params: dict) -> dict:
+    """The tags of the object version a read names, for ``s3:ExistingObjectTag`` in the identity check."""
+    bucket = _buckets.get(bucket_name)
+    if bucket is None:
+        return {}
+    return _object_tags.get((bucket_name, key, _resolve_subresource_version(query_params, bucket, key)), {})
+
+
+def upload_encryption_header(upload_id: str) -> str | None:
+    """The ``x-amz-server-side-encryption`` its CreateMultipartUpload carried, for the identity check of a part."""
+    upload = _multipart_uploads.get(upload_id)
+    return upload.get("requested_sse") if upload else None
+
+
 def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
                            method: str, query_params: dict, caller: str) -> bool:
     """Whether a caller who does not own the bucket may have this request.
@@ -7582,6 +7596,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "content_type": content_type,
         "content_encoding": content_encoding,
         "preserved_headers": preserved,
+        "requested_sse": headers.get("x-amz-server-side-encryption"),
         "storage_class": storage_class,
         "checksum_algorithm": checksum_algorithm,
         "created": now_iso(),

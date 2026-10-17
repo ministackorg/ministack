@@ -9082,6 +9082,101 @@ def test_s3_read_permission_contract(auth_enabled, iam_user, auth_s3_objects, pe
             assert body.read() == b"auth-contract"
 
 
+@pytest.fixture
+def auth_condition_bucket(s3):
+    """A bucket whose policy denies a user an object action under a condition; emptied and removed after."""
+    bucket = f"auth-cond-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=bucket)
+
+    def deny(user_arn, action, condition):
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": user_arn}, "Action": action,
+            "Resource": f"arn:aws:s3:::{bucket}/*", "Condition": condition}]}))
+        return bucket
+
+    yield deny
+    for upload in s3.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
+        s3.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+    for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+        s3.delete_object(Bucket=bucket, Key=item["Key"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+_ALLOW_ALL_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+
+
+def _assert_s3_condition(auth_enabled, allowed, call):
+    """Under AUTH a refused call answers 403 AccessDenied; anything else succeeds."""
+    if auth_enabled and not allowed:
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] in ("AccessDenied", "403")
+    else:
+        assert call()["ResponseMetadata"]["HTTPStatusCode"] in (200, 204)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("condition", [
+    {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}},
+    {"Null": {"s3:x-amz-server-side-encryption": "true"}},
+], ids=["string-not-equals", "null"])
+def test_s3_encryption_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket, condition):
+    """A bucket policy on s3:x-amz-server-side-encryption sees the header of a PutObject and a CopyObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", condition)
+    s3.put_object(Bucket=bucket, Key="source", Body=b"x")
+    client = user.client("s3")
+    for sse in (None, "AES256"):
+        extra = {"ServerSideEncryption": sse} if sse else {}
+        _assert_s3_condition(auth_enabled, sse is not None,
+                             lambda: client.put_object(Bucket=bucket, Key=f"put-{sse}", Body=b"x", **extra))
+        _assert_s3_condition(auth_enabled, sse is not None, lambda: client.copy_object(
+            Bucket=bucket, Key=f"copy-{sse}", CopySource={"Bucket": bucket, "Key": "source"}, **extra))
+
+
+@pytest.mark.auth_contract
+def test_s3_multipart_encryption_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A part and the completion carry the encryption header their CreateMultipartUpload sent."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"Null": {"s3:x-amz-server-side-encryption": "true"}})
+    client = user.client("s3")
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key="sealed", ServerSideEncryption="AES256")["UploadId"]
+    etag = client.upload_part(Bucket=bucket, Key="sealed", UploadId=upload_id, PartNumber=1, Body=b"x")["ETag"]
+    client.complete_multipart_upload(Bucket=bucket, Key="sealed", UploadId=upload_id,
+                                     MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})
+    plain = s3.create_multipart_upload(Bucket=bucket, Key="plain")["UploadId"]
+    _assert_s3_condition(auth_enabled, False, lambda: client.upload_part(
+        Bucket=bucket, Key="plain", UploadId=plain, PartNumber=1, Body=b"x"))
+
+
+@pytest.mark.auth_contract
+def test_s3_canned_acl_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """A bucket policy on s3:x-amz-acl sees the canned ACL of a PutObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject",
+                                   {"StringNotEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}})
+    client = user.client("s3")
+    for acl in (None, "bucket-owner-full-control", "private"):
+        extra = {"ACL": acl} if acl else {}
+        _assert_s3_condition(auth_enabled, acl == "bucket-owner-full-control",
+                             lambda: client.put_object(Bucket=bucket, Key=f"acl-{acl}", Body=b"x", **extra))
+
+
+@pytest.mark.auth_contract
+def test_s3_existing_object_tag_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A bucket policy on s3:ExistingObjectTag sees the tags of the object a GetObject or HeadObject reads."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:GetObject", {"StringEquals": {"s3:ExistingObjectTag/class": "secret"}})
+    for name, tagging in (("secret", "class=secret"), ("public", "class=public"), ("untagged", "")):
+        s3.put_object(Bucket=bucket, Key=name, Body=b"x", **({"Tagging": tagging} if tagging else {}))
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, False, lambda: client.get_object(Bucket=bucket, Key="secret"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.head_object(Bucket=bucket, Key="secret"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.get_object(Bucket=bucket, Key="public"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.get_object(Bucket=bucket, Key="untagged"))
+
+
 @pytest.mark.auth_contract
 @pytest.mark.parametrize("addressing_style", ["path", "virtual"])
 @pytest.mark.parametrize("allow_source_read", [False, True], ids=["no-source-read", "source-read"])
