@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **API Gateway — presigned calls to `AWS_IAM` REST methods under `AUTH=true`** — a request signed in its query string (`X-Amz-Signature`) with an IAM user or STS session key answered 403 `MissingAuthenticationTokenException` on an `AWS_IAM` method even when correctly signed; under `AUTH=true`, which verifies that signature, it now reaches the method as on AWS. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

@@ -1927,7 +1927,11 @@ async def _authorize_request_v1(
     if auth_type == "AWS_IAM":
         # Signatures are verified only under AUTH; here match AWS only to the extent
         # that a request with no Authorization header is rejected as unauthenticated.
-        if not _header_ci(headers, "authorization"):
+        # Under AUTH a presigned request was verified before it got here.
+        from ministack.app import AUTH
+        from ministack.core.iam_evaluator import _query_signed
+
+        if not _header_ci(headers, "authorization") and not (AUTH and _query_signed(query_params or {})):
             return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token"), None
         return None, None
     if auth_type == "COGNITO_USER_POOLS":
