@@ -2870,3 +2870,36 @@ def test_kms_create_grant_rejects_primary_pending_replica_deletion():
         assert east.list_grants(KeyId=key_id)["Grants"] == []
     finally:
         west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("algorithm,other", [
+    ("RSAES_OAEP_SHA_256", "RSAES_OAEP_SHA_1"),
+    ("RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"),
+])
+def test_kms_decrypt_uses_requested_rsa_algorithm(kms_client, algorithm, other):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    try:
+        public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+        digest = hashes.SHA256() if algorithm.endswith("SHA_256") else hashes.SHA1()
+        ciphertext = public_key.encrypt(b"external ciphertext", padding.OAEP(
+            mgf=padding.MGF1(digest), algorithm=digest, label=None))
+        with pytest.raises(ClientError) as exc:
+            kms_client.decrypt(KeyId=key_id, CiphertextBlob=ciphertext, EncryptionAlgorithm=other)
+        assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        result = kms_client.decrypt(KeyId=key_id, CiphertextBlob=ciphertext, EncryptionAlgorithm=algorithm)
+        assert result["Plaintext"] == b"external ciphertext"
+        assert result["EncryptionAlgorithm"] == algorithm
+        with pytest.raises(ClientError) as exc:
+            kms_client.decrypt(KeyId=key_id, CiphertextBlob=ciphertext)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        with pytest.raises(ClientError) as exc:
+            kms_client.decrypt(KeyId=key_id, CiphertextBlob=ciphertext, EncryptionAlgorithm="SYMMETRIC_DEFAULT")
+        assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
