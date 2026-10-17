@@ -4244,7 +4244,7 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", cop
         extra_hosts.setdefault(host, "host-gateway")
     if not os.path.exists(cert_path):
         return
-    # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
+    # NODE_EXTRA_CA_CERTS adds to node's roots; the others replace the store.
     bundle = _tls.ca_bundle_path(cert_path)
 
     def trust(target, source):
@@ -4257,7 +4257,7 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", cop
     container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
     if bundle:
         trust(_CONTAINER_BUNDLE_PATH, bundle)
-        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
             container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
     # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
     if runtime.startswith("java"):

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFormation — custom resource `ResponseURL` and `WaitConditionHandle` URL under `USE_SSL=1`** — both URLs were always `http://`, which the TLS-only gateway drops without a response, so a Python handler that PUTs its `ResponseURL` with `urllib` (CDK's bucket notifications handler does) never signalled and the stack waited out `ServiceTimeout`, and a signal to the handle URL never arrived; both are now `https://` when `USE_SSL` is on, and the Lambdas MiniStack runs also get `SSL_CERT_FILE` set to the gateway's CA bundle, which Python's `ssl` reads where it ignores `REQUESTS_CA_BUNDLE`. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

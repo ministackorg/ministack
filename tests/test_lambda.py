@@ -14071,6 +14071,15 @@ def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, 
         (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
 
 
+def test_lambda_container_python_ssl_trusts_the_gateway_under_use_ssl(monkeypatch, tmp_path):
+    """urllib reads SSL_CERT_FILE, not the *_CA_BUNDLE vars, e.g. for a custom-resource ResponseURL PUT."""
+    from ministack.services import lambda_svc as lsvc
+
+    _rk, container_env, _mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    assert container_env["SSL_CERT_FILE"] == lsvc._CONTAINER_BUNDLE_PATH
+
+
 def test_lambda_trust_files_are_copied_not_mounted_when_ministack_runs_in_docker(monkeypatch, tmp_path):
     """In a container the trust files are docker cp'd, not bind-mounted; a symlink is followed."""
     import tarfile

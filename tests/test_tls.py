@@ -280,6 +280,58 @@ def test_iot_data_client_reaches_the_described_endpoint_over_https(tmp_path, mon
         _terminate(proc)
 
 
+_CFN_RESPONDER = """\
+import json, urllib.request
+
+def handler(event, context):
+    body = json.dumps({"Status": "SUCCESS", "PhysicalResourceId": "tls", "StackId": event["StackId"],
+                       "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"],
+                       "Data": {"Scheme": event["ResponseURL"].split(":", 1)[0]}}).encode()
+    urllib.request.urlopen(urllib.request.Request(event["ResponseURL"], data=body, method="PUT"), timeout=10)
+"""
+
+
+@pytest.mark.serial
+def test_python_custom_resource_answers_its_response_url_over_https(tmp_path):
+    """A Python handler PUTs its ResponseURL with urllib, as CDK's bucket notifications handler does."""
+    import io
+    import json
+    import zipfile
+
+    import boto3
+
+    port = _free_port()
+    proc = _spawn({"USE_SSL": "1", "TMPDIR": str(tmp_path), "MINISTACK_HOST": "localhost",
+                   "GATEWAY_PORT": str(port), "MINISTACK_SSL_CERT": "", "MINISTACK_SSL_KEY": ""}, port)
+    try:
+        _wait_health(f"https://127.0.0.1:{port}/_ministack/health", ctx=_ctx_no_verify())
+        kw = {"endpoint_url": f"https://localhost:{port}", "region_name": "us-east-1",
+              "aws_access_key_id": "test", "aws_secret_access_key": "test",
+              "verify": str(tmp_path / "ministack-tls" / "server.crt")}
+        code = io.BytesIO()
+        with zipfile.ZipFile(code, "w") as zf:
+            zf.writestr("index.py", _CFN_RESPONDER)
+        role = boto3.client("iam", **kw).create_role(RoleName="tls-responder", AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                    "Principal": {"Service": "lambda.amazonaws.com"}}]}))["Role"]["Arn"]
+        arn = boto3.client("lambda", **kw).create_function(
+            FunctionName="tls-responder", Runtime="python3.12", Role=role,
+            Handler="index.handler", Code={"ZipFile": code.getvalue()})["FunctionArn"]
+        cfn = boto3.client("cloudformation", **kw)
+        cfn.create_stack(StackName="tls-cr", TemplateBody=json.dumps({
+            "Resources": {"CR": {"Type": "Custom::Tls", "Properties": {"ServiceToken": arn, "ServiceTimeout": "20"}}},
+            "Outputs": {"Scheme": {"Value": {"Fn::GetAtt": ["CR", "Scheme"]}}},
+        }))
+        deadline = time.time() + 60
+        while (stack := cfn.describe_stacks(StackName="tls-cr")["Stacks"][0])["StackStatus"].endswith("_IN_PROGRESS"):
+            assert time.time() < deadline, stack
+            time.sleep(1)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Outputs"][0]["OutputValue"] == "https"
+    finally:
+        _terminate(proc)
+
+
 def test_byo_certificate_is_never_regenerated(tmp_path, monkeypatch):
     """MINISTACK_SSL_CERT is the operator's, so the issuer host is their
     business and we must hand it back untouched."""
