@@ -711,6 +711,7 @@ _CUSTOM_NAME_REPLACEMENT = {
         ),
     },
     "AWS::IoT::DomainConfiguration": {"name": "DomainConfigurationName"},
+    "AWS::KinesisAnalyticsV2::Application": {"name": "ApplicationName"},
     # BackupVaultName is required, so every vault is custom-named. Measured on
     # an account: adding EncryptionKeyArn fails with the refusal sentence.
     "AWS::Backup::BackupVault": {
@@ -3468,15 +3469,6 @@ def _kda_application_create(logical_id, props, stack_name):
 
 
 def _kda_application_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """ApplicationName replaces; the rest updates in place."""
-    replaced = _rename_replacement(
-        physical_id, old_props, new_props, stack_name, logical_id,
-        new_props.get("ApplicationName") or physical_id,
-        physical_id if physical_id in _kda._applications else None,
-        _kda_application_create, _kda_application_delete,
-    )
-    if replaced is not None:
-        return replaced
     _kda.replace_from_template(physical_id, new_props)
     arn = _kda._applications[physical_id]["ApplicationARN"]
     tags = _tag_map(new_props.get("Tags"))
@@ -3505,11 +3497,14 @@ def _kda_logging_option_create(logical_id, props, stack_name):
 
 
 def _kda_logging_option_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """Both properties are create-only, so any change replaces the option."""
-    if old_props == new_props:
-        return physical_id, {}
-    _kda_logging_option_delete(physical_id, old_props)
-    return _kda_logging_option_create(logical_id or physical_id, new_props, stack_name)
+    stream = (new_props.get("CloudWatchLoggingOption") or {}).get("LogStreamARN")
+    if stream != (old_props.get("CloudWatchLoggingOption") or {}).get("LogStreamARN"):
+        _kda_call(_kda.update_application, {
+            "ApplicationName": new_props.get("ApplicationName"),
+            "CloudWatchLoggingOptionUpdates": [
+                {"CloudWatchLoggingOptionId": physical_id, "LogStreamARNUpdate": stream}],
+        }, "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption")
+    return physical_id, {}
 
 
 def _kda_logging_option_delete(physical_id, props):
@@ -3533,13 +3528,7 @@ def _cwlogs_stream_create(logical_id, props, stack_name):
 
 
 def _cwlogs_stream_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """LogGroupName and LogStreamName are create-only: a change replaces the stream."""
-    if (old_props.get("LogGroupName") == new_props.get("LogGroupName")
-            and (new_props.get("LogStreamName") or physical_id) == physical_id):
-        return physical_id, {}
-    created = _cwlogs_stream_create(logical_id or physical_id, new_props, stack_name)
-    _delete_predecessor(_cwlogs_stream_delete, physical_id, old_props)
-    return created
+    return physical_id, {}
 
 
 def _cwlogs_stream_delete(physical_id, props):
@@ -14579,6 +14568,9 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "FileSystemId", "IpAddress", "IpAddressType", "Ipv6Address", "SubnetId",
     ),
     "AWS::EFS::AccessPoint": ("ClientToken", "FileSystemId", "PosixUser", "RootDirectory"),
+    "AWS::KinesisAnalyticsV2::Application": ("ApplicationName", "ApplicationMode"),
+    "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption": ("ApplicationName",),
+    "AWS::Logs::LogStream": ("LogGroupName", "LogStreamName"),
 }
 
 

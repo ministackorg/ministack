@@ -634,3 +634,55 @@ def test_runtime_without_an_image_stays_control_plane_only(local_state, monkeypa
     assert described() == "READY"
     [snap] = kda._snapshots["dp"].values()
     assert snap["SnapshotStatus"] == "READY"
+
+
+def test_unknown_action_and_int_timestamps(local_state):
+    status, body = _call("ListApplications", {})
+    assert (status, body["__type"]) == (400, "UnknownOperationException")
+    kda.create_application({"ApplicationName": "ts", "RuntimeEnvironment": RUNTIME, "ServiceExecutionRole": ROLE})
+    detail = _call("DescribeApplication", {"ApplicationName": "ts"})[1]["ApplicationDetail"]
+    assert isinstance(detail["CreateTimestamp"], int)
+    assert isinstance(detail["LastUpdateTimestamp"], int)
+
+
+def _logging_stack(app_name, group, stream, mode="STREAMING"):
+    import json
+
+    return json.dumps({"Resources": {
+        "Logs": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": group}},
+        "StreamA": {"Type": "AWS::Logs::LogStream", "Properties": {"LogGroupName": {"Ref": "Logs"},
+                                                                   "LogStreamName": "a"}},
+        "StreamB": {"Type": "AWS::Logs::LogStream", "Properties": {"LogGroupName": {"Ref": "Logs"},
+                                                                   "LogStreamName": "b"}},
+        "App": {"Type": "AWS::KinesisAnalyticsV2::Application", "Properties": {
+            "ApplicationName": app_name, "RuntimeEnvironment": RUNTIME, "ServiceExecutionRole": ROLE,
+            "ApplicationMode": mode, "ApplicationConfiguration": CODE}},
+        "AppLogging": {"Type": "AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption",
+                       "DependsOn": ["StreamA", "StreamB"],
+                       "Properties": {"ApplicationName": {"Ref": "App"}, "CloudWatchLoggingOption": {
+                           "LogStreamARN": {"Fn::Sub": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:"
+                                                       f"log-group:{group}:log-stream:{stream}"}}}},
+    }})
+
+
+def test_cloudformation_logging_option_updates_in_place_and_mode_change_is_refused(cfn, kinesisanalyticsv2):
+    stack, app, group = _name("flink-log"), _name("cfn-app"), f"/flink/{_name()}"
+    cfn.create_stack(StackName=stack, TemplateBody=_logging_stack(app, group, "a"))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        [before] = _detail(kinesisanalyticsv2, app)["CloudWatchLoggingOptionDescriptions"]
+
+        cfn.update_stack(StackName=stack, TemplateBody=_logging_stack(app, group, "b"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        [after] = _detail(kinesisanalyticsv2, app)["CloudWatchLoggingOptionDescriptions"]
+        assert after["CloudWatchLoggingOptionId"] == before["CloudWatchLoggingOptionId"]
+        assert after["LogStreamARN"].endswith(":log-stream:b")
+
+        cfn.update_stack(StackName=stack, TemplateBody=_logging_stack(app, group, "b", mode="INTERACTIVE"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        events = cfn.describe_stack_events(StackName=stack)["StackEvents"]
+        failed = next(e for e in events if e["LogicalResourceId"] == "App" and e["ResourceStatus"] == "UPDATE_FAILED")
+        assert "custom-named resource requires replacing" in failed["ResourceStatusReason"]
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack)

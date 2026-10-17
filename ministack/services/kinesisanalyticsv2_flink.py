@@ -1,41 +1,7 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""
-Managed Service for Apache Flink data plane: Docker-backed job execution.
-
-The control plane (``kinesisanalyticsv2``) owns application records and status;
-this module owns the containers. When Docker is available, starting an
-application launches a JobManager and a TaskManager from the official Apache
-Flink image for the application's runtime, fetches the application jar from
-MiniStack S3 and submits it through the Flink REST API. Stop, snapshot and
-restore map to Flink savepoints.
-
-Interface used by the control plane (all synchronous; none raise):
-
-- ``available()``: Docker is reachable.
-- ``supports(runtime)``: this data plane can run jobs for the runtime
-  (``FLINK-1_19`` and ``FLINK-1_20``); other runtimes stay control plane only.
-- ``start(app, savepoint_path, on_status)``: launch the cluster and submit the
-  job in a background thread; ``on_status("RUNNING")`` or
-  ``on_status("FAILED", message)`` reports the outcome.
-- ``snapshot(app, snapshot_name)``: take a savepoint; returns its path, or
-  ``None`` if it failed.
-- ``stop(app, force, take_snapshot)``: stop the job and remove the containers;
-  returns the savepoint path when one was taken.
-- ``delete(app)``: remove containers, network and savepoint volume.
-- ``reset()``: remove everything this MiniStack instance created.
-
-``app`` is the stored record in the DescribeApplication shape plus
-``AccountId`` and ``Region``.
-
-Savepoints live in a per-application Docker volume mounted at the same path in
-both containers, so they survive a stop (which removes the containers) and a
-MiniStack restart, and need no S3 filesystem configuration.
-
-Runtime images match the Flink patch version and Java version AWS documents for
-each runtime (Managed Flink developer guide, "Amazon Managed Service for Apache
-Flink 1.19" and "1.20" pages: Flink 1.19.1 and 1.20.5, Java 11).
-"""
+"""Managed Service for Apache Flink data plane: each application runs as a JobManager and a TaskManager
+from the official Flink image, and snapshots are Flink savepoints in a per-application volume."""
 
 import hashlib
 import io
@@ -68,15 +34,8 @@ _RUNTIME_IMAGES = {
 _LABEL = "kinesisanalyticsv2"
 _REST_PORT = 8081
 _SAVEPOINT_DIR = "/flink-savepoints"
-# Path the aws-kinesisanalytics-runtime library reads runtime properties from
-# (com.amazonaws:aws-kinesisanalytics-runtime 1.2.0, config.properties).
 _PROPERTIES_PATH = "/etc/flink/application_properties.json"
-# Jars added to every cluster's /opt/flink/lib, like the libraries Managed Flink
-# provides on its classpath. Managed Flink provides
-# com.amazonaws:aws-kinesisanalytics-runtime ("Provided dependencies",
-# Managed Flink developer guide, best practices), and AWS documents building
-# jobs with it in provided scope, so it must come from here: mount a
-# directory holding it. Same pattern as the RDS IAM plugin's artifact root.
+# Jars mounted here join every cluster's classpath, as Managed Flink provides aws-kinesisanalytics-runtime.
 _FLINK_LIB_DIR = "/opt/ministack/flink-lib"
 # UID of the ``flink`` user in the official image; the savepoint volume must be
 # writable by it.

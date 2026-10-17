@@ -1,30 +1,6 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""
-Amazon Managed Service for Apache Flink (kinesisanalyticsv2) control plane.
-JSON 1.1 via X-Amz-Target (prefix: KinesisAnalytics_20180523).
-
-Verified against botocore kinesisanalyticsv2/2018-05-23/service-2.json:
-  metadata.targetPrefix = "KinesisAnalytics_20180523"
-  metadata.signingName  = "kinesisanalytics"
-  metadata.protocol     = "json", jsonVersion "1.1"
-
-Supports the operations a CDK deploy and a lifecycle script use:
-  CreateApplication, DescribeApplication, UpdateApplication, DeleteApplication,
-  StartApplication, StopApplication,
-  CreateApplicationSnapshot, ListApplicationSnapshots,
-  DescribeApplicationSnapshot, DeleteApplicationSnapshot,
-  AddApplicationCloudWatchLoggingOption, DeleteApplicationCloudWatchLoggingOption,
-  TagResource, UntagResource, ListTagsForResource.
-
-Running the job is the job of the optional data plane module
-(``kinesisanalyticsv2_flink``), which starts Flink containers when Docker is
-available. Without it, applications move through the same statuses and keep
-snapshot records, but no job runs.
-
-Records keep the request shape of ApplicationConfiguration; DescribeApplication
-renders the Description shape from it. Stores are per account and region.
-"""
+"""Amazon Managed Service for Apache Flink (kinesisanalyticsv2) control plane; jobs run in kinesisanalyticsv2_flink."""
 
 import base64
 import contextvars
@@ -43,13 +19,10 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
 )
+from ministack.services import kinesisanalyticsv2_flink as _dataplane
 
 logger = logging.getLogger("kinesisanalyticsv2")
 
-try:  # The Docker-backed data plane is optional.
-    from ministack.services import kinesisanalyticsv2_flink as _dataplane
-except ImportError:  # pragma: no cover - present once the data plane lands
-    _dataplane = None
 
 _applications = AccountRegionScopedDict()  # ApplicationName -> record
 _snapshots = AccountRegionScopedDict()     # ApplicationName -> {SnapshotName -> snapshot}
@@ -100,11 +73,10 @@ def load_persisted_state(data):
 
 
 def reset():
-    if _dataplane is not None:
-        try:
-            _dataplane.reset()
-        except Exception:  # never let cleanup break a reset
-            logger.exception("kinesisanalyticsv2 data plane reset failed")
+    try:
+        _dataplane.reset()
+    except Exception:
+        logger.exception("kinesisanalyticsv2 data plane reset failed")
     _applications.clear()
     _snapshots.clear()
     _tags.clear()
@@ -133,7 +105,7 @@ def _new_token():
 def _bump_version(record):
     record["ApplicationVersionId"] += 1
     record["ConditionalToken"] = _new_token()
-    record["LastUpdateTimestamp"] = time.time()
+    record["LastUpdateTimestamp"] = int(time.time())
 
 
 def _check_concurrency(record, data):
@@ -313,7 +285,7 @@ def create_application(data):
                       "(SQL and Studio applications) is not implemented.")
     if name in _applications:
         return _error("ResourceInUseException", f"Application '{name}' already exists.")
-    now = time.time()
+    now = int(time.time())
     record = {
         "ApplicationARN": _arn(name),
         "ApplicationName": name,
@@ -444,7 +416,7 @@ def delete_application(data, check_timestamp=True):
     if record["ApplicationStatus"] in _TRANSITIONAL:
         return _error("ResourceInUseException",
                       f"Application {name} is in {record['ApplicationStatus']} status and cannot be deleted.")
-    if _dataplane is not None and record.get("_driven"):
+    if record.get("_driven"):
         _in_background(_dataplane_call, "delete", _dataplane_view(record))
     del _applications[name]
     _snapshots.pop(name, None)
@@ -503,7 +475,7 @@ def _restore_path(record, restore):
 
 def _runs_jobs(record):
     """Docker is available and the data plane has an image for the runtime."""
-    return (_dataplane is not None and _dataplane.available()
+    return (_dataplane.available()
             and _dataplane.supports(record["RuntimeEnvironment"]))
 
 
@@ -616,7 +588,7 @@ def _add_snapshot(record, snapshot_name, savepoint_path, status="READY"):
         "SnapshotName": snapshot_name,
         "SnapshotStatus": status,
         "ApplicationVersionId": record["ApplicationVersionId"],
-        "SnapshotCreationTimestamp": time.time(),
+        "SnapshotCreationTimestamp": int(time.time()),
         "RuntimeEnvironment": record["RuntimeEnvironment"],
         "ApplicationEncryptionConfigurationDescription": _encryption_description(record),
     }
@@ -834,6 +806,5 @@ async def handle_request(method, path, headers, body, query_params):
         return _error("SerializationException", "Invalid JSON")
     handler = _HANDLERS.get(action)
     if handler is None:
-        return _error("UnsupportedOperationException",
-                      f"MiniStack does not implement kinesisanalyticsv2 {action or 'request'}.")
+        return _error("UnknownOperationException", f"Unknown operation: {action}")
     return handler(data)
