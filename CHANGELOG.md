@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — `aws:ResourceTag` conditions and the denied resource under `AUTH=true`** — a policy condition on `aws:ResourceTag/<key>` never matched for IoT, so a tag-scoped Allow denied every call and a tag-scoped Deny never applied; it now reads the tags of the thing group, policy, job or other IoT resource the call names, and an IoT denial names that resource (`on resource: <arn>`, `*` for a call that names none) as AWS does. Contributed by @iot-rocket.
+- **IoT — tagging calls are authorized on the tagged resource under `AUTH=true`** — `TagResource`, `UntagResource` and `ListTagsForResource` were checked against resource `*`, so a policy scoped to a thing group, job or other IoT ARN denied them even on that resource, and only `Resource: "*"` let them through; they are now checked against the `resourceArn` the request names. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
