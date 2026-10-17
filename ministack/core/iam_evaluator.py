@@ -1333,6 +1333,17 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     return AuthError(*failure) if failure else credential
 
 
+def check_credentials(access_key_id: str) -> AuthError | None:
+    """Authenticate a request no IAM action covers, with the checks enforce() makes before any policy."""
+    from ministack.core.responses import get_account_id
+
+    account_id = get_account_id()
+    checked = authenticate(access_key_id or "", account_id)
+    if checked is None:
+        checked = resolve_principal(access_key_id or "", account_id)
+    return checked if isinstance(checked, AuthError) else None
+
+
 # ---------------------------------------------------------------------------
 # Top-level enforcement entry point
 # ---------------------------------------------------------------------------

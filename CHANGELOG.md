@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **S3 Tables, Glue — Iceberg REST calls are authorized under `AUTH=true`** — the Iceberg REST catalog at `/iceberg` served S3 Tables and Glue catalog calls without checking their credentials; each call is now authorized for the catalog that serves it, whatever service it is signed for: on a table bucket as the `s3tables` actions AWS lists for its operation (`loadTable` needs `GetTableMetadataLocation`, then `GetTableData`) on the bucket or table (`table/*` for one that does not exist), on the Glue catalog as its `glue` action on the catalog, then the database, then the table, and `transactions/commit` as `updateTable` on each table it changes. A denial answers 403 in the Iceberg error shape naming the action and resource ("Access Denied" for a later S3 Tables action, no body for `HEAD`), and a `{prefix}` that is neither a table bucket ARN nor `<account>:s3tablescatalog/<bucket>` answers 400 `bad_request`, as AWS does. Contributed by @iot-rocket.
+- **RDS Data, S3 Control — calls are authorized under `AUTH=true`** — RDS Data calls and S3 Control tagging calls were served whatever the caller's policies allowed; each RDS Data call is now authorized as `rds-data:<operation>` on the cluster its `resourceArn` names, and `ListTagsForResource`, `TagResource` and `UntagResource` as `s3:<operation>` on the bucket, with a 403 denial (`AccessDeniedException` from RDS Data, `AccessDenied` from S3 Control) naming the action and resource, as on AWS. Contributed by @iot-rocket.
+- **SES v2 — calls are authorized under `AUTH=true`** — SES v2 calls were served whatever the caller's policies allowed; each is now authorized as `ses:<operation>` on the configuration set, contact list, custom verification email template, dedicated IP pool, identity or template its path or create body names (`*` otherwise), and a denial answers 403 `AccessDeniedException` naming the action and resource, as on AWS. Contributed by @iot-rocket.
+
+### Fixed
+- **Auth — requests that map to no IAM action are authenticated** — under `AUTH=true` a request MiniStack maps to no IAM action (SES v2, RDS Data, S3 Control, or a service MiniStack does not implement such as X-Ray) was served with a wrong secret, an unknown key, a session key without its token or a stale signature; it now answers the credential error AWS sends for the service, for example `InvalidSignatureException` 403 from SES v2 and RDS Data and `SignatureDoesNotMatch` 403 from S3 Control. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
