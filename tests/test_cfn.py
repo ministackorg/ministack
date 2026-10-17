@@ -22093,6 +22093,42 @@ def test_cfn_update_iam_role_in_place(cfn, iam):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+@pytest.mark.parametrize("operation, effect, message", [
+    ("create", "Allow", "Allow with NotPrincipal is not allowed."),
+    ("update", "Deny", "AssumeRole policy must not contain NotPrincipal field."),
+], ids=["create", "update"])
+def test_cfn_iam_role_not_principal_trust_policy_fails_the_resource(cfn, iam, operation, effect, message):
+    """IAM refuses a trust policy with NotPrincipal, so the role is not created or keeps its old one."""
+    name = f"cfn-np-role-{_uuid_mod.uuid4().hex[:8]}"
+    plain = {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
+    refused = {"Effect": effect, "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:root"}, "Action": "sts:AssumeRole"}
+
+    def tpl(statements):
+        return json.dumps({"Resources": {"Role": {"Type": "AWS::IAM::Role", "Properties": {
+            "RoleName": name, "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": statements}}}}})
+
+    try:
+        if operation == "update":
+            cfn.create_stack(StackName=name, TemplateBody=tpl([plain]), Capabilities=["CAPABILITY_NAMED_IAM"])
+            assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        statements = [plain, refused] if effect == "Deny" else [refused]
+        getattr(cfn, f"{operation}_stack")(StackName=name, TemplateBody=tpl(statements),
+                                           Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == (
+            "UPDATE_ROLLBACK_COMPLETE" if operation == "update" else "ROLLBACK_COMPLETE")
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Role" and e["ResourceStatus"] == f"{operation.upper()}_FAILED"]
+        assert any(message in r for r in reasons), reasons
+        if operation == "update":
+            trust = iam.get_role(RoleName=name)["Role"]["AssumeRolePolicyDocument"]
+            assert trust["Statement"] == [plain]
+        else:
+            with pytest.raises(iam.exceptions.NoSuchEntityException):
+                iam.get_role(RoleName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_update_iam_managed_policy_in_place(cfn, iam):
     """A managed policy's document update creates a new default version on
     the same ARN, exactly as CloudFormation's handler does."""

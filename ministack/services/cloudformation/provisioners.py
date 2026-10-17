@@ -2539,8 +2539,16 @@ def _validate_iam_identity_tag_keys(resource_type, tags):
         raise ValueError(_iam.DUPLICATE_IDENTITY_TAG_KEYS)
 
 
+def _validate_iam_role_trust_policy(props):
+    """IAM's refusal of a NotPrincipal trust policy, before any state changes."""
+    trust_err = _iam._trust_policy_not_principal_error(props.get("AssumeRolePolicyDocument"))
+    if trust_err:
+        raise ValueError(trust_err)
+
+
 def _iam_role_create(logical_id, props, stack_name):
     _validate_iam_identity_tag_keys("AWS::IAM::Role", props.get("Tags") or [])
+    _validate_iam_role_trust_policy(props)
     name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:iam::{get_account_id()}:role{props.get('Path', '/')}{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
@@ -2595,6 +2603,7 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
     in place, so policies attached from outside the template survive.
     """
     _validate_iam_identity_tag_keys("AWS::IAM::Role", new_props.get("Tags") or [])
+    _validate_iam_role_trust_policy(new_props)
     name = new_props.get("RoleName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )

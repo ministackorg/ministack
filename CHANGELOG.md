@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IAM — trust policies with `NotPrincipal`** — `CreateRole`, `UpdateAssumeRolePolicy` and `AWS::IAM::Role` stored a trust policy with a `NotPrincipal` statement; they now answer `MalformedPolicyDocument` with IAM's message, `Allow with NotPrincipal is not allowed.` when an `Allow` statement carries it and `AssumeRole policy must not contain NotPrincipal field.` for a `Deny`, with `AUTH` on or off. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
