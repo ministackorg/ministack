@@ -1395,6 +1395,53 @@ def test_s3_public_access_block(s3):
         s3.get_public_access_block(Bucket=bkt)
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
+
+def test_s3_block_public_acls_refuses_setting_a_public_acl(s3):
+    """BlockPublicAcls refuses every call that sets a public ACL; private grants and IgnorePublicAcls alone pass."""
+    import requests
+
+    bkt = f"bpa-acl-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(s3, bkt)
+    s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    all_users = "http://acs.amazonaws.com/groups/global/AllUsers"
+    public_policy = {"Owner": {"ID": owner_id}, "Grants": [
+        {"Grantee": {"Type": "Group", "URI": all_users}, "Permission": "READ"}]}
+    s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={"BlockPublicAcls": True})
+    try:
+        for call, kwargs in (
+            (s3.put_object, {"Key": "n", "Body": b"n", "ACL": "public-read"}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "ACL": "authenticated-read"}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "GrantRead": f'uri="{all_users}"'}),
+            (s3.put_object_acl, {"Key": "k", "ACL": "public-read"}),
+            (s3.put_object_acl, {"Key": "k", "GrantRead": f'uri="{all_users}"'}),
+            (s3.put_object_acl, {"Key": "k", "AccessControlPolicy": public_policy}),
+            (s3.copy_object, {"Key": "c", "CopySource": {"Bucket": bkt, "Key": "k"}, "ACL": "public-read"}),
+            (s3.create_multipart_upload, {"Key": "m", "ACL": "public-read"}),
+            (s3.put_bucket_acl, {"ACL": "authenticated-read"}),
+            (s3.put_bucket_acl, {"AccessControlPolicy": public_policy}),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=bkt, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied", kwargs
+            assert "BlockPublicAcls" in exc.value.response["Error"]["Message"]
+        post = s3.generate_presigned_post(
+            Bucket=bkt, Key="p", Fields={"acl": "public-read"}, Conditions=[{"acl": "public-read"}])
+        assert requests.post(post["url"], data=post["fields"], files={"file": ("p", b"x")}).status_code == 403
+        assert s3.list_objects_v2(Bucket=bkt)["KeyCount"] == 1
+
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", ACL="bucket-owner-full-control")
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", GrantRead=f'id="{owner_id}"')
+        s3.put_object_acl(Bucket=bkt, Key="k", ACL="private")
+        s3.put_bucket_acl(Bucket=bkt, ACL="log-delivery-write")
+        assert not any("URI" in g["Grantee"] and g["Grantee"]["URI"].endswith("/global/AllUsers")
+                       for g in s3.get_object_acl(Bucket=bkt, Key="k")["Grants"])
+
+        s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={"IgnorePublicAcls": True})
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", ACL="public-read")
+    finally:
+        _purge_foreign(s3, bkt)
+
 def test_s3_ownership_controls(s3):
     bkt = "intg-s3-ownership"
     s3.create_bucket(Bucket=bkt)
@@ -3194,6 +3241,62 @@ def test_s3_put_bucket_acl_xml_body(s3):
     perms = sorted(g["Permission"] for g in acl["Grants"])
     assert perms == ["FULL_CONTROL", "READ"]
     s3.delete_bucket(Bucket=bucket)
+
+def _grant_pairs(acl):
+    """``(ID or URI, permission)`` for each grant of a GetBucketAcl/GetObjectAcl response, in order."""
+    return [(g["Grantee"].get("ID") or g["Grantee"].get("URI"), g["Permission"]) for g in acl["Grants"]]
+
+
+def test_s3_bucket_acl_grant_headers(s3):
+    """x-amz-grant-* headers on CreateBucket and PutBucketAcl set exactly the grants they name."""
+    bucket = f"acl-bkt-grant-{uuid.uuid4().hex[:8]}"
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    other_id = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"
+    log_delivery = "http://acs.amazonaws.com/groups/s3/LogDelivery"
+    owner, other, logs = f'id="{owner_id}"', f'id="{other_id}"', f'uri="{log_delivery}"'
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="BucketOwnerPreferred", GrantFullControl=owner, GrantRead=other)
+    try:
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == [(other_id, "READ"), (owner_id, "FULL_CONTROL")]
+
+        s3.put_bucket_acl(Bucket=bucket, GrantFullControl=owner, GrantRead=f"{other}, {logs}", GrantWrite=logs,
+                          GrantReadACP=other, GrantWriteACP=logs)
+        expected = [(other_id, "READ"), (log_delivery, "READ"), (log_delivery, "WRITE"),
+                    (owner_id, "FULL_CONTROL"), (other_id, "READ_ACP"), (log_delivery, "WRITE_ACP")]
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == expected
+
+        policy = {"Owner": {"ID": owner_id}, "Grants": [
+            {"Grantee": {"Type": "CanonicalUser", "ID": owner_id}, "Permission": "FULL_CONTROL"}]}
+        for kwargs, code in (
+            ({"GrantRead": other, "ACL": "private"}, "InvalidRequest"),
+            ({"GrantRead": other, "AccessControlPolicy": policy}, "UnexpectedContent"),
+            ({"GrantRead": "bogus"}, "InvalidArgument"),
+            ({"GrantRead": 'id="abc"'}, "InvalidArgument"),
+            ({"GrantRead": 'uri="http://acs.amazonaws.com/groups/global/Nobody"'}, "InvalidArgument"),
+            ({"GrantRead": 'emailAddress="nobody@example.com"'}, "UnsupportedArgument"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_acl(Bucket=bucket, **kwargs)
+            assert exc.value.response["Error"]["Code"] == code, kwargs
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == expected
+
+        s3.put_bucket_acl(Bucket=bucket, GrantRead=f"ID={owner_id}")
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == [(owner_id, "READ")]
+        with pytest.raises(ClientError) as exc:
+            s3.create_bucket(Bucket=f"{bucket}-x", ObjectOwnership="ObjectWriter", GrantRead="bogus")
+        assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+        # BucketOwnerEnforced, the default, disables ACLs: grant headers on an ACL write are refused.
+        s3.create_bucket(Bucket=f"{bucket}-e")
+        s3.put_object(Bucket=f"{bucket}-e", Key="k", Body=b"x")
+        for call, kwargs in ((s3.put_bucket_acl, {}), (s3.put_object_acl, {"Key": "k"})):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=f"{bucket}-e", GrantRead=other, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "AccessControlListNotSupported"
+    finally:
+        s3.delete_bucket(Bucket=bucket)
+        s3.delete_object(Bucket=f"{bucket}-e", Key="k")
+        s3.delete_bucket(Bucket=f"{bucket}-e")
+
 
 def test_s3_range_suffix(s3):
     """Range: bytes=-N returns last N bytes."""
@@ -5351,6 +5454,43 @@ def test_s3_object_acl_grant_to_another_account_follows_the_version(s3):
         _purge_foreign(owner, bucket)
 
 
+def test_s3_object_grant_headers_set_the_object_acl(s3):
+    """x-amz-grant-* headers on PutObject and PutObjectAcl set the object ACL, which then answers reads."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    owner_id, reader_id = owner.list_buckets()["Owner"]["ID"], reader.list_buckets()["Owner"]["ID"]
+    bucket = f"acl-grant-hdr-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one", GrantRead=f'id="{reader_id}"')
+        assert _grant_pairs(owner.get_object_acl(Bucket=bucket, Key="k")) == [(reader_id, "READ")]
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_object_acl(Bucket=bucket, Key="k", GrantFullControl=f'id="{owner_id}"',
+                             GrantReadACP=f'id="{reader_id}"')
+        assert _grant_pairs(owner.get_object_acl(Bucket=bucket, Key="k")) == [
+            (owner_id, "FULL_CONTROL"), (reader_id, "READ_ACP")]
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+        assert _grant_pairs(reader.get_object_acl(Bucket=bucket, Key="k"))[1] == (reader_id, "READ_ACP")
+
+        policy = {"Owner": {"ID": owner_id}, "Grants": [
+            {"Grantee": {"Type": "CanonicalUser", "ID": owner_id}, "Permission": "FULL_CONTROL"}]}
+        grant = f'id="{reader_id}"'
+        for call, kwargs, code in (
+            (owner.put_object, {"Key": "n", "Body": b"x", "GrantRead": grant, "ACL": "private"}, "InvalidRequest"),
+            (owner.put_object, {"Key": "n", "Body": b"x", "GrantRead": "bogus"}, "InvalidArgument"),
+            (owner.put_object_acl, {"Key": "k", "GrantRead": grant, "ACL": "private"}, "InvalidRequest"),
+            (owner.put_object_acl, {"Key": "k", "GrantRead": grant, "AccessControlPolicy": policy},
+             "UnexpectedContent"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=bucket, **kwargs)
+            assert exc.value.response["Error"]["Code"] == code, kwargs
+        assert owner.list_objects_v2(Bucket=bucket)["KeyCount"] == 1
+        assert len(owner.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 2
+    finally:
+        _purge_foreign(owner, bucket)
+
+
 def test_s3_public_read_object_acl_opens_reads_to_another_account(s3):
     """A public-read object ACL answers another account's read until IgnorePublicAcls is set."""
     owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
@@ -5366,6 +5506,59 @@ def test_s3_public_read_object_acl_opens_reads_to_another_account(s3):
     finally:
         owner.delete_object(Bucket=bucket, Key="k")
         owner.delete_bucket(Bucket=bucket)
+
+
+def test_s3_block_public_access_settings_each_cover_their_own_grants(s3):
+    """Only IgnorePublicAcls drops a public ACL and only RestrictPublicBuckets a public policy."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"bpa-each-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    settings = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+    try:
+        owner.put_object(Bucket=bucket, Key="acl", Body=b"acl", ACL="public-read")
+        owner.put_object(Bucket=bucket, Key="pol/k", Body=b"pol")
+        owner.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bucket}/pol/*"}]}))
+        for setting in settings:
+            owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={setting: True})
+            for key, ignored_by in (("acl", "IgnorePublicAcls"), ("pol/k", "RestrictPublicBuckets")):
+                if setting == ignored_by:
+                    assert _denied(reader.get_object, Bucket=bucket, Key=key), (setting, key)
+                else:
+                    assert reader.get_object(Bucket=bucket, Key=key)["Body"].read(), (setting, key)
+    finally:
+        owner.delete_bucket_policy(Bucket=bucket)
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_public_bucket_acl_grants_only_what_the_bucket_permissions_cover(s3):
+    """Bucket READ lists and WRITE adds and removes objects; neither opens objects, configuration or the ACL."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"bacl-pub-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"k")
+        owner.put_bucket_acl(Bucket=bucket, ACL="public-read")
+        assert [o["Key"] for o in reader.list_objects_v2(Bucket=bucket)["Contents"]] == ["k"]
+        reader.list_object_versions(Bucket=bucket)
+        reader.list_multipart_uploads(Bucket=bucket)
+        for call in (reader.get_object, reader.head_object, reader.get_object_acl):
+            assert _denied(call, Bucket=bucket, Key="k"), call
+        for call in (reader.get_bucket_acl, reader.get_bucket_versioning, reader.get_bucket_tagging):
+            assert _denied(call, Bucket=bucket), call
+
+        owner.put_bucket_acl(Bucket=bucket, ACL="public-read-write")
+        reader.put_object(Bucket=bucket, Key="w", Body=b"w")
+        reader.delete_object(Bucket=bucket, Key="w")
+        assert _denied(reader.put_object_acl, Bucket=bucket, Key="k", ACL="public-read")
+        assert _denied(reader.put_bucket_tagging, Bucket=bucket, Tagging={"TagSet": [{"Key": "a", "Value": "b"}]})
+        assert _denied(reader.put_bucket_acl, Bucket=bucket, ACL="private")
+        assert _denied(reader.delete_bucket, Bucket=bucket)
+        grants = owner.get_bucket_acl(Bucket=bucket)["Grants"]
+        assert sorted(g["Permission"] for g in grants if "URI" in g["Grantee"]) == ["READ", "WRITE"]
+    finally:
+        _purge_foreign(owner, bucket)
 
 
 def test_s3_post_object_acl_field(s3):
@@ -6829,6 +7022,26 @@ def test_s3_copy_object_applies_canned_acl(s3):
         s3.copy_object(Bucket=bkt, Key="bad.txt", ACL="nonsense",
                        CopySource={"Bucket": bkt, "Key": "src.txt"})
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_copy_object_applies_grant_headers(s3):
+    """x-amz-grant-* headers on a copy set the destination's ACL; together with x-amz-acl the copy is refused."""
+    bkt = f"s3-copy-grant-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(s3, bkt)
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    other_id = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"
+    s3.put_object(Bucket=bkt, Key="src.txt", Body=b"body")
+    source = {"Bucket": bkt, "Key": "src.txt"}
+
+    s3.copy_object(Bucket=bkt, Key="dst.txt", CopySource=source, GrantRead=f'id="{other_id}"',
+                   GrantFullControl=f'id="{owner_id}"')
+    assert _grant_pairs(s3.get_object_acl(Bucket=bkt, Key="dst.txt")) == [
+        (other_id, "READ"), (owner_id, "FULL_CONTROL")]
+
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bkt, Key="both.txt", CopySource=source, GrantRead=f'id="{other_id}"', ACL="private")
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert [o["Key"] for o in s3.list_objects_v2(Bucket=bkt)["Contents"]] == ["dst.txt", "src.txt"]
 
 
 def test_s3_upload_part_copy_honours_source_preconditions(s3):
