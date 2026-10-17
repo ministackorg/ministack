@@ -12751,6 +12751,76 @@ def test_node_context_shim_keeps_https_to_a_tls_gateway(tmp_path):
         server.server_close()
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_node_context_shim_sends_the_https_default_port_to_a_tls_gateway(tmp_path):
+    """Under USE_SSL a CDK or cfn-response style PUT (no port, or 443) reaches the gateway port over TLS."""
+    import http.server
+    import ssl
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            seen.append((self.path, self.headers.get("Host")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    cert, key = tmp_path / "gw.crt", tmp_path / "gw.key"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+        "-days", "1", "-subj", "/CN=gateway", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+    ], check=True, capture_output=True)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve) => {\n"
+            "  const opts = {hostname: '127.0.0.1', path: '/_ministack/cfn-response/tok', method: 'PUT'};\n"
+            "  if (event.port) opts.port = event.port;\n"
+            "  const req = event.url ? https.request(event.url, {method: 'PUT'}) : https.request(opts);\n"
+            "  req.on('response', (res) => resolve({status: res.statusCode}));\n"
+            "  req.on('error', (e) => resolve({error: e.code || String(e)}));\n"
+            "  req.end('{}');\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {**os.environ, "LAMBDA_TASK_ROOT": str(code_dir), "_MS_REAL_HANDLER": "index.handler",
+               "AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}", "NODE_EXTRA_CA_CERTS": str(cert)}
+        script = ("require(process.argv[1]).handler(JSON.parse(process.argv[2]), {})"
+                  ".then((r) => process.stdout.write(JSON.stringify(r)));")
+
+        def run(event):
+            proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), json.dumps(event)],
+                                  env=env, capture_output=True, text=True, timeout=30)
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)
+
+        # The CDK shape (no port), the cfn-response shape (443) and a URL without a port.
+        assert run({}) == {"status": 200}
+        assert run({"port": 443}) == {"status": 200}
+        assert run({"url": "https://127.0.0.1/_ministack/cfn-response/tok"}) == {"status": 200}
+        assert [path for path, _host in seen] == ["/_ministack/cfn-response/tok"] * 3
+        assert all(host == f"127.0.0.1:{port}" for _path, host in seen)
+        # Any other explicit port is left alone.
+        assert "error" in run({"port": port + 1})
+        assert len(seen) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
     """The sweep drops extracted trees whose blob no longer backs any
     function, version, or layer version — and only those. References are read
