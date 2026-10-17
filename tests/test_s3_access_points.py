@@ -305,6 +305,115 @@ def test_access_point_alias_from_another_account_is_denied(access_point):
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
 
+def _access_point_policy(bucket, access_point_arn, grant, deny=None, condition=None):
+    """An identity policy allowing reads and copies on ``grant`` ("bucket", "access point" or "both")."""
+    arns = {"bucket": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            "access point": [access_point_arn, f"{access_point_arn}/object/*"]}
+    resources = arns["bucket"] + arns["access point"] if grant == "both" else arns[grant]
+    statements = [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+                   "Resource": resources}]
+    if deny or condition:
+        statements.append({"Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"],
+                           "Resource": arns[deny] if deny else "*", **({"Condition": condition} if condition else {})})
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
+def _assert_access(auth_enabled, allowed, call):
+    """Under AUTH a refused call answers 403 AccessDenied; anything else succeeds."""
+    if auth_enabled and not allowed:
+        with pytest.raises(ClientError) as exc:
+            call()
+        error = exc.value.response
+        assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("AccessDenied", 403)
+    else:
+        call()
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("grant, deny, allowed", [
+    ("both", None, True),
+    ("bucket", None, False),
+    ("access point", None, False),
+    ("both", "access point", False),
+    ("both", "bucket", False),
+], ids=["both", "bucket-only", "access-point-only", "deny-access-point", "deny-bucket"])
+def test_access_point_request_needs_access_point_and_bucket_contract(auth_enabled, iam_user, bucket, access_point,
+                                                                     via, grant, deny, allowed):
+    """Through an access point a read and a listing are checked on the access point and on its bucket."""
+    _name, created = access_point
+    client = iam_user(policy=_access_point_policy(bucket, created["AccessPointArn"], grant, deny)).client("s3")
+    target = created[via]
+    _assert_access(auth_enabled, allowed, lambda: client.get_object(Bucket=target, Key="k.txt"))
+    _assert_access(auth_enabled, allowed, lambda: client.list_objects_v2(Bucket=target))
+    _assert_access(auth_enabled, grant != "access point" and deny != "bucket",
+                   lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("key, condition_value, through_access_point, through_bucket", [
+    ("s3:DataAccessPointArn", "arn", False, True),
+    ("s3:DataAccessPointAccount", ACCOUNT, False, True),
+    ("s3:AccessPointNetworkOrigin", "Internet", False, True),
+    ("s3:ExistingObjectTag/class", "secret", False, False),
+    ("s3:DataAccessPointArn", None, True, False),
+], ids=["arn", "account", "network-origin", "object-tag", "arn-absent"])
+def test_access_point_condition_keys_contract(auth_enabled, iam_user, bucket, access_point, via, key,
+                                              condition_value, through_access_point, through_bucket):
+    """A request through an access point carries its ARN, account and network origin, and the object's tags."""
+    _name, created = access_point
+    _client("s3", "us-east-1").put_object_tagging(Bucket=bucket, Key="k.txt",
+                                                  Tagging={"TagSet": [{"Key": "class", "Value": "secret"}]})
+    arn = created["AccessPointArn"]
+    condition = ({"Null": {key: "true"}} if condition_value is None
+                 else {"StringEquals": {key: arn if condition_value == "arn" else condition_value}})
+    client = iam_user(policy=_access_point_policy(bucket, arn, "both", condition=condition)).client("s3")
+    _assert_access(auth_enabled, through_access_point, lambda: client.get_object(Bucket=created[via], Key="k.txt"))
+    _assert_access(auth_enabled, through_bucket, lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("condition, through_bucket", [(False, False), (True, True)], ids=["deny", "deny-on-arn-key"])
+def test_access_point_request_meets_the_bucket_policy_contract(auth_enabled, iam_user, bucket, access_point, via,
+                                                               condition, through_bucket):
+    """The bucket policy applies through an access point and sees its ARN."""
+    _name, created = access_point
+    arn = created["AccessPointArn"]
+    user = iam_user(policy=_access_point_policy(bucket, arn, "both"))
+    statement = {"Effect": "Deny", "Principal": {"AWS": user.arn}, "Action": "s3:GetObject",
+                 "Resource": f"arn:aws:s3:::{bucket}/*"}
+    if condition:
+        statement["Condition"] = {"StringEquals": {"s3:DataAccessPointArn": arn}}
+    _client("s3", "us-east-1").put_bucket_policy(
+        Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [statement]}))
+    client = user.client("s3")
+    _assert_access(auth_enabled, False, lambda: client.get_object(Bucket=created[via], Key="k.txt"))
+    _assert_access(auth_enabled, through_bucket, lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("grant, deny, condition, allowed", [
+    ("both", None, False, True),
+    ("bucket", None, False, False),
+    ("both", "access point", False, False),
+    ("both", None, True, False),
+], ids=["both", "bucket-only", "deny-access-point", "deny-on-arn-key"])
+def test_access_point_alias_copy_source_contract(auth_enabled, iam_user, bucket, access_point, grant, deny,
+                                                 condition, allowed):
+    """A copy source named by an alias is read through its access point."""
+    _name, created = access_point
+    arn = created["AccessPointArn"]
+    policy = _access_point_policy(bucket, arn, grant, deny,
+                                  {"StringEquals": {"s3:DataAccessPointArn": arn}} if condition else None)
+    client = iam_user(policy=policy).client("s3")
+    _assert_access(auth_enabled, allowed, lambda: client.copy_object(
+        Bucket=bucket, Key="copy.txt", CopySource={"Bucket": created["Alias"], "Key": "k.txt"}))
+    _assert_access(auth_enabled, True, lambda: client.copy_object(
+        Bucket=bucket, Key="copy.txt", CopySource={"Bucket": bucket, "Key": "k.txt"}))
+
+
 def test_access_point_control_invalid_name(bucket):
     ctl = _client("s3control", "us-east-1")
     with pytest.raises(ClientError) as exc:

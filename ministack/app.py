@@ -2236,7 +2236,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
     # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3`.
-    access_point_region = None
+    access_point_region = access_point_alias = None
     ap_match = _ACCESS_POINT_HOST_RE.match(bucket)
     s3 = _get_module("s3")
     if ap_match and s3.signed_service(headers, query_params) == "s3-object-lambda":
@@ -2268,6 +2268,8 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             if ap_error:
                 return ap_error
             bucket, access_point_region = ap_bucket, ap_region
+            access_point_alias = s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"),
+                                                         ap_region)["Alias"]
     # CloudFront KVS data-plane clients (boto3 cloudfront-keyvaluestore with
     # inject_host_prefix=False) hit ministack with host=localhost and path
     # prefixed by /key-value-stores/. Host-name exclusion above doesn't fire,
@@ -2300,27 +2302,34 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         from ministack.core.iam_actions import (
             _s3_action,
             extract_resource_arn,
+            s3_access_point_resources,
             s3_additional_checks,
             s3_service_context,
         )
 
-        s3_action = _s3_action(method, vhost_path, query_params)
+        # An access point ARN host is authorized as its alias.
+        iam_path = vhost_path if access_point_alias is None else f"/{access_point_alias}{vhost_path[len(bucket) + 1:]}"
+        s3_action = _s3_action(method, iam_path, query_params)
         # x-amz-* headers hoisted into the query string count as the headers they stand for.
         s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
         if s3_action:
-            s3_resource = extract_resource_arn("s3", method, vhost_path, s3_headers, body, query_params, "", "")
-            denied = _enforce_data_plane(
-                "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
-                service_context=s3_service_context(f"s3:{s3_action}", query_params, vhost_path, s3_headers),
-            )
-            if denied:
-                return denied
-            # A copy also reads its source, a batch delete is one check per
-            # key, an attributes call is a pair, a governance bypass its own action.
-            for extra_action, extra_arn in s3_additional_checks(method, vhost_path, s3_headers, body, query_params):
-                denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+            s3_resource = extract_resource_arn("s3", method, iam_path, s3_headers, body, query_params, "", "")
+            service_context = s3_service_context(f"s3:{s3_action}", query_params, iam_path, s3_headers)
+            for resource, keys in s3_access_point_resources(s3_resource):
+                denied = _enforce_data_plane(
+                    "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
+                    service_context={**service_context, **keys},
+                )
                 if denied:
                     return denied
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            for extra_action, extra_arn in s3_additional_checks(method, iam_path, s3_headers, body, query_params):
+                for resource, keys in s3_access_point_resources(extra_arn):
+                    denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=resource,
+                                                 service_context=keys)
+                    if denied:
+                        return denied
 
     try:
         # The access point an ARN host names, for its Block Public Access settings.
@@ -2871,6 +2880,7 @@ async def _dispatch_service_request(
             extract_resource_arn,
             logs_service_context,
             request_tag_context,
+            s3_access_point_resources,
             s3_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
@@ -2936,10 +2946,15 @@ async def _dispatch_service_request(
                         iam_action = item_action  # named in the AccessDenied message
                         break
             else:
-                denied = enforce(
-                    access_key, iam_action, service, region,
-                    resource_arn=resource_arn, service_context=service_context,
-                )
+                # Through an S3 access point alias the check is made on the access point and on its bucket.
+                for checked_arn, keys in (s3_access_point_resources(resource_arn) if service == "s3"
+                                          else [(resource_arn, {})]):
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=checked_arn, service_context={**service_context, **keys},
+                    )
+                    if denied:
+                        break
             # A malformed Logs tagging ARN fails validation ahead of a policy denial.
             if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
                 return logs_validation_error
@@ -2949,8 +2964,13 @@ async def _dispatch_service_request(
                 from ministack.core.iam_actions import s3_additional_checks
 
                 s3_headers = _get_module("s3")._merge_hoisted_amz_headers(headers, query_params)
-                for extra_action, extra_arn in s3_additional_checks(method, path, s3_headers, body, routing_params):
-                    denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
+                extra_checks = [(extra_action, checked_arn, keys)
+                                for extra_action, extra_arn in s3_additional_checks(method, path, s3_headers, body,
+                                                                                    routing_params)
+                                for checked_arn, keys in s3_access_point_resources(extra_arn)]
+                for extra_action, checked_arn, keys in extra_checks:
+                    denied = enforce(access_key, extra_action, service, region, resource_arn=checked_arn,
+                                     service_context=keys)
                     if denied:
                         iam_action = extra_action
                         break

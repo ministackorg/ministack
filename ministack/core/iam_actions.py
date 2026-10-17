@@ -465,6 +465,20 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
     return checks
 
 
+def s3_access_point_resources(resource_arn: str) -> list[tuple[str, dict]]:
+    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias."""
+    from ministack.services import s3 as s3_svc
+
+    alias, sep, key = resource_arn.removeprefix("arn:aws:s3:::").partition("/")
+    access_point = s3_svc.access_point_for_alias(alias) if resource_arn.startswith("arn:aws:s3:::") else None
+    if access_point is None:
+        return [(resource_arn, {})]
+    access_point_arn, bucket, keys = access_point
+    if sep:
+        return [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+    return [(access_point_arn, keys), (f"arn:aws:s3:::{bucket}", keys)]
+
+
 # Lambda REST path → IAM action
 def _lambda_action(method: str, path: str) -> str | None:
     parts = [p for p in path.split("/") if p]

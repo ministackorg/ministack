@@ -191,6 +191,19 @@ def resolve_access_point_alias(alias: str):
 _ACCESS_POINT_ALIAS_SUFFIX = "-s3alias"
 
 
+def access_point_for_alias(alias: str) -> tuple[str, str, dict] | None:
+    """``(access point ARN, bucket, condition keys)`` of an alias in the caller's account, for IAM checks."""
+    if not alias.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        return None
+    resolved = resolve_access_point_alias(alias)
+    if resolved is None or resolved[0] != get_account_id():
+        return None
+    account, region, record = resolved
+    arn = access_point_arn(record["Name"], account, region)
+    return arn, record["Bucket"], {"s3:DataAccessPointArn": arn, "s3:DataAccessPointAccount": account,
+                                   "s3:AccessPointNetworkOrigin": record["NetworkOrigin"]}
+
+
 def _resolve_copy_source_alias(headers: dict) -> tuple:
     """``(headers, denied)``: an ``x-amz-copy-source`` access point alias rewritten to its bucket."""
     source = headers.get("x-amz-copy-source", "")
