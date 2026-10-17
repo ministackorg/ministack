@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT Jobs — a status a device may not set is refused first** — `UpdateJobExecution` (HTTP and the MQTT `update` topic) to QUEUED, CANCELED or TIMED_OUT answered `ResourceNotFoundException` for an unknown job or thing and the version error for a stale `expectedVersion`; it now refuses the status first with `InvalidStateTransitionException` (over MQTT `InvalidStateTransition` without `executionState`), as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

@@ -8236,24 +8236,11 @@ def jobs_update_execution(
     """Apply a device-reported status to an execution.
 
     Returns ``(execution copy, None)``, or ``(None, error)`` for every
-    rejection: unknown execution (404), stale or non-numeric
-    `expectedVersion`, an already-terminal execution, an unknown status, the
-    illegal walk back to QUEUED, and the service-side statuses a device may
-    not set. A successful update may complete the job.
+    rejection, in this order: an unknown status or one a device may not set
+    (QUEUED and the service-side statuses), unknown execution (404), stale or
+    non-numeric `expectedVersion`, and an already-terminal execution. A
+    successful update may complete the job.
     """
-    _jobs_materialize_executions(job_id)
-    execution = _job_executions.get((thing_name, job_id))
-    if execution is None:
-        return None, error_response_json(
-            "ResourceNotFoundException",
-            f"Job {job_id} not found for {thing_name}",
-            404,
-        )
-    error = _jobs_check_expected_version(
-        execution, expected_version, "InvalidStateTransitionException"
-    )
-    if error:
-        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
@@ -8268,6 +8255,19 @@ def jobs_update_execution(
             f"The status of job execution cannot be changed to be {status}",
             409,
         )
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing_name, job_id))
+    if execution is None:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"Job {job_id} not found for {thing_name}",
+            404,
+        )
+    error = _jobs_check_expected_version(
+        execution, expected_version, "InvalidStateTransitionException"
+    )
+    if error:
+        return None, error
     error = _jobs_reject_if_terminal(
         execution,
         f"Job {job_id} for {thing_name} has already finished with status {execution['status']}",

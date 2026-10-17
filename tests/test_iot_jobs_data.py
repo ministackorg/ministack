@@ -1407,6 +1407,35 @@ def test_iot_jobs_update_rejects_service_side_statuses(
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
+def test_iot_jobs_update_refuses_the_status_before_looking_up_the_execution(iot_client, iot_jobs_data):
+    """A status a device may not set is refused before the existence and version checks."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        cases = [(thing, job_id, {"expectedVersion": 99})]
+        cases += [(thing, _unique("no-job"), {}), (_unique("no-thing"), _unique("no-job"), {})]
+        for target_thing, target_job, extra in cases:
+            for status in ("QUEUED", "CANCELED", "TIMED_OUT"):
+                with pytest.raises(iot_jobs_data.exceptions.InvalidStateTransitionException) as ei:
+                    iot_jobs_data.update_job_execution(
+                        jobId=target_job, thingName=target_thing, status=status, **extra
+                    )
+                assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+                assert ei.value.response["Error"]["Message"] == (
+                    f"The status of job execution cannot be changed to be {status}"
+                )
+
+        # An unknown execution is reported before a stale expectedVersion.
+        with pytest.raises(iot_jobs_data.exceptions.ResourceNotFoundException):
+            iot_jobs_data.update_job_execution(
+                jobId=_unique("no-job"), thingName=thing, status="SUCCEEDED", expectedVersion=99
+            )
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
 def test_iot_jobs_update_non_numeric_expected_version_is_400(iot_client):
     """A non-numeric expectedVersion (only reachable outside boto3's client-
     side typing) must be a clean InvalidRequestException, not a 500."""
@@ -4208,6 +4237,27 @@ def test_jobs_mqtt_version_mismatch_rejected(iot_client, iot_data_client):
     assert doc["executionState"] == {"status": "QUEUED", "versionNumber": 1}
     assert doc["clientToken"] == "tok-ver"
     _assert_epoch_seconds(doc["timestamp"])
+
+
+def test_jobs_mqtt_update_unknown_job_refused_status_rejected(iot_client, iot_data_client):
+    """A status a device may not set is refused before the job is looked up."""
+    thing = _unique("jobs-mqtt-rej")
+    _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+
+    received = _collect_shadow_frames(
+        f"{base}/no-such-job/update/rejected",
+        lambda: _mqtt_publish(
+            topic=f"{base}/no-such-job/update",
+            payload=json.dumps({"status": "QUEUED", "clientToken": "tok-q"}).encode(),
+        ),
+        want=1,
+    )
+    doc = _frames_by_topic(received)[f"{base}/no-such-job/update/rejected"]
+    assert doc["code"] == "InvalidStateTransition"
+    assert doc["message"] == "The status of job execution cannot be changed to be QUEUED"
+    assert "executionState" not in doc
+    assert doc["clientToken"] == "tok-q"
 
 
 def test_jobs_mqtt_update_unknown_job_rejected(iot_client, iot_data_client):
