@@ -4264,6 +4264,10 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
+    lock_err = _validate_object_lock_headers(bucket_name, headers)
+    if lock_err:
+        return lock_err
+
     md5_err = _validate_content_md5(headers, body)
     if md5_err:
         return md5_err
@@ -4767,6 +4771,20 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         return 201, {**base_resp, "Content-Type": "application/xml"}, _xml_body(root)
 
     return status, base_resp, b""
+
+
+def _validate_object_lock_headers(bucket_name: str, headers: dict):
+    lock_headers = (
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
+        "x-amz-object-lock-legal-hold-status",
+    )
+    if any(name in headers for name in lock_headers):
+        lock = _bucket_object_lock.get(bucket_name)
+        if not lock or not lock.get("enabled"):
+            return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
+    return None
 
 
 def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
@@ -5815,6 +5833,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
+
+    lock_err = _validate_object_lock_headers(bucket_name, headers)
+    if lock_err:
+        return lock_err
 
     # A canned ACL on the copy applies to the destination, as it does on a
     # put; an unknown value rejects the whole request rather than being
@@ -7545,6 +7567,10 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
+
+    lock_err = _validate_object_lock_headers(bucket_name, headers)
+    if lock_err:
+        return lock_err
 
     storage_class, sc_err = _resolve_storage_class(headers)
     if sc_err:
