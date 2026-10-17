@@ -1313,6 +1313,117 @@ def test_cognito_get_open_id_token_unknown_identity(cognito_identity):
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
     assert exc.value.response["Error"]["Message"] == f"Identity '{unknown}' not found."
 
+
+def _identity_logins(cognito_idp, cognito_identity):
+    """User pools A and B, an identity pool trusting A's first client, its identities and the users' tokens."""
+    from types import SimpleNamespace
+
+    def pool_with_users(*usernames):
+        pid = cognito_idp.create_user_pool(PoolName="IdentityLogins")["UserPool"]["Id"]
+        cid = cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+            IdTokenValidity=5, TokenValidityUnits={"IdToken": "minutes"})["UserPoolClient"]["ClientId"]
+        for name in usernames:
+            cognito_idp.admin_create_user(UserPoolId=pid, Username=name, MessageAction="SUPPRESS")
+            cognito_idp.admin_set_user_password(UserPoolId=pid, Username=name, Password="Passw0rd!", Permanent=True)
+        return pid, cid
+
+    def sign_in(cid, name):
+        return cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+            "USERNAME": name, "PASSWORD": "Passw0rd!"})["AuthenticationResult"]
+
+    pid, cid = pool_with_users("u1", "u2", "u3")
+    other_cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="other", ExplicitAuthFlows=[
+        "ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    pid_b, cid_b = pool_with_users("u4")
+    u1 = sign_in(cid, "u1")
+    tokens = {
+        "u1": u1["IdToken"], "u1 access": u1["AccessToken"], "u2": sign_in(cid, "u2")["IdToken"],
+        "u3": sign_in(cid, "u3")["IdToken"], "b": sign_in(cid_b, "u4")["IdToken"],
+        "u1 other client": sign_in(other_cid, "u1")["IdToken"],
+    }
+    provider = f"cognito-idp.us-east-1.amazonaws.com/{pid}"
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="IdentityLogins", AllowUnauthenticatedIdentities=True,
+        CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": cid}])["IdentityPoolId"]
+
+    def call(action, **data):
+        """The result of a cognito-identity call, or its (code, message)."""
+        try:
+            return getattr(cognito_identity, action)(**data)
+        except ClientError as e:
+            return e.response["Error"]["Code"], e.response["Error"]["Message"]
+
+    return SimpleNamespace(
+        call=call, tokens=tokens, provider=provider, provider_b=f"cognito-idp.us-east-1.amazonaws.com/{pid_b}",
+        unauth=cognito_identity.get_id(IdentityPoolId=iid)["IdentityId"],
+        u1=cognito_identity.get_id(IdentityPoolId=iid, Logins={provider: tokens["u1"]})["IdentityId"],
+    )
+
+
+@pytest.mark.auth_contract
+def test_cognito_get_open_id_token_checks_logins(auth_enabled, cognito_idp, cognito_identity):
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    provider, tokens = ctx.provider, ctx.tokens
+    head, payload, sig = tokens["u1"].split(".")
+    unsupported = "Token is not from a supported provider of this identity pool."
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    for logins, message in [
+        (None, f"Access to Identity '{ctx.u1}' is forbidden."),
+        ({provider: tokens["u3"]}, mismatch),
+        ({provider: tokens["u2"]}, mismatch),
+        ({provider: tokens["u1 other client"]}, unsupported),
+        ({provider: tokens["b"]}, "Invalid login token. Issuer doesn't match providerName"),
+        ({ctx.provider_b: tokens["b"]}, unsupported),
+        ({provider: tokens["u1 access"]}, "Invalid login token. Missing a required claim: aud"),
+        ({provider: f"{head}.{payload}.{sig[::-1]}"}, "Invalid login token. Token signature invalid."),
+        ({provider: "not-a-token"}, "Invalid login token. Not a valid OpenId Connect identity token."),
+    ]:
+        result = ctx.call("get_open_id_token", IdentityId=ctx.u1, **({"Logins": logins} if logins else {}))
+        if auth_enabled:
+            assert result == ("NotAuthorizedException", message)
+        else:
+            assert result["IdentityId"] == ctx.u1
+
+    def amr(**data):
+        return _decode_jwt_claims(ctx.call("get_open_id_token", **data)["Token"])["amr"]
+
+    assert amr(IdentityId=ctx.unauth) == ["unauthenticated"]
+    assert amr(IdentityId=ctx.u1, Logins={provider: tokens["u1"]})[:2] == ["authenticated", provider]
+    # An identity without a login takes one.
+    assert amr(IdentityId=ctx.unauth, Logins={provider: tokens["u2"]})[:2] == ["authenticated", provider]
+
+
+def test_cognito_get_open_id_token_expired_login_under_auth(monkeypatch):
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod, call = _idp_in_process(monkeypatch, auth=True)
+    monkeypatch.setattr(mod, "_identity_pools", AccountRegionScopedDict())
+
+    def identity(action, **data):
+        status, _, body = asyncio.run(mod._dispatch_identity(action, data))
+        result = json.loads(body) if body else {}
+        return (result["__type"].split("#")[-1], result["message"]) if status != 200 else result
+
+    pid, cid, sign_in = _password_client_with_users(
+        call, "u1", IdTokenValidity=5, TokenValidityUnits={"IdToken": "minutes"})
+    provider = f"cognito-idp.us-east-1.amazonaws.com/{pid}"
+    iid = identity("CreateIdentityPool", IdentityPoolName="ExpiredLogins", AllowUnauthenticatedIdentities=True,
+                   CognitoIdentityProviders=[{"ProviderName": provider, "ClientId": cid}])["IdentityPoolId"]
+    u1 = identity("GetId", IdentityPoolId=iid, Logins={provider: sign_in("u1")["IdToken"]})["IdentityId"]
+    now = int(time.time())
+    with monkeypatch.context() as m:
+        # ID tokens of this client live 300 s; AWS accepts them for 300 s more.
+        m.setattr(mod.time, "time", lambda: now - 599)
+        late = sign_in("u1")["IdToken"]
+        m.setattr(mod.time, "time", lambda: now - 600)
+        expired = sign_in("u1")["IdToken"]
+        m.setattr(mod.time, "time", lambda: now)
+        assert "Token" in identity("GetOpenIdToken", IdentityId=u1, Logins={provider: late})
+        assert identity("GetOpenIdToken", IdentityId=u1, Logins={provider: expired}) == (
+            "NotAuthorizedException", f"Invalid login token. Token expired: {now - 300} >= {now - 300}")
+
+
 def test_cognito_signup_always_unconfirmed(cognito_idp):
     """SignUp always returns UNCONFIRMED regardless of AutoVerifiedAttributes."""
     # Pool with AutoVerifiedAttributes — user still starts UNCONFIRMED

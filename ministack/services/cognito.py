@@ -7577,7 +7577,50 @@ def _get_credentials_for_identity(data):
     })
 
 
+_LOGIN_TOKEN_CLOCK_SKEW = 300
+
+
+def _open_id_token_logins_error(pool: dict, identity_id: str, logins: dict):
+    """The NotAuthorizedException for GetOpenIdToken Logins AWS would not accept, or None."""
+    stored = pool["_identities"][identity_id].get("Logins") or {}
+    if not logins:
+        if not stored:
+            return None
+        return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
+    unsupported = "Token is not from a supported provider of this identity pool."
+    skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
+    for provider, token in logins.items():
+        # Only user pool logins are verified; other providers' tokens are opaque here.
+        if not provider.startswith("cognito-idp."):
+            continue
+        clients = [p.get("ClientId") for p in pool.get("CognitoIdentityProviders") or []
+                   if p.get("ProviderName") == provider]
+        claims = _token_claims(token)
+        if not clients:
+            message = unsupported
+        elif not isinstance(token, str) or token.count(".") != 2 or not claims:
+            message = "Invalid login token. Not a valid OpenId Connect identity token."
+        elif claims.get("iss") != f"https://{provider}":
+            message = "Invalid login token. Issuer doesn't match providerName"
+        elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
+            message = "Invalid login token. Token signature invalid."
+        elif "aud" not in claims:
+            message = "Invalid login token. Missing a required claim: aud"
+        elif claims["aud"] not in clients:
+            message = unsupported
+        elif not isinstance(claims.get("exp"), (int, float)) or skewed_now >= claims["exp"]:
+            message = f"Invalid login token. Token expired: {skewed_now} >= {claims.get('exp')}"
+        elif provider in stored and _token_claims(stored[provider]).get("sub") != claims.get("sub"):
+            message = ("Logins don't match. Please include at least one valid login "
+                       "for this identity or identity pool.")
+        else:
+            continue
+        return error_response_json("NotAuthorizedException", message, 400)
+    return None
+
+
 def _get_open_id_token(data):
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     # Find pool containing this identity
     pool_id = ""
@@ -7585,6 +7628,9 @@ def _get_open_id_token(data):
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
+            error = _open_id_token_logins_error(pool, identity_id, logins) if AUTH else None
+            if error:
+                return error
             logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
     if not pool_id:

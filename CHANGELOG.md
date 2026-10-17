@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito Identity — `GetOpenIdToken` checks `Logins` under `AUTH=true`** — the call issued a token for an identity with a login when the request carried no `Logins`, and for any token in `Logins`; with `AUTH=true` it now answers `NotAuthorizedException` as AWS does, with `Access to Identity '<identity id>' is forbidden.` without `Logins` and, for a user pool login, when the token is no ID token of a trusted app client, has a bad signature, expired more than five minutes ago or belongs to another user than the identity's login. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
