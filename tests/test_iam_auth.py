@@ -2215,6 +2215,24 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
 
+    @pytest.mark.parametrize("method,path,body,resource", [
+        ("GET", "/v2/email/account", b"", "*"),
+        ("POST", "/v2/email/list-identities", b"{}", "*"),
+        ("POST", "/v2/email/configuration-sets", b'{"ConfigurationSetName": "cs"}', "configuration-set/cs"),
+        ("DELETE", "/v2/email/configuration-sets/cs", b"", "configuration-set/cs"),
+        ("PUT", "/v2/email/configuration-sets/cs/event-destinations/d", b"{}", "configuration-set/cs"),
+        ("POST", "/v2/email/templates", b'{"TemplateName": "t"}', "template/t"),
+        ("GET", "/v2/email/templates/t", b"", "template/t"),
+        ("POST", "/v2/email/contact-lists", b'{"ContactListName": "c"}', "contact-list/c"),
+        ("GET", "/v2/email/identities/a.example.com", b"", "identity/a.example.com"),
+        ("GET", "/v2/email/custom-verification-email-templates/v", b"", "custom-verification-email-template/v"),
+        ("GET", "/v2/email/dedicated-ip-pools/p", b"", "dedicated-ip-pool/p"),
+        ("POST", "/v2/email/outbound-emails", b"{}", "*"),
+    ])
+    def test_ses_v2_resource(self, method, path, body, resource):
+        arn = extract_resource_arn("ses", method, path, {}, body, {}, "us-east-1", "123")
+        assert arn == (resource if resource == "*" else f"arn:aws:ses:us-east-1:123:{resource}")
+
     def test_signer_profile_and_job(self):
         from ministack.core.iam_actions import extract_resource_arn
         job_body = b'{"profileName": "fleet", "source": {"s3": {}}}'
@@ -2957,6 +2975,19 @@ class TestActionExtraction:
         assert extract_iam_action("lambda", "POST", path, {}, b"", {}) == "lambda:TagResource"
         assert extract_iam_action("lambda", "DELETE", path, {}, b"", {"tagKeys": ["a"]}) == "lambda:UntagResource"
         assert extract_iam_action("lambda", "GET", path, {}, b"", {}) == "lambda:ListTags"
+
+    def test_ses_v2_rest(self):
+        assert extract_iam_action("ses", "GET", "/v2/email/account", {}, b"", {}) == "ses:GetAccount"
+        assert extract_iam_action("ses", "POST", "/v2/email/list-identities", {}, b"{}", {}) == (
+            "ses:ListEmailIdentities")
+        assert extract_iam_action("ses", "DELETE", "/v2/email/configuration-sets/cs", {}, b"", {}) == (
+            "ses:DeleteConfigurationSet")
+        assert extract_iam_action("ses", "GET", "/v2/email/templates/t", {}, b"", {}) == "ses:GetEmailTemplate"
+        assert extract_iam_action("ses", "POST", "/", {}, b"", {"Action": ["ListIdentities"]}) == "ses:ListIdentities"
+        # older SDK models list with GET on the collection
+        assert extract_iam_action("ses", "GET", "/v2/email/identities", {}, b"", {}) == "ses:ListEmailIdentities"
+        assert extract_iam_action("ses", "GET", "/v2/email/configuration-sets", {}, b"", {}) == (
+            "ses:ListConfigurationSets")
 
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
@@ -5160,6 +5191,77 @@ class TestQuerySignatures:
 
         monkeypatch.setattr(app_mod, "AUTH", False)
         assert _presigned(user_key[0], "wrong-secret", "iam", _LIST_USERS)[:2] == (None, 200)
+
+
+# SES v2 is authorized in its own handler; RDS Data, S3 Control and X-Ray (no
+# MiniStack service) map to no IAM action. All of them check credentials.
+_NO_ACTION_CALLS = {
+    "sesv2": lambda c: c.get_account(),
+    "xray": lambda c: c.get_sampling_rules(),
+    "rds-data": lambda c: c.execute_statement(
+        resourceArn="arn:aws:rds:us-east-1:000000000000:cluster:none",
+        secretArn="arn:aws:secretsmanager:us-east-1:000000000000:secret:none", sql="select 1"),
+    "s3control": lambda c: c.list_tags_for_resource(AccountId="000000000000", ResourceArn="arn:aws:s3:::none"),
+}
+
+
+def _contract_client(service, key, secret, token=None):
+    """A client of the running server with the given credentials and no retries."""
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, REGION
+
+    return boto3.client(service, endpoint_url=ENDPOINT, region_name=REGION, aws_access_key_id=key,
+                        aws_secret_access_key=secret, aws_session_token=token,
+                        config=Config(retries={"total_max_attempts": 1}, inject_host_prefix=False))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service,wrong_secret,unknown_key,expired,content_type", [
+    ("sesv2", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/x-amz-json-1.1"),
+    ("xray", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/json"),
+    ("rds-data", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/json"),
+    ("s3control", "SignatureDoesNotMatch", "InvalidAccessKeyId", "RequestTimeTooSkewed", "application/xml"),
+], ids=["sesv2", "xray", "rds-data", "s3control"])
+def test_credentials_without_an_iam_action_contract(auth_enabled, iam_user, service, wrong_secret, unknown_key,
+                                                    expired, content_type):
+    """A wrong secret, an unknown key, a session key without its token and a stale signature are refused."""
+    from botocore.config import Config
+    from conftest import make_client
+
+    user = iam_user(policy={"Version": "2012-10-17",
+                            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    key_id = make_client("iam").list_access_keys(UserName=user.name)["AccessKeyMetadata"][0]["AccessKeyId"]
+    session = user.client("sts").get_session_token()["Credentials"]
+    call = _NO_ACTION_CALLS[service]
+
+    def answer(client):
+        try:
+            call(client)
+        except ClientError as e:
+            return e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"], (
+                e.response["ResponseMetadata"]["HTTPHeaders"].get("content-type"))
+        return None, 200, None
+
+    with _signing_clock(-960):
+        stale = answer(user.client(service, config=Config(inject_host_prefix=False)))
+    answers = [
+        answer(_contract_client(service, key_id, "wrong-secret")),
+        answer(_contract_client(service, "AKIAUNKNOWNKEY000001", "secret")),
+        answer(_contract_client(service, session["AccessKeyId"], session["SecretAccessKey"])),
+        stale,
+    ]
+    control = answer(user.client(service, config=Config(inject_host_prefix=False)))
+    assert control[1] != 403
+    if auth_enabled:
+        assert [a[:2] for a in answers] == [(wrong_secret, 403), (unknown_key, 403), (unknown_key, 403),
+                                            (expired, 403)]
+        assert answers[0][2] == content_type
+    else:
+        assert answers == [control] * 4
 
 
 class TestSessionTokens:

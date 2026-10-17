@@ -517,6 +517,64 @@ def test_ses_v2_get_account(sesv2):
     assert resp["SendingEnabled"] is True
     assert resp["ProductionAccessEnabled"] is True
 
+
+_SES_V2_ARN = "arn:aws:ses:us-east-1:000000000000"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("call,action,resource,reason", [
+    (lambda ses, n: ses.get_account(), "GetAccount", "*", None),
+    (lambda ses, n: ses.list_email_identities(), "ListEmailIdentities", "*", None),
+    (lambda ses, n: ses.create_configuration_set(ConfigurationSetName=f"{n}-other"),
+     "CreateConfigurationSet", "configuration-set/{n}-other", None),
+    (lambda ses, n: ses.get_configuration_set(ConfigurationSetName=f"{n}-other"),
+     "GetConfigurationSet", "configuration-set/{n}-other", None),
+    (lambda ses, n: ses.create_email_template(TemplateName=f"{n}-other", TemplateContent={"Subject": "s"}),
+     "CreateEmailTemplate", "template/{n}-other", None),
+    (lambda ses, n: ses.get_email_identity(EmailIdentity=f"{n}-other.example.com"),
+     "GetEmailIdentity", "identity/{n}-other.example.com", None),
+    (lambda ses, n: ses.get_email_template(TemplateName=f"{n}-denied"),
+     "GetEmailTemplate", "template/{n}-denied", "with an explicit deny in an identity-based policy"),
+], ids=["account", "list", "create-set", "get-set", "create-template", "identity", "explicit-deny"])
+def test_ses_v2_authorization_contract(auth_enabled, iam_user, sesv2, call, action, resource, reason):
+    """An SES v2 call is authorized as ses:<operation> on the resource its path or create body names."""
+    name = f"sesv2-{_uuid_mod.uuid4().hex[:8]}"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow",
+         "Action": ["ses:CreateConfigurationSet", "ses:GetConfigurationSet", "ses:DeleteConfigurationSet"],
+         "Resource": f"{_SES_V2_ARN}:configuration-set/{name}-allowed"},
+        {"Effect": "Allow", "Action": "ses:GetEmailTemplate", "Resource": f"{_SES_V2_ARN}:template/{name}-allowed"},
+        {"Effect": "Deny", "Action": "ses:GetEmailTemplate", "Resource": f"{_SES_V2_ARN}:template/{name}-denied"},
+    ]})
+    ses = user.client("sesv2")
+    try:
+        ses.create_configuration_set(ConfigurationSetName=f"{name}-allowed")
+        ses.get_configuration_set(ConfigurationSetName=f"{name}-allowed")
+        ses.delete_configuration_set(ConfigurationSetName=f"{name}-allowed")
+        assert _sesv2_error(ses.get_email_template, TemplateName=f"{name}-allowed")[0] == "NotFoundException"
+        if not auth_enabled:
+            try:
+                call(ses, name)
+            except ClientError as error:
+                assert error.response["Error"]["Code"] == "NotFoundException"
+            return
+        with pytest.raises(ClientError) as exc:
+            call(ses, name)
+        resource = resource if resource == "*" else f"{_SES_V2_ARN}:{resource.format(n=name)}"
+        reason = reason or f"because no identity-based policy allows the ses:{action} action"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        assert exc.value.response["Error"]["Message"] == (
+            f"User: {user.arn} is not authorized to perform: ses:{action} on resource: {resource} {reason}")
+    finally:
+        for cleanup in (lambda: sesv2.delete_configuration_set(ConfigurationSetName=f"{name}-other"),
+                        lambda: sesv2.delete_email_template(TemplateName=f"{name}-other")):
+            try:
+                cleanup()
+            except ClientError:
+                pass
+
+
 def test_ses_v2_send_email_with_v1_template(ses, sesv2):
     """A template created with v1 CreateTemplate renders through v2 SendEmail."""
     import urllib.request

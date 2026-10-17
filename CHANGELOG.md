@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SES v2 — calls are authorized under `AUTH=true`** — SES v2 calls were served whatever the caller's policies allowed; each is now authorized as `ses:<operation>` on the configuration set, contact list, custom verification email template, dedicated IP pool, identity or template its path or create body names (`*` otherwise), and a denial answers 403 `AccessDeniedException` naming the action and resource, as on AWS. Contributed by @iot-rocket.
+
+### Fixed
+- **Auth — requests that map to no IAM action are authenticated** — under `AUTH=true` a request MiniStack maps to no IAM action (SES v2, RDS Data, S3 Control, or a service MiniStack does not implement such as X-Ray) was served with a wrong secret, an unknown key, a session key without its token or a stale signature; it now answers the credential error AWS sends for the service, for example `InvalidSignatureException` 403 from SES v2 and RDS Data and `SignatureDoesNotMatch` 403 from S3 Control. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
