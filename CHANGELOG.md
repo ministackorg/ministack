@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — Jobs MQTT messages are written as AWS writes them** — the `$aws/things/<thing>/jobs` messages were spaced, ASCII-escaped JSON with `clientToken` last, a `thingName` and an empty `statusDetails` in the `get` and `start-next` executions and no `jobDocument` in an execution whose document is `null`; they are now compact UTF-8 in AWS's member order with `clientToken` first, the job document as the HTTP plane sends it, characters outside the BMP escaped in `statusDetails` and in the update and rejected responses, and `"jobDocument":null` kept. Contributed by @iot-rocket.
+- **IoT Jobs — a status a device may not set is refused first** — `UpdateJobExecution` (HTTP and the MQTT `update` topic) to QUEUED, CANCELED or TIMED_OUT answered `ResourceNotFoundException` for an unknown job or thing and the version error for a stale `expectedVersion`; it now refuses the status first with `InvalidStateTransitionException` (over MQTT `InvalidStateTransition` without `executionState`), as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

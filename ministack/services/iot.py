@@ -8212,16 +8212,75 @@ def jobs_job_document(job_id: str) -> str:
         return document
 
 
-def _jobs_job_document_object(job_id: str):
-    """The job document as a JSON object — the shape AWS serves over MQTT
-    (over HTTP the same document stays a string; see jobs-mqtt-api vs the
-    REST JobExecution shape). A stored document that is not valid JSON
-    passes through as the raw string rather than being invented into one."""
+class _JobsDocumentText(str):
+    """A job document in its device spelling, written into a Jobs MQTT message as it is."""
+
+
+_JOBS_NON_BMP_RE = re.compile("[\\U00010000-\\U0010FFFF]")
+
+
+def _jobs_utf16_escape(match: re.Match) -> str:
+    """A character outside the BMP as the escapes of its UTF-16 surrogate pair."""
+    code = ord(match.group()) - 0x10000
+    return f"\\u{0xD800 + (code >> 10):04X}\\u{0xDC00 + (code & 0x3FF):04X}"
+
+
+def _jobs_job_document_object(job_id: str, escape_non_bmp: bool = False):
+    """The job document a Jobs MQTT message carries; a stored text that is not JSON goes out as a string."""
     document = jobs_job_document(job_id)
     try:
-        return json.loads(document)
+        json.loads(document)
     except ValueError:
         return document
+    if escape_non_bmp:
+        document = _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, document)
+    return _JobsDocumentText(document)
+
+
+_JOBS_MQTT_EXECUTION_MEMBERS = (
+    "jobId", "status", "statusDetails", "queuedAt", "startedAt", "lastUpdatedAt",
+    "versionNumber", "executionNumber", "approximateSecondsBeforeTimedOut", "jobDocument",
+)
+
+
+def _jobs_mqtt_execution(execution: dict, document) -> dict:
+    """A JobExecution as Jobs MQTT messages carry it: AWS's member order, no thingName, no empty statusDetails."""
+    view = jobs_execution_view(execution, document)
+    return {
+        key: view[key] for key in _JOBS_MQTT_EXECUTION_MEMBERS
+        if key in view and (key != "statusDetails" or view[key])
+    }
+
+
+def _jobs_mqtt_head(client_token, timestamp: int) -> dict:
+    """The members a Jobs MQTT response starts with: the request's clientToken, if any, then timestamp."""
+    head = {} if client_token is None else {"clientToken": client_token}
+    head["timestamp"] = timestamp
+    return head
+
+
+def _jobs_execution_state(execution: dict) -> dict:
+    """The executionState of a Jobs MQTT response: statusDetails only when set."""
+    state = {"status": execution["status"]}
+    if execution.get("statusDetails"):
+        state["statusDetails"] = execution["statusDetails"]
+    state["versionNumber"] = execution["versionNumber"]
+    return state
+
+
+def _jobs_mqtt_json(value) -> str:
+    """Compact JSON of a Jobs MQTT message: characters outside the BMP escaped, a job document's text kept as it is."""
+    if isinstance(value, _JobsDocumentText):
+        return value
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{_jobs_mqtt_json(key)}:{_jobs_mqtt_json(member)}" for key, member in value.items()
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(map(_jobs_mqtt_json, value)) + "]"
+    if isinstance(value, str):
+        return _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, _jobs_device_json(value))
+    return _jobs_device_json(value)
 
 
 def jobs_update_execution(
@@ -8236,24 +8295,11 @@ def jobs_update_execution(
     """Apply a device-reported status to an execution.
 
     Returns ``(execution copy, None)``, or ``(None, error)`` for every
-    rejection: unknown execution (404), stale or non-numeric
-    `expectedVersion`, an already-terminal execution, an unknown status, the
-    illegal walk back to QUEUED, and the service-side statuses a device may
-    not set. A successful update may complete the job.
+    rejection, in this order: an unknown status or one a device may not set
+    (QUEUED and the service-side statuses), unknown execution (404), stale or
+    non-numeric `expectedVersion`, and an already-terminal execution. A
+    successful update may complete the job.
     """
-    _jobs_materialize_executions(job_id)
-    execution = _job_executions.get((thing_name, job_id))
-    if execution is None:
-        return None, error_response_json(
-            "ResourceNotFoundException",
-            f"Job {job_id} not found for {thing_name}",
-            404,
-        )
-    error = _jobs_check_expected_version(
-        execution, expected_version, "InvalidStateTransitionException"
-    )
-    if error:
-        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
@@ -8268,6 +8314,19 @@ def jobs_update_execution(
             f"The status of job execution cannot be changed to be {status}",
             409,
         )
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing_name, job_id))
+    if execution is None:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"Job {job_id} not found for {thing_name}",
+            404,
+        )
+    error = _jobs_check_expected_version(
+        execution, expected_version, "InvalidStateTransitionException"
+    )
+    if error:
+        return None, error
     error = _jobs_reject_if_terminal(
         execution,
         f"Job {job_id} for {thing_name} has already finished with status {execution['status']}",
@@ -8307,7 +8366,7 @@ def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
     reference words every stamp as "the time, in seconds since the epoch"),
     flat statusDetails map. Shared by the iot-jobs-data HTTP plane (which
     passes ``document`` as the string AWS serves there) and the
-    jobs-over-MQTT bridge (which passes the parsed object) so both speak one
+    jobs-over-MQTT bridge (which passes the document as JSON) so both speak one
     shape."""
     view = {
         "jobId": execution["jobId"],
@@ -8336,11 +8395,11 @@ def jobs_execution_summary(execution: dict) -> dict:
         "jobId": execution["jobId"],
         "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
-        "versionNumber": execution["versionNumber"],
-        "executionNumber": execution["executionNumber"],
     }
     if execution.get("startedAt") is not None:
         entry["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    entry["executionNumber"] = execution["executionNumber"]
+    entry["versionNumber"] = execution["versionNumber"]
     return entry
 
 
@@ -8378,16 +8437,10 @@ async def jobs_notify_thing(
         pending = jobs_pending_for_thing(thing_name)
         nxt = jobs_start_next_execution(thing_name, peek=True)
         next_view = (
-            jobs_execution_view(nxt, _jobs_job_document_object(nxt["jobId"]))
+            _jobs_mqtt_execution(nxt, _jobs_job_document_object(nxt["jobId"]))
             if nxt is not None
             else None
         )
-    if next_view is not None:
-        # AWS sends no thingName and no empty statusDetails here (measured
-        # eu-central-1 2026-10-05).
-        del next_view["thingName"]
-        if not next_view["statusDetails"]:
-            del next_view["statusDetails"]
     ts = int(time.time())
     jobs_by_status: dict = {}
     for execution in pending:
@@ -8397,7 +8450,7 @@ async def jobs_notify_thing(
     base = f"$aws/things/{thing_name}/jobs"
     await broker_publish(
         account_id, region, f"{base}/notify",
-        json.dumps({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
+        _jobs_mqtt_json({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
     )
     next_job_id = nxt["jobId"] if nxt is not None else None
     if next_job_id == prev_next_job_id:
@@ -8407,7 +8460,7 @@ async def jobs_notify_thing(
         notify_next["execution"] = next_view
     await broker_publish(
         account_id, region, f"{base}/notify-next",
-        json.dumps(notify_next).encode("utf-8"), qos=1,
+        _jobs_mqtt_json(notify_next).encode("utf-8"), qos=1,
     )
 
 
@@ -9460,11 +9513,11 @@ def _jobs_rejected(
     enum (InvalidRequest, InvalidJson, ResourceNotFound, VersionMismatch,
     InvalidStateTransition, TerminalStateReached), never a numeric HTTP
     status."""
-    doc = {"code": code, "message": message, "timestamp": int(time.time())}
+    doc = _jobs_mqtt_head(client_token, int(time.time()))
     if execution_state is not None:
         doc["executionState"] = execution_state
-    if client_token is not None:
-        doc["clientToken"] = client_token
+    doc["code"] = code
+    doc["message"] = message
     return doc
 
 
@@ -9502,10 +9555,7 @@ def _jobs_error_tuple_to_rejected(
     # A refused status carries no executionState.
     refused_status = message.startswith("The status of job execution cannot be changed")
     if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None and not refused_status:
-        execution_state = {
-            "status": execution["status"],
-            "versionNumber": execution["versionNumber"],
-        }
+        execution_state = _jobs_execution_state(execution)
     return _jobs_rejected(code, message, client_token, execution_state)
 
 
@@ -9536,7 +9586,7 @@ async def _handle_jobs_publish(
         await broker_publish(
             account_id, region,
             f"{base}/{suffix_base}/{kind}",
-            json.dumps(doc).encode("utf-8"), qos=1,
+            _jobs_mqtt_json(doc).encode("utf-8"), qos=1,
         )
 
     try:
@@ -9564,17 +9614,13 @@ async def _handle_jobs_publish(
     if verb == "get" and job_id is None:
         with request_scope(account_id, region):
             pending = jobs_pending_for_thing(thing)
-        doc = {
-            "timestamp": ts,
-            "inProgressJobs": [
-                jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
-            ],
-            "queuedJobs": [
-                jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
-            ],
-        }
-        if client_token is not None:
-            doc["clientToken"] = client_token
+        doc = _jobs_mqtt_head(client_token, ts)
+        doc["inProgressJobs"] = [
+            jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
+        ]
+        doc["queuedJobs"] = [
+            jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
+        ]
         await _respond("accepted", doc)
         return
 
@@ -9588,11 +9634,9 @@ async def _handle_jobs_publish(
                 if execution is not None
                 else None
             )
-        doc = {"timestamp": ts}
+        doc = _jobs_mqtt_head(client_token, ts)
         if execution is not None:
-            doc["execution"] = jobs_execution_view(execution, document)
-        if client_token is not None:
-            doc["clientToken"] = client_token
+            doc["execution"] = _jobs_mqtt_execution(execution, document)
         await _respond("accepted", doc)
         # No notify / notify-next here: QUEUED -> IN_PROGRESS keeps the
         # execution both pending and at the front of the queue, and AWS stays
@@ -9629,11 +9673,9 @@ async def _handle_jobs_publish(
             await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
             return
         # An idle thing's "$next" mirrors the HTTP plane's empty structure.
-        doc = {"timestamp": ts}
+        doc = _jobs_mqtt_head(client_token, ts)
         if execution is not None:
-            doc["execution"] = jobs_execution_view(execution, document)
-        if client_token is not None:
-            doc["clientToken"] = client_token
+            doc["execution"] = _jobs_mqtt_execution(execution, document)
         await _respond("accepted", doc)
         return
 
@@ -9652,18 +9694,12 @@ async def _handle_jobs_publish(
             "rejected", _jobs_error_tuple_to_rejected(error, client_token, current)
         )
         return
-    doc = {"timestamp": ts}
+    doc = _jobs_mqtt_head(client_token, ts)
     if request.get("includeJobExecutionState"):
-        doc["executionState"] = {
-            "status": execution["status"],
-            "statusDetails": execution.get("statusDetails") or {},
-            "versionNumber": execution["versionNumber"],
-        }
+        doc["executionState"] = _jobs_execution_state(execution)
     if request.get("includeJobDocument"):
         with request_scope(account_id, region):
-            doc["jobDocument"] = _jobs_job_document_object(job_id)
-    if client_token is not None:
-        doc["clientToken"] = client_token
+            doc["jobDocument"] = _jobs_job_document_object(job_id, escape_non_bmp=True)
     await _respond("accepted", doc)
     if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
         # A terminal report removed the execution from the pending set. AWS
