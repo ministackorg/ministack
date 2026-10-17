@@ -1160,12 +1160,26 @@ def _decrypt(data):
         err = _require_crypto("Decrypt")
         if err:
             return err
+        algorithm = data.get("EncryptionAlgorithm")
+        if algorithm is None:
+            return error_response_json(
+                "ValidationException",
+                "EncryptionAlgorithm is required for asymmetric KMS keys.",
+                400,
+            )
+        if algorithm not in rec.get("EncryptionAlgorithms", []):
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Encryption algorithm {algorithm} is not supported for key spec {rec['KeySpec']}.",
+                400,
+            )
+        digest = hashes.SHA1() if algorithm == "RSAES_OAEP_SHA_1" else hashes.SHA256()
         try:
             plaintext = rec["_private_key"].decrypt(
                 ciphertext,
                 padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
+                    mgf=padding.MGF1(algorithm=digest),
+                    algorithm=digest,
                     label=None,
                 ),
             )
