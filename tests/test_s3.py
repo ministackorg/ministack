@@ -9184,3 +9184,42 @@ def test_s3_post_permission_contract(
         assert response.status_code == 204, response.text
         with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
             assert body.read() == b"post-auth-contract"
+
+
+@pytest.mark.parametrize("operation", ["put_object", "copy_object", "create_multipart_upload"])
+@pytest.mark.parametrize("lock", ["retention", "hold_on", "hold_off"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_s3_object_lock_headers_require_enabled_bucket(s3, operation, lock, enabled):
+    from datetime import timedelta, timezone
+
+    bucket = f"lock-headers-{uuid.uuid4().hex[:16]}"
+    s3.create_bucket(Bucket=bucket, **({"ObjectLockEnabledForBucket": True} if enabled else {}))
+    if not enabled:
+        s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bucket, Key="source", Body=b"original")
+    s3.put_object(Bucket=bucket, Key="target", Body=b"unchanged")
+    params = {"Bucket": bucket, "Key": "target"}
+    if operation == "put_object":
+        params["Body"] = b"replacement"
+    elif operation == "copy_object":
+        params["CopySource"] = f"{bucket}/source"
+    if lock == "retention":
+        params.update(ObjectLockMode="COMPLIANCE",
+                      ObjectLockRetainUntilDate=datetime.now(timezone.utc) + timedelta(days=1))
+    else:
+        params["ObjectLockLegalHoldStatus"] = "ON" if lock == "hold_on" else "OFF"
+    call = getattr(s3, operation)
+    if enabled:
+        result = call(**params)
+        assert result["ResponseMetadata"]["HTTPStatusCode"] == 200
+        if operation == "create_multipart_upload":
+            s3.abort_multipart_upload(Bucket=bucket, Key="target", UploadId=result["UploadId"])
+    else:
+        with pytest.raises(ClientError) as exc:
+            call(**params)
+        assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+        assert exc.value.response["Error"]["Message"]
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert s3.get_object(Bucket=bucket, Key="target")["Body"].read() == b"unchanged"
+        assert len(s3.list_object_versions(Bucket=bucket)["Versions"]) == 2
+        assert not s3.list_multipart_uploads(Bucket=bucket).get("Uploads")
