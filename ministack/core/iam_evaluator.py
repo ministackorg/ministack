@@ -1248,13 +1248,16 @@ class SignedRequest:
     headers: dict
     body: bytes = b""
     presigned: bool = False
+    handshake: bool = False
 
 
 _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
     "ministack_signed_request", default=None)
 
 
-def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_headers: list) -> None:
+def pin_signed_request(
+    method: str, raw_path: str, query_params: dict, raw_headers: list, handshake: bool = False,
+) -> None:
     """Keep a request signed with an IAM user or STS session key as sent, for its signature check."""
     from ministack.core.router import extract_access_key_id
     from ministack.core.sigv4 import decode_header_value
@@ -1262,7 +1265,9 @@ def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_heade
     authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
     presigned = not authorization.startswith("AWS4-HMAC-SHA256") and _query_signed(query_params)
     access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
-    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or _is_root_key(access_key_id):
+    # A signature that names no key is checked too: it is incomplete or names an unknown key.
+    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or (
+            access_key_id and _is_root_key(access_key_id)):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1270,7 +1275,8 @@ def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_heade
         key, text = name.decode("latin-1").lower(), decode_header_value(value)
         # SigV4 signs a header sent on several lines as its values joined by a bare comma.
         headers[key] = f"{headers[key]},{text}" if key in headers else text
-    _signed_request.set(SignedRequest(access_key_id, method, raw_path, query_params, headers, presigned=presigned))
+    _signed_request.set(SignedRequest(
+        access_key_id, method, raw_path, query_params, headers, presigned=presigned, handshake=handshake))
 
 
 def _query_signed(query_params: dict) -> bool:
@@ -1280,8 +1286,7 @@ def _query_signed(query_params: dict) -> bool:
         return found[0] if isinstance(found, list) else found
 
     scope = value("X-Amz-Credential").split("/")
-    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0]) and (
-        len(scope) < 4 or scope[3] != "s3")
+    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and (len(scope) < 4 or scope[3] != "s3")
 
 
 def pin_signed_body(body: bytes) -> None:
@@ -1289,6 +1294,25 @@ def pin_signed_body(body: bytes) -> None:
     request = _signed_request.get()
     if request is not None:
         _signed_request.set(replace(request, body=body))
+
+
+def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Check a WebSocket upgrade signed in its Authorization header or query string, as ``authenticate`` does."""
+    from urllib.parse import parse_qs, quote
+
+    from ministack.core.responses import get_account_id
+
+    raw_path = scope.get("raw_path") or quote(scope.get("path", "")).encode()
+    query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
+    pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
+    request = _signed_request.get()
+    if request is None or not request.access_key_id:
+        return None
+    try:
+        account_id = find_iam_access_key_account(request.access_key_id) or get_account_id()
+    except AmbiguousAccessKeyError:
+        account_id = get_account_id()
+    return authenticate(request.access_key_id, account_id)
 
 
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
@@ -1318,7 +1342,9 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         token = (request.query_params.get("X-Amz-Security-Token") or [""])[0]
     else:
         token = request.headers.get("x-amz-security-token", "")
-    credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id, token)
+    credential = resolve_credential(
+        access_key_id, _account_from_sts_session(access_key_id) or account_id, token,
+    ) if access_key_id else _unknown_access_key()
     if isinstance(credential, CredentialResolutionError):
         if credential.code == "InvalidToken":
             # AWS treats a session key without its token as unknown, and any other token as invalid.
@@ -1329,6 +1355,7 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     failure = header_signature_failure(
         signature, credential.secret_access_key, request.method, request.raw_path,
         request.query_params, request.headers, request.body, presigned=request.presigned,
+        explain=request.handshake,
     )
     return AuthError(*failure) if failure else credential
 
@@ -1414,7 +1441,9 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
-    checked = authenticate(access_key_id or "", account_id)
+    # S3, API Gateway methods and function URLs can be called anonymously: a request naming no key is not checked.
+    anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
+    checked = None if anonymous_ok and not access_key_id else authenticate(access_key_id or "", account_id)
     if isinstance(checked, AuthError):
         return checked
 

@@ -1139,6 +1139,32 @@ def test_lambda_list_functions(lam):
     names = [f["FunctionName"] for f in _list_all_functions(lam)]
     assert "lam-create-test" in names
 
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("credential, code, message", [
+    (b"", "MissingAuthenticationTokenException", "Missing Authentication Token"),
+    (b"Credential=, ", "IncompleteSignatureException", "Authorization header requires 'Credential' parameter."),
+], ids=["left-out", "empty"])
+def test_lambda_list_functions_header_without_credential_contract(auth_enabled, iam_user, credential, code, message):
+    """Under AUTH=true Lambda answers a header without Credential as unauthenticated, an empty one as incomplete."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "lambda:ListFunctions", "Resource": "*"}]}).client("lambda")
+    client.list_functions(MaxItems=1)
+
+    def replace_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + credential + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", replace_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_functions(MaxItems=1)
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (code, 403)
+        assert response["Error"]["Message"].startswith(message)
+    else:
+        assert "Functions" in client.list_functions(MaxItems=1)
+
 def test_lambda_delete_function(lam):
     lam.create_function(
         FunctionName="lam-to-delete",

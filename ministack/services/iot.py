@@ -11474,6 +11474,25 @@ async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bo
             return False
 
 
+def _ws_handshake_refused(scope: dict) -> bool:
+    """Under AUTH=true, whether the upgrade's SigV4 signature, time or session token fails."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import AuthError, authenticate_handshake
+
+    return bool(AUTH) and isinstance(authenticate_handshake(scope), AuthError)
+
+
+async def _refuse_ws_handshake(scope: dict, send) -> None:
+    """Answer a refused upgrade with 403 and a trace id, the device gateway's answer to any credential failure."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": "Forbidden", "traceId": str(uuid.uuid4())}, separators=(",", ":")).encode()
+    await send({"type": "websocket.http.response.start", "status": 403,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
 async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
@@ -11491,6 +11510,9 @@ async def handle_websocket(
             sub_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
         except UnicodeDecodeError:
             sub_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+    if _ws_handshake_refused(scope):
+        await _refuse_ws_handshake(scope, send)
+        return
     requested = sub_headers.get("sec-websocket-protocol", "")
     chosen = None
     for proto in [p.strip() for p in requested.split(",") if p.strip()]:
