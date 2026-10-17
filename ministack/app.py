@@ -1583,14 +1583,12 @@ def _s3control_mrap_arn(s3, path: str) -> str:
 def _s3control_access_point_arn(s3, path: str) -> str:
     """IAM resource for an access point request: its regional ARN, or the
     account's wildcard for ListAccessPoints."""
-    name = unquote(path).rstrip("/").removeprefix("/v20180820/accesspoint").strip("/").removesuffix("/policy")
-    return s3.access_point_arn(name or "*")
+    return s3.access_point_arn(s3.access_point_control_route(path)[0] or "*")
 
 
 def _s3control_object_lambda_arn(s3, path: str) -> str:
     """IAM resource for an Object Lambda Access Point request."""
-    name = unquote(path).rstrip("/").removeprefix("/v20180820/accesspointforobjectlambda").strip("/")
-    return s3.object_lambda_arn(name.split("/", 1)[0] or "*")
+    return s3.object_lambda_arn(s3.object_lambda_control_route(path)[0] or "*")
 
 
 async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,

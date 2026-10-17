@@ -6175,6 +6175,16 @@ def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
     ("PUT", "/v20180820/accesspoint/ap1/policy", "s3:PutAccessPointPolicy"),
     ("GET", "/v20180820/accesspoint/ap1/policy", "s3:GetAccessPointPolicy"),
     ("DELETE", "/v20180820/accesspoint/ap1/policy", "s3:DeleteAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/policy", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/policy", "s3:DeleteAccessPoint"),
+    ("POST", "/v20180820/accesspoint/ap1/policy", None),
+    ("POST", "/v20180820/accesspoint", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/x", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy/x", None),
+    ("PUT", "/v20180820/accesspoint//ap1/policy", None),
+    ("GET", "/v20180820/accesspoint/ap1/", None),
+    ("GET", "/v20180820/accesspoint/ap1/policyStatus", "s3:GetAccessPointPolicyStatus"),
+    ("PUT", "/v20180820/accesspoint/ap1/scope", "s3express:PutAccessPointScope"),
 ])
 def test_s3control_access_point_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
@@ -6209,6 +6219,13 @@ def test_s3control_access_point_denied_without_the_action(monkeypatch):
     ("PUT", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:PutAccessPointPolicyForObjectLambda"),
     ("GET", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:GetAccessPointPolicyForObjectLambda"),
     ("DELETE", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:DeleteAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/policy", "s3:GetAccessPointForObjectLambda"),
+    ("POST", "/v20180820/accesspointforobjectlambda/ol/policy", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/configuration", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/x", None),
+    ("PUT", "/v20180820/accesspointforobjectlambda//ol/policy", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policyStatus", "s3:GetAccessPointPolicyStatusForObjectLambda"),
 ])
 def test_s3control_object_lambda_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
