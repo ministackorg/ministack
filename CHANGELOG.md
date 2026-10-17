@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **AppSync — data-plane error responses** — Event API `POST /event` refusals answered `{"__type", "message"}` with MiniStack's own messages, and the GraphQL endpoint answered 500 for a body that is not a JSON object, a message-only 400 for a missing query and 200 for an unparseable one; both now answer AWS's `{"errors": [{"errorType", "message"}]}` envelope with AWS's error types, messages and `x-amzn-ErrorType` header (`SerializationException`, `MalformedHttpRequestException`, `ResourceNotFoundException` for an unknown API, `UnknownOperationException` for another path on an Event API host), and the publish endpoint answers `application/json`. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
