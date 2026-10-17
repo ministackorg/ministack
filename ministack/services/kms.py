@@ -1918,6 +1918,12 @@ def _schedule_key_deletion(data):
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
     days = data.get("PendingWindowInDays", 30)
+    if not isinstance(days, int) or isinstance(days, bool) or not 7 <= days <= 30:
+        return error_response_json(
+            "ValidationException",
+            "PendingWindowInDays must be an integer between 7 and 30, inclusive.",
+            400,
+        )
     state = "PendingDeletion"
     if rec.get("MultiRegion"):
         others = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]
