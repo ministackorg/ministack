@@ -5724,6 +5724,98 @@ def test_offline_qos1_messages_queued_and_delivered_on_reconnect():
     reset()
 
 
+def test_unacknowledged_qos1_message_is_resent_when_the_session_resumes(monkeypatch):
+    """A QoS 1 message without a PUBACK stays with the session and keeps its packet identifier."""
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(iot_module, "_RETRANSMIT_INTERVAL_SECONDS", 0.3)
+    reset()
+    connect = _build_connect_body(client_id="unacked", clean_session=False)
+
+    async def _run():
+        send1, sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("data/unacked", 1)]))
+        await publish("123456789012", "data/unacked", b"m1", qos=1)
+        assert _extract_publish_frames(sent1) == [("data/unacked", b"m1", 1, 1, False)]
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        await publish("123456789012", "data/unacked", b"m2", qos=1)
+        # The retransmit interval passes while the client is offline.
+        await asyncio.sleep(0.4)
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0)
+        assert _extract_publish_frames(sent2) == [
+            ("data/unacked", b"m1", 1, 1, True),
+            ("data/unacked", b"m2", 1, 2, False),
+        ]
+        for pid in (1, 2):
+            await session2.handle_packet(PKT_PUBACK, 0, struct.pack("!H", pid))
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent3) == (True, 0)
+        assert _extract_publish_frames(sent3) == []
+        await session3.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unacknowledged_qos1_message_waits_for_its_retransmit_interval_after_a_resume(monkeypatch):
+    """Resumed before the interval runs out, the message goes out when it does; a clean start drops it."""
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(iot_module, "_RETRANSMIT_INTERVAL_SECONDS", 0.3)
+    reset()
+    key = ("123456789012", _TEST_REGION, "unacked5")
+    connect = _build_mqtt5_connect_body("unacked5", clean_start=False, session_expiry=300)
+
+    async def _run():
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "data/unacked5", 0x01)
+        )
+        await publish("123456789012", "data/unacked5", b"m1", qos=1)
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0)
+        assert _extract_publish_frames(sent2) == []
+        await asyncio.sleep(0.5)
+        # The payload follows an empty property block.
+        assert _extract_publish_frames(sent2) == [("data/unacked5", b"\x00m1", 1, 1, True)]
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+        assert list(_persistent_sessions[key].in_flight) == [1]
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(
+            PKT_CONNECT, 0, _build_mqtt5_connect_body("unacked5", clean_start=True)
+        )
+        await asyncio.sleep(0.5)
+        assert _extract_publish_frames(sent3) == []
+        await session3.cleanup()
+        assert key not in _persistent_sessions
+
+    asyncio.run(_run())
+    reset()
+
+
 def test_qos0_messages_not_queued_for_offline_sessions():
     """QoS 0 messages should NOT be queued for offline persistent sessions."""
     reset()

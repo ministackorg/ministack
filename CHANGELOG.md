@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — unacknowledged QoS 1 messages survive a persistent session reconnect** — a QoS 1 message the subscriber had not acknowledged was dropped when its persistent session disconnected; the session now keeps it with its packet identifier, and the resumed connection sends it again once its retransmit interval has passed (at once when it passed while the client was offline, ahead of the messages queued meanwhile), continuing the session's packet identifiers. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

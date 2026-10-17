@@ -8655,7 +8655,7 @@ _MAX_QUEUED_MESSAGES = 1000
 class _PersistentSessionState:
     __slots__ = (
         "subscriptions", "queued_messages", "created_at", "expiry_interval",
-        "session_identifier",
+        "session_identifier", "in_flight", "next_packet_id",
     )
 
     def __init__(
@@ -8676,6 +8676,10 @@ class _PersistentSessionState:
         self.expiry_interval: int | None = expiry_interval
         # Reported as ``sessionIdentifier`` by every connection that resumes it.
         self.session_identifier: str = session_identifier or str(uuid.uuid4())
+        # QoS 1 messages sent but not acknowledged when the connection ended,
+        # and the packet identifier counter, both handed to the next resume.
+        self.in_flight: dict[int, "_InFlightMessage"] = {}
+        self.next_packet_id: int = 1
 
 
 def _is_session_expired(session_state: _PersistentSessionState) -> bool:
@@ -10783,21 +10787,27 @@ class _WSSession:
     async def _retransmit_loop(self) -> None:
         try:
             while self._in_flight:
-                await asyncio.sleep(_RETRANSMIT_INTERVAL_SECONDS)
+                oldest = min(msg.sent_at for msg in self._in_flight.values())
                 now = asyncio.get_event_loop().time()
-                for pid, msg in list(self._in_flight.items()):
-                    if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
-                        msg.retransmit_count += 1
-                        msg.sent_at = now
-                        await self.send_bytes(
-                            _make_publish(
-                                msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
-                                retain=msg.retain,
-                                properties=self._publish_properties(msg.properties),
-                            )
-                        )
+                await asyncio.sleep(max(oldest + _RETRANSMIT_INTERVAL_SECONDS - now, 0))
+                await self._retransmit_due()
         except asyncio.CancelledError:
             pass
+
+    async def _retransmit_due(self) -> None:
+        """Resend every in-flight QoS 1 message that has waited a retransmit interval for its PUBACK."""
+        now = asyncio.get_event_loop().time()
+        for pid, msg in list(self._in_flight.items()):
+            if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
+                msg.retransmit_count += 1
+                msg.sent_at = now
+                await self.send_bytes(
+                    _make_publish(
+                        msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
+                        retain=msg.retain,
+                        properties=self._publish_properties(msg.properties),
+                    )
+                )
 
     async def send_bytes(self, b: bytes) -> None:
         async with self._send_lock:
@@ -11154,6 +11164,12 @@ class _WSSession:
                     await self._send_connack(
                         session_present=True, assigned_client_id=assigned_client_id
                     )
+                    # Unacknowledged messages keep their packet identifiers and
+                    # go out again once their retransmit interval has passed.
+                    self._next_pid = existing_ps.next_packet_id
+                    self._in_flight.update(existing_ps.in_flight)
+                    existing_ps.in_flight = {}
+                    await self._retransmit_due()
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
                     for q_topic, q_payload, q_qos, q_properties, q_received_at in queued:
@@ -11165,6 +11181,8 @@ class _WSSession:
                             await self.deliver_to_client(q_topic, q_payload, q_qos)
                         finally:
                             _delivery_properties.reset(token)
+                    if self._in_flight:
+                        self._ensure_retransmit_timer()
                     await self._publish_connected()
                     return True
                 else:
@@ -11394,7 +11412,6 @@ class _WSSession:
             except asyncio.CancelledError:
                 pass
             self._retransmit_task = None
-        self._in_flight.clear()
         if not self._graceful_disconnect and self._will_topic is not None:
             await broker_publish(
                 self.account_id,
@@ -11418,6 +11435,7 @@ class _WSSession:
                 _persistent_sessions.pop(
                     (self.account_id, self.region, self._client_id), None
                 )
+        self._in_flight.clear()
         for sid in self._sub_ids:
             await broker_unsubscribe(sid)
         self._sub_ids.clear()
@@ -11444,12 +11462,15 @@ class _WSSession:
             existing.created_at = time.time()
             existing.expiry_interval = self._session_expiry_interval
         else:
-            _persistent_sessions[session_key] = _PersistentSessionState(
+            existing = _persistent_sessions[session_key] = _PersistentSessionState(
                 subscriptions=unprefixed_filters,
                 created_at=time.time(),
                 expiry_interval=self._session_expiry_interval,
                 session_identifier=self._session_identifier,
             )
+        pending = list(self._in_flight.items())[-_MAX_QUEUED_MESSAGES:]
+        existing.in_flight = dict(pending)
+        existing.next_packet_id = self._next_pid
 
 
 async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bool:
