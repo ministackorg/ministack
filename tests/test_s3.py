@@ -1491,45 +1491,32 @@ def test_s3_object_legal_hold(s3):
     assert resp["LegalHold"]["Status"] == "OFF"
 
 def test_s3_object_lock_prevents_delete(s3):
-    bkt = "intg-s3-lock-del"
-    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    s3.put_object(Bucket=bkt, Key="locked.txt", Body=b"immutable")
-
-    s3.put_object_legal_hold(
-        Bucket=bkt,
-        Key="locked.txt",
-        LegalHold={"Status": "ON"},
-    )
-    with pytest.raises(ClientError) as exc:
-        s3.delete_object(Bucket=bkt, Key="locked.txt")
-    assert exc.value.response["Error"]["Code"] == "AccessDenied"
-
-    # Remove legal hold, add governance retention
-    s3.put_object_legal_hold(
-        Bucket=bkt,
-        Key="locked.txt",
-        LegalHold={"Status": "OFF"},
-    )
+    """A delete naming a locked version is refused; a plain delete adds a delete marker (Object Lock docs)."""
     from datetime import datetime, timedelta, timezone
 
-    retain_until = datetime.now(timezone.utc) + timedelta(days=1)
-    s3.put_object_retention(
-        Bucket=bkt,
-        Key="locked.txt",
-        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
-    )
+    bkt = "intg-s3-lock-del"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    version = s3.put_object(Bucket=bkt, Key="locked.txt", Body=b"immutable")["VersionId"]
+    s3.put_object_legal_hold(Bucket=bkt, Key="locked.txt", LegalHold={"Status": "ON"})
     with pytest.raises(ClientError) as exc:
-        s3.delete_object(Bucket=bkt, Key="locked.txt")
+        s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version)
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
-    # Bypass governance retention
-    s3.delete_object(
-        Bucket=bkt,
-        Key="locked.txt",
-        BypassGovernanceRetention=True,
-    )
+    marker = s3.delete_object(Bucket=bkt, Key="locked.txt")
+    assert marker["DeleteMarker"] is True
+    assert s3.get_object(Bucket=bkt, Key="locked.txt", VersionId=version)["Body"].read() == b"immutable"
+    assert s3.get_object_legal_hold(Bucket=bkt, Key="locked.txt", VersionId=version)["LegalHold"]["Status"] == "ON"
+
+    s3.put_object_legal_hold(Bucket=bkt, Key="locked.txt", VersionId=version, LegalHold={"Status": "OFF"})
+    retain_until = datetime.now(timezone.utc) + timedelta(days=1)
+    s3.put_object_retention(Bucket=bkt, Key="locked.txt", VersionId=version,
+                            Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until})
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version, BypassGovernanceRetention=True)
     with pytest.raises(ClientError):
-        s3.head_object(Bucket=bkt, Key="locked.txt")
+        s3.get_object(Bucket=bkt, Key="locked.txt", VersionId=version)
 
 def test_s3_bucket_replication(s3):
     src = "intg-s3-repl-src"
@@ -1647,17 +1634,20 @@ def test_s3_default_retention_applied(s3):
 def test_s3_batch_delete_enforces_lock(s3):
     bkt = "intg-s3-batch-lock"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")
-    s3.put_object(Bucket=bkt, Key="b.txt", Body=b"b")
+    a_version = s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")["VersionId"]
+    b_version = s3.put_object(Bucket=bkt, Key="b.txt", Body=b"b")["VersionId"]
     s3.put_object_legal_hold(Bucket=bkt, Key="a.txt", LegalHold={"Status": "ON"})
     resp = s3.delete_objects(
         Bucket=bkt,
-        Delete={"Objects": [{"Key": "a.txt"}, {"Key": "b.txt"}]},
+        Delete={"Objects": [{"Key": "a.txt", "VersionId": a_version}, {"Key": "b.txt", "VersionId": b_version}]},
     )
     deleted_keys = [d["Key"] for d in resp.get("Deleted", [])]
     error_keys = [e["Key"] for e in resp.get("Errors", [])]
     assert "b.txt" in deleted_keys
     assert "a.txt" in error_keys
+    # Without a VersionId the locked key just gets a delete marker.
+    resp = s3.delete_objects(Bucket=bkt, Delete={"Objects": [{"Key": "a.txt"}]})
+    assert resp["Deleted"][0]["DeleteMarker"] is True
 
 def test_s3_copy_preserves_tags_and_lock(s3):
     src = "intg-s3-copy-tag-src"
@@ -9478,3 +9468,38 @@ def test_post_after_persisted_reload(post_form, monkeypatch, tmp_path):
     _s3_mod._buckets.clear()
     _s3_mod._load_persisted_data()
     assert post_form.submit(post_form.generate(), data=b"second")[0] == 204
+
+
+def test_s3_object_lock_headers_need_an_object_lock_bucket(s3):
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-nolock-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bkt, Key="k", Body=b"x", ObjectLockMode="COMPLIANCE",
+                          ObjectLockRetainUntilDate=datetime.now(timezone.utc) + timedelta(days=1))
+        err = exc.value.response
+        assert (err["Error"]["Code"], err["Error"]["Message"], err["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "InvalidRequest", "Bucket is missing ObjectLockConfiguration", 400)
+        assert s3.list_objects_v2(Bucket=bkt).get("KeyCount") == 0
+    finally:
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_object_lock_applies_to_its_version_only(s3):
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-lock-ver-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    locked = s3.put_object(Bucket=bkt, Key="k", Body=b"v1", ObjectLockMode="COMPLIANCE",
+                           ObjectLockRetainUntilDate=datetime.now(timezone.utc) + timedelta(days=1))["VersionId"]
+    free = s3.put_object(Bucket=bkt, Key="k", Body=b"v2")["VersionId"]
+    assert "ObjectLockMode" not in s3.head_object(Bucket=bkt, Key="k")
+    assert s3.head_object(Bucket=bkt, Key="k", VersionId=locked)["ObjectLockMode"] == "COMPLIANCE"
+    s3.delete_object(Bucket=bkt, Key="k", VersionId=free)
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bkt, Key="k", VersionId=locked)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+

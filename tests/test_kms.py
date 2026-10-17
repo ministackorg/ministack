@@ -2870,3 +2870,61 @@ def test_kms_create_grant_rejects_primary_pending_replica_deletion():
         assert east.list_grants(KeyId=key_id)["Grants"] == []
     finally:
         west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("days,accepted", [(6, False), (7, True), (30, True), (31, False)])
+def test_kms_schedule_key_deletion_window_is_7_to_30_days(kms_client, days, accepted):
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    if accepted:
+        assert kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)["KeyState"] == "PendingDeletion"
+    else:
+        with pytest.raises(ClientError) as exc:
+            kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)
+        assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                               "Message": "PendingWindowInDays must be between 7 and 30"}
+        assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+
+
+def test_kms_rsassa_pss_uses_a_digest_length_salt(kms_client):
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    digest = hashlib.sha256(b"payload").digest()
+    signature = kms_client.sign(KeyId=key_id, Message=digest, MessageType="DIGEST",
+                         SigningAlgorithm="RSASSA_PSS_SHA_256")["Signature"]
+    public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+    public_key.verify(signature, digest, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                                     salt_length=padding.PSS.DIGEST_LENGTH),
+                      utils.Prehashed(hashes.SHA256()))
+
+
+def test_kms_rsa_encryption_honours_the_named_algorithm(kms_client):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+    sha256 = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    blob = public_key.encrypt(b"secret", sha256)
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob, EncryptionAlgorithm="RSAES_OAEP_SHA_1")
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    assert kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob,
+                       EncryptionAlgorithm="RSAES_OAEP_SHA_256")["Plaintext"] == b"secret"
+    sha1_blob = kms_client.encrypt(KeyId=key_id, Plaintext=b"secret", EncryptionAlgorithm="RSAES_OAEP_SHA_1")["CiphertextBlob"]
+    assert kms_client.decrypt(KeyId=key_id, CiphertextBlob=sha1_blob,
+                       EncryptionAlgorithm="RSAES_OAEP_SHA_1")["Plaintext"] == b"secret"
+
+
+def test_kms_sign_refuses_a_wrong_digest_length_or_algorithm(kms_client):
+    ec_key = kms_client.create_key(KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=ec_key, Message=b"x" * 20, MessageType="DIGEST", SigningAlgorithm="ECDSA_SHA_256")
+    err = exc.value.response
+    assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("ValidationException", 400)
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=ec_key, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="RSASSA_PSS_SHA_256")
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"

@@ -2002,11 +2002,11 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
             expiry = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(restore["expires_at"]))
             h["x-amz-restore"] = f'ongoing-request="false", expiry-date="{expiry}"'
     if bucket_name and key:
-        retention = _object_retention.get((bucket_name, key))
+        retention = _object_retention.get((bucket_name, key, obj.get("version_id")))
         if retention:
             h["x-amz-object-lock-mode"] = retention["Mode"]
             h["x-amz-object-lock-retain-until-date"] = retention["RetainUntilDate"]
-        hold = _object_legal_hold.get((bucket_name, key))
+        hold = _object_legal_hold.get((bucket_name, key, obj.get("version_id")))
         if hold:
             h["x-amz-object-lock-legal-hold"] = hold
     # AWS only returns x-amz-checksum-* headers when the request opted in via
@@ -2325,9 +2325,9 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
             if "tagging" in query_params:
                 return _get_object_tagging(bucket, key, query_params)
             if "retention" in query_params:
-                return _get_object_retention(bucket, key)
+                return _get_object_retention(bucket, key, query_params)
             if "legal-hold" in query_params:
-                return _get_object_legal_hold(bucket, key)
+                return _get_object_legal_hold(bucket, key, query_params)
             if "acl" in query_params:
                 return _get_object_acl(bucket, key, query_params)
             if "attributes" in query_params:
@@ -2344,9 +2344,9 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
             if "tagging" in query_params:
                 return _put_object_tagging(bucket, key, body, query_params)
             if "retention" in query_params:
-                return _put_object_retention(bucket, key, body, headers)
+                return _put_object_retention(bucket, key, body, headers, query_params)
             if "legal-hold" in query_params:
-                return _put_object_legal_hold(bucket, key, body)
+                return _put_object_legal_hold(bucket, key, body, query_params)
             if "acl" in query_params:
                 return _put_object_acl(bucket, key, body, headers, query_params)
             if "x-amz-copy-source" in headers:
@@ -4292,14 +4292,14 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
 
+    lock_err = _object_lock_header_error(bucket_name, headers)
+    if lock_err:
+        return lock_err
     etag = f'"{md5_hash(body)}"'
     obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
     obj["preserved_headers"].update(sse_headers)
     prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
-
-    # --- Object Lock headers on PutObject ---
-    _apply_object_lock_from_headers(bucket_name, key, headers)
 
     # --- x-amz-tagging header on PutObject ---
     # Parse + validate up front so the count error returns before persist/event,
@@ -4315,6 +4315,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     resp_headers.update(sse_headers)
     _maybe_replicate(bucket_name, key, obj, body, pending_tags)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
+    _apply_object_lock_from_headers(bucket_name, key, headers, obj.get("version_id"))
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
     # After the version is cut, so the record names it.
@@ -4699,12 +4700,14 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     if sse_err:
         return sse_err
 
+    lock_err = _object_lock_header_error(bucket_name, synth)
+    if lock_err:
+        return lock_err
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
     obj["preserved_headers"].update(sse_headers)
     prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
-    _apply_object_lock_from_headers(bucket_name, key, synth)
 
     # Defer tag write until version_id is assigned (tags are per-version).
     pending_tags = None
@@ -4716,6 +4719,7 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
 
     _maybe_replicate(bucket_name, key, obj, file_value, pending_tags)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
+    _apply_object_lock_from_headers(bucket_name, key, synth, obj.get("version_id"))
     _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag, version_id=version_id)
 
     if pending_tags is not None:
@@ -4767,7 +4771,17 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     return status, base_resp, b""
 
 
-def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
+_OBJECT_LOCK_HEADERS = ("x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date",
+                        "x-amz-object-lock-legal-hold", "x-amz-object-lock-legal-hold-status")
+
+
+def _object_lock_header_error(bucket_name: str, headers: dict) -> tuple | None:
+    if any(headers.get(h) for h in _OBJECT_LOCK_HEADERS) and not _bucket_object_lock.get(bucket_name):
+        return _error("InvalidRequest", "Bucket is missing ObjectLockConfiguration", 400)
+    return None
+
+
+def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict, version_id):
     lock_mode = headers.get("x-amz-object-lock-mode", "")
     lock_until = headers.get("x-amz-object-lock-retain-until-date", "")
     lock_legal = headers.get("x-amz-object-lock-legal-hold", "") or headers.get(
@@ -4775,7 +4789,7 @@ def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
     )
 
     if lock_mode and lock_until:
-        _object_retention[(bucket_name, key)] = {
+        _object_retention[(bucket_name, key, version_id)] = {
             "Mode": lock_mode,
             "RetainUntilDate": lock_until,
         }
@@ -4793,13 +4807,13 @@ def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
                 until = now.replace(year=now.year + years)
             else:
                 return
-            _object_retention[(bucket_name, key)] = {
+            _object_retention[(bucket_name, key, version_id)] = {
                 "Mode": dr["Mode"],
                 "RetainUntilDate": until.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             }
 
     if lock_legal in ("ON", "OFF"):
-        _object_legal_hold[(bucket_name, key)] = lock_legal
+        _object_legal_hold[(bucket_name, key, version_id)] = lock_legal
 
 
 def _object_tagging_count_header(bucket_name: str, key: str, version_id) -> dict:
@@ -5173,8 +5187,8 @@ def _purge_current_object(bucket_name: str, key: str, bucket: dict):
     bucket["objects"].pop(key, None)
     _object_tags.pop((bucket_name, key, None), None)
     _object_annotations.pop((bucket_name, key, None), None)
-    _object_retention.pop((bucket_name, key), None)
-    _object_legal_hold.pop((bucket_name, key), None)
+    _object_retention.pop((bucket_name, key, None), None)
+    _object_legal_hold.pop((bucket_name, key, None), None)
     _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
@@ -5567,6 +5581,8 @@ def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id:
     _object_tags.pop((bucket_name, key, version_id), None)
     _object_acl.pop((bucket_name, key, version_id), None)
     _object_annotations.pop((bucket_name, key, None if version_id == "null" else version_id), None)
+    _object_retention.pop((bucket_name, key, version_id), None)
+    _object_legal_hold.pop((bucket_name, key, version_id), None)
 
     if not versions:
         # History is now empty — drop the index entry and the current object.
@@ -5638,16 +5654,14 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
                 f"/{bucket_name}/{key}",
             )
 
-    if key in bucket["objects"]:
-        lock_err = _check_object_lock(bucket_name, key, headers)
-        if lock_err:
-            return lock_err
-
     # An explicit VersionId permanently removes exactly that version (or that
     # specific delete marker) — it never creates a new marker. Only a delete
     # WITHOUT a VersionId falls through to the delete-marker path below.
     version_id = _qp(query_params, "versionId", "")
     if version_id:
+        lock_err = _check_object_lock(bucket_name, key, headers, None if version_id == "null" else version_id)
+        if lock_err:
+            return lock_err
         _found, was_delete_marker = _delete_object_version(bucket, bucket_name, key, version_id)
         # S3 returns 204 whether or not the version existed, echoing the
         # addressed VersionId (and delete-marker flag when one was removed).
@@ -5679,8 +5693,8 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
     bucket["objects"].pop(key, None)
     _object_tags.pop((bucket_name, key, None), None)
     _object_annotations.pop((bucket_name, key, None), None)
-    _object_retention.pop((bucket_name, key), None)
-    _object_legal_hold.pop((bucket_name, key), None)
+    _object_retention.pop((bucket_name, key, None), None)
+    _object_legal_hold.pop((bucket_name, key, None), None)
     _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
@@ -5689,8 +5703,9 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
     return 204, {}, b""
 
 
-def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | None:
-    hold = _object_legal_hold.get((bucket_name, key))
+def _check_object_lock(bucket_name: str, key: str, headers: dict, version_id) -> tuple | None:
+    """Refusal for a permanent delete of a version under retention or legal hold."""
+    hold = _object_legal_hold.get((bucket_name, key, version_id))
     if hold == "ON":
         return _error(
             "AccessDenied",
@@ -5698,7 +5713,7 @@ def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | Non
             403,
         )
 
-    retention = _object_retention.get((bucket_name, key))
+    retention = _object_retention.get((bucket_name, key, version_id))
     if retention:
         retain_until = retention.get("RetainUntilDate", "")
         if retain_until and retain_until > now_iso():
@@ -5969,19 +5984,6 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
                     }
                 pending_dest_annotations[name] = carried
 
-    # --- Preserve lock / retention ---
-    src_retention = _object_retention.get((src_bucket_name, src_key))
-    if src_retention:
-        _object_retention[(bucket_name, dest_key)] = dict(src_retention)
-    else:
-        _object_retention.pop((bucket_name, dest_key), None)
-
-    src_hold = _object_legal_hold.get((src_bucket_name, src_key))
-    if src_hold:
-        _object_legal_hold[(bucket_name, dest_key)] = src_hold
-    else:
-        _object_legal_hold.pop((bucket_name, dest_key), None)
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(dest_sse)
     if copy_src_vid:
@@ -6003,6 +6005,10 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     )
 
     dest_version_id = dest_obj.get("version_id")
+    src_lock_key = (src_bucket_name, src_key, src_obj.get("version_id"))
+    for store in (_object_retention, _object_legal_hold):
+        if src_lock_key in store and _bucket_object_lock.get(bucket_name):
+            store[(bucket_name, dest_key, dest_version_id)] = copy.deepcopy(store[src_lock_key])
     if pending_dest_annotations:
         _object_annotations[(bucket_name, dest_key, dest_version_id)] = pending_dest_annotations
         if dest_obj.get("_replica"):
@@ -6379,14 +6385,14 @@ def _annotation_checksum_headers(entry: dict) -> dict:
     return out
 
 
-def _annotation_lock_error(bucket_name: str, key: str, headers: dict) -> tuple | None:
+def _annotation_lock_error(bucket_name: str, key: str, headers: dict, version_id) -> tuple | None:
     """Object Lock refusal for an annotation write (observed on AWS)."""
     from ministack.app import AUTH
     if not AUTH:
         return None
-    if _object_legal_hold.get((bucket_name, key)) == "ON":
+    if _object_legal_hold.get((bucket_name, key, version_id)) == "ON":
         return _error("AccessDenied", "Access Denied because object protected by object lock legal hold.", 403)
-    retention = _object_retention.get((bucket_name, key))
+    retention = _object_retention.get((bucket_name, key, version_id))
     if not retention:
         return None
     retain_until = retention.get("RetainUntilDate", "")
@@ -6408,7 +6414,7 @@ def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dic
     if error:
         return error
     bucket, version_key, record = target
-    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    lock_error = _annotation_lock_error(bucket_name, key, headers, version_key)
     if lock_error:
         return lock_error
     precondition = _annotation_if_match(headers, record)
@@ -6577,7 +6583,7 @@ def _delete_object_annotation(bucket_name: str, key: str, headers: dict, query_p
     if error:
         return error
     bucket, version_key, record = target
-    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    lock_error = _annotation_lock_error(bucket_name, key, headers, version_key)
     if lock_error:
         return lock_error
     precondition = _annotation_if_match(headers, record)
@@ -6696,23 +6702,30 @@ def _put_object_lock_configuration(bucket_name: str, body: bytes):
     return 200, {"Content-Type": "application/xml"}, b""
 
 
-def _get_object_retention(bucket_name: str, key: str):
+def _object_lock_target(bucket_name: str, key: str, bucket: dict, query_params: dict | None):
+    """``(lock key, error)`` for the version a retention or legal-hold call addresses."""
+    if _qp(query_params or {}, "versionId", ""):
+        missing = _no_such_version(bucket_name, key, query_params)
+        if missing:
+            return None, missing
+    elif key not in bucket["objects"]:
+        return None, _error("NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}")
+    return (bucket_name, key, _resolve_subresource_version(query_params or {}, bucket, key)), None
+
+
+def _get_object_retention(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
         return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
 
-    retention = _object_retention.get((bucket_name, key))
+    retention = _object_retention.get(lock_key)
     if not retention:
         return _error(
             "NoSuchObjectLockConfiguration",
@@ -6726,17 +6739,13 @@ def _get_object_retention(bucket_name: str, key: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict):
+def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
@@ -6757,7 +6766,7 @@ def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict
 
     retain_until = date_el.text
 
-    existing = _object_retention.get((bucket_name, key))
+    existing = _object_retention.get(lock_key)
     if existing:
         is_reducing = existing.get("RetainUntilDate", "") > retain_until or (
             mode_el.text == "GOVERNANCE" and existing.get("Mode") == "COMPLIANCE"
@@ -6778,30 +6787,26 @@ def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict
                         403,
                     )
 
-    _object_retention[(bucket_name, key)] = {
+    _object_retention[lock_key] = {
         "Mode": mode_el.text,
         "RetainUntilDate": retain_until,
     }
     return 200, {"Content-Type": "application/xml"}, b""
 
 
-def _get_object_legal_hold(bucket_name: str, key: str):
+def _get_object_legal_hold(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
         return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
 
-    status = _object_legal_hold.get((bucket_name, key))
+    status = _object_legal_hold.get(lock_key)
     if status is None:
         return _error(
             "NoSuchObjectLockConfiguration",
@@ -6814,17 +6819,13 @@ def _get_object_legal_hold(bucket_name: str, key: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _put_object_legal_hold(bucket_name: str, key: str, body: bytes):
+def _put_object_legal_hold(bucket_name: str, key: str, body: bytes, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
@@ -6839,7 +6840,7 @@ def _put_object_legal_hold(bucket_name: str, key: str, body: bytes):
     if status_el is None or status_el.text not in ("ON", "OFF"):
         return _error("MalformedXML", "The XML you provided was not well-formed", 400)
 
-    _object_legal_hold[(bucket_name, key)] = status_el.text
+    _object_legal_hold[lock_key] = status_el.text
     return 200, {"Content-Type": "application/xml"}, b""
 
 
@@ -7407,8 +7408,8 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
         vid_el = _find_xml_tag(obj_el, "VersionId")
         version_id = vid_el.text if (vid_el is not None and vid_el.text) else ""
 
-        if k in bucket["objects"]:
-            lock_err = _check_object_lock(bucket_name, k, headers)
+        if version_id:
+            lock_err = _check_object_lock(bucket_name, k, headers, None if version_id == "null" else version_id)
             if lock_err:
                 errors.append(
                     {
@@ -7502,8 +7503,8 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             bucket["objects"].pop(k, None)
             _object_tags.pop((bucket_name, k, None), None)
             _object_annotations.pop((bucket_name, k, None), None)
-            _object_retention.pop((bucket_name, k), None)
-            _object_legal_hold.pop((bucket_name, k), None)
+            _object_retention.pop((bucket_name, k, None), None)
+            _object_legal_hold.pop((bucket_name, k, None), None)
             _object_acl.pop((bucket_name, k, None), None)
             _delete_persisted_object(bucket_name, k)
             deleted.append({"key": k, "version_id": "", "was_marker": False})
