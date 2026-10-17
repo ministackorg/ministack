@@ -2744,6 +2744,40 @@ async def _dispatch_identity(action: str, data: dict):
 # USER POOL CRUD
 # ===========================================================================
 
+_USER_POOL_TIERS = ("ESSENTIALS", "LITE", "PLUS")
+
+
+def _threat_protection_on(add_ons) -> bool:
+    return (add_ons or {}).get("AdvancedSecurityMode", "OFF") != "OFF"
+
+
+def _user_pool_tier(pool: dict) -> str:
+    """The pool's feature plan, defaulting as CreateUserPool does when the request omits it."""
+    tier = pool.get("UserPoolTier")
+    if tier is None:
+        tier = "PLUS" if _threat_protection_on(pool.get("UserPoolAddOns")) else "ESSENTIALS"
+    return tier
+
+
+def _user_pool_tier_error(tier, add_ons, policies, current=None):
+    """Refuse an unknown tier or a feature it lacks (threat protection on ESSENTIALS, password history on LITE)."""
+    if tier not in _USER_POOL_TIERS:
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{tier}' at 'userPoolTier' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_USER_POOL_TIERS)}]", 400)
+    if tier == "ESSENTIALS" and _threat_protection_on(add_ons):
+        feature = "Threat Protection"
+    elif tier == "LITE" and ((policies or {}).get("PasswordPolicy") or {}).get("PasswordHistorySize"):
+        feature = "Password History"
+    else:
+        return None
+    # A plan change the pool's features rule out has its own error code.
+    code = "TierChangeNotAllowedException" if current not in (None, tier) else "FeatureUnavailableInTierException"
+    return error_response_json(
+        code, f"The following features need to be disabled for the {tier} pricing tier configured: {feature}", 400)
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
@@ -2759,6 +2793,10 @@ def _create_user_pool(data):
             return error_response_json(
                 "InvalidParameterException",
                 "Required custom attributes are not supported.", 400)
+    tier = _user_pool_tier(data)
+    err = _user_pool_tier_error(tier, data.get("UserPoolAddOns"), data.get("Policies"))
+    if err:
+        return err
 
     pid = _pool_id()
     now = _now_epoch()
@@ -2798,6 +2836,7 @@ def _create_user_pool(data):
         "AccountRecoverySetting": data.get("AccountRecoverySetting", {}),
         "DeletionProtection": data.get("DeletionProtection", "INACTIVE"),
         "LambdaConfig": data.get("LambdaConfig", {}),
+        "UserPoolTier": tier,
         "Domain": None,
         "CustomDomain": None,
         "_clients": {},
@@ -2864,6 +2903,12 @@ def _update_user_pool(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    # An omitted tier keeps the pool's plan; omitted add-ons stay out of the check, AWS resets them.
+    current = _user_pool_tier(pool)
+    err = _user_pool_tier_error(data.get("UserPoolTier", current), data.get("UserPoolAddOns"),
+                                data.get("Policies", pool.get("Policies")), current)
+    if err:
+        return err
     updatable = {
         "Policies", "AutoVerifiedAttributes", "SmsVerificationMessage",
         "EmailVerificationMessage", "EmailVerificationSubject",
@@ -2871,7 +2916,7 @@ def _update_user_pool(data):
         "EmailConfiguration", "SmsConfiguration", "UserPoolTags",
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
-        "UserAttributeUpdateSettings",
+        "UserAttributeUpdateSettings", "UserPoolTier",
         # Deletion protection is switched off through UpdateUserPool before a
         # protected pool can be deleted (per the DeletionProtection property
         # on the CloudFormation resource reference).
@@ -2959,6 +3004,7 @@ def _email_configuration_out(email_configuration) -> dict:
 def _pool_out(pool: dict) -> dict:
     _ensure_schema_attributes(pool)
     output = {k: v for k, v in pool.items() if not k.startswith("_")}
+    output["UserPoolTier"] = _user_pool_tier(pool)
     if "EmailConfiguration" in output:
         output["EmailConfiguration"] = _email_configuration_out(
             output["EmailConfiguration"]

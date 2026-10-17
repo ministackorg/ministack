@@ -6926,7 +6926,7 @@ _COGNITO_USER_POOL_UPDATABLE = {
 _COGNITO_USER_POOL_CREATE_ONLY = ("Schema", "AliasAttributes", "UsernameAttributes",
                                   "UsernameConfiguration")
 
-# The rest of the AWS::Cognito::UserPool reference (UserPoolTier, the
+# The rest of the AWS::Cognito::UserPool reference (the
 # EmailAuthentication* and WebAuthn* properties, IssuerConfiguration,
 # KeyConfiguration) has no field on the service's record and is not
 # modelled: it is accepted and ignored on create and on update alike.
@@ -6946,7 +6946,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
     _cognito_user_pool_update applies later."""
     payload = {
         key: props[key]
-        for key in (*_COGNITO_USER_POOL_CREATE_ONLY, *_COGNITO_USER_POOL_UPDATABLE)
+        for key in (*_COGNITO_USER_POOL_CREATE_ONLY, *_COGNITO_USER_POOL_UPDATABLE, "UserPoolTier")
         if key in props
     }
     payload["PoolName"] = _cognito_user_pool_name(props, stack_name, logical_id)
@@ -7044,6 +7044,9 @@ def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name,
                 "a new UserPool resource instead."
             )
     payload = _declared_or_default(old_props, new_props, _COGNITO_USER_POOL_UPDATABLE)
+    # A dropped UserPoolTier keeps the pool's plan, as an UpdateUserPool without it does.
+    if "UserPoolTier" in new_props:
+        payload["UserPoolTier"] = new_props["UserPoolTier"]
     if payload:
         payload["UserPoolId"] = physical_id
         status, _, body = _cognito._update_user_pool(payload)

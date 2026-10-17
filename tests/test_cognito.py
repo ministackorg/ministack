@@ -77,6 +77,83 @@ def test_cognito_update_user_pool(cognito_idp):
     desc = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
     assert desc["UserPoolTags"].get("env") == "test"
 
+def test_cognito_user_pool_tier(cognito_idp):
+    """UserPoolTier defaults to ESSENTIALS (PLUS with threat protection on), is kept when an update omits it."""
+    def tier(pid):
+        return cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["UserPoolTier"]
+
+    created = cognito_idp.create_user_pool(PoolName="TierDefault")["UserPool"]
+    assert created["UserPoolTier"] == "ESSENTIALS"
+    assert tier(created["Id"]) == "ESSENTIALS"
+    audit = cognito_idp.create_user_pool(
+        PoolName="TierAudit", UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"})["UserPool"]
+    assert audit["UserPoolTier"] == "PLUS"
+    off = cognito_idp.create_user_pool(
+        PoolName="TierOff", UserPoolAddOns={"AdvancedSecurityMode": "OFF"})["UserPool"]
+    assert off["UserPoolTier"] == "ESSENTIALS"
+
+    pid = cognito_idp.create_user_pool(PoolName="TierLite", UserPoolTier="LITE")["UserPool"]["Id"]
+    assert tier(pid) == "LITE"
+    for target in ("PLUS", "LITE", "ESSENTIALS"):
+        cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTier=target)
+        assert tier(pid) == target
+    cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTags={"k": "v"})
+    assert tier(pid) == "ESSENTIALS"
+
+    for value in ("BASIC", "lite", ""):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.create_user_pool(PoolName="TierBad", UserPoolTier=value)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == (
+            f"1 validation error detected: Value '{value}' at 'userPoolTier' failed to satisfy "
+            "constraint: Member must satisfy enum value set: [ESSENTIALS, LITE, PLUS]")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTier="BASIC")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert tier(pid) == "ESSENTIALS"
+
+def test_cognito_user_pool_tier_features(cognito_idp):
+    """Threat protection needs a tier other than ESSENTIALS and password history one other than LITE."""
+    audit = {"AdvancedSecurityMode": "AUDIT"}
+    history = {"PasswordPolicy": {"MinimumLength": 8, "PasswordHistorySize": 3}}
+
+    def refused(code, tier, feature, call, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == (
+            f"The following features need to be disabled for the {tier} pricing tier configured: {feature}")
+
+    refused("FeatureUnavailableInTierException", "ESSENTIALS", "Threat Protection",
+            cognito_idp.create_user_pool, PoolName="TierEssAudit", UserPoolTier="ESSENTIALS",
+            UserPoolAddOns={"AdvancedSecurityMode": "ENFORCED"})
+    refused("FeatureUnavailableInTierException", "LITE", "Password History",
+            cognito_idp.create_user_pool, PoolName="TierLiteHistory", UserPoolTier="LITE", Policies=history)
+    # LITE keeps threat protection; a zero history size is no history.
+    cognito_idp.create_user_pool(PoolName="TierLiteAudit", UserPoolTier="LITE", UserPoolAddOns=audit)
+    cognito_idp.create_user_pool(
+        PoolName="TierLiteNoHistory", UserPoolTier="LITE",
+        Policies={"PasswordPolicy": {"MinimumLength": 8, "PasswordHistorySize": 0}})
+
+    pid = cognito_idp.create_user_pool(PoolName="TierUpdate", UserPoolTier="ESSENTIALS")["UserPool"]["Id"]
+    refused("FeatureUnavailableInTierException", "ESSENTIALS", "Threat Protection",
+            cognito_idp.update_user_pool, UserPoolId=pid, UserPoolAddOns=audit)
+    cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTier="PLUS", UserPoolAddOns=audit)
+    refused("TierChangeNotAllowedException", "ESSENTIALS", "Threat Protection",
+            cognito_idp.update_user_pool, UserPoolId=pid, UserPoolTier="ESSENTIALS", UserPoolAddOns=audit)
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["UserPoolTier"] == "PLUS"
+    # Nothing in this request needs PLUS once UserPoolAddOns is omitted, so the downgrade goes through.
+    cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTier="ESSENTIALS")
+
+    pid = cognito_idp.create_user_pool(PoolName="TierHistory", Policies=history)["UserPool"]["Id"]
+    refused("TierChangeNotAllowedException", "LITE", "Password History",
+            cognito_idp.update_user_pool, UserPoolId=pid, UserPoolTier="LITE")
+    pid = cognito_idp.create_user_pool(PoolName="TierLiteUpdate", UserPoolTier="LITE")["UserPool"]["Id"]
+    refused("FeatureUnavailableInTierException", "LITE", "Password History",
+            cognito_idp.update_user_pool, UserPoolId=pid, Policies=history)
+    cognito_idp.update_user_pool(UserPoolId=pid, UserPoolTier="ESSENTIALS", Policies=history)
+    assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["UserPoolTier"] == "ESSENTIALS"
+
 def test_cognito_delete_user_pool(cognito_idp):
     resp = cognito_idp.create_user_pool(PoolName="DeletePool")
     pid = resp["UserPool"]["Id"]
@@ -1837,6 +1914,31 @@ def test_cognito_restore_drops_the_old_default_token_validity():
         restored = mod._user_pools.get_scoped(account, region, pid)["_clients"]
         assert {cid: (c["AccessTokenValidity"], c["IdTokenValidity"]) for cid, c in restored.items()} == {
             "unset": (None, None), "minutes": (60, 60), "set": (2, 3)}
+    finally:
+        mod.reset()
+
+
+def test_cognito_user_pool_tier_survives_restore():
+    """A stored tier round-trips; a pool saved before UserPoolTier describes the CreateUserPool default."""
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    account, region = "111111111111", "eu-central-1"
+    saved = AccountRegionScopedDict()
+    saved.set_scoped(account, region, f"{region}_lite", {"Id": f"{region}_lite", "UserPoolTier": "LITE"})
+    saved.set_scoped(account, region, f"{region}_old", {"Id": f"{region}_old"})
+    saved.set_scoped(account, region, f"{region}_oldaudit",
+                     {"Id": f"{region}_oldaudit", "UserPoolAddOns": {"AdvancedSecurityMode": "AUDIT"}})
+    try:
+        mod.reset()
+        mod.load_persisted_state({"user_pools": saved})
+        state = mod.get_state()
+        mod.reset()
+        mod.load_persisted_state(state)
+        assert {
+            pid: mod._pool_out(mod._user_pools.get_scoped(account, region, f"{region}_{pid}"))["UserPoolTier"]
+            for pid in ("lite", "old", "oldaudit")
+        } == {"lite": "LITE", "old": "ESSENTIALS", "oldaudit": "PLUS"}
     finally:
         mod.reset()
 

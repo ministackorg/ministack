@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Cognito — user pool feature plans** — `CreateUserPool`, `UpdateUserPool` and `AWS::Cognito::UserPool` ignored `UserPoolTier`; a pool now stores and describes its tier (`ESSENTIALS` by default, `PLUS` when created with threat protection on), keeps it when an update omits it, and refuses threat protection on `ESSENTIALS` and password history on `LITE` with `FeatureUnavailableInTierException` or, on a tier change, `TierChangeNotAllowedException`. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

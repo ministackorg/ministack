@@ -22215,6 +22215,48 @@ def test_cfn_cognito_user_pool_update_preserves_users(cfn, cognito_idp):
     _wait_stack(cfn, "cfn-pool-upd")
 
 
+def test_cfn_cognito_user_pool_tier(cfn, cognito_idp):
+    """UserPoolTier is applied on create and updated in place; dropping it keeps the pool's tier."""
+    def template(**props):
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool",
+                                   "Properties": {"UserPoolName": "cfn-tier", **props}}},
+            "Outputs": {"Id": {"Value": {"Ref": "Pool"}}},
+        })
+
+    def tier(pid):
+        return cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["UserPoolTier"]
+
+    cfn.create_stack(StackName="cfn-tier", TemplateBody=template(UserPoolTier="LITE"))
+    stack = _wait_stack(cfn, "cfn-tier")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    pool_id = stack["Outputs"][0]["OutputValue"]
+    assert tier(pool_id) == "LITE"
+    for props, expected in (({"UserPoolTier": "PLUS"}, "PLUS"), ({"UserPoolTier": "LITE"}, "LITE"), ({}, "LITE")):
+        cfn.update_stack(StackName="cfn-tier", TemplateBody=template(**props))
+        stack = _wait_stack(cfn, "cfn-tier")
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert stack["Outputs"][0]["OutputValue"] == pool_id
+        assert tier(pool_id) == expected
+    cfn.delete_stack(StackName="cfn-tier")
+    _wait_stack(cfn, "cfn-tier")
+
+    cfn.create_stack(StackName="cfn-tier-audit", TemplateBody=template(
+        UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"}))
+    stack = _wait_stack(cfn, "cfn-tier-audit")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert tier(stack["Outputs"][0]["OutputValue"]) == "PLUS"
+    cfn.delete_stack(StackName="cfn-tier-audit")
+    _wait_stack(cfn, "cfn-tier-audit")
+
+    cfn.create_stack(StackName="cfn-tier-ess-audit", TemplateBody=template(
+        UserPoolTier="ESSENTIALS", UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"}))
+    assert _wait_stack(cfn, "cfn-tier-ess-audit")["StackStatus"] == "ROLLBACK_COMPLETE"
+    assert "FeatureUnavailableInTierException" in _stack_event_reasons(cfn, "cfn-tier-ess-audit")
+    cfn.delete_stack(StackName="cfn-tier-ess-audit")
+    _wait_stack(cfn, "cfn-tier-ess-audit")
+
+
 def test_cfn_secret_update_keeps_arn_and_versions(cfn):
     """A changed SecretString becomes the new AWSCURRENT on the same secret —
     same ARN, history kept (the fallback minted a new ARN and dropped it all)."""
