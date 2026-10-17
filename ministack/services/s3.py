@@ -1305,6 +1305,74 @@ def _validate_bucket_name(name: str) -> bool:
     return True
 
 
+def _upload_error(code: str, message: str, status: int, **fields) -> tuple:
+    """Error envelope observed on real S3 PutObject (Osaka, 2026-10-16)."""
+    request_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    host_id = base64.b64encode(os.urandom(57)).decode()
+    root = Element("Error")
+    for name, value in {"Code": code, "Message": message, **fields,
+                        "RequestId": request_id, "HostId": host_id}.items():
+        SubElement(root, name).text = value
+    return status, {"Content-Type": "application/xml", "x-amz-request-id": request_id,
+                    "x-amz-id-2": host_id}, _xml_body(root)
+
+
+def validate_upload_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
+    """Before IAM, check ordinary header-signed uploads in S3's observed order.
+
+    Called only with AUTH=true. Regional hosts distinguish the endpoint region
+    from the signing region. The handler still enforces the bucket's home
+    region for bare local endpoints. Copy, multipart, presigned and
+    bucket-subresource requests keep their existing validation paths.
+    """
+    from ministack.core.iam_actions import _auth_failure
+    from ministack.core.iam_evaluator import AuthError, authenticate
+    from ministack.core.sigv4 import parse_header_signature
+
+    bucket, key = _parse_bucket_key(path, headers)
+    if (method != "PUT" or not key or "x-amz-copy-source" in headers
+            or query_params.keys() - {"x-id"}
+            or not headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
+        return None
+    if bucket.endswith((_ACCESS_POINT_ALIAS_SUFFIX, _OBJECT_LAMBDA_ALIAS_SUFFIX)):
+        return None  # The S3 handler resolves access point aliases before bucket lookup.
+    if not _validate_bucket_name(bucket):
+        return _upload_error("InvalidBucketName", "The specified bucket is not valid.", 400, BucketName=bucket)
+    signature = parse_header_signature(headers)
+    if isinstance(signature, tuple):
+        return None  # Keep the shared malformed-signature handling.
+    owner = _bucket_owner_account(bucket)
+    record = _buckets.get_scoped(owner, None, bucket) if owner is not None else None
+    host = headers.get("host", "").lower()
+    regional = re.search(r"(?:^|\.)s3[.-]([a-z]{2}(?:-[a-z]+)+-\d+)\.(.+)$", host)
+    if regional:
+        endpoint_region, suffix = regional.groups()
+        bucket_region = (record or {}).get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        if record is not None and bucket_region != endpoint_region:
+            response = _upload_error(
+                "PermanentRedirect", "The bucket you are attempting to access must be addressed using the specified "
+                "endpoint. Please send all future requests to this endpoint.", 301,
+                Endpoint=f"{bucket}.s3.{bucket_region}.{suffix}", Bucket=bucket,
+            )
+            response[1]["x-amz-bucket-region"] = bucket_region
+            return response
+        if signature.region != endpoint_region:
+            return _upload_error(
+                "AuthorizationHeaderMalformed", "The authorization header is malformed; "
+                f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
+            )
+    denied = authenticate(signature.access_key_id, get_account_id())
+    if isinstance(denied, AuthError):
+        code, status, message = _auth_failure("s3", denied.code, denied.message, headers)
+        fields = denied.details
+        if code == "InvalidAccessKeyId":
+            fields = {"AWSAccessKeyId": signature.access_key_id}
+        return _upload_error(code, message, status, **fields)
+    if record is None:
+        return _upload_error("NoSuchBucket", "The specified bucket does not exist", 404, BucketName=bucket)
+    return None
+
+
 def _url_encode(value: str) -> str:
     # S3's `encoding-type=url` percent-encodes key names (spaces, `+`, unicode,
     # control chars) but leaves the forward slash intact, so a delimiter-collapsed

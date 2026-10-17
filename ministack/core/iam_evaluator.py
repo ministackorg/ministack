@@ -86,6 +86,7 @@ class AuthError:
     """Authentication failure (before policy evaluation)."""
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
+    details: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1330,7 +1331,24 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         signature, credential.secret_access_key, request.method, request.raw_path,
         request.query_params, request.headers, request.body, presigned=request.presigned,
     )
-    return AuthError(*failure) if failure else credential
+    if failure:
+        details = {}
+        if signature.service == "s3" and failure[0] == "SignatureDoesNotMatch":
+            from ministack.core.sigv4 import header_signing_documents
+
+            canonical, string_to_sign = header_signing_documents(
+                signature, request.method, request.raw_path, request.query_params, request.headers, request.body,
+            )
+            details = {
+                "AWSAccessKeyId": access_key_id,
+                "StringToSign": string_to_sign,
+                "SignatureProvided": signature.signature,
+                "StringToSignBytes": string_to_sign.encode("utf-8").hex(" "),
+                "CanonicalRequest": canonical,
+                "CanonicalRequestBytes": canonical.encode("utf-8").hex(" "),
+            }
+        return AuthError(*failure, details=details)
+    return credential
 
 
 # ---------------------------------------------------------------------------
