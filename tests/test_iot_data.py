@@ -992,6 +992,38 @@ def test_update_thing_shadow_version_conflict(iot_data_client):
     assert ei.value.response["Error"]["Code"] == "ConflictException"
 
 
+def test_update_thing_shadow_refuses_nan_and_infinity(iot_data_client):
+    """NaN, Infinity and -Infinity are not JSON: the update is refused as any invalid payload is."""
+    thing = _unique("dev")
+    for payload in (
+        b'{"state": {"reported": {"a": NaN}}}',
+        b'{"state": {"reported": {"a": Infinity}}}',
+        b'{"state": {"reported": {"a": -Infinity}}}',
+        b"not json",
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_data_client.update_thing_shadow(thingName=thing, payload=payload)
+        err = ei.value.response
+        assert err["ResponseMetadata"]["HTTPStatusCode"] == 400, payload
+        assert err["Error"]["Code"] == "InvalidRequestException"
+        assert err["Error"]["Message"] == "Payload contains invalid json"
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.get_thing_shadow(thingName=thing)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_update_thing_shadow_number_beyond_a_double_is_infinity_text(iot_data_client):
+    """A number beyond a double's range is stored and echoed as the string "Infinity" or "-Infinity"."""
+    thing = _unique("dev")
+    resp = iot_data_client.update_thing_shadow(
+        thingName=thing, payload=b'{"state": {"reported": {"a": 1E400, "b": -1E400, "c": 2.5}}}'
+    )
+    reported = {"a": "Infinity", "b": "-Infinity", "c": 2.5}
+    assert _read_shadow(resp)["state"]["reported"] == reported
+    got = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert got["state"]["reported"] == reported
+
+
 # ---------------------------------------------------------------------------    
 # Topic-rule routing (publish → rule → Lambda)
 # ---------------------------------------------------------------------------
@@ -2288,6 +2320,33 @@ def test_shadow_get_missing_over_mqtt_rejected_404(iot_data_client):
     doc = json.loads(payload)
     assert doc["code"] == 404
     assert thing in doc["message"]
+
+
+def test_shadow_requests_over_mqtt_refuse_nan_and_infinity(iot_data_client):
+    """NaN and Infinity reject every request verb; a number beyond a double's range becomes "Infinity"."""
+    thing = _unique("shadow-nan")
+    base = f"$aws/things/{thing}/shadow"
+    refused = [
+        ("update", b'{"state": {"reported": {"a": NaN}}}'),
+        ("update", b'{"state": {"reported": {"a": Infinity}}}'),
+        ("update", b'{"state": {"reported": {"a": -Infinity}}}'),
+        ("get", b'{"clientToken": "c", "a": NaN}'),
+        ("delete", b'{"clientToken": "c", "a": NaN}'),
+    ]
+
+    def _publish_all():
+        for verb, payload in [*refused, ("update", b'{"state": {"reported": {"a": 1E400}}}')]:
+            iot_data_client.publish(topic=f"{base}/{verb}", payload=payload)
+
+    # Five rejections, then update/accepted and update/documents.
+    received = _collect_shadow_frames(f"{base}/+/+", _publish_all, want=7)
+    frames = [(topic[len(base) + 1:], json.loads(payload)) for topic, payload in received]
+    rejected = [(topic, doc) for topic, doc in frames if topic.endswith("/rejected")]
+    assert sorted(topic for topic, _doc in rejected) == sorted(f"{verb}/rejected" for verb, _p in refused)
+    assert all(doc == {"code": 400, "message": "Payload contains invalid json"} for _t, doc in rejected)
+    assert dict(frames)["update/accepted"]["state"] == {"reported": {"a": "Infinity"}}
+    shadow = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert shadow["state"]["reported"] == {"a": "Infinity"}
 
 
 async def _ws_publish_shadow_and_collect(
