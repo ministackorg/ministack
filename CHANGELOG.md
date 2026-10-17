@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.29] — 2026-10-17
+
 ### Added
 - **Managed Service for Apache Flink — control plane** — `kinesisanalyticsv2` applications for the `FLINK-*` runtimes: create, describe, update and delete, start and stop with the model's status transitions, snapshots, CloudWatch logging options and tags, per account and region. Updates bump `ApplicationVersionId` and the `ConditionalToken`, and a stale one returns `ConcurrentModificationException`. CloudFormation creates, updates and deletes `AWS::KinesisAnalyticsV2::Application`, `AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption` and `AWS::Logs::LogStream`, so a CDK Flink stack deploys. Contributed by @Jolley71717.
 - **Managed Service for Apache Flink — job execution** — with Docker available, starting a `FLINK-1_19` or `FLINK-1_20` application runs its jar from MiniStack S3 in the official Apache Flink image (1.19.1 or 1.20.5, Java 11) with a JobManager and a TaskManager, its runtime properties at `/etc/flink/application_properties.json`, its configured parallelism and checkpointing, and its AWS calls pointed at MiniStack in the application's account. Snapshots are Flink savepoints, restores resume the job's state, and a job that fails to start returns the application to `READY`. Jars in `/opt/ministack/flink-lib` (for example a mounted `aws-kinesisanalytics-runtime`) are added to every cluster. Without Docker the control plane behaves as before. Contributed by @Jolley71717.
@@ -27,6 +29,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **KMS — RSASSA-PSS salt** — signatures used a maximum-length salt; they now use a salt as long as the digest, as AWS does, and `Verify` expects the same. Reported by @bettiah.
 - **KMS — RSA encryption algorithms** — `Encrypt` and `Decrypt` used OAEP SHA-256 whatever `EncryptionAlgorithm` named; they now use `RSAES_OAEP_SHA_1` or `RSAES_OAEP_SHA_256` as named, so a mismatched `Decrypt` answers `InvalidCiphertextException`, and an algorithm the key doesn't support answers `InvalidKeyUsageException`. Reported by @bettiah.
 - **KMS — `Sign` and `Verify` input checks** — a digest of the wrong length or an algorithm the key spec doesn't support crashed with a 500; they now answer 400 `ValidationException` (`Digest is invalid length for algorithm …`) and `InvalidKeyUsageException`. Reported by @bettiah.
+- **CloudFormation — `AWS::S3::MultiRegionAccessPoint` `Ref` when the access point exists** — a create that found an existing Multi-Region Access Point of the same name returned its alias as the physical id; `Ref` now returns the name in that case too.
 
 ## [1.5.28] — 2026-10-16
 

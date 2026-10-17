@@ -522,6 +522,10 @@ subnet = ec2.create_subnet(
 | `AWS::Lambda::EventSourceMapping` | UUID | — |
 | `AWS::Lambda::EventInvokeConfig` | Unique function/qualifier identifier | — |
 | `AWS::S3::BucketPolicy` | Bucket name | — |
+| `AWS::S3::AccessPoint` | Access point name | Alias, Arn, Name, NetworkOrigin |
+| `AWS::S3::MultiRegionAccessPoint` | Multi-Region Access Point name | Alias, CreatedAt |
+| `AWS::S3ObjectLambda::AccessPoint` | Object Lambda Access Point name | Alias.Status, Alias.Value, Arn, CreationDate |
+| `AWS::S3ObjectLambda::AccessPointPolicy` | Object Lambda Access Point name | — |
 | `AWS::SQS::QueuePolicy` | Policy ID | — |
 | `AWS::SNS::TopicPolicy` | Policy ID | — |
 | `AWS::ApiGateway::RestApi` | API ID | RootResourceId |

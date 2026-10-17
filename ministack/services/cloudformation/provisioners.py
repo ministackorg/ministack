@@ -1426,8 +1426,7 @@ def _s3_mrap_create(logical_id, props, stack_name):
 
     existing = _s3.find_mrap(name)
     if existing is not None and existing.get("Name") == name:
-        return existing["Alias"], {"Alias": existing["Alias"],
-                                   "CreatedAt": existing["CreatedAt"]}
+        return name, {"Alias": existing["Alias"], "CreatedAt": existing["CreatedAt"]}
 
     # strict=False: the provisioner has never applied the S3 Control bucket checks.
     record = _s3.create_mrap(name, buckets, props.get("PublicAccessBlockConfiguration") or {}, strict=False)
