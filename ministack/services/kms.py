@@ -834,8 +834,7 @@ def _signing_params(algorithm, for_verify=False):
     if not HAS_CRYPTO:
         return None, None
 
-    # PSS salt_length must be MAX_LENGTH for signing, AUTO for verification
-    pss_salt = padding.PSS.AUTO if for_verify else padding.PSS.MAX_LENGTH
+    pss_salt = padding.PSS.AUTO if for_verify else padding.PSS.DIGEST_LENGTH
 
     algo_map = {
         "RSASSA_PKCS1_V1_5_SHA_256": (padding.PKCS1v15(), hashes.SHA256()),
