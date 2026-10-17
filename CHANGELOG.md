@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Auth — WebSocket handshakes are verified for IAM user and STS session keys** — under `AUTH=true` an MQTT-over-WebSocket upgrade or an `AWS_IAM` WebSocket `$connect` signed with such a key was accepted with a wrong secret, a date more than 5 minutes off or a wrong session token; the signature in the query string or `Authorization` header is now checked like that of other requests, IoT answers 403 `Forbidden` and expects the session token after the signed part of the URL, and API Gateway names the canonical string it expected. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

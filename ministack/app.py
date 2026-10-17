@@ -91,7 +91,7 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
     SigV4 signature *verification* is intentionally lax (any
-    well-formed credential is accepted); IoT policy enforcement is not yet
+    well-formed credential is accepted) unless AUTH=true; IoT policy enforcement is not yet
     feature. The point here is multi-tenancy isolation, not auth.
     """
     qs = scope.get("query_string", b"").decode("utf-8", errors="replace")

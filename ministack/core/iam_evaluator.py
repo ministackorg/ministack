@@ -1248,13 +1248,16 @@ class SignedRequest:
     headers: dict
     body: bytes = b""
     presigned: bool = False
+    handshake: bool = False
 
 
 _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
     "ministack_signed_request", default=None)
 
 
-def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_headers: list) -> None:
+def pin_signed_request(
+    method: str, raw_path: str, query_params: dict, raw_headers: list, handshake: bool = False,
+) -> None:
     """Keep a request signed with an IAM user or STS session key as sent, for its signature check."""
     from ministack.core.router import extract_access_key_id
     from ministack.core.sigv4 import decode_header_value
@@ -1270,7 +1273,8 @@ def pin_signed_request(method: str, raw_path: str, query_params: dict, raw_heade
         key, text = name.decode("latin-1").lower(), decode_header_value(value)
         # SigV4 signs a header sent on several lines as its values joined by a bare comma.
         headers[key] = f"{headers[key]},{text}" if key in headers else text
-    _signed_request.set(SignedRequest(access_key_id, method, raw_path, query_params, headers, presigned=presigned))
+    _signed_request.set(SignedRequest(
+        access_key_id, method, raw_path, query_params, headers, presigned=presigned, handshake=handshake))
 
 
 def _query_signed(query_params: dict) -> bool:
@@ -1289,6 +1293,25 @@ def pin_signed_body(body: bytes) -> None:
     request = _signed_request.get()
     if request is not None:
         _signed_request.set(replace(request, body=body))
+
+
+def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Check a WebSocket upgrade signed in its Authorization header or query string, as ``authenticate`` does."""
+    from urllib.parse import parse_qs, quote
+
+    from ministack.core.responses import get_account_id
+
+    raw_path = scope.get("raw_path") or quote(scope.get("path", "")).encode()
+    query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
+    pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
+    request = _signed_request.get()
+    if request is None:
+        return None
+    try:
+        account_id = find_iam_access_key_account(request.access_key_id) or get_account_id()
+    except AmbiguousAccessKeyError:
+        account_id = get_account_id()
+    return authenticate(request.access_key_id, account_id)
 
 
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
@@ -1329,6 +1352,7 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     failure = header_signature_failure(
         signature, credential.secret_access_key, request.method, request.raw_path,
         request.query_params, request.headers, request.body, presigned=request.presigned,
+        explain=request.handshake,
     )
     return AuthError(*failure) if failure else credential
 
