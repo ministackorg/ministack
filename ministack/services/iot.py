@@ -8832,11 +8832,8 @@ def _validate_publish_topic(topic: str) -> bool:
     return True
 
 
-# The reserved topic space a client may publish into. AWS closes the connection
-# of an MQTT client that publishes to any other topic starting with ``$``
-# (measured for ``$aws/events/...``, ``$aws/jobs/...`` and ``$foo/...``; a
-# publish under ``$aws/rules/`` and ``$aws/things/`` is acknowledged). The HTTPS
-# Publish in iot_data.py applies the same list and answers 400.
+# The reserved topic families an HTTPS Publish may write into; iot_data.py
+# answers 400 for any other topic starting with ``$``.
 RESERVED_PUBLISH_PREFIXES = (
     "$aws/rules/",
     "$aws/things/",
@@ -8846,9 +8843,38 @@ RESERVED_PUBLISH_PREFIXES = (
     "$aws/commands/",
 )
 
+# Over MQTT a client may publish anywhere under $aws/rules/ and $aws/things/
+# except to the replies and notifications AWS IoT itself writes there, and
+# elsewhere in the reserved space only to the request topics below.
+_RESERVED_REPLY_TOPIC_RE = re.compile(
+    r"\$aws/things/[^/]+/(jobs/((get|start-next|[^/]+/(get|update))/(accepted|rejected)|notify|notify-next)"
+    r"|defender/metrics/[^/]+/(accepted|rejected)|streams/[^/]+/(data|description|rejected)/[^/]+)"
+)
+_RESERVED_REQUEST_TOPIC_RE = re.compile(
+    r"\$aws/(certificates/create(-from-csr)?/[^/]+|provisioning-templates/[^/]+/provision/[^/]+"
+    r"|device_location/[^/]+/get_position_estimate|commands/[^/]+/[^/]+/executions/[^/]+/response/(json|cbor))"
+)
+
+# The reserved filters a client may subscribe to; a variable segment may be a "+".
+_RESERVED_FILTER_RE = re.compile(
+    r"\$aws/(things/.+|events/.+|sitewise/asset-models/[^/]+/assets/[^/]+/properties/[^/]+"
+    r"|certificates/create(-from-csr)?/[^/]+/(accepted|rejected)"
+    r"|provisioning-templates/[^/]+/provision/[^/]+/(accepted|rejected)"
+    r"|device_location/[^/]+/get_position_estimate/(accepted|rejected)"
+    r"|commands/[^/]+/[^/]+/executions/[^/]+/(request(/(json|cbor))?|response/(accepted|rejected)/(json|cbor)))"
+)
+
 
 def _reserved_topic_publish_allowed(topic: str) -> bool:
-    return not topic.startswith("$") or topic.startswith(RESERVED_PUBLISH_PREFIXES)
+    if not topic.startswith("$"):
+        return True
+    if topic.startswith(("$aws/rules/", "$aws/things/")):
+        return _RESERVED_REPLY_TOPIC_RE.fullmatch(topic) is None
+    return _RESERVED_REQUEST_TOPIC_RE.fullmatch(topic) is not None
+
+
+def _reserved_filter_subscribe_allowed(topic_filter: str) -> bool:
+    return not topic_filter.startswith("$") or _RESERVED_FILTER_RE.fullmatch(topic_filter) is not None
 
 
 _POLICY_VARIABLE_RE = re.compile(r"\$\{(iot:[A-Za-z.]+)\}")
@@ -10229,6 +10255,7 @@ RC5_NO_SUBSCRIPTION_EXISTED = 0x11
 RC5_MALFORMED_PACKET = 0x81
 RC5_NOT_AUTHORIZED = 0x87
 RC5_SESSION_TAKEN_OVER = 0x8E
+RC5_TOPIC_FILTER_INVALID = 0x8F
 RC5_TOPIC_NAME_INVALID = 0x90
 
 # Layout of the MQTT 5 SUBSCRIBE options byte (§3.8.3.1). MQTT 3.1.1 sends a
@@ -11201,11 +11228,14 @@ class _WSSession:
                     await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
             if not _reserved_topic_publish_allowed(topic):
-                # AWS closes the connection without a PUBACK (measured over
-                # MQTT 3.1.1; the MQTT 5 reason code is not measured).
-                _broker_logger.warning("IoT broker: PUBLISH to a reserved topic closes the connection: %r", topic)
+                # Before the policy check: MQTT 5 answers a QoS 1 PUBLISH with
+                # PUBACK 0x90 and keeps the connection, 3.1.1 closes it.
+                _broker_logger.warning("IoT broker: PUBLISH to the reserved topic %r refused", topic)
                 if self.protocol_version == MQTT_5:
-                    await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
+                    if qos == 1 and packet_id is not None:
+                        await self.send_bytes(_make_puback(packet_id, reason_code=RC5_TOPIC_NAME_INVALID))
+                        return True
+                    await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
             if self.provisioning_template is not None and _mtls_claim_scope(self.certificate_id) is None:
                 # AWS acknowledges a PUBLISH on an expired claim's connection, then closes it.
@@ -11266,6 +11296,13 @@ class _WSSession:
                     raise ValueError("SUBSCRIBE topic filter without options byte")
                 subscription_options = body[off]
                 off += 1
+                if not _reserved_filter_subscribe_allowed(topic):
+                    # Before the policy check: 3.1.1 closes, MQTT 5 refuses this filter alone.
+                    _broker_logger.warning("IoT broker: SUBSCRIBE to the reserved filter %r refused", topic)
+                    if self.protocol_version != MQTT_5:
+                        return False
+                    granted.append(RC5_TOPIC_FILTER_INVALID)
+                    continue
                 if not self._policy_allows("iot:Subscribe", f"topicfilter/{topic}"):
                     # As on AWS: 3.1.1 closes, MQTT 5 refuses this filter alone.
                     _broker_logger.warning(

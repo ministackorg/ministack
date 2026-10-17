@@ -350,13 +350,19 @@ _MQTT_ONLY = "Invalid publish to restricted topic using HTTP"
         ("$aws/things/t1/jobs/get", _MQTT_ONLY),
         ("$aws/things/t1/defender/metrics/json", _MQTT_ONLY),
         ("$aws/commands/things/t1/executions/1/response/json", _MQTT_ONLY),
+        ("$aws/certificates/create/json/accepted", _NO_DOLLAR),
+        ("$aws/provisioning-templates/t1/provision/json/rejected", _NO_DOLLAR),
+        ("$aws/device_location/t1/get_position_estimate/accepted", _NO_DOLLAR),
         ("$aws/rules/no_such_rule/x", None),
         ("$aws/things/t1/jobs", None),
+        ("$aws/certificates/create/json", None),
+        ("$aws/device_location/t1/get_position_estimate", None),
     ],
 )
 def test_iot_data_publish_reserved_topics(iot_data_client, topic, message):
-    """HTTPS Publish to a "$" topic is refused outside the reserved families
-    and for the MQTT-only jobs, Device Defender and commands topics."""
+    """HTTPS Publish to a "$" topic is refused outside the reserved families,
+    for the fleet provisioning and Device Location replies, and for the
+    MQTT-only jobs, Device Defender and commands topics."""
     if message is None:
         resp = iot_data_client.publish(topic=topic, payload=b"{}")
         assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
@@ -3001,14 +3007,21 @@ def test_mqtt5_qos1_puback_carries_reason_code():
 @pytest.mark.parametrize("topic,acknowledged", [
     ("$aws/rules/no-such-rule/x", True),
     ("$aws/things/some-thing/shadow/update", True),
+    ("$aws/things/some-thing/shadow/update/accepted", True),
+    ("$aws/certificates/create/json", True),
     ("$aws/events/certificates/registered/abc", False),
     ("$aws/jobs/abc", False),
     ("$foo/abc", False),
-], ids=["rules", "shadow", "events", "jobs", "other-dollar"])
+    ("$aws/things/some-thing/jobs/notify", False),
+    ("$aws/certificates/create/json/accepted", False),
+    ("$aws/provisioning-templates/some-template/provision/json/rejected", False),
+], ids=["rules", "shadow", "shadow-reply", "fleet-request", "events", "jobs", "other-dollar", "jobs-reply",
+        "fleet-reply", "template-reply"])
 def test_mqtt_publish_to_reserved_topic_closes_the_connection(topic, acknowledged):
-    """AWS acknowledges a publish under $aws/rules/ and $aws/things/ and closes
-    the connection of a client that publishes to any other $ topic (measured
-    over MQTT 3.1.1); the HTTPS Publish applies the same list."""
+    """AWS acknowledges a publish under $aws/rules/ and $aws/things/ and to the
+    fleet provisioning requests, and closes the connection of a client that
+    publishes to a reply AWS IoT writes itself or to any other $ topic
+    (MQTT 3.1.1)."""
 
     async def scenario():
         async with _connect(MQTT_311) as (pub, _c):
@@ -3023,6 +3036,82 @@ def test_mqtt_publish_to_reserved_topic_closes_the_connection(topic, acknowledge
     assert kind == ("puback" if acknowledged else "closed"), (kind, detail)
     if acknowledged:
         assert detail == b"\x00\x05"
+
+
+def test_mqtt5_publish_to_a_reserved_reply_topic_answers_topic_name_invalid():
+    """MQTT 5: PUBACK 0x90 for a QoS 1 publish to a reply AWS IoT writes, the connection stays; DISCONNECT for QoS 0."""
+
+    async def scenario():
+        async with _connect(MQTT_5) as (client, _c):
+            await client.send(_make_publish("$aws/things/some-thing/jobs/notify", b"{}", qos=1, packet_id=1,
+                                            protocol_level=MQTT_5))
+            _flags, refused = await client.await_packet(PKT_PUBACK)
+            await client.send(_make_publish(_unique("v5/plain"), b"{}", qos=1, packet_id=2, protocol_level=MQTT_5))
+            _flags, accepted = await client.await_packet(PKT_PUBACK)
+            await client.send(_make_publish("$aws/certificates/create/json/accepted", b"{}", protocol_level=MQTT_5))
+            pkt_type, _flags, disconnect = await client.packet()
+            return refused, accepted, pkt_type, disconnect
+
+    refused, accepted, pkt_type, disconnect = _run(scenario())
+    assert refused == b"\x00\x01\x90\x00", "packet id 1, Topic Name invalid, no properties"
+    assert accepted == b"\x00\x02\x00\x00"
+    assert (pkt_type, disconnect[0]) == (PKT_DISCONNECT, 0x90)
+
+
+# MQTT 5 SUBACK reason code per filter: 0x01 granted, 0x8F Topic Filter invalid.
+_RESERVED_FILTERS = {
+    "$aws/things/some-thing/shadow/update/+": 0x01,
+    "$aws/things/+/jobs/#": 0x01,
+    "$aws/events/#": 0x01,
+    "$aws/certificates/create/+/accepted": 0x01,
+    "$aws/provisioning-templates/+/provision/json/rejected": 0x01,
+    "$aws/device_location/some-thing/get_position_estimate/accepted": 0x01,
+    "$aws/commands/things/some-thing/executions/+/request/json": 0x01,
+    "$aws/certificates/create/json": 0x8F,
+    "$aws/certificates/create/json/+": 0x8F,
+    "$aws/certificates/#": 0x8F,
+    "$aws/provisioning-templates/some-template/provision/json/+": 0x8F,
+    "$aws/rules/some_rule": 0x8F,
+    "$aws/device_location/some-thing/get_position_estimate": 0x8F,
+    "$aws/commands/things/some-thing/executions/e1/response/json": 0x8F,
+    "$aws/things": 0x8F,
+    "$aws/#": 0x8F,
+    "$foo/abc": 0x8F,
+}
+
+
+def test_mqtt5_subscribe_to_a_reserved_filter_answers_topic_filter_invalid():
+    """MQTT 5 refuses a reserved filter a client may not subscribe to with SUBACK 0x8F, and the connection stays."""
+
+    async def scenario():
+        async with _connect(MQTT_5) as (client, _c):
+            codes = {}
+            for packet_id, topic_filter in enumerate(_RESERVED_FILTERS, start=1):
+                await client.send(_make_subscribe(packet_id, topic_filter, qos=1, protocol_level=MQTT_5))
+                _flags, suback = await client.await_packet(PKT_SUBACK)
+                codes[topic_filter] = suback[3]
+            return codes
+
+    assert _run(scenario()) == _RESERVED_FILTERS
+
+
+@pytest.mark.parametrize("topic_filter,closed", [
+    ("$aws/certificates/create/json/accepted", False),
+    ("$aws/certificates/create/json/+", True),
+], ids=["reply", "request-wildcard"])
+def test_mqtt_subscribe_to_a_reserved_filter_closes_the_connection(topic_filter, closed):
+    """MQTT 3.1.1: a SUBSCRIBE to a reserved filter a client may not use closes the connection without a SUBACK."""
+
+    async def scenario():
+        async with _connect(MQTT_311) as (client, _c):
+            await client.send(_make_subscribe(1, topic_filter, qos=1))
+            try:
+                await client.await_packet(PKT_SUBACK, timeout=3)
+                return False
+            except (websockets.exceptions.ConnectionClosed, OSError):
+                return True
+
+    assert _run(scenario()) is closed
 
 
 def test_mqtt311_qos1_puback_stays_two_bytes():
@@ -4377,8 +4466,8 @@ def test_mtls_provisioning_claim_connects_and_provisions(broker, tmp_path):
     peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
     try:
         _assert_connack(peer.connect(_unique("claim")))
-        peer.subscribe(f"{create}/+", packet_id=1)
-        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.subscribe(f"{create}/accepted", packet_id=1)
+        peer.subscribe(f"{provision}/accepted", packet_id=2)
         peer.send(_make_publish(create, b"", qos=1, packet_id=3))
         topic, payload = peer.next_publish()
         assert topic == f"{create}/accepted"
@@ -4531,8 +4620,8 @@ def test_mtls_provisioning_hook_names_the_thing(broker, tmp_path):
     peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
     try:
         _assert_connack(peer.connect(_unique("claim")))
-        peer.subscribe(f"{create}/+", packet_id=1)
-        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.subscribe(f"{create}/accepted", packet_id=1)
+        peer.subscribe(f"{provision}/accepted", packet_id=2)
         peer.send(_make_publish(create, b"", qos=1, packet_id=3))
         topic, payload = peer.next_publish()
         assert topic == f"{create}/accepted"
@@ -4609,8 +4698,8 @@ def test_mtls_provisioning_applies_the_default_template_version(broker, tmp_path
 
     try:
         _assert_connack(peer.connect(_unique("claim")))
-        peer.subscribe(f"{create}/+", packet_id=1)
-        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.subscribe(f"{create}/accepted", packet_id=1)
+        peer.subscribe(f"{provision}/accepted", packet_id=2)
         iot.create_provisioning_template_version(templateName=name, templateBody=body("v2"))
         register("a", "v1")
         iot.update_provisioning_template(templateName=name, defaultVersionId=2)

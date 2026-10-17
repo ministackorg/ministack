@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — MQTT clients are held to the reserved topics AWS lets them use** — a client could subscribe to any `$` filter and publish to the replies AWS IoT writes itself (fleet provisioning, Jobs, Device Defender, MQTT file delivery, Device Location and commands), and an MQTT 5 publish to another `$` topic got DISCONNECT 0x87; the broker now refuses, before the policy check, a filter outside the reserved filters a client may use (SUBACK 0x8F on MQTT 5, a closed connection on 3.1.1) and a publish to those replies or to any other unknown `$` topic (PUBACK 0x90 on MQTT 5 and DISCONNECT 0x90 at QoS 0, a closed connection on 3.1.1), and HTTPS `Publish` answers "Topic can't start with $" for the fleet provisioning and Device Location replies, as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

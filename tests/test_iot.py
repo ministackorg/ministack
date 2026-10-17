@@ -2614,8 +2614,10 @@ async def _fleet_client(
     send, sent = _mock_send()
     session = _IoTWSSession(send, account, region, certificate_id)
     await session.handle_packet(PKT_CONNECT, 0, _build_connect_body(client_id))
-    filters = [f"{_FLEET_CREATE}/+"] + [
-        f"$aws/provisioning-templates/{t}/provision/json/+" for t in templates
+    filters = [
+        f"{topic}/{reply}"
+        for topic in [_FLEET_CREATE, *map(_fleet_provision_topic, templates)]
+        for reply in ("accepted", "rejected")
     ]
     await session.handle_packet(
         PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [(f, 1) for f in filters])
