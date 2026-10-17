@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `/oauth2/userInfo` requires the `openid` scope under `AUTH=true`** — an access token without the `openid` scope, such as the token of a user pool API sign-in or of a Hosted UI grant of `email` alone, returned the user's attributes; with `AUTH=true` it now answers 401 `invalid_token` `Access token does not contain the 'openid' scope` once the token, its `username` and the user have passed the other checks. Contributed by @iot-rocket.
+- **Cognito — `/oauth2/userInfo` verifies the access token under `AUTH=true`** — the endpoint returned the user's attributes for any JWT carrying a user's `sub`, including an ID token, a token with an altered payload, a revoked or expired token and the token of a disabled or deleted user; with `AUTH=true` it now answers 401 `invalid_token` with AWS's `error_description` and `WWW-Authenticate` for each case. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
