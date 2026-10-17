@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — OAuth scope checks for federation and `client_credentials`** — `/oauth2/authorize` with an `identity_provider` went on to the identity provider whatever the `scope`; it now redirects to the callback with `error_description=invalid_scope` (and the `state`) when a requested scope is not in the client's `AllowedOAuthScopes`, as the managed login does. The `client_credentials` grant answered `invalid_scope` to any request naming an undefined resource server scope; it now ignores those once a defined scope is requested, so `api/read bogus/x` is granted `api/read` and `api/admin bogus/x` answers `invalid_grant`, as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
