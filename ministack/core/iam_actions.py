@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
@@ -2093,6 +2094,13 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
+    if service == "iot-data":
+        # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
+        # for a failed authentication, no message for a policy denial.
+        return (
+            403, {"Content-Type": "application/json", "x-amzn-errortype": "ForbiddenException:"},
+            json.dumps({"message": "Forbidden" if error_code else None, "traceId": str(uuid.uuid4())}).encode(),
         )
     if not message and explicit_deny and resource_policy_arn:
         message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)

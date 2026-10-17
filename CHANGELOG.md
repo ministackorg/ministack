@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT Data — denials answer `ForbiddenException` under `AUTH=true`** — the data plane (Publish, retained messages, shadows) answered an IAM denial or a failed authentication with `AccessDeniedException`, `InvalidSignatureException` or `UnrecognizedClientException` and the principal and action in the message; it now answers 403 `ForbiddenException` as AWS does, with no message for a policy denial and `Forbidden` for a failed authentication. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

@@ -407,6 +407,66 @@ def test_iot_data_publish_refuses_invalid_mqtt5_properties(kwargs, user_properti
     assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
+# IAM contracts, run by CI with AUTH=false and AUTH=true.
+@pytest.fixture
+def auth_iot_shadow(iot_data_client):
+    """A classic shadow to read, removed after the test."""
+    thing = _unique("auth-thing")
+    iot_data_client.update_thing_shadow(thingName=thing, payload=b'{"state":{"reported":{"a":1}}}')
+    yield thing
+    iot_data_client.delete_thing_shadow(thingName=thing)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny"])
+def test_iot_data_permission_contract(auth_enabled, iam_user, auth_iot_shadow, permission):
+    """A refused data plane call answers 403 ForbiddenException without a message."""
+    statements = []
+    if permission != "none":
+        statements.append({"Effect": "Allow", "Action": ["iot:Publish", "iot:GetThingShadow"], "Resource": "*"})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": ["iot:Publish", "iot:GetThingShadow"], "Resource": "*"})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    user = iam_user(policy=policy)
+    data = user.client("iot-data")
+    calls = (
+        lambda: data.publish(topic=_unique("auth/topic"), payload=b"{}"),
+        lambda: data.get_thing_shadow(thingName=auth_iot_shadow),
+    )
+    for call in calls:
+        if auth_enabled and permission != "allow":
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            assert exc.value.response["Error"]["Code"] == "ForbiddenException"
+            assert exc.value.response["Error"]["Message"] is None
+        else:
+            assert call()["ResponseMetadata"]["HTTPStatusCode"] == 200
+    if auth_enabled and permission == "none":
+        # The control plane keeps its own denial.
+        with pytest.raises(ClientError) as exc:
+            user.client("iot").list_things()
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+@pytest.mark.auth_contract
+def test_iot_data_unknown_key_contract(auth_enabled):
+    """A key IAM does not know answers 403 ForbiddenException with the message Forbidden."""
+    data = boto3.client(
+        "iot-data", endpoint_url=ENDPOINT, region_name="us-east-1",
+        aws_access_key_id="AKIA" + uuid.uuid4().hex[:16].upper(), aws_secret_access_key="unknown-secret",
+        config=Config(retries={"total_max_attempts": 1}),
+    )
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            data.publish(topic=_unique("auth/topic"), payload=b"{}")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] == "ForbiddenException"
+        assert exc.value.response["Error"]["Message"] == "Forbidden"
+    else:
+        assert data.publish(topic=_unique("auth/topic"), payload=b"{}")["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
 # ---------------------------------------------------------------------------
 # MQTT-over-WebSocket round-trip
 # ---------------------------------------------------------------------------
