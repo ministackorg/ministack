@@ -2870,3 +2870,53 @@ def test_kms_create_grant_rejects_primary_pending_replica_deletion():
         assert east.list_grants(KeyId=key_id)["Grants"] == []
     finally:
         west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("bits", [256, 384, 512])
+@pytest.mark.parametrize("message_type", ["RAW", "DIGEST"])
+def test_kms_pss_signatures_use_digest_length_salt(kms_client, bits, message_type):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    try:
+        digest = getattr(hashes, f"SHA{bits}")()
+        message = b"PSS interoperability"
+        hash_arg = digest
+        if message_type == "DIGEST":
+            hasher = hashes.Hash(digest)
+            hasher.update(message)
+            message = hasher.finalize()
+            hash_arg = utils.Prehashed(digest)
+        algorithm = f"RSASSA_PSS_SHA_{bits}"
+        signature = kms_client.sign(KeyId=key_id, Message=message, MessageType=message_type,
+                                    SigningAlgorithm=algorithm)["Signature"]
+        public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+        public_key.verify(signature, message, padding.PSS(
+            mgf=padding.MGF1(digest), salt_length=digest.digest_size), hash_arg)
+        assert kms_client.verify(KeyId=key_id, Message=message, MessageType=message_type,
+                                 SigningAlgorithm=algorithm, Signature=signature)["SignatureValid"]
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("bits", [256, 384, 512])
+def test_kms_verify_accepts_external_digest_length_pss_salt(bits):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    from ministack.services import kms
+
+    key_id = json.loads(kms._create_key({"KeySpec": "RSA_2048", "KeyUsage": "SIGN_VERIFY"})[2])["KeyMetadata"]["KeyId"]
+    try:
+        digest = getattr(hashes, f"SHA{bits}")()
+        message = b"externally generated signature"
+        signature = kms._resolve_key(key_id)["_private_key"].sign(message, padding.PSS(
+            mgf=padding.MGF1(digest), salt_length=digest.digest_size), digest)
+        status, _, body = kms._verify({"KeyId": key_id, "Message": base64.b64encode(message).decode(),
+                                      "Signature": base64.b64encode(signature).decode(),
+                                      "SigningAlgorithm": f"RSASSA_PSS_SHA_{bits}"})
+        assert status == 200
+        assert json.loads(body)["SignatureValid"] is True
+    finally:
+        kms._keys.pop(key_id, None)
