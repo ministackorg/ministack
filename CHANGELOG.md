@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudWatch — composite alarms follow their rule** — a composite alarm stayed in `INSUFFICIENT_DATA` whatever its children did and `DeleteAlarms` removed alarms that composite alarms depend on; a composite alarm now evaluates its `AlarmRule` (`ALARM`, `OK`, `INSUFFICIENT_DATA`, `TRUE`, `FALSE`, `AND`, `OR`, `NOT`, `AT_LEAST`) when it is created or updated and whenever a child changes state, with the `StateReason`, `StateReasonData` and history items AWS writes, `PutCompositeAlarm` refuses an unknown child or a malformed rule with `ValidationError`, `DeleteAlarms` refuses an alarm a composite alarm depends on and more than one composite alarm per call, and `DescribeAlarmHistory` returns composite alarm items only for `AlarmTypes=["CompositeAlarm"]`, as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
