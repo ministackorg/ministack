@@ -1484,7 +1484,7 @@ def test_s3_object_legal_hold(s3):
 def test_s3_object_lock_prevents_delete(s3):
     bkt = "intg-s3-lock-del"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    s3.put_object(Bucket=bkt, Key="locked.txt", Body=b"immutable")
+    version_id = s3.put_object(Bucket=bkt, Key="locked.txt", Body=b"immutable")["VersionId"]
 
     s3.put_object_legal_hold(
         Bucket=bkt,
@@ -1492,7 +1492,7 @@ def test_s3_object_lock_prevents_delete(s3):
         LegalHold={"Status": "ON"},
     )
     with pytest.raises(ClientError) as exc:
-        s3.delete_object(Bucket=bkt, Key="locked.txt")
+        s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version_id)
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
     # Remove legal hold, add governance retention
@@ -1510,13 +1510,14 @@ def test_s3_object_lock_prevents_delete(s3):
         Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
     )
     with pytest.raises(ClientError) as exc:
-        s3.delete_object(Bucket=bkt, Key="locked.txt")
+        s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version_id)
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
     # Bypass governance retention
     s3.delete_object(
         Bucket=bkt,
         Key="locked.txt",
+        VersionId=version_id,
         BypassGovernanceRetention=True,
     )
     with pytest.raises(ClientError):
@@ -1638,12 +1639,12 @@ def test_s3_default_retention_applied(s3):
 def test_s3_batch_delete_enforces_lock(s3):
     bkt = "intg-s3-batch-lock"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")
+    version_id = s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")["VersionId"]
     s3.put_object(Bucket=bkt, Key="b.txt", Body=b"b")
     s3.put_object_legal_hold(Bucket=bkt, Key="a.txt", LegalHold={"Status": "ON"})
     resp = s3.delete_objects(
         Bucket=bkt,
-        Delete={"Objects": [{"Key": "a.txt"}, {"Key": "b.txt"}]},
+        Delete={"Objects": [{"Key": "a.txt", "VersionId": version_id}, {"Key": "b.txt"}]},
     )
     deleted_keys = [d["Key"] for d in resp.get("Deleted", [])]
     error_keys = [e["Key"] for e in resp.get("Errors", [])]

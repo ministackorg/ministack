@@ -5640,15 +5640,14 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
                 f"/{bucket_name}/{key}",
             )
 
-    if key in bucket["objects"]:
-        lock_err = _check_object_lock(bucket_name, key, headers)
-        if lock_err:
-            return lock_err
+    version_id = _qp(query_params, "versionId", "")
+    lock_err = _check_delete_object_lock(bucket, bucket_name, key, version_id, headers)
+    if lock_err:
+        return lock_err
 
     # An explicit VersionId permanently removes exactly that version (or that
     # specific delete marker) — it never creates a new marker. Only a delete
     # WITHOUT a VersionId falls through to the delete-marker path below.
-    version_id = _qp(query_params, "versionId", "")
     if version_id:
         _found, was_delete_marker = _delete_object_version(bucket, bucket_name, key, version_id)
         # S3 returns 204 whether or not the version existed, echoing the
@@ -5689,6 +5688,20 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
     if existed:
         _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
     return 204, {}, b""
+
+
+def _check_delete_object_lock(bucket: dict, bucket_name: str, key: str, version_id: str, headers: dict):
+    if version_id:
+        versions = _object_versions.get((bucket_name, key), [])
+        version = next((v for v in versions if v["version_id"] == version_id), None)
+        if version is not None:
+            if version.get("is_delete_marker"):
+                return None
+        elif version_id != "null" or key not in bucket["objects"] or bucket["objects"][key].get("version_id"):
+            return None
+    elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        return None
+    return _check_object_lock(bucket_name, key, headers)
 
 
 def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | None:
@@ -7409,18 +7422,17 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
         vid_el = _find_xml_tag(obj_el, "VersionId")
         version_id = vid_el.text if (vid_el is not None and vid_el.text) else ""
 
-        if k in bucket["objects"]:
-            lock_err = _check_object_lock(bucket_name, k, headers)
-            if lock_err:
-                errors.append(
-                    {
-                        "key": k,
-                        "version_id": version_id,
-                        "code": "AccessDenied",
-                        "msg": "Access Denied because object protected by object lock.",
-                    }
-                )
-                continue
+        lock_err = _check_delete_object_lock(bucket, bucket_name, k, version_id, headers)
+        if lock_err:
+            errors.append(
+                {
+                    "key": k,
+                    "version_id": version_id,
+                    "code": "AccessDenied",
+                    "msg": "Access Denied because object protected by object lock.",
+                }
+            )
+            continue
 
         # Conditional delete: an ObjectIdentifier carrying an ETag deletes only if it
         # matches the current object, and `*` asks only that a current object exist.
