@@ -734,6 +734,11 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "LaunchConfigurationName",
         "requires_replacement": lambda old, new: old != new,
     },
+    "AWS::S3::AccessPoint": {
+        "name": "Name",
+        "requires_replacement": lambda old, new: any(
+            old.get(p) != new.get(p) for p in ("Bucket", "BucketAccountId", "Name", "VpcConfiguration")),
+    },
     "AWS::IAM::InstanceProfile": {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
@@ -1435,6 +1440,127 @@ def _s3_mrap_create(logical_id, props, stack_name):
 
 def _s3_mrap_delete(physical_id, props):
     _s3.delete_mrap(physical_id)
+
+
+def _s3_access_point_policy(props) -> str | None:
+    policy = props.get("Policy")
+    if policy is None:
+        return None
+    return policy if isinstance(policy, str) else json.dumps(policy)
+
+
+def _s3_access_point_attrs(record: dict) -> dict:
+    return {"Arn": _s3.access_point_arn(record["Name"]), "Alias": record["Alias"],
+            "Name": record["Name"], "NetworkOrigin": record["NetworkOrigin"]}
+
+
+def _s3_access_point_create(logical_id, props, stack_name):
+    """Provision an AWS::S3::AccessPoint through the same checks as the S3
+    Control API. The physical id (and Ref) is the name."""
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=50)
+    try:
+        record = _s3.create_access_point(
+            name, props.get("Bucket", ""), props.get("VpcConfiguration"),
+            props.get("PublicAccessBlockConfiguration"), _s3_access_point_policy(props),
+            {t["Key"]: t["Value"] for t in props.get("Tags") or []},
+        )
+    except _s3.AccessPointError as exc:
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    return name, _s3_access_point_attrs(record)
+
+
+def _s3_access_point_update(physical_id, old_props, new_props, stack_name):
+    """Policy, PublicAccessBlockConfiguration and Tags update in place."""
+    record = _s3._access_points.get(physical_id)
+    if record is None:
+        return _s3_access_point_create(physical_id, new_props, stack_name)
+    record["Policy"] = _s3_access_point_policy(new_props)
+    pab = {field: True for field in _s3._PAB_FIELDS}
+    pab.update({k: bool(v) for k, v in (new_props.get("PublicAccessBlockConfiguration") or {}).items()
+                if k in _s3._PAB_FIELDS})
+    record["PublicAccessBlockConfiguration"] = pab
+    record["Tags"] = {t["Key"]: t["Value"] for t in new_props.get("Tags") or []}
+    return physical_id, _s3_access_point_attrs(record)
+
+
+def _s3_access_point_delete(physical_id, props):
+    _s3._access_points.pop(physical_id, None)
+
+
+def _object_lambda_configuration(props) -> dict:
+    """``ObjectLambdaConfiguration`` in the S3 Control record's shape."""
+    config = props.get("ObjectLambdaConfiguration") or {}
+    transformations = []
+    for tc in config.get("TransformationConfigurations") or []:
+        aws_lambda = (tc.get("ContentTransformation") or {}).get("AwsLambda") or {}
+        transformation = {"Actions": list(tc.get("Actions") or []), "FunctionArn": aws_lambda.get("FunctionArn", "")}
+        if "FunctionPayload" in aws_lambda:
+            transformation["FunctionPayload"] = aws_lambda["FunctionPayload"]
+        transformations.append(transformation)
+    return {
+        "SupportingAccessPoint": config.get("SupportingAccessPoint", ""),
+        "CloudWatchMetricsEnabled": bool(config.get("CloudWatchMetricsEnabled", False)),
+        "AllowedFeatures": list(config.get("AllowedFeatures") or []),
+        "TransformationConfigurations": transformations,
+    }
+
+
+def _object_lambda_attrs(record: dict) -> dict:
+    return {"Arn": _s3.object_lambda_arn(record["Name"]), "Alias.Value": record["Alias"]["Value"],
+            "Alias.Status": record["Alias"]["Status"], "CreationDate": record["CreationDate"]}
+
+
+def _object_lambda_create(logical_id, props, stack_name):
+    """AWS::S3ObjectLambda::AccessPoint, through the S3 Control checks."""
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=45)
+    try:
+        record = _s3.create_object_lambda_access_point(name, _object_lambda_configuration(props))
+    except _s3.AccessPointError as exc:
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    return name, _object_lambda_attrs(record)
+
+
+def _object_lambda_update(physical_id, old_props, new_props, stack_name):
+    """Name replaces the access point; the configuration updates in place."""
+    record = _s3._object_lambda_access_points.get(physical_id)
+    if record is None:
+        return _object_lambda_create(physical_id, new_props, stack_name)
+    config = _object_lambda_configuration(new_props)
+    try:
+        _s3.validate_object_lambda_configuration(config)
+    except _s3.AccessPointError as exc:
+        raise ValueError(f"{exc.code}: {exc.message}") from exc
+    record["Configuration"] = config
+    return physical_id, _object_lambda_attrs(record)
+
+
+def _object_lambda_delete(physical_id, props):
+    _s3._object_lambda_access_points.pop(physical_id, None)
+
+
+def _object_lambda_policy_create(logical_id, props, stack_name):
+    """AWS::S3ObjectLambda::AccessPointPolicy; its physical id is the access point name."""
+    name = props.get("ObjectLambdaAccessPoint", "")
+    record = _s3._object_lambda_access_points.get(name)
+    if record is None:
+        raise ValueError(f"NoSuchAccessPoint: The specified accesspoint does not exist: {name}")
+    document = props.get("PolicyDocument")
+    record["Policy"] = document if isinstance(document, str) else json.dumps(document)
+    return name, {}
+
+
+def _object_lambda_policy_update(physical_id, old_props, new_props, stack_name):
+    if new_props.get("ObjectLambdaAccessPoint") != old_props.get("ObjectLambdaAccessPoint"):
+        result = _object_lambda_policy_create(physical_id, new_props, stack_name)
+        _delete_predecessor(_object_lambda_policy_delete, physical_id, old_props)
+        return result
+    return _object_lambda_policy_create(physical_id, new_props, stack_name)
+
+
+def _object_lambda_policy_delete(physical_id, props):
+    record = _s3._object_lambda_access_points.get(physical_id)
+    if record is not None:
+        record["Policy"] = None
 
 
 def _s3_attrs(name):
@@ -14492,6 +14618,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Backup::BackupVault": ("BackupVaultName", "EncryptionKeyArn"),
     "AWS::Location::Tracker": ("TrackerName", "KmsKeyId"),
     "AWS::S3::MultiRegionAccessPoint": ("Name", "PublicAccessBlockConfiguration", "Regions"),
+    "AWS::S3::AccessPoint": ("Bucket", "BucketAccountId", "Name", "VpcConfiguration"),
+    "AWS::S3ObjectLambda::AccessPoint": ("Name",),
     "AWS::AutoScaling::LaunchConfiguration": (
         "AssociatePublicIpAddress", "BlockDeviceMappings", "ClassicLinkVPCId",
         "ClassicLinkVPCSecurityGroups", "EbsOptimized", "IamInstanceProfile", "ImageId",
@@ -14616,6 +14744,21 @@ _RESOURCE_HANDLERS = {
     "AWS::S3::MultiRegionAccessPoint": {
         "create": _s3_mrap_create,
         "delete": _s3_mrap_delete,
+    },
+    "AWS::S3::AccessPoint": {
+        "create": _s3_access_point_create,
+        "update": _s3_access_point_update,
+        "delete": _s3_access_point_delete,
+    },
+    "AWS::S3ObjectLambda::AccessPoint": {
+        "create": _object_lambda_create,
+        "update": _object_lambda_update,
+        "delete": _object_lambda_delete,
+    },
+    "AWS::S3ObjectLambda::AccessPointPolicy": {
+        "create": _object_lambda_policy_create,
+        "update": _object_lambda_policy_update,
+        "delete": _object_lambda_policy_delete,
     },
     "AWS::S3::BucketPolicy": {
         "create": _s3_bucket_policy_create,

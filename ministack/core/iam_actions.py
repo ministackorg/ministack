@@ -273,11 +273,44 @@ _S3CONTROL_MRAP_ASYNC_ACTIONS = {
 }
 
 
+_S3CONTROL_ACCESS_POINT_ACTIONS = {
+    ("PUT", False): "s3:CreateAccessPoint",
+    ("GET", False): "s3:GetAccessPoint",
+    ("DELETE", False): "s3:DeleteAccessPoint",
+    ("PUT", True): "s3:PutAccessPointPolicy",
+    ("GET", True): "s3:GetAccessPointPolicy",
+    ("DELETE", True): "s3:DeleteAccessPointPolicy",
+}
+
+
+_S3CONTROL_OBJECT_LAMBDA_ACTIONS = {
+    ("PUT", ""): "s3:CreateAccessPointForObjectLambda",
+    ("GET", ""): "s3:GetAccessPointForObjectLambda",
+    ("DELETE", ""): "s3:DeleteAccessPointForObjectLambda",
+    ("PUT", "configuration"): "s3:PutAccessPointConfigurationForObjectLambda",
+    ("GET", "configuration"): "s3:GetAccessPointConfigurationForObjectLambda",
+    ("PUT", "policy"): "s3:PutAccessPointPolicyForObjectLambda",
+    ("GET", "policy"): "s3:GetAccessPointPolicyForObjectLambda",
+    ("DELETE", "policy"): "s3:DeleteAccessPointPolicyForObjectLambda",
+}
+
+
 def s3control_action(method: str, path: str) -> str | None:
-    """IAM action for an S3 Control Multi-Region Access Point request, or None."""
+    """IAM action for an S3 Control Multi-Region Access Point or access point request, or None."""
     from urllib.parse import unquote
 
     path = unquote(path).rstrip("/")
+    object_lambda = "/v20180820/accesspointforobjectlambda"
+    if path == object_lambda:
+        return "s3:ListAccessPointsForObjectLambda" if method == "GET" else None
+    if path.startswith(object_lambda + "/"):
+        sub = path[len(object_lambda) + 1:].partition("/")[2]
+        return _S3CONTROL_OBJECT_LAMBDA_ACTIONS.get((method, sub))
+    access_points = "/v20180820/accesspoint"
+    if path == access_points:
+        return "s3:ListAccessPoints" if method == "GET" else None
+    if path.startswith(access_points + "/"):
+        return _S3CONTROL_ACCESS_POINT_ACTIONS.get((method, path.endswith("/policy")))
     async_prefix = "/v20180820/async-requests/mrap/"
     instances = "/v20180820/mrap/instances"
     if path.startswith(async_prefix):
@@ -295,6 +328,13 @@ def s3control_action(method: str, path: str) -> str | None:
             return "s3:GetMultiRegionAccessPointPolicy" if method == "GET" else None
         return "s3:GetMultiRegionAccessPoint" if method == "GET" else None
     return None
+
+
+def s3_object_lambda_action(method: str, key: str, query_params: dict) -> str | None:
+    """The ``s3-object-lambda:`` action for a request through an Object Lambda
+    Access Point: the S3 action the same request names, in that service."""
+    action = _s3_action(method, f"/olap/{key}" if key else "/olap", query_params or {})
+    return f"s3-object-lambda:{action}" if action else None
 
 
 def _s3_action(method: str, path: str, query_params: dict) -> str | None:

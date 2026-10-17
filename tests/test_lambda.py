@@ -14972,3 +14972,23 @@ def test_lambda_s3_code_region_publish_layer_version(use1_code_bucket):
     published = euw1.publish_layer_version(LayerName=layer, Content={"ZipFile": _make_zip("x = 1\n")})
     assert published["Version"] == 1
     euw1.delete_layer_version(LayerName=layer, VersionNumber=1)
+
+
+def test_lambda_env_disables_host_prefix_injection_by_default(lam):
+    """WriteGetObjectResponse's host prefix (<route>.<host>) doesn't resolve
+    from inside a Lambda, so boto3 in a handler is told not to inject it
+    unless the function sets the variable itself (#2159)."""
+    code = _make_zip("import os\ndef handler(e, c):\n    return os.environ.get('AWS_DISABLE_HOST_PREFIX_INJECTION')\n")
+    name = f"host-prefix-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": code})
+    own = f"{name}-own"
+    lam.create_function(FunctionName=own, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": code},
+                        Environment={"Variables": {"AWS_DISABLE_HOST_PREFIX_INJECTION": "false"}})
+    try:
+        assert json.loads(lam.invoke(FunctionName=name)["Payload"].read()) == "true"
+        assert json.loads(lam.invoke(FunctionName=own)["Payload"].read()) == "false"
+    finally:
+        lam.delete_function(FunctionName=name)
+        lam.delete_function(FunctionName=own)

@@ -1,0 +1,254 @@
+"""S3 Access Points (#2159): the S3 Control API and the data plane through an
+access point ARN or alias."""
+import json
+import os
+import re
+import uuid
+
+import boto3
+import pytest
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from conftest import patch_endpoint_dns
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+ACCOUNT = "000000000000"
+
+
+def _client(service, region, account_key="test"):
+    return boto3.client(
+        service, endpoint_url=ENDPOINT, region_name=region,
+        aws_access_key_id=account_key, aws_secret_access_key="test",
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _s3control_dns():
+    """boto3 prefixes S3 Control and access point hosts with the account id."""
+    with patch_endpoint_dns():
+        yield
+
+
+def _uid():
+    return uuid.uuid4().hex[:8]
+
+
+@pytest.fixture
+def bucket():
+    """A bucket in us-east-1 holding k.txt."""
+    s3 = _client("s3", "us-east-1")
+    name = f"ap-data-{_uid()}"
+    s3.create_bucket(Bucket=name)
+    s3.put_object(Bucket=name, Key="k.txt", Body=b"hello")
+    yield name
+    for obj in s3.list_objects_v2(Bucket=name).get("Contents", []):
+        s3.delete_object(Bucket=name, Key=obj["Key"])
+    try:
+        s3.delete_bucket(Bucket=name)
+    except ClientError:
+        pass
+
+
+@pytest.fixture
+def access_point(bucket):
+    ctl = _client("s3control", "us-east-1")
+    name = f"ap-{_uid()}"
+    created = ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    yield name, created
+    try:
+        ctl.delete_access_point(AccountId=ACCOUNT, Name=name)
+    except ClientError:
+        pass
+
+
+# --- Control plane ---------------------------------------------------------
+
+def test_access_point_control_create_get_list_delete(bucket):
+    ctl = _client("s3control", "us-east-1")
+    name = f"ap-{_uid()}"
+    created = ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    arn = f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}"
+    assert created["AccessPointArn"] == arn
+    assert re.fullmatch(rf"{name[:20]}-[a-z0-9]{{29}}use1b-s3alias", created["Alias"])
+
+    ap = ctl.get_access_point(AccountId=ACCOUNT, Name=name)
+    assert (ap["Name"], ap["Bucket"], ap["BucketAccountId"], ap["NetworkOrigin"]) == (
+        name, bucket, ACCOUNT, "Internet")
+    assert ap["AccessPointArn"] == arn and ap["Alias"] == created["Alias"]
+    assert ap["PublicAccessBlockConfiguration"] == {
+        "BlockPublicAcls": True, "IgnorePublicAcls": True, "BlockPublicPolicy": True, "RestrictPublicBuckets": True}
+    assert ap["Endpoints"]["ipv4"] == "s3-accesspoint.us-east-1.amazonaws.com"
+    assert set(ap["Endpoints"]) == {"ipv4", "fips", "dualstack", "fips_dualstack"}
+    assert "CreationDate" in ap
+
+    second = f"ap-{_uid()}"
+    ctl.create_access_point(AccountId=ACCOUNT, Name=second, Bucket=bucket,
+                            VpcConfiguration={"VpcId": "vpc-0123456789abcdef0"})
+    try:
+        listed = ctl.list_access_points(AccountId=ACCOUNT, Bucket=bucket)["AccessPointList"]
+        assert sorted(a["Name"] for a in listed) == sorted([name, second])
+        assert {a["Name"]: a["NetworkOrigin"] for a in listed}[second] == "VPC"
+        page = ctl.list_access_points(AccountId=ACCOUNT, Bucket=bucket, MaxResults=1)
+        assert len(page["AccessPointList"]) == 1 and page["NextToken"]
+        rest = ctl.list_access_points(AccountId=ACCOUNT, Bucket=bucket, NextToken=page["NextToken"])
+        assert len(rest["AccessPointList"]) == 1
+    finally:
+        ctl.delete_access_point(AccountId=ACCOUNT, Name=second)
+
+    with pytest.raises(ClientError) as exc:
+        ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert exc.value.response["Error"]["Code"] == "AccessPointAlreadyOwnedByYou"
+    assert exc.value.response["Error"]["Message"] == (
+        "Your previous request to create the named accesspoint succeeded and you already own it.")
+
+    with pytest.raises(ClientError) as exc:
+        _client("s3", "us-east-1").delete_bucket(Bucket=bucket)
+    assert exc.value.response["Error"]["Code"] == "BucketHasAccessPointsAttached"
+
+    ctl.delete_access_point(AccountId=ACCOUNT, Name=name)
+    with pytest.raises(ClientError) as exc:
+        ctl.get_access_point(AccountId=ACCOUNT, Name=name)
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert (err["Code"], err["Message"], err["AccessPointName"]) == (
+        "NoSuchAccessPoint", "The specified accesspoint does not exist", name)
+
+
+def test_access_point_control_bucket_must_be_in_request_region(bucket):
+    with pytest.raises(ClientError) as exc:
+        _client("s3control", "eu-west-1").create_access_point(AccountId=ACCOUNT, Name=f"ap-{_uid()}", Bucket=bucket)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert exc.value.response["Error"]["Message"] == (
+        "Amazon S3 AccessPoint can only be created for bucket in the same region")
+
+
+def test_access_point_control_same_name_in_another_region(bucket):
+    """Access point names are unique per account and region (observed)."""
+    euw1_s3 = _client("s3", "eu-west-1")
+    euw1_bucket = f"ap-euw1-{_uid()}"
+    euw1_s3.create_bucket(Bucket=euw1_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    name = f"ap-{_uid()}"
+    use1, euw1 = _client("s3control", "us-east-1"), _client("s3control", "eu-west-1")
+    use1.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    try:
+        alias = euw1.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=euw1_bucket)["Alias"]
+        assert alias.endswith("euw1b-s3alias")
+        assert euw1.get_access_point(AccountId=ACCOUNT, Name=name)["Bucket"] == euw1_bucket
+        assert use1.get_access_point(AccountId=ACCOUNT, Name=name)["Bucket"] == bucket
+        euw1.delete_access_point(AccountId=ACCOUNT, Name=name)
+    finally:
+        use1.delete_access_point(AccountId=ACCOUNT, Name=name)
+        euw1_s3.delete_bucket(Bucket=euw1_bucket)
+
+
+def test_access_point_control_policy_round_trip(access_point):
+    name, _ = access_point
+    ctl = _client("s3control", "us-east-1")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}/object/*"}]})
+    ctl.put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=policy)
+    assert ctl.get_access_point_policy(AccountId=ACCOUNT, Name=name)["Policy"] == policy
+    ctl.delete_access_point_policy(AccountId=ACCOUNT, Name=name)
+    with pytest.raises(ClientError) as exc:
+        ctl.get_access_point_policy(AccountId=ACCOUNT, Name=name)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+# --- Data plane --------------------------------------------------------------
+
+def _raw(method, host, path, region, body=b""):
+    """A SigV4-signed request with an explicit Host, no redirect handling."""
+    import hashlib
+    import http.client
+    from urllib.parse import urlparse
+
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    req = AWSRequest(method=method, url=f"http://{host}{path}", data=body)
+    req.headers["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
+    S3SigV4Auth(Credentials("test", "test"), "s3", region).add_auth(req)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, path, body=body or None, headers={**dict(req.headers.items()), "Host": host})
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, data
+
+
+def test_access_point_arn_reaches_the_bucket(bucket, access_point):
+    name, created = access_point
+    s3 = _client("s3", "us-east-1")
+    arn = created["AccessPointArn"]
+    assert s3.get_object(Bucket=arn, Key="k.txt")["Body"].read() == b"hello"
+    s3.put_object(Bucket=arn, Key="through-ap.txt", Body=b"via ap")
+    assert s3.get_object(Bucket=bucket, Key="through-ap.txt")["Body"].read() == b"via ap"
+    keys = [o["Key"] for o in s3.list_objects_v2(Bucket=arn)["Contents"]]
+    assert keys == ["k.txt", "through-ap.txt"]
+    # A client configured for another region still signs for the ARN's region.
+    assert _client("s3", "eu-west-1").get_object(Bucket=arn, Key="k.txt")["Body"].read() == b"hello"
+
+
+def test_access_point_arn_wrong_region_signing_gets_the_redirect(access_point):
+    name, _ = access_point
+    host = f"{name}-{ACCOUNT}.{ENDPOINT.split('://', 1)[1]}"
+    status, headers, _ = _raw("GET", host, "/k.txt", "eu-west-1")
+    assert status == 301
+    assert headers["x-amz-bucket-region"] == "us-east-1"
+    assert _raw("GET", host, "/k.txt", "us-east-1")[0] == 200
+
+
+def test_access_point_arn_other_account_is_denied(access_point):
+    _, created = access_point
+    other = _client("s3", "us-east-1", account_key="111122223333")
+    with pytest.raises(ClientError) as exc:
+        other.get_object(Bucket=created["AccessPointArn"], Key="k.txt")
+    assert exc.value.response["Error"]["Code"] in ("AccessDenied", "NoSuchAccessPoint")
+
+
+def test_access_point_arn_shaped_bucket_without_access_point_is_a_bucket():
+    """`<name>-<12 digits>` is a valid bucket name; with no access point of
+    that name it is served as the bucket."""
+    s3 = _client("s3", "us-east-1")
+    name = f"plain-{_uid()}-123456789012"
+    s3.create_bucket(Bucket=name)
+    try:
+        s3.put_object(Bucket=name, Key="b.txt", Body=b"bucket")
+        host = f"{name}.{ENDPOINT.split('://', 1)[1]}"
+        assert _raw("GET", host, "/b.txt", "us-east-1")[2] == b"bucket"
+    finally:
+        s3.delete_object(Bucket=name, Key="b.txt")
+        s3.delete_bucket(Bucket=name)
+
+
+def test_access_point_alias_works_as_a_bucket_name(bucket, access_point):
+    _, created = access_point
+    s3 = _client("s3", "us-east-1")
+    alias = created["Alias"]
+    assert s3.get_object(Bucket=alias, Key="k.txt")["Body"].read() == b"hello"
+    s3.put_object(Bucket=alias, Key="alias.txt", Body=b"via alias")
+    assert s3.get_object(Bucket=bucket, Key="alias.txt")["Body"].read() == b"via alias"
+    s3.copy_object(Bucket=bucket, Key="copied.txt", CopySource={"Bucket": alias, "Key": "k.txt"})
+    assert s3.get_object(Bucket=bucket, Key="copied.txt")["Body"].read() == b"hello"
+
+
+def test_access_point_alias_from_another_account_is_denied(access_point):
+    _name, created = access_point
+    other = _client("s3", "us-east-1", account_key="111122223333")
+    with pytest.raises(ClientError) as exc:
+        other.get_object(Bucket=created["Alias"], Key="k.txt")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_access_point_control_invalid_name(bucket):
+    ctl = _client("s3control", "us-east-1")
+    with pytest.raises(ClientError) as exc:
+        ctl.create_access_point(AccountId=ACCOUNT, Name="Bad_Name", Bucket=bucket)
+    err = exc.value.response
+    assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidAccessPoint", 400)

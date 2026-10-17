@@ -63,6 +63,7 @@ from ministack.core.iam_evaluator import (
     resolve_credential,
 )
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
     get_region,
@@ -106,6 +107,130 @@ _bucket_cors = AccountScopedDict()
 _mraps = AccountScopedDict()
 # S3 Control async request token -> the AsyncOperation DescribeMultiRegionAccessPointOperation reports.
 _mrap_operations = AccountScopedDict()
+# Regional access points, by name within an account and region:
+# {Name, Bucket, BucketAccountId, Alias, CreationDate, NetworkOrigin, VpcConfiguration,
+#  PublicAccessBlockConfiguration, Policy, Tags}
+_access_points = AccountRegionScopedDict()
+
+# Object Lambda Access Points, by name within an account and region:
+# {Name, Alias: {Value, Status}, CreationDate, Configuration, Policy, PublicAccessBlockConfiguration}
+_object_lambda_access_points = AccountRegionScopedDict()
+# GetObject requests waiting on the Lambda's WriteGetObjectResponse, keyed by
+# (route, token). In flight only: never persisted, cleared on reset.
+_olap_requests: dict[tuple[str, str], dict] = {}
+_olap_requests_lock = threading.Lock()
+_OBJECT_LAMBDA_ALIAS_SUFFIX = "--ol-s3"
+
+
+def object_lambda_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
+    return f"arn:aws:s3-object-lambda:{region or get_region()}:{account_id or get_account_id()}:accesspoint/{name}"
+
+
+def new_object_lambda_alias(name: str, region: str) -> str:
+    """Shape of the documented example ``myolap-1a4n8yjrb3kda96f67zwrwiiuse1a--ol-s3``."""
+    alphabet = string.ascii_lowercase + string.digits
+    return f"{name[:20]}-{''.join(random.choices(alphabet, k=24))}{_region_code(region)}a{_OBJECT_LAMBDA_ALIAS_SUFFIX}"
+
+
+def resolve_object_lambda_alias(alias: str):
+    """``(account, region, record)`` for an Object Lambda alias in any tenant, or None."""
+    for (account, region, _name), record in list(_object_lambda_access_points._data.items()):
+        if (record.get("Alias") or {}).get("Value") == alias:
+            return account, region, record
+    return None
+
+
+_ACCESS_POINT_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,48}[a-z0-9])$")
+_OBJECT_LAMBDA_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,43}[a-z0-9])$")
+_COMPASS_CODES = {"northeast": "ne", "southeast": "se", "northwest": "nw", "southwest": "sw"}
+
+
+def _region_code(region: str) -> str:
+    """AWS's short region code in access point aliases: ``use1``, ``euw1``…"""
+    parts = region.split("-")
+    if len(parts) < 3:
+        return region.replace("-", "")
+    middle = "".join(_COMPASS_CODES.get(p, p[:1]) for p in parts[1:-1])
+    return f"{parts[0]}{middle}{parts[-1]}"
+
+
+def new_access_point_alias(name: str, region: str) -> str:
+    """The alias S3 mints for an access point (observed shape):
+    ``<first 20 chars of name>-<29 lowercase alnum><region code>b-s3alias``."""
+    alphabet = string.ascii_lowercase + string.digits
+    return f"{name[:20]}-{''.join(random.choices(alphabet, k=29))}{_region_code(region)}b-s3alias"
+
+
+def access_point_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
+    return f"arn:aws:s3:{region or get_region()}:{account_id or get_account_id()}:accesspoint/{name}"
+
+
+def resolve_access_point(name: str, account_id: str, region: str) -> dict | None:
+    return _access_points.get_scoped(account_id, region, name)
+
+
+def access_point_regions(name: str, account_id: str) -> list[str]:
+    """Regions in which an account has an access point of this name."""
+    return [region for (account, region, ap_name) in _access_points._data
+            if account == account_id and ap_name == name]
+
+
+def resolve_access_point_alias(alias: str):
+    """``(account, region, record)`` for an access point alias in any tenant, or None."""
+    for (account, region, _name), record in list(_access_points._data.items()):
+        if record.get("Alias") == alias:
+            return account, region, record
+    return None
+
+
+_ACCESS_POINT_ALIAS_SUFFIX = "-s3alias"
+
+
+def _resolve_copy_source_alias(headers: dict) -> tuple:
+    """``(headers, denied)``: an ``x-amz-copy-source`` access point alias rewritten to its bucket."""
+    source = headers.get("x-amz-copy-source", "")
+    src_bucket, sep, rest = source.lstrip("/").partition("/")
+    if not sep or not src_bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        return headers, None
+    resolved = resolve_access_point_alias(src_bucket)
+    if resolved is None:
+        return headers, None
+    if resolved[0] != get_account_id():
+        return headers, _error("AccessDenied", "Access Denied", 403, f"/{src_bucket}")
+    return {**headers, "x-amz-copy-source": f"{resolved[2]['Bucket']}/{rest}"}, None
+
+
+def resolve_access_point_host(name: str, account_id: str, signed_region: str | None):
+    """The target of an access point host ``<name>-<account>.<host>`` as
+    ``(bucket, access point region, error)``, or None when no such access
+    point exists (the host then names a bucket). An access point in another
+    region than the signing one still resolves, so the region check answers
+    with the access point's region."""
+    regions = access_point_regions(name, account_id)
+    if not regions:
+        return None
+    if account_id != get_account_id():
+        # Access point policies aren't evaluated; another account is refused.
+        return None, None, _error("AccessDenied", "Access Denied", 403, f"/{name}")
+    region = signed_region if signed_region in regions else regions[0]
+    return resolve_access_point(name, account_id, region)["Bucket"], region, None
+
+
+def signed_service(headers: dict, query_params: dict) -> str | None:
+    """The service a SigV4 request was signed for, from its credential scope."""
+    auth = headers.get("authorization", "")
+    if auth.startswith("AWS4-HMAC-SHA256"):
+        m = _SIGV4_SCOPE_SERVICE_RE.search(auth)
+        return m.group(1) if m else None
+    parts = (_qp(query_params, "X-Amz-Credential", "") or _qp(query_params, "x-amz-credential", "")).split("/")
+    return parts[3] if len(parts) == 5 else None
+
+
+def bucket_access_points_attached(bucket: str) -> bool:
+    """Whether a bucket in the current account fronts an MRAP or an access point."""
+    account = get_account_id()
+    return mrap_member(bucket) or any(
+        a == account and r.get("Bucket") == bucket for (a, _region, _n), r in list(_access_points._data.items()))
 
 
 def new_mrap_alias() -> str:
@@ -272,6 +397,8 @@ _PERSISTED_BUCKET_DICTS = {
     # alias fronting them fails where a missing bucket would not.
     "mraps": _mraps,
     "mrap_operations": _mrap_operations,
+    "access_points": _access_points,
+    "object_lambda_access_points": _object_lambda_access_points,
 }
 
 
@@ -1079,7 +1206,12 @@ def _check_bucket_region(method: str, bucket: str, key: str, headers: dict, quer
     home = home or bucket_region(bucket)
     if home is None or home == signed:
         return None
+    return region_mismatch_error(method, bucket, key, headers, query_params, signed, home)
 
+
+def region_mismatch_error(method: str, bucket: str, key: str, headers: dict, query_params: dict,
+                          signed: str, home: str) -> tuple:
+    """The response to a request signed for ``signed`` that belongs to ``home``."""
     resource = f"/{bucket}/{key}" if key else f"/{bucket}"
     presigned = bool(_qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", ""))
     if _host_region(headers) == home:
@@ -2104,7 +2236,10 @@ async def handle_request(
     signed_path: str | None = None,
     enforce_bucket_region: bool = True,
     internal: bool = False,
+    access_point_region: str | None = None,
 ) -> tuple:
+    """``access_point_region`` is set for a request that came through an access
+    point host; the region check then compares against the access point."""
     bucket, key = _parse_bucket_key(path, headers)
 
     # A virtual-hosted request is rewritten to path-style before it reaches here
@@ -2124,10 +2259,34 @@ async def handle_request(
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
 
+    # An Object Lambda Access Point alias goes to the Object Lambda flow.
+    if bucket.endswith(_OBJECT_LAMBDA_ALIAS_SUFFIX):
+        resolved = resolve_object_lambda_alias(bucket)
+        if resolved is not None:
+            from ministack.services import s3_object_lambda
+
+            account, olap_region, record = resolved
+            if account != get_account_id():
+                return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
+            return await s3_object_lambda.handle_request(record, olap_region, method, key, headers, body,
+                                                         query_params, path)
+
+    # An access point alias works wherever a bucket name does on the S3 API.
+    if bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        resolved = resolve_access_point_alias(bucket)
+        if resolved is not None:
+            account, access_point_region, record = resolved
+            if account != get_account_id():
+                return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
+            bucket = record["Bucket"]
+    headers, denied = _resolve_copy_source_alias(headers)
+    if denied is not None:
+        return denied
+
     denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
     if denied is None and enforce_bucket_region:
         # After the scope is pinned, so the owner's record names the home region.
-        denied = _check_bucket_region(method, bucket, key, headers, query_params)
+        denied = _check_bucket_region(method, bucket, key, headers, query_params, home=access_point_region)
     if denied is not None:
         status, resp_headers, resp_body = denied
         resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -2546,7 +2705,7 @@ def _delete_bucket(name: str):
     bucket = _ensure_bucket(name)
     if bucket is None:
         return _no_such_bucket(name)
-    if mrap_member(name):
+    if bucket_access_points_attached(name):
         return _error("BucketHasAccessPointsAttached",
                       "Bucket has access points attached and cannot be deleted.", 400, f"/{name}")
     if bucket["objects"] or _bucket_has_versions(name):
@@ -8573,6 +8732,386 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
     return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405)
 
 
+# ---------------------------------------------------------------------------
+# S3 Control: regional access points
+# ---------------------------------------------------------------------------
+
+_ACCESS_POINT_PREFIX = "/v20180820/accesspoint"
+_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+class AccessPointError(Exception):
+    def __init__(self, code: str, message: str, status: int, extra: dict[str, str] | None = None):
+        super().__init__(message)
+        self.code, self.message, self.status, self.extra = code, message, status, extra
+
+    def response(self) -> tuple:
+        return s3control_error(self.code, self.message, self.status, self.extra)
+
+
+def _no_such_access_point(name: str) -> AccessPointError:
+    return AccessPointError("NoSuchAccessPoint", "The specified accesspoint does not exist", 404,
+                            {"AccessPointName": name})
+
+
+def create_access_point(name: str, bucket: str, vpc_configuration: dict | None = None,
+                        public_access_block: dict | None = None, policy: str | None = None,
+                        tags: dict | None = None) -> dict:
+    """Create an access point in the current account and region (observed
+    rules: the bucket must be in that region, the name unique there)."""
+    if not _ACCESS_POINT_NAME_RE.match(name or "") or "--" in name:
+        raise AccessPointError("InvalidAccessPoint", "The specified access point name or account is not valid.", 400)
+    region = bucket_region(bucket)
+    if region is None:
+        raise AccessPointError("NoSuchBucket", "The specified bucket does not exist", 404, {"BucketName": bucket})
+    if region != get_region():
+        raise AccessPointError("InvalidRequest",
+                               "Amazon S3 AccessPoint can only be created for bucket in the same region", 400)
+    if _access_points.get(name) is not None:
+        raise AccessPointError("AccessPointAlreadyOwnedByYou",
+                               "Your previous request to create the named accesspoint succeeded and you already "
+                               "own it.", 409)
+    pab = {field: True for field in _PAB_FIELDS}
+    pab.update({k: bool(v) for k, v in (public_access_block or {}).items() if k in _PAB_FIELDS})
+    record = {
+        "Name": name,
+        "Bucket": bucket,
+        "BucketAccountId": get_account_id(),
+        "Alias": new_access_point_alias(name, region),
+        "CreationDate": now_iso(),
+        "NetworkOrigin": "VPC" if (vpc_configuration or {}).get("VpcId") else "Internet",
+        "VpcConfiguration": vpc_configuration or None,
+        "PublicAccessBlockConfiguration": pab,
+        "Policy": policy,
+        "Tags": tags or {},
+    }
+    _access_points[name] = record
+    return record
+
+
+def delete_access_point(name: str) -> None:
+    if _access_points.pop(name, None) is None:
+        raise _no_such_access_point(name)
+
+
+def _access_point_xml(parent, record: dict, full: bool) -> None:
+    SubElement(parent, "Name").text = record["Name"]
+    SubElement(parent, "NetworkOrigin").text = record["NetworkOrigin"]
+    if record.get("VpcConfiguration"):
+        SubElement(SubElement(parent, "VpcConfiguration"), "VpcId").text = record["VpcConfiguration"]["VpcId"]
+    SubElement(parent, "Bucket").text = record["Bucket"]
+    if full:
+        pab = SubElement(parent, "PublicAccessBlockConfiguration")
+        for field in _PAB_FIELDS:
+            SubElement(pab, field).text = str(record["PublicAccessBlockConfiguration"].get(field, True)).lower()
+        SubElement(parent, "CreationDate").text = record["CreationDate"]
+    SubElement(parent, "AccessPointArn").text = access_point_arn(record["Name"])
+    SubElement(parent, "Alias").text = record["Alias"]
+    if full:
+        region = get_region()
+        endpoints = SubElement(parent, "Endpoints")
+        for key, host in (("ipv4", f"s3-accesspoint.{region}.amazonaws.com"),
+                          ("fips", f"s3-accesspoint-fips.{region}.amazonaws.com"),
+                          ("dualstack", f"s3-accesspoint.dualstack.{region}.amazonaws.com"),
+                          ("fips_dualstack", f"s3-accesspoint-fips.dualstack.{region}.amazonaws.com")):
+            entry = SubElement(endpoints, "entry")
+            SubElement(entry, "key").text = key
+            SubElement(entry, "value").text = host
+    SubElement(parent, "BucketAccountId").text = record["BucketAccountId"]
+
+
+def _access_point_create_request(name: str, body: bytes) -> tuple:
+    try:
+        root = fromstring(body) if body else Element("CreateAccessPointRequest")
+    except Exception:
+        return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+    vpc_el = _child(root, "VpcConfiguration")
+    tags_el = _child(root, "Tags")
+    try:
+        record = create_access_point(
+            name, _child_text(root, "Bucket"),
+            vpc_configuration={"VpcId": _child_text(vpc_el, "VpcId")} if vpc_el is not None else None,
+            public_access_block=_parse_pab(_child(root, "PublicAccessBlockConfiguration")),
+            tags={_child_text(t, "Key"): _child_text(t, "Value") for t in tags_el} if tags_el is not None else None,
+        )
+    except AccessPointError as exc:
+        return exc.response()
+    out = Element("CreateAccessPointResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "AccessPointArn").text = access_point_arn(name)
+    SubElement(out, "Alias").text = record["Alias"]
+    return _s3control_response(out)
+
+
+def _access_point_list(query_params: dict) -> tuple:
+    bucket = _qp(query_params, "bucket", "")
+    records = sorted((r for r in _access_points.values() if not bucket or r["Bucket"] == bucket),
+                     key=lambda r: r["Name"])
+    start = int(_qp(query_params, "nextToken", "0") or "0")
+    max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
+    out = Element("ListAccessPointsResult", xmlns=S3CONTROL_NS)
+    aps = SubElement(out, "AccessPointList")
+    for record in records[start:start + max_results]:
+        _access_point_xml(SubElement(aps, "AccessPoint"), record, full=False)
+    if start + max_results < len(records):
+        SubElement(out, "NextToken").text = str(start + max_results)
+    return _s3control_response(out)
+
+
+def _access_point_policy(name: str, method: str, body: bytes) -> tuple:
+    record = _access_points.get(name)
+    if record is None:
+        return _no_such_access_point(name).response()
+    if method == "PUT":
+        try:
+            record["Policy"] = _child_text(fromstring(body), "Policy")
+        except Exception:
+            return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return 200, {"Content-Type": "application/xml"}, b""
+    if method == "DELETE":
+        record["Policy"] = None
+        return 204, {}, b""
+    if not record.get("Policy"):
+        # The code and message are inferred from the other S3 policy errors.
+        return s3control_error("NoSuchAccessPointPolicy", "The specified accesspoint policy does not exist", 404,
+                               {"AccessPointName": name})
+    out = Element("GetAccessPointPolicyResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "Policy").text = record["Policy"]
+    return _s3control_response(out)
+
+
+def is_access_point_control_path(path: str) -> bool:
+    return path.rstrip("/") == _ACCESS_POINT_PREFIX or path.startswith(_ACCESS_POINT_PREFIX + "/")
+
+
+def handle_access_point_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
+    """S3 Control access point operations in the request's region."""
+    tail = url_unquote(path).rstrip("/")[len(_ACCESS_POINT_PREFIX):].strip("/")
+    if not tail:
+        if method == "GET":
+            return _access_point_list(query_params)
+    elif tail.endswith("/policy"):
+        return _access_point_policy(tail[: -len("/policy")], method, body)
+    elif method == "PUT":
+        return _access_point_create_request(tail, body)
+    elif method == "GET":
+        record = _access_points.get(tail)
+        if record is None:
+            return _no_such_access_point(tail).response()
+        out = Element("GetAccessPointResult", xmlns=S3CONTROL_NS)
+        _access_point_xml(out, record, full=True)
+        return _s3control_response(out)
+    elif method == "DELETE":
+        try:
+            delete_access_point(tail)
+        except AccessPointError as exc:
+            return exc.response()
+        return 204, {}, b""
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405)
+
+
+# ---------------------------------------------------------------------------
+# S3 Control: Object Lambda Access Points
+# ---------------------------------------------------------------------------
+
+_OBJECT_LAMBDA_PREFIX = "/v20180820/accesspointforobjectlambda"
+OBJECT_LAMBDA_ACTIONS = ("GetObject", "HeadObject", "ListObjects", "ListObjectsV2")
+OBJECT_LAMBDA_FEATURES = ("GetObject-Range", "GetObject-PartNumber", "HeadObject-Range", "HeadObject-PartNumber")
+
+
+def _no_such_object_lambda(name: str) -> AccessPointError:
+    # Object Lambda shares the access point error (inference).
+    return _no_such_access_point(name)
+
+
+def _parse_object_lambda_configuration(el) -> dict:
+    transformations = []
+    for tc in _child(el, "TransformationConfigurations") or []:
+        actions_el = _child(tc, "Actions")
+        aws_lambda = _child(_child(tc, "ContentTransformation"), "AwsLambda")
+        transformation = {
+            "Actions": [a.text or "" for a in actions_el] if actions_el is not None else [],
+            "FunctionArn": _child_text(aws_lambda, "FunctionArn"),
+        }
+        if _child(aws_lambda, "FunctionPayload") is not None:
+            transformation["FunctionPayload"] = _child_text(aws_lambda, "FunctionPayload")
+        transformations.append(transformation)
+    features_el = _child(el, "AllowedFeatures")
+    return {
+        "SupportingAccessPoint": _child_text(el, "SupportingAccessPoint"),
+        "CloudWatchMetricsEnabled": _child_text(el, "CloudWatchMetricsEnabled").lower() == "true",
+        "AllowedFeatures": [f.text or "" for f in features_el] if features_el is not None else [],
+        "TransformationConfigurations": transformations,
+    }
+
+
+def _object_lambda_configuration_xml(parent, config: dict) -> None:
+    el = SubElement(parent, "Configuration")
+    SubElement(el, "SupportingAccessPoint").text = config["SupportingAccessPoint"]
+    SubElement(el, "CloudWatchMetricsEnabled").text = str(config.get("CloudWatchMetricsEnabled", False)).lower()
+    features = SubElement(el, "AllowedFeatures")
+    for feature in config.get("AllowedFeatures") or []:
+        SubElement(features, "AllowedFeature").text = feature
+    tcs = SubElement(el, "TransformationConfigurations")
+    for transformation in config.get("TransformationConfigurations") or []:
+        tc = SubElement(tcs, "TransformationConfiguration")
+        actions = SubElement(tc, "Actions")
+        for action in transformation["Actions"]:
+            SubElement(actions, "Action").text = action
+        aws_lambda = SubElement(SubElement(tc, "ContentTransformation"), "AwsLambda")
+        SubElement(aws_lambda, "FunctionArn").text = transformation["FunctionArn"]
+        if "FunctionPayload" in transformation:
+            SubElement(aws_lambda, "FunctionPayload").text = transformation["FunctionPayload"]
+
+
+def supporting_access_point(config: dict, region: str | None = None):
+    """``(name, record)`` of the access point an Object Lambda Access Point in
+    ``region`` (default: the request's) sits on, or None."""
+    region = region or get_region()
+    try:
+        arn = parse_arn(config.get("SupportingAccessPoint", ""))
+    except ArnParseError:
+        return None
+    if (arn.service, arn.account_id, arn.region) != ("s3", get_account_id(), region):
+        return None
+    name = arn.resource.split("/", 1)[-1]
+    record = _access_points.get_scoped(get_account_id(), region, name)
+    return (name, record) if record is not None else None
+
+
+def validate_object_lambda_configuration(config: dict) -> None:
+    """The supporting access point and every Lambda share the access point's
+    account and region (S3 user guide); actions and features come from the
+    documented sets. The error code and messages are inferred."""
+    def invalid(message):
+        raise AccessPointError("InvalidRequest", message, 400)
+
+    if supporting_access_point(config) is None:
+        invalid("The supporting access point must be an existing access point in the same account and Region.")
+    for feature in config.get("AllowedFeatures") or []:
+        if feature not in OBJECT_LAMBDA_FEATURES:
+            invalid(f"Invalid AllowedFeature: {feature}")
+    if not config.get("TransformationConfigurations"):
+        invalid("At least one TransformationConfiguration is required.")
+    for transformation in config["TransformationConfigurations"]:
+        if not transformation["Actions"] or any(a not in OBJECT_LAMBDA_ACTIONS for a in transformation["Actions"]):
+            invalid("Invalid transformation configuration action.")
+        try:
+            fn = parse_arn(transformation["FunctionArn"])
+        except ArnParseError:
+            invalid("The Lambda function ARN is invalid.")
+        if (fn.service, fn.account_id, fn.region) != ("lambda", get_account_id(), get_region()):
+            invalid("The Lambda function must be in the same account and Region as the Object Lambda Access Point.")
+
+
+def create_object_lambda_access_point(name: str, config: dict, policy: str | None = None) -> dict:
+    if not _OBJECT_LAMBDA_NAME_RE.match(name or ""):
+        raise AccessPointError("InvalidAccessPoint", "The specified access point name or account is not valid.", 400)
+    validate_object_lambda_configuration(config)
+    if _object_lambda_access_points.get(name) is not None:
+        raise AccessPointError("AccessPointAlreadyOwnedByYou",
+                               "Your previous request to create the named accesspoint succeeded and you already "
+                               "own it.", 409)
+    record = {
+        "Name": name,
+        "Alias": {"Value": new_object_lambda_alias(name, get_region()), "Status": "READY"},
+        "CreationDate": now_iso(),
+        "Configuration": config,
+        "Policy": policy,
+        "PublicAccessBlockConfiguration": {field: True for field in _PAB_FIELDS},
+    }
+    _object_lambda_access_points[name] = record
+    return record
+
+
+def _object_lambda_alias_xml(parent, record: dict) -> None:
+    alias = SubElement(parent, "Alias")
+    SubElement(alias, "Value").text = record["Alias"]["Value"]
+    SubElement(alias, "Status").text = record["Alias"]["Status"]
+
+
+def is_object_lambda_control_path(path: str) -> bool:
+    return path.rstrip("/") == _OBJECT_LAMBDA_PREFIX or path.startswith(_OBJECT_LAMBDA_PREFIX + "/")
+
+
+def _object_lambda_request(name: str, method: str, body: bytes, sub: str) -> tuple:
+    record = _object_lambda_access_points.get(name)
+    if method == "PUT" and not sub:
+        try:
+            root = fromstring(body)
+            config = _parse_object_lambda_configuration(_child(root, "Configuration"))
+            record = create_object_lambda_access_point(name, config)
+        except AccessPointError as exc:
+            return exc.response()
+        except Exception:
+            return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+        out = Element("CreateAccessPointForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        SubElement(out, "ObjectLambdaAccessPointArn").text = object_lambda_arn(name)
+        _object_lambda_alias_xml(out, record)
+        return _s3control_response(out)
+    if record is None:
+        return _no_such_object_lambda(name).response()
+    if sub == "configuration":
+        if method == "PUT":
+            try:
+                config = _parse_object_lambda_configuration(_child(fromstring(body), "Configuration"))
+                validate_object_lambda_configuration(config)
+            except AccessPointError as exc:
+                return exc.response()
+            record["Configuration"] = config
+            return 200, {"Content-Type": "application/xml"}, b""
+        out = Element("GetAccessPointConfigurationForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        _object_lambda_configuration_xml(out, record["Configuration"])
+        return _s3control_response(out)
+    if sub == "policy":
+        if method == "PUT":
+            record["Policy"] = _child_text(fromstring(body), "Policy")
+            return 200, {"Content-Type": "application/xml"}, b""
+        if method == "DELETE":
+            record["Policy"] = None
+            return 204, {}, b""
+        if not record.get("Policy"):
+            return s3control_error("NoSuchAccessPointPolicy", "The specified accesspoint policy does not exist",
+                                   404, {"AccessPointName": name})
+        out = Element("GetAccessPointPolicyForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        SubElement(out, "Policy").text = record["Policy"]
+        return _s3control_response(out)
+    if method == "DELETE":
+        _object_lambda_access_points.pop(name, None)
+        return 204, {}, b""
+    out = Element("GetAccessPointForObjectLambdaResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "Name").text = name
+    pab = SubElement(out, "PublicAccessBlockConfiguration")
+    for field in _PAB_FIELDS:
+        SubElement(pab, field).text = "true"
+    SubElement(out, "CreationDate").text = record["CreationDate"]
+    _object_lambda_alias_xml(out, record)
+    return _s3control_response(out)
+
+
+def handle_object_lambda_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
+    """S3 Control Object Lambda Access Point operations in the request's region."""
+    tail = url_unquote(path).rstrip("/")[len(_OBJECT_LAMBDA_PREFIX):].strip("/")
+    if not tail:
+        if method != "GET":
+            return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.",
+                                   405)
+        records = sorted(_object_lambda_access_points.values(), key=lambda r: r["Name"])
+        start = int(_qp(query_params, "nextToken", "0") or "0")
+        max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
+        out = Element("ListAccessPointsForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        listed = SubElement(out, "ObjectLambdaAccessPointList")
+        for record in records[start:start + max_results]:
+            entry = SubElement(listed, "ObjectLambdaAccessPoint")
+            SubElement(entry, "Name").text = record["Name"]
+            SubElement(entry, "ObjectLambdaAccessPointArn").text = object_lambda_arn(record["Name"])
+            _object_lambda_alias_xml(entry, record)
+        if start + max_results < len(records):
+            SubElement(out, "NextToken").text = str(start + max_results)
+        return _s3control_response(out)
+    name, _, sub = tail.partition("/")
+    return _object_lambda_request(name, method, body, sub)
+
+
 def reset():
     """Wipe all in-memory state (used by /_ministack/reset)."""
     global _buckets, _bucket_policies, _bucket_notifications, _bucket_tags
@@ -8607,6 +9146,9 @@ def reset():
         _object_versions,
         _mraps,
         _mrap_operations,
+        _access_points,
+        _object_lambda_access_points,
+        _olap_requests,
     ):
         d.clear()
 

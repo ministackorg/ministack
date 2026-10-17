@@ -54,6 +54,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import esm_wake, run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
+    HOST_PREFIX_ENV,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
@@ -4498,6 +4499,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     # /opt/bin) — no _LAMBDA_LAYERS_DIRS shim here (the official RIE bootstrap
     # ignores it anyway).
     container_env.update(env_vars)
+    container_env.setdefault(HOST_PREFIX_ENV, "true")
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
     container_env.update(_durable_env_overlay())
@@ -5391,6 +5393,7 @@ def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
     })
     proc_env.update(execution_credentials(config))
     proc_env.update(env_vars)
+    proc_env.setdefault(HOST_PREFIX_ENV, "true")
     proc_env.update(_durable_env_overlay())
     # Override AWS_ENDPOINT_URL *after* function env vars so Lambda binaries
     # always call back to this MiniStack instance.
@@ -5736,6 +5739,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
+            env.setdefault(HOST_PREFIX_ENV, "true")
             env.update(_durable_env_overlay())
             # X-Ray active tracing — one-shot subprocess, env is per-invocation
             # so a fresh trace ID per call is safe (unlike the pooled RIE).

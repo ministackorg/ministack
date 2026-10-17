@@ -36535,6 +36535,114 @@ def test_cfn_s3_name_conflict_with_validation_disabled_fails_the_resource(cfn, s
         s3.delete_bucket(Bucket=name)
 
 
+def test_cfn_s3_access_point_provisions_updates_and_deletes(cfn, s3):
+    """AWS::S3::AccessPoint (#2159): Ref is the name; Arn, Alias, Name and
+    NetworkOrigin resolve; Policy updates in place; delete removes it."""
+    from conftest import patch_endpoint_dns
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket, stack_name, ap_name = f"cfn-ap-data-{uid}", f"cfn-ap-{uid}", f"cfn-ap-{uid}"
+    s3.create_bucket(Bucket=bucket)
+
+    def template(policy_action, block_acls=True):
+        return json.dumps({
+            "Resources": {"Ap": {"Type": "AWS::S3::AccessPoint", "Properties": {
+                "Name": ap_name, "Bucket": bucket,
+                "PublicAccessBlockConfiguration": {"BlockPublicAcls": block_acls},
+                "Policy": {"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                    "Action": policy_action,
+                    "Resource": f"arn:aws:s3:us-east-1:000000000000:accesspoint/{ap_name}/object/*"}]}}}},
+            "Outputs": {k: {"Value": v} for k, v in {
+                "Ref": {"Ref": "Ap"}, "Arn": {"Fn::GetAtt": ["Ap", "Arn"]},
+                "Alias": {"Fn::GetAtt": ["Ap", "Alias"]}, "Name": {"Fn::GetAtt": ["Ap", "Name"]},
+                "NetworkOrigin": {"Fn::GetAtt": ["Ap", "NetworkOrigin"]}}.items()},
+        })
+
+    ctl = boto3.client("s3control", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                       region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+    cfn.create_stack(StackName=stack_name, TemplateBody=template("s3:GetObject"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Ref") == _output(stack, "Name") == ap_name
+        assert _output(stack, "Arn") == f"arn:aws:s3:us-east-1:000000000000:accesspoint/{ap_name}"
+        assert _output(stack, "Alias").endswith("use1b-s3alias")
+        assert _output(stack, "NetworkOrigin") == "Internet"
+        with patch_endpoint_dns():
+            assert ctl.get_access_point(AccountId="000000000000", Name=ap_name)["Bucket"] == bucket
+            assert "s3:GetObject" in ctl.get_access_point_policy(AccountId="000000000000", Name=ap_name)["Policy"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template("s3:PutObject", block_acls=False))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        with patch_endpoint_dns():
+            assert "s3:PutObject" in ctl.get_access_point_policy(AccountId="000000000000", Name=ap_name)["Policy"]
+            pab = ctl.get_access_point(AccountId="000000000000", Name=ap_name)["PublicAccessBlockConfiguration"]
+            assert pab["BlockPublicAcls"] is False and pab["BlockPublicPolicy"] is True
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with patch_endpoint_dns(), pytest.raises(ClientError):
+        ctl.get_access_point(AccountId="000000000000", Name=ap_name)
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_s3_object_lambda_access_point_and_policy(cfn, s3, lam):
+    """AWS::S3ObjectLambda::AccessPoint and AccessPointPolicy (#2159)."""
+    from conftest import patch_endpoint_dns
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket, stack_name = f"cfn-olap-data-{uid}", f"cfn-olap-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e, c):\n    return 1\n")
+    fn_arn = lam.create_function(FunctionName=f"cfn-olap-fn-{uid}", Runtime="python3.12", Role=_CR_LAMBDA_ROLE,
+                                 Handler="index.handler", Code={"ZipFile": buf.getvalue()})["FunctionArn"]
+    template = {
+        "Resources": {
+            "Ap": {"Type": "AWS::S3::AccessPoint", "Properties": {"Bucket": bucket, "Name": f"cfn-sup-{uid}"}},
+            "Olap": {"Type": "AWS::S3ObjectLambda::AccessPoint", "Properties": {
+                "Name": f"cfn-olap-{uid}",
+                "ObjectLambdaConfiguration": {
+                    "SupportingAccessPoint": {"Fn::GetAtt": ["Ap", "Arn"]},
+                    "TransformationConfigurations": [{
+                        "Actions": ["GetObject"],
+                        "ContentTransformation": {"AwsLambda": {"FunctionArn": fn_arn}}}]}}},
+            "OlapPolicy": {"Type": "AWS::S3ObjectLambda::AccessPointPolicy", "Properties": {
+                "ObjectLambdaAccessPoint": {"Ref": "Olap"},
+                "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                    "Action": "s3-object-lambda:GetObject", "Resource": {"Fn::GetAtt": ["Olap", "Arn"]}}]}}},
+        },
+        "Outputs": {k: {"Value": v} for k, v in {
+            "Ref": {"Ref": "Olap"}, "Arn": {"Fn::GetAtt": ["Olap", "Arn"]},
+            "AliasValue": {"Fn::GetAtt": ["Olap", "Alias.Value"]},
+            "AliasStatus": {"Fn::GetAtt": ["Olap", "Alias.Status"]},
+            "Created": {"Fn::GetAtt": ["Olap", "CreationDate"]}}.items()},
+    }
+    ctl = boto3.client("s3control", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                       region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test")
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Ref") == f"cfn-olap-{uid}"
+        assert _output(stack, "Arn") == f"arn:aws:s3-object-lambda:us-east-1:000000000000:accesspoint/cfn-olap-{uid}"
+        assert _output(stack, "AliasValue").endswith("--ol-s3")
+        assert _output(stack, "AliasStatus") == "READY"
+        assert _output(stack, "Created")
+        with patch_endpoint_dns():
+            policy = ctl.get_access_point_policy_for_object_lambda(AccountId="000000000000", Name=f"cfn-olap-{uid}")
+            assert "s3-object-lambda:GetObject" in policy["Policy"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        lam.delete_function(FunctionName=f"cfn-olap-fn-{uid}")
+    with patch_endpoint_dns(), pytest.raises(ClientError):
+        ctl.get_access_point_for_object_lambda(AccountId="000000000000", Name=f"cfn-olap-{uid}")
+    s3.delete_bucket(Bucket=bucket)
+
+
 @pytest.mark.parametrize("custom_bus", [True, False])
 def test_cfn_events_rule_bus_arn_delivery_and_lifecycle(cfn, eb, sqs, custom_bus):
     """ARN/name aliases share a rule on create, update, delivery, drift and delete."""

@@ -26,6 +26,12 @@ from ministack.core.responses import _12_DIGIT_RE
 
 logger = logging.getLogger("lambda_runtime")
 
+# S3 Object Lambda handlers call WriteGetObjectResponse, whose modeled host
+# prefix (`<route>.<host>`) doesn't resolve against MiniStack's endpoint.
+# botocore reads this variable and skips the prefix; MiniStack routes the call
+# by its x-amz-request-route header instead. A function's own value wins.
+HOST_PREFIX_ENV = "AWS_DISABLE_HOST_PREFIX_INJECTION"
+
 _RESERVED_RUNTIME_ENV_VARS = {
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
@@ -1192,6 +1198,7 @@ class Worker:
                 spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
+        spawn_env.setdefault(HOST_PREFIX_ENV, "true")
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))

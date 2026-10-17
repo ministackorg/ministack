@@ -659,6 +659,38 @@ def test_s3_mrap_round_trip():
     _round_trip("s3", "s3", populate, observe)
 
 
+def test_s3_access_points_round_trip_every_tenant():
+    """Access points are scoped by account and region; a restart keeps all of
+    them, not only the tenant that saved."""
+    record = {"Name": "ap", "Bucket": "data", "Alias": "ap-abc-s3alias", "NetworkOrigin": "Internet"}
+
+    def populate(mod):
+        mod._access_points.set_scoped("111111111111", "us-east-1", "ap", dict(record))
+        mod._access_points.set_scoped("222222222222", "eu-west-1", "ap", {**record, "Bucket": "other"})
+
+    def observe(mod):
+        assert mod._access_points.get_scoped("111111111111", "us-east-1", "ap")["Bucket"] == "data"
+        assert mod._access_points.get_scoped("222222222222", "eu-west-1", "ap")["Bucket"] == "other"
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_s3_object_lambda_access_points_round_trip_without_pending_requests():
+    """Object Lambda Access Points outlive a restart; requests waiting for a
+    WriteGetObjectResponse are in flight only and are never saved."""
+    def populate(mod):
+        mod._object_lambda_access_points.set_scoped("111111111111", "us-east-1", "olap", {
+            "Name": "olap", "Alias": {"Value": "olap-abc--ol-s3", "Status": "READY"}})
+        mod._olap_requests[("route", "token")] = {"done": False}
+
+    def observe(mod):
+        assert mod._object_lambda_access_points.get_scoped(
+            "111111111111", "us-east-1", "olap")["Alias"]["Value"] == "olap-abc--ol-s3"
+        assert "olap_requests" not in mod.get_state()
+
+    _round_trip("s3", "s3", populate, observe)
+
+
 def test_transcribe_round_trip():
     import time as _time
 

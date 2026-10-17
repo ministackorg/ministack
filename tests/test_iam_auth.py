@@ -5770,3 +5770,79 @@ def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
         iam.delete_user_policy(UserName=name, PolicyName="home")
         iam.delete_user(UserName=name)
         root_s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("PUT", "/v20180820/accesspoint/ap1", "s3:CreateAccessPoint"),
+    ("GET", "/v20180820/accesspoint/ap1", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/ap1", "s3:DeleteAccessPoint"),
+    ("GET", "/v20180820/accesspoint", "s3:ListAccessPoints"),
+    ("PUT", "/v20180820/accesspoint/ap1/policy", "s3:PutAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/ap1/policy", "s3:GetAccessPointPolicy"),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy", "s3:DeleteAccessPointPolicy"),
+])
+def test_s3control_access_point_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+def test_s3control_access_point_denied_without_the_action(monkeypatch):
+    """Under AUTH=true access point calls need their own action, on the access
+    point's regional ARN."""
+    import ministack.app as app
+
+    seen = _capture_enforced_arn(monkeypatch)
+    headers = {
+        "authorization": "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "x-amz-account-id": "000000000000",
+    }
+    monkeypatch.setattr(app, "AUTH", True)
+    asyncio.run(app._handle_s3_control_request("/v20180820/accesspoint/ap1/policy", "GET", b"", {}, "rid", headers))
+    assert seen["action"] == "s3:GetAccessPointPolicy"
+    assert seen["arn"].endswith(":000000000000:accesspoint/ap1")
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol", "s3:CreateAccessPointForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol", "s3:GetAccessPointForObjectLambda"),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol", "s3:DeleteAccessPointForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda", "s3:ListAccessPointsForObjectLambda"),
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol/configuration", "s3:PutAccessPointConfigurationForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/configuration", "s3:GetAccessPointConfigurationForObjectLambda"),
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:PutAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:GetAccessPointPolicyForObjectLambda"),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:DeleteAccessPointPolicyForObjectLambda"),
+])
+def test_s3control_object_lambda_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+@pytest.mark.parametrize("method,key,query,action", [
+    ("GET", "k.txt", {}, "s3-object-lambda:GetObject"),
+    ("HEAD", "k.txt", {}, "s3-object-lambda:GetObject"),
+    ("PUT", "k.txt", {}, "s3-object-lambda:PutObject"),
+    ("DELETE", "k.txt", {}, "s3-object-lambda:DeleteObject"),
+    ("GET", "", {"list-type": ["2"]}, "s3-object-lambda:ListBucket"),
+])
+def test_s3_object_lambda_data_plane_iam_action(method, key, query, action):
+    from ministack.core.iam_actions import s3_object_lambda_action
+
+    assert s3_object_lambda_action(method, key, query) == action
+
+
+def test_write_get_object_response_needs_its_iam_action(monkeypatch):
+    import ministack.app as app
+
+    seen = _capture_enforced_arn(monkeypatch)
+    monkeypatch.setattr(app, "AUTH", True)
+    headers = {"x-amz-request-route": "io-use1-unknown", "x-amz-request-token": "t",
+               "authorization": "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/s3-object-lambda/"
+                                "aws4_request, SignedHeaders=host, Signature=x"}
+    status = asyncio.run(app._handle_special_data_plane_request(
+        "POST", "/WriteGetObjectResponse", headers, b"", {}, "rid"))[0]
+    assert seen["action"] == "s3-object-lambda:WriteGetObjectResponse"
+    assert status == 400
