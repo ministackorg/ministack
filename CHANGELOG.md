@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — job documents nested too deep** — `CreateJob` and `CreateJobTemplate` accepted an inline document that is not JSON, and a document nested deeper than Python's JSON parser goes answered 500 (from `documentSource`, or inline once it headed a thing's queue, after which every later `CreateJob` for that thing answered 500 too); they now refuse a document that is not JSON or nests more than 1000 levels deep with AWS's `InvalidRequestException`, and a device gets a 1000-level document compact. Contributed by @iot-rocket.
+- **IoT — job execution versions, `statusDetails`, execution numbers and timeouts** — `UpdateJobExecution` answered a stale `expectedVersion` with 409 `InvalidStateTransitionException` and now answers 400 `InvalidRequestException` (`VersionMismatch` over MQTT, as before); an execution has no `statusDetails` until a device reports some, and a reported empty map replaces the previous one; the MQTT `get` and `update` topics answer `ResourceNotFound` for an `executionNumber` other than the execution's; and `DescribeJobExecution`, `ListJobExecutionsForJob`, `ListJobExecutionsForThing` and `DescribeJob` time out an expired `IN_PROGRESS` execution as the device reads do. Contributed by @iot-rocket.
+- **IoT — Jobs MQTT messages are written as AWS writes them** — the `$aws/things/<thing>/jobs` messages were spaced, ASCII-escaped JSON with `clientToken` last, a `thingName` and an empty `statusDetails` in the `get` and `start-next` executions and no `jobDocument` in an execution whose document is `null`; they are now compact UTF-8 in AWS's member order with `clientToken` first, the job document as the HTTP plane sends it, characters outside the BMP escaped in `statusDetails` and in the update and rejected responses, and `"jobDocument":null` kept. Contributed by @iot-rocket.
+- **IoT Jobs — a status a device may not set is refused first** — `UpdateJobExecution` (HTTP and the MQTT `update` topic) to QUEUED, CANCELED or TIMED_OUT answered `ResourceNotFoundException` for an unknown job or thing and the version error for a stale `expectedVersion`; it now refuses the status first with `InvalidStateTransitionException` (over MQTT `InvalidStateTransition` without `executionState`), as AWS does. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

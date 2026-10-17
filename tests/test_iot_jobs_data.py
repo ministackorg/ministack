@@ -14,6 +14,7 @@ data-plane responses use raw `long` shapes carrying whole epoch seconds
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -345,6 +346,94 @@ def test_iot_jobs_document_source_refusals(iot_client, s3):
     finally:
         _cleanup(iot_client, things=[thing])
         _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_nesting_limit(iot_client, iot_jobs_data, s3):
+    """A document nested deeper than 1000 levels, or not JSON, refuses the job or template."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    jobs, templates = [], []
+    deepest = {
+        "array": "[ " * 1000 + "]" * 1000,
+        "object": '{ "a": ' * 1000 + "1" + " }" * 1000,
+    }
+    compact = {"array": "[" * 1000 + "]" * 1000, "object": '{"a":' * 1000 + "1" + "}" * 1000}
+    refused = {
+        "array": "[" * 1001 + "]" * 1001,
+        "object": '{"a":' * 1001 + "1" + "}" * 1001,
+        "beyond the parser": "[" * 16000 + "]" * 16000,
+        "not JSON": "not json",
+    }
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        for kind, document in refused.items():
+            s3.put_object(Bucket=bucket, Key=f"{kind}.json", Body=document)
+            source = f"s3://{bucket}/{kind}.json"
+            for request, where in (({"document": document}, "request input"), ({"documentSource": source}, source)):
+                message = f"Job document located at {where} is an invalid JSON document."
+                job_id, template_id = _unique("job"), _unique("tmpl")
+                with pytest.raises(ClientError) as ei:
+                    iot_client.create_job(jobId=job_id, targets=[thing_arn], **request)
+                assert _error(ei) == (400, "InvalidRequestException", message), kind
+                with pytest.raises(ClientError) as ei:
+                    iot_client.describe_job(jobId=job_id)
+                assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+                with pytest.raises(ClientError) as ei:
+                    iot_client.create_job_template(jobTemplateId=template_id, description="d", **request)
+                assert _error(ei) == (400, "InvalidRequestException", message), kind
+
+        # Brackets inside a string are no nesting.
+        jobs.append(_unique("job"))
+        iot_client.create_job(
+            jobId=jobs[-1], targets=[thing_arn], document=json.dumps({"s": "[" * 1001})
+        )
+
+        # 1000 levels are accepted; the device gets them compact.
+        for kind, document in deepest.items():
+            s3.put_object(Bucket=bucket, Key=f"{kind}.json", Body=document)
+            for request in ({"document": document}, {"documentSource": f"s3://{bucket}/{kind}.json"}):
+                jobs.append(_unique("job"))
+                iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], **request)
+                assert iot_client.get_job_document(jobId=jobs[-1])["document"] == document
+                execution = iot_jobs_data.describe_job_execution(
+                    jobId=jobs[-1], thingName=thing, includeJobDocument=True
+                )["execution"]
+                assert execution["jobDocument"] == compact[kind], kind
+                templates.append(_unique("tmpl"))
+                iot_client.create_job_template(jobTemplateId=templates[-1], description="d", **request)
+                desc = iot_client.describe_job_template(jobTemplateId=templates[-1])
+                assert desc["document"] == document
+    finally:
+        _delete_templates(iot_client, *templates)
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
+def test_iot_jobs_document_with_unterminated_strings_is_refused(iot_client):
+    """A document of escaped quotes without a closing one is refused."""
+    thing = _unique("jobs-thing")
+    document = '"' + '\\"' * 16383
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        with pytest.raises(ClientError) as ei:
+            iot_client.create_job(jobId=_unique("job"), targets=[thing_arn], document=document)
+        message = "Job document located at request input is an invalid JSON document."
+        assert _error(ei) == (400, "InvalidRequestException", message)
+    finally:
+        _cleanup(iot_client, things=[thing])
+
+
+def test_iot_jobs_stored_document_too_deep_to_parse_stays_text():
+    """A stored document too deep for the JSON parser reaches the device as its text."""
+    from ministack.services import iot as iot_module
+
+    job_id, document = _unique("job"), "[" * 16000 + "]" * 16000
+    iot_module._jobs[job_id] = {"jobId": job_id, "document": document}
+    try:
+        assert iot_module.jobs_job_document(job_id) == document
+        assert iot_module._jobs_job_document_object(job_id) == document
+    finally:
+        iot_module._jobs.pop(job_id, None)
 
 
 def test_iot_jobs_document_source_is_read_in_the_callers_account():
@@ -1296,8 +1385,8 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         assert [e["jobId"] for e in pending["inProgressJobs"]] == [job_id]
         assert pending["queuedJobs"] == []
 
-        # A wrong expectedVersion is rejected with the code the iot-jobs-data
-        # model declares for UpdateJobExecution — InvalidStateTransitionException,
+        # A wrong expectedVersion is rejected with a code the iot-jobs-data
+        # model declares for UpdateJobExecution — InvalidRequestException (400),
         # NOT the VersionConflictException the control plane uses. botocore only
         # synthesizes exception classes for modeled errors, so an unmodeled code
         # would make the device's `except client.exceptions.…` raise
@@ -1305,16 +1394,16 @@ def test_iot_jobs_start_next_update_and_auto_complete(iot_client, iot_jobs_data)
         # version so the device can resync without a separate describe.
         assert not hasattr(iot_jobs_data.exceptions, "VersionConflictException")
         with pytest.raises(
-            iot_jobs_data.exceptions.InvalidStateTransitionException
+            iot_jobs_data.exceptions.InvalidRequestException
         ) as ei:
             iot_jobs_data.update_job_execution(
                 jobId=job_id, thingName=thing, status="SUCCEEDED",
                 expectedVersion=1,
             )
         error = ei.value.response["Error"]
-        assert error["Code"] == "InvalidStateTransitionException"
-        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
-        assert "found version 2" in error["Message"]
+        assert error["Code"] == "InvalidRequestException"
+        assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert error["Message"] == "Expected version 1 but found version 2"
 
         updated = iot_jobs_data.update_job_execution(
             jobId=job_id,
@@ -1403,6 +1492,35 @@ def test_iot_jobs_update_rejects_service_side_statuses(
         )["execution"]
         assert execution["status"] == "QUEUED"
         assert execution["versionNumber"] == 1
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
+def test_iot_jobs_update_refuses_the_status_before_looking_up_the_execution(iot_client, iot_jobs_data):
+    """A status a device may not set is refused before the existence and version checks."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        cases = [(thing, job_id, {"expectedVersion": 99})]
+        cases += [(thing, _unique("no-job"), {}), (_unique("no-thing"), _unique("no-job"), {})]
+        for target_thing, target_job, extra in cases:
+            for status in ("QUEUED", "CANCELED", "TIMED_OUT"):
+                with pytest.raises(iot_jobs_data.exceptions.InvalidStateTransitionException) as ei:
+                    iot_jobs_data.update_job_execution(
+                        jobId=target_job, thingName=target_thing, status=status, **extra
+                    )
+                assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+                assert ei.value.response["Error"]["Message"] == (
+                    f"The status of job execution cannot be changed to be {status}"
+                )
+
+        # An unknown execution is reported before a stale expectedVersion.
+        with pytest.raises(iot_jobs_data.exceptions.ResourceNotFoundException):
+            iot_jobs_data.update_job_execution(
+                jobId=_unique("no-job"), thingName=thing, status="SUCCEEDED", expectedVersion=99
+            )
     finally:
         _cleanup(iot_client, jobs=[job_id], things=[thing])
 
@@ -3366,6 +3484,40 @@ def test_iot_jobs_recreated_thing_starts_with_no_execution_history(
 # ---------------------------------------------------------------------------
 
 
+def test_iot_jobs_status_details_are_left_out_until_a_device_reports_them(
+    iot_client, iot_jobs_data
+):
+    """No statusDetails member until a device reports some; a reported empty map replaces the old one."""
+    thing = _unique("jobs-thing")
+    job_id = _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+
+        def update(**kwargs):
+            return iot_jobs_data.update_job_execution(
+                jobId=job_id, thingName=thing, status="IN_PROGRESS",
+                includeJobExecutionState=True, **kwargs,
+            )["executionState"]
+
+        def device():
+            return iot_jobs_data.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+
+        def control():
+            return iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+
+        assert "statusDetails" not in device()
+        assert update() == {"status": "IN_PROGRESS", "versionNumber": 2}
+        assert "statusDetails" not in device()
+        assert control()["statusDetails"] == {}
+        assert update(statusDetails={"step": "1"})["statusDetails"] == {"step": "1"}
+        assert update()["statusDetails"] == {"step": "1"}
+        assert update(statusDetails={}) == {"status": "IN_PROGRESS", "statusDetails": {}, "versionNumber": 5}
+        assert device()["statusDetails"] == {}
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
+
+
 def test_iot_jobs_status_details_are_nested_on_the_control_plane_only(
     iot_client, iot_jobs_data
 ):
@@ -3796,6 +3948,11 @@ def _frames_by_topic(received):
     return {topic: json.loads(payload) for topic, payload in received}
 
 
+def _unstamped(payload):
+    """A raw Jobs MQTT payload with each epoch-seconds stamp as 0, every other byte as sent."""
+    return re.sub(r'(?<=":)\d{10}(?=[,}])', "0", payload.decode("utf-8"))
+
+
 def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client):
     """CreateJob publishes notify (per-status aggregate) + notify-next (full
     execution incl. the jobDocument as an object) to each target thing; a
@@ -3846,6 +4003,58 @@ def test_jobs_mqtt_create_job_notifies_and_get_lists(iot_client, iot_data_client
     assert doc["inProgressJobs"] == []
     _assert_epoch_seconds(doc["timestamp"])
     _assert_epoch_seconds(doc["queuedJobs"][0]["queuedAt"])
+
+
+def test_jobs_mqtt_messages_are_compact_in_aws_member_order(iot_client, iot_data_client):
+    """Jobs MQTT messages are compact UTF-8 in AWS's member order, clientToken first, without thingName."""
+    thing = _unique("jobs-mqtt-raw")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+    summary = (
+        f'{{"jobId":"{job_id}","queuedAt":0,"lastUpdatedAt":0,'
+        '"executionNumber":1,"versionNumber":1}'
+    )
+    execution = (
+        f'{{"jobId":"{job_id}","status":"QUEUED","queuedAt":0,"lastUpdatedAt":0,'
+        '"versionNumber":1,"executionNumber":1,"jobDocument":{"s":"\u00e9 \U0001f600","f":1.0E21}}'
+    )
+    try:
+        received = _collect_shadow_frames(
+            f"{base}/#",
+            lambda: iot_client.create_job(
+                jobId=job_id,
+                targets=[thing_arn],
+                document='{"s": "\\u00e9 \\ud83d\\ude00", "f": 1e21}',
+            ),
+            want=2,
+        )
+        frames = {topic: _unstamped(payload) for topic, payload in received}
+        assert frames[f"{base}/notify"] == f'{{"timestamp":0,"jobs":{{"QUEUED":[{summary}]}}}}'
+        assert frames[f"{base}/notify-next"] == f'{{"timestamp":0,"execution":{execution}}}'
+        for topic, request, accepted in (
+            (
+                "get",
+                {"clientToken": "tok"},
+                f'{{"clientToken":"tok","timestamp":0,"inProgressJobs":[],"queuedJobs":[{summary}]}}',
+            ),
+            (
+                f"{job_id}/get",
+                {"clientToken": "tok"},
+                f'{{"clientToken":"tok","timestamp":0,"execution":{execution}}}',
+            ),
+            (f"{job_id}/get", {}, f'{{"timestamp":0,"execution":{execution}}}'),
+        ):
+            received = _collect_shadow_frames(
+                f"{base}/{topic}/accepted",
+                lambda topic=topic, request=request: _mqtt_publish(
+                    topic=f"{base}/{topic}", payload=json.dumps(request).encode()
+                ),
+                want=1,
+            )
+            assert [_unstamped(payload) for _, payload in received] == [accepted]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_jobs_mqtt_create_behind_existing_job_no_notify_next(
@@ -4025,6 +4234,60 @@ def test_jobs_mqtt_update_include_flags_and_terminal_notify(
     assert topics.index(f"{base}/{job_id}/update/accepted") < topics.index(
         f"{base}/notify"
     ) < topics.index(f"{base}/notify-next")
+
+
+def test_jobs_mqtt_status_details_and_update_responses_escape_non_bmp(
+    iot_client, iot_data_client
+):
+    """statusDetails and update responses escape characters beyond the BMP; the job document elsewhere does not."""
+    thing = _unique("jobs-mqtt-bmp")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+    details = '"statusDetails":{"k":"\u00e9 \\uD83D\\uDE00"}'
+    try:
+        iot_client.create_job(
+            jobId=job_id, targets=[thing_arn], document='{"s": "\\u00e9 \\ud83d\\ude00"}'
+        )
+        for topic, request, answer, expected in (
+            (
+                "start-next",
+                {"statusDetails": {"k": "\u00e9 \U0001f600"}, "clientToken": "tok"},
+                "accepted",
+                f'{{"clientToken":"tok","timestamp":0,"execution":{{"jobId":"{job_id}",'
+                f'"status":"IN_PROGRESS",{details},"queuedAt":0,"startedAt":0,"lastUpdatedAt":0,'
+                '"versionNumber":2,"executionNumber":1,"jobDocument":{"s":"\u00e9 \U0001f600"}}}',
+            ),
+            (
+                f"{job_id}/update",
+                {
+                    "status": "IN_PROGRESS",
+                    "includeJobExecutionState": True,
+                    "includeJobDocument": True,
+                    "clientToken": "tok",
+                },
+                "accepted",
+                f'{{"clientToken":"tok","timestamp":0,"executionState":{{"status":"IN_PROGRESS",{details},'
+                '"versionNumber":3},"jobDocument":{"s":"\u00e9 \\uD83D\\uDE00"}}',
+            ),
+            (
+                f"{job_id}/update",
+                {"status": "IN_PROGRESS", "expectedVersion": 9},
+                "rejected",
+                f'{{"timestamp":0,"executionState":{{"status":"IN_PROGRESS",{details},"versionNumber":3}},'
+                '"code":"VersionMismatch","message":"Expected version 9 but found version 3"}',
+            ),
+        ):
+            received = _collect_shadow_frames(
+                f"{base}/{topic}/{answer}",
+                lambda topic=topic, request=request: _mqtt_publish(
+                    topic=f"{base}/{topic}", payload=json.dumps(request).encode()
+                ),
+                want=1,
+            )
+            assert [_unstamped(payload) for _, payload in received] == [expected]
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_jobs_mqtt_presigned_urls(iot_client, iot_data_client, s3, iam):
@@ -4210,6 +4473,27 @@ def test_jobs_mqtt_version_mismatch_rejected(iot_client, iot_data_client):
     _assert_epoch_seconds(doc["timestamp"])
 
 
+def test_jobs_mqtt_update_unknown_job_refused_status_rejected(iot_client, iot_data_client):
+    """A status a device may not set is refused before the job is looked up."""
+    thing = _unique("jobs-mqtt-rej")
+    _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+
+    received = _collect_shadow_frames(
+        f"{base}/no-such-job/update/rejected",
+        lambda: _mqtt_publish(
+            topic=f"{base}/no-such-job/update",
+            payload=json.dumps({"status": "QUEUED", "clientToken": "tok-q"}).encode(),
+        ),
+        want=1,
+    )
+    doc = _frames_by_topic(received)[f"{base}/no-such-job/update/rejected"]
+    assert doc["code"] == "InvalidStateTransition"
+    assert doc["message"] == "The status of job execution cannot be changed to be QUEUED"
+    assert "executionState" not in doc
+    assert doc["clientToken"] == "tok-q"
+
+
 def test_jobs_mqtt_update_unknown_job_rejected(iot_client, iot_data_client):
     """An update for a job that does not exist answers update/rejected with
     the string ResourceNotFound code — never a silent drop."""
@@ -4307,6 +4591,36 @@ def test_jobs_mqtt_next_sentinel_get(iot_client, iot_data_client):
     assert doc["inProgressJobs"] == []
 
 
+def test_jobs_mqtt_unknown_execution_number_rejected(iot_client, iot_data_client):
+    """get and update with another executionNumber than the execution's answer ResourceNotFound."""
+    thing = _unique("jobs-mqtt-num")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+    base = f"$aws/things/{thing}/jobs"
+
+    def answer(verb, request):
+        received = _collect_shadow_frames(
+            f"{base}/{job_id}/{verb}/+",
+            lambda: _mqtt_publish(topic=f"{base}/{job_id}/{verb}", payload=json.dumps(request).encode()),
+            want=1,
+        )
+        ((topic, payload),) = received
+        return topic.rsplit("/", 1)[1], json.loads(payload)
+
+    kind, doc = answer("get", {"executionNumber": 9, "clientToken": "n1"})
+    assert (kind, doc["code"], doc["clientToken"]) == ("rejected", "ResourceNotFound", "n1")
+    kind, doc = answer("update", {"status": "IN_PROGRESS", "executionNumber": 9})
+    assert (kind, doc["code"]) == ("rejected", "ResourceNotFound")
+    execution = iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+    assert (execution["status"], execution["versionNumber"]) == ("QUEUED", 1)
+
+    kind, doc = answer("get", {"executionNumber": 1})
+    assert (kind, doc["execution"]["executionNumber"]) == ("accepted", 1)
+    kind, _ = answer("update", {"status": "IN_PROGRESS", "executionNumber": 1})
+    assert kind == "accepted"
+
+
 def test_jobs_mqtt_job_document_leaves_out_null_members(iot_client, iot_data_client):
     """The jobDocument object over MQTT is the device's document: no null members, Infinity as a string."""
     thing = _unique("jobs-mqtt-doc")
@@ -4326,6 +4640,38 @@ def test_jobs_mqtt_job_document_leaves_out_null_members(iot_client, iot_data_cli
     )
     execution = _frames_by_topic(received)[f"{base}/{job_id}/get/accepted"]["execution"]
     assert execution["jobDocument"] == {"o": {"k": [None]}, "f": ["Infinity", 2.5]}
+
+
+def test_jobs_mqtt_null_job_document_is_sent_as_null(iot_client, iot_data_client):
+    """A job document that is JSON null reaches the device as "jobDocument":null on every MQTT path."""
+    thing = _unique("jobs-mqtt-null")
+    job_id = _unique("job")
+    thing_arn = _create_thing(iot_client, thing)
+    base = f"$aws/things/{thing}/jobs"
+    try:
+        received = _collect_shadow_frames(
+            f"{base}/notify-next",
+            lambda: iot_client.create_job(jobId=job_id, targets=[thing_arn], document="null"),
+            want=1,
+        )
+        documents = [json.loads(received[0][1])["execution"]]
+        for topic, request in (
+            (f"{job_id}/get", {}),
+            ("start-next", {}),
+            (f"{job_id}/update", {"status": "SUCCEEDED", "includeJobDocument": True}),
+        ):
+            received = _collect_shadow_frames(
+                f"{base}/{topic}/accepted",
+                lambda topic=topic, request=request: _mqtt_publish(
+                    topic=f"{base}/{topic}", payload=json.dumps(request).encode()
+                ),
+                want=1,
+            )
+            accepted = json.loads(received[0][1])
+            documents.append(accepted.get("execution", accepted))
+        assert [document.get("jobDocument", "absent") for document in documents] == [None] * 4
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])
 
 
 def test_jobs_mqtt_non_object_payload_rejected(iot_client, iot_data_client):
