@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — bucket configuration validation** — `PutBucketVersioning` accepted any `Status` or `MfaDelete` and stored it, `PutBucketLifecycleConfiguration` accepted any rule `Status` or transition `StorageClass` and non-positive days, and `PutBucketEncryption` accepted any `SSEAlgorithm`. Out-of-enum values now return 400 `MalformedXML` (`The XML you provided was not well-formed or did not validate against our published schema`, now the message for every `MalformedXML`). A zero or negative `Expiration` `Days` or `NoncurrentVersionExpiration` `NoncurrentDays` returns 400 `InvalidArgument` (`'Days' for Expiration action must be a positive integer`).
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
