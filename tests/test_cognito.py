@@ -699,6 +699,274 @@ def test_cognito_admin_list_user_auth_events_requires_addons(cognito_idp):
     assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
     assert exc.value.response["Error"]["Message"] == "User does not exist."
 
+
+def _auth_events_pool(cognito_idp, name, mode="AUDIT"):
+    """A pool with threat protection in `mode`, a client for every password flow and user 'eve'."""
+    pid = cognito_idp.create_user_pool(
+        PoolName=name, UserPoolAddOns={"AdvancedSecurityMode": mode},
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="events",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                           "ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="eve", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="eve", Password="Correct1!", Permanent=True)
+    return pid, cid
+
+
+def _auth_event_summary(event):
+    return (event["EventType"], event["EventResponse"],
+            [(c["ChallengeName"], c["ChallengeResponse"]) for c in event["ChallengeResponses"]])
+
+
+@pytest.mark.parametrize("mode", ["AUDIT", "ENFORCED"])
+def test_cognito_auth_events_record_sign_ins(cognito_idp, mode):
+    """Password, admin and SRP sign-ins are logged newest first; a refresh and an unknown user are not."""
+    pid, cid = _auth_events_pool(cognito_idp, f"AuthEventsSignIn{mode}", mode)
+    password_auth = {"ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH"}
+    tokens = cognito_idp.initiate_auth(
+        **password_auth, AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"})["AuthenticationResult"]
+    with pytest.raises(ClientError):
+        cognito_idp.initiate_auth(**password_auth, AuthParameters={"USERNAME": "eve", "PASSWORD": "Wrong1!x"})
+    cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"},
+        ContextData={"IpAddress": "203.0.113.10", "ServerName": "app.example.com", "ServerPath": "/login",
+                     "HttpHeaders": [{"headerName": "User-Agent", "headerValue": "test"}]})
+    with pytest.raises(ClientError):
+        cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "eve", "PASSWORD": "Wrong1!x"})
+    assert "AuthenticationResult" in _srp_sign_in(cognito_idp, pid, cid, "eve", "Correct1!")[1]
+    with pytest.raises(ClientError):
+        _srp_sign_in(cognito_idp, pid, cid, "eve", "Wrong1!x")
+    cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                              AuthParameters={"REFRESH_TOKEN": tokens["RefreshToken"]})
+    with pytest.raises(ClientError):
+        cognito_idp.initiate_auth(**password_auth, AuthParameters={"USERNAME": "nobody", "PASSWORD": "Correct1!"})
+
+    events = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="eve")["AuthEvents"]
+    passed, failed = [("Password", "Success")], [("Password", "Failure")]
+    assert [_auth_event_summary(e) for e in events] == [
+        ("SignIn", "Fail", failed), ("SignIn", "Pass", passed),
+        ("SignIn", "Fail", failed), ("SignIn", "Pass", passed),
+        ("SignIn", "Fail", failed), ("SignIn", "Pass", passed),
+    ]
+    assert [e["CreationDate"] for e in events] == sorted((e["CreationDate"] for e in events), reverse=True)
+    for event in events:
+        assert str(_uuid_mod.UUID(event["EventId"])) == event["EventId"]
+        assert event["EventRisk"] == {"RiskDecision": "NoRisk", "CompromisedCredentialsDetected": False}
+        assert event["EventContextData"]["City"] == event["EventContextData"]["Country"] == "null"
+        assert "EventFeedback" not in event
+    ips = [e["EventContextData"]["IpAddress"] for e in events]
+    assert ips[3] == "203.0.113.10"
+    assert ips[0] and ips[0] != "203.0.113.10" and len(set(ips[:3] + ips[4:])) == 1
+
+    # The events belong to the user record: a user created again under the name has none.
+    cognito_idp.admin_delete_user(UserPoolId=pid, Username="eve")
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="eve", MessageAction="SUPPRESS")
+    assert cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="eve")["AuthEvents"] == []
+
+
+def test_cognito_auth_events_mfa_and_password_changes(cognito_idp):
+    """An MFA sign-in is InProgress until answered; new and changed passwords log PasswordChange."""
+    pid, cid = _auth_events_pool(cognito_idp, "AuthEventsMfa")
+
+    def summaries(username):
+        events = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username=username)["AuthEvents"]
+        return [_auth_event_summary(e) for e in events]
+
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="temp", MessageAction="SUPPRESS",
+                                  TemporaryPassword="Temporary1!")
+    started = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                                        AuthParameters={"USERNAME": "temp", "PASSWORD": "Temporary1!"})
+    assert started["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    tokens = cognito_idp.respond_to_auth_challenge(
+        ClientId=cid, ChallengeName="NEW_PASSWORD_REQUIRED", Session=started["Session"],
+        ChallengeResponses={"USERNAME": "temp", "NEW_PASSWORD": "Changed1!"})["AuthenticationResult"]
+    cognito_idp.change_password(AccessToken=tokens["AccessToken"], PreviousPassword="Changed1!",
+                                ProposedPassword="Changed2!")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="temp", Password="Changed3!", Permanent=True)
+    assert summaries("temp") == [("PasswordChange", "Pass", []), ("PasswordChange", "Pass", []),
+                                 ("SignIn", "Pass", [("Password", "Success")])]
+
+    cognito_idp.set_user_pool_mfa_config(UserPoolId=pid, SoftwareTokenMfaConfiguration={"Enabled": True},
+                                         MfaConfiguration="OPTIONAL")
+    access = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                                       AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"},
+                                       )["AuthenticationResult"]["AccessToken"]
+    secret = cognito_idp.associate_software_token(AccessToken=access)["SecretCode"]
+    cognito_idp.verify_software_token(AccessToken=access, UserCode=_totp_code(secret))
+    cognito_idp.admin_set_user_mfa_preference(UserPoolId=pid, Username="eve",
+                                              SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True})
+
+    def mfa_started():
+        started = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                                            AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"})
+        assert started["ChallengeName"] == "SOFTWARE_TOKEN_MFA"
+        assert summaries("eve")[0] == ("SignIn", "InProgress", [("Password", "Success")])
+        return started["Session"]
+
+    def answer(session, code):
+        cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", Session=session,
+            ChallengeResponses={"USERNAME": "eve", "SOFTWARE_TOKEN_MFA_CODE": code})
+
+    # Two sign-ins wait on MFA at once: each answer closes its own session's event.
+    first, second = mfa_started(), mfa_started()
+    answer(first, _totp_code(secret))
+    assert summaries("eve")[:2] == [
+        ("SignIn", "InProgress", [("Password", "Success")]),
+        ("SignIn", "Pass", [("Password", "Success"), ("Mfa", "Success")]),
+    ]
+    with pytest.raises(ClientError) as exc:
+        answer(second, "000000" if _totp_code(secret) != "000000" else "111111")
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="eve")
+    with pytest.raises(ClientError):
+        cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                                  AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"})
+    assert summaries("eve") == [
+        ("SignIn", "Fail", [("Password", "Success"), ("Mfa", "Failure")]),
+        ("SignIn", "Pass", [("Password", "Success"), ("Mfa", "Success")]),
+        ("SignIn", "Pass", [("Password", "Success")]),
+    ]
+
+
+def test_cognito_auth_events_paging(cognito_idp):
+    """MaxResults pages (0 or absent means 60, outside 0-60 is refused); an unknown NextToken starts over."""
+    pid, cid = _auth_events_pool(cognito_idp, "AuthEventsPaging")
+    for _ in range(5):
+        cognito_idp.admin_initiate_auth(UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                                        AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"})
+    every = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="eve")
+    assert len(every["AuthEvents"]) == 5 and "NextToken" not in every
+    assert cognito_idp.admin_list_user_auth_events(
+        UserPoolId=pid, Username="eve", MaxResults=0)["AuthEvents"] == every["AuthEvents"]
+
+    pages, token = [], None
+    while True:
+        page = cognito_idp.admin_list_user_auth_events(
+            UserPoolId=pid, Username="eve", MaxResults=2, **({"NextToken": token} if token else {}))
+        pages.append([e["EventId"] for e in page["AuthEvents"]])
+        token = page.get("NextToken")
+        if not token:
+            break
+        assert token.startswith(page["AuthEvents"][-1]["EventId"] + "#") and token.endswith("Z")
+    assert pages == [[e["EventId"] for e in every["AuthEvents"][i:i + 2]] for i in (0, 2, 4)]
+    assert cognito_idp.admin_list_user_auth_events(
+        UserPoolId=pid, Username="eve", NextToken="not-a-token")["AuthEvents"] == every["AuthEvents"]
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="eve", MaxResults=61)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == (
+        "1 validation error detected: Value '61' at 'maxResults' failed to satisfy constraint:"
+        " Member must have value less than or equal to 60")
+
+    def raw_list(max_results):
+        """Sent raw and signed: botocore refuses these values client-side."""
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        body = json.dumps({"UserPoolId": pid, "Username": "eve", "MaxResults": max_results})
+        signed = AWSRequest(method="POST", url=ENDPOINT, data=body, headers={
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": "AWSCognitoIdentityProviderService.AdminListUserAuthEvents"})
+        SigV4Auth(Credentials("test", "test"), "cognito-idp", "us-east-1").add_auth(signed)
+        request = urllib.request.Request(ENDPOINT, data=body.encode(), headers=dict(signed.headers), method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                return resp.status, len(json.loads(resp.read())["AuthEvents"])
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read())
+
+    assert raw_list(-1) == (400, {
+        "__type": "InvalidParameterException",
+        "message": "1 validation error detected: Value '-1' at 'maxResults' failed to satisfy constraint:"
+                   " Member must have value greater than or equal to 0"})
+    assert raw_list(61.5)[1]["message"].startswith("1 validation error detected: Value '61' at")
+    assert raw_list(2.5) == (200, 2)
+    for value, message in (("5", "STRING_VALUE can not be converted to an Integer"),
+                           (True, "TRUE_VALUE can not be converted to an Integer"),
+                           ([], "Start of list found where not expected")):
+        status, error = raw_list(value)
+        assert (status, error["__type"], error["Message"]) == (
+            400, "SerializationException", message)
+
+
+def test_cognito_auth_event_feedback(cognito_idp):
+    """AdminUpdateAuthEventFeedback sets EventFeedback; UpdateAuthEventFeedback has no valid token here."""
+    pid, cid = _auth_events_pool(cognito_idp, "AuthEventsFeedback")
+    cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                              AuthParameters={"USERNAME": "eve", "PASSWORD": "Correct1!"})
+    event_id = cognito_idp.admin_list_user_auth_events(
+        UserPoolId=pid, Username="eve")["AuthEvents"][0]["EventId"]
+
+    for value in ("Valid", "Invalid"):
+        cognito_idp.admin_update_auth_event_feedback(
+            UserPoolId=pid, Username="eve", EventId=event_id, FeedbackValue=value)
+        feedback = cognito_idp.admin_list_user_auth_events(
+            UserPoolId=pid, Username="eve")["AuthEvents"][0]["EventFeedback"]
+        assert (feedback["FeedbackValue"], feedback["Provider"]) == (value, "Admin")
+        assert isinstance(feedback["FeedbackDate"], datetime.datetime)
+
+    def refused(call, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(**{"UserPoolId": pid, "Username": "eve", "EventId": event_id, "FeedbackValue": "Valid",
+                    **kwargs})
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    admin = cognito_idp.admin_update_auth_event_feedback
+    assert refused(admin, FeedbackValue="valid") == (
+        "InvalidParameterException",
+        "1 validation error detected: Value 'valid' at 'feedbackValue' failed to satisfy constraint:"
+        " Member must satisfy enum value set: [Invalid, Valid]")
+    assert refused(admin, EventId="not an id") == (
+        "InvalidParameterException",
+        "1 validation error detected: Value 'not an id' at 'eventId' failed to satisfy constraint:"
+        " Member must satisfy regular expression pattern: [\\w+-]+")
+    assert refused(admin, EventId=str(_uuid_mod.uuid4())) == ("InvalidParameterException", "EventId is invalid")
+    assert refused(admin, Username="nobody") == ("NotAuthorizedException", "Incorrect username or password.")
+    user = cognito_idp.update_auth_event_feedback
+    assert refused(user, FeedbackToken="made-up") == ("NotAuthorizedException", "Invalid session provided")
+
+    off = cognito_idp.create_user_pool(PoolName="AuthEventsFeedbackOff")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=off, Username="eve", MessageAction="SUPPRESS")
+    for call, extra in ((admin, {}), (user, {"FeedbackToken": "made-up"})):
+        assert refused(call, UserPoolId=off, **extra)[0] == "UserPoolAddOnNotEnabledException"
+
+
+def test_cognito_auth_events_survive_restore(_enable_persistence):
+    """Events live on the user record, so they survive a warm boot through load_persisted_state."""
+    mod = _cognito_module()
+    try:
+        mod.reset()
+        _, _, body = mod._create_user_pool({"PoolName": "AuthEventsRestore",
+                                            "UserPoolAddOns": {"AdvancedSecurityMode": "AUDIT"}})
+        pid = json.loads(body)["UserPool"]["Id"]
+        _, _, body = mod._create_user_pool_client({"UserPoolId": pid, "ClientName": "c",
+                                                   "ExplicitAuthFlows": ["ALLOW_ADMIN_USER_PASSWORD_AUTH"]})
+        cid = json.loads(body)["UserPoolClient"]["ClientId"]
+        mod._admin_create_user({"UserPoolId": pid, "Username": "eve", "MessageAction": "SUPPRESS"})
+        mod._admin_set_user_password({"UserPoolId": pid, "Username": "eve", "Password": "Correct1!",
+                                      "Permanent": True})
+        mod._admin_initiate_auth({"UserPoolId": pid, "ClientId": cid, "AuthFlow": "ADMIN_USER_PASSWORD_AUTH",
+                                  "AuthParameters": {"USERNAME": "eve", "PASSWORD": "Correct1!"}})
+        listing = {"UserPoolId": pid, "Username": "eve"}
+        event_id = json.loads(mod._admin_list_user_auth_events(listing)[2])["AuthEvents"][0]["EventId"]
+        mod._admin_update_auth_event_feedback({**listing, "EventId": event_id, "FeedbackValue": "Valid"})
+        before = json.loads(mod._admin_list_user_auth_events(listing)[2])
+
+        _cognito_round_trip(mod)
+
+        assert json.loads(mod._admin_list_user_auth_events(listing)[2]) == before
+        assert before["AuthEvents"][0]["EventFeedback"]["FeedbackValue"] == "Valid"
+    finally:
+        mod.reset()
+
 def test_cognito_domain_crud(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
     resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")

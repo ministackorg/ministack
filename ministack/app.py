@@ -235,6 +235,7 @@ from ministack.core.responses import (
     fix_error_content_type,
     fix_success_content_type,
     set_request_account_id,
+    set_request_client_ip,
     set_request_region,
 )
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
@@ -3158,6 +3159,7 @@ async def app(scope, receive, send):
     # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
     if scope.get("scheme") == "https":
         headers.setdefault("x-forwarded-proto", "https")
+    set_request_client_ip((scope.get("client") or ("127.0.0.1",))[0])
     if AUTH:
         pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
                            headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")
