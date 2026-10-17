@@ -1183,6 +1183,45 @@ def test_iot_tagging_refuses_unknown_and_foreign_arns(iot_client):
         assert _iot_error(iot_client.list_tags_for_resource, resourceArn=target) == (400, message)
 
 
+@pytest.mark.auth_contract
+def test_iot_tagging_authorizes_on_the_resource_arn(auth_enabled, iam_user, iot_client):
+    allowed, other = (iot_client.create_thing_group(thingGroupName=_unique("group"))["thingGroupArn"]
+                      for _ in range(2))
+    iot_client.tag_resource(resourceArn=other, tags=[{"Key": "existing", "Value": "before"}])
+    thing_type = allowed.rsplit(":", 1)[0] + ":thingtype/" + _unique("type")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": ["iot:TagResource", "iot:UntagResource", "iot:ListTagsForResource"],
+        "Resource": allowed,
+    }]})
+    client = user.client("iot")
+    try:
+        client.tag_resource(resourceArn=allowed, tags=[{"Key": "k", "Value": "v"}])
+        assert client.list_tags_for_resource(resourceArn=allowed)["tags"] == [{"Key": "k", "Value": "v"}]
+        client.untag_resource(resourceArn=allowed, tagKeys=["k"])
+        assert client.list_tags_for_resource(resourceArn=allowed)["tags"] == []
+
+        for action, call, arn, kwargs in (
+            ("TagResource", client.tag_resource, other, {"tags": [{"Key": "k", "Value": "v"}]}),
+            ("UntagResource", client.untag_resource, other, {"tagKeys": ["existing"]}),
+            ("ListTagsForResource", client.list_tags_for_resource, other, {}),
+            ("ListTagsForResource", client.list_tags_for_resource, thing_type, {}),
+        ):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(resourceArn=arn, **kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert error["Error"]["Message"].startswith(
+                    f"User: {user.arn} is not authorized to perform: iot:{action} ")
+            else:
+                assert call(resourceArn=arn, **kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert _iot_tags(iot_client, other) == ({"existing": "before"} if auth_enabled else {"k": "v"})
+    finally:
+        for arn in (allowed, other):
+            iot_client.delete_thing_group(thingGroupName=arn.rsplit("/", 1)[1])
+
+
 def test_iot_tag_limits_and_validation(iot_client):
     from conftest import make_client
 

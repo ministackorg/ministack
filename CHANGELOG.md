@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — tagging calls are authorized on the tagged resource under `AUTH=true`** — `TagResource`, `UntagResource` and `ListTagsForResource` were checked against resource `*`, so a policy scoped to a thing group, job or other IoT ARN denied them even on that resource, and only `Resource: "*"` let them through; they are now checked against the `resourceArn` the request names. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added

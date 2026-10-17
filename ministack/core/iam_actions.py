@@ -1613,6 +1613,12 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
             topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
+        # The tagging calls authorize on the resource they name in resourceArn,
+        # read from where the handler reads it: the body of a POST, the query of a GET.
+        if parts in (["tags"], ["untag"]):
+            arn = (_safe_json_field(body, "resourceArn") if method == "POST"
+                   else _query_param(query_params, "resourceArn"))
+            return arn if isinstance(arn, str) and arn else "*"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
