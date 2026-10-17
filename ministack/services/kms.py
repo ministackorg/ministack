@@ -836,10 +836,24 @@ def _verify(data):
     })
 
 
+_SIGNING_ALGORITHM_ENUM = (
+    "RSASSA_PSS_SHA_256", "RSASSA_PSS_SHA_384", "RSASSA_PSS_SHA_512", "RSASSA_PKCS1_V1_5_SHA_256",
+    "RSASSA_PKCS1_V1_5_SHA_384", "RSASSA_PKCS1_V1_5_SHA_512", "ECDSA_SHA_256", "ECDSA_SHA_384", "ECDSA_SHA_512",
+    "ED25519_SHA_512", "ED25519_PH_SHA_512", "SM2DSA", "ML_DSA_SHAKE_256",
+)
+
+
 def _algorithm_error(rec, algorithm, field):
     """InvalidKeyUsageException for an algorithm the key spec doesn't support."""
     if algorithm in rec.get(field, []):
         return None
+    if field == "SigningAlgorithms" and algorithm not in _SIGNING_ALGORITHM_ENUM:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at 'signingAlgorithm' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_SIGNING_ALGORITHM_ENUM)}]",
+            400,
+        )
     return error_response_json(
         "InvalidKeyUsageException",
         f"Algorithm {algorithm} is incompatible with key spec {rec.get('KeySpec', '')}.",
@@ -1192,9 +1206,9 @@ def _decrypt(data):
         if err:
             return err
         algorithm = data.get("EncryptionAlgorithm", "SYMMETRIC_DEFAULT")
-        err = _algorithm_error(rec, algorithm, "EncryptionAlgorithms")
-        if err:
-            return err
+        if algorithm not in rec.get("EncryptionAlgorithms", []):
+            # Observed on AWS: RSA Decrypt without a matching algorithm is an opaque invalid ciphertext.
+            return error_response_json("InvalidCiphertextException", "", 400)
         try:
             plaintext = rec["_private_key"].decrypt(ciphertext, _oaep_padding(algorithm))
         except ValueError:

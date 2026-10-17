@@ -9503,3 +9503,35 @@ def test_s3_object_lock_applies_to_its_version_only(s3):
         s3.delete_object(Bucket=bkt, Key="k", VersionId=locked)
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
+
+def test_s3_copy_and_multipart_refuse_object_lock_headers_without_object_lock(s3):
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-nolock-cp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="src", Body=b"x")
+    until = datetime.now(timezone.utc) + timedelta(days=1)
+    calls = (
+        lambda: s3.copy_object(Bucket=bkt, Key="dst", CopySource={"Bucket": bkt, "Key": "src"},
+                               ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=until),
+        lambda: s3.copy_object(Bucket=bkt, Key="dst", CopySource={"Bucket": bkt, "Key": "src"},
+                               ObjectLockLegalHoldStatus="OFF"),
+        lambda: s3.create_multipart_upload(Bucket=bkt, Key="mpu", ObjectLockMode="COMPLIANCE",
+                                           ObjectLockRetainUntilDate=until),
+        lambda: s3.create_multipart_upload(Bucket=bkt, Key="mpu", ObjectLockLegalHoldStatus="ON"),
+    )
+    try:
+        for call in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            err = exc.value.response
+            assert (err["Error"]["Code"], err["Error"]["Message"], err["ResponseMetadata"]["HTTPStatusCode"]) == (
+                "InvalidRequest", "Bucket is missing ObjectLockConfiguration", 400)
+        assert [o["Key"] for o in s3.list_objects_v2(Bucket=bkt)["Contents"]] == ["src"]
+        assert "Uploads" not in s3.list_multipart_uploads(Bucket=bkt)
+    finally:
+        for v in s3.list_object_versions(Bucket=bkt).get("Versions", []):
+            s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
+        s3.delete_bucket(Bucket=bkt)
+

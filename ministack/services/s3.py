@@ -5828,6 +5828,9 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
+    lock_err = _object_lock_header_error(bucket_name, headers)
+    if lock_err:
+        return lock_err
 
     # A canned ACL on the copy applies to the destination, as it does on a
     # put; an unknown value rejects the whole request rather than being
@@ -7544,6 +7547,9 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
+    lock_err = _object_lock_header_error(bucket_name, headers)
+    if lock_err:
+        return lock_err
 
     storage_class, sc_err = _resolve_storage_class(headers)
     if sc_err:

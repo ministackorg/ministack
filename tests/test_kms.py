@@ -2928,3 +2928,26 @@ def test_kms_sign_refuses_a_wrong_digest_length_or_algorithm(kms_client):
     with pytest.raises(ClientError) as exc:
         kms_client.sign(KeyId=ec_key, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="RSASSA_PSS_SHA_256")
     assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
+
+
+def test_kms_sign_unknown_algorithm_is_an_enum_validation_error(kms_client):
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=key_id, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="NOT_A_SIGNING_ALGORITHM")
+    error = exc.value.response["Error"]
+    assert error["Code"] == "ValidationException"
+    assert error["Message"].startswith(
+        "1 validation error detected: Value 'NOT_A_SIGNING_ALGORITHM' at 'signingAlgorithm' failed to satisfy "
+        "constraint: Member must satisfy enum value set: [RSASSA_PSS_SHA_256, ")
+
+
+def test_kms_rsa_decrypt_without_algorithm_is_invalid_ciphertext(kms_client):
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    blob = kms_client.encrypt(KeyId=key_id, Plaintext=b"secret", EncryptionAlgorithm="RSAES_OAEP_SHA_256")["CiphertextBlob"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob)
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
+    assert exc.value.response["Error"] == {
+        "Code": "InvalidKeyUsageException", "Message": "Algorithm SYMMETRIC_DEFAULT is incompatible with key spec RSA_2048."}
