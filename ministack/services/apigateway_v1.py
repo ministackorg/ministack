@@ -932,12 +932,13 @@ def rest_api_policy_for_arn(resource_arn):
     return policy, account_id
 
 
-def _anonymous_policy_error(api_id, stage_name, method, path, headers, account_id, region):
-    """ACCESS_DENIED for a call without SigV4 that the REST API's resource policy does not allow."""
+def _anonymous_policy_error(api_id, stage_name, method, path, account_id, region):
+    """ACCESS_DENIED for a call to a method without authorization that the REST API's resource policy does not allow."""
     from ministack.app import AUTH
     from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
-    if not AUTH or _header_ci(headers, "authorization").startswith("AWS4-"):
+    # Such a call is anonymous even when it is signed.
+    if not AUTH:
         return None
     arn = execute_api_arn(region, account_id, api_id, stage_name, method, path)
     policy = (rest_api_policy_for_arn(arn) or ("",))[0]
@@ -1594,6 +1595,25 @@ def authentication_error_response(api_id, stage_name, error, headers, query_para
         return _gateway_error_response(_GatewayError(response_type, error.message, error_type), request)
 
 
+def method_authorization_type(api_id, stage_name, method, path):
+    """The authorizationType of the method a REST API stage serves for this request, or None."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return None
+    segments = [s for s in path.strip("/").split("/") if s]
+    with request_scope(*scope):
+        if stage_name not in _stages_v1.get(api_id, {}):
+            return None
+        resource, _ = _match_resource_tree(api_id, segments)
+        methods = (resource or {}).get("resourceMethods", {})
+        method_obj = methods.get(method) or methods.get("ANY")
+        if not method_obj:
+            resource, _ = _match_greedy_fallback(api_id, segments, method)
+            methods = (resource or {}).get("resourceMethods", {})
+            method_obj = methods.get(method) or methods.get("ANY")
+    return (method_obj.get("authorizationType") or "NONE").upper() if method_obj else None
+
+
 def _arn_matches(pattern, arn):
     """Match an IAM policy Resource against a method ARN, honoring `*`/`?` globs."""
     regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
@@ -1923,7 +1943,7 @@ async def _authorize_request_v1(
     auth_type = (method_obj.get("authorizationType") or "NONE").upper()
     if auth_type in ("", "NONE"):
         return _anonymous_policy_error(
-            api_id, stage_name, method, request_path, headers, owner_account_id, owner_region), None
+            api_id, stage_name, method, request_path, owner_account_id, owner_region), None
     if auth_type == "AWS_IAM":
         # Signatures are verified only under AUTH; here match AWS only to the extent
         # that a request with no Authorization header is rejected as unauthenticated.
