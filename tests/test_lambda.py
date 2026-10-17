@@ -8720,6 +8720,89 @@ exports.handler = (event, ctx, cb) => {{
     assert received.get("body") == "test"
 
 
+@pytest.mark.parametrize("use_ssl", [False, True], ids=["plain", "use_ssl"])
+def test_nodejs_worker_https_call_forms_reach_the_gateway(tmp_path, use_ssl):
+    """Every https.request/https.get form and the SDK stubs reach the gateway, over TLS when its endpoint is https."""
+    import ssl
+    import subprocess
+    from http.server import ThreadingHTTPServer
+
+    seen = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _answer(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append((self.command, self.path, self.headers.get("X-Amz-Target")))
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-amz-json-1.1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_PUT = do_POST = _answer
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    env = {"AWS_ENDPOINT_URL": f"http://127.0.0.1:{port}"}
+    if use_ssl:
+        cert, key = tmp_path / "gw.crt", tmp_path / "gw.key"
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+            "-days", "1", "-subj", "/CN=gateway", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ], check=True, capture_output=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+        # A TLS-only listener, like the gateway under USE_SSL: a plain request fails the handshake.
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        env = {"AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}", "NODE_EXTRA_CA_CERTS": str(cert)}
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    handler_js = f"""\
+const https = require("https");
+const {{ SSMClient, DescribeParametersCommand }} = require("@aws-sdk/client-ssm");
+const base = "https://127.0.0.1:{port}";
+const call = (start) => new Promise((resolve) => {{
+  let req;
+  try {{
+    req = start((res) => {{ res.resume(); res.on("end", () => resolve(res.statusCode)); }});
+  }} catch (e) {{
+    return resolve(e.code || String(e));
+  }}
+  req.on("error", (e) => resolve(e.code || e.message));
+  if (!req.writableEnded) req.end();
+}});
+exports.handler = async () => ({{
+  urlOptions: await call((cb) => https.request(base + "/url-options", {{ method: "PUT" }}, cb)),
+  urlObject: await call((cb) => https.request(new URL(base + "/url-object"), cb)),
+  noPort: await call((cb) => https.request({{ hostname: "127.0.0.1", path: "/no-port", method: "PUT" }}, cb)),
+  port443: await call((cb) => https.request({{ hostname: "127.0.0.1", port: 443, path: "/port-443",
+    method: "PUT" }}, cb)),
+  getUrlOptions: await call((cb) => https.get(base + "/get", {{ headers: {{ "x-probe": "1" }} }}, cb)),
+  awsHost: await call((cb) => https.request({{ hostname: "ssm.us-east-1.amazonaws.com", path: "/aws-host",
+    method: "POST", headers: {{ host: "ssm.us-east-1.amazonaws.com" }} }}, cb)),
+  sdkStub: await new SSMClient({{}}).send(new DescribeParametersCommand({{}}))
+    .then(() => 200, (e) => e.code || String(e)),
+}});
+"""
+    try:
+        result = _run_nodejs_worker(handler_js, env_extra=env)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert result.get("status") == "ok", f"Handler failed: {result}"
+    assert set(result["result"].values()) == {200}, result["result"]
+    assert sorted(seen) == sorted([
+        ("PUT", "/url-options", None), ("GET", "/url-object", None), ("PUT", "/no-port", None),
+        ("PUT", "/port-443", None), ("GET", "/get", None), ("POST", "/aws-host", None),
+        ("POST", "/", "AmazonSSM.DescribeParameters"),
+    ])
+
+
 def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     """End-to-end: a Node.js Lambda using @aws-sdk/client-ssm's
     PutParameterCommand actually creates a parameter on MiniStack's SSM
