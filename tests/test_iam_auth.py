@@ -6086,6 +6086,16 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
      "s3:GetMultiRegionAccessPointRoutes"),
     ("PATCH", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
      "s3:SubmitMultiRegionAccessPointRoutes"),
+    ("GET", "/v20180820/mrap/instances/policy", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/routes", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policystatus", "s3:GetMultiRegionAccessPointPolicyStatus"),
+    ("GET", "/v20180820/mrap/instances/", None),
+    ("GET", "/v20180820/mrap/instances/m1/", None),
+    ("GET", "/v20180820/mrap/instances/m1/policy/", None),
+    ("GET", "/v20180820/mrap/instances/m1/x", None),
+    ("POST", "/v20180820/mrap/instances/m1/policy", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes/", None),
 ])
 def test_s3control_mrap_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action

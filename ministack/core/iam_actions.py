@@ -280,29 +280,23 @@ def s3control_action(method: str, path: str) -> str | None:
 
     from ministack.services import s3
 
-    # Access point actions come from the route the handler serves.
+    # Access point and MRAP instance actions come from the route the handler serves.
     for in_family, route_of in ((s3.is_object_lambda_control_path, s3.object_lambda_control_route),
                                 (s3.is_access_point_control_path, s3.access_point_control_route)):
         if in_family(path):
             route = route_of(path)
             return route[3].get(method) if route else None
+    instances = "/v20180820/mrap/instances"
+    if unquote(path) == instances or unquote(path).startswith(instances + "/"):
+        route = s3.mrap_control_route(path)
+        return route[3].get(method) if route else None
     path = unquote(path).rstrip("/")
     async_prefix = "/v20180820/async-requests/mrap/"
-    instances = "/v20180820/mrap/instances"
     if path.startswith(async_prefix):
         tail = path[len(async_prefix):]
         if method == "POST":
             return _S3CONTROL_MRAP_ASYNC_ACTIONS.get(tail)
         return "s3:DescribeMultiRegionAccessPointOperation" if method == "GET" else None
-    if path == instances:
-        return "s3:ListMultiRegionAccessPoints" if method == "GET" else None
-    if path.startswith(instances + "/"):
-        if path.endswith("/routes"):
-            return {"GET": "s3:GetMultiRegionAccessPointRoutes",
-                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}.get(method)
-        if path.endswith("/policy"):
-            return "s3:GetMultiRegionAccessPointPolicy" if method == "GET" else None
-        return "s3:GetMultiRegionAccessPoint" if method == "GET" else None
     return None
 
 

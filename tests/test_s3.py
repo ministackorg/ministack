@@ -9806,6 +9806,77 @@ def test_s3_mrap_control_read_get_list_policy(s3control_dns, mrap_members):
     assert (err["MultiRegionAccessPointName"], err["AccountId"]) == (names[0], _ACCOUNT)
 
 
+def _mrap_control_raw(method, path, key=("test", "test")):
+    """A SigV4-signed S3 Control request for us-west-2, the path sent as given: status and body."""
+    import http.client
+
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", headers={"x-amz-account-id": _ACCOUNT})
+    req.headers["x-amz-content-sha256"] = hashlib.sha256(b"").hexdigest()
+    S3SigV4Auth(Credentials(*key), "s3", "us-west-2").add_auth(req)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, path, headers=dict(req.headers.items()))
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+_MRAP_ARN_PATH = f"arn%3Aaws%3As3%3A%3A{_ACCOUNT}%3Aaccesspoint/nope.mrap"
+
+
+@pytest.mark.parametrize("method,path,status,fields", [
+    ("POST", "", 405, {"Method": "POST", "ResourceType": "MULTI_REGION_ACCESS_POINTS"}),
+    ("DELETE", "/m1", 405, {"Method": "DELETE", "ResourceType": "MULTI_REGION_ACCESS_POINT"}),
+    ("POST", "/m1/policy", 405, {"Method": "POST", "ResourceType": "GET_MULTI_REGION_ACCESS_POINT_POLICY"}),
+    ("POST", f"/{_MRAP_ARN_PATH}/routes", 405, {"Method": "POST", "ResourceType": "MULTI_REGION_ACCESS_POINT_ROUTES"}),
+    ("GET", "/", 400, {"URI": "mrap/instances/"}),
+    ("GET", "/m1/", 400, {}),
+    ("GET", "//m1", 400, {}),
+    ("GET", "/m1/policy/", 400, {}),
+    ("GET", "/m1/x", 400, {"URI": "mrap/instances/m1/x"}),
+    ("GET", "/m1/policy/x", 400, {}),
+    ("GET", f"/{_MRAP_ARN_PATH}", 400, {}),
+    ("GET", f"/{_MRAP_ARN_PATH}/routes/", 400, {}),
+    ("GET", "/routes", 404, {"MultiRegionAccessPointName": "routes"}),
+    ("GET", "/m1/policystatus", 404, {}),
+])
+def test_s3_mrap_control_unserved_requests(method, path, status, fields):
+    """Unserved methods answer 405, unparsed paths 400 InvalidURI; "routes" alone names an MRAP."""
+    got, data = _mrap_control_raw(method, "/v20180820/mrap/instances" + path)
+    code = {405: "MethodNotAllowed", 400: "InvalidURI", 404: "NoSuchMultiRegionAccessPoint"}[status]
+    assert (got, re.search(rb"<Code>(\w+)</Code>", data).group(1).decode()) == (status, code)
+    for tag, value in fields.items():
+        assert f"<{tag}>{value}</{tag}>".encode() in data
+
+
+@pytest.mark.auth_contract
+def test_s3_mrap_named_policy_needs_the_get_action(auth_enabled, iam_user, s3control_dns, mrap_members):
+    """/v20180820/mrap/instances/policy names an MRAP called "policy"."""
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    assert _mrap_create(ctl, "policy", [use1_bucket, euw1_bucket])["RequestStatus"] == "SUCCEEDED"
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "s3:GetMultiRegionAccessPointPolicy", "Resource": "*"}]}).client(
+            "s3control", region="us-west-2")
+        assert "Policy" in user.get_multi_region_access_point_policy(AccountId=_ACCOUNT, Name="policy")
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                user.get_multi_region_access_point(AccountId=_ACCOUNT, Name="policy")
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        else:
+            assert user.get_multi_region_access_point(AccountId=_ACCOUNT, Name="policy")["AccessPoint"]["Name"] == (
+                "policy")
+    finally:
+        _mrap_delete(ctl, "policy")
+
+
 def test_s3_mrap_control_read_routes(s3control_dns, mrap_members):
     _, use1_bucket, _, euw1_bucket = mrap_members
     ctl, routes_ctl = _regional_client("s3control", "us-west-2"), _regional_client("s3control", "eu-west-1")

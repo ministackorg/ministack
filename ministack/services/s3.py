@@ -9459,6 +9459,37 @@ def _mrap_submit_routes(record: dict, body: bytes) -> tuple:
     return 200, {"Content-Type": "application/xml"}, b""
 
 
+# Each Multi-Region Access Point instance resource, by the segment after the
+# reference (None for the collection): its ResourceType and the IAM action per
+# method. A documented resource MiniStack does not emulate has no ResourceType.
+_MRAP_RESOURCES = {
+    None: ("MULTI_REGION_ACCESS_POINTS", {"GET": "s3:ListMultiRegionAccessPoints"}),
+    "": ("MULTI_REGION_ACCESS_POINT", {"GET": "s3:GetMultiRegionAccessPoint"}),
+    "policy": ("GET_MULTI_REGION_ACCESS_POINT_POLICY", {"GET": "s3:GetMultiRegionAccessPointPolicy"}),
+    "policystatus": (None, {"GET": "s3:GetMultiRegionAccessPointPolicyStatus"}),
+    "routes": ("MULTI_REGION_ACCESS_POINT_ROUTES", {"GET": "s3:GetMultiRegionAccessPointRoutes",
+                                                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}),
+}
+
+
+def mrap_control_route(path: str) -> tuple | None:
+    """``(reference, sub-resource, resource type, IAM actions by method)`` of an MRAP instances path, or None."""
+    rest = url_unquote(path)[len(_MRAP_INSTANCES_PREFIX):]
+    if not rest:
+        ref, sub = "", None
+    elif not rest.startswith("/") or not all(segments := rest[1:].split("/")):
+        return None
+    elif len(segments) > 1 and segments[-1] == "routes":  # routes take the MRAP's ARN, which holds a slash
+        ref, sub = "/".join(segments[:-1]), "routes"
+    elif len(segments) == 1:
+        ref, sub = segments[0], ""
+    elif len(segments) == 2 and segments[1] in ("policy", "policystatus"):
+        ref, sub = segments
+    else:
+        return None
+    return ref, sub, *_MRAP_RESOURCES[sub]
+
+
 def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     """S3 Control's Multi-Region Access Point operations (``/v20180820/mrap/``
     and ``/v20180820/async-requests/mrap/``). Management is served from
@@ -9466,7 +9497,9 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
     without a signing region is let through, as S3's own region check does."""
     signed = _signed_region(headers, query_params)
     decoded = url_unquote(path)
-    is_routes = decoded.startswith(_MRAP_INSTANCES_PREFIX + "/") and decoded.endswith("/routes")
+    is_instances = decoded == _MRAP_INSTANCES_PREFIX or decoded.startswith(_MRAP_INSTANCES_PREFIX + "/")
+    route = mrap_control_route(path) if is_instances else None
+    is_routes = route is not None and route[1] == "routes"
     if signed is not None:
         if is_routes and signed not in _MRAP_ROUTE_REGIONS:
             return _mrap_region_error(path, routes=True)
@@ -9479,12 +9512,13 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
             return _mrap_async(tail, body, signed)
         if method == "GET":
             return _mrap_describe(tail)
-    elif decoded.rstrip("/") == _MRAP_INSTANCES_PREFIX and method == "GET":
-        return _mrap_list(query_params)
-    elif decoded.startswith(_MRAP_INSTANCES_PREFIX + "/"):
-        ref = decoded[len(_MRAP_INSTANCES_PREFIX) + 1:]
-        if is_routes:
-            ref = ref[: -len("/routes")]
+    elif is_instances:
+        if route is None or method not in route[3]:
+            return _control_route_error(method, path, route)
+        ref, sub = route[0], route[1]
+        if sub is None:
+            return _mrap_list(query_params)
+        if sub == "routes":
             if not ref.startswith("arn:"):
                 return s3control_error("InvalidRequest", "Request invalid", 400)
             record = find_mrap(ref)
@@ -9492,18 +9526,17 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
                 return _no_such_mrap(ref.rsplit("/", 1)[-1])
             if method == "GET":
                 return _mrap_get_routes(ref, record)
-            if method == "PATCH":
-                return _mrap_submit_routes(record, body)
-        elif ref.endswith("/policy") and method == "GET":
-            record = find_mrap(ref[: -len("/policy")])
-            return _mrap_policy(record) if record else _no_such_mrap(ref[: -len("/policy")])
-        elif method == "GET":
-            record = find_mrap(ref)
-            if record is None:
-                return _no_such_mrap(ref)
-            out = Element("GetMultiRegionAccessPointResult", xmlns=S3CONTROL_NS)
-            _mrap_report_xml(out, record)
-            return _s3control_response(out)
+            return _mrap_submit_routes(record, body)
+        if route[2] is None:
+            return _no_such_mrap(f"{ref}/{sub}")
+        record = find_mrap(ref)
+        if record is None:
+            return _no_such_mrap(ref)
+        if sub == "policy":
+            return _mrap_policy(record)
+        out = Element("GetMultiRegionAccessPointResult", xmlns=S3CONTROL_NS)
+        _mrap_report_xml(out, record)
+        return _s3control_response(out)
     return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405)
 
 

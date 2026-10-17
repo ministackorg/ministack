@@ -1574,9 +1574,8 @@ def _s3control_mrap_arn(s3, path: str) -> str:
     from ministack.core.responses import get_account_id
 
     account = get_account_id()
-    ref = unquote(path).rstrip("/").removeprefix("/v20180820/mrap/instances").strip("/")
-    ref = ref.removesuffix("/routes").removesuffix("/policy")
-    record = s3.find_mrap(ref) if ref and not path.startswith("/v20180820/async-requests/") else None
+    route = None if path.startswith("/v20180820/async-requests/") else s3.mrap_control_route(path)
+    record = s3.find_mrap(route[0]) if route and route[0] else None
     return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
 
 
