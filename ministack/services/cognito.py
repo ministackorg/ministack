@@ -7287,6 +7287,28 @@ async def handle_oauth2_token(method, path, headers, body, query_params):
 
 # -- /oauth2/userInfo (GET/POST) ---------------------------------------------
 
+def _userinfo_token_error(token: str):
+    """The error_description /oauth2/userInfo answers for a token AWS would not accept, or None."""
+    claims = _token_claims(token)
+    if token.count(".") != 2 or not claims:
+        return "Access token format is not valid"
+    if not isinstance(claims.get("client_id"), str):
+        return "Value of client_id in token claims must be a String"
+    if claims.get("token_use") != "access":
+        return "Access token format is not valid"
+    expired = "Access token is expired or user has globally signed out, disabled, or been deleted"
+    # _access_token_error's checks without the admin scope, which userInfo does not require.
+    if ((_RSA_PRIVATE_KEY is not None and not _signature_valid(token))
+            or not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]
+            or claims.get("origin_jti") in _revoked_tokens):
+        return expired
+    if not isinstance(claims.get("username"), str):
+        return "Value of username in token claims must be a String"
+    pool = _get_pool_unscoped(str(claims.get("iss", "")).rsplit("/", 1)[-1])
+    user = _user_from_token(token, pool) if pool else None
+    return None if user and user.get("Enabled", True) else expired
+
+
 def handle_oauth2_userinfo(method, path, headers, body, query_params):
     """GET or POST /oauth2/userInfo — return user claims from the access token."""
     auth = headers.get("authorization", "")
@@ -7295,6 +7317,13 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
             json.dumps({"error": "invalid_token", "error_description": "Missing Bearer token."}).encode()
 
     token = auth.split(" ", 1)[1].strip()
+    from ministack.app import AUTH
+    error = _userinfo_token_error(token) if AUTH else None
+    if error:
+        iss = _token_claims(token).get("iss")
+        realm = f"realm={iss}, " if isinstance(iss, str) and _get_pool_unscoped(iss.rsplit("/", 1)[-1]) else ""
+        return 401, {"Content-Type": "application/json", "WWW-Authenticate": f"Bearer {realm}error=INVALID_TOKEN"}, \
+            json.dumps({"error": "invalid_token", "error_description": error}).encode()
     # Decode JWT payload
     try:
         parts = token.split(".")

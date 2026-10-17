@@ -5245,6 +5245,114 @@ def test_oauth2_userinfo_missing_token():
         assert e.code == 401
 
 
+def _userinfo(token):
+    """(status, WWW-Authenticate, body) of GET /oauth2/userInfo with *token*."""
+    req = urllib.request.Request(f"{ENDPOINT}/oauth2/userInfo", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.headers.get("WWW-Authenticate"), json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("WWW-Authenticate"), json.loads(e.read())
+
+
+def _userinfo_pool(cognito_idp, *usernames):
+    """A pool with testuser, *usernames* and a public code client; returns (pool id, client id, Hosted UI sign-in)."""
+    pid, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    for name in usernames:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username=name, MessageAction="SUPPRESS")
+        cognito_idp.admin_set_user_password(UserPoolId=pid, Username=name, Password="TestPass1!", Permanent=True)
+
+    def sign_in(username, scope="openid email"):
+        code = _do_login_and_get_code(cognito_idp, client["ClientId"], {"username": username, "scope": scope})
+        status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+            "grant_type": "authorization_code", "code": code, "client_id": client["ClientId"],
+            "redirect_uri": "http://localhost:3000/callback"})
+        assert status == 200, body
+        return json.loads(body)
+
+    return pid, client["ClientId"], sign_in
+
+
+@pytest.mark.auth_contract
+def test_oauth2_userinfo_verifies_the_access_token(auth_enabled, cognito_idp):
+    pid, _, sign_in = _userinfo_pool(cognito_idp, "bob")
+    alice, bob = sign_in("testuser"), sign_in("bob")
+    header, _, signature = alice["access_token"].split(".")
+
+    def own_signature(**changes):
+        claims = {**_decode_jwt_claims(alice["access_token"]), **changes}
+        claims = {k: v for k, v in claims.items() if v is not None}
+        return f"{header}.{base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=')}.{signature}"
+
+    cognito_idp.create_resource_server(UserPoolId=pid, Identifier="api", Name="api",
+                                       Scopes=[{"ScopeName": "read", "ScopeDescription": "read"}])
+    machine = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="m2m", GenerateSecret=True, AllowedOAuthFlows=["client_credentials"],
+        AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]
+    _, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+        "grant_type": "client_credentials", "client_id": machine["ClientId"], "client_secret": machine["ClientSecret"]})
+    realm = f"Bearer realm=https://cognito-idp.us-east-1.amazonaws.com/{pid}, error=INVALID_TOKEN"
+    expired = "Access token is expired or user has globally signed out, disabled, or been deleted"
+    # (token, WWW-Authenticate, error_description with AUTH, status without AUTH)
+    for token, challenge, message, permissive in [
+        ("not-a-token", "Bearer error=INVALID_TOKEN", "Access token format is not valid", 401),
+        (alice["refresh_token"], realm, "Access token format is not valid", 200),
+        (alice["id_token"], realm, "Value of client_id in token claims must be a String", 200),
+        (own_signature(client_id=None), realm, "Value of client_id in token claims must be a String", 200),
+        (own_signature(token_use="id"), realm, "Access token format is not valid", 200),
+        (own_signature(username=None), realm, expired, 200),
+        (f"{header}.{bob['access_token'].split('.')[1]}.{signature}", realm, expired, 200),
+        (json.loads(body)["access_token"], realm, "Value of username in token claims must be a String", 401),
+    ]:
+        if auth_enabled:
+            assert _userinfo(token) == (401, challenge, {"error": "invalid_token", "error_description": message})
+        else:
+            assert _userinfo(token)[0] == permissive
+    status, _, claims = _userinfo(alice["access_token"])
+    assert (status, claims["username"]) == (200, "testuser")
+
+
+@pytest.mark.auth_contract
+def test_oauth2_userinfo_refuses_revoked_tokens_and_disabled_users(auth_enabled, cognito_idp):
+    pid, cid, sign_in = _userinfo_pool(cognito_idp, "bob", "carol", "dave")
+    revoked, kept = sign_in("testuser"), sign_in("testuser")
+    cognito_idp.revoke_token(ClientId=cid, Token=revoked["refresh_token"])
+    assert _userinfo(kept["access_token"])[0] == 200
+    signed_out, disabled, deleted = (sign_in(name)["access_token"] for name in ("carol", "bob", "dave"))
+    cognito_idp.admin_user_global_sign_out(UserPoolId=pid, Username="carol")
+    cognito_idp.admin_disable_user(UserPoolId=pid, Username="bob")
+    cognito_idp.admin_delete_user(UserPoolId=pid, Username="dave")
+    generic = "Access token is expired or user has globally signed out, disabled, or been deleted"
+    for token, permissive in ((revoked["access_token"], 200), (signed_out, 200), (disabled, 200), (deleted, 401)):
+        if auth_enabled:
+            assert _userinfo(token)[::2] == (401, {"error": "invalid_token", "error_description": generic})
+        else:
+            assert _userinfo(token)[0] == permissive
+    assert _userinfo(kept["access_token"])[0] == 200
+
+
+def _userinfo_in_process(mod, token):
+    """(status, WWW-Authenticate, body) of /oauth2/userInfo called in process."""
+    status, headers, body = mod.handle_oauth2_userinfo(
+        "GET", "/oauth2/userInfo", {"authorization": f"Bearer {token}"}, b"", {})
+    return status, headers.get("WWW-Authenticate"), json.loads(body)
+
+
+def test_oauth2_userinfo_refuses_an_expired_token_under_auth(monkeypatch):
+    mod, call = _idp_in_process(monkeypatch, auth=True)
+    _, _, sign_in = _password_client_with_users(
+        call, "carol", AccessTokenValidity=5, TokenValidityUnits={"AccessToken": "minutes"})
+    issued = time.time() - 301
+    with monkeypatch.context() as m:
+        m.setattr(mod.time, "time", lambda: issued)
+        expired = sign_in("carol")["AccessToken"]
+    assert _userinfo_in_process(mod, sign_in("carol")["AccessToken"])[0] == 200
+    assert _userinfo_in_process(mod, expired)[2] == {
+        "error": "invalid_token",
+        "error_description": "Access token is expired or user has globally signed out, disabled, or been deleted",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests — /logout
 # ---------------------------------------------------------------------------

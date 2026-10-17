@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `/oauth2/userInfo` verifies the access token under `AUTH=true`** — the endpoint returned the user's attributes for any JWT carrying a user's `sub`, including an ID token, a token with an altered payload, a revoked or expired token and the token of a disabled or deleted user; with `AUTH=true` it now answers 401 `invalid_token` with AWS's `error_description` and `WWW-Authenticate` for each case. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
