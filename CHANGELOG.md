@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudTrail — `RecursiveLogging` on trails** — `CreateTrail` and `UpdateTrail` ignored `RecursiveLogging` and no trail response carried it; trails now store it (default `true`, kept by an `UpdateTrail` that leaves it out) and return it from `CreateTrail`, `UpdateTrail`, `GetTrail` and `DescribeTrails`. Contributed by @iot-rocket.
+
 ## [1.5.29] — 2026-10-17
 
 ### Added
