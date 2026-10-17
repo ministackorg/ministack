@@ -1881,12 +1881,22 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
     which AWS authorizes under that separate action.
     """
     from ministack.core.arn import execute_api_arn
+    from ministack.core.iam_evaluator import AuthError
     from ministack.core.responses import get_account_id
+    from ministack.core.sigv4 import foreign_authorization_failure
 
+    authorization = _execute_api_authorization_type(
+        api_id, stage, method, execute_path) if AUTH and iam_action == "execute-api:Invoke" else None
     # Only an AWS_IAM method reads the caller's signature and policies.
-    if AUTH and iam_action == "execute-api:Invoke" and _execute_api_authorization_type(
-            api_id, stage, method, execute_path) not in (None, "AWS_IAM"):
+    if authorization not in (None, "AWS_IAM"):
         return None
+    header = headers.get("authorization", "")
+    if authorization == "AWS_IAM" and header and not header.startswith("AWS4-HMAC-SHA256"):
+        # A REST method with AWS_IAM refuses an Authorization header that is not SigV4.
+        apigw_v1 = _get_module("apigateway_v1")
+        refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
+        if refused:
+            return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
     return _enforce_data_plane(
         "apigateway", iam_action, headers, query_params, "",
         resource_arn=execute_api_arn(

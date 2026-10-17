@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **API Gateway — `AWS_IAM` methods refuse an `Authorization` header that is not SigV4** — under `AUTH=true` a REST API method with `AWS_IAM` authorization served a bearer token or an algorithm in lower case, and answered the SigV4a algorithm name without a signed `x-amz-region-set` or an unknown `AWS4-` algorithm with `UnrecognizedClientException`; it now answers 403 `IncompleteSignatureException` with API Gateway's message for each, while a method without `AWS_IAM` still serves such calls. Contributed by @iot-rocket.
+
 ## [1.5.31] — 2026-10-21
 
 ### Added
