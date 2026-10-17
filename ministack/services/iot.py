@@ -95,7 +95,7 @@ from urllib.parse import parse_qs, parse_qsl
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.iam_evaluator import EvalContext, evaluate, parse_policy_document
+from ministack.core.iam_evaluator import AuthError, EvalContext, ResolvedCredential, evaluate, parse_policy_document
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -8927,6 +8927,17 @@ def _mqtt_policy_allows(
     return evaluate(ctx, [_parsed_iot_policy(doc, variables) for doc in documents]).decision == "Allow"
 
 
+def _mqtt_iam_allows(
+    account_id: str, region: str, credential: tuple[str, str], action: str, resource: str
+) -> bool:
+    """Whether the IAM policies of the key that signed a WebSocket session allow ``action`` on ``resource``."""
+    from ministack.core.iam_evaluator import enforce
+
+    access_key_id, key_account = credential
+    with request_scope(key_account, region):
+        return enforce(access_key_id, action, "iot", region, f"arn:aws:iot:{region}:{account_id}:{resource}") is None
+
+
 # ---------------------------------------------------------------------------
 # Broker public API (consumed by iot_data.py and handle_websocket)
 # ---------------------------------------------------------------------------
@@ -10693,6 +10704,9 @@ class _WSSession:
         self.certificate_id: str | None = None
         # The template of a provisioning claim certificate, which has a policy of its own.
         self.provisioning_template: str | None = None
+        # The access key and account of an IAM principal that signed a WebSocket
+        # session; its IAM policies are evaluated under AUTH=true.
+        self.iam_credential: tuple[str, str] | None = None
         self._policy_context: dict = {}
 
     def disconnect_reason(self) -> str:
@@ -10701,7 +10715,7 @@ class _WSSession:
         Only the reasons the broker can actually tell apart are ever reported: a
         DISCONNECT packet (``CLIENT_INITIATED_DISCONNECT``), a takeover by a
         second connection using the same client id (``DUPLICATE_CLIENTID``),
-        a packet the certificate's policies refuse (``CLIENT_ERROR`` on 3.1.1,
+        a packet the session's policies refuse (``CLIENT_ERROR`` on 3.1.1,
         ``AUTH_ERROR`` on MQTT 5), and everything else — a transport that went
         away (``CONNECTION_LOST``).
         AWS's remaining reasons name machinery this broker does not have
@@ -10898,13 +10912,15 @@ class _WSSession:
             )
 
     def _evaluates_policies(self) -> bool:
-        """Whether this session is held to its certificate's IoT policies (AUTH=true only)."""
+        """Whether this session is held to its certificate's IoT policies or its signer's IAM policies (AUTH=true)."""
         from ministack import app
 
-        return app.AUTH and self.certificate_id is not None
+        return app.AUTH and (self.certificate_id is not None or self.iam_credential is not None)
 
     def _policy_allows(self, action: str, resource: str) -> bool:
         """Whether this session may do ``action`` on ``resource``."""
+        if self._evaluates_policies() and self.iam_credential is not None:
+            return _mqtt_iam_allows(self.account_id, self.region, self.iam_credential, action, resource)
         return not self._evaluates_policies() or _mqtt_policy_allows(
             self.account_id,
             self.region,
@@ -11102,7 +11118,7 @@ class _WSSession:
                 self._will_retain = False
                 self._will_properties = b""
 
-            if self._evaluates_policies():
+            if self._evaluates_policies() and self.certificate_id is not None:
                 self._policy_context = _mqtt_policy_context(
                     self.account_id, self.region, self.certificate_id, client_id
                 )
@@ -11474,6 +11490,25 @@ async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bo
             return False
 
 
+def _ws_handshake_check(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Under AUTH=true, the upgrade's verified IAM credential or the ``AuthError`` refusing it; else None."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import authenticate_handshake
+
+    return authenticate_handshake(scope) if AUTH else None
+
+
+async def _refuse_ws_handshake(scope: dict, send) -> None:
+    """Answer a refused upgrade with 403 and a trace id, the device gateway's answer to any credential failure."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": "Forbidden", "traceId": str(uuid.uuid4())}, separators=(",", ":")).encode()
+    await send({"type": "websocket.http.response.start", "status": 403,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
 async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
@@ -11491,6 +11526,10 @@ async def handle_websocket(
             sub_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
         except UnicodeDecodeError:
             sub_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+    checked = _ws_handshake_check(scope)
+    if isinstance(checked, AuthError):
+        await _refuse_ws_handshake(scope, send)
+        return
     requested = sub_headers.get("sec-websocket-protocol", "")
     chosen = None
     for proto in [p.strip() for p in requested.split(",") if p.strip()]:
@@ -11509,6 +11548,8 @@ async def handle_websocket(
     query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
     principal = _caller_principal(extract_access_key_id(sub_headers, query))
     session = _WSSession(send, account_id, region, principal)
+    if checked is not None:
+        session.iam_credential = (checked.access_key_id, checked.account_id)
     max_buffer = _max_frame_buffer_bytes()
 
     try:
