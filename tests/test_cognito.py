@@ -6106,6 +6106,33 @@ def test_cognito_username_attributes_admin_create_user_username_is_sub(cognito_i
     assert cognito_idp.get_user(AccessToken=tokens["AccessToken"])["Username"] == sub
 
 
+def test_cognito_id_token_verified_flags_are_booleans(cognito_idp):
+    """email_verified and phone_number_verified are JSON booleans in the ID token, as on AWS (#2294)."""
+    pid = cognito_idp.create_user_pool(PoolName="IdTokenVerifiedFlagsPool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="verified", MessageAction="SUPPRESS",
+        UserAttributes=[
+            {"Name": "email", "Value": "verified@example.com"},
+            {"Name": "email_verified", "Value": "true"},
+            {"Name": "phone_number", "Value": "+15555550100"},
+            {"Name": "phone_number_verified", "Value": "false"},
+        ],
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="verified", Password="StrongPass1!", Permanent=True,
+    )
+    tokens = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "verified", "PASSWORD": "StrongPass1!"},
+    )["AuthenticationResult"]
+    claims = _decode_jwt_claims(tokens["IdToken"])
+    assert claims["email_verified"] is True
+    assert claims["phone_number_verified"] is False
+
+
 def test_cognito_username_attributes_sign_up_username_is_sub(cognito_idp):
     """SignUp in a UsernameAttributes pool stores the email as an alias and the sub as Username."""
     pid = cognito_idp.create_user_pool(
