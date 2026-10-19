@@ -208,6 +208,27 @@ def test_appsync_graphql_on_an_event_api_host_is_not_found():
         west.delete_api(apiId=api["apiId"])
 
 
+def test_appsync_graphql_on_an_event_api_host_names_its_error_type():
+    west = _client("us-west-2")
+    mode = [{"authType": "API_KEY"}]
+    api = west.create_api(name="host-events-type", eventConfig={
+        "authProviders": mode, "connectionAuthModes": mode,
+        "defaultPublishAuthModes": mode, "defaultSubscribeAuthModes": mode,
+    })["api"]
+    key = west.create_api_key(apiId=api["apiId"])["apiKey"]["id"]
+    req = urllib.request.Request(f"{_ENDPOINT}/graphql", data=b'{"query": "{ __typename }"}', method="POST", headers={
+        "Host": f"{api['apiId']}.appsync-api.us-west-2.{_ENDPOINT_NETLOC}",
+        "Content-Type": "application/json", "x-api-key": key})
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 404
+        assert exc.value.headers["x-amzn-ErrorType"] == "ResourceNotFoundException"
+        assert exc.value.headers["Content-Type"] == "application/json"
+    finally:
+        west.delete_api(apiId=api["apiId"])
+
+
 def test_appsync_graphql_honors_dynamodb_data_source_region():
     east_ddb = boto3.client(
         "dynamodb",
@@ -650,6 +671,50 @@ def test_appsync_graphql_empty_query():
         assert False, "Should have failed"
     except urllib.error.HTTPError as e:
         assert e.code == 400
+
+
+def _graphql_raw(api_id, body, headers=None):
+    """POST raw bytes to an API's GraphQL endpoint; return status, headers and decoded body."""
+    req = urllib.request.Request(
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=body, method="POST",
+        headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.headers, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, json.loads(e.read())
+
+
+@pytest.mark.parametrize("body, message", [
+    (b"{not json", "Invalid JSON payload in GraphQLAuth POST request."),
+    (b'[{"query": "{ hello }"}]', "Invalid JSON payload in GraphQLAuth POST request."),
+    (b'{"variables": {}}', "Invalid request, `query` can't be null."),
+    (b'{"query": ""}', "Invalid request, `query` can't be empty."),
+    (b'{"query": "{ hello "}', "Unable to parse GraphQL query."),
+])
+def test_appsync_graphql_malformed_request_refused(appsync, body, message):
+    api_id = appsync.create_graphql_api(name="gql-malformed", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    appsync.start_schema_creation(apiId=api_id, definition=b"type Query { hello: String }")
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    try:
+        status, headers, doc = _graphql_raw(api_id, body, {"x-api-key": key})
+        assert status == 400
+        assert headers["x-amzn-ErrorType"] == "MalformedHttpRequestException"
+        assert headers["Content-Type"] == "application/json"
+        assert doc == {"errors": [{"errorType": "MalformedHttpRequestException", "message": message}]}
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_refusal_names_its_error_type(appsync):
+    api_id = appsync.create_graphql_api(name="gql-unauth", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    try:
+        status, headers, doc = _graphql_raw(api_id, b'{"query": "{ hello }"}')
+        assert status == 401
+        assert headers["x-amzn-ErrorType"] == "UnauthorizedException"
+        assert doc["errors"][0]["errorType"] == "UnauthorizedException"
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
 
 
 # ---------------------------------------------------------------------------

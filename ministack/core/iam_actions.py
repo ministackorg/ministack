@@ -1614,6 +1614,12 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
             topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
+        # The tagging calls authorize on the resource they name in resourceArn,
+        # read from where the handler reads it: the body of a POST, the query of a GET.
+        if parts in (["tags"], ["untag"]):
+            arn = (_safe_json_field(body, "resourceArn") if method == "POST"
+                   else _query_param(query_params, "resourceArn"))
+            return arn if isinstance(arn, str) and arn else "*"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -2109,7 +2115,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
-        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
+        # IoT names the resource, "*" for an action that takes none.
+        on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
     if code in _AUTH_FAILURES:

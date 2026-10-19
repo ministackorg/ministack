@@ -2386,6 +2386,26 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/jobs", {}, b"", {}, "us-east-1", "123") == "*"
 
+    def test_iot_tagging_calls_authorize_on_the_named_resource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        group = "arn:aws:iot:us-east-1:123:thinggroup/fleet"
+        tag = json.dumps({"resourceArn": group, "tags": [{"Key": "k", "Value": "v"}]}).encode()
+        untag = json.dumps({"resourceArn": group, "tagKeys": ["k"]}).encode()
+        assert extract_resource_arn("iot", "POST", "/tags", {}, tag, {}, "us-east-1", "123") == group
+        assert extract_resource_arn("iot", "POST", "/untag", {}, untag, {}, "us-east-1", "123") == group
+        assert extract_resource_arn(
+            "iot", "GET", "/tags", {}, b"", {"resourceArn": [group]}, "us-east-1", "123"
+        ) == group
+        assert extract_resource_arn("iot", "GET", "/tags", {}, b"", {}, "us-east-1", "123") == "*"
+        # Only where the handler reads it: a second resourceArn elsewhere is not the target.
+        other = {"resourceArn": ["arn:aws:iot:us-east-1:123:thinggroup/other"]}
+        assert extract_resource_arn("iot", "POST", "/tags", {}, tag, other, "us-east-1", "123") == group
+        assert extract_resource_arn(
+            "iot", "GET", "/tags", {}, tag, other, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:thinggroup/other"
+        bad = json.dumps({"resourceArn": [group]}).encode()
+        assert extract_resource_arn("iot", "POST", "/untag", {}, bad, {}, "us-east-1", "123") == "*"
+
     def test_iot_job_policy_from_the_cdk_actually_allows_the_call(self):
         """The two halves together, which is where this showed up. The CDK's
         AwsCustomResource emits exactly this policy for an IoT job, and every
