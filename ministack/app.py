@@ -2293,6 +2293,9 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
+        upload_error = _get_module("s3").validate_upload_request(method, vhost_path, headers, query_params)
+        if upload_error is not None:
+            return upload_error
         from ministack.core.iam_actions import (
             _s3_action,
             extract_resource_arn,
@@ -2350,9 +2353,11 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
         headers["Access-Control-Allow-Origin"] = "*"
     # An API Gateway gateway response already carries the id it rendered.
     request_id = headers.setdefault("x-amzn-requestid", request_id)
-    headers["x-amz-request-id"] = request_id
     if include_s3_id:
-        headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
+        headers.setdefault("x-amz-request-id", request_id)
+        headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        headers["x-amz-request-id"] = request_id
     return status, headers, body
 
 

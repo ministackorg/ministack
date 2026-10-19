@@ -4941,11 +4941,12 @@ class TestCredentialErrors:
 def user_key(monkeypatch):
     """An IAM user allowed everything, created through the app under AUTH=true."""
     from ministack import app as app_mod
+    from ministack.services import iam as iam_svc
 
     monkeypatch.setattr(app_mod, "AUTH", True)
     iam = _local_client("iam")
     name = f"signer-{time.time_ns()}"
-    iam.create_user(UserName=name)
+    user = iam.create_user(UserName=name)["User"]
     iam.put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps(
         {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
     key = iam.create_access_key(UserName=name)["AccessKey"]
@@ -4953,6 +4954,8 @@ def user_key(monkeypatch):
     iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
     iam.delete_user_policy(UserName=name, PolicyName="all")
     iam.delete_user(UserName=name)
+    # DeleteUserPolicy leaves an empty map after its last policy is deleted.
+    iam_svc._user_inline_policies.pop_scoped(user["Arn"].split(":")[4], None, name, None)
 
 
 def _chunked_put(key, secret, url, data, *, bad_chunk=False):
@@ -4990,6 +4993,254 @@ def _chunked_put(key, secret, url, data, *, bad_chunk=False):
         signature = "0" * 64 if bad_chunk and chunk else previous
         body += f"{len(chunk):x};chunk-signature={signature}\r\n".encode() + chunk + b"\r\n"
     return _asgi_send(AWSRequest(method="PUT", url=url, headers=headers, data=body).prepare())
+
+
+class TestS3UploadErrorParity:
+    """HTTP observations from AWS.Tools.S3 5.0.318, Osaka, 2026-10-16.
+
+    Fixed messages, statuses and XML child order were captured on real AWS
+    using path addressing and MaxErrorRetry=0, with Tokyo as the wrong region.
+    These tests replay the observations locally; they do not contact AWS.
+    Live identifiers are omitted; signing diagnostics use synthetic credentials.
+    """
+
+    @pytest.fixture
+    def upload_bucket(self, user_key):
+        bucket = f"upload-errors-{time.time_ns()}"
+        root = _local_client("s3")
+        root.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "ap-northeast-3"})
+        yield bucket
+        root.delete_bucket(Bucket=bucket)
+
+    @staticmethod
+    def upload(bucket, credentials, *, endpoint_region="ap-northeast-3", region="ap-northeast-3",
+               virtual=False, host=None):
+        from urllib.parse import quote
+
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        host = host or f"s3.{endpoint_region}.localhost:4566"
+        path = "/probe.txt" if virtual else f"/{quote(bucket)}/probe.txt"
+        host = f"{bucket}.{host}" if virtual else host
+        request = AWSRequest(method="PUT", url=f"http://{host}{path}", data=b"probe")
+        S3SigV4Auth(Credentials(*credentials), "s3", region).add_auth(request)
+        return _asgi_send(request.prepare())
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    @pytest.mark.parametrize("case,status,code,message,children", [
+        (
+            "invalid-bucket-name", 400, "InvalidBucketName", "The specified bucket is not valid.",
+            ["Code", "Message", "BucketName", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-regional-endpoint", 301, "PermanentRedirect",
+            "The bucket you are attempting to access must be addressed using the specified endpoint. "
+            "Please send all future requests to this endpoint.",
+            ["Code", "Message", "Endpoint", "Bucket", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-signing-region", 400, "AuthorizationHeaderMalformed",
+            "The authorization header is malformed; the region 'ap-northeast-1' is wrong; expecting 'ap-northeast-3'",
+            ["Code", "Message", "Region", "RequestId", "HostId"],
+        ),
+        (
+            "unknown-access-key", 403, "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            ["Code", "Message", "AWSAccessKeyId", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-secret", 403, "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature you provided. "
+            "Check your key and signing method.",
+            ["Code", "Message", "AWSAccessKeyId", "StringToSign", "SignatureProvided", "StringToSignBytes",
+             "CanonicalRequest", "CanonicalRequestBytes", "RequestId", "HostId"],
+        ),
+        (
+            "missing-bucket", 404, "NoSuchBucket", "The specified bucket does not exist",
+            ["Code", "Message", "BucketName", "RequestId", "HostId"],
+        ),
+    ])
+    def test_observed_error_envelopes(self, user_key, upload_bucket, case, status, code, message, children, virtual):
+        import base64
+        import re
+        from xml.etree.ElementTree import fromstring
+
+        if case == "invalid-bucket-name" and virtual:
+            pytest.skip("Invalid bucket syntax was observed using path addressing")
+        bucket, credentials, options = upload_bucket, user_key, {"virtual": virtual}
+        if case == "invalid-bucket-name":
+            bucket, credentials = "invalid bucket", ("AKIAUNKNOWNKEY000001", "wrong")
+        elif case == "wrong-regional-endpoint":
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            options.update(endpoint_region="ap-northeast-1", region="ap-northeast-1")
+        elif case == "wrong-signing-region":
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            options["region"] = "ap-northeast-1"
+        elif case == "unknown-access-key":
+            bucket, credentials = "missing-upload-bucket", ("AKIAUNKNOWNKEY000001", "wrong")
+        elif case == "wrong-secret":
+            bucket, credentials = "missing-upload-bucket", (user_key[0], "wrong")
+        elif case == "missing-bucket":
+            bucket = "missing-upload-bucket"
+        response = self.upload(bucket, credentials, **options)
+        error = fromstring(response.content)
+        assert response.status_code == status
+        assert error.findtext("Code") == code
+        assert error.findtext("Message") == message
+        assert [child.tag for child in error] == children
+        assert response.headers["content-type"] == "application/xml"
+        assert error.findtext("RequestId") == response.headers["x-amz-request-id"]
+        assert re.fullmatch(r"[A-Z0-9]{16}", error.findtext("RequestId"))
+        assert error.findtext("HostId") == response.headers["x-amz-id-2"]
+        assert len(base64.b64decode(error.findtext("HostId"), validate=True)) >= 48
+        assert "location" not in response.headers
+        if case == "wrong-regional-endpoint":
+            assert response.headers["x-amz-bucket-region"] == "ap-northeast-3"
+            assert error.findtext("Endpoint") == f"{bucket}.s3.ap-northeast-3.localhost:4566"
+            assert error.findtext("Bucket") == bucket
+        else:
+            assert "x-amz-bucket-region" not in response.headers
+        if case in {"invalid-bucket-name", "missing-bucket"}:
+            assert error.findtext("BucketName") == bucket
+        if case == "wrong-signing-region":
+            assert error.findtext("Region") == "ap-northeast-3"
+        if case in {"unknown-access-key", "wrong-secret"}:
+            assert error.findtext("AWSAccessKeyId") == credentials[0]
+        if case == "wrong-secret":
+            import hashlib
+
+            from botocore.auth import S3SigV4Auth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+
+            for name in ("CanonicalRequest", "StringToSign"):
+                assert bytes.fromhex(error.findtext(name + "Bytes")).decode() == error.findtext(name)
+            signed_path = "/probe.txt" if virtual else f"/{bucket}/probe.txt"
+            assert error.findtext("CanonicalRequest").startswith(f"PUT\n{signed_path}\n")
+            document = error.findtext("StringToSign")
+            assert document.splitlines()[-1] == hashlib.sha256(error.findtext("CanonicalRequest").encode()).hexdigest()
+            request = AWSRequest()
+            request.context["timestamp"] = document.splitlines()[1]
+            signer = S3SigV4Auth(Credentials(*credentials), "s3", "ap-northeast-3")
+            assert signer.signature(document, request) == error.findtext("SignatureProvided")
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    @pytest.mark.parametrize("missing", [False, True])
+    @pytest.mark.parametrize("credential_kind", ["unknown", "wrong-secret", "valid"])
+    @pytest.mark.parametrize("endpoint_region,region", [
+        ("ap-northeast-3", "ap-northeast-3"),
+        ("ap-northeast-1", "ap-northeast-1"),
+        ("ap-northeast-3", "ap-northeast-1"),
+        ("ap-northeast-1", "ap-northeast-3"),
+    ])
+    def test_combined_failures(self, user_key, upload_bucket, virtual, missing, credential_kind,
+                               endpoint_region, region):
+        from xml.etree.ElementTree import fromstring
+
+        bucket = "missing-upload-bucket" if missing else upload_bucket
+        credentials = {"unknown": ("AKIAUNKNOWNKEY000001", "wrong"),
+                       "wrong-secret": (user_key[0], "wrong"), "valid": user_key}[credential_kind]
+        if not missing and endpoint_region != "ap-northeast-3":
+            expected = (301, "PermanentRedirect")
+        elif region != endpoint_region:
+            expected = (400, "AuthorizationHeaderMalformed")
+        elif credential_kind == "unknown":
+            expected = (403, "InvalidAccessKeyId")
+        elif credential_kind == "wrong-secret":
+            expected = (403, "SignatureDoesNotMatch")
+        elif missing:
+            expected = (404, "NoSuchBucket")
+        else:
+            expected = (200, None)
+        response = self.upload(bucket, credentials, virtual=virtual, endpoint_region=endpoint_region, region=region)
+        try:
+            code = fromstring(response.content).findtext("Code") if response.status_code != 200 else None
+            assert (response.status_code, code) == expected
+        finally:
+            if response.status_code == 200:
+                _local_client("s3").delete_object(Bucket=bucket, Key="probe.txt")
+
+    def test_invalid_name_precedes_scope_and_credentials(self, user_key):
+        from xml.etree.ElementTree import fromstring
+
+        response = self.upload("invalid bucket", ("AKIAUNKNOWNKEY000001", "wrong"), region="ap-northeast-1")
+        assert response.status_code == 400
+        assert fromstring(response.content).findtext("Code") == "InvalidBucketName"
+
+    @pytest.mark.parametrize("mode", [
+        "auth-disabled", "auth-disabled-wrong-region", "reserved-root", "bare-endpoint-wrong-region",
+    ])
+    def test_auth_modes_and_bare_endpoint(self, monkeypatch, user_key, upload_bucket, mode):
+        from ministack import app as app_mod
+
+        credentials, options = user_key, {}
+        if mode in {"auth-disabled", "auth-disabled-wrong-region"}:
+            monkeypatch.setattr(app_mod, "AUTH", False)
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            if mode == "auth-disabled-wrong-region":
+                options.update(endpoint_region="ap-northeast-1", region="ap-northeast-1")
+        elif mode == "reserved-root":
+            credentials = ("test", "any-secret")
+        else:
+            options.update(host="localhost:4566", region="ap-northeast-1")
+        response = self.upload(upload_bucket, credentials, **options)
+        try:
+            if mode in {"auth-disabled-wrong-region", "bare-endpoint-wrong-region"}:
+                from xml.etree.ElementTree import fromstring
+
+                assert response.status_code == 301
+                assert fromstring(response.content).findtext("Code") == "PermanentRedirect"
+                assert response.headers["x-amz-bucket-region"] == "ap-northeast-3"
+            else:
+                assert response.status_code == 200
+        finally:
+            _local_client("s3").delete_object(Bucket=upload_bucket, Key="probe.txt")
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    def test_policy_denial_still_applies(self, user_key, upload_bucket, virtual):
+        from ministack.services import iam as iam_svc
+
+        name = iam_svc._access_keys[user_key[0]]["UserName"]
+        iam = _local_client("iam")
+        iam.put_user_policy(UserName=name, PolicyName="deny-upload", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*"}],
+        }))
+        try:
+            assert self.upload(upload_bucket, user_key, virtual=virtual).status_code == 403
+        finally:
+            iam.delete_user_policy(UserName=name, PolicyName="deny-upload")
+
+    def test_missing_bucket_after_authentication_before_policy(self, user_key, upload_bucket):
+        from xml.etree.ElementTree import fromstring
+
+        from ministack.services import iam as iam_svc
+
+        name = iam_svc._access_keys[user_key[0]]["UserName"]
+        _local_client("iam").put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:PutObject",
+                "Resource": f"arn:aws:s3:::{upload_bucket}/*"}],
+        }))
+        response = self.upload("missing-upload-bucket", user_key)
+        assert response.status_code == 404
+        assert fromstring(response.content).findtext("Code") == "NoSuchBucket"
+
+    def test_foreign_bucket_routing_does_not_grant_access(self, user_key):
+        from xml.etree.ElementTree import fromstring
+
+        owner = _local_client("s3", "333333333333", "root-secret")
+        bucket = f"foreign-upload-{time.time_ns()}"
+        owner.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "ap-northeast-3"})
+        try:
+            response = self.upload(bucket, ("AKIAUNKNOWNKEY000001", "wrong"), endpoint_region="ap-northeast-1")
+            assert response.status_code == 301
+            assert fromstring(response.content).findtext("Code") == "PermanentRedirect"
+            response = self.upload(bucket, user_key)
+            assert response.status_code == 403
+            assert fromstring(response.content).findtext("Code") == "AccessDenied"
+        finally:
+            owner.delete_bucket(Bucket=bucket)
 
 
 class TestHeaderSignatures:

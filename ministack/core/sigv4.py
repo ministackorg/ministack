@@ -285,9 +285,8 @@ def _remove_dot_segments(path: str) -> str:
 _cached_signing_key = functools.lru_cache(maxsize=256)(derive_signing_key)
 
 
-def header_signature_failure(
+def header_signing_documents(
     signature: HeaderSignature,
-    secret: str,
     method: str,
     raw_path: str,
     query_params: Mapping[str, Any],
@@ -295,13 +294,8 @@ def header_signature_failure(
     body: bytes,
     *,
     presigned: bool = False,
-    explain: bool = False,
-) -> tuple[str, str] | None:
-    """Recompute a header (or, ``presigned``, query-string) signature; S3 signs its path as sent, other services
-    the normalized path encoded again."""
-    if signature.date_stamp != signature.amz_date[:8]:
-        return "CredentialDateMismatch", (
-            "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ")
+) -> tuple[str, str]:
+    """The canonical request and string to sign, also used in S3 signature errors."""
     path = raw_path if signature.service == "s3" else uri_encode(_remove_dot_segments(raw_path), encode_slash=False)
     payload_hash = headers.get("x-amz-content-sha256") or hashlib.sha256(body).hexdigest()
     excluded = ("x-amz-signature",) if presigned else ()
@@ -315,6 +309,31 @@ def header_signature_failure(
     string_to_sign = build_string_to_sign(
         signature.amz_date, signature.date_stamp, signature.region, signature.service, canonical_request
     )
+    return canonical_request, string_to_sign
+
+
+def header_signature_failure(
+    signature: HeaderSignature,
+    secret: str,
+    method: str,
+    raw_path: str,
+    query_params: Mapping[str, Any],
+    headers: Mapping[str, Any],
+    body: bytes,
+    *,
+    presigned: bool = False,
+) -> tuple[str, str] | None:
+    """Recompute a header (or, ``presigned``, query-string) signature; S3 signs its path as sent, other services
+    the normalized path encoded again."""
+    if signature.date_stamp != signature.amz_date[:8]:
+        return "CredentialDateMismatch", (
+            "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ")
+    _, string_to_sign = header_signing_documents(
+        signature, method, raw_path, query_params, headers, body, presigned=presigned,
+    )
+    # Only an explicit streaming marker requires chunk verification; an absent
+    # header's body hash was already computed in header_signing_documents.
+    payload_hash = headers.get("x-amz-content-sha256") or ""
     key = _cached_signing_key(secret, signature.date_stamp, signature.region, signature.service)
     computed = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     if not signatures_match(computed, signature.signature) or (

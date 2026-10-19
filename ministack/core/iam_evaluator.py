@@ -86,6 +86,7 @@ class AuthError:
     """Authentication failure (before policy evaluation)."""
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
+    details: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

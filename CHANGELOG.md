@@ -36,6 +36,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Auth — requests that map to no IAM action are authenticated** — under `AUTH=true` a request MiniStack maps to no IAM action (SES v2, RDS Data, S3 Control, or a service MiniStack does not implement such as X-Ray) was served with a wrong secret, an unknown key, a session key without its token or a stale signature; it now answers the credential error AWS sends for the service, for example `InvalidSignatureException` 403 from SES v2 and RDS Data and `SignatureDoesNotMatch` 403 from S3 Control. Contributed by @iot-rocket.
+- **S3 upload errors under `AUTH=true`** — ordinary header-signed `PutObject` requests now check invalid bucket names, regional endpoint routing and signing regions before credentials, and missing buckets after authentication, matching observed AWS error precedence. The six upload errors include AWS's fixed messages, XML detail fields and matching request identifiers. Pre-authentication regional endpoint checks use `s3.<region>.<host>` hosts. Reserved root credentials and `AUTH=false` keep their existing authentication behavior; bucket home-region checks still apply.
 
 ## [1.5.29] — 2026-10-17
 
