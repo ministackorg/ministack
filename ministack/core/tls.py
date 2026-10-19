@@ -145,7 +145,7 @@ def trust_gateway_cert(env: dict) -> None:
     env.setdefault("NODE_EXTRA_CA_CERTS", cert_path)
     bundle = ca_bundle_path(cert_path)
     if bundle:
-        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
             env.setdefault(var, bundle)
 
 

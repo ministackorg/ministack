@@ -2539,8 +2539,16 @@ def _validate_iam_identity_tag_keys(resource_type, tags):
         raise ValueError(_iam.DUPLICATE_IDENTITY_TAG_KEYS)
 
 
+def _validate_iam_role_trust_policy(props):
+    """IAM's refusal of a NotPrincipal trust policy, before any state changes."""
+    trust_err = _iam._trust_policy_not_principal_error(props.get("AssumeRolePolicyDocument"))
+    if trust_err:
+        raise ValueError(trust_err)
+
+
 def _iam_role_create(logical_id, props, stack_name):
     _validate_iam_identity_tag_keys("AWS::IAM::Role", props.get("Tags") or [])
+    _validate_iam_role_trust_policy(props)
     name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
     arn = f"arn:aws:iam::{get_account_id()}:role{props.get('Path', '/')}{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
@@ -2595,6 +2603,7 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
     in place, so policies attached from outside the template survive.
     """
     _validate_iam_identity_tag_keys("AWS::IAM::Role", new_props.get("Tags") or [])
+    _validate_iam_role_trust_policy(new_props)
     name = new_props.get("RoleName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
     )
@@ -6926,7 +6935,7 @@ _COGNITO_USER_POOL_UPDATABLE = {
 _COGNITO_USER_POOL_CREATE_ONLY = ("Schema", "AliasAttributes", "UsernameAttributes",
                                   "UsernameConfiguration")
 
-# The rest of the AWS::Cognito::UserPool reference (UserPoolTier, the
+# The rest of the AWS::Cognito::UserPool reference (the
 # EmailAuthentication* and WebAuthn* properties, IssuerConfiguration,
 # KeyConfiguration) has no field on the service's record and is not
 # modelled: it is accepted and ignored on create and on update alike.
@@ -6946,7 +6955,7 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
     _cognito_user_pool_update applies later."""
     payload = {
         key: props[key]
-        for key in (*_COGNITO_USER_POOL_CREATE_ONLY, *_COGNITO_USER_POOL_UPDATABLE)
+        for key in (*_COGNITO_USER_POOL_CREATE_ONLY, *_COGNITO_USER_POOL_UPDATABLE, "UserPoolTier")
         if key in props
     }
     payload["PoolName"] = _cognito_user_pool_name(props, stack_name, logical_id)
@@ -7044,6 +7053,9 @@ def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name,
                 "a new UserPool resource instead."
             )
     payload = _declared_or_default(old_props, new_props, _COGNITO_USER_POOL_UPDATABLE)
+    # A dropped UserPoolTier keeps the pool's plan, as an UpdateUserPool without it does.
+    if "UserPoolTier" in new_props:
+        payload["UserPoolTier"] = new_props["UserPoolTier"]
     if payload:
         payload["UserPoolId"] = physical_id
         status, _, body = _cognito._update_user_pool(payload)

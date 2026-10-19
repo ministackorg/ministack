@@ -360,6 +360,7 @@ _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_rec
 
 _bucket_object_lock = AccountScopedDict()
 _bucket_replication = AccountScopedDict()
+_MALFORMED_XML = "The XML you provided was not well-formed or did not validate against our published schema"
 _object_retention = AccountScopedDict()
 _object_legal_hold = AccountScopedDict()
 
@@ -984,9 +985,8 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
 
 
 _ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
-# The permissions that answer a read and a write, FULL_CONTROL covering both.
+# The permissions that answer an object read, FULL_CONTROL included.
 _ACL_READ_PERMS = ("READ", "FULL_CONTROL")
-_ACL_WRITE_PERMS = ("WRITE", "FULL_CONTROL")
 _ACL_READ_ACP_PERMS = ("READ_ACP", "FULL_CONTROL")
 # Object reads an object ACL grants nothing for: READ covers the data, READ_ACP the ACL.
 _ACL_UNGRANTED_OBJECT_READS = ("uploadId", "annotation", "tagging", "retention", "legal-hold", "attributes")
@@ -1015,8 +1015,8 @@ def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str,
     return grants
 
 
-def _public_access_blocked(owner_account: str, bucket_name: str) -> bool:
-    """Whether the bucket's Public Access Block shuts public grants off."""
+def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
+    """Whether the bucket's Public Access Block turns *setting* on, e.g. ``IgnorePublicAcls``."""
     record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
     stored = record.get("_public_access_block")
     if not stored:
@@ -1026,10 +1026,8 @@ def _public_access_blocked(owner_account: str, bucket_name: str) -> bool:
     except Exception:
         return False
     for child in root.iter():
-        if child.tag.endswith(("BlockPublicAcls", "RestrictPublicBuckets",
-                               "BlockPublicPolicy", "IgnorePublicAcls")):
-            if (child.text or "").strip().lower() == "true":
-                return True
+        if child.tag.rsplit("}", 1)[-1] == setting:
+            return (child.text or "").strip().lower() == "true"
     return False
 
 
@@ -1066,6 +1064,20 @@ def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
 
 
+def object_tags_for_condition(bucket_name: str, key: str, query_params: dict) -> dict:
+    """The tags of the object version a read names, for ``s3:ExistingObjectTag`` in the identity check."""
+    bucket = _buckets.get(bucket_name)
+    if bucket is None:
+        return {}
+    return _object_tags.get((bucket_name, key, _resolve_subresource_version(query_params, bucket, key)), {})
+
+
+def upload_encryption_header(upload_id: str) -> str | None:
+    """The ``x-amz-server-side-encryption`` its CreateMultipartUpload carried, for the identity check of a part."""
+    upload = _multipart_uploads.get(upload_id)
+    return upload.get("requested_sse") if upload else None
+
+
 def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
                            method: str, query_params: dict, caller: str) -> bool:
     """Whether a caller who does not own the bucket may have this request.
@@ -1073,7 +1085,8 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
     The owner's grants decide it: a Group grant on the bucket or the object
     ACL, a grant to the caller's canonical ID on the object ACL, or an allow
     in the bucket policy. Nothing granted means the request is denied, which
-    is S3's default for a bucket nobody has opened up.
+    is S3's default for a bucket nobody has opened up. IgnorePublicAcls drops
+    the Group grants and RestrictPublicBuckets the policy.
     """
     object_acl, object_wants = _foreign_object_acl(owner_account, bucket_name, key, method, query_params)
     caller_id = _canonical_owner_id(caller) if caller else ""
@@ -1081,20 +1094,19 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
            for grantee, permission in _acl_grants(object_acl, "ID")):
         # A grant to one account is not public, so Block Public Access leaves it alone.
         return True
-    if _public_access_blocked(owner_account, bucket_name):
-        return False
-    wants = _ACL_READ_PERMS if method in ("GET", "HEAD") else _ACL_WRITE_PERMS
+    wants = _bucket_acl_wants(method, bucket_name, key, query_params)
     groups = [_ACL_GROUP_ALL_USERS] if not caller else [
         _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
 
-    for stored, granted in ((_bucket_acl.get_scoped(owner_account, None, bucket_name), wants),
-                            (object_acl, object_wants)):
-        for uri, permission in _acl_grants(stored):
-            if uri in groups and permission in granted:
-                return True
+    if not _public_access_blocked(owner_account, bucket_name, "IgnorePublicAcls"):
+        for stored, granted in ((_bucket_acl.get_scoped(owner_account, None, bucket_name), wants),
+                                (object_acl, object_wants)):
+            for uri, permission in _acl_grants(stored):
+                if uri in groups and permission in granted:
+                    return True
 
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
-    if policy:
+    if policy and not _public_access_blocked(owner_account, bucket_name, "RestrictPublicBuckets"):
         from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
         action = "s3:GetObject" if method in ("GET", "HEAD") else "s3:PutObject"
@@ -1124,6 +1136,23 @@ def _foreign_object_acl(owner_account: str, bucket_name: str, key: str, method: 
     version_id = _resolve_subresource_version(query_params, bucket, key)
     wants = _ACL_READ_ACP_PERMS if "acl" in query_params else _ACL_READ_PERMS
     return _object_acl.get_scoped(owner_account, None, (bucket_name, key, version_id)), wants
+
+
+# The bucket ACL permission each action needs: READ lists, WRITE adds and removes objects.
+_BUCKET_ACL_PERMISSIONS = {
+    "ListBucket": "READ", "ListBucketVersions": "READ", "ListBucketMultipartUploads": "READ",
+    "ListMultipartUploadParts": "READ", "PutObject": "WRITE", "DeleteObject": "WRITE",
+    "AbortMultipartUpload": "WRITE", "GetBucketAcl": "READ_ACP", "PutBucketAcl": "WRITE_ACP",
+}
+
+
+def _bucket_acl_wants(method: str, bucket_name: str, key: str, query_params: dict) -> tuple[str, ...]:
+    """The bucket ACL permissions that grant the request's action, none for an action a bucket ACL cannot grant."""
+    from ministack.core.iam_actions import _s3_action
+
+    action = _s3_action(method, f"/{bucket_name}/{key}" if key else f"/{bucket_name}", query_params)
+    permission = _BUCKET_ACL_PERMISSIONS.get(action or "")
+    return (permission, "FULL_CONTROL") if permission else ()
 
 
 def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
@@ -2684,6 +2713,12 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    current = _buckets.get(name)
+    enforced = (_bucket_owner_enforced(current) if current
+                else headers.get("x-amz-object-ownership", "BucketOwnerEnforced") == "BucketOwnerEnforced")
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
     if endpoint_region:
         err = _location_constraint_error(name, _location_constraint(body), endpoint_region)
         if err is not None:
@@ -2698,6 +2733,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
         _bucket_acl.pop(name, None)
         if canned_acl:
             _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+        elif grant_acl:
+            _bucket_acl[name] = grant_acl
         return 200, {"Location": f"/{name}"}, b""
     if _bucket_owner_account(name) is not None:
         # "After creating a general purpose bucket in the shared global
@@ -2748,6 +2785,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
         _bucket_tags[name] = tags
     if canned_acl:
         _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    elif grant_acl:
+        _bucket_acl[name] = grant_acl
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
@@ -2883,11 +2922,15 @@ def _put_bucket_versioning(name: str, body: bytes):
         return _no_such_bucket(name)
     try:
         xml_root = fromstring(body)
-        status_el = _find_xml_tag(xml_root, "Status")
-        if status_el is not None and status_el.text:
-            _bucket_versioning[name] = status_el.text
     except Exception:
-        pass
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    status_el = _find_xml_tag(xml_root, "Status")
+    mfa_el = _find_xml_tag(xml_root, "MfaDelete")
+    if (status_el is not None and status_el.text not in ("Enabled", "Suspended")) or (
+            mfa_el is not None and mfa_el.text not in ("Enabled", "Disabled")):
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    if status_el is not None:
+        _bucket_versioning[name] = status_el.text
     return 200, {}, b""
 
 
@@ -2912,9 +2955,18 @@ def _get_bucket_encryption(name: str):
     return 200, {"Content-Type": "application/xml"}, default
 
 
+_SSE_ALGORITHMS = ("AES256", "aws:fsx", "aws:backup", "aws:kms", "aws:kms:dsse")
+
+
 def _put_bucket_encryption(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
+    try:
+        root = fromstring(body)
+    except Exception:
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    if any(el.tag.rsplit("}", 1)[-1] == "SSEAlgorithm" and el.text not in _SSE_ALGORITHMS for el in root.iter()):
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     _bucket_encryption[name] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
@@ -3177,8 +3229,29 @@ def _put_bucket_lifecycle(name: str, body: bytes):
         # Fallback: store raw if parsing fails
         _bucket_lifecycle[name] = body.decode("utf-8", errors="replace")
         return 200, {"x-amz-transition-default-minimum-object-size": "all_storage_classes_128K"}, b""
+    err = _lifecycle_rules_error(rules)
+    if err:
+        return err
     _bucket_lifecycle[name] = rules
     return 200, {"x-amz-transition-default-minimum-object-size": "all_storage_classes_128K"}, b""
+
+
+_TRANSITION_STORAGE_CLASSES = ("GLACIER", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "DEEP_ARCHIVE", "GLACIER_IR")
+
+
+def _lifecycle_rules_error(rules: list) -> tuple | None:
+    """The refusals real S3 returns for an out-of-schema or non-positive lifecycle value."""
+    for rule in rules:
+        if rule.get("Status") not in ("Enabled", "Disabled") or any(
+                t.get("StorageClass") not in _TRANSITION_STORAGE_CLASSES for t in rule.get("Transitions", [])):
+            return _error("MalformedXML", _MALFORMED_XML, 400)
+        if "Days" in rule.get("Expiration", {}) and rule["Expiration"]["Days"] <= 0:
+            return _error("InvalidArgument", "'Days' for Expiration action must be a positive integer", 400)
+        nve = rule.get("NoncurrentVersionExpiration", {})
+        if "NoncurrentDays" in nve and nve["NoncurrentDays"] <= 0:
+            return _error("InvalidArgument",
+                          "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer", 400)
+    return None
 
 
 def _delete_bucket_lifecycle(name: str):
@@ -3240,6 +3313,13 @@ def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
     headers = headers or {}
     if name not in _buckets:
         return _no_such_bucket(name)
+    refused = _public_acl_refused(name, headers, body)
+    if refused:
+        return refused
+    enforced = _bucket_owner_enforced(_buckets[name])
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
     # exclusive with an XML body per the AWS API reference. SDK callers send
@@ -3253,9 +3333,14 @@ def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
             return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned}", 400)
         _bucket_acl[name] = _canned_acl_policy_xml(canned, _canonical_owner_id())
         return 200, {}, b""
+    if grant_acl:
+        if body:
+            return _error("UnexpectedContent", "This request does not support content", 400)
+        _bucket_acl[name] = grant_acl
+        return 200, {}, b""
 
     if not body:
-        return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
+        return _missing_acl_error(headers, enforced)
     try:
         # Validate XML well-formedness — real AWS rejects malformed bodies
         # with MalformedACLError. We don't enforce grantee/permission
@@ -3293,7 +3378,7 @@ def _put_bucket_tagging(name: str, body: bytes):
     try:
         tags = _parse_tags_xml(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     if len(tags) > 50:
         return _error("BadRequest", "Object tags cannot be greater than 50", 400)
     _bucket_tags[name] = tags
@@ -4359,6 +4444,12 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    grant_acl, err = _grant_headers_acl(headers, _bucket_owner_enforced(bucket))
+    if err:
+        return err
+    refused = _public_acl_refused(bucket_name, headers)
+    if refused:
+        return refused
 
     lock_err = _object_lock_header_error(bucket_name, headers)
     if lock_err:
@@ -4402,6 +4493,8 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
+    elif grant_acl:
+        _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -4751,6 +4844,9 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     canned_acl = synth.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    refused = _public_acl_refused(bucket_name, synth)
+    if refused:
+        return refused
 
     # The POST form names its SSE fields exactly like the request headers.
     sse_fields = {
@@ -5906,6 +6002,12 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    grant_acl, err = _grant_headers_acl(headers, _bucket_owner_enforced(dest_bucket))
+    if err:
+        return err
+    refused = _public_acl_refused(bucket_name, headers)
+    if refused:
+        return refused
 
     # A new checksum algorithm on the copy also applies to the annotations.
     annotation_directive = headers.get("x-amz-object-annotation-directive", "COPY").upper()
@@ -6106,6 +6208,8 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         _object_acl[(bucket_name, dest_key, dest_version_id)] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
+    elif grant_acl:
+        _object_acl[(bucket_name, dest_key, dest_version_id)] = grant_acl
     else:
         # The destination is a new object: it does not inherit whatever the
         # key it replaced was permissioned with.
@@ -6210,7 +6314,7 @@ def _put_object_tagging(bucket_name: str, key: str, body: bytes, query_params: d
     try:
         tags = _parse_tags_xml(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     if len(tags) > 10:
         return _error("BadRequest", "Object tags cannot be greater than 10", 400)
     gone = _no_such_version(bucket_name, key, query_params)
@@ -6732,30 +6836,30 @@ def _put_object_lock_configuration(bucket_name: str, body: bytes):
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     enabled_el = _find_xml_tag(xml_root, "ObjectLockEnabled")
     if enabled_el is None or enabled_el.text != "Enabled":
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     default_retention = None
     rule_el = _find_xml_tag(xml_root, "Rule")
     if rule_el is not None:
         ret_el = _find_xml_tag(rule_el, "DefaultRetention")
         if ret_el is None:
-            return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
         mode_el = _find_xml_tag(ret_el, "Mode")
         days_el = _find_xml_tag(ret_el, "Days")
         years_el = _find_xml_tag(ret_el, "Years")
 
         if mode_el is None or mode_el.text not in ("GOVERNANCE", "COMPLIANCE"):
-            return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
         has_days = days_el is not None and days_el.text
         has_years = years_el is not None and years_el.text
         if (has_days and has_years) or (not has_days and not has_years):
-            return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
         default_retention = {"Mode": mode_el.text}
         try:
@@ -6764,7 +6868,7 @@ def _put_object_lock_configuration(bucket_name: str, body: bytes):
             if has_years:
                 default_retention["Years"] = int(years_el.text)
         except (ValueError, TypeError):
-            return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
     _bucket_object_lock[bucket_name] = {
         "enabled": True,
@@ -6825,15 +6929,15 @@ def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     mode_el = _find_xml_tag(xml_root, "Mode")
     date_el = _find_xml_tag(xml_root, "RetainUntilDate")
 
     if mode_el is None or mode_el.text not in ("GOVERNANCE", "COMPLIANCE"):
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     if date_el is None or not date_el.text:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     retain_until = date_el.text
 
@@ -6905,11 +7009,11 @@ def _put_object_legal_hold(bucket_name: str, key: str, body: bytes, query_params
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     status_el = _find_xml_tag(xml_root, "Status")
     if status_el is None or status_el.text not in ("ON", "OFF"):
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     _object_legal_hold[lock_key] = status_el.text
     return 200, {"Content-Type": "application/xml"}, b""
@@ -6960,6 +7064,22 @@ _CANNED_ACL_GROUP_GRANTS = {
 }
 
 
+def _public_acl_refused(bucket_name: str, headers: dict, acl_xml: str | bytes | None = None) -> tuple | None:
+    """AccessDenied for a request that sets a public ACL on a bucket whose BlockPublicAcls is on."""
+    public = (_ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED)
+    uris = [uri for uri, _ in _CANNED_ACL_GROUP_GRANTS.get(headers.get("x-amz-acl", ""), [])]
+    uris += [uri for uri, _ in _acl_grants(acl_xml)]
+    grants = " ".join(v for k, v in headers.items() if k.lower().startswith("x-amz-grant-"))
+    if not any(uri in public for uri in uris) and not any(group in grants for group in public):
+        return None
+    bucket = _buckets.get(bucket_name)
+    if (bucket is None or _bucket_owner_enforced(bucket)
+            or not _public_access_blocked(get_account_id(), bucket_name, "BlockPublicAcls")):
+        return None
+    return _error("AccessDenied",
+                  "public ACLs are prevented by the BlockPublicAcls setting in S3 Block Public Access.", 403)
+
+
 def _canned_acl_policy_xml(canned: str, owner_id: str) -> str:
     """AccessControlPolicy XML for a canned ACL: the owner's FULL_CONTROL plus the
     group grants the canned value implies (e.g. public-read grants AllUsers READ),
@@ -6986,6 +7106,59 @@ def _canned_acl_policy_xml(canned: str, owner_id: str) -> str:
         f'<AccessControlList>{"".join(grants)}</AccessControlList>'
         "</AccessControlPolicy>"
     )
+
+
+# The x-amz-grant-* headers in the order S3 lists their grants back.
+_GRANT_HEADER_PERMISSIONS = (
+    ("x-amz-grant-read", "READ"),
+    ("x-amz-grant-write", "WRITE"),
+    ("x-amz-grant-full-control", "FULL_CONTROL"),
+    ("x-amz-grant-read-acp", "READ_ACP"),
+    ("x-amz-grant-write-acp", "WRITE_ACP"),
+)
+
+
+def _grant_headers_acl(headers: dict, enforced: bool) -> tuple[str | None, tuple | None]:
+    """The ACL the request's ``x-amz-grant-*`` headers set (None without any or with ACLs disabled), or their error."""
+    present = [(headers[name], permission) for name, permission in _GRANT_HEADER_PERMISSIONS if headers.get(name)]
+    if not present or enforced:
+        return None, None
+    if headers.get("x-amz-acl"):
+        return None, _error("InvalidRequest", "Specifying both Canned ACLs and Header Grants is not allowed", 400)
+    grants = []
+    for value, permission in present:
+        for item in value.split(","):
+            kind, _, grantee = item.partition("=")
+            kind, grantee = kind.strip().lower(), grantee.strip().strip('"')
+            if kind == "id" and re.fullmatch(r"[0-9a-fA-F]{64}", grantee):
+                grantee_xml = f'xsi:type="CanonicalUser"><ID>{grantee}</ID>'
+            elif kind == "uri" and grantee in (_ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTH_USERS, _ACL_GROUP_LOG_DELIVERY):
+                grantee_xml = f'xsi:type="Group"><URI>{grantee}</URI>'
+            elif kind in ("id", "uri"):
+                return None, _error("InvalidArgument", "Invalid id" if kind == "id" else "Invalid group uri", 400)
+            elif kind == "emailaddress":
+                return None, _error("UnsupportedArgument", "The request contained an unsupported argument.", 400)
+            else:
+                return None, _error("InvalidArgument", "Argument format not recognized", 400)
+            grants.append(
+                '<Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+                f"{grantee_xml}</Grantee><Permission>{permission}</Permission></Grant>"
+            )
+    owner_id = _canonical_owner_id()
+    return (
+        XML_DECL.decode() + "\n"
+        f'<AccessControlPolicy xmlns="{S3_NS}">'
+        f"<Owner><ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Owner>"
+        f'<AccessControlList>{"".join(grants)}</AccessControlList>'
+        "</AccessControlPolicy>"
+    ), None
+
+
+def _missing_acl_error(headers: dict, enforced: bool) -> tuple:
+    """The error for an ACL write with neither a canned ACL nor a body (grant headers with ACLs disabled included)."""
+    if enforced and any(headers.get(name) for name, _ in _GRANT_HEADER_PERMISSIONS):
+        return _error("AccessControlListNotSupported", "The bucket does not allow ACLs", 400)
+    return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
 
 
 def _default_object_acl_xml() -> bytes:
@@ -7053,6 +7226,13 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
     if gone is not None:
         return gone
     version_id = _resolve_subresource_version(query_params, bucket, key)
+    refused = _public_acl_refused(bucket_name, headers, body)
+    if refused:
+        return refused
+    enforced = _bucket_owner_enforced(bucket)
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
     # exclusive with an XML body per the AWS API reference. Either path
@@ -7065,9 +7245,15 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned, _canonical_owner_id())
         _persist_version_state(bucket_name, key, bucket)
         return 200, {}, b""
+    if grant_acl:
+        if body:
+            return _error("UnexpectedContent", "This request does not support content", 400)
+        _object_acl[(bucket_name, key, version_id)] = grant_acl
+        _persist_version_state(bucket_name, key, bucket)
+        return 200, {}, b""
 
     if not body:
-        return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
+        return _missing_acl_error(headers, enforced)
     try:
         # Validate XML well-formedness — real AWS rejects malformed bodies
         # with MalformedACLError. We don't enforce grantee/permission
@@ -7153,7 +7339,7 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     role_el = _find_xml_tag(xml_root, "Role")
     role = role_el.text if role_el is not None and role_el.text else ""
@@ -7213,7 +7399,7 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
         rules.append(rule)
 
     if not rules:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     _bucket_replication[bucket_name] = {"Role": role, "Rules": rules}
     return 200, {"Content-Type": "application/xml"}, b""
@@ -7462,7 +7648,7 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     quiet = False
     quiet_el = _find_xml_tag(xml_root, "Quiet")
@@ -7618,6 +7804,9 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     lock_err = _object_lock_header_error(bucket_name, headers)
     if lock_err:
         return lock_err
+    refused = _public_acl_refused(bucket_name, headers)
+    if refused:
+        return refused
 
     storage_class, sc_err = _resolve_storage_class(headers)
     if sc_err:
@@ -7650,6 +7839,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "content_type": content_type,
         "content_encoding": content_encoding,
         "preserved_headers": preserved,
+        "requested_sse": headers.get("x-amz-server-side-encryption"),
         "storage_class": storage_class,
         "checksum_algorithm": checksum_algorithm,
         "created": now_iso(),
@@ -8762,7 +8952,7 @@ def _mrap_async(op_segment: str, body: bytes, signed_region: str | None) -> tupl
     try:
         root = fromstring(body)
     except Exception:
-        return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return s3control_error("MalformedXML", _MALFORMED_XML, 400)
     details = _child(root, "Details")
     name = _child_text(details, "Name")
     token_arn = (f"arn:aws:s3:{signed_region or get_region()}:{get_account_id()}:async-request/mrap/"
@@ -8890,7 +9080,7 @@ def _mrap_submit_routes(record: dict, body: bytes) -> tuple:
     try:
         root = fromstring(body)
     except Exception:
-        return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return s3control_error("MalformedXML", _MALFORMED_XML, 400)
     routes = mrap_routes(record)
     by_region = {bucket_region(b): b for b in routes}
     updated = dict(routes)
@@ -9056,7 +9246,7 @@ def _access_point_create_request(name: str, body: bytes) -> tuple:
     try:
         root = fromstring(body) if body else Element("CreateAccessPointRequest")
     except Exception:
-        return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return s3control_error("MalformedXML", _MALFORMED_XML, 400)
     vpc_el = _child(root, "VpcConfiguration")
     tags_el = _child(root, "Tags")
     try:
@@ -9097,7 +9287,7 @@ def _access_point_policy(name: str, method: str, body: bytes) -> tuple:
         try:
             record["Policy"] = _child_text(fromstring(body), "Policy")
         except Exception:
-            return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return s3control_error("MalformedXML", _MALFORMED_XML, 400)
         return 200, {"Content-Type": "application/xml"}, b""
     if method == "DELETE":
         record["Policy"] = None
@@ -9275,7 +9465,7 @@ def _object_lambda_request(name: str, method: str, body: bytes, sub: str) -> tup
         except AccessPointError as exc:
             return exc.response()
         except Exception:
-            return s3control_error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return s3control_error("MalformedXML", _MALFORMED_XML, 400)
         out = Element("CreateAccessPointForObjectLambdaResult", xmlns=S3CONTROL_NS)
         SubElement(out, "ObjectLambdaAccessPointArn").text = object_lambda_arn(name)
         _object_lambda_alias_xml(out, record)

@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import uuid as _uuid_mod
 
@@ -587,7 +588,245 @@ def test_cloudwatch_composite_alarm(cw):
     )
     resp = cw.describe_alarms(AlarmNames=[composite], AlarmTypes=["CompositeAlarm"])
     assert any(a["AlarmName"] == composite for a in resp.get("CompositeAlarms", []))
-    cw.delete_alarms(AlarmNames=[child, composite])
+    cw.delete_alarms(AlarmNames=[composite])
+    cw.delete_alarms(AlarmNames=[child])
+
+
+def _composite(cw, name):
+    return cw.describe_alarms(AlarmNames=[name], AlarmTypes=["CompositeAlarm"])["CompositeAlarms"][0]
+
+
+def _triggering(alarm):
+    return [(t["arn"].rsplit(":", 1)[1], t["state"]["value"])
+            for t in json.loads(alarm["StateReasonData"])["triggeringAlarms"]]
+
+
+def _delete_composites_then_children(cw, composites, children):
+    for name in composites:
+        cw.delete_alarms(AlarmNames=[name])
+    cw.delete_alarms(AlarmNames=children)
+
+
+def test_cloudwatch_composite_alarm_follows_child_states(cw):
+    p = f"cw-comp-{_uuid_mod.uuid4().hex[:8]}-"
+    a, b = f"{p}a", f"{p}b"
+    for name in (a, b):
+        _put_paging_alarm(cw, name)
+    a_arn = cw.describe_alarms(AlarmNames=[a])["MetricAlarms"][0]["AlarmArn"]
+    rules = {
+        "and": f'ALARM("{a}") AND ALARM("{b}")',
+        "or": f"ALARM({a_arn}) OR ALARM({b})",
+        "not": f'NOT ALARM("{a}")',
+        "ok": f'OK("{a}")',
+        "ins": f'INSUFFICIENT_DATA("{b}")',
+        "true": "TRUE",
+        "false": "FALSE",
+        "mix": f'(ALARM("{a}") OR OK("{b}")) AND NOT INSUFFICIENT_DATA("{b}")',
+        "least": f'AT_LEAST(2, ALARM, ("{a}", "{b}"))',
+        "pct": f"AT_LEAST(50%, NOT OK, ({a}, {b}))",
+        "prec": "TRUE OR TRUE AND FALSE",
+        "notprec": "NOT TRUE AND FALSE",
+    }
+    for key, rule in rules.items():
+        cw.put_composite_alarm(AlarmName=f"{p}{key}", AlarmRule=rule)
+    cw.put_composite_alarm(AlarmName=f"{p}nest", AlarmRule=f'ALARM("{p}or")')
+    names = [f"{p}{key}" for key in rules] + [f"{p}nest"]
+
+    def states():
+        resp = cw.describe_alarms(AlarmNames=names, AlarmTypes=["CompositeAlarm"])
+        return {x["AlarmName"][len(p):]: x["StateValue"] for x in resp["CompositeAlarms"]}
+
+    try:
+        assert states() == {"and": "OK", "or": "OK", "not": "ALARM", "ok": "OK", "ins": "ALARM", "true": "ALARM",
+                            "false": "OK", "mix": "OK", "least": "OK", "pct": "ALARM", "prec": "ALARM",
+                            "notprec": "OK", "nest": "OK"}
+        created = _composite(cw, f"{p}and")
+        assert created["StateReason"] == f"{created['AlarmArn']} was created and its alarm rule evaluates to OK"
+        assert created["StateUpdatedTimestamp"] == created["StateTransitionedTimestamp"]
+        assert sorted(_triggering(created)) == [(a, "INSUFFICIENT_DATA"), (b, "INSUFFICIENT_DATA")]
+        assert _triggering(_composite(cw, f"{p}true")) == []
+
+        cw.set_alarm_state(AlarmName=a, StateValue="ALARM", StateReason="test")
+        assert states() == {"and": "OK", "or": "ALARM", "not": "OK", "ok": "OK", "ins": "ALARM", "true": "ALARM",
+                            "false": "OK", "mix": "OK", "least": "OK", "pct": "ALARM", "prec": "ALARM",
+                            "notprec": "OK", "nest": "ALARM"}
+        nest = _composite(cw, f"{p}nest")
+        assert re.fullmatch(
+            rf"{re.escape(nest['AlarmArn'][:-4])}or transitioned to ALARM at "
+            r"[A-Z][a-z]+day \d\d [A-Z][a-z]+, \d{4} \d\d:\d\d:\d\d UTC", nest["StateReason"])
+        assert _triggering(nest) == [(f"{p}or", "ALARM")]
+        timestamp = json.loads(nest["StateReasonData"])["triggeringAlarms"][0]["state"]["timestamp"]
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}\+0000", timestamp)
+
+        cw.set_alarm_state(AlarmName=b, StateValue="ALARM", StateReason="test")
+        assert states()["and"] == "ALARM" and states()["mix"] == "ALARM" and states()["ins"] == "OK"
+        # Both children changed since the last transition of "and".
+        assert sorted(_triggering(_composite(cw, f"{p}and"))) == [(a, "ALARM"), (b, "ALARM")]
+
+        cw.set_alarm_state(AlarmName=a, StateValue="OK", StateReason="test")
+        assert states() == {"and": "OK", "or": "ALARM", "not": "ALARM", "ok": "ALARM", "ins": "OK", "true": "ALARM",
+                            "false": "OK", "mix": "OK", "least": "OK", "pct": "ALARM", "prec": "ALARM",
+                            "notprec": "OK", "nest": "ALARM"}
+        # Only the child that changed since the last transition is named.
+        assert _triggering(_composite(cw, f"{p}mix")) == [(a, "OK")]
+
+        cw.set_alarm_state(AlarmName=b, StateValue="OK", StateReason="test")
+        assert states()["or"] == "OK" and states()["nest"] == "OK" and states()["pct"] == "OK"
+        assert sorted(_triggering(_composite(cw, f"{p}or"))) == [(a, "OK"), (b, "OK")]
+        # A composite whose state did not change keeps its reason.
+        assert _composite(cw, f"{p}true")["StateReason"].endswith("was created and its alarm rule evaluates to ALARM")
+    finally:
+        _delete_composites_then_children(cw, [f"{p}nest"] + names[:-1], [a, b])
+
+
+def test_cloudwatch_composite_alarm_update_and_set_state(cw):
+    p = f"cw-comp-upd-{_uuid_mod.uuid4().hex[:8]}-"
+    a, b = f"{p}a", f"{p}b"
+    for name in (a, b):
+        _put_paging_alarm(cw, name)
+    cw.set_alarm_state(AlarmName=a, StateValue="ALARM", StateReason="test")
+    comp = f"{p}comp"
+    cw.put_composite_alarm(AlarmName=comp, AlarmRule=f'ALARM("{a}") AND ALARM("{b}")')
+    try:
+        assert _composite(cw, comp)["StateValue"] == "OK"
+        created = _composite(cw, comp)
+
+        # An update that leaves the result alone keeps state and reason.
+        cw.put_composite_alarm(AlarmName=comp, AlarmRule=f'ALARM("{b}")')
+        same = _composite(cw, comp)
+        assert (same["StateValue"], same["StateReason"]) == ("OK", created["StateReason"])
+
+        # An update that changes the result moves the state at once, naming the children that agree with it.
+        cw.put_composite_alarm(AlarmName=comp, AlarmRule=f'ALARM("{a}") OR ALARM("{b}")')
+        updated = _composite(cw, comp)
+        assert updated["StateValue"] == "ALARM"
+        assert updated["StateReason"] == f"{updated['AlarmArn']} was updated and its new alarm rule evaluates to ALARM"
+        assert _triggering(updated) == [(a, "ALARM")]
+
+        # Of the children that changed since the last transition, only those that agree with the new state are named.
+        cw.set_alarm_state(AlarmName=a, StateValue="OK", StateReason="test")
+        cw.set_alarm_state(AlarmName=b, StateValue="OK", StateReason="test")
+        cw.set_alarm_state(AlarmName=a, StateValue="ALARM", StateReason="test")
+        assert _triggering(_composite(cw, comp)) == [(a, "ALARM")]
+
+        # SetAlarmState holds until a child changes state.
+        cw.set_alarm_state(AlarmName=comp, StateValue="OK", StateReason="manual")
+        manual = _composite(cw, comp)
+        assert (manual["StateValue"], manual["StateReason"]) == ("OK", "manual")
+        assert "StateReasonData" not in manual
+        cw.set_alarm_state(AlarmName=b, StateValue="ALARM", StateReason="test")
+        back = _composite(cw, comp)
+        assert back["StateValue"] == "ALARM"
+        assert back["StateReason"].startswith(f"{back['AlarmArn'][:-4]}b transitioned to ALARM at ")
+        assert _triggering(back) == [(b, "ALARM")]
+    finally:
+        _delete_composites_then_children(cw, [comp], [a, b])
+
+
+def test_cloudwatch_put_composite_alarm_validates_rule(cw):
+    p = f"cw-comp-val-{_uuid_mod.uuid4().hex[:8]}-"
+    a = f"{p}a"
+    _put_paging_alarm(cw, a)
+    try:
+        cases = {
+            f'ALARM("{p}missing")': (
+                "Could not save the composite alarm as alarms "
+                f"[arn:aws:cloudwatch:us-east-1:000000000000:alarm:{p}missing] in the alarm rule do not exist"),
+            f'ALARM("{a}") AND': (
+                f"Error in AlarmRule [Unsupported token '<EOF>' at char {len(a) + 13}, must be: '(', 'NOT', "
+                "AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA]"),
+            f'ALARM("{a}"': f"Error in AlarmRule [Unsupported token '<EOF>' at char {len(a) + 8}]",
+            f'ALARM("{a}") XOR TRUE': (
+                f"Error in AlarmRule [Unsupported token 'XOR' at char {len(a) + 10}, must be: <EOF>, 'AND', 'OR']"),
+            "false": (
+                "Error in AlarmRule [Unsupported token 'false' at char 0, must be: '(', 'NOT', AT_LEAST, "
+                "TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA]"),
+        }
+        for rule, message in cases.items():
+            with pytest.raises(ClientError) as exc:
+                cw.put_composite_alarm(AlarmName=f"{p}bad", AlarmRule=rule)
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == message
+        assert cw.describe_alarms(AlarmNames=[f"{p}bad"], AlarmTypes=["CompositeAlarm"])["CompositeAlarms"] == []
+    finally:
+        cw.delete_alarms(AlarmNames=[a])
+
+
+def test_cloudwatch_delete_alarms_refuses_children_and_several_composites(cw):
+    p = f"cw-comp-del-{_uuid_mod.uuid4().hex[:8]}-"
+    a = f"{p}a"
+    _put_paging_alarm(cw, a)
+    cw.put_composite_alarm(AlarmName=f"{p}c1", AlarmRule=f'ALARM("{a}")')
+    cw.put_composite_alarm(AlarmName=f"{p}c2", AlarmRule=f'ALARM("{p}c1")')
+    cw.put_composite_alarm(AlarmName=f"{p}c3", AlarmRule="TRUE")
+    refused = {
+        (a,): f"Cannot delete {a} as there are composite alarm(s) depending on it.",
+        (a, f"{p}c1"): f"Cannot delete {a} as there are composite alarm(s) depending on it.",
+        (f"{p}c1",): f"Cannot delete {p}c1 as there are composite alarm(s) depending on it.",
+        (f"{p}c2", f"{p}c3"): (
+            "Cannot delete [2] Composite Alarms as only one composite alarm delete is allowed in single request"),
+    }
+    try:
+        for names, message in refused.items():
+            with pytest.raises(ClientError) as exc:
+                cw.delete_alarms(AlarmNames=list(names))
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == message
+        assert len(cw.describe_alarms(AlarmNamePrefix=p, AlarmTypes=["CompositeAlarm"])["CompositeAlarms"]) == 3
+        assert cw.describe_alarms(AlarmNames=[a])["MetricAlarms"]
+        cw.delete_alarms(AlarmNames=[f"{p}missing", f"{p}c3"])
+    finally:
+        _delete_composites_then_children(cw, [f"{p}c2", f"{p}c1", f"{p}c3"], [a])
+    left = cw.describe_alarms(AlarmNamePrefix=p, AlarmTypes=["MetricAlarm", "CompositeAlarm"])
+    assert left["MetricAlarms"] == left["CompositeAlarms"] == []
+
+
+def test_cloudwatch_composite_alarm_history_needs_alarm_types(cw):
+    p = f"cw-comp-hist-{_uuid_mod.uuid4().hex[:8]}-"
+    a, comp = f"{p}a", f"{p}comp"
+    _put_paging_alarm(cw, a)
+    cw.put_composite_alarm(AlarmName=comp, AlarmRule=f'ALARM("{a}")')
+    cw.set_alarm_state(AlarmName=a, StateValue="ALARM", StateReason="test")
+    try:
+        assert cw.describe_alarm_history(AlarmName=comp)["AlarmHistoryItems"] == []
+        items = cw.describe_alarm_history(AlarmName=comp, AlarmTypes=["CompositeAlarm"],
+                                          ScanBy="TimestampAscending")["AlarmHistoryItems"]
+        assert [(i["AlarmType"], i["HistorySummary"]) for i in items] == [
+            ("CompositeAlarm", "Alarm updated from INSUFFICIENT_DATA to OK"),
+            ("CompositeAlarm", "Alarm updated from OK to ALARM"),
+        ]
+        new_state = json.loads(items[1]["HistoryData"])["newState"]
+        assert new_state["stateReasonData"]["triggeringAlarms"][0]["state"]["value"] == "ALARM"
+        assert [i["AlarmType"] for i in cw.describe_alarm_history(AlarmName=a)["AlarmHistoryItems"]] == [
+            "MetricAlarm", "MetricAlarm"]
+    finally:
+        _delete_composites_then_children(cw, [comp], [a])
+
+
+def test_cloudwatch_composite_alarm_triggers_survive_persistence():
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import cloudwatch as service
+
+    set_request_account_id("111111111111")
+    set_request_region("us-east-1")
+    service.reset()
+    try:
+        for name in ("a", "b"):
+            service._put_metric_alarm({}, {"AlarmName": name, "MetricName": "M", "Namespace": "N", "Period": 60,
+                                          "EvaluationPeriods": 1, "Threshold": 1.0, "Statistic": "Sum",
+                                          "ComparisonOperator": "GreaterThanThreshold"}, False, True)
+        service._put_composite_alarm({}, {"AlarmName": "comp", "AlarmRule": "ALARM(a) AND ALARM(b)"}, False, True)
+        service._set_alarm_state({}, {"AlarmName": "b", "StateValue": "ALARM", "StateReason": "t"}, False, True)
+        state = service.get_state()
+        service.reset()
+        service.load_persisted_state(state)
+        service._set_alarm_state({}, {"AlarmName": "a", "StateValue": "ALARM", "StateReason": "t"}, False, True)
+        comp = service._composite_alarms["comp"]
+        assert comp["StateValue"] == "ALARM"
+        assert [t["arn"].rsplit(":", 1)[1] for t in json.loads(comp["StateReasonData"])["triggeringAlarms"]] == [
+            "a", "b"]
+    finally:
+        service.reset()
 
 def test_cloudwatch_describe_alarms_for_metric(cw):
     import uuid as _uuid
