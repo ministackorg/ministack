@@ -9449,6 +9449,18 @@ def test_s3_canned_acl_condition_contract(auth_enabled, iam_user, auth_condition
 
 
 @pytest.mark.auth_contract
+def test_s3_grant_header_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """A bucket policy on s3:x-amz-grant-read sees the grant header of a PutObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"Null": {"s3:x-amz-grant-read": "false"}})
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(Bucket=bucket, Key="plain", Body=b"x"))
+    grant = 'id="c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"'
+    _assert_s3_condition(auth_enabled, False,
+                         lambda: client.put_object(Bucket=bucket, Key="granted", Body=b"x", GrantRead=grant))
+
+
+@pytest.mark.auth_contract
 def test_s3_existing_object_tag_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
     """A bucket policy on s3:ExistingObjectTag sees the tags of the object a GetObject or HeadObject reads."""
     user = iam_user(policy=_ALLOW_ALL_S3)

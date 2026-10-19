@@ -9027,6 +9027,9 @@ def _reserved_topic_publish_allowed(topic: str) -> bool:
 
 
 def _reserved_filter_subscribe_allowed(topic_filter: str) -> bool:
+    if topic_filter.startswith("$share/"):
+        # A shared subscription ($share/{ShareName}/{TopicFilter}) is held to the rule for its filter.
+        topic_filter = topic_filter.split("/", 2)[2] if topic_filter.count("/") >= 2 else ""
     return not topic_filter.startswith("$") or _RESERVED_FILTER_RE.fullmatch(topic_filter) is not None
 
 

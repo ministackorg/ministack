@@ -3392,6 +3392,7 @@ _RESERVED_FILTERS = {
     "$aws/things/some-thing/shadow/update/+": 0x01,
     "$aws/things/+/jobs/#": 0x01,
     "$aws/events/#": 0x01,
+    "$share/consumer/sports/#": 0x01,
     "$aws/certificates/create/+/accepted": 0x01,
     "$aws/provisioning-templates/+/provision/json/rejected": 0x01,
     "$aws/device_location/some-thing/get_position_estimate/accepted": 0x01,

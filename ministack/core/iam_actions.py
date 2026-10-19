@@ -1928,7 +1928,7 @@ def s3_service_context(iam_action: str, query_params: dict | None, path: str = "
 
 
 def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
-    """s3:x-amz-server-side-encryption and s3:x-amz-acl of a write, s3:ExistingObjectTag/<key> of a read."""
+    """s3:x-amz-server-side-encryption, s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
     from ministack.services import s3 as s3_svc
 
     bucket, _, key = path.lstrip("/").partition("/")
@@ -1941,8 +1941,11 @@ def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: 
         sse = s3_svc.upload_encryption_header(upload_id) if upload_id else headers.get("x-amz-server-side-encryption")
         if sse:
             context["s3:x-amz-server-side-encryption"] = sse
-        if not upload_id and headers.get("x-amz-acl"):
-            context["s3:x-amz-acl"] = headers["x-amz-acl"]
+        if not upload_id:
+            for name in ("x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
+                         "x-amz-grant-write-acp", "x-amz-grant-full-control"):
+                if headers.get(name):
+                    context[f"s3:{name}"] = headers[name]
     else:
         for name, value in s3_svc.object_tags_for_condition(bucket, key, query_params).items():
             context[f"s3:ExistingObjectTag/{name}"] = value
