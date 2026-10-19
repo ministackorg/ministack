@@ -5827,12 +5827,17 @@ def _error_rule_denied(name: str) -> tuple:
 
 
 def _error_rule_name(name: str) -> tuple:
-    return error_response_json(
-        "InvalidRequestException",
-        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-        400,
+    """The 400 for a rule name outside the pattern, longer than 128, or both."""
+    failed = []
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", name):
+        failed.append("satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
+    if len(name) > 128:
+        failed.append("have length less than or equal to 128")
+    detail = "; ".join(
+        f"Value '{name}' at 'ruleName' failed to satisfy constraint: Member must {c}" for c in failed
     )
+    count = "1 validation error" if len(failed) == 1 else f"{len(failed)} validation errors"
+    return error_response_json("InvalidRequestException", f"{count} detected: {detail}", 400)
 
 
 def _replace_topic_rule(name: str, payload: dict) -> tuple:

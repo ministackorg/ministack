@@ -4102,6 +4102,62 @@ def test_iot_topic_rule_duplicate_rejected(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
 
 
+def test_iot_topic_rule_name_refused_by_pattern_and_length():
+    from conftest import make_client
+
+    raw = make_client("iot", {"parameter_validation": False})
+    long_name, long_dash = "r" * 129, "bad-" + "r" * 125
+    pattern = "Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    length = "Member must have length less than or equal to 128"
+    cases = (
+        ("bad-name", f"1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+                     f"constraint: {pattern}"),
+        (long_name, f"1 validation error detected: Value '{long_name}' at 'ruleName' failed to satisfy "
+                    f"constraint: {length}"),
+        (long_dash, f"2 validation errors detected: Value '{long_dash}' at 'ruleName' failed to satisfy "
+                    f"constraint: {pattern}; Value '{long_dash}' at 'ruleName' failed to satisfy "
+                    f"constraint: {length}"),
+    )
+    for name, message in cases:
+        calls = (
+            lambda: raw.create_topic_rule(
+                ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+            ),
+            lambda: raw.get_topic_rule(ruleName=name),
+            lambda: raw.disable_topic_rule(ruleName=name),
+        )
+        for call in calls:
+            with pytest.raises(ClientError) as ei:
+                call()
+            err = ei.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                400, "InvalidRequestException", message)
+    assert not [r for r in raw.list_topic_rules()["rules"] if r["ruleName"] in (long_name, long_dash)]
+
+
+def test_iot_topic_rule_name_with_trailing_newline_refused(iot_client):
+    name = _rule_name() + "\n"
+    message = (
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$"
+    )
+    calls = (
+        lambda: iot_client.create_topic_rule(
+            ruleName=name, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.get_topic_rule(ruleName=name),
+        lambda: iot_client.delete_topic_rule(ruleName=name),
+        lambda: iot_client.enable_topic_rule(ruleName=name),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException", message)
+    assert name not in [r["ruleName"] for r in iot_client.list_topic_rules()["rules"]]
+
+
 def test_iot_replace_topic_rule(iot_client):
     name = _rule_name()
     iot_client.create_topic_rule(
