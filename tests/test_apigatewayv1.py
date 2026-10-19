@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -8,10 +9,11 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
 import yaml
 from botocore.exceptions import ClientError
-from conftest import inprocess_iam_user, routed_request
+from conftest import inprocess_iam_user, make_client, routed_request
 
 from ministack.core.responses import set_request_region
 from ministack.services import apigateway_v1
@@ -1353,6 +1355,83 @@ def test_apigwv1_execute_aws_iam_requires_auth_header(apigw_v1, lam):
         lam.delete_function(FunctionName=fname)
 
 
+@contextlib.contextmanager
+def _second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def _signed_rest_get(url, key, secret, *, session=False, header=False, expires=300, skew=0):
+    """Status and x-amzn-ErrorType of a GET signed by botocore for execute-api, in its query string by default."""
+    import datetime as dt
+    import urllib.error
+    import urllib.request
+    from unittest import mock
+
+    import botocore.auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    token = None
+    if session:
+        credentials = boto3.client("sts", endpoint_url=_endpoint, aws_access_key_id=key, aws_secret_access_key=secret,
+                                   region_name="us-east-1").get_session_token()["Credentials"]
+        key, secret, token = credentials["AccessKeyId"], credentials["SecretAccessKey"], credentials["SessionToken"]
+    request = AWSRequest(method="GET", url=url)
+    signer = botocore.auth.SigV4Auth(Credentials(key, secret, token), "execute-api", "us-east-1") if header else (
+        botocore.auth.SigV4QueryAuth(Credentials(key, secret, token), "execute-api", "us-east-1", expires=expires))
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=skew)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        signer.add_auth(request)
+    prepared = request.prepare()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(prepared.url, headers=dict(prepared.headers))) as resp:
+            return resp.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("x-amzn-ErrorType", "").split(":")[0]
+
+
+_MISSING_TOKEN = (403, "MissingAuthenticationTokenException")
+_REST_SIGNED_CASES = {  # case: (signing arguments, answer under AUTH=true, answer with AUTH off)
+    "presigned": ({}, (200, None), _MISSING_TOKEN),
+    "presigned-4-min-ago-expires-60": ({"skew": -240, "expires": 60}, (200, None), _MISSING_TOKEN),
+    "presigned-session": ({"session": True}, (200, None), _MISSING_TOKEN),
+    "presigned-wrong-secret": ({"secret": "wrong"}, (403, "InvalidSignatureException"), _MISSING_TOKEN),
+    "header-signed": ({"header": True}, (200, None), (200, None)),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case", list(_REST_SIGNED_CASES))
+def test_apigwv1_aws_iam_presigned_call_contract(auth_enabled, iam_user, apigw_v1, case):
+    """Under AUTH=true a verified presigned call reaches an AWS_IAM method, as a header-signed one does."""
+    api_id = apigw_v1.create_rest_api(name=f"v1-presigned-{_uuid_mod.uuid4().hex[:8]}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        apigw_v1.put_method(restApiId=api_id, resourceId=root["id"], httpMethod="GET", authorizationType="AWS_IAM")
+        apigw_v1.put_integration(restApiId=api_id, resourceId=root["id"], httpMethod="GET", type="MOCK",
+                                 requestTemplates={"application/json": '{"statusCode": 200}'})
+        apigw_v1.put_method_response(restApiId=api_id, resourceId=root["id"], httpMethod="GET", statusCode="200")
+        apigw_v1.put_integration_response(restApiId=api_id, resourceId=root["id"], httpMethod="GET",
+                                          statusCode="200")
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["execute-api:Invoke", "sts:GetSessionToken"], "Resource": "*"}]}
+        args, strict, permissive = _REST_SIGNED_CASES[case]
+        with _second_access_key(iam_user(policy=policy)) as (key, secret):
+            args = {"key": key, "secret": secret, **args}
+            answer = _signed_rest_get(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p/",
+                                      args.pop("key"), args.pop("secret"), **args)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+    assert answer == (strict if auth_enabled else permissive)
+
+
 def _policy_api(policy, region="us-east-1"):
     """A deployed REST API with GET /iam (AWS_IAM) and GET /open (NONE), both MOCK, and *policy*."""
     set_request_region(region)
@@ -1437,6 +1516,71 @@ def test_api_policy_applies_to_an_unsigned_call_on_a_method_without_authorizatio
 def test_api_policy_treats_a_bearer_token_on_a_method_without_authorization_as_anonymous(auth):
     api_id = _policy_api(_api_policy(("Allow", _ACCOUNT)))
     assert _invoke(api_id, "open", headers={"authorization": "Bearer abc.def.ghi"})[0] == 403
+
+
+@contextlib.contextmanager
+def _contract_signing_credentials(user):
+    """A second access key of an ``iam_user`` for raw SigV4 calls, deleted before the fixture's cleanup."""
+    from botocore.credentials import Credentials
+
+    admin = make_client("iam")
+    key = admin.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield Credentials(key["AccessKeyId"], key["SecretAccessKey"])
+    finally:
+        admin.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def _contract_invoke(api_id, path, credentials=None):
+    """GET /s/<path> of a deployed API over HTTP, SigV4-signed with *credentials* unless None."""
+    import urllib.error
+    import urllib.request
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    request = AWSRequest("GET", f"http://{host}/s/{path}", headers={"host": host})
+    if credentials:
+        SigV4Auth(credentials, "execute-api", "us-east-1").add_auth(request)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                request.url, headers=dict(request.headers.items()), method="GET"), timeout=10) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+@pytest.mark.auth_contract
+def test_api_policy_signed_call_on_a_method_without_authorization_contract(auth_enabled, iam_user, apigw_v1):
+    """A signed call to a NONE method meets the REST API policy as anonymous, even by the user it allows."""
+    user = iam_user(policy=_ALLOW_INVOKE)
+    api_id = apigw_v1.create_rest_api(
+        name=f"auth-none-{_uuid_mod.uuid4().hex[:8]}", policy=json.dumps(_api_policy(("Allow", {"AWS": user.arn}))),
+    )["id"]
+    try:
+        root_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        for part, authorization in (("iam", "AWS_IAM"), ("open", "NONE")):
+            resource_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart=part)["id"]
+            method = {"restApiId": api_id, "resourceId": resource_id, "httpMethod": "GET"}
+            apigw_v1.put_method(**method, authorizationType=authorization)
+            apigw_v1.put_integration(
+                **method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+            apigw_v1.put_method_response(**method, statusCode="200")
+            apigw_v1.put_integration_response(**method, statusCode="200")
+        apigw_v1.create_deployment(restApiId=api_id, stageName="s")
+        with _contract_signing_credentials(user) as credentials:
+            assert _contract_invoke(api_id, "iam", credentials)[0] == 200
+            for signer in (credentials, None):
+                status, headers, body = _contract_invoke(api_id, "open", signer)
+                if auth_enabled:
+                    assert (status, headers.get("x-amzn-ErrorType")) == (403, "AccessDeniedException")
+                    assert json.loads(body)["Message"].startswith(
+                        "User: anonymous is not authorized to perform: execute-api:Invoke")
+                else:
+                    assert status == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
 
 
 def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):
@@ -4575,6 +4719,67 @@ def test_apigwv1_aws_iam_method_fills_caller_identity(apigw_v1, lam, cognito_idp
         lam.delete_function(FunctionName=fname)
 
 
+@pytest.mark.auth_contract
+def test_apigwv1_methods_without_aws_iam_read_no_credentials(auth_enabled, iam_user, apigw_v1, apigw, cognito_idp):
+    """NONE and COGNITO_USER_POOLS methods and an HTTP API route without authorization ignore the SigV4 signer."""
+    import http.client as _http
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    pool = cognito_idp.create_user_pool(PoolName="none-methods")["UserPool"]
+    api = apigw_v1.create_rest_api(name="none-methods")["id"]
+    http_api = apigw.create_api(Name="none-route", ProtocolType="HTTP")["ApiId"]
+    try:
+        root = apigw_v1.get_resources(restApiId=api)["items"][0]["id"]
+        authorizer = apigw_v1.create_authorizer(
+            restApiId=api, name="pool", type="COGNITO_USER_POOLS", providerARNs=[pool["Arn"]],
+            identitySource="method.request.header.Authorization")["id"]
+        for part, kind in ((None, "NONE"), ("cognito", "COGNITO_USER_POOLS"), ("iam", "AWS_IAM")):
+            resource = apigw_v1.create_resource(restApiId=api, parentId=root, pathPart=part)["id"] if part else root
+            method = {"restApiId": api, "resourceId": resource, "httpMethod": "GET"}
+            extra = {"authorizerId": authorizer} if kind == "COGNITO_USER_POOLS" else {}
+            apigw_v1.put_method(**method, authorizationType=kind, **extra)
+            apigw_v1.put_integration(
+                **method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+            apigw_v1.put_method_response(**method, statusCode="200")
+            apigw_v1.put_integration_response(**method, statusCode="200", responseTemplates={"application/json": "{}"})
+        apigw_v1.create_deployment(restApiId=api, stageName="p")
+        integration = apigw.create_integration(  # nothing listens there: reaching it answers 502
+            ApiId=http_api, IntegrationType="HTTP_PROXY", IntegrationMethod="GET", IntegrationUri="http://127.0.0.1:9",
+            PayloadFormatVersion="1.0")["IntegrationId"]
+        apigw.create_route(ApiId=http_api, RouteKey="GET /open", Target=f"integrations/{integration}")
+        apigw.create_stage(ApiId=http_api, StageName="$default", AutoDeploy=True)
+
+        def status(api_id, path, credentials):
+            host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+            request = AWSRequest(method="GET", url=f"http://{host}{path}", headers={"Host": host})
+            SigV4Auth(credentials, "execute-api", "us-east-1").add_auth(request)
+            conn = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT, timeout=10)
+            try:
+                conn.request("GET", path, headers=dict(request.headers))
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        allowed = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "execute-api:Invoke", "Resource": "*"}]})
+        with _contract_signing_credentials(allowed) as allowed_key, \
+                _contract_signing_credentials(iam_user()) as bare_key:
+            assert status(api, "/p/iam", allowed_key) == 200
+            assert status(api, "/p/iam", bare_key) == (403 if auth_enabled else 200)
+            unknown = Credentials("AKIAUNKNOWNKEY000001", "secret")
+            for signer in (bare_key, Credentials(bare_key.access_key, "wrong-secret"), unknown):
+                assert status(api, "/p/", signer) == 200
+                assert status(api, "/p/cognito", signer) == 401
+                assert status(http_api, "/open", signer) == 502
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api)
+        apigw.delete_api(ApiId=http_api)
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
+
+
 def _v1_signed_token(claims: dict) -> str:
     """Mint an RS256 token signed with the local Cognito pool key."""
     import base64 as _b64
@@ -4878,7 +5083,7 @@ def test_apigwv1_cognito_client_credentials_http(apigw_v1, cognito_idp, basic):
             assert (status, body) == (401, {"message": "Unauthorized"})
             assert headers["x-amzn-errortype"] == "UnauthorizedException"
         for scope, error in (("api/admin", "invalid_grant"), ("api/missing", "invalid_scope"),
-                             ("api/read api/admin", "invalid_grant"), ("api/read api/missing", "invalid_scope")):
+                             ("api/read api/admin", "invalid_grant"), ("api/admin bogus/x", "invalid_grant")):
             status, response = get_token(scope)
             assert status == 400, response
             assert response["error"] == error
