@@ -170,20 +170,17 @@ def _incomplete(authorization: str, reason: str, code: str = "IncompleteSignatur
     return code, f"{reason} (Hashed with SHA-256 and encoded with Base64) Authorization={digest}"
 
 
+def _missing_parts(values: Mapping[str, Any], names: tuple[str, ...]) -> tuple[list[str], str]:
+    """The names without a value, and the code: MissingAuthorizationParameter when one is left out entirely."""
+    missing = [name for name in names if not values.get(name)]
+    absent = any(name not in values for name in missing)
+    return missing, "MissingAuthorizationParameter" if absent else "IncompleteSignature"
+
+
 def parse_header_signature(headers: Mapping[str, Any]) -> HeaderSignature | tuple[str, str]:
-    """Split a header signature into its parts, or name the part that is missing."""
+    """Split a header signature into its parts, or name every part that is missing."""
     authorization = headers.get("authorization", "")
     fields = dict(part.strip().partition("=")[::2] for part in authorization.split(" ", 1)[-1].split(","))
-    for name in ("Credential", "SignedHeaders", "Signature"):
-        if not fields.get(name):
-            return _incomplete(
-                authorization, f"Authorization header requires '{name}' parameter.", "MissingAuthorizationParameter")
-    scope = fields["Credential"].split("/")
-    if len(scope) != 5:
-        return "IncompleteSignature", (
-            "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
-            f"got '{fields['Credential']}'"
-        )
     amz_date = headers.get("x-amz-date", "")
     if not amz_date and headers.get("date"):
         try:
@@ -191,10 +188,19 @@ def parse_header_signature(headers: Mapping[str, Any]) -> HeaderSignature | tupl
             amz_date = signed_at.strftime("%Y%m%dT%H%M%SZ")
         except (TypeError, ValueError):
             pass
-    if not amz_date:
-        return _incomplete(
-            authorization, "Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header."
+    no_date = "Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header."
+    missing, code = _missing_parts(fields, ("Credential", "Signature", "SignedHeaders"))
+    if missing:
+        reasons = [f"Authorization header requires '{name}' parameter." for name in missing]
+        return _incomplete(authorization, " ".join(reasons + ([] if amz_date else [no_date])), code)
+    scope = fields["Credential"].split("/")
+    if len(scope) != 5:
+        return "IncompleteSignature", (
+            "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
+            f"got '{fields['Credential']}'"
         )
+    if not amz_date:
+        return _incomplete(authorization, no_date)
     return HeaderSignature(*scope[:4], fields["SignedHeaders"], fields["Signature"], amz_date)
 
 
@@ -204,12 +210,16 @@ def _query_value(query_params: Mapping[str, Any], name: str) -> str:
 
 
 def parse_query_signature(query_params: Mapping[str, Any]) -> HeaderSignature | tuple[str, str]:
-    """Split a query-string (presigned) signature into its parts, or name the part that is missing."""
+    """Split a query-string (presigned) signature into its parts, or name every part that is missing."""
+    names = ("X-Amz-Credential", "X-Amz-Signature", "X-Amz-SignedHeaders", "X-Amz-Date")
+    missing, code = _missing_parts(
+        {name: _query_value(query_params, name) for name in names
+         if name in query_params or name.lower() in query_params}, names)
+    if missing:
+        return code, " ".join(
+            [f"AWS query-string parameters must include '{name}'." for name in missing]
+            + ["Re-examine the query-string parameters."])
     credential = _query_value(query_params, "X-Amz-Credential")
-    for name in ("X-Amz-Signature", "X-Amz-SignedHeaders", "X-Amz-Date"):
-        if not _query_value(query_params, name):
-            return "IncompleteSignature", (
-                f"AWS query-string parameters must include '{name}'. Re-examine the query-string parameters.")
     scope = credential.split("/")
     if len(scope) != 5:
         return "IncompleteSignature", (
@@ -275,6 +285,33 @@ def _remove_dot_segments(path: str) -> str:
 _cached_signing_key = functools.lru_cache(maxsize=256)(derive_signing_key)
 
 
+def header_signing_documents(
+    signature: HeaderSignature,
+    method: str,
+    raw_path: str,
+    query_params: Mapping[str, Any],
+    headers: Mapping[str, Any],
+    body: bytes,
+    *,
+    presigned: bool = False,
+) -> tuple[str, str]:
+    """The canonical request and string to sign, also used in S3 signature errors."""
+    path = raw_path if signature.service == "s3" else uri_encode(_remove_dot_segments(raw_path), encode_slash=False)
+    payload_hash = headers.get("x-amz-content-sha256") or hashlib.sha256(body).hexdigest()
+    excluded = ("x-amz-signature",) if presigned else ()
+    if presigned and signature.service == "iotdevicegateway":
+        # AWS IoT signs the URL without the session token and appends the token afterwards.
+        excluded += ("x-amz-security-token",)
+    canonical_request = "\n".join([
+        method, path, build_canonical_query_string(query_params, exclude=excluded),
+        build_canonical_headers(headers, signature.signed_headers), signature.signed_headers, payload_hash,
+    ])
+    string_to_sign = build_string_to_sign(
+        signature.amz_date, signature.date_stamp, signature.region, signature.service, canonical_request
+    )
+    return canonical_request, string_to_sign
+
+
 def header_signature_failure(
     signature: HeaderSignature,
     secret: str,
@@ -291,22 +328,23 @@ def header_signature_failure(
     if signature.date_stamp != signature.amz_date[:8]:
         return "CredentialDateMismatch", (
             "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ")
-    path = raw_path if signature.service == "s3" else uri_encode(_remove_dot_segments(raw_path), encode_slash=False)
-    payload_hash = headers.get("x-amz-content-sha256") or hashlib.sha256(body).hexdigest()
-    excluded = ("x-amz-signature",) if presigned else ()
-    canonical_request = "\n".join([
-        method, path, build_canonical_query_string(query_params, exclude=excluded),
-        build_canonical_headers(headers, signature.signed_headers), signature.signed_headers, payload_hash,
-    ])
-    string_to_sign = build_string_to_sign(
-        signature.amz_date, signature.date_stamp, signature.region, signature.service, canonical_request
+    _, string_to_sign = header_signing_documents(
+        signature, method, raw_path, query_params, headers, body, presigned=presigned,
     )
+    # Only an explicit streaming marker requires chunk verification; an absent
+    # header's body hash was already computed in header_signing_documents.
+    payload_hash = headers.get("x-amz-content-sha256") or ""
     key = _cached_signing_key(secret, signature.date_stamp, signature.region, signature.service)
     computed = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
     if not signatures_match(computed, signature.signature) or (
         payload_hash.startswith("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
         and not _chunk_signatures_match(body, computed, signature, key)
     ):
+        if explain:  # API Gateway names the strings it expected
+            return "SignatureDoesNotMatch", (
+                f"{SIGNATURE_MISMATCH}\n\nThe Canonical String for this request should have been\n'{canonical_request}'"
+                f"\n\nThe String-to-Sign should have been\n'{string_to_sign}'\n"
+            )
         return "SignatureDoesNotMatch", SIGNATURE_MISMATCH
     return None
 

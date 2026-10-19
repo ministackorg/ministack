@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from ministack.core.responses import new_uuid
 
-from .custom_resource import _HOST, _PORT
+from .custom_resource import _gateway_url
 
 logger = logging.getLogger("cloudformation")
 
@@ -95,7 +95,7 @@ def validate_resource_signal_timeout(value, logical_id: str) -> int:
 
 
 def handle_url(token: str) -> str:
-    return f"http://{_HOST}:{_PORT}{SIGNAL_PATH}{token}"
+    return f"{_gateway_url()}{SIGNAL_PATH}{token}"
 
 
 def _token_of(url) -> str | None:

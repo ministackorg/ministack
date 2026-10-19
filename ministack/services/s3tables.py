@@ -689,7 +689,13 @@ def _in_bucket(bucket_arn: str, bucket_filter) -> bool:
     return bucket_arn.endswith("/" + bucket_filter)
 
 
-def _iceberg_allows_cross_region(headers):
+def _iceberg_allows_cross_region(headers, query_params=None):
+    """Whether a call names no signing region; under AUTH a presigned call names it in its query, as checks read it."""
+    if query_params and "X-Amz-Credential" in query_params:
+        from ministack.app import AUTH
+
+        if AUTH:
+            return False
     return _SIGV4_CREDENTIAL_REGION_RE.search(headers.get("authorization", "")) is None
 
 
@@ -1102,14 +1108,141 @@ def _unknown_operation():
     return 404, {"Content-Type": "application/xml"}, b"<UnknownOperationException/>"
 
 
+# Iceberg REST calls on a namespace or table -> the s3tables actions they need, in order.
+_ICEBERG_NAMESPACE_ACTIONS = {
+    (0, "GET"): "ListNamespaces",
+    (0, "POST"): "CreateNamespace",
+    (1, "GET"): "GetNamespace",
+    (1, "HEAD"): "GetNamespace",
+    (1, "DELETE"): "DeleteNamespace",
+}
+_ICEBERG_TABLE_ACTIONS = {
+    (2, "GET"): ("ListTables",),
+    (2, "POST"): ("CreateTable", "PutTableData"),
+    (3, "GET"): ("GetTableMetadataLocation", "GetTableData"),
+    (3, "POST"): ("UpdateTableMetadataLocation", "PutTableData", "GetTableData"),
+    (3, "DELETE"): ("DeleteTable",),
+    (3, "HEAD"): ("GetTable",),
+}
+_ICEBERG_BUCKET_ACTIONS = frozenset({"ListTables", "CreateTable"})
+_TABLE_BUCKET_CATALOG_RE = re.compile(r"\d{12}:s3tablescatalog/([a-z0-9-]+)")
+
+
+def _iceberg_route(method, path):
+    """The route the Iceberg REST router reads from a path: (route, raw {prefix} segments, raw segments after it)."""
+    parts = [p for p in path.strip("/").split("/") if p]
+    if parts[1:2] == ["v1"] and parts[2:] == ["config"] and method == "GET":
+        return "config", [], []
+    if parts[1:2] == ["v1"] and method == "POST" and "transactions" in parts[2:]:
+        index = parts.index("transactions", 2)
+        return "transactions", parts[2:index], parts[index + 1:]
+    if "namespaces" in parts[2:]:
+        index = parts.index("namespaces", 2)
+        return "namespaces", parts[2:index], parts[index + 1:]
+    if method == "POST" and len(parts) > 3 and parts[-2:] == ["tables", "rename"]:
+        return "rename", parts[2:-2], []
+    return None
+
+
+def _iceberg_change_identifier(change):
+    """The namespace and table name a transactions/commit table change names, read as the commit reads them."""
+    ident = change.get("identifier", {})
+    ns = ident.get("namespace", [""])
+    return (ns[0] if isinstance(ns, list) else ns), ident.get("name", "")
+
+
+def iceberg_iam_checks(method, path, body, query_params):
+    """The s3tables actions an Iceberg REST call on a table bucket needs, with resources, in AWS's order; else None."""
+    route = _iceberg_route(method, path)
+    if not route:
+        return None
+    kind, prefix, rest = route
+    if kind == "config":
+        warehouse = query_params.get("warehouse", "") if query_params else ""
+        warehouse = (warehouse[0] if warehouse else "") if isinstance(warehouse, list) else warehouse
+        bucket_arn = _iceberg_bucket_arn(warehouse)
+        # getConfig serves any account:s3tablescatalog/ warehouse; one that names no bucket needs it on every bucket.
+        if bucket_arn != "*" or ":s3tablescatalog/" in warehouse:
+            return [("s3tables:GetTableBucket", bucket_arn)]
+        return None
+    bucket_arn = _iceberg_bucket_arn(unquote("/".join(prefix)))
+    if bucket_arn == "*":
+        return None
+    if kind == "rename":
+        try:
+            source = json.loads(body or b"{}").get("source") or {}
+            namespace, name = source.get("namespace") or [""], source.get("name", "")
+        except (ValueError, AttributeError):
+            namespace, name = [""], ""
+        namespace = namespace[0] if isinstance(namespace, list) else namespace
+        return [("s3tables:RenameTable", _iceberg_table_arn(bucket_arn, namespace, name))]
+    if kind == "transactions":
+        # Each table change is an updateTable; a body whose changes cannot be read needs them on every resource.
+        try:
+            data = json.loads(body) if body else {}
+            tables = [_iceberg_change_identifier(change) for change in data.get("table-changes", [])]
+        except (ValueError, TypeError, AttributeError, IndexError):
+            tables = []
+        arns = [_iceberg_table_arn(bucket_arn, ns, name) for ns, name in tables] or ["*"]
+        return [(f"s3tables:{name}", arn) for arn in arns for name in _ICEBERG_TABLE_ACTIONS[3, "POST"]]
+    if len(rest) < 2:
+        action = _ICEBERG_NAMESPACE_ACTIONS.get((len(rest), method))
+        return [(f"s3tables:{action}", bucket_arn)] if action else None
+    if rest[1] != "tables" or len(rest) > 3:
+        return None
+    table_arn = _iceberg_table_arn(bucket_arn, rest[0], rest[2] if len(rest) == 3 else "")
+    names = _ICEBERG_TABLE_ACTIONS.get((len(rest), method), ())
+    return [(f"s3tables:{name}", bucket_arn if name in _ICEBERG_BUCKET_ACTIONS else table_arn)
+            for name in names] or None
+
+
+def iceberg_lacks_prefix(method, path):
+    """Whether an Iceberg REST route leaves out the table bucket {prefix}, which the router answers 404 unread."""
+    route = _iceberg_route(method, path)
+    return bool(route) and route[0] != "config" and not route[1]
+
+
+def iceberg_prefix_error(method, path):
+    """The 400 for a route whose {prefix} names no table bucket, which AWS answers before any policy check."""
+    route = _iceberg_route(method, path)
+    if not route or route[0] == "config" or not route[1]:
+        return None
+    prefix = unquote("/".join(route[1]))
+    if _iceberg_bucket_arn(prefix) != "*":
+        return None
+    if _TABLE_BUCKET_ARN_RE.match(prefix):
+        message = "The specified bucket name isn't valid. Specify a different bucket name, and then try again."
+    else:
+        message = "The specified table bucket ARN is not valid."
+    status, headers, body = _iceberg_error(message, "bad_request", 400)
+    return status, headers, b"" if method == "HEAD" else body
+
+
+def _iceberg_bucket_arn(prefix):
+    """The table bucket a {prefix} or warehouse names by its ARN or as account:s3tablescatalog/bucket, or '*'."""
+    if _TABLE_BUCKET_ARN_RE.fullmatch(prefix):
+        return prefix
+    named = _TABLE_BUCKET_CATALOG_RE.fullmatch(prefix)
+    return _bucket_arn(named.group(1)) if named else "*"
+
+
+def _iceberg_table_arn(bucket_arn, namespace, name):
+    """A table's ARN; AWS names table/* for a table that does not exist."""
+    if bucket_arn == "*":
+        return "*"
+    table = _tables.get(_table_key(bucket_arn, namespace, name))
+    return table["tableARN"] if table else f"{bucket_arn}/table/*"
+
+
 async def _handle_iceberg_request(method, path, headers, body, query_params):
     parts = [p for p in path.strip("/").split("/") if p]
-    allow_cross_region = _iceberg_allows_cross_region(headers)
+    allow_cross_region = _iceberg_allows_cross_region(headers, query_params)
     # parts: ["iceberg", "v1", ...]
     if len(parts) < 2:
         return None
 
-    if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
+    route = _iceberg_route(method, path)
+    if route and route[0] == "config":
         return _iceberg_config(query_params, headers)
 
     # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit.
@@ -1117,40 +1250,26 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     # this arrives as /iceberg/v1/{prefix}/transactions/commit. Match on the
     # `transactions` segment wherever it lands, not a fixed position — otherwise
     # a prefixed commit is silently dropped and the delivery writes nothing.
-    if parts[1] == "v1" and method == "POST" and "transactions" in parts[2:]:
+    if route and route[0] == "transactions":
         data = json.loads(body) if body else {}
-        tx_idx = parts.index("transactions", 2)
-        if tx_idx == 2:
+        if not route[1]:
             return _unknown_operation()
-        tx_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:tx_idx])))
+        tx_filter = _bucket_scope_from_prefix(unquote("/".join(route[1])))
         for change in data.get("table-changes", []):
-            ident = change.get("identifier", {})
-            ns = ident.get("namespace", [""])
-            ns = ns[0] if isinstance(ns, list) else ns
-            tbl = ident.get("name", "")
+            ns, tbl = _iceberg_change_identifier(change)
             result = _iceberg_commit_table(ns, tbl, change, allow_cross_region, tx_filter)
             if result and result[0] not in (200, 204):
                 return result
         return json_response({})
 
-    if len(parts) < 3:
-        return None
-
     # Every route but /v1/config takes the {prefix}, which "for S3 Tables is
     # always your url-encoded table bucket ARN"; it can span several segments.
-    bucket_filter = None
-    ns_idx = None
-    for i in range(2, len(parts)):
-        if parts[i] == "namespaces":
-            ns_idx = i
-            break
-    if ns_idx is None:
+    if not route or route[0] != "namespaces":
         return None
-    if ns_idx == 2:
+    prefix, rest = route[1], route[2]  # rest: segments after "namespaces"
+    if not prefix:
         return _unknown_operation()
-    bucket_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:ns_idx])))
-
-    rest = parts[ns_idx + 1 :]  # segments after "namespaces"
+    bucket_filter = _bucket_scope_from_prefix(unquote("/".join(prefix)))
 
     if len(rest) == 0 and method == "GET":
         return _iceberg_list_namespaces(allow_cross_region, bucket_filter)

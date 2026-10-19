@@ -6239,6 +6239,18 @@ def test_cfn_wait_condition_validators(validator, value, message):
     assert wc.validate_resource_signal_timeout("PT1H30M15S", "Wait") == 5415
 
 
+def test_cfn_wait_condition_handle_url_names_the_scheme_the_gateway_serves(monkeypatch):
+    """Under USE_SSL the gateway answers TLS only, so the handle URL is https."""
+    from ministack.services.cloudformation import custom_resource
+    from ministack.services.cloudformation import wait_conditions as wc
+
+    monkeypatch.delenv("USE_SSL", raising=False)
+    assert wc.handle_url("tok").startswith("http://")
+    monkeypatch.setenv("USE_SSL", "1")
+    assert wc.handle_url("tok") == (
+        f"https://{custom_resource._HOST}:{custom_resource._PORT}/_ministack/cfn-signal/tok")
+
+
 @pytest.mark.parametrize(
     "policy",
     [
@@ -18916,6 +18928,17 @@ def test_cfn_response_endpoint_accepts_put(cfn):
         assert resp.status == 200
 
 
+def test_cfn_response_url_names_the_scheme_the_gateway_serves(monkeypatch):
+    """Under USE_SSL the gateway answers TLS only, so the ResponseURL is https."""
+    from ministack.services.cloudformation import custom_resource
+
+    monkeypatch.delenv("USE_SSL", raising=False)
+    assert custom_resource._response_url("tok").startswith("http://")
+    monkeypatch.setenv("USE_SSL", "1")
+    assert custom_resource._response_url("tok") == (
+        f"https://{custom_resource._HOST}:{custom_resource._PORT}/_ministack/cfn-response/tok")
+
+
 # -- Create lifecycle -------------------------------------------------------
 
 _CR_HANDLER_SUCCESS = """\
@@ -21525,7 +21548,7 @@ def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_create(cfn, iot_cl
             "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
         with pytest.raises(ClientError) as ei:
             iot_client.get_topic_rule(ruleName=rule_name)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
@@ -22093,6 +22116,42 @@ def test_cfn_update_iam_role_in_place(cfn, iam):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+@pytest.mark.parametrize("operation, effect, message", [
+    ("create", "Allow", "Allow with NotPrincipal is not allowed."),
+    ("update", "Deny", "AssumeRole policy must not contain NotPrincipal field."),
+], ids=["create", "update"])
+def test_cfn_iam_role_not_principal_trust_policy_fails_the_resource(cfn, iam, operation, effect, message):
+    """IAM refuses a trust policy with NotPrincipal, so the role is not created or keeps its old one."""
+    name = f"cfn-np-role-{_uuid_mod.uuid4().hex[:8]}"
+    plain = {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
+    refused = {"Effect": effect, "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:root"}, "Action": "sts:AssumeRole"}
+
+    def tpl(statements):
+        return json.dumps({"Resources": {"Role": {"Type": "AWS::IAM::Role", "Properties": {
+            "RoleName": name, "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": statements}}}}})
+
+    try:
+        if operation == "update":
+            cfn.create_stack(StackName=name, TemplateBody=tpl([plain]), Capabilities=["CAPABILITY_NAMED_IAM"])
+            assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        statements = [plain, refused] if effect == "Deny" else [refused]
+        getattr(cfn, f"{operation}_stack")(StackName=name, TemplateBody=tpl(statements),
+                                           Capabilities=["CAPABILITY_NAMED_IAM"])
+        assert _wait_stack(cfn, name)["StackStatus"] == (
+            "UPDATE_ROLLBACK_COMPLETE" if operation == "update" else "ROLLBACK_COMPLETE")
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                   if e["LogicalResourceId"] == "Role" and e["ResourceStatus"] == f"{operation.upper()}_FAILED"]
+        assert any(message in r for r in reasons), reasons
+        if operation == "update":
+            trust = iam.get_role(RoleName=name)["Role"]["AssumeRolePolicyDocument"]
+            assert trust["Statement"] == [plain]
+        else:
+            with pytest.raises(iam.exceptions.NoSuchEntityException):
+                iam.get_role(RoleName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_update_iam_managed_policy_in_place(cfn, iam):
     """A managed policy's document update creates a new default version on
     the same ARN, exactly as CloudFormation's handler does."""
@@ -22213,6 +22272,48 @@ def test_cfn_cognito_user_pool_update_preserves_users(cfn, cognito_idp):
 
     cfn.delete_stack(StackName="cfn-pool-upd")
     _wait_stack(cfn, "cfn-pool-upd")
+
+
+def test_cfn_cognito_user_pool_tier(cfn, cognito_idp):
+    """UserPoolTier is applied on create and updated in place; dropping it keeps the pool's tier."""
+    def template(**props):
+        return json.dumps({
+            "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool",
+                                   "Properties": {"UserPoolName": "cfn-tier", **props}}},
+            "Outputs": {"Id": {"Value": {"Ref": "Pool"}}},
+        })
+
+    def tier(pid):
+        return cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["UserPoolTier"]
+
+    cfn.create_stack(StackName="cfn-tier", TemplateBody=template(UserPoolTier="LITE"))
+    stack = _wait_stack(cfn, "cfn-tier")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    pool_id = stack["Outputs"][0]["OutputValue"]
+    assert tier(pool_id) == "LITE"
+    for props, expected in (({"UserPoolTier": "PLUS"}, "PLUS"), ({"UserPoolTier": "LITE"}, "LITE"), ({}, "LITE")):
+        cfn.update_stack(StackName="cfn-tier", TemplateBody=template(**props))
+        stack = _wait_stack(cfn, "cfn-tier")
+        assert stack["StackStatus"] == "UPDATE_COMPLETE"
+        assert stack["Outputs"][0]["OutputValue"] == pool_id
+        assert tier(pool_id) == expected
+    cfn.delete_stack(StackName="cfn-tier")
+    _wait_stack(cfn, "cfn-tier")
+
+    cfn.create_stack(StackName="cfn-tier-audit", TemplateBody=template(
+        UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"}))
+    stack = _wait_stack(cfn, "cfn-tier-audit")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    assert tier(stack["Outputs"][0]["OutputValue"]) == "PLUS"
+    cfn.delete_stack(StackName="cfn-tier-audit")
+    _wait_stack(cfn, "cfn-tier-audit")
+
+    cfn.create_stack(StackName="cfn-tier-ess-audit", TemplateBody=template(
+        UserPoolTier="ESSENTIALS", UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"}))
+    assert _wait_stack(cfn, "cfn-tier-ess-audit")["StackStatus"] == "ROLLBACK_COMPLETE"
+    assert "FeatureUnavailableInTierException" in _stack_event_reasons(cfn, "cfn-tier-ess-audit")
+    cfn.delete_stack(StackName="cfn-tier-ess-audit")
+    _wait_stack(cfn, "cfn-tier-ess-audit")
 
 
 def test_cfn_secret_update_keeps_arn_and_versions(cfn):

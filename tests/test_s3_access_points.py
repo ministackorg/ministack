@@ -238,6 +238,31 @@ def test_access_point_alias_works_as_a_bucket_name(bucket, access_point):
     assert s3.get_object(Bucket=bucket, Key="copied.txt")["Body"].read() == b"hello"
 
 
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("addressing_style", ["path", "virtual"])
+@pytest.mark.parametrize("allow_upload", [False, True], ids=["no-permission", "allow"])
+def test_access_point_alias_upload_permission_contract(
+    bucket, access_point, auth_enabled, iam_user, addressing_style, allow_upload,
+):
+    _, created = access_point
+    policy = {"Statement": [{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if allow_upload else None).client(
+        "s3", config=Config(s3={"addressing_style": addressing_style}),
+    )
+    root = _client("s3", "us-east-1")
+    if auth_enabled and not allow_upload:
+        with pytest.raises(ClientError) as exc:
+            client.put_object(Bucket=created["Alias"], Key="contract-upload", Body=b"via alias")
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert root.list_objects_v2(Bucket=bucket, Prefix="contract-upload")["KeyCount"] == 0
+    else:
+        assert client.put_object(
+            Bucket=created["Alias"], Key="contract-upload", Body=b"via alias",
+        )["ResponseMetadata"]["HTTPStatusCode"] == 200
+        with root.get_object(Bucket=bucket, Key="contract-upload")["Body"] as body:
+            assert body.read() == b"via alias"
+
+
 def test_access_point_alias_from_another_account_is_denied(access_point):
     _name, created = access_point
     other = _client("s3", "us-east-1", account_key="111122223333")

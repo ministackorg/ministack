@@ -808,7 +808,7 @@ def _id_token_granted(scope: str | None) -> bool:
 
 
 def _client_credentials_scope_error(pool: dict, client: dict, requested: str | None):
-    """invalid_scope for an undefined scope, invalid_grant for one the client doesn't allow; the whole grant fails."""
+    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one the client doesn't allow."""
     allowed = client.get("AllowedOAuthScopes") or []
     wanted = requested.split() if requested else [s for s in allowed if "/" in s]
     defined = {
@@ -816,10 +816,13 @@ def _client_credentials_scope_error(pool: dict, client: dict, requested: str | N
         for identifier, server in (pool.get("_resource_servers") or {}).items()
         for scope in server.get("Scopes", [])
     }
-    if (requested and not wanted) or any(scope not in defined for scope in wanted):
+    # An undefined resource server scope is dropped when a defined one is requested
+    if (requested and not wanted) or any("/" not in scope for scope in wanted):
         error = "invalid_scope"
-    elif any(scope not in allowed for scope in wanted):
+    elif any(scope in defined and scope not in allowed for scope in wanted):
         error = "invalid_grant"
+    elif wanted and not defined.intersection(wanted):
+        error = "invalid_scope"
     else:
         return None
     return 400, {"Content-Type": "application/json"}, json.dumps({"error": error}).encode()
@@ -1302,8 +1305,16 @@ def _signature_valid(token: str) -> bool:
     return True
 
 
+def _token_owner(claims: dict):
+    """The user named by a token's iss and username, False if the pool lacks it, None without either."""
+    pool = _user_pools.get(str(claims.get("iss", "")).rsplit("/", 1)[-1])
+    if not pool or not claims.get("username"):
+        return None
+    return pool["_users"].get(claims["username"]) or False
+
+
 def _access_token_error(data: dict):
-    """The NotAuthorizedException for an AccessToken AWS would not accept, or None."""
+    """The error for an AccessToken AWS would not accept, or None."""
     token = data.get("AccessToken")
     if not token or not isinstance(token, str):
         return None
@@ -1316,6 +1327,10 @@ def _access_token_error(data: dict):
         message = "Could not verify signature for Access Token"
     elif not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]:
         message = "Access Token has expired"
+    elif (user := _token_owner(claims)) is False:
+        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    elif user and not user.get("Enabled", True):
+        message = "User is disabled."
     elif claims.get("origin_jti") in _revoked_tokens:
         message = "Access Token has been revoked"
     elif _API_TOKEN_SCOPE not in str(claims.get("scope", _API_TOKEN_SCOPE)).split():
@@ -2748,6 +2763,40 @@ async def _dispatch_identity(action: str, data: dict):
 # USER POOL CRUD
 # ===========================================================================
 
+_USER_POOL_TIERS = ("ESSENTIALS", "LITE", "PLUS")
+
+
+def _threat_protection_on(add_ons) -> bool:
+    return (add_ons or {}).get("AdvancedSecurityMode", "OFF") != "OFF"
+
+
+def _user_pool_tier(pool: dict) -> str:
+    """The pool's feature plan, defaulting as CreateUserPool does when the request omits it."""
+    tier = pool.get("UserPoolTier")
+    if tier is None:
+        tier = "PLUS" if _threat_protection_on(pool.get("UserPoolAddOns")) else "ESSENTIALS"
+    return tier
+
+
+def _user_pool_tier_error(tier, add_ons, policies, current=None):
+    """Refuse an unknown tier or a feature it lacks (threat protection on ESSENTIALS, password history on LITE)."""
+    if tier not in _USER_POOL_TIERS:
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{tier}' at 'userPoolTier' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_USER_POOL_TIERS)}]", 400)
+    if tier == "ESSENTIALS" and _threat_protection_on(add_ons):
+        feature = "Threat Protection"
+    elif tier == "LITE" and ((policies or {}).get("PasswordPolicy") or {}).get("PasswordHistorySize"):
+        feature = "Password History"
+    else:
+        return None
+    # A plan change the pool's features rule out has its own error code.
+    code = "TierChangeNotAllowedException" if current not in (None, tier) else "FeatureUnavailableInTierException"
+    return error_response_json(
+        code, f"The following features need to be disabled for the {tier} pricing tier configured: {feature}", 400)
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
@@ -2763,6 +2812,10 @@ def _create_user_pool(data):
             return error_response_json(
                 "InvalidParameterException",
                 "Required custom attributes are not supported.", 400)
+    tier = _user_pool_tier(data)
+    err = _user_pool_tier_error(tier, data.get("UserPoolAddOns"), data.get("Policies"))
+    if err:
+        return err
 
     pid = _pool_id()
     now = _now_epoch()
@@ -2802,6 +2855,7 @@ def _create_user_pool(data):
         "AccountRecoverySetting": data.get("AccountRecoverySetting", {}),
         "DeletionProtection": data.get("DeletionProtection", "INACTIVE"),
         "LambdaConfig": data.get("LambdaConfig", {}),
+        "UserPoolTier": tier,
         "Domain": None,
         "CustomDomain": None,
         "_clients": {},
@@ -2868,6 +2922,12 @@ def _update_user_pool(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    # An omitted tier keeps the pool's plan; omitted add-ons stay out of the check, AWS resets them.
+    current = _user_pool_tier(pool)
+    err = _user_pool_tier_error(data.get("UserPoolTier", current), data.get("UserPoolAddOns"),
+                                data.get("Policies", pool.get("Policies")), current)
+    if err:
+        return err
     updatable = {
         "Policies", "AutoVerifiedAttributes", "SmsVerificationMessage",
         "EmailVerificationMessage", "EmailVerificationSubject",
@@ -2875,7 +2935,7 @@ def _update_user_pool(data):
         "EmailConfiguration", "SmsConfiguration", "UserPoolTags",
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
-        "UserAttributeUpdateSettings",
+        "UserAttributeUpdateSettings", "UserPoolTier",
         # Deletion protection is switched off through UpdateUserPool before a
         # protected pool can be deleted (per the DeletionProtection property
         # on the CloudFormation resource reference).
@@ -2963,6 +3023,7 @@ def _email_configuration_out(email_configuration) -> dict:
 def _pool_out(pool: dict) -> dict:
     _ensure_schema_attributes(pool)
     output = {k: v for k, v in pool.items() if not k.startswith("_")}
+    output["UserPoolTier"] = _user_pool_tier(pool)
     if "EmailConfiguration" in output:
         output["EmailConfiguration"] = _email_configuration_out(
             output["EmailConfiguration"]
@@ -3829,6 +3890,13 @@ def _admin_disable_user(data):
         return err
     user["Enabled"] = False
     user["UserLastModifiedDate"] = _now_epoch()
+    from ministack.app import AUTH
+    if AUTH:
+        # Every session ends: its tokens stay revoked after AdminEnableUser.
+        _revoked_tokens.update(user.pop("_origin_jtis", []))
+        for tok in [t for t, e in _refresh_tokens.items()
+                    if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
+            del _refresh_tokens[tok]
     return json_response({})
 
 
@@ -4420,7 +4488,10 @@ def _refresh_auth_user(pool, pid, cid, refresh_token):
     if not user:
         return None, error_response_json("NotAuthorizedException",
                                          "The user has been deleted for the associated refresh token", 400)
-    if _refresh_token_revoked(refresh_token, user):
+    from ministack.app import AUTH
+    if AUTH and not user.get("Enabled", True):
+        return None, error_response_json("NotAuthorizedException", "User is disabled.", 400)
+    if _refresh_token_revoked(refresh_token, user) or (AUTH and claims.get("origin_jti") in _revoked_tokens):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
     return user, None
@@ -5964,6 +6035,18 @@ def _oauth2_error(error: str, description: str, status: int = 400):
     return status, {"Content-Type": "application/json"}, body
 
 
+def _invalid_scope_redirect(client, redirect_uri: str, scope: str, state: str):
+    """The redirect back to the app for an authorize request with a scope the client does not allow, or None."""
+    allowed_scopes = client.get("AllowedOAuthScopes") or []
+    if not (redirect_uri and scope and allowed_scopes and any(s not in allowed_scopes for s in scope.split())):
+        return None
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}error=invalid_request&error_description=invalid_scope"
+    if state:
+        location += f"&state={quote(state)}"
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+
 def _use_choice_based_ui(client) -> bool:
     """True when the client's ExplicitAuthFlows opts into USER_AUTH (choice-based
     sign-in), which drives a multi-step Hosted UI instead of the single-page form."""
@@ -6173,6 +6256,9 @@ def _oauth2_authorize_federation(query_params):
     if callback_urls and redirect_uri not in callback_urls:
         return error_response_json("InvalidParameterException",
                                    f"redirect_uri {redirect_uri} is not in CallbackURLs.", 400)
+    invalid_scope = _invalid_scope_redirect(client, redirect_uri, _qp(query_params, "scope"), state)
+    if invalid_scope:
+        return invalid_scope
 
     if not identity_provider:
         return error_response_json("InvalidParameterException", "identity_provider is required.", 400)
@@ -6279,14 +6365,9 @@ def handle_oauth2_authorize(method, path, headers, query_params):
         return _oauth2_error("invalid_request", "redirect_uri is required.")
     if callback_urls and redirect_uri not in callback_urls:
         return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
-
-    allowed_scopes = client.get("AllowedOAuthScopes") or []
-    if scope and allowed_scopes and any(s not in allowed_scopes for s in scope.split()):
-        sep = "&" if "?" in redirect_uri else "?"
-        location = f"{redirect_uri}{sep}error=invalid_request&error_description=invalid_scope"
-        if state:
-            location += f"&state={quote(state)}"
-        return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+    invalid_scope = _invalid_scope_redirect(client, redirect_uri, scope, state)
+    if invalid_scope:
+        return invalid_scope
 
     if _use_choice_based_ui(client):
         html_body = _username_page_html(
@@ -7291,6 +7372,32 @@ async def handle_oauth2_token(method, path, headers, body, query_params):
 
 # -- /oauth2/userInfo (GET/POST) ---------------------------------------------
 
+def _userinfo_token_error(token: str):
+    """The error_description /oauth2/userInfo answers for a token AWS would not accept, or None."""
+    claims = _token_claims(token)
+    if token.count(".") != 2 or not claims:
+        return "Access token format is not valid"
+    if not isinstance(claims.get("client_id"), str):
+        return "Value of client_id in token claims must be a String"
+    if claims.get("token_use") != "access":
+        return "Access token format is not valid"
+    expired = "Access token is expired or user has globally signed out, disabled, or been deleted"
+    # _access_token_error's checks without the admin scope, which userInfo does not require.
+    if ((_RSA_PRIVATE_KEY is not None and not _signature_valid(token))
+            or not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]
+            or claims.get("origin_jti") in _revoked_tokens):
+        return expired
+    if not isinstance(claims.get("username"), str):
+        return "Value of username in token claims must be a String"
+    pool = _get_pool_unscoped(str(claims.get("iss", "")).rsplit("/", 1)[-1])
+    user = _user_from_token(token, pool) if pool else None
+    if not user or not user.get("Enabled", True):
+        return expired
+    if "openid" not in str(claims.get("scope", "")).split():
+        return "Access token does not contain the 'openid' scope"
+    return None
+
+
 def handle_oauth2_userinfo(method, path, headers, body, query_params):
     """GET or POST /oauth2/userInfo — return user claims from the access token."""
     auth = headers.get("authorization", "")
@@ -7299,6 +7406,13 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
             json.dumps({"error": "invalid_token", "error_description": "Missing Bearer token."}).encode()
 
     token = auth.split(" ", 1)[1].strip()
+    from ministack.app import AUTH
+    error = _userinfo_token_error(token) if AUTH else None
+    if error:
+        iss = _token_claims(token).get("iss")
+        realm = f"realm={iss}, " if isinstance(iss, str) and _get_pool_unscoped(iss.rsplit("/", 1)[-1]) else ""
+        return 401, {"Content-Type": "application/json", "WWW-Authenticate": f"Bearer {realm}error=INVALID_TOKEN"}, \
+            json.dumps({"error": "invalid_token", "error_description": error}).encode()
     # Decode JWT payload
     try:
         parts = token.split(".")
@@ -7476,10 +7590,19 @@ def _update_identity_pool(data):
 
 
 def _get_id(data):
+    from ministack.app import AUTH
     iid = data.get("IdentityPoolId")
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    if AUTH:
+        logins = data.get("Logins") or {}
+        error = _identity_logins_error(pool, None, logins)
+        if error:
+            return error
+        owner = _link_logins(pool, None, logins)
+        if owner:
+            return json_response({"IdentityId": owner})
     identity_id = _identity_id(iid)
     pool["_identities"][identity_id] = {
         "IdentityId": identity_id,
@@ -7526,6 +7649,7 @@ def _get_credentials_for_identity(data):
     ``CognitoIdentityCredentials`` — GetCallerIdentity reports
     ``arn:aws:sts::<account>:assumed-role/<RoleName>/CognitoIdentityCredentials``.
     """
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     now = int(time.time())
     logins = data.get("Logins") or {}
@@ -7533,6 +7657,11 @@ def _get_credentials_for_identity(data):
     for _iid, candidate in _identity_pools.items():
         if identity_id in candidate.get("_identities", {}):
             pool = candidate
+            if AUTH:
+                error = _identity_logins_error(candidate, identity_id, logins)
+                if error:
+                    return error
+                identity_id = _link_logins(candidate, identity_id, logins)
             if not logins:
                 logins = candidate["_identities"][identity_id].get("Logins") or {}
             break
@@ -7581,7 +7710,104 @@ def _get_credentials_for_identity(data):
     })
 
 
+_LOGIN_TOKEN_CLOCK_SKEW = 300
+
+
+def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
+    """The NotAuthorizedException for Logins AWS would not accept for an identity (None: a new one), or None."""
+    identity = pool["_identities"][identity_id] if identity_id else {}
+    stored = identity.get("Logins") or {}
+    if not logins:
+        if not stored and not identity.get("_merged_into"):
+            return None
+        return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
+    unsupported = "Token is not from a supported provider of this identity pool."
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
+    for provider, token in logins.items():
+        clients = [p.get("ClientId") for p in pool.get("CognitoIdentityProviders") or []
+                   if p.get("ProviderName") == provider]
+        claims = _token_claims(token)
+        is_jwt = isinstance(token, str) and token.count(".") == 2 and bool(claims)
+        if provider == "accounts.google.com" and not is_jwt and provider in (pool.get("SupportedLoginProviders") or {}):
+            message = not_oidc
+        elif not provider.startswith("cognito-idp."):
+            # Other providers' tokens are opaque here.
+            continue
+        elif not clients:
+            message = unsupported
+        elif not is_jwt:
+            message = not_oidc
+        elif claims.get("iss") != f"https://{provider}":
+            message = "Invalid login token. Issuer doesn't match providerName"
+        elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
+            message = "Invalid login token. Token signature invalid."
+        elif "aud" not in claims:
+            message = "Invalid login token. Missing a required claim: aud"
+        elif claims["aud"] not in clients:
+            message = unsupported
+        elif not isinstance(claims.get("exp"), (int, float)) or skewed_now >= claims["exp"]:
+            message = f"Invalid login token. Token expired: {skewed_now} >= {claims.get('exp')}"
+        elif provider in stored and _token_claims(stored[provider]).get("sub") != claims.get("sub"):
+            message = mismatch
+        else:
+            continue
+        return error_response_json("NotAuthorizedException", message, 400)
+    # An identity with a login needs one of its own; a disabled one, a login another identity holds.
+    none_of_its_own = stored and not stored.keys() & logins.keys()
+    if none_of_its_own or identity.get("_merged_into") and not _login_owner(pool, logins):
+        return error_response_json("NotAuthorizedException", mismatch, 400)
+    return None
+
+
+def _login_owner(pool: dict, logins: dict):
+    """The id of the pool's identity that already holds one of these logins, or None."""
+    for provider, token in logins.items():
+        sub = _token_claims(token).get("sub")
+        for identity_id, identity in pool["_identities"].items():
+            held = (identity.get("Logins") or {}).get(provider)
+            if held is not None and (held == token or (sub and _token_claims(held).get("sub") == sub)):
+                return identity_id
+    return None
+
+
+def _link_logins(pool: dict, identity_id: str | None, logins: dict):
+    """Link Logins to the identity the call answers for, merge the identities holding them into it, return its id."""
+    identities = pool["_identities"]
+    caller = identities[identity_id] if identity_id else None
+    # An identity with a login answers for itself; one without (or disabled) gives way to the login's identity.
+    target = identity_id if caller and caller.get("Logins") else _login_owner(pool, logins) or identity_id
+    if target is None:
+        return None
+    identity = identities[target]
+    merged = dict.fromkeys(_login_owner(pool, {provider: token}) for provider, token in logins.items())
+    if target != identity_id and caller and not caller.get("_merged_into"):
+        merged[identity_id] = None
+    merged.pop(None, None)
+    merged.pop(target, None)
+    now = _now_epoch()
+    linked = dict(logins)
+    for other_id in merged:
+        other = identities[other_id]
+        linked = {**(other.get("Logins") or {}), **linked}
+        other.update(Logins={}, _merged_into=target, LastModifiedDate=now)
+    added = {provider: token for provider, token in linked.items() if provider not in (identity.get("Logins") or {})}
+    if added:
+        identity["Logins"] = {**(identity.get("Logins") or {}), **added}
+        identity["LastModifiedDate"] = now
+    return target
+
+
+def _identity_login_names(identity: dict) -> list:
+    """An identity's Logins as DescribeIdentity lists them; DISABLED and the region once merged into another."""
+    if identity.get("_merged_into"):
+        return ["DISABLED", identity["IdentityId"].partition(":")[0]]
+    return list((identity.get("Logins") or {}).keys())
+
+
 def _get_open_id_token(data):
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     # Find pool containing this identity
     pool_id = ""
@@ -7589,6 +7815,11 @@ def _get_open_id_token(data):
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
+            if AUTH:
+                error = _identity_logins_error(pool, identity_id, logins)
+                if error:
+                    return error
+                identity_id = _link_logins(pool, identity_id, logins)
             logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
     if not pool_id:
@@ -7698,11 +7929,12 @@ def _list_identities(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
     max_results = min(data.get("MaxResults", 60), 60)
-    identities = list(pool["_identities"].values())[:max_results]
+    identities = [i for i in pool["_identities"].values()
+                  if not (data.get("HideDisabled") and i.get("_merged_into"))][:max_results]
     return json_response({
         "IdentityPoolId": iid,
         "Identities": [
-            {"IdentityId": i["IdentityId"], "Logins": list(i.get("Logins", {}).keys()),
+            {"IdentityId": i["IdentityId"], "Logins": _identity_login_names(i),
              "CreationDate": i["CreationDate"], "LastModifiedDate": i["LastModifiedDate"]}
             for i in identities
         ],
@@ -7716,7 +7948,7 @@ def _describe_identity(data):
         if identity:
             return json_response({
                 "IdentityId": identity_id,
-                "Logins": list(identity.get("Logins", {}).keys()),
+                "Logins": _identity_login_names(identity),
                 "CreationDate": identity["CreationDate"],
                 "LastModifiedDate": identity["LastModifiedDate"],
             })
