@@ -465,6 +465,7 @@ def _create_trail(body: dict):
         "HasCustomEventSelectors": False,
         "HasInsightSelectors": False,
         "IsOrganizationTrail": body.get("IsOrganizationTrail", False),
+        "RecursiveLogging": body.get("RecursiveLogging", True),
         "IsLogging": False,
     }
     # CreateTrail must persist KmsKeyId so DescribeTrails/GetTrail echo it; otherwise a
@@ -484,6 +485,7 @@ def _create_trail(body: dict):
         "TrailARN": arn,
         "LogFileValidationEnabled": trail["LogFileValidationEnabled"],
         "IsOrganizationTrail": trail["IsOrganizationTrail"],
+        "RecursiveLogging": trail["RecursiveLogging"],
     }
     if kms:
         resp["KmsKeyId"] = kms
@@ -646,6 +648,7 @@ def _update_trail(body: dict):
         ("CloudWatchLogsLogGroupArn", "CloudWatchLogsLogGroupArn"),
         ("CloudWatchLogsRoleArn", "CloudWatchLogsRoleArn"),
         ("IsOrganizationTrail", "IsOrganizationTrail"),
+        ("RecursiveLogging", "RecursiveLogging"),
     ):
         if src in body:
             trail[dst] = body[src]
@@ -670,6 +673,7 @@ def _update_trail(body: dict):
         "CloudWatchLogsLogGroupArn": trail.get("CloudWatchLogsLogGroupArn", ""),
         "CloudWatchLogsRoleArn": trail.get("CloudWatchLogsRoleArn", ""),
         "IsOrganizationTrail": trail.get("IsOrganizationTrail", False),
+        "RecursiveLogging": trail.get("RecursiveLogging", True),
     }
     # Omit KmsKeyId when unset, matching CreateTrail and the DescribeTrails/GetTrail
     # read-back: AWS omits the field when there is no CMK, and an empty "" is not a
