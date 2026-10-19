@@ -14,6 +14,7 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
 
 import base64
 import copy
+import functools
 import json
 import logging
 import os
@@ -41,6 +42,8 @@ _metrics = AccountRegionScopedDict()
 # dashboards/history have no ARN so legacy data lands in the default region.
 _alarms = AccountRegionScopedDict()
 _composite_alarms = AccountRegionScopedDict()
+# Composite alarm name -> names of its children that changed state since its last transition, newest first.
+_composite_triggers = AccountRegionScopedDict()
 # Alarm state-change history, per-account+region. Stored under a single key
 # "entries" so the standard list manipulation still applies to the caller's scope.
 _alarm_history = AccountRegionScopedDict()
@@ -112,6 +115,7 @@ def get_state():
         "metrics": copy.deepcopy(_metrics),
         "alarms": copy.deepcopy(_alarms),
         "composite_alarms": copy.deepcopy(_composite_alarms),
+        "composite_triggers": copy.deepcopy(_composite_triggers),
         "alarm_history": copy.deepcopy(_alarm_history),
         "dashboards": copy.deepcopy(_dashboards),
         "resource_tags": copy.deepcopy(_resource_tags),
@@ -127,6 +131,7 @@ def _restore_state(data):
         _metrics.update(data.get("metrics", {}))
         _alarms.update(data.get("alarms", {}))
         _composite_alarms.update(data.get("composite_alarms", {}))
+        _composite_triggers.update(data.get("composite_triggers", {}))
         _alarm_history.update(data.get("alarm_history", {}))
         _dashboards.update(data.get("dashboards", {}))
         _resource_tags.update(data.get("resource_tags", {}))
@@ -336,6 +341,7 @@ def _evaluate_alarm(alarm):
         alarm["StateUpdatedTimestamp"] = int(time.time())
         _record_history(alarm["AlarmName"], old_state, new_state, reason)
         _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+        _evaluate_parent_alarms(alarm)
 
 
 def _evaluate_all_alarms():
@@ -346,11 +352,14 @@ def _evaluate_all_alarms():
             logger.debug("alarm eval error", exc_info=True)
 
 
-def _record_history(alarm_name, old_state, new_state, reason):
+def _record_history(alarm_name, old_state, new_state, reason, alarm_type="MetricAlarm", reason_data=None):
+    new = {"stateValue": new_state, "stateReason": reason}
+    if reason_data is not None:
+        new["stateReasonData"] = reason_data
     _history_entries().append(
         {
             "AlarmName": alarm_name,
-            "AlarmType": "MetricAlarm",
+            "AlarmType": alarm_type,
             "Timestamp": _ts_iso(time.time()),
             "HistoryItemType": "StateUpdate",
             "HistorySummary": f"Alarm updated from {old_state} to {new_state}",
@@ -358,7 +367,7 @@ def _record_history(alarm_name, old_state, new_state, reason):
                 {
                     "version": "1.0",
                     "oldState": {"stateValue": old_state},
-                    "newState": {"stateValue": new_state, "stateReason": reason},
+                    "newState": new,
                 }
             ),
         }
@@ -1087,6 +1096,234 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     return _xml(200, "PutMetricAlarmResponse", "")
 
 
+# ---------------------------------------------------------------------------
+# Composite alarm rules
+# ---------------------------------------------------------------------------
+
+_RULE_TOKEN = re.compile(r'[(),]|"(?:[^"\\]|\\.)*"|[^\s(),"]+|\S')
+_RULE_STATES = ("ALARM", "OK", "INSUFFICIENT_DATA")
+_RULE_OPERAND = "'(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA"
+
+
+@functools.lru_cache(maxsize=512)
+def _parse_alarm_rule(rule):
+    """Parse an AlarmRule into a tree of tuples, raising ValueError with the AWS message."""
+    tokens = [(m.group(), m.start()) for m in _RULE_TOKEN.finditer(rule)] + [("<EOF>", len(rule))]
+    at = 0
+
+    def word():
+        return tokens[at][0]
+
+    def fail(expected=None):
+        text, pos = tokens[at]
+        expected = f", must be: {expected}" if expected else ""
+        raise ValueError(f"Error in AlarmRule [Unsupported token '{text}' at char {pos}{expected}]")
+
+    def take(expected):
+        nonlocal at
+        if word() != expected:
+            fail()
+        at += 1
+
+    def ref():
+        nonlocal at
+        text = tokens[at][0]
+        if text in ("(", ")", ",", '"', "<EOF>"):
+            fail()
+        at += 1
+        return re.sub(r"\\(.)", r"\1", text[1:-1]) if text.startswith('"') else text
+
+    def operand():
+        nonlocal at
+        w = word()
+        at += 1
+        if w == "NOT":
+            return ("not", operand())
+        if w == "(":
+            node = disjunction()
+            take(")")
+            return node
+        if w in ("TRUE", "FALSE"):
+            return ("const", w == "TRUE")
+        if w in _RULE_STATES:
+            take("(")
+            name = ref()
+            take(")")
+            return ("state", w, name)
+        if w == "AT_LEAST":
+            take("(")
+            count = re.fullmatch(r"(\d+)(%?)", tokens[at][0])
+            if not count:
+                fail()
+            at += 1
+            take(",")
+            negate = word() == "NOT"
+            at += negate
+            state = word()
+            if state not in _RULE_STATES:
+                fail()
+            at += 1
+            take(",")
+            take("(")
+            names = [ref()]
+            while word() == ",":
+                at += 1
+                names.append(ref())
+            take(")")
+            take(")")
+            return ("at_least", int(count.group(1)), bool(count.group(2)), negate, state, tuple(names))
+        at -= 1
+        fail(_RULE_OPERAND)
+
+    def conjunction():
+        nonlocal at
+        node = operand()
+        while word() == "AND":
+            at += 1
+            node = ("and", node, operand())
+        return node
+
+    def disjunction():
+        nonlocal at
+        node = conjunction()
+        while word() == "OR":
+            at += 1
+            node = ("or", node, conjunction())
+        return node
+
+    tree = disjunction()
+    if at != len(tokens) - 1:
+        fail("<EOF>, 'AND', 'OR'")
+    return tree
+
+
+def _rule_alarm_state(ref):
+    name = _rule_ref_name(ref)
+    alarm = (_alarms.get(name) or _composite_alarms.get(name)) if name else None
+    return alarm["StateValue"] if alarm else None
+
+
+def _rule_true(node):
+    """Truth of a parsed AlarmRule over the current alarm states."""
+    kind = node[0]
+    if kind == "const":
+        return node[1]
+    if kind == "state":
+        return _rule_alarm_state(node[2]) == node[1]
+    if kind == "not":
+        return not _rule_true(node[1])
+    if kind == "and":
+        return _rule_true(node[1]) and _rule_true(node[2])
+    if kind == "or":
+        return _rule_true(node[1]) or _rule_true(node[2])
+    _, count, percent, negate, state, refs = node
+    hits = sum((_rule_alarm_state(r) == state) != negate for r in refs)
+    return hits * 100 >= count * len(refs) if percent else hits >= count
+
+
+def _rule_matches(node, target):
+    """Alarm references whose own condition gives the rule the value target (NOT flips it), in rule order."""
+    kind = node[0]
+    if kind == "state":
+        return [node[2]] if (_rule_alarm_state(node[2]) == node[1]) == target else []
+    if kind == "at_least":
+        _, _, _, negate, state, refs = node
+        return [r for r in refs if ((_rule_alarm_state(r) == state) != negate) == target]
+    if kind == "not":
+        return _rule_matches(node[1], not target)
+    if kind == "const":
+        return []
+    return _rule_matches(node[1], target) + _rule_matches(node[2], target)
+
+
+def _rule_refs(node):
+    """Alarm references of a parsed AlarmRule, in rule order."""
+    if node[0] == "state":
+        return [node[2]]
+    if node[0] == "at_least":
+        return list(node[5])
+    if node[0] == "const":
+        return []
+    return [r for child in node[1:] for r in _rule_refs(child)]
+
+
+def _rule_ref_name(ref):
+    """Alarm name for a rule reference (a name or an alarm ARN of this account and region)."""
+    return _alarm_name_from_local_arn(ref) if ref.startswith("arn:") else ref
+
+
+def _composite_children(alarm):
+    """Names of the alarms a composite alarm's rule references, in rule order."""
+    try:
+        refs = _rule_refs(_parse_alarm_rule(alarm.get("AlarmRule", "")))
+    except ValueError:
+        return []
+    return list(dict.fromkeys(name for name in map(_rule_ref_name, refs) if name))
+
+
+def _composite_rule_state(alarm):
+    return "ALARM" if _rule_true(_parse_alarm_rule(alarm["AlarmRule"])) else "OK"
+
+
+def _matching_children(alarm, state):
+    """Children whose condition in the rule agrees with state, the most recently changed first."""
+    refs = _rule_matches(_parse_alarm_rule(alarm["AlarmRule"]), state == "ALARM")
+    names = {n for n in map(_rule_ref_name, refs) if n and n != alarm["AlarmName"]}
+    # Whole-second timestamps tie often: the alarm created later counts as the more recent one.
+    created = [n for n in list(_alarms.keys()) + list(_composite_alarms.keys()) if n in names]
+    return sorted(reversed(created), reverse=True,
+                  key=lambda n: (_alarms.get(n) or _composite_alarms[n]).get("StateUpdatedTimestamp", 0))
+
+
+def _transition_composite(alarm, new_state, reason, triggers, seen=frozenset()):
+    """Move a composite alarm to new_state and re-evaluate the composite alarms above it."""
+    triggering = []
+    for name in triggers:
+        child = _alarms.get(name) or _composite_alarms.get(name)
+        if child:
+            at = datetime.fromtimestamp(child.get("StateUpdatedTimestamp", time.time()), tz=timezone.utc)
+            triggering.append({
+                "arn": child["AlarmArn"],
+                "state": {
+                    "value": child["StateValue"],
+                    "timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{at.microsecond // 1000:03d}+0000",
+                },
+            })
+    reason_data = {"triggeringAlarms": triggering}
+    old_state = alarm["StateValue"]
+    now = int(time.time())
+    alarm["StateValue"] = new_state
+    alarm["StateReason"] = reason
+    alarm["StateReasonData"] = json.dumps(reason_data, separators=(",", ":"))
+    alarm["StateUpdatedTimestamp"] = now
+    alarm["StateTransitionedTimestamp"] = now
+    _composite_triggers.pop(alarm["AlarmName"], None)
+    _record_history(alarm["AlarmName"], old_state, new_state, reason, "CompositeAlarm", reason_data)
+    _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+    _evaluate_parent_alarms(alarm, seen)
+
+
+def _evaluate_parent_alarms(child, seen=frozenset()):
+    """Re-evaluate the composite alarms whose rule references child after its state changed."""
+    name = child["AlarmName"]
+    # A composite already on this path is part of a cycle: stop there.
+    seen = seen | {name}
+    for parent in list(_composite_alarms.values()):
+        parent_name = parent["AlarmName"]
+        if parent_name in seen or name not in _composite_children(parent):
+            continue
+        pending = [name] + [n for n in _composite_triggers.get(parent_name, []) if n != name]
+        _composite_triggers[parent_name] = pending
+        new_state = _composite_rule_state(parent)
+        if new_state != parent["StateValue"]:
+            at = datetime.fromtimestamp(child["StateUpdatedTimestamp"], tz=timezone.utc)
+            reason = (f"{child['AlarmArn']} transitioned to {child['StateValue']} at "
+                      f"{at.strftime('%A %d %B, %Y %H:%M:%S')} UTC")
+            # Named: the children that changed since the last transition and agree with the new state.
+            agree = set(_matching_children(parent, new_state))
+            _transition_composite(parent, new_state, reason, [n for n in pending if n in agree], seen)
+
+
 def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         name = cbor_data.get("AlarmName", "")
@@ -1117,7 +1354,25 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
             insuff_actions.append(_p(params, f"InsufficientDataActions.member.{ii}"))
             ii += 1
 
-    _composite_alarms[name] = {
+    try:
+        refs = _rule_refs(_parse_alarm_rule(alarm_rule))
+    except ValueError as exc:
+        return _error("ValidationError", str(exc), 400, use_json=is_json, use_cbor=is_cbor)
+    missing = []
+    for ref in dict.fromkeys(refs):
+        child = _rule_ref_name(ref)
+        if not child or (child not in _alarms and child not in _composite_alarms):
+            missing.append(ref if ref.startswith("arn:") else
+                           f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{ref}")
+    if missing:
+        return _error(
+            "ValidationError",
+            f"Could not save the composite alarm as alarms [{', '.join(missing)}] in the alarm rule do not exist",
+            400, use_json=is_json, use_cbor=is_cbor,
+        )
+
+    existing = _composite_alarms.get(name)
+    alarm = {
         "AlarmName": name,
         "AlarmArn": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}",
         "AlarmDescription": desc,
@@ -1131,6 +1386,19 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
         "InsufficientDataActions": insuff_actions,
         "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
+    # An update keeps the state; the new rule is evaluated at once and moves it only when the result differs.
+    if existing:
+        for key in ("StateValue", "StateReason", "StateReasonData", "StateUpdatedTimestamp",
+                    "StateTransitionedTimestamp"):
+            if key in existing:
+                alarm[key] = existing[key]
+    _composite_alarms[name] = alarm
+    new_state = _composite_rule_state(alarm)
+    if not existing or new_state != alarm["StateValue"]:
+        verb = "was updated and its new alarm rule evaluates to" if existing else \
+            "was created and its alarm rule evaluates to"
+        _transition_composite(alarm, new_state, f"{alarm['AlarmArn']} {verb} {new_state}",
+                              _matching_children(alarm, new_state))
     if is_cbor:
         return _cbor_ok({})
     if is_json:
@@ -1327,6 +1595,7 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         history_type = cbor_data.get("HistoryItemType")
         start_date = _parse_ts(cbor_data.get("StartDate"))
         end_date = _parse_ts(cbor_data.get("EndDate"))
+        alarm_types = cbor_data.get("AlarmTypes") or ["MetricAlarm"]
         max_records = cbor_data.get("MaxRecords")
         next_token = cbor_data.get("NextToken")
         scan_by = cbor_data.get("ScanBy")
@@ -1335,11 +1604,16 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         history_type = _p(params, "HistoryItemType")
         start_date = _parse_ts(_p(params, "StartDate"))
         end_date = _parse_ts(_p(params, "EndDate"))
+        alarm_types = [
+            _p(params, f"AlarmTypes.member.{i}")
+            for i in range(1, 11)
+            if _p(params, f"AlarmTypes.member.{i}")
+        ] or ["MetricAlarm"]
         max_records = _p(params, "MaxRecords")
         next_token = _p(params, "NextToken")
         scan_by = _p(params, "ScanBy")
 
-    items = list(enumerate(_history_entries()))
+    items = [(i, h) for i, h in enumerate(_history_entries()) if h.get("AlarmType", "MetricAlarm") in alarm_types]
     if alarm_name:
         items = [(i, h) for i, h in items if h["AlarmName"] == alarm_name]
     if history_type:
@@ -1413,9 +1687,28 @@ def _delete_alarms(params, cbor_data, is_cbor, is_json=False):
             names.append(_p(params, f"AlarmNames.member.{i}"))
             i += 1
 
+    composites = [n for n in dict.fromkeys(names) if n in _composite_alarms]
+    if len(composites) > 1:
+        return _error(
+            "ValidationError",
+            f"Cannot delete [{len(composites)}] Composite Alarms as only one composite alarm delete is allowed "
+            f"in single request",
+            400, use_json=is_json, use_cbor=is_cbor,
+        )
+    for n in names:
+        if (n in _alarms or n in _composite_alarms) and any(
+            n in _composite_children(parent) for parent in _composite_alarms.values()
+        ):
+            return _error(
+                "ValidationError",
+                f"Cannot delete {n} as there are composite alarm(s) depending on it.",
+                400, use_json=is_json, use_cbor=is_cbor,
+            )
+
     for n in names:
         _alarms.pop(n, None)
         _composite_alarms.pop(n, None)
+        _composite_triggers.pop(n, None)
         _resource_tags.pop(f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{n}", None)
 
     if is_cbor:
@@ -1490,16 +1783,24 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
             "ResourceNotFound", f"Alarm {name} not found", 404, use_json=is_json, use_cbor=is_cbor
         )
 
+    is_composite = name not in _alarms
     old_state = alarm["StateValue"]
     alarm["StateValue"] = new_state
     alarm["StateReason"] = reason
     if reason_data:
         alarm["StateReasonData"] = reason_data
+    elif is_composite:
+        alarm.pop("StateReasonData", None)
     alarm["StateUpdatedTimestamp"] = int(time.time())
 
     if old_state != new_state:
-        _record_history(name, old_state, new_state, reason)
+        if is_composite:
+            # The rule is evaluated again only when one of its children changes state.
+            alarm["StateTransitionedTimestamp"] = alarm["StateUpdatedTimestamp"]
+            _composite_triggers.pop(name, None)
+        _record_history(name, old_state, new_state, reason, "CompositeAlarm" if is_composite else "MetricAlarm")
         _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+        _evaluate_parent_alarms(alarm)
 
     if is_cbor:
         return _cbor_ok({})
@@ -2007,6 +2308,7 @@ def cloudformation_delete_dashboard(name: str) -> None:
 def reset():
     _alarms.clear()
     _composite_alarms.clear()
+    _composite_triggers.clear()
     _alarm_history.clear()
     _metrics.clear()
     _resource_tags.clear()
