@@ -5820,9 +5820,26 @@ def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> 
     return json_response({})
 
 
+def _error_rule_denied(name: str) -> tuple:
+    return error_response_json(
+        "UnauthorizedException", f"Access to topic rule '{name}' was denied", 401
+    )
+
+
+def _error_rule_name(name: str) -> tuple:
+    return error_response_json(
+        "InvalidRequestException",
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
+        400,
+    )
+
+
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     if name not in _topic_rules:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     try:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
@@ -5833,29 +5850,30 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
 
 
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
     if not _RULE_NAME_RE.match(name):
-        return error_response_json(
-            "InvalidRequestException",
-            f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-            400,
-        )
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     rule["ruleDisabled"] = disabled
     return 200, {}, b""
 
 
 def _delete_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
+    if name not in _topic_rules:
+        return _error_rule_denied(name)
     delete_topic_rule(name)
     return json_response({})
 
@@ -6059,7 +6077,7 @@ def _list_tags_for_resource(qp: dict) -> tuple:
 #   QUEUED → IN_PROGRESS → {SUCCEEDED, FAILED, REJECTED, CANCELED}
 #
 # `versionNumber` gives optimistic concurrency: every transition bumps it, and
-# a stale `expectedVersion` is rejected with a 409. `executionNumber` is NOT a
+# a stale `expectedVersion` is rejected. `executionNumber` is NOT a
 # concurrency token here. It counts a thing's executions of one job: 1 for the
 # first, one more each time the thing joins a CONTINUOUS job's target group
 # again after its last execution finished (AWS also increments it when a job
@@ -6217,7 +6235,6 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
         "jobId": job_id,
         "thingName": thing,
         "status": "QUEUED",
-        "statusDetails": {},
         "queuedAt": now,
         "startedAt": None,
         "lastUpdatedAt": now,
@@ -6602,16 +6619,16 @@ def _jobs_abort(job_id: str) -> dict:
 
 
 def _jobs_check_expected_version(
-    execution: dict, expected, conflict_code: str
+    execution: dict, expected, conflict_code: str, status: int = 409
 ) -> tuple | None:
     """Optimistic-concurrency gate, shared by the two update paths.
 
     The rejection message carries the current version so a device can resync
-    without a separate describe. `conflict_code` differs by plane and is NOT
-    cosmetic: the `iot` model declares VersionConflictException for
-    CancelJobExecution, while the `iot-jobs-data` model declares only
-    InvalidStateTransitionException for UpdateJobExecution — returning the
-    unmodeled code there makes a device's
+    without a separate describe. `conflict_code` and `status` differ by plane
+    and are NOT cosmetic: the `iot` model declares VersionConflictException
+    for CancelJobExecution, while UpdateJobExecution in the `iot-jobs-data`
+    model answers 400 InvalidRequestException — returning the unmodeled code
+    there makes a device's
     `except client.exceptions.VersionConflictException` raise AttributeError
     instead of catching, because botocore only synthesizes exception classes
     for the errors its model lists.
@@ -6629,7 +6646,7 @@ def _jobs_check_expected_version(
             conflict_code,
             f"Expected version {expected} but found version "
             f"{execution['versionNumber']}",
-            409,
+            status,
         )
     return None
 
@@ -6686,6 +6703,7 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
 # An S3 host: path style without a bucket label, virtual-hosted with one.
 _JOB_DOCUMENT_S3_HOST_RE = re.compile(r"(?:(?P<bucket>.+)\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com")
 _JOB_DOCUMENT_MAX_BYTES = 32768
+_JOB_DOCUMENT_MAX_DEPTH = 1000
 
 
 def _job_document_s3_location(source: str) -> tuple[str, str]:
@@ -6705,6 +6723,27 @@ def _job_document_s3_location(source: str) -> tuple[str, str]:
                 bucket, _, key = parts.path[1:].partition("/")
                 key = unquote(key)
     return bucket, key
+
+
+def _job_document_is_json(document: str) -> bool:
+    """Whether a job document is JSON nested no deeper than AWS accepts."""
+    from ministack.services.apigateway_v1 import _json_depth
+
+    try:
+        value = json.loads(document)
+    except (ValueError, RecursionError):
+        return False
+    return _json_depth(value) <= _JOB_DOCUMENT_MAX_DEPTH
+
+
+def _job_inline_document_error(document) -> tuple | None:
+    """The refusal of a request's document that is not JSON AWS accepts, or None."""
+    if isinstance(document, str) and document and not _job_document_is_json(document):
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document located at request input is an invalid JSON document.", 400,
+        )
+    return None
 
 
 def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
@@ -6739,8 +6778,9 @@ def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
         )
     try:
         document = _s3._get_object_data(bucket, key).decode("utf-8")
-        json.loads(document)
     except ValueError:
+        document = ""
+    if not _job_document_is_json(document):
         return None, error_response_json(
             "InvalidRequestException",
             f"Job document located at {source} is an invalid JSON document.",
@@ -6869,6 +6909,8 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             "InvalidRequestException",
             "document exceeds the maximum length of 32768", 400,
         )
+    if err := _job_inline_document_error(document):
+        return err
     source = payload.get("documentSource")
     if isinstance(source, str) and not 1 <= len(source) <= 1350:
         return error_response_json(
@@ -7210,6 +7252,9 @@ def _describe_job(job_id: str) -> tuple:
     if job is None:
         return _error_not_found("Job", job_id)
     _jobs_materialize_executions(job_id)
+    for latest in _job_executions.values():
+        if latest["jobId"] == job_id:
+            _jobs_apply_timeout(latest)
     # Every execution counts, a rejoined thing's earlier ones included
     # (measured eu-central-1 2026-10-05).
     counts = _jobs_status_counts(job_id)
@@ -7431,6 +7476,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         return _job_template_validation_error(
             document, "document", "Member must have length less than or equal to 32768"
         )
+    if err := _job_inline_document_error(document):
+        return err
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
     if minutes is not None and (err := _job_timeout_error(minutes)):
         return err
@@ -7744,7 +7791,7 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     executions = [
         execution
         for latest in _job_executions.values()
-        for execution in _jobs_with_history(latest)
+        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
     ]
     for execution in executions:
         if execution["thingName"] != thing:
@@ -7801,7 +7848,7 @@ def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
         execution
         for latest in _job_executions.values()
         if latest["jobId"] == job_id
-        for execution in _jobs_with_history(latest)
+        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
         if status is None or execution["status"] == status
     ]
     executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
@@ -7821,6 +7868,8 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
     """Without `executionNumber` the newest execution, with it that one."""
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
+    if execution is not None:
+        _jobs_apply_timeout(execution)
     number = qp.get("executionNumber")
     if execution is not None and number is not None:
         try:
@@ -7840,7 +7889,9 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
         "status": execution["status"],
         # Control-plane JobExecution nests the map under `detailsMap`
         # (JobExecutionStatusDetails); the data plane returns it flat.
-        "statusDetails": {"detailsMap": execution.get("statusDetails") or {}},
+        "statusDetails": (
+            {"detailsMap": execution["statusDetails"]} if execution.get("statusDetails") is not None else {}
+        ),
         "thingArn": _thing_arn(thing),
         "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
@@ -8061,18 +8112,35 @@ def _jobs_device_float(value: float) -> str:
 
 def _jobs_device_json(value) -> str:
     """Compact JSON of a job document as AWS sends it to a device: object members that are null are left out."""
-    if isinstance(value, dict):
-        return "{" + ",".join(
-            f"{_jobs_device_json(key)}:{_jobs_device_json(member)}"
-            for key, member in value.items() if member is not None
-        ) + "}"
-    if isinstance(value, list):
-        return "[" + ",".join(map(_jobs_device_json, value)) + "]"
-    if isinstance(value, str):
-        return '"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"'
-    if isinstance(value, float):
-        return _jobs_device_float(value)
-    return json.dumps(value)
+    parts: list[str] = []
+    # Values still to write, last first; a tuple holds punctuation (json.loads makes none).
+    pending = [value]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, tuple):
+            parts.append(value[0])
+        elif isinstance(value, dict):
+            members = [(key, member) for key, member in value.items() if member is not None]
+            parts.append("{")
+            pending.append(("}",))
+            for index in range(len(members) - 1, -1, -1):
+                key, member = members[index]
+                pending.append(member)
+                pending.append(("," * bool(index) + '"' + key.translate(_JOBS_DEVICE_ESCAPES) + '":',))
+        elif isinstance(value, list):
+            parts.append("[")
+            pending.append(("]",))
+            for index in range(len(value) - 1, -1, -1):
+                pending.append(value[index])
+                if index:
+                    pending.append((",",))
+        elif isinstance(value, str):
+            parts.append('"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"')
+        elif isinstance(value, float):
+            parts.append(_jobs_device_float(value))
+        else:
+            parts.append(json.dumps(value))
+    return "".join(parts)
 
 
 # The host a device reached MiniStack on: its presigned URLs name it.
@@ -8212,16 +8280,72 @@ def jobs_job_document(job_id: str) -> str:
         return document
 
 
-def _jobs_job_document_object(job_id: str):
-    """The job document as a JSON object — the shape AWS serves over MQTT
-    (over HTTP the same document stays a string; see jobs-mqtt-api vs the
-    REST JobExecution shape). A stored document that is not valid JSON
-    passes through as the raw string rather than being invented into one."""
+class _JobsDocumentText(str):
+    """A job document in its device spelling, written into a Jobs MQTT message as it is."""
+
+
+_JOBS_NON_BMP_RE = re.compile("[\\U00010000-\\U0010FFFF]")
+
+
+def _jobs_utf16_escape(match: re.Match) -> str:
+    """A character outside the BMP as the escapes of its UTF-16 surrogate pair."""
+    code = ord(match.group()) - 0x10000
+    return f"\\u{0xD800 + (code >> 10):04X}\\u{0xDC00 + (code & 0x3FF):04X}"
+
+
+def _jobs_job_document_object(job_id: str, escape_non_bmp: bool = False):
+    """The job document a Jobs MQTT message carries; a stored text that is not JSON goes out as a string."""
     document = jobs_job_document(job_id)
     try:
-        return json.loads(document)
-    except ValueError:
+        json.loads(document)
+    except (ValueError, RecursionError):
         return document
+    if escape_non_bmp:
+        document = _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, document)
+    return _JobsDocumentText(document)
+
+
+_JOBS_MQTT_EXECUTION_MEMBERS = (
+    "jobId", "status", "statusDetails", "queuedAt", "startedAt", "lastUpdatedAt",
+    "versionNumber", "executionNumber", "approximateSecondsBeforeTimedOut", "jobDocument",
+)
+
+
+def _jobs_mqtt_execution(execution: dict, document) -> dict:
+    """A JobExecution as Jobs MQTT messages carry it: AWS's member order, no thingName."""
+    view = jobs_execution_view(execution, document)
+    return {key: view[key] for key in _JOBS_MQTT_EXECUTION_MEMBERS if key in view}
+
+
+def _jobs_mqtt_head(client_token, timestamp: int) -> dict:
+    """The members a Jobs MQTT response starts with: the request's clientToken, if any, then timestamp."""
+    head = {} if client_token is None else {"clientToken": client_token}
+    head["timestamp"] = timestamp
+    return head
+
+
+def jobs_execution_state(execution: dict) -> dict:
+    """The executionState of an update or a Jobs MQTT rejection: statusDetails only when set."""
+    state = {"status": execution["status"]}
+    if execution.get("statusDetails") is not None:
+        state["statusDetails"] = execution["statusDetails"]
+    state["versionNumber"] = execution["versionNumber"]
+    return state
+
+
+def _jobs_mqtt_json(value) -> str:
+    """Compact JSON of a Jobs MQTT message: characters outside the BMP escaped, a job document's text kept as it is."""
+    if isinstance(value, _JobsDocumentText):
+        return value
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{_jobs_mqtt_json(key)}:{_jobs_mqtt_json(member)}" for key, member in value.items()
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(map(_jobs_mqtt_json, value)) + "]"
+    if isinstance(value, str):
+        return _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, _jobs_device_json(value))
+    return _jobs_device_json(value)
 
 
 def jobs_update_execution(
@@ -8232,28 +8356,16 @@ def jobs_update_execution(
     expected_version=None,
     status_details: dict | None = None,
     step_timeout_minutes=None,
+    execution_number=None,
 ) -> tuple:
     """Apply a device-reported status to an execution.
 
     Returns ``(execution copy, None)``, or ``(None, error)`` for every
-    rejection: unknown execution (404), stale or non-numeric
-    `expectedVersion`, an already-terminal execution, an unknown status, the
-    illegal walk back to QUEUED, and the service-side statuses a device may
-    not set. A successful update may complete the job.
+    rejection, in this order: an unknown status or one a device may not set
+    (QUEUED and the service-side statuses), unknown execution or
+    `execution_number` (404), stale or non-numeric `expectedVersion`, and an
+    already-terminal execution. A successful update may complete the job.
     """
-    _jobs_materialize_executions(job_id)
-    execution = _job_executions.get((thing_name, job_id))
-    if execution is None:
-        return None, error_response_json(
-            "ResourceNotFoundException",
-            f"Job {job_id} not found for {thing_name}",
-            404,
-        )
-    error = _jobs_check_expected_version(
-        execution, expected_version, "InvalidStateTransitionException"
-    )
-    if error:
-        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
@@ -8268,6 +8380,21 @@ def jobs_update_execution(
             f"The status of job execution cannot be changed to be {status}",
             409,
         )
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing_name, job_id))
+    if execution_number is not None and execution and execution_number != execution["executionNumber"]:
+        execution = None
+    if execution is None:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"Job {job_id} not found for {thing_name}",
+            404,
+        )
+    error = _jobs_check_expected_version(
+        execution, expected_version, "InvalidRequestException", 400
+    )
+    if error:
+        return None, error
     error = _jobs_reject_if_terminal(
         execution,
         f"Job {job_id} for {thing_name} has already finished with status {execution['status']}",
@@ -8276,7 +8403,7 @@ def jobs_update_execution(
         return None, error
     now = _jobs_now_ms()
     execution["status"] = status
-    if status_details:
+    if status_details is not None:
         execution["statusDetails"] = dict(status_details)
     # The first report starts the execution, unless the device rejects the job.
     if status != "REJECTED" and execution.get("startedAt") is None:
@@ -8307,18 +8434,19 @@ def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
     reference words every stamp as "the time, in seconds since the epoch"),
     flat statusDetails map. Shared by the iot-jobs-data HTTP plane (which
     passes ``document`` as the string AWS serves there) and the
-    jobs-over-MQTT bridge (which passes the parsed object) so both speak one
+    jobs-over-MQTT bridge (which passes the document as JSON) so both speak one
     shape."""
     view = {
         "jobId": execution["jobId"],
         "thingName": execution["thingName"],
         "status": execution["status"],
-        "statusDetails": execution.get("statusDetails") or {},
         "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
         "executionNumber": execution["executionNumber"],
         "versionNumber": execution["versionNumber"],
     }
+    if execution.get("statusDetails") is not None:
+        view["statusDetails"] = dict(execution["statusDetails"])
     if execution.get("startedAt") is not None:
         view["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
     remaining = _jobs_seconds_before_timeout(execution)
@@ -8336,11 +8464,11 @@ def jobs_execution_summary(execution: dict) -> dict:
         "jobId": execution["jobId"],
         "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
-        "versionNumber": execution["versionNumber"],
-        "executionNumber": execution["executionNumber"],
     }
     if execution.get("startedAt") is not None:
         entry["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    entry["executionNumber"] = execution["executionNumber"]
+    entry["versionNumber"] = execution["versionNumber"]
     return entry
 
 
@@ -8378,16 +8506,10 @@ async def jobs_notify_thing(
         pending = jobs_pending_for_thing(thing_name)
         nxt = jobs_start_next_execution(thing_name, peek=True)
         next_view = (
-            jobs_execution_view(nxt, _jobs_job_document_object(nxt["jobId"]))
+            _jobs_mqtt_execution(nxt, _jobs_job_document_object(nxt["jobId"]))
             if nxt is not None
             else None
         )
-    if next_view is not None:
-        # AWS sends no thingName and no empty statusDetails here (measured
-        # eu-central-1 2026-10-05).
-        del next_view["thingName"]
-        if not next_view["statusDetails"]:
-            del next_view["statusDetails"]
     ts = int(time.time())
     jobs_by_status: dict = {}
     for execution in pending:
@@ -8397,7 +8519,7 @@ async def jobs_notify_thing(
     base = f"$aws/things/{thing_name}/jobs"
     await broker_publish(
         account_id, region, f"{base}/notify",
-        json.dumps({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
+        _jobs_mqtt_json({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
     )
     next_job_id = nxt["jobId"] if nxt is not None else None
     if next_job_id == prev_next_job_id:
@@ -8407,7 +8529,7 @@ async def jobs_notify_thing(
         notify_next["execution"] = next_view
     await broker_publish(
         account_id, region, f"{base}/notify-next",
-        json.dumps(notify_next).encode("utf-8"), qos=1,
+        _jobs_mqtt_json(notify_next).encode("utf-8"), qos=1,
     )
 
 
@@ -8655,7 +8777,7 @@ _MAX_QUEUED_MESSAGES = 1000
 class _PersistentSessionState:
     __slots__ = (
         "subscriptions", "queued_messages", "created_at", "expiry_interval",
-        "session_identifier",
+        "session_identifier", "in_flight", "next_packet_id",
     )
 
     def __init__(
@@ -8676,6 +8798,10 @@ class _PersistentSessionState:
         self.expiry_interval: int | None = expiry_interval
         # Reported as ``sessionIdentifier`` by every connection that resumes it.
         self.session_identifier: str = session_identifier or str(uuid.uuid4())
+        # QoS 1 messages sent but not acknowledged when the connection ended,
+        # and the packet identifier counter, both handed to the next resume.
+        self.in_flight: dict[int, "_InFlightMessage"] = {}
+        self.next_packet_id: int = 1
 
 
 def _is_session_expired(session_state: _PersistentSessionState) -> bool:
@@ -9471,11 +9597,11 @@ def _jobs_rejected(
     enum (InvalidRequest, InvalidJson, ResourceNotFound, VersionMismatch,
     InvalidStateTransition, TerminalStateReached), never a numeric HTTP
     status."""
-    doc = {"code": code, "message": message, "timestamp": int(time.time())}
+    doc = _jobs_mqtt_head(client_token, int(time.time()))
     if execution_state is not None:
         doc["executionState"] = execution_state
-    if client_token is not None:
-        doc["clientToken"] = client_token
+    doc["code"] = code
+    doc["message"] = message
     return doc
 
 
@@ -9485,9 +9611,10 @@ def _jobs_error_tuple_to_rejected(
     """Map a jobs_* seam error (a ready HTTP response tuple) onto the MQTT
     rejected document.
 
-    The HTTP status folds onto the string ErrorCode enum; the three 409s all
-    share one HTTP ``__type`` (InvalidStateTransitionException), so the
-    specific code is read off the message sentence — every candidate
+    The HTTP status folds onto the string ErrorCode enum; the 409s share one
+    HTTP ``__type`` (InvalidStateTransitionException) and the version mismatch
+    shares the 400 with a bad request, so the specific code is read off the
+    message sentence — every candidate
     sentence is authored in this module (_jobs_check_expected_version,
     _jobs_reject_if_terminal, jobs_update_execution), so the match cannot
     drift silently. ``execution`` is the execution's current state, when it
@@ -9501,7 +9628,7 @@ def _jobs_error_tuple_to_rejected(
         message = ""
     if status == 404:
         code = "ResourceNotFound"
-    elif status == 400:
+    elif status == 400 and not message.startswith("Expected version"):
         code = "InvalidRequest"
     elif status == 410:
         code = "TerminalStateReached"
@@ -9513,10 +9640,7 @@ def _jobs_error_tuple_to_rejected(
     # A refused status carries no executionState.
     refused_status = message.startswith("The status of job execution cannot be changed")
     if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None and not refused_status:
-        execution_state = {
-            "status": execution["status"],
-            "versionNumber": execution["versionNumber"],
-        }
+        execution_state = jobs_execution_state(execution)
     return _jobs_rejected(code, message, client_token, execution_state)
 
 
@@ -9533,12 +9657,10 @@ async def _handle_jobs_publish(
     ``accepted`` / ``rejected`` responses back through the broker.
 
     Payload members (`statusDetails`, `expectedVersion`,
-    `includeJobExecutionState`, `includeJobDocument`, `clientToken`) follow
-    the device SDK contract and mirror the HTTP plane's handling; the request
-    members `stepTimeoutInMinutes` and `executionNumber` are accepted but
-    ignored — MiniStack has no execution timeouts, and `executionNumber` is
-    write-once so there is never more than one execution to address. Every
-    ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
+    `includeJobExecutionState`, `includeJobDocument`, `clientToken`,
+    `executionNumber`) follow the device SDK contract and mirror the HTTP
+    plane's handling; the request member `stepTimeoutInMinutes` is accepted
+    but ignored. Every ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
     served as a JSON object here (over HTTP it stays a string, as on AWS)."""
     base = f"{SHADOW_TOPIC_PREFIX}{thing}/jobs"
     suffix_base = f"{job_id}/{verb}" if job_id is not None else verb
@@ -9547,7 +9669,7 @@ async def _handle_jobs_publish(
         await broker_publish(
             account_id, region,
             f"{base}/{suffix_base}/{kind}",
-            json.dumps(doc).encode("utf-8"), qos=1,
+            _jobs_mqtt_json(doc).encode("utf-8"), qos=1,
         )
 
     try:
@@ -9575,17 +9697,13 @@ async def _handle_jobs_publish(
     if verb == "get" and job_id is None:
         with request_scope(account_id, region):
             pending = jobs_pending_for_thing(thing)
-        doc = {
-            "timestamp": ts,
-            "inProgressJobs": [
-                jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
-            ],
-            "queuedJobs": [
-                jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
-            ],
-        }
-        if client_token is not None:
-            doc["clientToken"] = client_token
+        doc = _jobs_mqtt_head(client_token, ts)
+        doc["inProgressJobs"] = [
+            jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
+        ]
+        doc["queuedJobs"] = [
+            jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
+        ]
         await _respond("accepted", doc)
         return
 
@@ -9599,11 +9717,9 @@ async def _handle_jobs_publish(
                 if execution is not None
                 else None
             )
-        doc = {"timestamp": ts}
+        doc = _jobs_mqtt_head(client_token, ts)
         if execution is not None:
-            doc["execution"] = jobs_execution_view(execution, document)
-        if client_token is not None:
-            doc["clientToken"] = client_token
+            doc["execution"] = _jobs_mqtt_execution(execution, document)
         await _respond("accepted", doc)
         # No notify / notify-next here: QUEUED -> IN_PROGRESS keeps the
         # execution both pending and at the front of the queue, and AWS stays
@@ -9619,6 +9735,9 @@ async def _handle_jobs_publish(
                 execution = jobs_start_next_execution(thing, peek=True)
             else:
                 execution = jobs_describe_execution(thing, job_id)
+                number = request.get("executionNumber")
+                if number is not None and execution and number != execution["executionNumber"]:
+                    execution = None
             include_document = request.get("includeJobDocument", True)
             document = (
                 _jobs_job_document_object(execution["jobId"])
@@ -9640,11 +9759,9 @@ async def _handle_jobs_publish(
             await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
             return
         # An idle thing's "$next" mirrors the HTTP plane's empty structure.
-        doc = {"timestamp": ts}
+        doc = _jobs_mqtt_head(client_token, ts)
         if execution is not None:
-            doc["execution"] = jobs_execution_view(execution, document)
-        if client_token is not None:
-            doc["clientToken"] = client_token
+            doc["execution"] = _jobs_mqtt_execution(execution, document)
         await _respond("accepted", doc)
         return
 
@@ -9656,6 +9773,7 @@ async def _handle_jobs_publish(
             status=request.get("status"),
             expected_version=request.get("expectedVersion"),
             status_details=request.get("statusDetails"),
+            execution_number=request.get("executionNumber"),
         )
         current = jobs_describe_execution(thing, job_id) if error else None
     if error:
@@ -9663,18 +9781,12 @@ async def _handle_jobs_publish(
             "rejected", _jobs_error_tuple_to_rejected(error, client_token, current)
         )
         return
-    doc = {"timestamp": ts}
+    doc = _jobs_mqtt_head(client_token, ts)
     if request.get("includeJobExecutionState"):
-        doc["executionState"] = {
-            "status": execution["status"],
-            "statusDetails": execution.get("statusDetails") or {},
-            "versionNumber": execution["versionNumber"],
-        }
+        doc["executionState"] = jobs_execution_state(execution)
     if request.get("includeJobDocument"):
         with request_scope(account_id, region):
-            doc["jobDocument"] = _jobs_job_document_object(job_id)
-    if client_token is not None:
-        doc["clientToken"] = client_token
+            doc["jobDocument"] = _jobs_job_document_object(job_id, escape_non_bmp=True)
     await _respond("accepted", doc)
     if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
         # A terminal report removed the execution from the pending set. AWS
@@ -10797,21 +10909,27 @@ class _WSSession:
     async def _retransmit_loop(self) -> None:
         try:
             while self._in_flight:
-                await asyncio.sleep(_RETRANSMIT_INTERVAL_SECONDS)
+                oldest = min(msg.sent_at for msg in self._in_flight.values())
                 now = asyncio.get_event_loop().time()
-                for pid, msg in list(self._in_flight.items()):
-                    if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
-                        msg.retransmit_count += 1
-                        msg.sent_at = now
-                        await self.send_bytes(
-                            _make_publish(
-                                msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
-                                retain=msg.retain,
-                                properties=self._publish_properties(msg.properties),
-                            )
-                        )
+                await asyncio.sleep(max(oldest + _RETRANSMIT_INTERVAL_SECONDS - now, 0))
+                await self._retransmit_due()
         except asyncio.CancelledError:
             pass
+
+    async def _retransmit_due(self) -> None:
+        """Resend every in-flight QoS 1 message that has waited a retransmit interval for its PUBACK."""
+        now = asyncio.get_event_loop().time()
+        for pid, msg in list(self._in_flight.items()):
+            if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
+                msg.retransmit_count += 1
+                msg.sent_at = now
+                await self.send_bytes(
+                    _make_publish(
+                        msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
+                        retain=msg.retain,
+                        properties=self._publish_properties(msg.properties),
+                    )
+                )
 
     async def send_bytes(self, b: bytes) -> None:
         async with self._send_lock:
@@ -11170,6 +11288,12 @@ class _WSSession:
                     await self._send_connack(
                         session_present=True, assigned_client_id=assigned_client_id
                     )
+                    # Unacknowledged messages keep their packet identifiers and
+                    # go out again once their retransmit interval has passed.
+                    self._next_pid = existing_ps.next_packet_id
+                    self._in_flight.update(existing_ps.in_flight)
+                    existing_ps.in_flight = {}
+                    await self._retransmit_due()
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
                     for q_topic, q_payload, q_qos, q_properties, q_received_at in queued:
@@ -11181,6 +11305,8 @@ class _WSSession:
                             await self.deliver_to_client(q_topic, q_payload, q_qos)
                         finally:
                             _delivery_properties.reset(token)
+                    if self._in_flight:
+                        self._ensure_retransmit_timer()
                     await self._publish_connected()
                     return True
                 else:
@@ -11410,7 +11536,6 @@ class _WSSession:
             except asyncio.CancelledError:
                 pass
             self._retransmit_task = None
-        self._in_flight.clear()
         if not self._graceful_disconnect and self._will_topic is not None:
             await broker_publish(
                 self.account_id,
@@ -11434,6 +11559,7 @@ class _WSSession:
                 _persistent_sessions.pop(
                     (self.account_id, self.region, self._client_id), None
                 )
+        self._in_flight.clear()
         for sid in self._sub_ids:
             await broker_unsubscribe(sid)
         self._sub_ids.clear()
@@ -11460,12 +11586,15 @@ class _WSSession:
             existing.created_at = time.time()
             existing.expiry_interval = self._session_expiry_interval
         else:
-            _persistent_sessions[session_key] = _PersistentSessionState(
+            existing = _persistent_sessions[session_key] = _PersistentSessionState(
                 subscriptions=unprefixed_filters,
                 created_at=time.time(),
                 expiry_interval=self._session_expiry_interval,
                 session_identifier=self._session_identifier,
             )
+        pending = list(self._in_flight.items())[-_MAX_QUEUED_MESSAGES:]
+        existing.in_flight = dict(pending)
+        existing.next_packet_id = self._next_pid
 
 
 async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bool:
