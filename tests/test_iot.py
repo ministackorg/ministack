@@ -3988,7 +3988,7 @@ def test_iot_topic_rule_lifecycle(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
     with pytest.raises(ClientError) as ei:
         iot_client.get_topic_rule(ruleName=name)
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
 
 
 def test_iot_topic_rule_duplicate_rejected(iot_client):
@@ -4051,7 +4051,9 @@ def test_iot_enable_disable_topic_rule_refusals(iot_client):
     for call in (iot_client.enable_topic_rule, iot_client.disable_topic_rule):
         with pytest.raises(ClientError) as ei:
             call(ruleName=missing)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
         with pytest.raises(ClientError) as ei:
             call(ruleName="bad-name")
         assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
@@ -4279,7 +4281,7 @@ def test_iot_create_topic_rule_republish_inside_own_filter_rejected(
     )
     with pytest.raises(ClientError) as ei:
         iot_client.get_topic_rule(ruleName=name)
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
 
 
 @pytest.mark.parametrize(
@@ -4339,12 +4341,41 @@ def test_iot_replace_topic_rule_republish_inside_own_filter_rejected(iot_client,
     iot_client.delete_topic_rule(ruleName=name)
 
 
-def test_iot_replace_missing_topic_rule_404(iot_client):
-    with pytest.raises(ClientError) as ei:
-        iot_client.replace_topic_rule(
-            ruleName=_rule_name(), topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
-        )
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+def test_iot_missing_topic_rule_unauthorized(iot_client):
+    """Get, Replace and Delete of an unknown rule answer 401 as AWS does."""
+    missing = _rule_name()
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName=missing),
+        lambda: iot_client.replace_topic_rule(
+            ruleName=missing, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName=missing),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
+
+
+def test_iot_get_replace_delete_topic_rule_name_pattern_refused(iot_client):
+    """Get, Replace and Delete refuse a rule name outside the pattern with 400, as Enable does."""
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName="bad-name"),
+        lambda: iot_client.replace_topic_rule(
+            ruleName="bad-name", topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName="bad-name"),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException",
+            "1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
 
 
 def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
@@ -4434,7 +4465,7 @@ def test_iot_topic_rule_cfn_invalid_sql_fails_resource(cfn, iot_client):
         # Nothing was stored: the invalid rule never entered the rule store.
         with pytest.raises(ClientError) as ei:
             iot_client.get_topic_rule(ruleName=rule)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
     finally:
         try:
             cfn.delete_stack(StackName=stack)
@@ -7992,6 +8023,42 @@ def test_iot_jobs_in_progress_timeout_reaches_timed_out():
         assert iot_module._jobs_apply_timeout(execution)["status"] == "TIMED_OUT"
         assert iot_module._jobs["j1"]["status"] == "COMPLETED"
         assert iot_module._jobs_seconds_before_timeout(execution) is None
+    reset()
+
+
+def test_iot_jobs_in_progress_timeout_reaches_control_plane_reads():
+    """DescribeJobExecution, both execution lists and DescribeJob each report the timed-out execution."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    def read_after_the_timeout(read):
+        reset()
+        with request_scope("123456789012", _TEST_REGION):
+            started = iot_module._jobs_now_ms() - 61_000
+            iot_module._jobs["j1"] = {
+                "jobId": "j1", "jobArn": iot_module._job_arn("j1"), "targets": [],
+                "targetSelection": "SNAPSHOT", "status": "IN_PROGRESS", "document": "{}",
+                "snapshotted": True, "createdAt": started, "lastUpdatedAt": started,
+                "timeoutConfig": {"inProgressTimeoutInMinutes": 1},
+            }
+            iot_module._job_executions[("t1", "j1")] = {
+                "jobId": "j1", "thingName": "t1", "status": "IN_PROGRESS",
+                "queuedAt": started, "startedAt": started, "lastUpdatedAt": started,
+                "executionNumber": 1, "versionNumber": 2,
+            }
+            status, _, body = read()
+        assert status == 200
+        return json.loads(body)
+
+    execution = read_after_the_timeout(
+        lambda: iot_module._describe_job_execution("t1", "j1", {}))["execution"]
+    assert (execution["status"], execution["versionNumber"]) == ("TIMED_OUT", 3)
+    for read in (lambda: iot_module._list_job_executions_for_job("j1", {}),
+                 lambda: iot_module._list_job_executions_for_thing("t1", {})):
+        (summary,) = read_after_the_timeout(read)["executionSummaries"]
+        assert summary["jobExecutionSummary"]["status"] == "TIMED_OUT"
+    details = read_after_the_timeout(lambda: iot_module._describe_job("j1"))["job"]["jobProcessDetails"]
+    assert (details["numberOfTimedOutThings"], details["numberOfInProgressThings"]) == (1, 0)
     reset()
 
 
