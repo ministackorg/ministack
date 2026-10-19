@@ -2798,7 +2798,10 @@ async def _dispatch_service_request(
         return _unknown_query_error(body, request_id)
 
     # AppSync authorizes a GraphQL request by the API's own authorization types.
-    if AUTH and not (service == "appsync" and method == "POST" and _APPSYNC_GRAPHQL_RE.match(path)):
+    appsync_graphql = service == "appsync" and method == "POST" and (
+        _APPSYNC_GRAPHQL_RE.match(path)
+        or (path == "/graphql" and re.search(r"\.appsync-api\.", headers.get("host", ""))))
+    if AUTH and not appsync_graphql:
         from ministack.core.iam_actions import (
             access_denied_response,
             agentcore_endpoint_arn,
