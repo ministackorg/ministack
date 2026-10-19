@@ -557,6 +557,26 @@ def _validate_role_description(description):
     return None
 
 
+def _trust_policy_not_principal_error(doc):
+    """IAM's message refusing a role trust policy that carries NotPrincipal, or None."""
+    if isinstance(doc, str):
+        try:
+            doc = json.loads(doc)
+        except ValueError:
+            return None
+    statements = doc.get("Statement") if isinstance(doc, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return None
+    flagged = [s for s in statements if isinstance(s, dict) and "NotPrincipal" in s]
+    if any(s.get("Effect") == "Allow" for s in flagged):
+        return "Allow with NotPrincipal is not allowed."
+    if flagged:
+        return "AssumeRole policy must not contain NotPrincipal field."
+    return None
+
+
 def _create_role(p):
     name = _p(p, "RoleName")
     description = _p(p, "Description")
@@ -566,6 +586,9 @@ def _create_role(p):
     if name in _roles:
         return _error(409, "EntityAlreadyExists",
                       f"Role with name {name} already exists.", ns="iam")
+    trust_err = _trust_policy_not_principal_error(_p(p, "AssumeRolePolicyDocument"))
+    if trust_err:
+        return _error(400, "MalformedPolicyDocument", trust_err, ns="iam")
     boundary_err = _p(p, "PermissionsBoundary") and _boundary_policy_error(_p(p, "PermissionsBoundary"))
     if boundary_err:
         return boundary_err
@@ -656,6 +679,9 @@ def _update_assume_role_policy(p):
     if name not in _roles:
         return _error(404, "NoSuchEntity",
                       f"Role {name} not found.", ns="iam")
+    trust_err = _trust_policy_not_principal_error(_p(p, "PolicyDocument"))
+    if trust_err:
+        return _error(400, "MalformedPolicyDocument", trust_err, ns="iam")
     _roles[name]["AssumeRolePolicyDocument"] = _p(p, "PolicyDocument")
     return _xml(200, "UpdateAssumeRolePolicyResponse", "", ns="iam")
 
