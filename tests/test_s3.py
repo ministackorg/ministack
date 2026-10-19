@@ -9635,3 +9635,45 @@ def test_s3_copy_and_multipart_refuse_object_lock_headers_without_object_lock(s3
             s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
         s3.delete_bucket(Bucket=bkt)
 
+
+
+def test_s3_bucket_config_enum_and_day_validation(s3):
+    bucket = f"cfgval-{uuid.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=bucket)
+    malformed = "The XML you provided was not well-formed or did not validate against our published schema"
+
+    def err(fn):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    for status in ("Disabled", "banana", "enabled"):
+        assert err(lambda: s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": status})) == (
+            "MalformedXML", malformed)
+    assert err(lambda: s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled", "MFADelete": "banana"}))[0] == "MalformedXML"
+    assert "Status" not in s3.get_bucket_versioning(Bucket=bucket)
+
+    def rule(**kw):
+        return {"Rules": [{"ID": "r", "Status": "Enabled", "Filter": {"Prefix": ""}, **kw}]}
+
+    for days in (0, -1):
+        assert err(lambda: s3.put_bucket_lifecycle_configuration(
+            Bucket=bucket, LifecycleConfiguration=rule(Expiration={"Days": days}))) == (
+            "InvalidArgument", "'Days' for Expiration action must be a positive integer")
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration=rule(NoncurrentVersionExpiration={"NoncurrentDays": 0}))) == (
+        "InvalidArgument", "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer")
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": [
+        {"ID": "r", "Status": "banana", "Filter": {"Prefix": ""}, "Expiration": {"Days": 1}}]}))[0] == "MalformedXML"
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration=rule(Transitions=[{"Days": 30, "StorageClass": "banana"}])))[0] == "MalformedXML"
+    assert err(lambda: s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "banana"}}]}))[0] == "MalformedXML"
+
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended"})
+    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration=rule(
+        Expiration={"Days": 1}, Transitions=[{"Days": 30, "StorageClass": "GLACIER_IR"}]))
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms:dsse"}}]})
+    s3.delete_bucket(Bucket=bucket)
