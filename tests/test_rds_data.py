@@ -145,6 +145,45 @@ def test_execute_nonexistent_cluster():
     assert "not found" in body.get("message", body.get("Message", "")).lower()
 
 
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("operation,action,params,cluster,reason", [
+    ("execute_statement", "ExecuteStatement", {"sql": "select 1"}, "other", None),
+    ("batch_execute_statement", "BatchExecuteStatement", {"sql": "select 1"}, "other", None),
+    ("begin_transaction", "BeginTransaction", {}, "other", None),
+    ("commit_transaction", "CommitTransaction", {"transactionId": "t"}, "other", None),
+    ("rollback_transaction", "RollbackTransaction", {"transactionId": "t"}, "other", None),
+    ("execute_statement", "ExecuteStatement", {"sql": "select 1"}, "denied",
+     "with an explicit deny in an identity-based policy"),
+], ids=["execute", "batch-execute", "begin", "commit", "rollback", "explicit-deny"])
+def test_rds_data_authorization_contract(auth_enabled, iam_user, operation, action, params, cluster, reason):
+    """An RDS Data call is authorized as rds-data:<operation> on the cluster its resourceArn names."""
+    name = f"rdsdata-{uuid.uuid4().hex[:8]}"
+    clusters = f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:cluster:{name}"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["rds-data:ExecuteStatement", "rds-data:BeginTransaction"],
+         "Resource": f"{clusters}-allowed"},
+        {"Effect": "Deny", "Action": "rds-data:ExecuteStatement", "Resource": f"{clusters}-denied"},
+    ]})
+    rds = user.client("rds-data")
+    allowed = {"resourceArn": f"{clusters}-allowed", "secretArn": FAKE_SECRET_ARN}
+    for call in (lambda: rds.execute_statement(**allowed, sql="select 1"), lambda: rds.begin_transaction(**allowed)):
+        with pytest.raises(ClientError) as served:
+            call()
+        assert served.value.response["Error"]["Code"] == "BadRequestException"
+    with pytest.raises(ClientError) as exc:
+        getattr(rds, operation)(resourceArn=f"{clusters}-{cluster}", secretArn=FAKE_SECRET_ARN, **params)
+    response = exc.value.response
+    if not auth_enabled:
+        assert response["Error"]["Code"] == "BadRequestException"
+        return
+    reason = reason or f"because no identity-based policy allows the rds-data:{action} action"
+    assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (
+        403, "AccessDeniedException")
+    assert response["Error"]["Message"] == (
+        f"User: {user.arn} is not authorized to perform: rds-data:{action} on resource: {clusters}-{cluster} {reason}")
+    assert response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == "application/json"
+
+
 def test_rds_data_resolves_cluster_arn_by_arn_region(rds, sm):
     east_rds = _regional_client("rds", "us-east-1")
     west_rds = _regional_client("rds", "us-west-2")

@@ -124,6 +124,21 @@ def test_create_trail(ct):
     assert f"/{name}" in resp["TrailARN"]
 
 
+def test_create_trail_recursive_logging_defaults_to_true(ct):
+    name = f"trail-recursive-{_uid()}"
+    assert ct.create_trail(Name=name, S3BucketName="bucket")["RecursiveLogging"] is True
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is True
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is True
+
+
+def test_create_trail_stores_recursive_logging_false(ct):
+    name = f"trail-recursive-off-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", RecursiveLogging=False)
+    assert resp["RecursiveLogging"] is False
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is False
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is False
+
+
 def test_create_trail_duplicate(ct):
     name = f"trail-dup-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
@@ -156,6 +171,7 @@ def test_get_trail_and_describe_trails_return_the_trail_shape(ct):
         "HasCustomEventSelectors": False,
         "HasInsightSelectors": False,
         "IsOrganizationTrail": False,
+        "RecursiveLogging": True,
     }
     assert _raw_body(ct, "get_trail", Name=name)["Trail"] == expected
     assert _raw_body(ct, "describe_trails", trailNameList=[name])["trailList"] == [expected]
@@ -509,6 +525,18 @@ def test_update_trail_persists_fields(ct):
     desc = ct.get_trail(Name=name)["Trail"]
     assert desc["S3BucketName"] == "updated"
     assert desc["IsMultiRegionTrail"] is True
+
+
+def test_update_trail_sets_and_keeps_recursive_logging(ct):
+    name = f"trail-update-recursive-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    assert ct.update_trail(Name=name, RecursiveLogging=False)["RecursiveLogging"] is False
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is False
+    # An update that leaves the member out keeps the stored value.
+    assert ct.update_trail(Name=name, IncludeGlobalServiceEvents=False)["RecursiveLogging"] is False
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is False
+    assert ct.update_trail(Name=name, RecursiveLogging=True)["RecursiveLogging"] is True
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is True
 
 
 def test_create_trail_persists_kms_key_id(ct):
