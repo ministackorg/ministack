@@ -6239,6 +6239,18 @@ def test_cfn_wait_condition_validators(validator, value, message):
     assert wc.validate_resource_signal_timeout("PT1H30M15S", "Wait") == 5415
 
 
+def test_cfn_wait_condition_handle_url_names_the_scheme_the_gateway_serves(monkeypatch):
+    """Under USE_SSL the gateway answers TLS only, so the handle URL is https."""
+    from ministack.services.cloudformation import custom_resource
+    from ministack.services.cloudformation import wait_conditions as wc
+
+    monkeypatch.delenv("USE_SSL", raising=False)
+    assert wc.handle_url("tok").startswith("http://")
+    monkeypatch.setenv("USE_SSL", "1")
+    assert wc.handle_url("tok") == (
+        f"https://{custom_resource._HOST}:{custom_resource._PORT}/_ministack/cfn-signal/tok")
+
+
 @pytest.mark.parametrize(
     "policy",
     [
@@ -18914,6 +18926,17 @@ def test_cfn_response_endpoint_accepts_put(cfn):
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
         assert resp.status == 200
+
+
+def test_cfn_response_url_names_the_scheme_the_gateway_serves(monkeypatch):
+    """Under USE_SSL the gateway answers TLS only, so the ResponseURL is https."""
+    from ministack.services.cloudformation import custom_resource
+
+    monkeypatch.delenv("USE_SSL", raising=False)
+    assert custom_resource._response_url("tok").startswith("http://")
+    monkeypatch.setenv("USE_SSL", "1")
+    assert custom_resource._response_url("tok") == (
+        f"https://{custom_resource._HOST}:{custom_resource._PORT}/_ministack/cfn-response/tok")
 
 
 # -- Create lifecycle -------------------------------------------------------
