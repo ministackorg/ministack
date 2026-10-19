@@ -95,7 +95,7 @@ from urllib.parse import parse_qs, parse_qsl
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.iam_evaluator import EvalContext, evaluate, parse_policy_document
+from ministack.core.iam_evaluator import AuthError, EvalContext, ResolvedCredential, evaluate, parse_policy_document
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -5820,9 +5820,26 @@ def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> 
     return json_response({})
 
 
+def _error_rule_denied(name: str) -> tuple:
+    return error_response_json(
+        "UnauthorizedException", f"Access to topic rule '{name}' was denied", 401
+    )
+
+
+def _error_rule_name(name: str) -> tuple:
+    return error_response_json(
+        "InvalidRequestException",
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
+        400,
+    )
+
+
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     if name not in _topic_rules:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     try:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
@@ -5833,29 +5850,30 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
 
 
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
     if not _RULE_NAME_RE.match(name):
-        return error_response_json(
-            "InvalidRequestException",
-            f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-            400,
-        )
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     rule["ruleDisabled"] = disabled
     return 200, {}, b""
 
 
 def _delete_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
+    if name not in _topic_rules:
+        return _error_rule_denied(name)
     delete_topic_rule(name)
     return json_response({})
 
@@ -8775,7 +8793,7 @@ _MAX_QUEUED_MESSAGES = 1000
 class _PersistentSessionState:
     __slots__ = (
         "subscriptions", "queued_messages", "created_at", "expiry_interval",
-        "session_identifier",
+        "session_identifier", "in_flight", "next_packet_id",
     )
 
     def __init__(
@@ -8796,6 +8814,10 @@ class _PersistentSessionState:
         self.expiry_interval: int | None = expiry_interval
         # Reported as ``sessionIdentifier`` by every connection that resumes it.
         self.session_identifier: str = session_identifier or str(uuid.uuid4())
+        # QoS 1 messages sent but not acknowledged when the connection ended,
+        # and the packet identifier counter, both handed to the next resume.
+        self.in_flight: dict[int, "_InFlightMessage"] = {}
+        self.next_packet_id: int = 1
 
 
 def _is_session_expired(session_state: _PersistentSessionState) -> bool:
@@ -9045,6 +9067,17 @@ def _mqtt_policy_allows(
     )
     variables = tuple(sorted(context.items()))
     return evaluate(ctx, [_parsed_iot_policy(doc, variables) for doc in documents]).decision == "Allow"
+
+
+def _mqtt_iam_allows(
+    account_id: str, region: str, credential: tuple[str, str], action: str, resource: str
+) -> bool:
+    """Whether the IAM policies of the key that signed a WebSocket session allow ``action`` on ``resource``."""
+    from ministack.core.iam_evaluator import enforce
+
+    access_key_id, key_account = credential
+    with request_scope(key_account, region):
+        return enforce(access_key_id, action, "iot", region, f"arn:aws:iot:{region}:{account_id}:{resource}") is None
 
 
 # ---------------------------------------------------------------------------
@@ -10799,6 +10832,9 @@ class _WSSession:
         self.certificate_id: str | None = None
         # The template of a provisioning claim certificate, which has a policy of its own.
         self.provisioning_template: str | None = None
+        # The access key and account of an IAM principal that signed a WebSocket
+        # session; its IAM policies are evaluated under AUTH=true.
+        self.iam_credential: tuple[str, str] | None = None
         self._policy_context: dict = {}
 
     def disconnect_reason(self) -> str:
@@ -10807,7 +10843,7 @@ class _WSSession:
         Only the reasons the broker can actually tell apart are ever reported: a
         DISCONNECT packet (``CLIENT_INITIATED_DISCONNECT``), a takeover by a
         second connection using the same client id (``DUPLICATE_CLIENTID``),
-        a packet the certificate's policies refuse (``CLIENT_ERROR`` on 3.1.1,
+        a packet the session's policies refuse (``CLIENT_ERROR`` on 3.1.1,
         ``AUTH_ERROR`` on MQTT 5), and everything else — a transport that went
         away (``CONNECTION_LOST``).
         AWS's remaining reasons name machinery this broker does not have
@@ -10889,21 +10925,27 @@ class _WSSession:
     async def _retransmit_loop(self) -> None:
         try:
             while self._in_flight:
-                await asyncio.sleep(_RETRANSMIT_INTERVAL_SECONDS)
+                oldest = min(msg.sent_at for msg in self._in_flight.values())
                 now = asyncio.get_event_loop().time()
-                for pid, msg in list(self._in_flight.items()):
-                    if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
-                        msg.retransmit_count += 1
-                        msg.sent_at = now
-                        await self.send_bytes(
-                            _make_publish(
-                                msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
-                                retain=msg.retain,
-                                properties=self._publish_properties(msg.properties),
-                            )
-                        )
+                await asyncio.sleep(max(oldest + _RETRANSMIT_INTERVAL_SECONDS - now, 0))
+                await self._retransmit_due()
         except asyncio.CancelledError:
             pass
+
+    async def _retransmit_due(self) -> None:
+        """Resend every in-flight QoS 1 message that has waited a retransmit interval for its PUBACK."""
+        now = asyncio.get_event_loop().time()
+        for pid, msg in list(self._in_flight.items()):
+            if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
+                msg.retransmit_count += 1
+                msg.sent_at = now
+                await self.send_bytes(
+                    _make_publish(
+                        msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
+                        retain=msg.retain,
+                        properties=self._publish_properties(msg.properties),
+                    )
+                )
 
     async def send_bytes(self, b: bytes) -> None:
         async with self._send_lock:
@@ -11004,13 +11046,15 @@ class _WSSession:
             )
 
     def _evaluates_policies(self) -> bool:
-        """Whether this session is held to its certificate's IoT policies (AUTH=true only)."""
+        """Whether this session is held to its certificate's IoT policies or its signer's IAM policies (AUTH=true)."""
         from ministack import app
 
-        return app.AUTH and self.certificate_id is not None
+        return app.AUTH and (self.certificate_id is not None or self.iam_credential is not None)
 
     def _policy_allows(self, action: str, resource: str) -> bool:
         """Whether this session may do ``action`` on ``resource``."""
+        if self._evaluates_policies() and self.iam_credential is not None:
+            return _mqtt_iam_allows(self.account_id, self.region, self.iam_credential, action, resource)
         return not self._evaluates_policies() or _mqtt_policy_allows(
             self.account_id,
             self.region,
@@ -11208,7 +11252,7 @@ class _WSSession:
                 self._will_retain = False
                 self._will_properties = b""
 
-            if self._evaluates_policies():
+            if self._evaluates_policies() and self.certificate_id is not None:
                 self._policy_context = _mqtt_policy_context(
                     self.account_id, self.region, self.certificate_id, client_id
                 )
@@ -11260,6 +11304,12 @@ class _WSSession:
                     await self._send_connack(
                         session_present=True, assigned_client_id=assigned_client_id
                     )
+                    # Unacknowledged messages keep their packet identifiers and
+                    # go out again once their retransmit interval has passed.
+                    self._next_pid = existing_ps.next_packet_id
+                    self._in_flight.update(existing_ps.in_flight)
+                    existing_ps.in_flight = {}
+                    await self._retransmit_due()
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
                     for q_topic, q_payload, q_qos, q_properties, q_received_at in queued:
@@ -11271,6 +11321,8 @@ class _WSSession:
                             await self.deliver_to_client(q_topic, q_payload, q_qos)
                         finally:
                             _delivery_properties.reset(token)
+                    if self._in_flight:
+                        self._ensure_retransmit_timer()
                     await self._publish_connected()
                     return True
                 else:
@@ -11500,7 +11552,6 @@ class _WSSession:
             except asyncio.CancelledError:
                 pass
             self._retransmit_task = None
-        self._in_flight.clear()
         if not self._graceful_disconnect and self._will_topic is not None:
             await broker_publish(
                 self.account_id,
@@ -11524,6 +11575,7 @@ class _WSSession:
                 _persistent_sessions.pop(
                     (self.account_id, self.region, self._client_id), None
                 )
+        self._in_flight.clear()
         for sid in self._sub_ids:
             await broker_unsubscribe(sid)
         self._sub_ids.clear()
@@ -11550,12 +11602,15 @@ class _WSSession:
             existing.created_at = time.time()
             existing.expiry_interval = self._session_expiry_interval
         else:
-            _persistent_sessions[session_key] = _PersistentSessionState(
+            existing = _persistent_sessions[session_key] = _PersistentSessionState(
                 subscriptions=unprefixed_filters,
                 created_at=time.time(),
                 expiry_interval=self._session_expiry_interval,
                 session_identifier=self._session_identifier,
             )
+        pending = list(self._in_flight.items())[-_MAX_QUEUED_MESSAGES:]
+        existing.in_flight = dict(pending)
+        existing.next_packet_id = self._next_pid
 
 
 async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bool:
@@ -11580,6 +11635,25 @@ async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bo
             return False
 
 
+def _ws_handshake_check(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Under AUTH=true, the upgrade's verified IAM credential or the ``AuthError`` refusing it; else None."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import authenticate_handshake
+
+    return authenticate_handshake(scope) if AUTH else None
+
+
+async def _refuse_ws_handshake(scope: dict, send) -> None:
+    """Answer a refused upgrade with 403 and a trace id, the device gateway's answer to any credential failure."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": "Forbidden", "traceId": str(uuid.uuid4())}, separators=(",", ":")).encode()
+    await send({"type": "websocket.http.response.start", "status": 403,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
 async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
@@ -11597,6 +11671,10 @@ async def handle_websocket(
             sub_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
         except UnicodeDecodeError:
             sub_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+    checked = _ws_handshake_check(scope)
+    if isinstance(checked, AuthError):
+        await _refuse_ws_handshake(scope, send)
+        return
     requested = sub_headers.get("sec-websocket-protocol", "")
     chosen = None
     for proto in [p.strip() for p in requested.split(",") if p.strip()]:
@@ -11615,6 +11693,8 @@ async def handle_websocket(
     query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
     principal = _caller_principal(extract_access_key_id(sub_headers, query))
     session = _WSSession(send, account_id, region, principal)
+    if checked is not None:
+        session.iam_credential = (checked.access_key_id, checked.account_id)
     max_buffer = _max_frame_buffer_bytes()
 
     try:

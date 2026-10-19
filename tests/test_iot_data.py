@@ -12,9 +12,11 @@ bridge layer.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io as _io
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -31,7 +33,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import iot_test_ca, patch_endpoint_dns, sqs_policy_allow_sns
+from conftest import iot_test_ca, make_client, patch_endpoint_dns, sqs_policy_allow_sns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -405,6 +407,66 @@ def test_iot_data_publish_refuses_invalid_mqtt5_properties(kwargs, user_properti
     assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
     assert ei.value.response["Error"]["Message"] == message
     assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+# IAM contracts, run by CI with AUTH=false and AUTH=true.
+@pytest.fixture
+def auth_iot_shadow(iot_data_client):
+    """A classic shadow to read, removed after the test."""
+    thing = _unique("auth-thing")
+    iot_data_client.update_thing_shadow(thingName=thing, payload=b'{"state":{"reported":{"a":1}}}')
+    yield thing
+    iot_data_client.delete_thing_shadow(thingName=thing)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny"])
+def test_iot_data_permission_contract(auth_enabled, iam_user, auth_iot_shadow, permission):
+    """A refused data plane call answers 403 ForbiddenException without a message."""
+    statements = []
+    if permission != "none":
+        statements.append({"Effect": "Allow", "Action": ["iot:Publish", "iot:GetThingShadow"], "Resource": "*"})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": ["iot:Publish", "iot:GetThingShadow"], "Resource": "*"})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    user = iam_user(policy=policy)
+    data = user.client("iot-data")
+    calls = (
+        lambda: data.publish(topic=_unique("auth/topic"), payload=b"{}"),
+        lambda: data.get_thing_shadow(thingName=auth_iot_shadow),
+    )
+    for call in calls:
+        if auth_enabled and permission != "allow":
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            assert exc.value.response["Error"]["Code"] == "ForbiddenException"
+            assert exc.value.response["Error"]["Message"] is None
+        else:
+            assert call()["ResponseMetadata"]["HTTPStatusCode"] == 200
+    if auth_enabled and permission == "none":
+        # The control plane keeps its own denial.
+        with pytest.raises(ClientError) as exc:
+            user.client("iot").list_things()
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+@pytest.mark.auth_contract
+def test_iot_data_unknown_key_contract(auth_enabled):
+    """A key IAM does not know answers 403 ForbiddenException with the message Forbidden."""
+    data = boto3.client(
+        "iot-data", endpoint_url=ENDPOINT, region_name="us-east-1",
+        aws_access_key_id="AKIA" + uuid.uuid4().hex[:16].upper(), aws_secret_access_key="unknown-secret",
+        config=Config(retries={"total_max_attempts": 1}),
+    )
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            data.publish(topic=_unique("auth/topic"), payload=b"{}")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] == "ForbiddenException"
+        assert exc.value.response["Error"]["Message"] == "Forbidden"
+    else:
+        assert data.publish(topic=_unique("auth/topic"), payload=b"{}")["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +951,203 @@ def test_iot_ws_same_account_publish_delivers(iot_data_client):
     delivered_topic, delivered_payload = received[0]
     assert delivered_topic == topic
     assert delivered_payload == payload
+
+
+_IOT_WS_POLICY = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["iot:*", "sts:GetSessionToken"], "Resource": "*"}]}
+
+
+@contextlib.contextmanager
+def _second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def _iot_ws_host() -> str:
+    parsed = urlparse(ENDPOINT)
+    return f"prefix-ats.iot.us-east-1.{parsed.hostname or 'localhost'}:{parsed.port or 4566}"
+
+
+def _signed_mqtt_upgrade(key, secret, *, session=False, token=None, token_signed=False, header=False,
+                         expires=3600, skew=0, extra="", drop=""):
+    """Query and headers of a GET /mqtt signed by botocore; IoT expects the session token appended afterwards."""
+    import datetime as dt
+    from unittest import mock
+
+    import botocore.auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    if session or token == "session":
+        credentials = boto3.client("sts", endpoint_url=ENDPOINT, aws_access_key_id=key, aws_secret_access_key=secret,
+                                   region_name="us-east-1").get_session_token()["Credentials"]
+        token = credentials["SessionToken"] if token == "session" else token
+        if session:
+            key, secret = credentials["AccessKeyId"], credentials["SecretAccessKey"]
+    token_after = not header and not token_signed
+    request = AWSRequest(method="GET", url=f"http://{_iot_ws_host()}/mqtt")
+    signing = Credentials(key, secret, None if token_after else token)
+    signer = botocore.auth.SigV4Auth(signing, "iotdevicegateway", "us-east-1") if header else (
+        botocore.auth.SigV4QueryAuth(signing, "iotdevicegateway", "us-east-1", expires=expires))
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=skew)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        signer.add_auth(request)
+    query = "&".join(p for p in urlparse(request.url).query.split("&") if not drop or not p.startswith(drop + "="))
+    if token_after and token:
+        query += "&X-Amz-Security-Token=" + quote(token, safe="")
+    return query + extra, {k: v for k, v in request.headers.items() if k.lower() != "host"}
+
+
+def _iot_ws_upgrade(query: str, headers: dict | None = None) -> tuple[int, str, dict]:
+    """Status, Content-Type and JSON body of an MQTT-over-WebSocket upgrade."""
+    import http.client
+
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname or "localhost", parsed.port or 4566, timeout=30)
+    try:
+        conn.request("GET", f"/mqtt?{query}" if query else "/mqtt", headers={
+            "Host": _iot_ws_host(), "Upgrade": "websocket", "Connection": "Upgrade",
+            "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(), "Sec-WebSocket-Version": "13",
+            "Sec-WebSocket-Protocol": "mqtt", **(headers or {}),
+        })
+        resp = conn.getresponse()
+        if resp.status == 101:
+            return 101, "", {}
+        return resp.status, resp.getheader("content-type", ""), json.loads(resp.read() or b"{}")
+    finally:
+        conn.close()
+
+
+_IOT_WS_CASES = {  # case: (signing arguments, refused under AUTH=true)
+    "signed": ({}, False),
+    "wrong-secret": ({"secret": "wrong"}, True),
+    "parameter-added": ({"extra": "&a=b"}, True),
+    "signed-4-min-ago": ({"skew": -240}, False),
+    "signed-6-min-ago-expires-86400": ({"skew": -360, "expires": 86400}, True),
+    "signed-6-min-ahead": ({"skew": 360}, True),
+    "no-signature": ({"drop": "X-Amz-Signature"}, True),
+    "no-date": ({"drop": "X-Amz-Date"}, True),
+    "header-signed": ({"header": True}, False),
+    "header-wrong-secret": ({"header": True, "secret": "wrong"}, True),
+    "unknown-key": ({"key": "AKIAUNKNOWNKEY000001"}, True),
+    "session-token-appended": ({"session": True, "token": "session"}, False),
+    "session-token-signed": ({"session": True, "token": "session", "token_signed": True}, True),
+    "session-no-token": ({"session": True}, True),
+    "session-other-token": ({"session": True, "token": "other"}, True),
+    "user-key-with-token": ({"token": "session"}, True),
+    "root-key-wrong-secret": ({"key": "test", "secret": "wrong"}, False),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case", list(_IOT_WS_CASES))
+def test_iot_ws_handshake_signature_contract(auth_enabled, iam_user, case):
+    """Under AUTH=true an MQTT-over-WebSocket upgrade signed with an IAM key is verified like a request."""
+    args, refused = _IOT_WS_CASES[case]
+    with _second_access_key(iam_user(policy=_IOT_WS_POLICY)) as (key, secret):
+        args = {"key": key, "secret": secret, **args}
+        status, content_type, body = _iot_ws_upgrade(*_signed_mqtt_upgrade(args.pop("key"), args.pop("secret"),
+                                                                           **args))
+    if auth_enabled and refused:
+        assert (status, content_type, body["message"]) == (403, "application/json", "Forbidden")
+        assert re.fullmatch(r"[0-9a-f-]{36}", body["traceId"])
+    else:
+        assert status == 101
+
+
+async def _mqtt_over_signed_ws(query: str, packets: list[bytes]) -> list[str]:
+    """The packets the broker answers over an MQTT WebSocket signed in ``query``, named; a PINGREQ goes last."""
+    names: list[str] = []
+    async with websockets.connect(f"ws://{_iot_ws_host()}/mqtt?{query}", subprotocols=["mqtt"]) as ws:
+        try:
+            for packet in (*packets, b"\xc0\x00"):
+                await ws.send(packet)
+            while "PINGRESP" not in names:
+                buf = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
+                while parsed := _parse_packet(bytes(buf)):
+                    kind, _flags, body, used = parsed
+                    buf = buf[used:]
+                    names.append({
+                        2: lambda: f"CONNACK {body[1]:#04x}",
+                        3: lambda: f"PUBLISH {_dec_str(body, 0)[0]}",
+                        4: lambda: f"PUBACK {body[2] if len(body) > 2 else 0:#04x}",
+                        9: lambda: f"SUBACK {body[-1]:#04x}",
+                        13: lambda: "PINGRESP",
+                        14: lambda: f"DISCONNECT {body[0] if body else 0:#04x}",
+                    }[kind]())
+        except websockets.ConnectionClosed:
+            pass
+    return names
+
+
+_MQTT_WS_CASES = {  # case: (packets as (kind, name, v5), names under AUTH=true, names with AUTH off)
+    "connect-allowed": ([("connect", "dev-1", False)], ["CONNACK 0x00", "PINGRESP"], None),
+    "connect-other-client": ([("connect", "other", False)], [], ["CONNACK 0x00", "PINGRESP"]),
+    "connect-denied-client": ([("connect", "dev-denied", False)], [], ["CONNACK 0x00", "PINGRESP"]),
+    "connect-other-client-v5": ([("connect", "other", True)], ["CONNACK 0x87"], ["CONNACK 0x00", "PINGRESP"]),
+    "receive-allowed": ([("connect", "dev-1", False), ("subscribe", "t/a", False), ("publish", "t/a", False)],
+                        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PUBLISH t/a", "PINGRESP"], None),
+    "receive-not-allowed": (
+        [("connect", "dev-1", False), ("subscribe", "t/nr", False), ("publish", "t/nr", False)],
+        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PINGRESP"],
+        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PUBLISH t/nr", "PINGRESP"]),
+    "publish-other-topic": ([("connect", "dev-1", False), ("publish", "other/x", False)], ["CONNACK 0x00"],
+                            ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "publish-denied-topic": ([("connect", "dev-1", False), ("publish", "t/denied", False)], ["CONNACK 0x00"],
+                             ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "subscribe-other-filter": ([("connect", "dev-1", False), ("subscribe", "other/x", False)], ["CONNACK 0x00"],
+                               ["CONNACK 0x00", "SUBACK 0x01", "PINGRESP"]),
+    "publish-other-topic-v5": ([("connect", "dev-1", True), ("publish", "other/x", True)],
+                               ["CONNACK 0x00", "PUBACK 0x87", "PINGRESP"],
+                               ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "retain-without-retain-publish-v5": ([("connect", "dev-1", True), ("retain", "t/a", True)],
+                                         ["CONNACK 0x00", "PUBACK 0x87", "PINGRESP"],
+                                         ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "subscribe-other-filter-v5": ([("connect", "dev-1", True), ("subscribe", "other/x", True)],
+                                  ["CONNACK 0x00", "SUBACK 0x87", "PINGRESP"],
+                                  ["CONNACK 0x00", "SUBACK 0x01", "PINGRESP"]),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("signer", ["user", "session", "root"])
+@pytest.mark.parametrize("case", list(_MQTT_WS_CASES))
+def test_iot_ws_session_iam_policy_contract(auth_enabled, iam_user, case, signer):
+    """Under AUTH=true an IAM-signed MQTT-over-WebSocket session is held to the signer's IAM policies."""
+    run = _unique("p")
+    statements = [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{run}-dev-*"},
+        {"Effect": "Deny", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{run}-dev-denied"},
+        {"Effect": "Allow", "Action": "iot:Publish", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/*"},
+        {"Effect": "Deny", "Action": "iot:Publish", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/denied"},
+        {"Effect": "Allow", "Action": "iot:Subscribe", "Resource": f"arn:aws:iot:*:*:topicfilter/{run}/t/*"},
+        {"Effect": "Allow", "Action": "iot:Receive", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/a"},
+        {"Effect": "Allow", "Action": "sts:GetSessionToken", "Resource": "*"},
+    ]
+    packets, strict, permissive = _MQTT_WS_CASES[case]
+    frames = []
+    for kind, name, v5 in packets:
+        level = MQTT_5 if v5 else MQTT_311
+        if kind == "connect":
+            frames.append(_make_connect(f"{run}-{name}", protocol_level=level))
+        elif kind == "subscribe":
+            frames.append(_make_subscribe(1, f"{run}/{name}", qos=1, protocol_level=level))
+        else:
+            frames.append(_make_publish(f"{run}/{name}", b"{}", qos=1, packet_id=2, protocol_level=level,
+                                        retain=kind == "retain"))
+    with _second_access_key(iam_user(policy={"Version": "2012-10-17", "Statement": statements})) as (key, secret):
+        if signer == "root":
+            key, secret = "test", "test"
+        query, _ = _signed_mqtt_upgrade(key, secret, session=signer == "session",
+                                        token="session" if signer == "session" else None)
+        names = asyncio.run(_mqtt_over_signed_ws(query, frames))
+    expected = strict if auth_enabled and signer != "root" else (permissive or strict)
+    assert sorted(names) == sorted(n.replace(" t/", f" {run}/t/") for n in expected)
 
 
 # ---------------------------------------------------------------------------
