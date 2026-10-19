@@ -1296,14 +1296,13 @@ def pin_signed_request(
         _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, headers, sigv2=True,
                                           auth_path=f"/{bucket}{raw_path}" if bucket else raw_path))
         return
-    if not verifiable and _signature_attempted(authorization, query_params) and not (
+    # A SigV4 signature that names no key is checked too: it is incomplete or names an unknown key.
+    names_no_key = not claimed and (authorization.startswith("AWS4-HMAC-SHA256") or presigned)
+    if not verifiable and not names_no_key and _signature_attempted(authorization, query_params) and not (
             claimed and _is_root_key(claimed)) and not _s3_presigned_query(query_params):
         _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, unverifiable=True))
         return
-    if not verifiable or _is_root_key(access_key_id):
-    # A signature that names no key is checked too: it is incomplete or names an unknown key.
-    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or (
-            access_key_id and _is_root_key(access_key_id)):
+    if not (verifiable or names_no_key) or (access_key_id and _is_root_key(access_key_id)):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1409,7 +1408,7 @@ def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None
     query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
     pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
     request = _signed_request.get()
-    if request is None or not request.access_key_id:
+    if request is None:
         return None
     try:
         account_id = find_iam_access_key_account(request.access_key_id) or get_account_id()
@@ -1562,9 +1561,10 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
-    # S3, API Gateway methods and function URLs can be called anonymously: a request naming no key is not checked.
+    # S3, API Gateway methods and function URLs can be called anonymously: an unsigned request is not checked.
     anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
-    checked = None if anonymous_ok and not access_key_id else authenticate(access_key_id or "", account_id)
+    unsigned = anonymous_ok and not access_key_id and _signed_request.get() is None
+    checked = None if unsigned else authenticate(access_key_id or "", account_id)
     if isinstance(checked, AuthError):
         return checked
 

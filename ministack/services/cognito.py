@@ -7615,7 +7615,7 @@ def _get_id(data):
         error = _identity_logins_error(pool, None, logins)
         if error:
             return error
-    owner = _login_owner(pool, logins)
+    owner = _link_logins(pool, None, logins)
     if owner:
         return json_response({"IdentityId": owner})
     identity_id = _identity_id(iid)
@@ -7676,7 +7676,7 @@ def _get_credentials_for_identity(data):
                 error = _identity_logins_error(candidate, identity_id, logins)
                 if error:
                     return error
-            _link_logins(candidate, identity_id, logins)
+            identity_id = _link_logins(candidate, identity_id, logins)
             if not logins:
                 logins = candidate["_identities"][identity_id].get("Logins") or {}
             break
@@ -7741,7 +7741,6 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
     if not isinstance(logins, dict):
         return error_response_json("NotAuthorizedException", unsupported, 400)
     not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
-    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
     skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
     supported = set(pool.get("SupportedLoginProviders") or {}) | set(pool.get("SamlProviderARNs") or [])
     supported |= {arn.split("oidc-provider/", 1)[-1] for arn in pool.get("OpenIdConnectProviderARNs") or []}
@@ -7782,8 +7781,9 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
         else:
             continue
         return error_response_json("NotAuthorizedException", message, 400)
-    if stored and not any(provider in stored for provider in logins):
-        # An identity with a login answers only to that login.
+    # An identity with a login needs one of its own; a disabled one, a login another identity holds.
+    if stored and not any(provider in stored for provider in logins) or (
+            identity.get("_merged_into") and not _login_owner(pool, logins)):
         return error_response_json("NotAuthorizedException", mismatch, 400)
     return None
 
@@ -7850,7 +7850,7 @@ def _get_open_id_token(data):
                 error = _identity_logins_error(pool, identity_id, logins)
                 if error:
                     return error
-            _link_logins(pool, identity_id, logins)
+            identity_id = _link_logins(pool, identity_id, logins)
             logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
     if not pool_id:

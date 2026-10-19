@@ -11707,12 +11707,12 @@ async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bo
             return False
 
 
-def _ws_handshake_refused(scope: dict) -> bool:
-    """Under AUTH=true, whether the upgrade's SigV4 signature, time or session token fails."""
+def _ws_handshake_check(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Under AUTH=true, the upgrade's verified IAM credential or the ``AuthError`` refusing it; else None."""
     from ministack.app import AUTH
-    from ministack.core.iam_evaluator import AuthError, authenticate_handshake
+    from ministack.core.iam_evaluator import authenticate_handshake
 
-    return bool(AUTH) and isinstance(authenticate_handshake(scope), AuthError)
+    return authenticate_handshake(scope) if AUTH else None
 
 
 async def _refuse_ws_handshake(scope: dict, send) -> None:
@@ -11743,7 +11743,8 @@ async def handle_websocket(
             sub_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
         except UnicodeDecodeError:
             sub_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
-    if _ws_handshake_refused(scope):
+    checked = _ws_handshake_check(scope)
+    if isinstance(checked, AuthError):
         await _refuse_ws_handshake(scope, send)
         return
     if checked is not None:

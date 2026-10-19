@@ -1550,18 +1550,16 @@ def test_cognito_identity_without_login_merges_into_the_logins_identity(auth_ena
         identity_id = ctx.call("get_id", IdentityPoolId=ctx.pool)["IdentityId"]
         result = ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})
         logins = ctx.call("describe_identity", IdentityId=identity_id)["Logins"]
-        if not auth_enabled:
-            assert (result["IdentityId"], logins) == (identity_id, [])
-            continue
         # The call answers for the identity that holds the login and disables the caller's.
         assert (result["IdentityId"], logins) == (holder, ["DISABLED", "us-east-1"])
         if action == "get_open_id_token":
             assert _decode_jwt_claims(result["Token"])["sub"] == holder
         assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens[user]})["IdentityId"] == holder
-        assert ctx.call(action, IdentityId=identity_id) == (
-            "NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
-        assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens["u2"]}) == (
-            "NotAuthorizedException", mismatch)
+        if auth_enabled:
+            assert ctx.call(action, IdentityId=identity_id) == (
+                "NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
+            assert ctx.call(action, IdentityId=identity_id, Logins={provider: tokens["u2"]}) == (
+                "NotAuthorizedException", mismatch)
         listed = {hide: [i["IdentityId"] for i in ctx.call(
             "list_identities", IdentityPoolId=ctx.pool, MaxResults=60, HideDisabled=hide)["Identities"]]
             for hide in (False, True)}
@@ -1591,20 +1589,18 @@ def test_cognito_identity_merges_the_identities_holding_its_logins(auth_enabled,
     only_new_login = ctx.call("get_credentials_for_identity", IdentityId=u3, Logins={provider_b: tokens["b5"]})
     u5, b6 = get_id({provider: tokens["u5"]}), get_id({provider_b: tokens["b6"]})
     both_held = get_id({provider: tokens["u5"], provider_b: tokens["b6"]})
-    if not auth_enabled:
-        assert (logins_of(ctx.u1), logins_of(held_b)) == ([provider], [provider_b])
-        assert only_new_login["IdentityId"] == u3
-        assert both_held not in (u5, b6)
-        return
     # The caller keeps its identity, takes the other identity's logins and disables it.
     assert (logins_of(ctx.u1), logins_of(held_b)) == (sorted([provider, provider_b]), ["DISABLED", "us-east-1"])
     assert get_id({provider_b: tokens["b"]}) == ctx.u1
     assert ctx.call("get_credentials_for_identity", IdentityId=held_b,
                     Logins={provider_b: tokens["b"]})["IdentityId"] == ctx.u1
-    # An identity with a login needs one of its own; a new login next to it is linked.
-    assert only_new_login == (
-        "NotAuthorizedException",
-        "Logins don't match. Please include at least one valid login for this identity or identity pool.")
+    # Under AUTH an identity with a login needs one of its own; a new login next to it is linked.
+    if auth_enabled:
+        assert only_new_login == (
+            "NotAuthorizedException",
+            "Logins don't match. Please include at least one valid login for this identity or identity pool.")
+    else:
+        assert only_new_login["IdentityId"] == u3
     result = ctx.call("get_credentials_for_identity", IdentityId=u3,
                       Logins={provider: tokens["u3"], provider_b: tokens["b5"]})
     assert (result["IdentityId"], logins_of(u3)) == (u3, sorted([provider, provider_b]))
