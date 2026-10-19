@@ -5787,7 +5787,7 @@ def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tu
 
 def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> tuple:
     """CreateTopicRule; its tags arrive as the ``x-amz-tagging`` header, ``k1=v1&k2=v2``."""
-    if not _RULE_NAME_RE.match(name or ""):
+    if not _RULE_NAME_RE.fullmatch(name or ""):
         return error_response_json(
             "InvalidRequestException",
             "Invalid ruleName: must match [a-zA-Z0-9_]{1,128}",
@@ -5836,7 +5836,7 @@ def _error_rule_name(name: str) -> tuple:
 
 
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
@@ -5850,7 +5850,7 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
@@ -5860,7 +5860,7 @@ def _get_topic_rule(name: str) -> tuple:
 
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
@@ -5870,7 +5870,7 @@ def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
 
 
 def _delete_topic_rule(name: str) -> tuple:
-    if not _RULE_NAME_RE.match(name):
+    if not _RULE_NAME_RE.fullmatch(name):
         return _error_rule_name(name)
     if name not in _topic_rules:
         return _error_rule_denied(name)
@@ -7788,14 +7788,12 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     # the jobId beside it (JobExecutionSummaryForThing).
     summaries = []
     # A rejoined thing's executions of one job come newest first, as on AWS.
-    executions = [
-        execution
-        for latest in _job_executions.values()
-        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
-    ]
+    # Time out only this thing's executions, all of them before any is read, so the page agrees with itself.
+    latest_executions = [e for e in list(_job_executions.values()) if e["thingName"] == thing]
+    for latest in latest_executions:
+        _jobs_apply_timeout(latest)
+    executions = [execution for latest in latest_executions for execution in _jobs_with_history(latest)]
     for execution in executions:
-        if execution["thingName"] != thing:
-            continue
         if wanted_status and execution["status"] != wanted_status:
             continue
         if wanted_job and execution["jobId"] != wanted_job:
@@ -7844,11 +7842,13 @@ def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
             "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
         )
     _jobs_materialize_executions(job_id)
+    latest_executions = [e for e in list(_job_executions.values()) if e["jobId"] == job_id]
+    for latest in latest_executions:
+        _jobs_apply_timeout(latest)
     executions = [
         execution
-        for latest in _job_executions.values()
-        if latest["jobId"] == job_id
-        for execution in _jobs_with_history(_jobs_apply_timeout(latest))
+        for latest in latest_executions
+        for execution in _jobs_with_history(latest)
         if status is None or execution["status"] == status
     ]
     executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
@@ -7929,7 +7929,7 @@ async def _cancel_job_execution(
         )
     prev_next = jobs_first_pending_job_id(thing)
     execution["status"] = "CANCELED"
-    if payload.get("statusDetails"):
+    if isinstance(payload.get("statusDetails"), dict):
         execution["statusDetails"] = dict(payload["statusDetails"])
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
@@ -8064,7 +8064,7 @@ def jobs_start_next_execution(
         execution["startedAt"] = now
         execution["lastUpdatedAt"] = now
         execution["versionNumber"] += 1
-        if status_details:
+        if isinstance(status_details, dict):
             execution["statusDetails"] = dict(status_details)
     return dict(execution)
 
@@ -8348,6 +8348,15 @@ def _jobs_mqtt_json(value) -> str:
     return _jobs_device_json(value)
 
 
+def _jobs_status_details_error(status_details):
+    """InvalidRequestException unless statusDetails is a map of non-empty strings, as the DetailsMap shape is."""
+    if status_details is None or (isinstance(status_details, dict) and all(
+            isinstance(k, str) and k and isinstance(v, str) and v for k, v in status_details.items())):
+        return None
+    return error_response_json(
+        "InvalidRequestException", "statusDetails must be a map of non-empty string keys to non-empty strings", 400)
+
+
 def jobs_update_execution(
     thing_name: str,
     job_id: str,
@@ -8366,6 +8375,8 @@ def jobs_update_execution(
     `execution_number` (404), stale or non-numeric `expectedVersion`, and an
     already-terminal execution. A successful update may complete the job.
     """
+    if error := _jobs_status_details_error(status_details):
+        return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
@@ -9708,6 +9719,9 @@ async def _handle_jobs_publish(
         return
 
     if verb == "start-next":
+        if error := _jobs_status_details_error(request.get("statusDetails")):
+            await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
+            return
         with request_scope(account_id, region):
             execution = jobs_start_next_execution(
                 thing, status_details=request.get("statusDetails"), peek=False
@@ -10780,6 +10794,7 @@ class _WSSession:
         self._send = send_coro
         self.account_id = account_id
         self.region = region
+        self._cleaned_up = False
         # The client certificate id or the IAM caller's user id, else the account:
         # lifecycle events' principalIdentifier and the rule SQL principal().
         self._principal = principal or account_id
@@ -10898,8 +10913,12 @@ class _WSSession:
             await self.deliver_to_client(reply_topic, json.dumps(doc).encode("utf-8"), max(granted))
 
     def _alloc_packet_id(self) -> int:
-        pid = self._next_pid
-        self._next_pid = (self._next_pid % 65535) + 1
+        # Skip identifiers still in flight: one id never names two messages at once.
+        for _ in range(65535):
+            pid = self._next_pid
+            self._next_pid = (self._next_pid % 65535) + 1
+            if pid not in self._in_flight:
+                return pid
         return pid
 
     def _ensure_retransmit_timer(self) -> None:
@@ -11269,6 +11288,13 @@ class _WSSession:
                 if existing_ps is not None and not _is_session_expired(existing_ps):
                     session_present = True
                     self._session_identifier = existing_ps.session_identifier
+                    # Unacknowledged messages keep their packet identifiers: restore them before
+                    # a resubscription replays a retained message, so no new id collides with them.
+                    self._next_pid = existing_ps.next_packet_id
+                    # The resuming connection receives them only where its own policies allow it.
+                    self._in_flight.update({pid: msg for pid, msg in existing_ps.in_flight.items()
+                                            if self._policy_allows("iot:Receive", f"topic/{msg.topic}")})
+                    existing_ps.in_flight = {}
                     for topic_filter in existing_ps.subscriptions:
                         # A stored session keeps its topic filters, not the
                         # subscription options they were made with: those live
@@ -11288,11 +11314,7 @@ class _WSSession:
                     await self._send_connack(
                         session_present=True, assigned_client_id=assigned_client_id
                     )
-                    # Unacknowledged messages keep their packet identifiers and
-                    # go out again once their retransmit interval has passed.
-                    self._next_pid = existing_ps.next_packet_id
-                    self._in_flight.update(existing_ps.in_flight)
-                    existing_ps.in_flight = {}
+                    # They go out again once their retransmit interval has passed.
                     await self._retransmit_due()
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
@@ -11529,6 +11551,11 @@ class _WSSession:
         return True
 
     async def cleanup(self) -> None:
+        # A takeover cleans the old connection up, and its own transport loop does again on exit:
+        # the second run must not overwrite the stored session with the evicted connection's state.
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
         if self._retransmit_task is not None and not self._retransmit_task.done():
             self._retransmit_task.cancel()
             try:
@@ -11659,6 +11686,9 @@ async def handle_websocket(
     if isinstance(checked, AuthError):
         await _refuse_ws_handshake(scope, send)
         return
+    if checked is not None:
+        # The session belongs to the signing key's account, not the one guessed from the key id.
+        account_id = checked.account_id
     requested = sub_headers.get("sec-websocket-protocol", "")
     chosen = None
     for proto in [p.strip() for p in requested.split(",") if p.strip()]:
@@ -11675,7 +11705,9 @@ async def handle_websocket(
 
     ctx_token = _request_account_id.set(account_id)
     query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
-    principal = _caller_principal(extract_access_key_id(sub_headers, query))
+    # A verified signer names the session; an unverified credential only guesses one.
+    principal = _caller_principal(checked.access_key_id if checked is not None
+                                  else extract_access_key_id(sub_headers, query))
     session = _WSSession(send, account_id, region, principal)
     if checked is not None:
         session.iam_credential = (checked.access_key_id, checked.account_id)

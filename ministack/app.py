@@ -2289,17 +2289,19 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         )
 
         s3_action = _s3_action(method, vhost_path, query_params)
+        # x-amz-* headers hoisted into the query string count as the headers they stand for.
+        s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
         if s3_action:
-            s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
+            s3_resource = extract_resource_arn("s3", method, vhost_path, s3_headers, body, query_params, "", "")
             denied = _enforce_data_plane(
                 "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
-                service_context=s3_service_context(f"s3:{s3_action}", query_params, vhost_path, headers),
+                service_context=s3_service_context(f"s3:{s3_action}", query_params, vhost_path, s3_headers),
             )
             if denied:
                 return denied
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
-            for extra_action, extra_arn in s3_additional_checks(method, vhost_path, headers, body, query_params):
+            for extra_action, extra_arn in s3_additional_checks(method, vhost_path, s3_headers, body, query_params):
                 denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
                 if denied:
                     return denied
@@ -2802,7 +2804,14 @@ async def _dispatch_service_request(
 
         pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
-        if iam_action is None and (failure := _authenticate_only(service, headers, query_params, request_id)):
+        if service == "ses" and (path.startswith("/v2/") or "sesv2" in headers.get("x-amz-target", "").lower()):
+            # SES v2 also answers on paths without /v2/email when the target header names it: authorize the call
+            # as the /v2/email operation it performs, never as an action the target header names.
+            v2_path = path if path.startswith(_SES_V2_PREFIX) else f"{_SES_V2_PREFIX}/{path.lstrip('/')}"
+            if denied := _enforce_ses_v2(method, v2_path, headers, body, query_params, request_id):
+                return denied
+            iam_action = None
+        elif iam_action is None and (failure := _authenticate_only(service, headers, query_params, request_id)):
             return failure
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
@@ -2811,7 +2820,9 @@ async def _dispatch_service_request(
             )
             service_context = (
                 dynamodb_service_context(body) if service == "dynamodb"
-                else s3_service_context(iam_action, query_params, path, headers) if service == "s3"
+                else s3_service_context(iam_action, query_params, path,
+                                        _get_module("s3")._merge_hoisted_amz_headers(headers, query_params))
+                if service == "s3"
                 else None
             )
             if service == "logs":
@@ -2863,7 +2874,8 @@ async def _dispatch_service_request(
             if service == "s3" and not denied:
                 from ministack.core.iam_actions import s3_additional_checks
 
-                for extra_action, extra_arn in s3_additional_checks(method, path, headers, body, routing_params):
+                s3_headers = _get_module("s3")._merge_hoisted_amz_headers(headers, query_params)
+                for extra_action, extra_arn in s3_additional_checks(method, path, s3_headers, body, routing_params):
                     denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
                     if denied:
                         iam_action = extra_action

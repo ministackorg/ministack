@@ -2089,6 +2089,11 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
     ),
     "IncompleteSignature": _INCOMPLETE,
     "MissingAuthorizationParameter": _INCOMPLETE,
+    "UnsupportedSignature": (
+        "IncompleteSignature", 400, "IncompleteSignatureException",
+        ("InvalidRequest", 400, "The authorization mechanism you have provided is not supported. "
+                                "Please use AWS4-HMAC-SHA256."),
+    ),
 }
 
 _QUERY_COMPATIBLE = frozenset({"sqs"})

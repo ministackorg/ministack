@@ -12,7 +12,6 @@ bridge layer.
 from __future__ import annotations
 
 import base64
-import contextlib
 import io as _io
 import json
 import os
@@ -33,7 +32,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import iot_test_ca, make_client, patch_endpoint_dns, sqs_policy_allow_sns
+from conftest import iot_test_ca, patch_endpoint_dns, second_access_key, sqs_policy_allow_sns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -957,17 +956,6 @@ _IOT_WS_POLICY = {"Version": "2012-10-17", "Statement": [
     {"Effect": "Allow", "Action": ["iot:*", "sts:GetSessionToken"], "Resource": "*"}]}
 
 
-@contextlib.contextmanager
-def _second_access_key(user):
-    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
-    iam = make_client("iam")
-    key = iam.create_access_key(UserName=user.name)["AccessKey"]
-    try:
-        yield key["AccessKeyId"], key["SecretAccessKey"]
-    finally:
-        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
-
-
 def _iot_ws_host() -> str:
     parsed = urlparse(ENDPOINT)
     return f"prefix-ats.iot.us-east-1.{parsed.hostname or 'localhost'}:{parsed.port or 4566}"
@@ -1049,7 +1037,7 @@ _IOT_WS_CASES = {  # case: (signing arguments, refused under AUTH=true)
 def test_iot_ws_handshake_signature_contract(auth_enabled, iam_user, case):
     """Under AUTH=true an MQTT-over-WebSocket upgrade signed with an IAM key is verified like a request."""
     args, refused = _IOT_WS_CASES[case]
-    with _second_access_key(iam_user(policy=_IOT_WS_POLICY)) as (key, secret):
+    with second_access_key(iam_user(policy=_IOT_WS_POLICY)) as (key, secret):
         args = {"key": key, "secret": secret, **args}
         status, content_type, body = _iot_ws_upgrade(*_signed_mqtt_upgrade(args.pop("key"), args.pop("secret"),
                                                                            **args))
@@ -1140,7 +1128,7 @@ def test_iot_ws_session_iam_policy_contract(auth_enabled, iam_user, case, signer
         else:
             frames.append(_make_publish(f"{run}/{name}", b"{}", qos=1, packet_id=2, protocol_level=level,
                                         retain=kind == "retain"))
-    with _second_access_key(iam_user(policy={"Version": "2012-10-17", "Statement": statements})) as (key, secret):
+    with second_access_key(iam_user(policy={"Version": "2012-10-17", "Statement": statements})) as (key, secret):
         if signer == "root":
             key, secret = "test", "test"
         query, _ = _signed_mqtt_upgrade(key, secret, session=signer == "session",
@@ -1148,6 +1136,29 @@ def test_iot_ws_session_iam_policy_contract(auth_enabled, iam_user, case, signer
         names = asyncio.run(_mqtt_over_signed_ws(query, frames))
     expected = strict if auth_enabled and signer != "root" else (permissive or strict)
     assert sorted(names) == sorted(n.replace(" t/", f" {run}/t/") for n in expected)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("policy_account, connects", [("111111111111", True), ("000000000000", False)],
+                         ids=["own-account", "default-account"])
+def test_iot_ws_session_runs_in_the_signers_account(auth_enabled, policy_account, connects):
+    """An IAM user of another account is authorized on its own account's ARNs, not the default account's."""
+    iam = boto3.client("iam", endpoint_url=ENDPOINT, region_name="us-east-1",
+                       aws_access_key_id="111111111111", aws_secret_access_key="test")
+    name = _unique("ws-acct")
+    iam.create_user(UserName=name)
+    iam.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:{policy_account}:*"}]}))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    try:
+        query, _ = _signed_mqtt_upgrade(key["AccessKeyId"], key["SecretAccessKey"])
+        names = asyncio.run(_mqtt_over_signed_ws(query, [_make_connect(name, protocol_level=MQTT_311)]))
+    finally:
+        iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user_policy(UserName=name, PolicyName="p")
+        iam.delete_user(UserName=name)
+    assert names == (["CONNACK 0x00", "PINGRESP"] if connects or not auth_enabled else [])
 
 
 # ---------------------------------------------------------------------------

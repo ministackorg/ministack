@@ -1191,7 +1191,10 @@ def _parse_alarm_rule(rule):
             node = ("or", node, conjunction())
         return node
 
-    tree = disjunction()
+    try:
+        tree = disjunction()
+    except RecursionError:
+        fail()
     if at != len(tokens) - 1:
         fail("<EOF>, 'AND', 'OR'")
     return tree
@@ -2276,8 +2279,14 @@ def cloudformation_set_metric_alarm_tags(name: str, tags: list) -> None:
     _resource_tags[arn] = {t["Key"]: t.get("Value", "") for t in tags}
 
 
-def cloudformation_delete_metric_alarm(name: str) -> None:
-    """Remove a metric alarm created from a template (not composite alarms)."""
+def cloudformation_delete_metric_alarm(name: str, refuse_dependents: bool = False) -> None:
+    """Remove a metric alarm created from a template (not composite alarms).
+
+    ``refuse_dependents`` makes a stack delete fail, as DeleteAlarms does, while a composite alarm still needs it.
+    """
+    if refuse_dependents and name in _alarms and any(
+            name in _composite_children(parent) for parent in _composite_alarms.values()):
+        raise ValueError(f"Cannot delete {name} as there are composite alarm(s) depending on it.")
     _alarms.pop(name, None)
     _resource_tags.pop(
         f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}", None

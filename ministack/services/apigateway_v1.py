@@ -1930,8 +1930,11 @@ async def _authorize_request_v1(
         # Under AUTH a presigned request was verified before it got here.
         from ministack.app import AUTH
         from ministack.core.iam_evaluator import _query_signed
+        from ministack.core.router import extract_access_key_id
 
-        if not _header_ci(headers, "authorization") and not (AUTH and _query_signed(query_params or {})):
+        # A presigned call passes only when its query names a key, whose signature the router then verified.
+        if not _header_ci(headers, "authorization") and not (
+                AUTH and _query_signed(query_params or {}) and extract_access_key_id({}, query_params or {})):
             return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token"), None
         return None, None
     if auth_type == "COGNITO_USER_POOLS":

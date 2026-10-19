@@ -1071,7 +1071,7 @@ async def handle_request(method, path, headers, body, query_params):
                 allow_cross_region=not _has_sigv4_credentials(headers, query_params),
             )
         if not api_id:
-            return error_response_json("UnauthorizedException", "Valid API key required", 401)
+            return _unauthorized_response()
         data = _graphql_request(body)
         if data is None:
             return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
@@ -1537,7 +1537,14 @@ def _request_is_authenticated(api_id, api, request_headers):
         if auth and not auth.startswith("AWS4-HMAC-SHA256"):
             return True
     if "AWS_IAM" in modes and auth.startswith("AWS4-HMAC-SHA256"):
-        return True
+        from ministack.app import AUTH
+        if not AUTH:
+            return True
+        from ministack.core.iam_evaluator import caller_verified
+        from ministack.core.router import extract_access_key_id
+        # Under AUTH a SigV4 header counts only once its signature checks out.
+        if caller_verified(extract_access_key_id(headers, {}), get_account_id()):
+            return True
     if "AWS_LAMBDA" in modes and api.get("lambdaAuthorizerConfig"):
         # The authorizer runs below and may still reject.
         return True
@@ -1611,11 +1618,14 @@ def _execute_graphql(api_id, data, request_headers=None):
 
     if data.get("query") is None:
         return _malformed_graphql_request("Invalid request, `query` can't be null.")
+    if not isinstance(query, str) or (variables is not None and not isinstance(variables, dict)):
+        return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
+    variables = variables or {}
     if not query.strip():
         return _malformed_graphql_request("Invalid request, `query` can't be empty.")
 
     if api_id not in _apis:
-        return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
+        return _graphql_error(404, "ResourceNotFoundException", "Unable to find the Api.")
 
     # Applied before either execution path, so it does not depend on whether
     # the API has a schema. AWS refuses a request that satisfies none of the

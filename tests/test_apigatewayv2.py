@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import contextlib
 import io
 import json
 import os
@@ -24,8 +23,8 @@ from conftest import (
     ENDPOINT,
     LoopProbe,
     concurrent_burst,
-    make_client,
     make_probe_lambda,
+    second_access_key,
 )
 
 from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
@@ -3269,17 +3268,6 @@ _WS_IAM_POLICY = {"Version": "2012-10-17", "Statement": [
     {"Effect": "Allow", "Action": ["execute-api:Invoke", "sts:GetSessionToken"], "Resource": "*"}]}
 
 
-@contextlib.contextmanager
-def _second_access_key(user):
-    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
-    iam = make_client("iam")
-    key = iam.create_access_key(UserName=user.name)["AccessKey"]
-    try:
-        yield key["AccessKeyId"], key["SecretAccessKey"]
-    finally:
-        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
-
-
 def _signed_ws_connect(host, key, secret, *, session=False, token=None, token_after=False, header=False,
                        expires=3600, skew=0, drop=""):
     """Path and headers of a GET /prod handshake signed by botocore for execute-api."""
@@ -3350,7 +3338,7 @@ def test_ws_connect_aws_iam_handshake_signature_contract(auth_enabled, iam_user,
         apigw.create_stage(ApiId=api_id, StageName="prod")
         args, message = _WS_CONNECT_CASES[case]
         host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
-        with _second_access_key(iam_user(policy=_WS_IAM_POLICY)) as (key, secret):
+        with second_access_key(iam_user(policy=_WS_IAM_POLICY)) as (key, secret):
             args = {"key": key, "secret": secret, **args}
             path, headers = _signed_ws_connect(host, args.pop("key"), args.pop("secret"), **args)
             status, body = _ws_handshake(api_id, path, headers)

@@ -958,7 +958,7 @@ async def _publish(api_id: str, headers: dict, body: bytes):
         return _publish_error(
             400, "BadRequestException", f"Input exceeded {_MAX_EVENTS_PER_BATCH} event limit")
 
-    if _validate_channel(channel, allow_wildcard=False):
+    if not isinstance(channel, str) or _validate_channel(channel, allow_wildcard=False):
         return _publish_error(400, "BadRequestException", "Invalid Channel Format")
 
     ns_name = _channel_namespace_for(channel)

@@ -1249,10 +1249,27 @@ class SignedRequest:
     body: bytes = b""
     presigned: bool = False
     handshake: bool = False
+    # Credentials this server cannot verify (another algorithm, a key the signature does not cover).
+    unverifiable: bool = False
+    # A SigV2 (HmacV1) header or query signature, checked against the path S3 signs.
+    sigv2: bool = False
+    auth_path: str = ""
 
 
 _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
     "ministack_signed_request", default=None)
+# The access key whose signature this request already passed, once checked.
+_verified_key: contextvars.ContextVar[str] = contextvars.ContextVar("ministack_verified_key", default="")
+
+
+def caller_verified(access_key_id: str, account_id: str) -> bool:
+    """Whether the request's SigV4/SigV2 signature for this key checks out (root keys are not checked)."""
+    if not access_key_id:
+        return False
+    if _is_root_key(access_key_id) or _verified_key.get() == access_key_id:
+        return True
+    checked = authenticate(access_key_id, account_id)
+    return checked is not None and not isinstance(checked, AuthError)
 
 
 def pin_signed_request(
@@ -1262,10 +1279,28 @@ def pin_signed_request(
     from ministack.core.router import extract_access_key_id
     from ministack.core.sigv4 import decode_header_value
 
+    _verified_key.set("")
     authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
     presigned = not authorization.startswith("AWS4-HMAC-SHA256") and _query_signed(query_params)
     access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
-    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or _is_root_key(access_key_id):
+    # The key the policy check will use; it must be the one the signature is checked for.
+    claimed = extract_access_key_id({"authorization": authorization}, query_params)
+    verifiable = (authorization.startswith("AWS4-HMAC-SHA256") or presigned) and bool(claimed) and access_key_id == claimed
+    sigv2 = authorization.startswith("AWS ") or bool(
+        _query_value(query_params or {}, "AWSAccessKeyId") and _query_value(query_params or {}, "Signature")
+        and not _query_value(query_params or {}, "SignatureVersion"))
+    if sigv2 and claimed and not _is_root_key(claimed) and not authorization.startswith("AWS4-"):
+        headers = {name.decode("latin-1").lower(): decode_header_value(value) for name, value in raw_headers}
+        from ministack.app import _extract_s3_vhost_bucket
+        bucket = _extract_s3_vhost_bucket(headers.get("host", ""))
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, headers, sigv2=True,
+                                          auth_path=f"/{bucket}{raw_path}" if bucket else raw_path))
+        return
+    if not verifiable and _signature_attempted(authorization, query_params) and not (
+            claimed and _is_root_key(claimed)) and not _s3_presigned_query(query_params):
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, unverifiable=True))
+        return
+    if not verifiable or _is_root_key(access_key_id):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1275,6 +1310,73 @@ def pin_signed_request(
         headers[key] = f"{headers[key]},{text}" if key in headers else text
     _signed_request.set(SignedRequest(
         access_key_id, method, raw_path, query_params, headers, presigned=presigned, handshake=handshake))
+
+
+def _sigv2_check(request: SignedRequest, account_id: str) -> AuthError | ResolvedCredential:
+    """Verify a SigV2 (HmacV1) header or query signature as S3 computes it."""
+    from urllib.parse import urlencode, urlsplit
+
+    from botocore.auth import HmacV1Auth
+    from botocore.awsrequest import HTTPHeaders
+    from botocore.credentials import Credentials
+
+    from ministack.core.responses import _account_from_sts_session
+
+    query = request.query_params or {}
+    presigned = not request.headers.get("authorization", "").startswith("AWS ")
+    token = (_query_value(query, "x-amz-security-token") if presigned
+             else request.headers.get("x-amz-security-token", ""))
+    credential = resolve_credential(request.access_key_id,
+                                    _account_from_sts_session(request.access_key_id) or account_id, token)
+    if isinstance(credential, CredentialResolutionError):
+        return AuthError(credential.code, credential.message)
+    headers = HTTPHeaders()
+    for name, value in request.headers.items():
+        headers[name] = value
+    pairs = [(k, v) for k, values in query.items() for v in (values if isinstance(values, list) else [values])]
+    split = urlsplit("http://host" + request.auth_path + ("?" + urlencode(pairs) if pairs else ""))
+    if presigned:
+        # A query signature signs Expires where a header signature signs Date.
+        signed_date = _query_value(query, "Expires")
+        if not signed_date.isdigit() or int(signed_date) < time.time():
+            return AuthError("SignatureDoesNotMatch", "Request has expired")
+        given = _query_value(query, "Signature")
+    else:
+        signed_date = request.headers.get("date", "")
+        given = request.headers["authorization"].split(":", 1)[-1]
+
+    class _Signer(HmacV1Auth):
+        def _get_date(self):  # the date the client signed, not the time of this check
+            return signed_date
+
+    signer = _Signer(Credentials(credential.access_key_id, credential.secret_access_key, token or None))
+    expected = signer.get_signature(request.method, split, headers)
+    if not hmac.compare_digest(given.encode(), expected.encode()):
+        return AuthError("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
+                                                  "you provided. Check your key and signing method.")
+    _verified_key.set(request.access_key_id)
+    return credential
+
+
+def _query_value(query_params: dict, name: str) -> str:
+    found = query_params.get(name) or query_params.get(name.lower()) or [""]
+    return found[0] if isinstance(found, list) else found
+
+
+def _signature_attempted(authorization: str, query_params: dict) -> bool:
+    """Whether a request carries any AWS signature or credential, valid or not."""
+    if authorization.startswith(("AWS4-", "AWS ")):
+        return True
+    return any(_query_value(query_params or {}, name) for name in (
+        "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Signature", "AWSAccessKeyId", "Signature"))
+
+
+def _s3_presigned_query(query_params: dict) -> bool:
+    """A complete SigV4 presigned S3 URL, which S3 verifies itself."""
+    query_params = query_params or {}
+    scope = _query_value(query_params, "X-Amz-Credential").split("/")
+    return (_query_value(query_params, "X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0])
+            and len(scope) == 5 and scope[3] == "s3" and bool(_query_value(query_params, "X-Amz-Signature")))
 
 
 def _query_signed(query_params: dict) -> bool:
@@ -1328,6 +1430,10 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     if request is None or request.access_key_id != access_key_id:
         return None
     _signed_request.set(None)  # checked once; the request's later checks skip it
+    if request.unverifiable:
+        return AuthError("UnsupportedSignature", "The request signature does not conform to AWS standards.")
+    if request.sigv2:
+        return _sigv2_check(request, account_id)
     if request.presigned:
         signature = parse_query_signature(request.query_params)
     else:
@@ -1354,7 +1460,10 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         request.query_params, request.headers, request.body, presigned=request.presigned,
         explain=request.handshake,
     )
-    return AuthError(*failure) if failure else credential
+    if failure:
+        return AuthError(*failure)
+    _verified_key.set(access_key_id)
+    return credential
 
 
 def check_credentials(access_key_id: str) -> AuthError | None:

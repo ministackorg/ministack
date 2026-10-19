@@ -187,6 +187,17 @@ def iam_user(auth_enabled):
         yield create
 
 
+@contextlib.contextmanager
+def second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
 def inprocess_iam_user(identity_policy=None):
     """An in-process IAM user with an access key in the default account: ``((key id, secret), arn)``."""
     from ministack.core.responses import get_account_id, request_scope

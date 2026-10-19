@@ -32,6 +32,7 @@ import copy
 import datetime as _dt
 import hashlib
 import hmac
+import ipaddress
 import itertools
 import json
 import logging
@@ -1066,6 +1067,10 @@ def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
 
 def object_tags_for_condition(bucket_name: str, key: str, query_params: dict) -> dict:
     """The tags of the object version a read names, for ``s3:ExistingObjectTag`` in the identity check."""
+    if bucket_name.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        resolved = resolve_access_point_alias(bucket_name)
+        if resolved is not None and resolved[0] == get_account_id():
+            bucket_name = resolved[2]["Bucket"]
     bucket = _buckets.get(bucket_name)
     if bucket is None:
         return {}
@@ -1079,7 +1084,7 @@ def upload_encryption_header(upload_id: str) -> str | None:
 
 
 def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
-                           method: str, query_params: dict, caller: str) -> bool:
+                           method: str, query_params: dict, caller: str, headers: dict | None = None) -> bool:
     """Whether a caller who does not own the bucket may have this request.
 
     The owner's grants decide it: a Group grant on the bucket or the object
@@ -1107,10 +1112,14 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
 
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
     if policy and not _public_access_blocked(owner_account, bucket_name, "RestrictPublicBuckets"):
+        from ministack.core.iam_actions import _s3_action, s3_service_context
         from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
-        action = "s3:GetObject" if method in ("GET", "HEAD") else "s3:PutObject"
+        path = f"/{bucket_name}/{key}" if key else f"/{bucket_name}"
+        action = f"s3:{_s3_action(method, path, query_params) or ('GetObject' if method in ('GET', 'HEAD') else 'PutObject')}"
         resource = f"arn:aws:s3:::{bucket_name}"
+        with request_scope(owner_account, get_region()):
+            service_context = s3_service_context(action, query_params, path, headers or {})
         ctx = EvalContext(
             principal_arn=f"arn:aws:iam::{caller}:root" if caller else "*",
             principal_type="Root" if caller else "Anonymous",
@@ -1118,6 +1127,7 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
             action=action,
             resource_arn=f"{resource}/{key}" if key else resource,
             region=get_region(),
+            service_context={k.lower(): v for k, v in service_context.items()},
         )
         if evaluate_resource_policy(policy, ctx).decision == "Allow":
             return True
@@ -1292,8 +1302,12 @@ def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
     if owner is None:
         return None
     from ministack.app import AUTH
-    if AUTH and not internal and not _request_access_key(method, key, headers, query_params, body):
-        if not _foreign_bucket_allows(owner, bucket, key, method, query_params, ""):
+    anonymous = AUTH and not internal and not _request_access_key(method, key, headers, query_params, body)
+    source_denied = _copy_source_denied(headers, "" if anonymous else get_account_id(), anonymous, internal)
+    if source_denied is not None:
+        return source_denied
+    if anonymous:
+        if not _foreign_bucket_allows(owner, bucket, key, method, query_params, "", headers):
             return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
         set_request_account_id(owner)
         return None
@@ -1308,10 +1322,27 @@ def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
         # The caller is the owner; the credential just was not in a header.
         set_request_account_id(owner)
         return None
-    if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller):
+    if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller, headers):
         return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
     set_request_account_id(owner)
     return None
+
+
+def _copy_source_denied(headers: dict, caller: str, anonymous: bool, internal: bool):
+    """AccessDenied when a copy reads a source object its caller may not read in another account's bucket."""
+    source = headers.get("x-amz-copy-source", "")
+    if internal or not source:
+        return None
+    src, _, query = source.partition("?")
+    src_bucket, _, src_key = url_unquote(src).lstrip("/").partition("/")
+    src_owner = _bucket_owner_account(src_bucket)
+    if src_owner is None or (not anonymous and src_owner == caller):
+        return None
+    version = _parse_qs(query).get("versionId")
+    if _foreign_bucket_allows(src_owner, src_bucket, src_key, "GET", {"versionId": version} if version else {},
+                              caller):
+        return None
+    return _error("AccessDenied", "Access Denied", 403, f"/{src_bucket}/{src_key}")
 
 
 def _ensure_bucket(name: str):
@@ -2815,9 +2846,80 @@ def _get_bucket_policy(name: str):
     return 200, {"Content-Type": "application/json"}, policy.encode("utf-8")
 
 
+# Condition keys whose fixed value makes a statement non-public, per the S3 "meaning of public".
+_NON_PUBLIC_CONDITION_KEYS = {
+    "aws:principalorgid", "aws:principalaccount", "aws:principalarn", "aws:sourceip", "aws:sourcearn",
+    "aws:sourcevpc", "aws:sourcevpce", "aws:sourceowner", "aws:sourceaccount", "aws:userid",
+    "s3:dataaccesspointarn", "s3:dataaccesspointaccount",
+}
+# Operators that narrow access to the values they name; negated, Null and ForAllValues ones do not.
+_NARROWING_OPERATORS = {
+    "stringequals", "stringequalsignorecase", "stringlike", "arnequals", "arnlike", "ipaddress",
+    "foranyvalue:stringequals", "foranyvalue:stringequalsignorecase", "foranyvalue:stringlike",
+    "foranyvalue:arnequals", "foranyvalue:arnlike",
+}
+
+
+def _fixed_condition_value(key: str, value: str) -> bool:
+    if key == "s3:dataaccesspointarn":
+        # A wildcard access point name with a fixed account still delegates to that account only.
+        parts = value.split(":")
+        return len(parts) >= 6 and parts[4].isdigit() and not any(c in ":".join(parts[:5]) for c in "*?")
+    if any(c in value for c in "*?") or "${" in value:
+        return False
+    if key == "aws:sourceip":
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            return False
+        return net.is_private or net.prefixlen >= (8 if net.version == 4 else 32)
+    return True
+
+
+def _statement_is_public(statement: dict) -> bool:
+    """Whether an Allow statement grants access the S3 Block Public Access rules count as public."""
+    if statement.get("Effect") != "Allow":
+        return False
+    if "NotPrincipal" in statement:
+        return True
+    principal = statement.get("Principal")
+    if isinstance(principal, dict):
+        aws = principal.get("AWS", [])
+        aws = aws if isinstance(aws, list) else [aws]
+        if not any("*" in str(p) for p in aws):
+            return False
+    elif principal != "*":
+        return False
+    conditions = statement.get("Condition") or {}
+    if not isinstance(conditions, dict):
+        return True
+    for operator, keys in conditions.items():
+        if str(operator).lower().removesuffix("ifexists") not in _NARROWING_OPERATORS or not isinstance(keys, dict):
+            continue
+        for key, values in keys.items():
+            values = values if isinstance(values, list) else [values]
+            if str(key).lower() in _NON_PUBLIC_CONDITION_KEYS and values and all(
+                    _fixed_condition_value(str(key).lower(), str(v)) for v in values):
+                return False
+    return True
+
+
+def _policy_is_public(policy_text: str) -> bool:
+    try:
+        statements = json.loads(policy_text).get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    statements = [statements] if isinstance(statements, dict) else statements
+    return any(isinstance(s, dict) and _statement_is_public(s) for s in statements)
+
+
 def _put_bucket_policy(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
+    if _public_access_blocked(get_account_id(), name, "BlockPublicPolicy") and _policy_is_public(
+            body.decode("utf-8", errors="replace")):
+        return _error("AccessDenied",
+                      "public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.", 403)
     _bucket_policies[name] = body.decode("utf-8")
     return 204, {}, b""
 

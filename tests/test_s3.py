@@ -1439,6 +1439,35 @@ def test_s3_public_access_block(s3):
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
 
+def test_s3_block_public_policy_refuses_a_public_bucket_policy(s3):
+    bkt = f"intg-s3-bpp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    def policy(**extra):
+        return json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bkt}/*", **extra}]})
+
+    try:
+        s3.put_bucket_policy(Bucket=bkt, Policy=policy())
+        s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={
+            "BlockPublicAcls": False, "IgnorePublicAcls": False,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": False})
+        # The policy set before the setting stays.
+        assert json.loads(s3.get_bucket_policy(Bucket=bkt)["Policy"]) == json.loads(policy())
+        for public in (policy(), policy(Condition={"StringLike": {"aws:SourceVpc": "vpc-*"}})):
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_policy(Bucket=bkt, Policy=public)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        s3.put_bucket_policy(Bucket=bkt, Policy=policy(
+            Condition={"StringEquals": {"aws:SourceVpc": "vpc-91237329"}}))
+    finally:
+        s3.delete_public_access_block(Bucket=bkt)
+        s3.delete_bucket_policy(Bucket=bkt)
+        s3.delete_bucket(Bucket=bkt)
+
+
 def test_s3_block_public_acls_refuses_setting_a_public_acl(s3):
     """BlockPublicAcls refuses every call that sets a public ACL; private grants and IgnorePublicAcls alone pass."""
     import requests

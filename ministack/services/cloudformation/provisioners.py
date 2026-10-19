@@ -10365,7 +10365,7 @@ def _cw_metric_alarm_update(physical_id, old_props, new_props, stack_name,
 
 
 def _cw_metric_alarm_delete(physical_id, props):
-    _cw.cloudformation_delete_metric_alarm(physical_id)
+    _cw.cloudformation_delete_metric_alarm(physical_id, refuse_dependents=True)
 
 
 # ---------------------------------------------------------------------------

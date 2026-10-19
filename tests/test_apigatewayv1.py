@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import io
 import json
 import os
@@ -13,7 +12,7 @@ import boto3
 import pytest
 import yaml
 from botocore.exceptions import ClientError
-from conftest import inprocess_iam_user, make_client, routed_request
+from conftest import inprocess_iam_user, routed_request, second_access_key
 
 from ministack.core.responses import set_request_region
 from ministack.services import apigateway_v1
@@ -1355,17 +1354,6 @@ def test_apigwv1_execute_aws_iam_requires_auth_header(apigw_v1, lam):
         lam.delete_function(FunctionName=fname)
 
 
-@contextlib.contextmanager
-def _second_access_key(user):
-    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
-    iam = make_client("iam")
-    key = iam.create_access_key(UserName=user.name)["AccessKey"]
-    try:
-        yield key["AccessKeyId"], key["SecretAccessKey"]
-    finally:
-        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
-
-
 def _signed_rest_get(url, key, secret, *, session=False, header=False, expires=300, skew=0):
     """Status and x-amzn-ErrorType of a GET signed by botocore for execute-api, in its query string by default."""
     import datetime as dt
@@ -1423,7 +1411,7 @@ def test_apigwv1_aws_iam_presigned_call_contract(auth_enabled, iam_user, apigw_v
         policy = {"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Action": ["execute-api:Invoke", "sts:GetSessionToken"], "Resource": "*"}]}
         args, strict, permissive = _REST_SIGNED_CASES[case]
-        with _second_access_key(iam_user(policy=policy)) as (key, secret):
+        with second_access_key(iam_user(policy=policy)) as (key, secret):
             args = {"key": key, "secret": secret, **args}
             answer = _signed_rest_get(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p/",
                                       args.pop("key"), args.pop("secret"), **args)

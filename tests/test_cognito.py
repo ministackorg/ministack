@@ -1441,9 +1441,8 @@ def test_cognito_get_id_checks_logins(auth_enabled, cognito_idp, cognito_identit
     ]:
         result = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins=logins)
         assert result == ("NotAuthorizedException", message) if auth_enabled else "IdentityId" in result
-    # With AUTH a login that has an identity gets that identity back; without it every GetId makes a new one.
-    found = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens["u1"]})["IdentityId"]
-    assert (found == ctx.u1) == auth_enabled
+    # A login that has an identity gets that identity back.
+    assert ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens["u1"]})["IdentityId"] == ctx.u1
 
 
 @pytest.mark.auth_contract
@@ -1456,12 +1455,11 @@ def test_cognito_identity_without_login_takes_one(auth_enabled, cognito_idp, cog
         logins = ctx.call("describe_identity", IdentityId=identity_id).get("Logins", [])
         found = ctx.call("get_id", IdentityPoolId=ctx.pool, Logins={provider: tokens[user]})["IdentityId"]
         without_logins = ctx.call("get_credentials_for_identity", IdentityId=identity_id)
+        assert (logins, found) == ([provider], identity_id)
         if auth_enabled:
-            assert (logins, found) == ([provider], identity_id)
             assert without_logins == ("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.")
         else:
-            assert (logins, without_logins["IdentityId"]) == ([], identity_id)
-            assert found != identity_id
+            assert without_logins["IdentityId"] == identity_id
 
 
 def test_cognito_get_open_id_token_expired_login_under_auth(monkeypatch):
