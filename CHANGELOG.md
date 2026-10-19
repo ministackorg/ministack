@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **IoT Jobs — a status a device may not set is refused first** — `UpdateJobExecution` (HTTP and the MQTT `update` topic) to QUEUED, CANCELED or TIMED_OUT answered `ResourceNotFoundException` for an unknown job or thing and the version error for a stale `expectedVersion`; it now refuses the status first with `InvalidStateTransitionException` (over MQTT `InvalidStateTransition` without `executionState`), as AWS does. Contributed by @iot-rocket.
+- **IoT — unknown topic rules answer 401** — `GetTopicRule`, `ReplaceTopicRule`, `EnableTopicRule` and `DisableTopicRule` on a rule that does not exist answered 404 `ResourceNotFoundException` and `DeleteTopicRule` answered 200; they now answer 401 `UnauthorizedException` (`Access to topic rule '<name>' was denied`) as AWS does, and `GetTopicRule`, `ReplaceTopicRule` and `DeleteTopicRule` refuse a name outside the rule name pattern with the 400 `InvalidRequestException` that `EnableTopicRule` gives. Contributed by @iot-rocket.
+- **S3 — bucket configuration validation** — `PutBucketVersioning` accepted any `Status` or `MfaDelete` and stored it, `PutBucketLifecycleConfiguration` accepted any rule `Status` or transition `StorageClass` and non-positive days, and `PutBucketEncryption` accepted any `SSEAlgorithm`. Out-of-enum values now return 400 `MalformedXML` (`The XML you provided was not well-formed or did not validate against our published schema`, now the message for every `MalformedXML`). A zero or negative `Expiration` `Days` or `NoncurrentVersionExpiration` `NoncurrentDays` returns 400 `InvalidArgument` (`'Days' for Expiration action must be a positive integer`).
 
 ## [1.5.29] — 2026-10-17
 
