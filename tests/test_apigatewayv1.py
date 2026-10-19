@@ -4878,7 +4878,7 @@ def test_apigwv1_cognito_client_credentials_http(apigw_v1, cognito_idp, basic):
             assert (status, body) == (401, {"message": "Unauthorized"})
             assert headers["x-amzn-errortype"] == "UnauthorizedException"
         for scope, error in (("api/admin", "invalid_grant"), ("api/missing", "invalid_scope"),
-                             ("api/read api/admin", "invalid_grant"), ("api/read api/missing", "invalid_scope")):
+                             ("api/read api/admin", "invalid_grant"), ("api/admin bogus/x", "invalid_grant")):
             status, response = get_token(scope)
             assert status == 400, response
             assert response["error"] == error
