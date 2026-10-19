@@ -1829,6 +1829,12 @@ class _NoApiModule:
         return None
 
     @staticmethod
+    def method_authorization_type(api_id, stage, method, path):
+        return None
+
+    route_authorization_type = method_authorization_type
+
+    @staticmethod
     async def handle_connections_api(method, api_id, stage, connection_id, body, headers):
         return 200, {}, b""
 
