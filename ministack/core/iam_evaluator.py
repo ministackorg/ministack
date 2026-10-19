@@ -1301,6 +1301,9 @@ def pin_signed_request(
         _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, unverifiable=True))
         return
     if not verifiable or _is_root_key(access_key_id):
+    # A signature that names no key is checked too: it is incomplete or names an unknown key.
+    if not (authorization.startswith("AWS4-HMAC-SHA256") or presigned) or (
+            access_key_id and _is_root_key(access_key_id)):
         _signed_request.set(None)
         return
     headers: dict[str, str] = {}
@@ -1386,8 +1389,7 @@ def _query_signed(query_params: dict) -> bool:
         return found[0] if isinstance(found, list) else found
 
     scope = value("X-Amz-Credential").split("/")
-    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0]) and (
-        len(scope) < 4 or scope[3] != "s3")
+    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and (len(scope) < 4 or scope[3] != "s3")
 
 
 def pin_signed_body(body: bytes) -> None:
@@ -1407,7 +1409,7 @@ def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None
     query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
     pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
     request = _signed_request.get()
-    if request is None:
+    if request is None or not request.access_key_id:
         return None
     try:
         account_id = find_iam_access_key_account(request.access_key_id) or get_account_id()
@@ -1447,7 +1449,9 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         token = (request.query_params.get("X-Amz-Security-Token") or [""])[0]
     else:
         token = request.headers.get("x-amz-security-token", "")
-    credential = resolve_credential(access_key_id, _account_from_sts_session(access_key_id) or account_id, token)
+    credential = resolve_credential(
+        access_key_id, _account_from_sts_session(access_key_id) or account_id, token,
+    ) if access_key_id else _unknown_access_key()
     if isinstance(credential, CredentialResolutionError):
         if credential.code == "InvalidToken":
             # AWS treats a session key without its token as unknown, and any other token as invalid.
@@ -1558,7 +1562,9 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
-    checked = authenticate(access_key_id or "", account_id)
+    # S3, API Gateway methods and function URLs can be called anonymously: a request naming no key is not checked.
+    anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
+    checked = None if anonymous_ok and not access_key_id else authenticate(access_key_id or "", account_id)
     if isinstance(checked, AuthError):
         return checked
 

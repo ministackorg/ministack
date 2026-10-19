@@ -181,6 +181,25 @@ _SCOPE = "AKIAIOSFODNN7EXAMPLE/20260930/eu-central-1/sts/aws4_request"
             "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
             "got 'AKIAIOSFODNN7EXAMPLE/eu-central-1/sts/aws4_request'",
         ),
+        (
+            "AWS4-HMAC-SHA256 SignedHeaders=host;x-amz-date, Signature=abc",
+            "MissingAuthorizationParameter",
+            "Authorization header requires 'Credential' parameter. (Hashed with SHA-256 and encoded with Base64) "
+            "Authorization=ahJcBrcKAe4SBJto5I/CIJQro+xeLn5ihFrmUmERRpY=",
+        ),
+        (
+            "AWS4-HMAC-SHA256 Credential=, SignedHeaders=host;x-amz-date, Signature=abc",
+            "IncompleteSignature",
+            "Authorization header requires 'Credential' parameter. (Hashed with SHA-256 and encoded with Base64) "
+            "Authorization=Rso9P5e0/U0V+vZQW+PsjFTI/EYgUn2YbmHes/SFYPA=",
+        ),
+        (
+            "AWS4-HMAC-SHA256",
+            "MissingAuthorizationParameter",
+            "Authorization header requires 'Credential' parameter. Authorization header requires 'Signature' "
+            "parameter. Authorization header requires 'SignedHeaders' parameter. (Hashed with SHA-256 and encoded "
+            "with Base64) Authorization=YI2YWea8FSxnksZL2ETHbs5elHm9HQufxTLK0W0ffV0=",
+        ),
     ],
 )
 def test_parse_header_signature_names_the_missing_part_as_aws_does(authorization, code, message):
@@ -199,6 +218,33 @@ def test_parse_header_signature_takes_the_date_header_when_x_amz_date_is_absent(
 
     assert (parsed.access_key_id, parsed.service, parsed.amz_date) == (
         "AKIAIOSFODNN7EXAMPLE", "sts", "20260930T120000Z")
+
+
+def test_parse_header_signature_names_a_missing_date_with_the_missing_parameters():
+    headers = {"authorization": "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc"}
+
+    assert parse_header_signature(headers) == (
+        "MissingAuthorizationParameter",
+        "Authorization header requires 'Credential' parameter. Authorization header requires existence of either "
+        "a 'X-Amz-Date' or a 'Date' header. (Hashed with SHA-256 and encoded with Base64) "
+        "Authorization=QtbsE59+Cww86WuNzDL08sE4JUxLk21/H/rRcBdVXrQ=",
+    )
+
+
+@pytest.mark.parametrize("query, code, missing", [
+    ({"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"], "X-Amz-Date": ["20260930T120000Z"],
+      "X-Amz-SignedHeaders": ["host"], "X-Amz-Signature": ["abc"]},
+     "MissingAuthorizationParameter", ["X-Amz-Credential"]),
+    ({"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"], "X-Amz-Credential": [""], "X-Amz-Date": ["20260930T120000Z"],
+      "X-Amz-SignedHeaders": ["host"], "X-Amz-Signature": ["abc"]},
+     "IncompleteSignature", ["X-Amz-Credential"]),
+    ({"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"]},
+     "MissingAuthorizationParameter", ["X-Amz-Credential", "X-Amz-Signature", "X-Amz-SignedHeaders", "X-Amz-Date"]),
+], ids=["no-credential", "empty-credential", "only-algorithm"])
+def test_parse_query_signature_names_every_missing_parameter(query, code, missing):
+    assert parse_query_signature(query) == (code, " ".join(
+        [f"AWS query-string parameters must include '{name}'." for name in missing]
+        + ["Re-examine the query-string parameters."]))
 
 
 def _presigned(secret, token_signed, service="iotdevicegateway"):

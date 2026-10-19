@@ -876,6 +876,29 @@ def test_dynamodb_list_tables(ddb):
         resp2 = ddb.list_tables(ExclusiveStartTableName=resp["LastEvaluatedTableName"], Limit=100)
         assert len(resp2["TableNames"]) >= 1
 
+
+@pytest.mark.auth_contract
+def test_dynamodb_list_tables_header_without_credential_contract(auth_enabled, iam_user):
+    """Under AUTH=true a header signature without Credential answers IncompleteSignatureException."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}).client("dynamodb")
+    client.list_tables(Limit=1)
+
+    def strip_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", strip_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_tables(Limit=1)
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "IncompleteSignatureException", 400)
+        assert response["Error"]["Message"].startswith("Authorization header requires 'Credential' parameter.")
+    else:
+        assert "TableNames" in client.list_tables(Limit=1)
+
 def test_dynamodb_put_get_item(ddb):
     ddb.put_item(
         TableName="t_hash_only",
