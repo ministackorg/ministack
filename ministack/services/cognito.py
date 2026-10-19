@@ -7730,9 +7730,10 @@ _LOGIN_TOKEN_CLOCK_SKEW = 300
 
 def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
     """The NotAuthorizedException for Logins AWS would not accept for an identity (None: a new one), or None."""
-    stored = (pool["_identities"][identity_id].get("Logins") or {}) if identity_id else {}
+    identity = pool["_identities"][identity_id] if identity_id else {}
+    stored = identity.get("Logins") or {}
     if not logins:
-        if not stored:
+        if not stored and not identity.get("_merged_into"):
             return None
         return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
     unsupported = "Token is not from a supported provider of this identity pool."
@@ -7740,6 +7741,7 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
     if not isinstance(logins, dict):
         return error_response_json("NotAuthorizedException", unsupported, 400)
     not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
     skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
     supported = set(pool.get("SupportedLoginProviders") or {}) | set(pool.get("SamlProviderARNs") or [])
     supported |= {arn.split("oidc-provider/", 1)[-1] for arn in pool.get("OpenIdConnectProviderARNs") or []}
@@ -7776,8 +7778,7 @@ def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
         elif not isinstance(claims.get("exp"), (int, float)) or skewed_now >= claims["exp"]:
             message = f"Invalid login token. Token expired: {skewed_now} >= {claims.get('exp')}"
         elif provider in stored and _token_claims(stored[provider]).get("sub") != claims.get("sub"):
-            message = ("Logins don't match. Please include at least one valid login "
-                       "for this identity or identity pool.")
+            message = mismatch
         else:
             continue
         return error_response_json("NotAuthorizedException", message, 400)
@@ -7802,12 +7803,38 @@ def _login_owner(pool: dict, logins: dict):
     return None
 
 
-def _link_logins(pool: dict, identity_id: str, logins: dict) -> None:
-    """Give an identity without a login the call's Logins unless another identity holds them."""
-    identity = pool["_identities"][identity_id]
-    if logins and not identity.get("Logins") and not _login_owner(pool, logins):
-        identity["Logins"] = dict(logins)
-        identity["LastModifiedDate"] = _now_epoch()
+def _link_logins(pool: dict, identity_id: str | None, logins: dict):
+    """Link Logins to the identity the call answers for, merge the identities holding them into it, return its id."""
+    identities = pool["_identities"]
+    caller = identities[identity_id] if identity_id else None
+    # An identity with a login answers for itself; one without (or disabled) gives way to the login's identity.
+    target = identity_id if caller and caller.get("Logins") else _login_owner(pool, logins) or identity_id
+    if target is None:
+        return None
+    identity = identities[target]
+    merged = dict.fromkeys(_login_owner(pool, {provider: token}) for provider, token in logins.items())
+    if target != identity_id and caller and not caller.get("_merged_into"):
+        merged[identity_id] = None
+    merged.pop(None, None)
+    merged.pop(target, None)
+    now = _now_epoch()
+    linked = dict(logins)
+    for other_id in merged:
+        other = identities[other_id]
+        linked = {**(other.get("Logins") or {}), **linked}
+        other.update(Logins={}, _merged_into=target, LastModifiedDate=now)
+    added = {provider: token for provider, token in linked.items() if provider not in (identity.get("Logins") or {})}
+    if added:
+        identity["Logins"] = {**(identity.get("Logins") or {}), **added}
+        identity["LastModifiedDate"] = now
+    return target
+
+
+def _identity_login_names(identity: dict) -> list:
+    """An identity's Logins as DescribeIdentity lists them; DISABLED and the region once merged into another."""
+    if identity.get("_merged_into"):
+        return ["DISABLED", identity["IdentityId"].partition(":")[0]]
+    return list((identity.get("Logins") or {}).keys())
 
 
 def _get_open_id_token(data):
@@ -7933,11 +7960,12 @@ def _list_identities(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
     max_results = min(data.get("MaxResults", 60), 60)
-    identities = list(pool["_identities"].values())[:max_results]
+    identities = [i for i in pool["_identities"].values()
+                  if not (data.get("HideDisabled") and i.get("_merged_into"))][:max_results]
     return json_response({
         "IdentityPoolId": iid,
         "Identities": [
-            {"IdentityId": i["IdentityId"], "Logins": list(i.get("Logins", {}).keys()),
+            {"IdentityId": i["IdentityId"], "Logins": _identity_login_names(i),
              "CreationDate": i["CreationDate"], "LastModifiedDate": i["LastModifiedDate"]}
             for i in identities
         ],
@@ -7951,7 +7979,7 @@ def _describe_identity(data):
         if identity:
             return json_response({
                 "IdentityId": identity_id,
-                "Logins": list(identity.get("Logins", {}).keys()),
+                "Logins": _identity_login_names(identity),
                 "CreationDate": identity["CreationDate"],
                 "LastModifiedDate": identity["LastModifiedDate"],
             })
