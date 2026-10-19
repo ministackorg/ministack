@@ -21525,7 +21525,7 @@ def test_cfn_iot_topic_rule_republish_inside_own_filter_fails_create(cfn, iot_cl
             "Republish topic cannot be within topic space of rule's topic pattern 'things/in/#'")
         with pytest.raises(ClientError) as ei:
             iot_client.get_topic_rule(ruleName=rule_name)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 

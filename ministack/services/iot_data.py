@@ -163,9 +163,9 @@ async def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
         status, doc = _iot_module.get_thing_shadow(thing, shadow_name)
     elif method == "POST":
         try:
-            request = json.loads(body) if body else {}
-        except json.JSONDecodeError:
-            return error_response_json("InvalidRequestException", "Invalid JSON", 400)
+            request = _iot_module.parse_shadow_request(body) if body else {}
+        except ValueError:
+            return error_response_json("InvalidRequestException", "Payload contains invalid json", 400)
         # Snapshot around the mutation: the store hands back live dicts, and
         # the documents notification needs the before/after pair (same
         # discipline as the MQTT bridge).
