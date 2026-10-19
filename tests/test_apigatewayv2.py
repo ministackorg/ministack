@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 from conftest import (
@@ -22,6 +24,7 @@ from conftest import (
     ENDPOINT,
     LoopProbe,
     concurrent_burst,
+    make_client,
     make_probe_lambda,
 )
 
@@ -3260,6 +3263,105 @@ def test_ws_connect_aws_iam_needs_a_signed_request(apigw, lam):
     assert _ws_handshake(api_id, "/prod", signed)[0] == 101
     presigned = "/prod?X-Amz-Credential=test%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request&X-Amz-Signature=0"
     assert _ws_handshake(api_id, presigned)[0] == 101
+
+
+_WS_IAM_POLICY = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["execute-api:Invoke", "sts:GetSessionToken"], "Resource": "*"}]}
+
+
+@contextlib.contextmanager
+def _second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def _signed_ws_connect(host, key, secret, *, session=False, token=None, token_after=False, header=False,
+                       expires=3600, skew=0, drop=""):
+    """Path and headers of a GET /prod handshake signed by botocore for execute-api."""
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import quote
+
+    import botocore.auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    if session or token == "session":
+        credentials = boto3.client("sts", endpoint_url=ENDPOINT, aws_access_key_id=key, aws_secret_access_key=secret,
+                                   region_name="us-east-1").get_session_token()["Credentials"]
+        token = credentials["SessionToken"] if token == "session" else token
+        if session:
+            key, secret = credentials["AccessKeyId"], credentials["SecretAccessKey"]
+    request = AWSRequest(method="GET", url=f"http://{host}/prod")
+    signing = Credentials(key, secret, None if token_after else token)
+    signer = botocore.auth.SigV4Auth(signing, "execute-api", "us-east-1") if header else (
+        botocore.auth.SigV4QueryAuth(signing, "execute-api", "us-east-1", expires=expires))
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=skew)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        signer.add_auth(request)
+    query = "&".join(p for p in urlparse(request.url).query.split("&") if not drop or not p.startswith(drop + "="))
+    if token_after and token:
+        query += "&X-Amz-Security-Token=" + quote(token, safe="")
+    return f"/prod?{query}" if query else "/prod", {k: v for k, v in request.headers.items() if k.lower() != "host"}
+
+
+_MISMATCH = (
+    "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key "
+    "and signing method. Consult the service documentation for details.\n\nThe Canonical String for this request "
+    "should have been\n'GET\n/prod\n"
+)
+_INVALID_TOKEN = "The security token included in the request is invalid"
+_WS_CONNECT_CASES = {  # case: (signing arguments, AWS's 403 message under AUTH=true, or None for 101)
+    "signed": ({}, None),
+    "wrong-secret": ({"secret": "wrong"}, _MISMATCH),
+    "signed-2-min-ago-expires-60": ({"skew": -120, "expires": 60}, None),
+    "signed-6-min-ago-expires-86400": ({"skew": -360, "expires": 86400}, "Signature expired: "),
+    "signed-16-min-ahead": ({"skew": 960}, "Signature not yet current: "),
+    "no-signature": ({"drop": "X-Amz-Signature"}, "AWS query-string parameters must include 'X-Amz-Signature'. "
+                                                  "Re-examine the query-string parameters."),
+    "no-date": ({"drop": "X-Amz-Date"}, "AWS query-string parameters must include 'X-Amz-Date'. "
+                                        "Re-examine the query-string parameters."),
+    "header-signed": ({"header": True}, None),
+    "header-wrong-secret": ({"header": True, "secret": "wrong"}, _MISMATCH),
+    "unknown-key": ({"key": "AKIAUNKNOWNKEY000001"}, _INVALID_TOKEN + "."),
+    "session-token-signed": ({"session": True, "token": "session"}, None),
+    "session-token-appended": ({"session": True, "token": "session", "token_after": True}, _MISMATCH),
+    "session-no-token": ({"session": True}, _INVALID_TOKEN + "."),
+    "session-other-token": ({"session": True, "token": "other"}, _INVALID_TOKEN),
+    "user-key-with-token": ({"token": "session"}, _INVALID_TOKEN),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case", list(_WS_CONNECT_CASES))
+def test_ws_connect_aws_iam_handshake_signature_contract(auth_enabled, iam_user, apigw, case):
+    """Under AUTH=true an AWS_IAM $connect verifies the handshake's signature before its policy."""
+    api_id = apigw.create_api(Name=f"ws-iam-sig-{uuid.uuid4().hex[:6]}", ProtocolType="WEBSOCKET",
+                              RouteSelectionExpression="$request.body.action")["ApiId"]
+    try:
+        integration = apigw.create_integration(ApiId=api_id, IntegrationType="MOCK")["IntegrationId"]
+        apigw.create_route(ApiId=api_id, RouteKey="$connect", AuthorizationType="AWS_IAM",
+                           Target=f"integrations/{integration}")
+        apigw.create_stage(ApiId=api_id, StageName="prod")
+        args, message = _WS_CONNECT_CASES[case]
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        with _second_access_key(iam_user(policy=_WS_IAM_POLICY)) as (key, secret):
+            args = {"key": key, "secret": secret, **args}
+            path, headers = _signed_ws_connect(host, args.pop("key"), args.pop("secret"), **args)
+            status, body = _ws_handshake(api_id, path, headers)
+    finally:
+        apigw.delete_api(ApiId=api_id)
+    if auth_enabled and message:
+        assert status == 403
+        assert body["message"].startswith(message) if message.endswith((" ", "\n")) else body["message"] == message
+        assert body["connectionId"] and body["requestId"]
+    else:
+        assert status == 101
 
 
 @pytest.mark.parametrize("resource, message", [

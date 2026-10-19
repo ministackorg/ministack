@@ -1156,6 +1156,49 @@ def test_s3_control_list_tags_via_s3_control_host(s3):
     assert "env" in body
     assert "test" in body
 
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("bucket,operation,action,reason", [
+    ("other", "list_tags_for_resource", "ListTagsForResource", None),
+    ("other", "tag_resource", "TagResource", None),
+    ("other", "untag_resource", "UntagResource", None),
+    ("allowed", "untag_resource", "UntagResource", "with an explicit deny in an identity-based policy"),
+], ids=["list", "tag", "untag", "explicit-deny"])
+def test_s3_control_tagging_authorization_contract(auth_enabled, iam_user, s3, bucket, operation, action, reason):
+    """S3 Control tagging calls are authorized as s3:<operation> on the bucket."""
+    name = f"s3c-auth-{_uuid_mod.uuid4().hex[:8]}"
+    for suffix in ("allowed", "other"):
+        s3.create_bucket(Bucket=f"{name}-{suffix}")
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["s3:ListTagsForResource", "s3:TagResource"],
+             "Resource": f"arn:aws:s3:::{name}-allowed"},
+            {"Effect": "Deny", "Action": "s3:UntagResource", "Resource": f"arn:aws:s3:::{name}-allowed"},
+        ]})
+        control = user.client("s3control", config=Config(inject_host_prefix=False))
+        allowed = f"arn:aws:s3:::{name}-allowed"
+        control.tag_resource(AccountId="000000000000", ResourceArn=allowed, Tags=[{"Key": "k", "Value": "v"}])
+        assert control.list_tags_for_resource(AccountId="000000000000", ResourceArn=allowed)["Tags"] == [
+            {"Key": "k", "Value": "v"}]
+        arn = f"arn:aws:s3:::{name}-{bucket}"
+        params = {"tag_resource": {"Tags": [{"Key": "k", "Value": "v"}]}, "untag_resource": {"TagKeys": ["k"]}}
+        call = getattr(control, operation)
+        if not auth_enabled:
+            call(AccountId="000000000000", ResourceArn=arn, **params.get(operation, {}))
+            return
+        with pytest.raises(ClientError) as exc:
+            call(AccountId="000000000000", ResourceArn=arn, **params.get(operation, {}))
+        reason = reason or f"because no identity-based policy allows the s3:{action} action"
+        response = exc.value.response
+        assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (403, "AccessDenied")
+        assert response["Error"]["Message"] == (
+            f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" {reason}')
+        assert response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == "application/xml"
+    finally:
+        for suffix in ("allowed", "other"):
+            s3.delete_bucket(Bucket=f"{name}-{suffix}")
+
+
 class TestS3VhostGetPutObject:
     """
     Ensure vhost style and path style requests work correctly.
@@ -9295,6 +9338,101 @@ def test_s3_read_permission_contract(auth_enabled, iam_user, auth_s3_objects, pe
             assert body.read() == b"auth-contract"
 
 
+@pytest.fixture
+def auth_condition_bucket(s3):
+    """A bucket whose policy denies a user an object action under a condition; emptied and removed after."""
+    bucket = f"auth-cond-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=bucket)
+
+    def deny(user_arn, action, condition):
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": user_arn}, "Action": action,
+            "Resource": f"arn:aws:s3:::{bucket}/*", "Condition": condition}]}))
+        return bucket
+
+    yield deny
+    for upload in s3.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
+        s3.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+    for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+        s3.delete_object(Bucket=bucket, Key=item["Key"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+_ALLOW_ALL_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+
+
+def _assert_s3_condition(auth_enabled, allowed, call):
+    """Under AUTH a refused call answers 403 AccessDenied; anything else succeeds."""
+    if auth_enabled and not allowed:
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] in ("AccessDenied", "403")
+    else:
+        assert call()["ResponseMetadata"]["HTTPStatusCode"] in (200, 204)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("condition", [
+    {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}},
+    {"Null": {"s3:x-amz-server-side-encryption": "true"}},
+], ids=["string-not-equals", "null"])
+def test_s3_encryption_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket, condition):
+    """A bucket policy on s3:x-amz-server-side-encryption sees the header of a PutObject and a CopyObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", condition)
+    s3.put_object(Bucket=bucket, Key="source", Body=b"x")
+    client = user.client("s3")
+    for sse in (None, "AES256"):
+        extra = {"ServerSideEncryption": sse} if sse else {}
+        _assert_s3_condition(auth_enabled, sse is not None,
+                             lambda: client.put_object(Bucket=bucket, Key=f"put-{sse}", Body=b"x", **extra))
+        _assert_s3_condition(auth_enabled, sse is not None, lambda: client.copy_object(
+            Bucket=bucket, Key=f"copy-{sse}", CopySource={"Bucket": bucket, "Key": "source"}, **extra))
+
+
+@pytest.mark.auth_contract
+def test_s3_multipart_encryption_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A part and the completion carry the encryption header their CreateMultipartUpload sent."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"Null": {"s3:x-amz-server-side-encryption": "true"}})
+    client = user.client("s3")
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key="sealed", ServerSideEncryption="AES256")["UploadId"]
+    etag = client.upload_part(Bucket=bucket, Key="sealed", UploadId=upload_id, PartNumber=1, Body=b"x")["ETag"]
+    client.complete_multipart_upload(Bucket=bucket, Key="sealed", UploadId=upload_id,
+                                     MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})
+    plain = s3.create_multipart_upload(Bucket=bucket, Key="plain")["UploadId"]
+    _assert_s3_condition(auth_enabled, False, lambda: client.upload_part(
+        Bucket=bucket, Key="plain", UploadId=plain, PartNumber=1, Body=b"x"))
+
+
+@pytest.mark.auth_contract
+def test_s3_canned_acl_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """A bucket policy on s3:x-amz-acl sees the canned ACL of a PutObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject",
+                                   {"StringNotEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}})
+    client = user.client("s3")
+    for acl in (None, "bucket-owner-full-control", "private"):
+        extra = {"ACL": acl} if acl else {}
+        _assert_s3_condition(auth_enabled, acl == "bucket-owner-full-control",
+                             lambda: client.put_object(Bucket=bucket, Key=f"acl-{acl}", Body=b"x", **extra))
+
+
+@pytest.mark.auth_contract
+def test_s3_existing_object_tag_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A bucket policy on s3:ExistingObjectTag sees the tags of the object a GetObject or HeadObject reads."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:GetObject", {"StringEquals": {"s3:ExistingObjectTag/class": "secret"}})
+    for name, tagging in (("secret", "class=secret"), ("public", "class=public"), ("untagged", "")):
+        s3.put_object(Bucket=bucket, Key=name, Body=b"x", **({"Tagging": tagging} if tagging else {}))
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, False, lambda: client.get_object(Bucket=bucket, Key="secret"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.head_object(Bucket=bucket, Key="secret"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.get_object(Bucket=bucket, Key="public"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.get_object(Bucket=bucket, Key="untagged"))
+
+
 @pytest.mark.auth_contract
 @pytest.mark.parametrize("addressing_style", ["path", "virtual"])
 @pytest.mark.parametrize("allow_source_read", [False, True], ids=["no-source-read", "source-read"])
@@ -9748,3 +9886,45 @@ def test_s3_copy_and_multipart_refuse_object_lock_headers_without_object_lock(s3
             s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
         s3.delete_bucket(Bucket=bkt)
 
+
+
+def test_s3_bucket_config_enum_and_day_validation(s3):
+    bucket = f"cfgval-{uuid.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=bucket)
+    malformed = "The XML you provided was not well-formed or did not validate against our published schema"
+
+    def err(fn):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    for status in ("Disabled", "banana", "enabled"):
+        assert err(lambda: s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": status})) == (
+            "MalformedXML", malformed)
+    assert err(lambda: s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled", "MFADelete": "banana"}))[0] == "MalformedXML"
+    assert "Status" not in s3.get_bucket_versioning(Bucket=bucket)
+
+    def rule(**kw):
+        return {"Rules": [{"ID": "r", "Status": "Enabled", "Filter": {"Prefix": ""}, **kw}]}
+
+    for days in (0, -1):
+        assert err(lambda: s3.put_bucket_lifecycle_configuration(
+            Bucket=bucket, LifecycleConfiguration=rule(Expiration={"Days": days}))) == (
+            "InvalidArgument", "'Days' for Expiration action must be a positive integer")
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration=rule(NoncurrentVersionExpiration={"NoncurrentDays": 0}))) == (
+        "InvalidArgument", "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer")
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": [
+        {"ID": "r", "Status": "banana", "Filter": {"Prefix": ""}, "Expiration": {"Days": 1}}]}))[0] == "MalformedXML"
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration=rule(Transitions=[{"Days": 30, "StorageClass": "banana"}])))[0] == "MalformedXML"
+    assert err(lambda: s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "banana"}}]}))[0] == "MalformedXML"
+
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended"})
+    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration=rule(
+        Expiration={"Days": 1}, Transitions=[{"Days": 30, "StorageClass": "GLACIER_IR"}]))
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms:dsse"}}]})
+    s3.delete_bucket(Bucket=bucket)

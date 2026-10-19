@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
@@ -549,11 +550,13 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "airflow": ["mwaa"],
     "opensearch": ["opensearch"],
     "pipes": ["pipes"],
+    "rds-data": ["rds-data"],
     "resource-groups": ["resource-groups"],
     "route53": ["route53"],
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "ses": ["sesv2"],  # the v2 REST API; v1 names its Action
     "signer": ["signer"],
 }
 
@@ -808,6 +811,8 @@ def extract_iam_action(service: str, method: str, path: str,
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
         return f"{_IAM_NAMESPACE_BY_OPERATION.get((service, action_name), namespace)}:{action_name}"
+    if service == "ses" and method == "GET" and path.rstrip("/") in _SES_V2_LEGACY_LIST_ROUTES:
+        return f"ses:{_SES_V2_LEGACY_LIST_ROUTES[path.rstrip('/')]}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)
@@ -931,6 +936,33 @@ def _kms_key_id_from_ciphertext(ciphertext_b64: str) -> str:
         return ""
     candidate = raw[:36].decode("utf-8", errors="ignore")
     return candidate if _KMS_KEY_ID_RE.match(candidate) else ""
+
+
+# Older SDK models send these SES v2 list calls as GET on the collection; the current model lists with POST.
+_SES_V2_LEGACY_LIST_ROUTES = {
+    "/v2/email/identities": "ListEmailIdentities",
+    "/v2/email/configuration-sets": "ListConfigurationSets",
+}
+
+# SES v2 path collection -> the resource type it names, and the body field that names it on create.
+_SES_V2_RESOURCES = {
+    "configuration-sets": ("configuration-set", "ConfigurationSetName"),
+    "contact-lists": ("contact-list", "ContactListName"),
+    "custom-verification-email-templates": ("custom-verification-email-template", "TemplateName"),
+    "dedicated-ip-pools": ("dedicated-ip-pool", "PoolName"),
+    "identities": ("identity", "EmailIdentity"),
+    "templates": ("template", "TemplateName"),
+}
+
+
+def _ses_v2_resource_arn(method: str, path: str, body: bytes, region: str, account_id: str) -> str:
+    """The SES v2 resource a /v2/email path or create body names, or '*'."""
+    parts = [p for p in path.split("/") if p]
+    if parts[:2] != ["v2", "email"] or len(parts) < 3 or parts[2] not in _SES_V2_RESOURCES:
+        return "*"
+    resource_type, create_field = _SES_V2_RESOURCES[parts[2]]
+    name = parts[3] if len(parts) > 3 else _safe_json_field(body, create_field) if method == "POST" else ""
+    return f"arn:aws:ses:{region}:{account_id}:{resource_type}/{name}" if name else "*"
 
 
 def extract_resource_arn(service: str, method: str, path: str,
@@ -1337,7 +1369,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         identity = _query_param(query_params, "Identity")
         if identity:
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
-        return "*"
+        return _ses_v2_resource_arn(method, path, body, region, account_id)
 
     if service == "signer":
         # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
@@ -1613,6 +1645,12 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
             topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
+        # The tagging calls authorize on the resource they name in resourceArn,
+        # read from where the handler reads it: the body of a POST, the query of a GET.
+        if parts in (["tags"], ["untag"]):
+            arn = (_safe_json_field(body, "resourceArn") if method == "POST"
+                   else _query_param(query_params, "resourceArn"))
+            return arn if isinstance(arn, str) and arn else "*"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1872,8 +1910,11 @@ def dynamodb_transaction_checks(
     return checks
 
 
-def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
-    """The s3:prefix, s3:delimiter and s3:max-keys a ListBucket or ListBucketVersions request sends."""
+def s3_service_context(iam_action: str, query_params: dict | None, path: str = "",
+                       headers: dict | None = None) -> dict:
+    """The S3 condition keys a request carries: listing keys, a write's encryption and ACL, a read's object tags."""
+    if iam_action in ("s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"):
+        return _s3_object_context(iam_action, query_params or {}, path, headers or {})
     if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
         return {}
     context = {}
@@ -1883,6 +1924,28 @@ def s3_service_context(iam_action: str, query_params: dict | None) -> dict:
             value = value[0] if value else None
         if value is not None:
             context[f"s3:{param}"] = value
+    return context
+
+
+def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
+    """s3:x-amz-server-side-encryption and s3:x-amz-acl of a write, s3:ExistingObjectTag/<key> of a read."""
+    from ministack.services import s3 as s3_svc
+
+    bucket, _, key = path.lstrip("/").partition("/")
+    context: dict = {}
+    if not key:
+        return context
+    if iam_action == "s3:PutObject":
+        # A part and the completion carry no headers: the upload's own request decides.
+        upload_id = _query_param(query_params, "uploadId")
+        sse = s3_svc.upload_encryption_header(upload_id) if upload_id else headers.get("x-amz-server-side-encryption")
+        if sse:
+            context["s3:x-amz-server-side-encryption"] = sse
+        if not upload_id and headers.get("x-amz-acl"):
+            context["s3:x-amz-acl"] = headers["x-amz-acl"]
+    else:
+        for name, value in s3_svc.object_tags_for_condition(bucket, key, query_params).items():
+            context[f"s3:ExistingObjectTag/{name}"] = value
     return context
 
 
@@ -2067,6 +2130,15 @@ def _resource_policy_denial(service: str, action: str, principal_arn: str, resou
             "with an explicit deny in a resource-based policy")
 
 
+def identity_denial_message(action: str, principal_arn: str, resource: str, explicit_deny: bool) -> str:
+    """The message of a denial an identity-based policy decided, naming the resource."""
+    reason = (
+        "with an explicit deny in an identity-based policy" if explicit_deny
+        else f"because no identity-based policy allows the {action} action"
+    )
+    return f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource} {reason}"
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
@@ -2082,17 +2154,17 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     if service in {"ssm", "logs"} and not error_code:
         # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
         # capitalized Message naming the resource, as observed on live AWS.
-        reason = (
-            "with an explicit deny in an identity-based policy" if explicit_deny
-            else f"because no identity-based policy allows the {action} action"
-        )
-        message = (
-            f"User: {principal_arn} is not authorized to perform: {action} "
-            f"on resource: {resource_arn} {reason}"
-        )
+        message = identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
+    if service == "iot-data":
+        # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
+        # for a failed authentication, no message for a policy denial.
+        return (
+            403, {"Content-Type": "application/json", "x-amzn-errortype": "ForbiddenException:"},
+            json.dumps({"message": "Forbidden" if error_code else None, "traceId": str(uuid.uuid4())}).encode(),
         )
     if not message and explicit_deny and resource_policy_arn:
         message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
@@ -2101,7 +2173,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
-        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
+        # IoT names the resource, "*" for an action that takes none.
+        on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
     if code in _AUTH_FAILURES:
