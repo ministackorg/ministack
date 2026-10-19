@@ -423,6 +423,38 @@ def test_iot_jobs_document_with_unterminated_strings_is_refused(iot_client):
         _cleanup(iot_client, things=[thing])
 
 
+def test_iot_jobs_document_nan_and_infinity_are_refused(iot_client, s3):
+    """NaN, Infinity and -Infinity refuse the job or template; a number beyond a double's range is JSON."""
+    thing, bucket = _unique("jobs-thing"), _unique("jobs-doc")
+    jobs, templates = [], []
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        s3.create_bucket(Bucket=bucket)
+        for index, value in enumerate(("NaN", "Infinity", "-Infinity", "1E400")):
+            document = '{"a": ' + value + "}"
+            s3.put_object(Bucket=bucket, Key=f"{index}.json", Body=document)
+            source = f"s3://{bucket}/{index}.json"
+            for request, where in (({"document": document}, "request input"), ({"documentSource": source}, source)):
+                if value == "1E400":
+                    jobs.append(_unique("job"))
+                    iot_client.create_job(jobId=jobs[-1], targets=[thing_arn], **request)
+                    assert iot_client.get_job_document(jobId=jobs[-1])["document"] == document
+                    templates.append(_unique("tmpl"))
+                    iot_client.create_job_template(jobTemplateId=templates[-1], description="d", **request)
+                    continue
+                message = f"Job document located at {where} is an invalid JSON document."
+                with pytest.raises(ClientError) as ei:
+                    iot_client.create_job(jobId=_unique("job"), targets=[thing_arn], **request)
+                assert _error(ei) == (400, "InvalidRequestException", message), value
+                with pytest.raises(ClientError) as ei:
+                    iot_client.create_job_template(jobTemplateId=_unique("tmpl"), description="d", **request)
+                assert _error(ei) == (400, "InvalidRequestException", message), value
+    finally:
+        _delete_templates(iot_client, *templates)
+        _cleanup(iot_client, jobs=jobs, things=[thing])
+        _delete_bucket(s3, bucket)
+
+
 def test_iot_jobs_stored_document_too_deep_to_parse_stays_text():
     """A stored document too deep for the JSON parser reaches the device as its text."""
     from ministack.services import iot as iot_module

@@ -6726,11 +6726,12 @@ def _job_document_s3_location(source: str) -> tuple[str, str]:
 
 
 def _job_document_is_json(document: str) -> bool:
-    """Whether a job document is JSON nested no deeper than AWS accepts."""
+    """Whether a job document is JSON (NaN and Infinity are not) nested no deeper than AWS accepts."""
     from ministack.services.apigateway_v1 import _json_depth
+    from ministack.services.eventbridge import _reject_json_constant
 
     try:
-        value = json.loads(document)
+        value = json.loads(document, parse_constant=_reject_json_constant)
     except (ValueError, RecursionError):
         return False
     return _json_depth(value) <= _JOB_DOCUMENT_MAX_DEPTH
@@ -8625,6 +8626,21 @@ def _shadow_error(status: int, message: str) -> tuple:
     return status, {"message": message}
 
 
+def _shadow_number(text: str):
+    """A JSON number with a fraction or exponent; one beyond a double's range is stored as AWS stores it."""
+    value = float(text)
+    if math.isfinite(value):
+        return value
+    return "Infinity" if value > 0 else "-Infinity"
+
+
+def parse_shadow_request(payload):
+    """A shadow request payload as AWS reads it; ValueError when it is not JSON (NaN and Infinity are not)."""
+    from ministack.services.eventbridge import _reject_json_constant
+
+    return json.loads(payload, parse_constant=_reject_json_constant, parse_float=_shadow_number)
+
+
 def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tuple:
     """Merge ``request`` into the shadow. Returns (status, response_doc)."""
     if not isinstance(request, dict) or not isinstance(request.get("state"), dict):
@@ -9921,11 +9937,11 @@ async def _handle_shadow_publish(
         )
 
     try:
-        request = json.loads(payload) if payload else {}
+        request = parse_shadow_request(payload) if payload else {}
     except (ValueError, UnicodeDecodeError):
         # All three request verbs reject malformed JSON, as on AWS — a `get`
         # or `delete` payload is optional but must parse when present.
-        await _respond(f"{verb}/rejected", _shadow_rejected(400, "invalid json"))
+        await _respond(f"{verb}/rejected", _shadow_rejected(400, "Payload contains invalid json"))
         return
     if not isinstance(request, dict):
         request = {}
