@@ -3091,6 +3091,27 @@ def test_cognito_oauth2_authorize_oidc_redirect(cognito_idp):
         stop()
 
 
+def test_cognito_oauth2_authorize_oidc_invalid_scope_redirects_to_the_callback(cognito_idp):
+    """A scope the client does not allow is refused before the IdP redirect."""
+    _pid, cid = _setup_oidc_pool(cognito_idp, "https://idp.example.com/token")
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestOIDC&state=mystate&scope=openid+profile"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected 302"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302
+        location = e.headers.get("Location", "")
+    assert location.startswith("http://localhost:3000/callback?")
+    assert _parse_qs(urlparse(location).query) == {
+        "error": ["invalid_request"], "error_description": ["invalid_scope"], "state": ["mystate"],
+    }
+
+
 def test_cognito_oidc_full_flow(cognito_idp):
     """End-to-end OIDC federation: authorize → IdP callback → token exchange
     against fake IdP → user provisioned → app redirect with MS auth code."""
@@ -4805,6 +4826,8 @@ def test_oauth2_token_client_credentials_expires_with_the_client():
     ('api/read', 'api/read'),
     ('api/read api/write zeta/x', 'zeta/x api/write api/read'),
     ('api/read api/read', 'api/read'),
+    ('api/read bogus/x', 'api/read'),
+    ('api/read api/bogus', 'api/read'),
 ])
 def test_oauth2_token_client_credentials_carries_granted_scopes(requested, scope):
     """No scope parameter grants every scope the client allows."""
@@ -4859,7 +4882,7 @@ def test_oauth2_token_client_credentials_refuses_scopes_it_cannot_grant(requeste
     ('api/missing', 'invalid_scope'),
     ('missing/read', 'invalid_scope'),
     ('api/read api/admin', 'invalid_grant'),
-    ('api/read api/missing', 'invalid_scope'),
+    ('api/admin missing/read', 'invalid_grant'),
     ('openid', 'invalid_scope'),
     ('   ', 'invalid_scope'),
 ])

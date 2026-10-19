@@ -87,12 +87,17 @@ _LAMBDA_CODE_V2 = 'def handler(event, context):\n    return {"statusCode": 200, 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
-@pytest.fixture(autouse=True)
-def _lambda_role(iam):
-    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server: AUTH=true needs it to exist."""
+def _create_lambda_role(iam):
+    """Create ``lambda-role`` in the account of *iam*'s key unless it exists: AUTH=true needs it to exist."""
     with contextlib.suppress(iam.exceptions.EntityAlreadyExistsException):
         iam.create_role(RoleName="lambda-role", AssumeRolePolicyDocument=json.dumps({"Statement": [{
             "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+
+
+@pytest.fixture(autouse=True)
+def _lambda_role(iam):
+    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server."""
+    _create_lambda_role(iam)
 
 
 _NODE_CODE = (
@@ -2537,7 +2542,7 @@ def test_lambda_unknown_path_returns_404(lam):
     except urllib.error.HTTPError as e:
         assert e.code == 404
 
-def test_lambda_reset_terminates_workers(lam):
+def test_lambda_reset_terminates_workers(lam, iam):
     """/_ministack/reset must cleanly terminate warm Lambda workers."""
     import urllib.request
 
@@ -2564,6 +2569,7 @@ def test_lambda_reset_terminates_workers(lam):
         except Exception:
             if _attempt == 2:
                 raise
+    _create_lambda_role(iam)
 
     # Re-create and invoke — new worker means new boot time
     lam.create_function(
