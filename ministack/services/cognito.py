@@ -3727,8 +3727,7 @@ def _admin_delete_user(data):
     # can pass an alias (email), which is not the "_users" key.
     del pool["_users"][user["Username"]]
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
-    # A deleted user's sessions end with it: a new user of the same name inherits none of them.
-    _revoked_tokens.update(user.get("_origin_jtis", []))
+    # A deleted user's refresh tokens end with it: a new user of the same name inherits none of them.
     for token in [t for t, e in _refresh_tokens.items()
                   if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
         del _refresh_tokens[token]

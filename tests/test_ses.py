@@ -1970,3 +1970,33 @@ def test_ses_send_email_rejects_non_ascii_address(ses):
     ses.send_email(Source="sender@example.com", Destination={"ToAddresses": ["user@xn--xample-9ua.com"]},
                    Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
 
+
+
+@pytest.mark.auth_contract
+def test_ses_v2_target_header_route_is_authorized_contract(auth_enabled, iam_user):
+    """SES v2 on a path without /v2/email, selected by the target header, is authorized like the prefixed call."""
+    import urllib.error
+    import urllib.request
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    name = f"tpl-{uuid4().hex[:8]}"
+    sesv2 = make_client("sesv2")
+    sesv2.create_email_template(TemplateName=name, TemplateContent={"Subject": "s", "Text": "t"})
+    with second_access_key(iam_user()) as (key, secret):
+        request = AWSRequest(method="DELETE", url=f"{ENDPOINT}/templates/{name}", headers={"x-amz-target": "sesv2"})
+        SigV4Auth(Credentials(key, secret), "ses", "us-east-1").add_auth(request)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    request.url, method="DELETE", headers=dict(request.headers)), timeout=10) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+    if auth_enabled:
+        assert status == 403
+        sesv2.delete_email_template(TemplateName=name)
+    else:
+        assert status == 200

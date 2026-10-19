@@ -4840,3 +4840,19 @@ def test_jobs_mqtt_start_next_twice_rehands_in_progress_silently(iot_client, iot
     assert d2["status"] == "IN_PROGRESS"
     assert d2["statusDetails"] == {"step": "a"}
     assert d2["versionNumber"] == d1["versionNumber"]
+
+
+@pytest.mark.parametrize("details", [{"k": 1}, {"k": {"nested": "x"}}, {"k": ""}, False], ids=["number", "map", "empty", "false"])
+def test_iot_jobs_update_refuses_status_details_that_is_not_a_string_map(iot_client, details):
+    """statusDetails is a DetailsMap of non-empty strings; anything else is refused before the execution changes."""
+    thing, job_id = _unique("jobs-thing"), _unique("job")
+    try:
+        thing_arn = _create_thing(iot_client, thing)
+        iot_client.create_job(jobId=job_id, targets=[thing_arn], document=_DOCUMENT)
+        status, body = _raw_jobs_data("POST", f"/things/{thing}/jobs/{job_id}",
+                                      {"status": "IN_PROGRESS", "statusDetails": details})
+        assert status == 400 and body["__type"].endswith("InvalidRequestException")
+        execution = iot_client.describe_job_execution(jobId=job_id, thingName=thing)["execution"]
+        assert (execution["status"], execution["versionNumber"]) == ("QUEUED", 1)
+    finally:
+        _cleanup(iot_client, jobs=[job_id], things=[thing])

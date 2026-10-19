@@ -1071,7 +1071,7 @@ async def handle_request(method, path, headers, body, query_params):
                 allow_cross_region=not _has_sigv4_credentials(headers, query_params),
             )
         if not api_id:
-            return error_response_json("UnauthorizedException", "Valid API key required", 401)
+            return _unauthorized_response()
         authorize = _iam_field_authorizer(api_id, headers, query_params)
         if isinstance(authorize, tuple):
             return authorize

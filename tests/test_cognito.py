@@ -11832,3 +11832,32 @@ def test_cognito_inbound_federation_trigger_unconfigured_pool_keeps_idp_attribut
     user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_plain-name-id")
     attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
     assert attrs["email"] == "raw@example.com"
+
+
+@pytest.mark.auth_contract
+def test_cognito_unsupported_login_and_forged_refresh_token_contract(auth_enabled, cognito_idp, cognito_identity):
+    """A linked identity answers to no unsupported provider, and a refresh token's signature is checked."""
+    ctx = _identity_logins(cognito_idp, cognito_identity)
+    result = ctx.call("get_credentials_for_identity", IdentityId=ctx.u1, Logins={"made.up": "x"})
+    if auth_enabled:
+        assert result == ("NotAuthorizedException", "Token is not from a supported provider of this identity pool.")
+    else:
+        assert result["IdentityId"] == ctx.u1
+
+    pid = cognito_idp.create_user_pool(PoolName="ForgedRefresh")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="app", ExplicitAuthFlows=[
+        "ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"])["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="victim", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="victim", Password="Passw0rd!", Permanent=True)
+    refresh = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+        "USERNAME": "victim", "PASSWORD": "Passw0rd!"})["AuthenticationResult"]["RefreshToken"]
+    header, payload, _signature = refresh.split(".")
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=="))
+    forged_payload = base64.urlsafe_b64encode(json.dumps({**claims, "origin_jti": "forged"}).encode()).decode().rstrip("=")
+    forged = f"{header}.{forged_payload}.AAAA"
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": forged})
+        assert exc.value.response["Error"]["Message"] == "Invalid Refresh Token"
+    assert cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={
+        "REFRESH_TOKEN": refresh})["AuthenticationResult"]["AccessToken"]

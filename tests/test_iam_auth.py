@@ -5980,3 +5980,72 @@ def test_write_get_object_response_needs_its_iam_action(monkeypatch):
         "POST", "/WriteGetObjectResponse", headers, b"", {}, "rid"))[0]
     assert seen["action"] == "s3-object-lambda:WriteGetObjectResponse"
     assert status == 400
+
+
+@pytest.mark.auth_contract
+def test_unverifiable_credentials_are_refused_contract(auth_enabled, iam_user):
+    """A credential this server cannot verify never acts as its key's user: another algorithm, SigV2, no Credential."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    from conftest import ENDPOINT, second_access_key
+
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*"}]})
+
+    def create_queue(authorization, query=""):
+        body = f"Action=CreateQueue&QueueName=unverifiable-{uuid.uuid4().hex[:8]}&Version=2012-11-05".encode()
+        request = urllib.request.Request(f"{ENDPOINT}/{query}", data=body, method="POST", headers={
+            "Content-Type": "application/x-www-form-urlencoded", "Authorization": authorization})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    with second_access_key(user) as (key, _secret):
+        scope = f"{key}/20261019/us-east-1/sqs/aws4_request"
+        for authorization, query in (
+            (f"AWS4-HMAC-SHA512 Credential={scope}, SignedHeaders=host, Signature=00", ""),
+            (f"AWS {key}:bogus", ""),
+            ("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00", ""),
+            ("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00", f"?X-Amz-Credential={scope.replace('/', '%2F')}"),
+        ):
+            status = create_queue(authorization, query)
+            assert status >= 400 if auth_enabled else status == 200, (authorization, query)
+
+
+@pytest.mark.auth_contract
+def test_s3_sigv2_signatures_are_verified_contract(auth_enabled, iam_user):
+    """SigV2 header and query signatures are checked for an IAM user, and still work when they are right."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    bucket = f"sigv2-{uuid.uuid4().hex[:8]}"
+    admin = make_client("s3")
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key="k", Body=b"v")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]})
+    try:
+        with second_access_key(user) as (key, secret):
+            v2 = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=key,
+                              aws_secret_access_key=secret, config=Config(signature_version="s3"))
+            assert v2.get_object(Bucket=bucket, Key="k")["Body"].read() == b"v"
+            url = v2.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "k"})
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                assert resp.status == 200
+            try:
+                with urllib.request.urlopen(url.replace("Signature=", "Signature=AA"), timeout=10) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            assert status == (403 if auth_enabled else 200)
+    finally:
+        admin.delete_object(Bucket=bucket, Key="k")
+        admin.delete_bucket(Bucket=bucket)

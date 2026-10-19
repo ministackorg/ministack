@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -12,7 +13,7 @@ import boto3
 import pytest
 import yaml
 from botocore.exceptions import ClientError
-from conftest import inprocess_iam_user, routed_request, second_access_key
+from conftest import inprocess_iam_user, make_client, routed_request, second_access_key
 
 from ministack.core.responses import set_request_region
 from ministack.services import apigateway_v1

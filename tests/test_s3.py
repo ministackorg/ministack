@@ -9844,3 +9844,57 @@ def test_s3_bucket_config_enum_and_day_validation(s3):
     s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
         {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms:dsse"}}]})
     s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_anonymous_copy_source_and_policy_action_contract(auth_enabled, s3):
+    """A public PutObject policy lets anonymous callers write, not read another bucket through a copy or delete."""
+    secret, upload = f"anon-src-{uuid.uuid4().hex[:8]}", f"anon-dst-{uuid.uuid4().hex[:8]}"
+    for bucket in (secret, upload):
+        s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=secret, Key="c", Body=b"secret")
+    s3.put_object(Bucket=upload, Key="kept", Body=b"kept")
+    s3.put_bucket_policy(Bucket=upload, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]}))
+    try:
+        assert requests.put(f"{ENDPOINT}/{upload}/plain", data=b"x").status_code == 200
+        copy = requests.put(f"{ENDPOINT}/{upload}/loot", headers={"x-amz-copy-source": f"/{secret}/c"})
+        delete = requests.delete(f"{ENDPOINT}/{upload}/kept")
+        if auth_enabled:
+            assert (copy.status_code, delete.status_code) == (403, 403)
+        else:
+            assert (copy.status_code, delete.status_code) == (200, 204)
+    finally:
+        s3.delete_bucket_policy(Bucket=upload)
+        for bucket in (secret, upload):
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_copy_source_in_the_query_string_is_authorized_contract(auth_enabled, iam_user, s3):
+    """x-amz-copy-source hoisted into the query string is checked like the header."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import second_access_key
+
+    secret, upload = f"hoist-src-{uuid.uuid4().hex[:8]}", f"hoist-dst-{uuid.uuid4().hex[:8]}"
+    for bucket in (secret, upload):
+        s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=secret, Key="c", Body=b"secret")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]})
+    try:
+        with second_access_key(user) as (key, secret_key):
+            url = f"{ENDPOINT}/{upload}/b?x-amz-copy-source=%2F{secret}%2Fc"
+            request = AWSRequest(method="PUT", url=url, data=b"")
+            S3SigV4Auth(Credentials(key, secret_key), "s3", "us-east-1").add_auth(request)
+            status = requests.put(url, data=b"", headers=dict(request.headers)).status_code
+        assert status == (403 if auth_enabled else 200)
+    finally:
+        for bucket in (secret, upload):
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)

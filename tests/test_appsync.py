@@ -2789,3 +2789,38 @@ def test_appsync_cfn_schema_lands_in_the_schema_store():
     assert _appsync._schemas.get(api_id) is None
 
     _appsync._delete_graphql_api(api_id)
+
+
+@pytest.mark.auth_contract
+def test_appsync_aws_iam_api_refuses_an_unverifiable_signature_contract(auth_enabled, appsync):
+    """A SigV4 header the server cannot verify is no AWS_IAM credential."""
+    api_id = appsync.create_graphql_api(name="iam-unverifiable", authenticationType="AWS_IAM")["graphqlApi"]["apiId"]
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=b"type Query { hello: String }")
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=b'{"query": "{ hello }"}',
+                                     method="POST", headers={"Content-Type": "application/json",
+                                                             "Authorization": "AWS4-HMAC-SHA256 garbage"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status in ((401, 403) if auth_enabled else (200,))
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("payload", [{"query": 123}, {"query": "{ hello }", "variables": "x"}], ids=["query", "variables"])
+def test_appsync_graphql_refuses_malformed_request_members(appsync, payload):
+    api_id = appsync.create_graphql_api(name="gql-members", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    appsync.start_schema_creation(apiId=api_id, definition=b"type Query { hello: String }")
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    try:
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=json.dumps(payload).encode(),
+                                     method="POST", headers={"Content-Type": "application/json", "x-api-key": key})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["errors"][0]["errorType"] == "MalformedHttpRequestException"
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
