@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **RDS Data, S3 Control — calls are authorized under `AUTH=true`** — RDS Data calls and S3 Control tagging calls were served whatever the caller's policies allowed; each RDS Data call is now authorized as `rds-data:<operation>` on the cluster its `resourceArn` names, and `ListTagsForResource`, `TagResource` and `UntagResource` as `s3:<operation>` on the bucket, with a 403 denial (`AccessDeniedException` from RDS Data, `AccessDenied` from S3 Control) naming the action and resource, as on AWS. Contributed by @iot-rocket.
 - **SES v2 — calls are authorized under `AUTH=true`** — SES v2 calls were served whatever the caller's policies allowed; each is now authorized as `ses:<operation>` on the configuration set, contact list, custom verification email template, dedicated IP pool, identity or template its path or create body names (`*` otherwise), and a denial answers 403 `AccessDeniedException` naming the action and resource, as on AWS. Contributed by @iot-rocket.
 
 ### Fixed

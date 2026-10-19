@@ -1156,6 +1156,49 @@ def test_s3_control_list_tags_via_s3_control_host(s3):
     assert "env" in body
     assert "test" in body
 
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("bucket,operation,action,reason", [
+    ("other", "list_tags_for_resource", "ListTagsForResource", None),
+    ("other", "tag_resource", "TagResource", None),
+    ("other", "untag_resource", "UntagResource", None),
+    ("allowed", "untag_resource", "UntagResource", "with an explicit deny in an identity-based policy"),
+], ids=["list", "tag", "untag", "explicit-deny"])
+def test_s3_control_tagging_authorization_contract(auth_enabled, iam_user, s3, bucket, operation, action, reason):
+    """S3 Control tagging calls are authorized as s3:<operation> on the bucket."""
+    name = f"s3c-auth-{_uuid_mod.uuid4().hex[:8]}"
+    for suffix in ("allowed", "other"):
+        s3.create_bucket(Bucket=f"{name}-{suffix}")
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["s3:ListTagsForResource", "s3:TagResource"],
+             "Resource": f"arn:aws:s3:::{name}-allowed"},
+            {"Effect": "Deny", "Action": "s3:UntagResource", "Resource": f"arn:aws:s3:::{name}-allowed"},
+        ]})
+        control = user.client("s3control", config=Config(inject_host_prefix=False))
+        allowed = f"arn:aws:s3:::{name}-allowed"
+        control.tag_resource(AccountId="000000000000", ResourceArn=allowed, Tags=[{"Key": "k", "Value": "v"}])
+        assert control.list_tags_for_resource(AccountId="000000000000", ResourceArn=allowed)["Tags"] == [
+            {"Key": "k", "Value": "v"}]
+        arn = f"arn:aws:s3:::{name}-{bucket}"
+        params = {"tag_resource": {"Tags": [{"Key": "k", "Value": "v"}]}, "untag_resource": {"TagKeys": ["k"]}}
+        call = getattr(control, operation)
+        if not auth_enabled:
+            call(AccountId="000000000000", ResourceArn=arn, **params.get(operation, {}))
+            return
+        with pytest.raises(ClientError) as exc:
+            call(AccountId="000000000000", ResourceArn=arn, **params.get(operation, {}))
+        reason = reason or f"because no identity-based policy allows the s3:{action} action"
+        response = exc.value.response
+        assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (403, "AccessDenied")
+        assert response["Error"]["Message"] == (
+            f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" {reason}')
+        assert response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == "application/xml"
+    finally:
+        for suffix in ("allowed", "other"):
+            s3.delete_bucket(Bucket=f"{name}-{suffix}")
+
+
 class TestS3VhostGetPutObject:
     """
     Ensure vhost style and path style requests work correctly.

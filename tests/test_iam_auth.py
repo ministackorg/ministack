@@ -3009,6 +3009,12 @@ class TestActionExtraction:
         assert extract_iam_action("ses", "GET", "/v2/email/configuration-sets", {}, b"", {}) == (
             "ses:ListConfigurationSets")
 
+    def test_rds_data_rest(self):
+        for path, action in (("/Execute", "ExecuteStatement"), ("/BatchExecute", "BatchExecuteStatement"),
+                             ("/BeginTransaction", "BeginTransaction"), ("/CommitTransaction", "CommitTransaction"),
+                             ("/RollbackTransaction", "RollbackTransaction")):
+            assert extract_iam_action("rds-data", "POST", path, {}, b"{}", {}) == f"rds-data:{action}"
+
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("unknown_svc", "GET", "/", {}, b"", {}) is None

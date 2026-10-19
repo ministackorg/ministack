@@ -550,6 +550,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "airflow": ["mwaa"],
     "opensearch": ["opensearch"],
     "pipes": ["pipes"],
+    "rds-data": ["rds-data"],
     "resource-groups": ["resource-groups"],
     "route53": ["route53"],
     "s3files": [],  # uses S3 namespace but different paths
