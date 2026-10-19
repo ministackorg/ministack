@@ -243,11 +243,7 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
 
     response: dict = {}
     if str(payload.get("includeJobExecutionState", "")).lower() in ("true", "1"):
-        response["executionState"] = {
-            "status": execution["status"],
-            "statusDetails": execution.get("statusDetails") or {},
-            "versionNumber": execution["versionNumber"],
-        }
+        response["executionState"] = _iot_module.jobs_execution_state(execution)
     if str(payload.get("includeJobDocument", "")).lower() in ("true", "1"):
         response["jobDocument"] = _iot_module.jobs_job_document(job_id)
     if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
