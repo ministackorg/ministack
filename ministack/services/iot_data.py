@@ -47,6 +47,8 @@ _RETAINED_PAGE_MAX = 200
 # under one of these reserved families. Within them, the device-side jobs,
 # Device Defender and commands topics are MQTT-only.
 _HTTP_RESERVED_PREFIXES = _iot_module.RESERVED_PUBLISH_PREFIXES
+# Families that take only their request topics, over HTTPS as over MQTT.
+_HTTP_REQUEST_ONLY_PREFIXES = ("$aws/certificates/", "$aws/provisioning-templates/", "$aws/device_location/")
 _HTTP_RESTRICTED_TOPIC_RE = re.compile(
     r"^\$aws/(things/[^/]+/(jobs|defender)/|commands/)"
 )
@@ -74,7 +76,10 @@ def _validate_topic(topic: str) -> tuple | None:
             400,
         )
     if topic.startswith("$"):
-        if not topic.startswith(_HTTP_RESERVED_PREFIXES):
+        if not topic.startswith(_HTTP_RESERVED_PREFIXES) or (
+            topic.startswith(_HTTP_REQUEST_ONLY_PREFIXES)
+            and _iot_module._RESERVED_REQUEST_TOPIC_RE.fullmatch(topic) is None
+        ):
             return error_response_json(
                 "InvalidRequestException", "Topic can't start with $", 400
             )
@@ -163,9 +168,9 @@ async def _shadow(method: str, path: str, body: bytes, qp: dict) -> tuple:
         status, doc = _iot_module.get_thing_shadow(thing, shadow_name)
     elif method == "POST":
         try:
-            request = json.loads(body) if body else {}
-        except json.JSONDecodeError:
-            return error_response_json("InvalidRequestException", "Invalid JSON", 400)
+            request = _iot_module.parse_shadow_request(body) if body else {}
+        except ValueError:
+            return error_response_json("InvalidRequestException", "Payload contains invalid json", 400)
         # Snapshot around the mutation: the store hands back live dicts, and
         # the documents notification needs the before/after pair (same
         # discipline as the MQTT bridge).

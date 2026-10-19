@@ -1,4 +1,5 @@
 import datetime as dt
+import hashlib
 
 import pytest
 
@@ -9,7 +10,9 @@ from ministack.core.sigv4 import (
     build_string_to_sign,
     calculate_signature,
     derive_signing_key,
+    header_signature_failure,
     parse_header_signature,
+    parse_query_signature,
     presigned_request_is_expired,
     request_time_failure,
     signatures_match,
@@ -178,6 +181,25 @@ _SCOPE = "AKIAIOSFODNN7EXAMPLE/20260930/eu-central-1/sts/aws4_request"
             "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, "
             "got 'AKIAIOSFODNN7EXAMPLE/eu-central-1/sts/aws4_request'",
         ),
+        (
+            "AWS4-HMAC-SHA256 SignedHeaders=host;x-amz-date, Signature=abc",
+            "MissingAuthorizationParameter",
+            "Authorization header requires 'Credential' parameter. (Hashed with SHA-256 and encoded with Base64) "
+            "Authorization=ahJcBrcKAe4SBJto5I/CIJQro+xeLn5ihFrmUmERRpY=",
+        ),
+        (
+            "AWS4-HMAC-SHA256 Credential=, SignedHeaders=host;x-amz-date, Signature=abc",
+            "IncompleteSignature",
+            "Authorization header requires 'Credential' parameter. (Hashed with SHA-256 and encoded with Base64) "
+            "Authorization=Rso9P5e0/U0V+vZQW+PsjFTI/EYgUn2YbmHes/SFYPA=",
+        ),
+        (
+            "AWS4-HMAC-SHA256",
+            "MissingAuthorizationParameter",
+            "Authorization header requires 'Credential' parameter. Authorization header requires 'Signature' "
+            "parameter. Authorization header requires 'SignedHeaders' parameter. (Hashed with SHA-256 and encoded "
+            "with Base64) Authorization=YI2YWea8FSxnksZL2ETHbs5elHm9HQufxTLK0W0ffV0=",
+        ),
     ],
 )
 def test_parse_header_signature_names_the_missing_part_as_aws_does(authorization, code, message):
@@ -196,6 +218,87 @@ def test_parse_header_signature_takes_the_date_header_when_x_amz_date_is_absent(
 
     assert (parsed.access_key_id, parsed.service, parsed.amz_date) == (
         "AKIAIOSFODNN7EXAMPLE", "sts", "20260930T120000Z")
+
+
+def test_parse_header_signature_names_a_missing_date_with_the_missing_parameters():
+    headers = {"authorization": "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc"}
+
+    assert parse_header_signature(headers) == (
+        "MissingAuthorizationParameter",
+        "Authorization header requires 'Credential' parameter. Authorization header requires existence of either "
+        "a 'X-Amz-Date' or a 'Date' header. (Hashed with SHA-256 and encoded with Base64) "
+        "Authorization=QtbsE59+Cww86WuNzDL08sE4JUxLk21/H/rRcBdVXrQ=",
+    )
+
+
+@pytest.mark.parametrize("query, code, missing", [
+    ({"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"], "X-Amz-Date": ["20260930T120000Z"],
+      "X-Amz-SignedHeaders": ["host"], "X-Amz-Signature": ["abc"]},
+     "MissingAuthorizationParameter", ["X-Amz-Credential"]),
+    ({"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"], "X-Amz-Credential": [""], "X-Amz-Date": ["20260930T120000Z"],
+      "X-Amz-SignedHeaders": ["host"], "X-Amz-Signature": ["abc"]},
+     "IncompleteSignature", ["X-Amz-Credential"]),
+    ({"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"]},
+     "MissingAuthorizationParameter", ["X-Amz-Credential", "X-Amz-Signature", "X-Amz-SignedHeaders", "X-Amz-Date"]),
+], ids=["no-credential", "empty-credential", "only-algorithm"])
+def test_parse_query_signature_names_every_missing_parameter(query, code, missing):
+    assert parse_query_signature(query) == (code, " ".join(
+        [f"AWS query-string parameters must include '{name}'." for name in missing]
+        + ["Re-examine the query-string parameters."]))
+
+
+def _presigned(secret, token_signed, service="iotdevicegateway"):
+    """Query parameters of a GET /mqtt presigned for ``service``, with its session token."""
+    amz_date = "20260930T120000Z"
+    query = {"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"],
+             "X-Amz-Credential": [f"ASIAEXAMPLE/20260930/us-east-1/{service}/aws4_request"],
+             "X-Amz-Date": [amz_date], "X-Amz-SignedHeaders": ["host"]}
+    if token_signed:
+        query["X-Amz-Security-Token"] = ["token/+="]
+    canonical = build_canonical_request("GET", "/mqtt", {"host": "iot.example"}, query, "host",
+                                        payload_hash=hashlib.sha256(b"").hexdigest())
+    string_to_sign = build_string_to_sign(amz_date, amz_date[:8], "us-east-1", service, canonical)
+    query["X-Amz-Signature"] = [calculate_signature(secret, amz_date[:8], "us-east-1", service, string_to_sign)]
+    query["X-Amz-Security-Token"] = ["token/+="]
+    return query
+
+
+@pytest.mark.parametrize("service, token_signed, expected", [
+    ("iotdevicegateway", False, None),
+    ("iotdevicegateway", True, "SignatureDoesNotMatch"),
+    ("execute-api", True, None),
+    ("execute-api", False, "SignatureDoesNotMatch"),
+])
+def test_presigned_iot_url_leaves_the_session_token_unsigned(service, token_signed, expected):
+    query = _presigned("secret", token_signed, service)
+    signature = parse_query_signature(query)
+
+    failure = header_signature_failure(signature, "secret", "GET", "/mqtt", query, {"host": "iot.example"}, b"",
+                                       presigned=True)
+
+    assert (failure and failure[0]) == expected
+
+
+def test_signature_failure_can_name_the_strings_it_expected():
+    query = _presigned("secret", True, "execute-api")
+    signature = parse_query_signature(query)
+
+    code, message = header_signature_failure(signature, "other", "GET", "/mqtt", query, {"host": "iot.example"}, b"",
+                                             presigned=True, explain=True)
+
+    canonical = (
+        "GET\n/mqtt\nX-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ASIAEXAMPLE%2F20260930%2Fus-east-1"
+        "%2Fexecute-api%2Faws4_request&X-Amz-Date=20260930T120000Z&X-Amz-Security-Token=token%2F%2B%3D"
+        f"&X-Amz-SignedHeaders=host\nhost:iot.example\n\nhost\n{hashlib.sha256(b'').hexdigest()}"
+    )
+    string_to_sign = build_string_to_sign("20260930T120000Z", "20260930", "us-east-1", "execute-api", canonical)
+    assert code == "SignatureDoesNotMatch"
+    assert message == (
+        "The request signature we calculated does not match the signature you provided. Check your AWS Secret "
+        "Access Key and signing method. Consult the service documentation for details.\n\n"
+        f"The Canonical String for this request should have been\n'{canonical}'\n\n"
+        f"The String-to-Sign should have been\n'{string_to_sign}'\n"
+    )
 
 
 @pytest.mark.parametrize(

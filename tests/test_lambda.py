@@ -87,12 +87,17 @@ _LAMBDA_CODE_V2 = 'def handler(event, context):\n    return {"statusCode": 200, 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
-@pytest.fixture(autouse=True)
-def _lambda_role(iam):
-    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server: AUTH=true needs it to exist."""
+def _create_lambda_role(iam):
+    """Create ``lambda-role`` in the account of *iam*'s key unless it exists: AUTH=true needs it to exist."""
     with contextlib.suppress(iam.exceptions.EntityAlreadyExistsException):
         iam.create_role(RoleName="lambda-role", AssumeRolePolicyDocument=json.dumps({"Statement": [{
             "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+
+
+@pytest.fixture(autouse=True)
+def _lambda_role(iam):
+    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server."""
+    _create_lambda_role(iam)
 
 
 _NODE_CODE = (
@@ -1138,6 +1143,32 @@ def test_lambda_get_function_not_found(lam):
 def test_lambda_list_functions(lam):
     names = [f["FunctionName"] for f in _list_all_functions(lam)]
     assert "lam-create-test" in names
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("credential, code, message", [
+    (b"", "MissingAuthenticationTokenException", "Missing Authentication Token"),
+    (b"Credential=, ", "IncompleteSignatureException", "Authorization header requires 'Credential' parameter."),
+], ids=["left-out", "empty"])
+def test_lambda_list_functions_header_without_credential_contract(auth_enabled, iam_user, credential, code, message):
+    """Under AUTH=true Lambda answers a header without Credential as unauthenticated, an empty one as incomplete."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "lambda:ListFunctions", "Resource": "*"}]}).client("lambda")
+    client.list_functions(MaxItems=1)
+
+    def replace_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + credential + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", replace_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_functions(MaxItems=1)
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (code, 403)
+        assert response["Error"]["Message"].startswith(message)
+    else:
+        assert "Functions" in client.list_functions(MaxItems=1)
 
 def test_lambda_delete_function(lam):
     lam.create_function(
@@ -2537,7 +2568,7 @@ def test_lambda_unknown_path_returns_404(lam):
     except urllib.error.HTTPError as e:
         assert e.code == 404
 
-def test_lambda_reset_terminates_workers(lam):
+def test_lambda_reset_terminates_workers(lam, iam):
     """/_ministack/reset must cleanly terminate warm Lambda workers."""
     import urllib.request
 
@@ -2564,6 +2595,7 @@ def test_lambda_reset_terminates_workers(lam):
         except Exception:
             if _attempt == 2:
                 raise
+    _create_lambda_role(iam)
 
     # Re-create and invoke — new worker means new boot time
     lam.create_function(

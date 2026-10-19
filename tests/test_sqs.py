@@ -88,6 +88,29 @@ def test_sqs_list_queues(sqs):
     assert any("intg-sqs-list-alpha" in u for u in urls)
     assert any("intg-sqs-list-beta" in u for u in urls)
 
+
+@pytest.mark.auth_contract
+def test_sqs_list_queues_header_without_credential_contract(auth_enabled, iam_user):
+    """Under AUTH=true a header signature without Credential answers IncompleteSignature."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}]}).client("sqs")
+    client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+
+    def strip_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", strip_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "IncompleteSignature", 400)
+        assert response["Error"]["Message"].startswith("Authorization header requires 'Credential' parameter.")
+    else:
+        client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+
 def test_sqs_list_queues_paginates_with_max_results(sqs):
     prefix = f"intg-sqs-page-{_uuid_mod.uuid4().hex[:8]}-"
     for i in range(5):

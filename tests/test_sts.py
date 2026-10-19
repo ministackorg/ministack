@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 
 import pytest
 from botocore.exceptions import ClientError
@@ -1015,6 +1016,68 @@ def test_sts_get_caller_identity_json_protocol_resolves_iam_user(iam):
         assert data["Arn"] == "arn:aws:iam::000000000000:user/caller-identity-json-user"
         assert data["Account"] == "000000000000"
         assert data["UserId"]
+
+
+def _strip_credential(request, **_):
+    """Send the signed Authorization header without its Credential part."""
+    algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+    request.headers["Authorization"] = algorithm + b" " + fields.partition(b", ")[2]
+
+
+def _empty_credential_key(request, **_):
+    """Send the signed Authorization header with the access key cut out of its Credential."""
+    algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+    request.headers["Authorization"] = algorithm + b" Credential=/" + fields.split(b"/", 1)[1]
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("edit, code, status, message", [
+    (_strip_credential, "IncompleteSignature", 400,
+     "Authorization header requires 'Credential' parameter. (Hashed with SHA-256 and encoded with Base64) "),
+    (_empty_credential_key, "InvalidClientTokenId", 403, "The security token included in the request is invalid."),
+], ids=["no-credential", "empty-key"])
+def test_sts_header_signature_without_access_key_contract(auth_enabled, iam_user, edit, code, status, message):
+    """Under AUTH=true a header signature that names no access key is refused, not served as the root."""
+    user = iam_user()
+    client = user.client("sts")
+    assert client.get_caller_identity()["Arn"] == user.arn
+    client.meta.events.register_first("before-send", edit)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.get_caller_identity()
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (code, status)
+        assert response["Error"]["Message"].startswith(message)
+    else:
+        assert client.get_caller_identity()["Arn"].endswith(":root")
+
+
+@pytest.mark.auth_contract
+def test_sts_presigned_url_without_credential_contract(auth_enabled, iam_user):
+    """Under AUTH=true a presigned URL without X-Amz-Credential answers IncompleteSignature."""
+    import html
+    import urllib.error
+    import urllib.request
+
+    def post(url):
+        # botocore presigns a Query API call as a POST, as AWS checks it.
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, data=b"", method="POST"), timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as err:
+            return err.code, err.read().decode()
+
+    url = iam_user().client("sts").generate_presigned_url("get_caller_identity", ExpiresIn=300)
+    assert post(url)[0] == 200
+    status, body = post(re.sub(r"X-Amz-Credential=[^&]*&", "", url))
+    if auth_enabled:
+        assert status == 400
+        assert "<Code>IncompleteSignature</Code>" in body
+        assert ("AWS query-string parameters must include 'X-Amz-Credential'. "
+                "Re-examine the query-string parameters.") in html.unescape(body)
+    else:
+        assert status == 200
+        assert ":root</Arn>" in body
 
 
 @pytest.mark.parametrize("auth_enabled", [False, True])
