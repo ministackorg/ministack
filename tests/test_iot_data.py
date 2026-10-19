@@ -352,13 +352,19 @@ _MQTT_ONLY = "Invalid publish to restricted topic using HTTP"
         ("$aws/things/t1/jobs/get", _MQTT_ONLY),
         ("$aws/things/t1/defender/metrics/json", _MQTT_ONLY),
         ("$aws/commands/things/t1/executions/1/response/json", _MQTT_ONLY),
+        ("$aws/certificates/create/json/accepted", _NO_DOLLAR),
+        ("$aws/provisioning-templates/t1/provision/json/rejected", _NO_DOLLAR),
+        ("$aws/device_location/t1/get_position_estimate/accepted", _NO_DOLLAR),
         ("$aws/rules/no_such_rule/x", None),
         ("$aws/things/t1/jobs", None),
+        ("$aws/certificates/create/json", None),
+        ("$aws/device_location/t1/get_position_estimate", None),
     ],
 )
 def test_iot_data_publish_reserved_topics(iot_data_client, topic, message):
-    """HTTPS Publish to a "$" topic is refused outside the reserved families
-    and for the MQTT-only jobs, Device Defender and commands topics."""
+    """HTTPS Publish to a "$" topic is refused outside the reserved families,
+    for the fleet provisioning and Device Location replies, and for the
+    MQTT-only jobs, Device Defender and commands topics."""
     if message is None:
         resp = iot_data_client.publish(topic=topic, payload=b"{}")
         assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
@@ -407,6 +413,66 @@ def test_iot_data_publish_refuses_invalid_mqtt5_properties(kwargs, user_properti
     assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
     assert ei.value.response["Error"]["Message"] == message
     assert ei.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+# IAM contracts, run by CI with AUTH=false and AUTH=true.
+@pytest.fixture
+def auth_iot_shadow(iot_data_client):
+    """A classic shadow to read, removed after the test."""
+    thing = _unique("auth-thing")
+    iot_data_client.update_thing_shadow(thingName=thing, payload=b'{"state":{"reported":{"a":1}}}')
+    yield thing
+    iot_data_client.delete_thing_shadow(thingName=thing)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny"])
+def test_iot_data_permission_contract(auth_enabled, iam_user, auth_iot_shadow, permission):
+    """A refused data plane call answers 403 ForbiddenException without a message."""
+    statements = []
+    if permission != "none":
+        statements.append({"Effect": "Allow", "Action": ["iot:Publish", "iot:GetThingShadow"], "Resource": "*"})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": ["iot:Publish", "iot:GetThingShadow"], "Resource": "*"})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    user = iam_user(policy=policy)
+    data = user.client("iot-data")
+    calls = (
+        lambda: data.publish(topic=_unique("auth/topic"), payload=b"{}"),
+        lambda: data.get_thing_shadow(thingName=auth_iot_shadow),
+    )
+    for call in calls:
+        if auth_enabled and permission != "allow":
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            assert exc.value.response["Error"]["Code"] == "ForbiddenException"
+            assert exc.value.response["Error"]["Message"] is None
+        else:
+            assert call()["ResponseMetadata"]["HTTPStatusCode"] == 200
+    if auth_enabled and permission == "none":
+        # The control plane keeps its own denial.
+        with pytest.raises(ClientError) as exc:
+            user.client("iot").list_things()
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+@pytest.mark.auth_contract
+def test_iot_data_unknown_key_contract(auth_enabled):
+    """A key IAM does not know answers 403 ForbiddenException with the message Forbidden."""
+    data = boto3.client(
+        "iot-data", endpoint_url=ENDPOINT, region_name="us-east-1",
+        aws_access_key_id="AKIA" + uuid.uuid4().hex[:16].upper(), aws_secret_access_key="unknown-secret",
+        config=Config(retries={"total_max_attempts": 1}),
+    )
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            data.publish(topic=_unique("auth/topic"), payload=b"{}")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] == "ForbiddenException"
+        assert exc.value.response["Error"]["Message"] == "Forbidden"
+    else:
+        assert data.publish(topic=_unique("auth/topic"), payload=b"{}")["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1066,96 @@ def test_iot_ws_handshake_signature_contract(auth_enabled, iam_user, case):
         assert status == 101
 
 
+async def _mqtt_over_signed_ws(query: str, packets: list[bytes]) -> list[str]:
+    """The packets the broker answers over an MQTT WebSocket signed in ``query``, named; a PINGREQ goes last."""
+    names: list[str] = []
+    async with websockets.connect(f"ws://{_iot_ws_host()}/mqtt?{query}", subprotocols=["mqtt"]) as ws:
+        try:
+            for packet in (*packets, b"\xc0\x00"):
+                await ws.send(packet)
+            while "PINGRESP" not in names:
+                buf = await asyncio.wait_for(ws.recv(), timeout=_WS_HANDSHAKE_TIMEOUT)
+                while parsed := _parse_packet(bytes(buf)):
+                    kind, _flags, body, used = parsed
+                    buf = buf[used:]
+                    names.append({
+                        2: lambda: f"CONNACK {body[1]:#04x}",
+                        3: lambda: f"PUBLISH {_dec_str(body, 0)[0]}",
+                        4: lambda: f"PUBACK {body[2] if len(body) > 2 else 0:#04x}",
+                        9: lambda: f"SUBACK {body[-1]:#04x}",
+                        13: lambda: "PINGRESP",
+                        14: lambda: f"DISCONNECT {body[0] if body else 0:#04x}",
+                    }[kind]())
+        except websockets.ConnectionClosed:
+            pass
+    return names
+
+
+_MQTT_WS_CASES = {  # case: (packets as (kind, name, v5), names under AUTH=true, names with AUTH off)
+    "connect-allowed": ([("connect", "dev-1", False)], ["CONNACK 0x00", "PINGRESP"], None),
+    "connect-other-client": ([("connect", "other", False)], [], ["CONNACK 0x00", "PINGRESP"]),
+    "connect-denied-client": ([("connect", "dev-denied", False)], [], ["CONNACK 0x00", "PINGRESP"]),
+    "connect-other-client-v5": ([("connect", "other", True)], ["CONNACK 0x87"], ["CONNACK 0x00", "PINGRESP"]),
+    "receive-allowed": ([("connect", "dev-1", False), ("subscribe", "t/a", False), ("publish", "t/a", False)],
+                        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PUBLISH t/a", "PINGRESP"], None),
+    "receive-not-allowed": (
+        [("connect", "dev-1", False), ("subscribe", "t/nr", False), ("publish", "t/nr", False)],
+        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PINGRESP"],
+        ["CONNACK 0x00", "SUBACK 0x01", "PUBACK 0x00", "PUBLISH t/nr", "PINGRESP"]),
+    "publish-other-topic": ([("connect", "dev-1", False), ("publish", "other/x", False)], ["CONNACK 0x00"],
+                            ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "publish-denied-topic": ([("connect", "dev-1", False), ("publish", "t/denied", False)], ["CONNACK 0x00"],
+                             ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "subscribe-other-filter": ([("connect", "dev-1", False), ("subscribe", "other/x", False)], ["CONNACK 0x00"],
+                               ["CONNACK 0x00", "SUBACK 0x01", "PINGRESP"]),
+    "publish-other-topic-v5": ([("connect", "dev-1", True), ("publish", "other/x", True)],
+                               ["CONNACK 0x00", "PUBACK 0x87", "PINGRESP"],
+                               ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "retain-without-retain-publish-v5": ([("connect", "dev-1", True), ("retain", "t/a", True)],
+                                         ["CONNACK 0x00", "PUBACK 0x87", "PINGRESP"],
+                                         ["CONNACK 0x00", "PUBACK 0x00", "PINGRESP"]),
+    "subscribe-other-filter-v5": ([("connect", "dev-1", True), ("subscribe", "other/x", True)],
+                                  ["CONNACK 0x00", "SUBACK 0x87", "PINGRESP"],
+                                  ["CONNACK 0x00", "SUBACK 0x01", "PINGRESP"]),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("signer", ["user", "session", "root"])
+@pytest.mark.parametrize("case", list(_MQTT_WS_CASES))
+def test_iot_ws_session_iam_policy_contract(auth_enabled, iam_user, case, signer):
+    """Under AUTH=true an IAM-signed MQTT-over-WebSocket session is held to the signer's IAM policies."""
+    run = _unique("p")
+    statements = [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{run}-dev-*"},
+        {"Effect": "Deny", "Action": "iot:Connect", "Resource": f"arn:aws:iot:*:*:client/{run}-dev-denied"},
+        {"Effect": "Allow", "Action": "iot:Publish", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/*"},
+        {"Effect": "Deny", "Action": "iot:Publish", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/denied"},
+        {"Effect": "Allow", "Action": "iot:Subscribe", "Resource": f"arn:aws:iot:*:*:topicfilter/{run}/t/*"},
+        {"Effect": "Allow", "Action": "iot:Receive", "Resource": f"arn:aws:iot:*:*:topic/{run}/t/a"},
+        {"Effect": "Allow", "Action": "sts:GetSessionToken", "Resource": "*"},
+    ]
+    packets, strict, permissive = _MQTT_WS_CASES[case]
+    frames = []
+    for kind, name, v5 in packets:
+        level = MQTT_5 if v5 else MQTT_311
+        if kind == "connect":
+            frames.append(_make_connect(f"{run}-{name}", protocol_level=level))
+        elif kind == "subscribe":
+            frames.append(_make_subscribe(1, f"{run}/{name}", qos=1, protocol_level=level))
+        else:
+            frames.append(_make_publish(f"{run}/{name}", b"{}", qos=1, packet_id=2, protocol_level=level,
+                                        retain=kind == "retain"))
+    with _second_access_key(iam_user(policy={"Version": "2012-10-17", "Statement": statements})) as (key, secret):
+        if signer == "root":
+            key, secret = "test", "test"
+        query, _ = _signed_mqtt_upgrade(key, secret, session=signer == "session",
+                                        token="session" if signer == "session" else None)
+        names = asyncio.run(_mqtt_over_signed_ws(query, frames))
+    expected = strict if auth_enabled and signer != "root" else (permissive or strict)
+    assert sorted(names) == sorted(n.replace(" t/", f" {run}/t/") for n in expected)
+
+
 # ---------------------------------------------------------------------------
 # Device Shadow (GetThingShadow / UpdateThingShadow / DeleteThingShadow)
 # ---------------------------------------------------------------------------
@@ -1099,6 +1255,38 @@ def test_update_thing_shadow_version_conflict(iot_data_client):
             payload=json.dumps({"state": {"reported": {"x": 2}}, "version": 99}).encode(),
         )
     assert ei.value.response["Error"]["Code"] == "ConflictException"
+
+
+def test_update_thing_shadow_refuses_nan_and_infinity(iot_data_client):
+    """NaN, Infinity and -Infinity are not JSON: the update is refused as any invalid payload is."""
+    thing = _unique("dev")
+    for payload in (
+        b'{"state": {"reported": {"a": NaN}}}',
+        b'{"state": {"reported": {"a": Infinity}}}',
+        b'{"state": {"reported": {"a": -Infinity}}}',
+        b"not json",
+    ):
+        with pytest.raises(ClientError) as ei:
+            iot_data_client.update_thing_shadow(thingName=thing, payload=payload)
+        err = ei.value.response
+        assert err["ResponseMetadata"]["HTTPStatusCode"] == 400, payload
+        assert err["Error"]["Code"] == "InvalidRequestException"
+        assert err["Error"]["Message"] == "Payload contains invalid json"
+    with pytest.raises(ClientError) as ei:
+        iot_data_client.get_thing_shadow(thingName=thing)
+    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_update_thing_shadow_number_beyond_a_double_is_infinity_text(iot_data_client):
+    """A number beyond a double's range is stored and echoed as the string "Infinity" or "-Infinity"."""
+    thing = _unique("dev")
+    resp = iot_data_client.update_thing_shadow(
+        thingName=thing, payload=b'{"state": {"reported": {"a": 1E400, "b": -1E400, "c": 2.5}}}'
+    )
+    reported = {"a": "Infinity", "b": "-Infinity", "c": 2.5}
+    assert _read_shadow(resp)["state"]["reported"] == reported
+    got = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert got["state"]["reported"] == reported
 
 
 # ---------------------------------------------------------------------------    
@@ -2399,6 +2587,33 @@ def test_shadow_get_missing_over_mqtt_rejected_404(iot_data_client):
     assert thing in doc["message"]
 
 
+def test_shadow_requests_over_mqtt_refuse_nan_and_infinity(iot_data_client):
+    """NaN and Infinity reject every request verb; a number beyond a double's range becomes "Infinity"."""
+    thing = _unique("shadow-nan")
+    base = f"$aws/things/{thing}/shadow"
+    refused = [
+        ("update", b'{"state": {"reported": {"a": NaN}}}'),
+        ("update", b'{"state": {"reported": {"a": Infinity}}}'),
+        ("update", b'{"state": {"reported": {"a": -Infinity}}}'),
+        ("get", b'{"clientToken": "c", "a": NaN}'),
+        ("delete", b'{"clientToken": "c", "a": NaN}'),
+    ]
+
+    def _publish_all():
+        for verb, payload in [*refused, ("update", b'{"state": {"reported": {"a": 1E400}}}')]:
+            iot_data_client.publish(topic=f"{base}/{verb}", payload=payload)
+
+    # Five rejections, then update/accepted and update/documents.
+    received = _collect_shadow_frames(f"{base}/+/+", _publish_all, want=7)
+    frames = [(topic[len(base) + 1:], json.loads(payload)) for topic, payload in received]
+    rejected = [(topic, doc) for topic, doc in frames if topic.endswith("/rejected")]
+    assert sorted(topic for topic, _doc in rejected) == sorted(f"{verb}/rejected" for verb, _p in refused)
+    assert all(doc == {"code": 400, "message": "Payload contains invalid json"} for _t, doc in rejected)
+    assert dict(frames)["update/accepted"]["state"] == {"reported": {"a": "Infinity"}}
+    shadow = _read_shadow(iot_data_client.get_thing_shadow(thingName=thing))
+    assert shadow["state"]["reported"] == {"a": "Infinity"}
+
+
 async def _ws_publish_shadow_and_collect(
     ws_url, sub_filter, pub_topic, pub_payload, received, want
 ):
@@ -3110,14 +3325,21 @@ def test_mqtt5_qos1_puback_carries_reason_code():
 @pytest.mark.parametrize("topic,acknowledged", [
     ("$aws/rules/no-such-rule/x", True),
     ("$aws/things/some-thing/shadow/update", True),
+    ("$aws/things/some-thing/shadow/update/accepted", True),
+    ("$aws/certificates/create/json", True),
     ("$aws/events/certificates/registered/abc", False),
     ("$aws/jobs/abc", False),
     ("$foo/abc", False),
-], ids=["rules", "shadow", "events", "jobs", "other-dollar"])
+    ("$aws/things/some-thing/jobs/notify", False),
+    ("$aws/certificates/create/json/accepted", False),
+    ("$aws/provisioning-templates/some-template/provision/json/rejected", False),
+], ids=["rules", "shadow", "shadow-reply", "fleet-request", "events", "jobs", "other-dollar", "jobs-reply",
+        "fleet-reply", "template-reply"])
 def test_mqtt_publish_to_reserved_topic_closes_the_connection(topic, acknowledged):
-    """AWS acknowledges a publish under $aws/rules/ and $aws/things/ and closes
-    the connection of a client that publishes to any other $ topic (measured
-    over MQTT 3.1.1); the HTTPS Publish applies the same list."""
+    """AWS acknowledges a publish under $aws/rules/ and $aws/things/ and to the
+    fleet provisioning requests, and closes the connection of a client that
+    publishes to a reply AWS IoT writes itself or to any other $ topic
+    (MQTT 3.1.1)."""
 
     async def scenario():
         async with _connect(MQTT_311) as (pub, _c):
@@ -3132,6 +3354,82 @@ def test_mqtt_publish_to_reserved_topic_closes_the_connection(topic, acknowledge
     assert kind == ("puback" if acknowledged else "closed"), (kind, detail)
     if acknowledged:
         assert detail == b"\x00\x05"
+
+
+def test_mqtt5_publish_to_a_reserved_reply_topic_answers_topic_name_invalid():
+    """MQTT 5: PUBACK 0x90 for a QoS 1 publish to a reply AWS IoT writes, the connection stays; DISCONNECT for QoS 0."""
+
+    async def scenario():
+        async with _connect(MQTT_5) as (client, _c):
+            await client.send(_make_publish("$aws/things/some-thing/jobs/notify", b"{}", qos=1, packet_id=1,
+                                            protocol_level=MQTT_5))
+            _flags, refused = await client.await_packet(PKT_PUBACK)
+            await client.send(_make_publish(_unique("v5/plain"), b"{}", qos=1, packet_id=2, protocol_level=MQTT_5))
+            _flags, accepted = await client.await_packet(PKT_PUBACK)
+            await client.send(_make_publish("$aws/certificates/create/json/accepted", b"{}", protocol_level=MQTT_5))
+            pkt_type, _flags, disconnect = await client.packet()
+            return refused, accepted, pkt_type, disconnect
+
+    refused, accepted, pkt_type, disconnect = _run(scenario())
+    assert refused == b"\x00\x01\x90\x00", "packet id 1, Topic Name invalid, no properties"
+    assert accepted == b"\x00\x02\x00\x00"
+    assert (pkt_type, disconnect[0]) == (PKT_DISCONNECT, 0x90)
+
+
+# MQTT 5 SUBACK reason code per filter: 0x01 granted, 0x8F Topic Filter invalid.
+_RESERVED_FILTERS = {
+    "$aws/things/some-thing/shadow/update/+": 0x01,
+    "$aws/things/+/jobs/#": 0x01,
+    "$aws/events/#": 0x01,
+    "$aws/certificates/create/+/accepted": 0x01,
+    "$aws/provisioning-templates/+/provision/json/rejected": 0x01,
+    "$aws/device_location/some-thing/get_position_estimate/accepted": 0x01,
+    "$aws/commands/things/some-thing/executions/+/request/json": 0x01,
+    "$aws/certificates/create/json": 0x8F,
+    "$aws/certificates/create/json/+": 0x8F,
+    "$aws/certificates/#": 0x8F,
+    "$aws/provisioning-templates/some-template/provision/json/+": 0x8F,
+    "$aws/rules/some_rule": 0x8F,
+    "$aws/device_location/some-thing/get_position_estimate": 0x8F,
+    "$aws/commands/things/some-thing/executions/e1/response/json": 0x8F,
+    "$aws/things": 0x8F,
+    "$aws/#": 0x8F,
+    "$foo/abc": 0x8F,
+}
+
+
+def test_mqtt5_subscribe_to_a_reserved_filter_answers_topic_filter_invalid():
+    """MQTT 5 refuses a reserved filter a client may not subscribe to with SUBACK 0x8F, and the connection stays."""
+
+    async def scenario():
+        async with _connect(MQTT_5) as (client, _c):
+            codes = {}
+            for packet_id, topic_filter in enumerate(_RESERVED_FILTERS, start=1):
+                await client.send(_make_subscribe(packet_id, topic_filter, qos=1, protocol_level=MQTT_5))
+                _flags, suback = await client.await_packet(PKT_SUBACK)
+                codes[topic_filter] = suback[3]
+            return codes
+
+    assert _run(scenario()) == _RESERVED_FILTERS
+
+
+@pytest.mark.parametrize("topic_filter,closed", [
+    ("$aws/certificates/create/json/accepted", False),
+    ("$aws/certificates/create/json/+", True),
+], ids=["reply", "request-wildcard"])
+def test_mqtt_subscribe_to_a_reserved_filter_closes_the_connection(topic_filter, closed):
+    """MQTT 3.1.1: a SUBSCRIBE to a reserved filter a client may not use closes the connection without a SUBACK."""
+
+    async def scenario():
+        async with _connect(MQTT_311) as (client, _c):
+            await client.send(_make_subscribe(1, topic_filter, qos=1))
+            try:
+                await client.await_packet(PKT_SUBACK, timeout=3)
+                return False
+            except (websockets.exceptions.ConnectionClosed, OSError):
+                return True
+
+    assert _run(scenario()) is closed
 
 
 def test_mqtt311_qos1_puback_stays_two_bytes():
@@ -4486,8 +4784,8 @@ def test_mtls_provisioning_claim_connects_and_provisions(broker, tmp_path):
     peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
     try:
         _assert_connack(peer.connect(_unique("claim")))
-        peer.subscribe(f"{create}/+", packet_id=1)
-        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.subscribe(f"{create}/accepted", packet_id=1)
+        peer.subscribe(f"{provision}/accepted", packet_id=2)
         peer.send(_make_publish(create, b"", qos=1, packet_id=3))
         topic, payload = peer.next_publish()
         assert topic == f"{create}/accepted"
@@ -4640,8 +4938,8 @@ def test_mtls_provisioning_hook_names_the_thing(broker, tmp_path):
     peer = _Peer(_mtls_connect(broker, claim["certificatePem"], claim["keyPair"]["PrivateKey"], tmp_path))
     try:
         _assert_connack(peer.connect(_unique("claim")))
-        peer.subscribe(f"{create}/+", packet_id=1)
-        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.subscribe(f"{create}/accepted", packet_id=1)
+        peer.subscribe(f"{provision}/accepted", packet_id=2)
         peer.send(_make_publish(create, b"", qos=1, packet_id=3))
         topic, payload = peer.next_publish()
         assert topic == f"{create}/accepted"
@@ -4718,8 +5016,8 @@ def test_mtls_provisioning_applies_the_default_template_version(broker, tmp_path
 
     try:
         _assert_connack(peer.connect(_unique("claim")))
-        peer.subscribe(f"{create}/+", packet_id=1)
-        peer.subscribe(f"{provision}/+", packet_id=2)
+        peer.subscribe(f"{create}/accepted", packet_id=1)
+        peer.subscribe(f"{provision}/accepted", packet_id=2)
         iot.create_provisioning_template_version(templateName=name, templateBody=body("v2"))
         register("a", "v1")
         iot.update_provisioning_template(templateName=name, defaultVersionId=2)

@@ -61,6 +61,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -1536,6 +1537,18 @@ def _match_route(api_id, method, path):
         if route.get("routeKey") == "$default":
             return route
     return None
+
+
+def route_authorization_type(api_id, stage, method, path):
+    """The authorizationType of the route an HTTP API request reaches, or None."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return None
+    with request_scope(*scope):
+        if stage not in _stages.get(api_id, {}) and stage != "$default":
+            return None
+        route = _match_route(api_id, method, "/" + path.lstrip("/"))
+    return (route.get("authorizationType") or "NONE").upper() if route else None
 
 
 def _extract_path_params(route_path: str, request_path: str) -> dict | None:

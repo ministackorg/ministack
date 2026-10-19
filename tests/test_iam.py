@@ -72,6 +72,52 @@ def test_iam_get_role(iam):
     assert resp["Role"]["RoleName"] == "iam-test-role"
 
 
+_TRUST_ALLOW_ROOT = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                     "Action": "sts:AssumeRole"}
+_TRUST_ALLOW_NOT_PRINCIPAL = {"Effect": "Allow", "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:root"},
+                              "Action": "sts:AssumeRole"}
+_TRUST_DENY_NOT_PRINCIPAL = {"Effect": "Deny", "NotPrincipal": {"AWS": "arn:aws:iam::000000000000:root"},
+                             "Action": "sts:AssumeRole"}
+
+
+@pytest.mark.parametrize("statement, message", [
+    ([_TRUST_ALLOW_NOT_PRINCIPAL], "Allow with NotPrincipal is not allowed."),
+    (_TRUST_ALLOW_NOT_PRINCIPAL, "Allow with NotPrincipal is not allowed."),
+    ([_TRUST_ALLOW_ROOT, _TRUST_DENY_NOT_PRINCIPAL], "AssumeRole policy must not contain NotPrincipal field."),
+    ([_TRUST_DENY_NOT_PRINCIPAL, _TRUST_ALLOW_NOT_PRINCIPAL], "Allow with NotPrincipal is not allowed."),
+], ids=["allow", "allow-object", "deny", "deny-then-allow"])
+def test_iam_role_trust_policy_not_principal_refused(iam, statement, message):
+    name = f"not-principal-role-{_uuid_mod.uuid4().hex[:8]}"
+    refused = json.dumps({"Version": "2012-10-17", "Statement": statement})
+    plain = {"Version": "2012-10-17", "Statement": [_TRUST_ALLOW_ROOT]}
+    with pytest.raises(ClientError) as exc:
+        iam.create_role(RoleName=name, AssumeRolePolicyDocument=refused)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+    assert exc.value.response["Error"]["Message"] == message
+    with pytest.raises(ClientError) as exc:
+        iam.get_role(RoleName=name)
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+    iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(plain))
+    try:
+        with pytest.raises(ClientError) as exc:
+            iam.update_assume_role_policy(RoleName=name, PolicyDocument=refused)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Code"] == "MalformedPolicyDocument"
+        assert exc.value.response["Error"]["Message"] == message
+        assert iam.get_role(RoleName=name)["Role"]["AssumeRolePolicyDocument"] == plain
+        # The name and the role's existence are checked before the document.
+        with pytest.raises(ClientError) as exc:
+            iam.create_role(RoleName=name, AssumeRolePolicyDocument=refused)
+        assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+        with pytest.raises(ClientError) as exc:
+            iam.update_assume_role_policy(RoleName=f"{name}-missing", PolicyDocument=refused)
+        assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+    finally:
+        iam.delete_role(RoleName=name)
+
+
 def test_iam_update_role_description(iam):
     name = f"description-role-{_uuid_mod.uuid4().hex[:8]}"
     iam.create_role(
