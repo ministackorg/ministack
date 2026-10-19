@@ -882,6 +882,10 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                     except (TypeError, ValueError):
                         claims[k] = v
                     continue
+                if k in ("email_verified", "phone_number_verified"):
+                    # AWS carries the standard verified flags as JSON booleans in the ID token
+                    claims[k] = v == "true"
+                    continue
                 claims[k] = v
             if "email" in user_attrs:
                 claims.setdefault("email_verified", True)
