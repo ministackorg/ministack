@@ -2676,6 +2676,12 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    current = _buckets.get(name)
+    enforced = (_bucket_owner_enforced(current) if current
+                else headers.get("x-amz-object-ownership", "BucketOwnerEnforced") == "BucketOwnerEnforced")
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
     if endpoint_region:
         err = _location_constraint_error(name, _location_constraint(body), endpoint_region)
         if err is not None:
@@ -2690,6 +2696,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
         _bucket_acl.pop(name, None)
         if canned_acl:
             _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+        elif grant_acl:
+            _bucket_acl[name] = grant_acl
         return 200, {"Location": f"/{name}"}, b""
     if _bucket_owner_account(name) is not None:
         # "After creating a general purpose bucket in the shared global
@@ -2740,6 +2748,8 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
         _bucket_tags[name] = tags
     if canned_acl:
         _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    elif grant_acl:
+        _bucket_acl[name] = grant_acl
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
@@ -3340,6 +3350,10 @@ def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
     refused = _public_acl_refused(name, headers, body)
     if refused:
         return refused
+    enforced = _bucket_owner_enforced(_buckets[name])
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
     # exclusive with an XML body per the AWS API reference. SDK callers send
@@ -3353,9 +3367,14 @@ def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
             return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned}", 400)
         _bucket_acl[name] = _canned_acl_policy_xml(canned, _canonical_owner_id())
         return 200, {}, b""
+    if grant_acl:
+        if body:
+            return _error("UnexpectedContent", "This request does not support content", 400)
+        _bucket_acl[name] = grant_acl
+        return 200, {}, b""
 
     if not body:
-        return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
+        return _missing_acl_error(headers, enforced)
     try:
         # Validate XML well-formedness — real AWS rejects malformed bodies
         # with MalformedACLError. We don't enforce grantee/permission
@@ -4459,6 +4478,9 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    grant_acl, err = _grant_headers_acl(headers, _bucket_owner_enforced(bucket))
+    if err:
+        return err
     refused = _public_acl_refused(bucket_name, headers)
     if refused:
         return refused
@@ -4505,6 +4527,8 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
+    elif grant_acl:
+        _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -6012,6 +6036,9 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     canned_acl = headers.get("x-amz-acl")
     if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
         return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    grant_acl, err = _grant_headers_acl(headers, _bucket_owner_enforced(dest_bucket))
+    if err:
+        return err
     refused = _public_acl_refused(bucket_name, headers)
     if refused:
         return refused
@@ -6215,6 +6242,8 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         _object_acl[(bucket_name, dest_key, dest_version_id)] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
+    elif grant_acl:
+        _object_acl[(bucket_name, dest_key, dest_version_id)] = grant_acl
     else:
         # The destination is a new object: it does not inherit whatever the
         # key it replaced was permissioned with.
@@ -7113,6 +7142,59 @@ def _canned_acl_policy_xml(canned: str, owner_id: str) -> str:
     )
 
 
+# The x-amz-grant-* headers in the order S3 lists their grants back.
+_GRANT_HEADER_PERMISSIONS = (
+    ("x-amz-grant-read", "READ"),
+    ("x-amz-grant-write", "WRITE"),
+    ("x-amz-grant-full-control", "FULL_CONTROL"),
+    ("x-amz-grant-read-acp", "READ_ACP"),
+    ("x-amz-grant-write-acp", "WRITE_ACP"),
+)
+
+
+def _grant_headers_acl(headers: dict, enforced: bool) -> tuple[str | None, tuple | None]:
+    """The ACL the request's ``x-amz-grant-*`` headers set (None without any or with ACLs disabled), or their error."""
+    present = [(headers[name], permission) for name, permission in _GRANT_HEADER_PERMISSIONS if headers.get(name)]
+    if not present or enforced:
+        return None, None
+    if headers.get("x-amz-acl"):
+        return None, _error("InvalidRequest", "Specifying both Canned ACLs and Header Grants is not allowed", 400)
+    grants = []
+    for value, permission in present:
+        for item in value.split(","):
+            kind, _, grantee = item.partition("=")
+            kind, grantee = kind.strip().lower(), grantee.strip().strip('"')
+            if kind == "id" and re.fullmatch(r"[0-9a-fA-F]{64}", grantee):
+                grantee_xml = f'xsi:type="CanonicalUser"><ID>{grantee}</ID>'
+            elif kind == "uri" and grantee in (_ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTH_USERS, _ACL_GROUP_LOG_DELIVERY):
+                grantee_xml = f'xsi:type="Group"><URI>{grantee}</URI>'
+            elif kind in ("id", "uri"):
+                return None, _error("InvalidArgument", "Invalid id" if kind == "id" else "Invalid group uri", 400)
+            elif kind == "emailaddress":
+                return None, _error("UnsupportedArgument", "The request contained an unsupported argument.", 400)
+            else:
+                return None, _error("InvalidArgument", "Argument format not recognized", 400)
+            grants.append(
+                '<Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+                f"{grantee_xml}</Grantee><Permission>{permission}</Permission></Grant>"
+            )
+    owner_id = _canonical_owner_id()
+    return (
+        XML_DECL.decode() + "\n"
+        f'<AccessControlPolicy xmlns="{S3_NS}">'
+        f"<Owner><ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Owner>"
+        f'<AccessControlList>{"".join(grants)}</AccessControlList>'
+        "</AccessControlPolicy>"
+    ), None
+
+
+def _missing_acl_error(headers: dict, enforced: bool) -> tuple:
+    """The error for an ACL write with neither a canned ACL nor a body (grant headers with ACLs disabled included)."""
+    if enforced and any(headers.get(name) for name, _ in _GRANT_HEADER_PERMISSIONS):
+        return _error("AccessControlListNotSupported", "The bucket does not allow ACLs", 400)
+    return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
+
+
 def _default_object_acl_xml() -> bytes:
     """Default ACL real AWS returns when no ACL has been set on an object:
     a single Grant of FULL_CONTROL to the bucket owner (CanonicalUser).
@@ -7181,6 +7263,10 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
     refused = _public_acl_refused(bucket_name, headers, body)
     if refused:
         return refused
+    enforced = _bucket_owner_enforced(bucket)
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
 
     # Canned ACL from x-amz-acl header takes precedence and is mutually
     # exclusive with an XML body per the AWS API reference. Either path
@@ -7193,9 +7279,15 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned, _canonical_owner_id())
         _persist_version_state(bucket_name, key, bucket)
         return 200, {}, b""
+    if grant_acl:
+        if body:
+            return _error("UnexpectedContent", "This request does not support content", 400)
+        _object_acl[(bucket_name, key, version_id)] = grant_acl
+        _persist_version_state(bucket_name, key, bucket)
+        return 200, {}, b""
 
     if not body:
-        return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
+        return _missing_acl_error(headers, enforced)
     try:
         # Validate XML well-formedness — real AWS rejects malformed bodies
         # with MalformedACLError. We don't enforce grantee/permission
