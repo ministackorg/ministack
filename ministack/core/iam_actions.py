@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
@@ -1644,6 +1645,12 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
             topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
+        # The tagging calls authorize on the resource they name in resourceArn,
+        # read from where the handler reads it: the body of a POST, the query of a GET.
+        if parts in (["tags"], ["untag"]):
+            arn = (_safe_json_field(body, "resourceArn") if method == "POST"
+                   else _query_param(query_params, "resourceArn"))
+            return arn if isinstance(arn, str) and arn else "*"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -2127,6 +2134,13 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
+    if service == "iot-data":
+        # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
+        # for a failed authentication, no message for a policy denial.
+        return (
+            403, {"Content-Type": "application/json", "x-amzn-errortype": "ForbiddenException:"},
+            json.dumps({"message": "Forbidden" if error_code else None, "traceId": str(uuid.uuid4())}).encode(),
+        )
     if not message and explicit_deny and resource_policy_arn:
         message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
     if not message:
@@ -2134,7 +2148,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
-        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
+        # IoT names the resource, "*" for an action that takes none.
+        on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
     if code in _AUTH_FAILURES:
