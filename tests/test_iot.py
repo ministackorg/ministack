@@ -3988,7 +3988,7 @@ def test_iot_topic_rule_lifecycle(iot_client):
     iot_client.delete_topic_rule(ruleName=name)
     with pytest.raises(ClientError) as ei:
         iot_client.get_topic_rule(ruleName=name)
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
 
 
 def test_iot_topic_rule_duplicate_rejected(iot_client):
@@ -4051,7 +4051,9 @@ def test_iot_enable_disable_topic_rule_refusals(iot_client):
     for call in (iot_client.enable_topic_rule, iot_client.disable_topic_rule):
         with pytest.raises(ClientError) as ei:
             call(ruleName=missing)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
         with pytest.raises(ClientError) as ei:
             call(ruleName="bad-name")
         assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
@@ -4279,7 +4281,7 @@ def test_iot_create_topic_rule_republish_inside_own_filter_rejected(
     )
     with pytest.raises(ClientError) as ei:
         iot_client.get_topic_rule(ruleName=name)
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
 
 
 @pytest.mark.parametrize(
@@ -4339,12 +4341,41 @@ def test_iot_replace_topic_rule_republish_inside_own_filter_rejected(iot_client,
     iot_client.delete_topic_rule(ruleName=name)
 
 
-def test_iot_replace_missing_topic_rule_404(iot_client):
-    with pytest.raises(ClientError) as ei:
-        iot_client.replace_topic_rule(
-            ruleName=_rule_name(), topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
-        )
-    assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+def test_iot_missing_topic_rule_unauthorized(iot_client):
+    """Get, Replace and Delete of an unknown rule answer 401 as AWS does."""
+    missing = _rule_name()
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName=missing),
+        lambda: iot_client.replace_topic_rule(
+            ruleName=missing, topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName=missing),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            401, "UnauthorizedException", f"Access to topic rule '{missing}' was denied")
+
+
+def test_iot_get_replace_delete_topic_rule_name_pattern_refused(iot_client):
+    """Get, Replace and Delete refuse a rule name outside the pattern with 400, as Enable does."""
+    calls = (
+        lambda: iot_client.get_topic_rule(ruleName="bad-name"),
+        lambda: iot_client.replace_topic_rule(
+            ruleName="bad-name", topicRulePayload={"sql": "SELECT * FROM 'a'", "actions": []}
+        ),
+        lambda: iot_client.delete_topic_rule(ruleName="bad-name"),
+    )
+    for call in calls:
+        with pytest.raises(ClientError) as ei:
+            call()
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "InvalidRequestException",
+            "1 validation error detected: Value 'bad-name' at 'ruleName' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
 
 
 def test_iot_topic_rule_cfn_deploy(cfn, iot_client):
@@ -4434,7 +4465,7 @@ def test_iot_topic_rule_cfn_invalid_sql_fails_resource(cfn, iot_client):
         # Nothing was stored: the invalid rule never entered the rule store.
         with pytest.raises(ClientError) as ei:
             iot_client.get_topic_rule(ruleName=rule)
-        assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert ei.value.response["Error"]["Code"] == "UnauthorizedException"
     finally:
         try:
             cfn.delete_stack(StackName=stack)
@@ -5719,6 +5750,98 @@ def test_offline_qos1_messages_queued_and_delivered_on_reconnect():
         assert len(ps.queued_messages) == 0
 
         await session2.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unacknowledged_qos1_message_is_resent_when_the_session_resumes(monkeypatch):
+    """A QoS 1 message without a PUBACK stays with the session and keeps its packet identifier."""
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(iot_module, "_RETRANSMIT_INTERVAL_SECONDS", 0.3)
+    reset()
+    connect = _build_connect_body(client_id="unacked", clean_session=False)
+
+    async def _run():
+        send1, sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(PKT_SUBSCRIBE, 0x02, _build_subscribe_body(1, [("data/unacked", 1)]))
+        await publish("123456789012", "data/unacked", b"m1", qos=1)
+        assert _extract_publish_frames(sent1) == [("data/unacked", b"m1", 1, 1, False)]
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        await publish("123456789012", "data/unacked", b"m2", qos=1)
+        # The retransmit interval passes while the client is offline.
+        await asyncio.sleep(0.4)
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0)
+        assert _extract_publish_frames(sent2) == [
+            ("data/unacked", b"m1", 1, 1, True),
+            ("data/unacked", b"m2", 1, 2, False),
+        ]
+        for pid in (1, 2):
+            await session2.handle_packet(PKT_PUBACK, 0, struct.pack("!H", pid))
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent3) == (True, 0)
+        assert _extract_publish_frames(sent3) == []
+        await session3.cleanup()
+
+    asyncio.run(_run())
+    reset()
+
+
+def test_unacknowledged_qos1_message_waits_for_its_retransmit_interval_after_a_resume(monkeypatch):
+    """Resumed before the interval runs out, the message goes out when it does; a clean start drops it."""
+    from ministack.services import iot as iot_module
+
+    monkeypatch.setattr(iot_module, "_RETRANSMIT_INTERVAL_SECONDS", 0.3)
+    reset()
+    key = ("123456789012", _TEST_REGION, "unacked5")
+    connect = _build_mqtt5_connect_body("unacked5", clean_start=False, session_expiry=300)
+
+    async def _run():
+        send1, _sent1 = _mock_send()
+        session1 = _WSSession(send1, "123456789012")
+        await session1.handle_packet(PKT_CONNECT, 0, connect)
+        await session1.handle_packet(
+            PKT_SUBSCRIBE, 0x02, _build_mqtt5_subscribe_body(1, "data/unacked5", 0x01)
+        )
+        await publish("123456789012", "data/unacked5", b"m1", qos=1)
+        await session1.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session1.cleanup()
+
+        send2, sent2 = _mock_send()
+        session2 = _WSSession(send2, "123456789012")
+        await session2.handle_packet(PKT_CONNECT, 0, connect)
+        assert _parse_connack(sent2) == (True, 0)
+        assert _extract_publish_frames(sent2) == []
+        await asyncio.sleep(0.5)
+        # The payload follows an empty property block.
+        assert _extract_publish_frames(sent2) == [("data/unacked5", b"\x00m1", 1, 1, True)]
+        await session2.handle_packet(PKT_DISCONNECT, 0, b"")
+        await session2.cleanup()
+        assert list(_persistent_sessions[key].in_flight) == [1]
+
+        send3, sent3 = _mock_send()
+        session3 = _WSSession(send3, "123456789012")
+        await session3.handle_packet(
+            PKT_CONNECT, 0, _build_mqtt5_connect_body("unacked5", clean_start=True)
+        )
+        await asyncio.sleep(0.5)
+        assert _extract_publish_frames(sent3) == []
+        await session3.cleanup()
+        assert key not in _persistent_sessions
 
     asyncio.run(_run())
     reset()
@@ -7900,6 +8023,42 @@ def test_iot_jobs_in_progress_timeout_reaches_timed_out():
         assert iot_module._jobs_apply_timeout(execution)["status"] == "TIMED_OUT"
         assert iot_module._jobs["j1"]["status"] == "COMPLETED"
         assert iot_module._jobs_seconds_before_timeout(execution) is None
+    reset()
+
+
+def test_iot_jobs_in_progress_timeout_reaches_control_plane_reads():
+    """DescribeJobExecution, both execution lists and DescribeJob each report the timed-out execution."""
+    from ministack.core.responses import request_scope
+    from ministack.services import iot as iot_module
+
+    def read_after_the_timeout(read):
+        reset()
+        with request_scope("123456789012", _TEST_REGION):
+            started = iot_module._jobs_now_ms() - 61_000
+            iot_module._jobs["j1"] = {
+                "jobId": "j1", "jobArn": iot_module._job_arn("j1"), "targets": [],
+                "targetSelection": "SNAPSHOT", "status": "IN_PROGRESS", "document": "{}",
+                "snapshotted": True, "createdAt": started, "lastUpdatedAt": started,
+                "timeoutConfig": {"inProgressTimeoutInMinutes": 1},
+            }
+            iot_module._job_executions[("t1", "j1")] = {
+                "jobId": "j1", "thingName": "t1", "status": "IN_PROGRESS",
+                "queuedAt": started, "startedAt": started, "lastUpdatedAt": started,
+                "executionNumber": 1, "versionNumber": 2,
+            }
+            status, _, body = read()
+        assert status == 200
+        return json.loads(body)
+
+    execution = read_after_the_timeout(
+        lambda: iot_module._describe_job_execution("t1", "j1", {}))["execution"]
+    assert (execution["status"], execution["versionNumber"]) == ("TIMED_OUT", 3)
+    for read in (lambda: iot_module._list_job_executions_for_job("j1", {}),
+                 lambda: iot_module._list_job_executions_for_thing("t1", {})):
+        (summary,) = read_after_the_timeout(read)["executionSummaries"]
+        assert summary["jobExecutionSummary"]["status"] == "TIMED_OUT"
+    details = read_after_the_timeout(lambda: iot_module._describe_job("j1"))["job"]["jobProcessDetails"]
+    assert (details["numberOfTimedOutThings"], details["numberOfInProgressThings"]) == (1, 0)
     reset()
 
 
