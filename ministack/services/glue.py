@@ -711,19 +711,91 @@ def _iceberg_rest_commit_table(namespace, table_name, body):
 def _iceberg_rest_commit_transaction(body):
     """POST transactions/commit -- DuckDB's atomic multi-table commit."""
     for change in body.get("table-changes", []):
-        ident = change.get("identifier", {})
-        ns_field = ident.get("namespace", [""])
-        ns = ns_field[0] if isinstance(ns_field, list) and ns_field else (ns_field or "")
-        tbl = ident.get("name", "")
+        ns, tbl = _iceberg_rest_change_identifier(change)
         result = _iceberg_rest_commit_table(ns, tbl, change)
         if result and result[0] not in (200, 204):
             return result
     return _iceberg_json({})
 
 
+# Iceberg REST calls below namespaces/ -> the glue action they need and how many of catalog, database, table it names.
+_ICEBERG_IAM_ACTIONS = {
+    (0, "GET"): ("GetDatabases", 1),
+    (0, "POST"): ("CreateDatabase", 2),
+    (1, "GET"): ("GetDatabase", 2),
+    (1, "HEAD"): ("GetDatabase", 2),
+    (1, "DELETE"): ("DeleteDatabase", 2),
+    (2, "GET"): ("GetTables", 2),
+    (2, "POST"): ("CreateTable", 3),
+    (3, "GET"): ("GetTable", 3),
+    (3, "HEAD"): ("GetTable", 3),
+    (3, "POST"): ("UpdateTable", 3),
+    (3, "DELETE"): ("DeleteTable", 3),
+}
+
+
+def iceberg_iam_checks(method, path, body, query_params):
+    """The glue actions an Iceberg REST call on the Glue catalog needs, with resources, in order; else None."""
+    parts = _iceberg_rest_parts(path)[2:]
+    catalog = f"arn:aws:glue:{get_region()}:{get_account_id()}:catalog"
+    if parts == ["config"] and method == "GET":
+        return [("glue:GetCatalog", catalog)]
+    # Every {catalog} is served from the account's default catalog, so it is authorized as that one.
+    if parts[:1] == ["catalogs"] and parts[2:3] == ["transactions"] and method == "POST":
+        # Each table change is an updateTable; a body whose changes cannot be read needs it on every resource.
+        try:
+            tables = [_iceberg_rest_change_identifier(change)
+                      for change in json.loads(body or b"{}").get("table-changes", [])]
+        except (ValueError, TypeError, AttributeError):
+            tables = []
+        if not tables:
+            return [("glue:UpdateTable", "*")]
+        return [("glue:UpdateTable", arn) for namespace, table in tables
+                for arn in (catalog, _arn("database", namespace), _arn("table", f"{namespace}/{table}"))]
+    if parts[:1] != ["catalogs"] or parts[2:3] != ["namespaces"]:
+        return None
+    rest = parts[3:]
+    if rest[1:] == ["properties"] and method == "POST":
+        resources = [catalog, _arn("database", rest[0])]
+        return [(f"glue:{action}", arn) for action in ("GetDatabase", "UpdateDatabase") for arn in resources]
+    entry = _ICEBERG_IAM_ACTIONS.get((len(rest), method))
+    if not entry or rest[1:2] not in ([], ["tables"]):
+        return None
+    action, depth = entry
+    namespace, _, table = rest + [""] * (3 - len(rest))
+    if method == "POST" and len(rest) in (0, 2):
+        named = _iceberg_body_name(body, "namespace" if not rest else "name")
+        namespace, table = (named, table) if not rest else (namespace, named)
+    resources = [catalog, _arn("database", namespace), _arn("table", f"{namespace}/{table}")]
+    return [(f"glue:{action}", arn) for arn in resources[:depth]]
+
+
+def _iceberg_rest_parts(path):
+    """The segments of an Iceberg REST path as the Glue router reads them, each decoded on its own."""
+    return [unquote(p) for p in path.strip("/").split("/") if p]
+
+
+def _iceberg_rest_change_identifier(change):
+    """The namespace and table name a transactions/commit table change names, read as the commit reads them."""
+    ident = change.get("identifier", {})
+    ns_field = ident.get("namespace", [""])
+    return (ns_field[0] if isinstance(ns_field, list) and ns_field else (ns_field or "")), ident.get("name", "")
+
+
+def _iceberg_body_name(body, field):
+    """The namespace or table name an Iceberg REST request body names, read as the handlers read it, or ''."""
+    try:
+        name = json.loads(body or b"{}").get(field, "")
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    if field == "namespace":
+        name = name[0] if isinstance(name, list) and name else (name or "")
+    return str(name)
+
+
 def _handle_iceberg_rest(method, path, query_params, body=None):
     _iceberg_maybe_log_tls_hint()
-    parts = [unquote(p) for p in path.strip("/").split("/") if p]
+    parts = _iceberg_rest_parts(path)
     if len(parts) < 3 or parts[0] != "iceberg" or parts[1] != "v1":
         return _iceberg_error(f"Unknown Iceberg REST path: {path}", "NotFoundException", 404)
 

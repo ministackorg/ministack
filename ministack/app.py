@@ -2430,6 +2430,63 @@ def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_pa
                                named_resource=resource_arn)
 
 
+def _iceberg_json_failure(failure):
+    """A credential failure as both Iceberg REST catalogs send it, in application/json."""
+    status, resp_headers, resp_body = failure
+    return status, {**resp_headers, "Content-Type": "application/json"}, resp_body
+
+
+def _enforce_iceberg(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an Iceberg REST call for the catalog the router serves it from, whatever it is signed for."""
+    from ministack.core.iam_actions import identity_denial_message
+    from ministack.core.iam_evaluator import AuthError, enforce
+
+    glue = _iceberg_targets_glue_catalog(path, query_params)
+    service = "glue" if glue else "s3tables"
+    catalog = _get_module(service)
+    # A route without the table bucket prefix answers 404 before any credential check.
+    if not glue and catalog.iceberg_lacks_prefix(method, path):
+        return None
+    checks = catalog.iceberg_iam_checks(method, path, body, query_params)
+    if not checks:
+        if failure := _authenticate_only(service, headers, query_params, request_id):
+            return _iceberg_json_failure(failure)
+        return None if glue else catalog.iceberg_prefix_error(method, path)
+    access_key, region = extract_access_key_id(headers, query_params), extract_region(headers, query_params)
+    for position, (iam_action, resource_arn) in enumerate(checks):
+        denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+        if isinstance(denied, AuthError):
+            return _iceberg_json_failure(_credential_failure(service, iam_action, request_id, denied, headers))
+        if not denied:
+            continue
+        resp_headers = {"Content-Type": "application/json",
+                        "x-amzn-errortype": "ForbiddenResponse" if glue else "IrcForbiddenResponse"}
+        if method == "HEAD":
+            return 403, resp_headers, b""
+        # S3 Tables names only the first action's denial; a later one answers "Access Denied".
+        message = identity_denial_message(iam_action, denied.principal_arn, resource_arn,
+                                          denied.decision == "Deny") if glue or position == 0 else "Access Denied"
+        error = {"message": message, "type": "AccessDeniedException" if glue else "forbidden", "code": 403}
+        return 403, resp_headers, json.dumps({"error": error}).encode()
+    return None
+
+
+def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an SES v2 call as ses:<operation> on the resource it names, which its denial names too."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+    from ministack.core.responses import get_account_id
+
+    iam_action = extract_iam_action("ses", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("sesv2", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("ses", method, path, headers, body, query_params,
+                                        extract_region(headers, query_params), get_account_id())
+    return _enforce_data_plane("sesv2", iam_action, headers, query_params, request_id, resource_arn=resource_arn,
+                               named_resource=resource_arn)
+
+
 def _iceberg_targets_glue_catalog(path, query_params):
     """Decide whether an ``/iceberg`` REST request belongs to the Glue Data
     Catalog (Glue jobs + Firehose lakehouse) or to S3 Tables.
@@ -2479,6 +2536,8 @@ async def _handle_special_data_plane_request(
     # the other reads. Must not fall through to S3 (which reads "iceberg" as a
     # bucket name).
     if path.startswith("/iceberg"):
+        if AUTH and (denied := _enforce_iceberg(method, path, headers, body, query_params, request_id)):
+            return denied
         try:
             if _iceberg_targets_glue_catalog(path, query_params):
                 result = _get_module("glue")._handle_iceberg_rest(method, path, query_params, body=body)
