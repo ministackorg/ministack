@@ -5788,11 +5788,7 @@ def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tu
 def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> tuple:
     """CreateTopicRule; its tags arrive as the ``x-amz-tagging`` header, ``k1=v1&k2=v2``."""
     if not _RULE_NAME_RE.fullmatch(name or ""):
-        return error_response_json(
-            "InvalidRequestException",
-            "Invalid ruleName: must match [a-zA-Z0-9_]{1,128}",
-            400,
-        )
+        return _error_rule_name(name or "")
     if name in _topic_rules:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Rule {name!r} already exists", 409
