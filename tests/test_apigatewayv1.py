@@ -52,6 +52,21 @@ def test_apigwv1_get_rest_apis(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=id1)
     apigw_v1.delete_rest_api(restApiId=id2)
 
+def test_apigwv1_rest_api_reports_status_and_root_resource(apigw_v1):
+    """Every RestApi response carries apiStatus AVAILABLE and the id of its / resource, which Terraform waits on."""
+    created = apigw_v1.create_rest_api(name="v1-status-test")
+    api_id = created["id"]
+    try:
+        root_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        updated = apigw_v1.update_rest_api(
+            restApiId=api_id, patchOperations=[{"op": "replace", "path": "/description", "value": "d"}])
+        listed = next(a for a in apigw_v1.get_rest_apis()["items"] if a["id"] == api_id)
+        for api in (created, apigw_v1.get_rest_api(restApiId=api_id), listed, updated):
+            assert (api["apiStatus"], api["rootResourceId"]) == ("AVAILABLE", root_id)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_get_account_defaults_and_update_roundtrip(apigw_v1):
     """GetAccount returns AWS-shaped defaults; UpdateAccount with /cloudwatchRoleArn
     patch op round-trips. Single test to avoid cross-test state bleed on the

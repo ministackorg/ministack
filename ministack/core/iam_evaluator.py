@@ -1465,7 +1465,23 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         explain=request.handshake,
     )
     if failure:
-        return AuthError(*failure)
+        details = {}
+        if signature.service == "s3" and failure[0] == "SignatureDoesNotMatch":
+            from ministack.core.sigv4 import header_signing_documents
+
+            canonical, string_to_sign = header_signing_documents(
+                signature, request.method, request.raw_path, request.query_params, request.headers, request.body,
+                presigned=request.presigned,
+            )
+            details = {
+                "AWSAccessKeyId": access_key_id,
+                "StringToSign": string_to_sign,
+                "SignatureProvided": signature.signature,
+                "StringToSignBytes": string_to_sign.encode("utf-8").hex(" "),
+                "CanonicalRequest": canonical,
+                "CanonicalRequestBytes": canonical.encode("utf-8").hex(" "),
+            }
+        return AuthError(*failure, details=details)
     _verified_key.set(access_key_id)
     return credential
 

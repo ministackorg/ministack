@@ -427,6 +427,22 @@ def test_s3tables_iceberg_catalog_spans_control_plane_regions():
         west.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
+@pytest.mark.parametrize("headers, query, cross_region", [
+    ({"authorization": "AWS AKIAEXAMPLE:sig"}, {}, False),
+    ({}, {"x-amz-credential": ["AKIAEXAMPLE/20260101/us-west-2/s3tables/aws4_request"]}, False),
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-west-2/s3tables/aws4_request, "
+                       "SignedHeaders=host, Signature=abc"}, {}, False),
+    ({}, {}, True),
+], ids=["sigv2", "lowercase-query", "sigv4", "unsigned"])
+def test_s3tables_iceberg_auth_holds_a_named_key_to_its_region(monkeypatch, headers, query, cross_region):
+    """Under AUTH a call that names any key serves its own region, the one its checks resolve."""
+    import ministack.app as app
+    from ministack.services import s3tables
+
+    monkeypatch.setattr(app, "AUTH", True)
+    assert s3tables._iceberg_allows_cross_region(headers, query) is cross_region
+
+
 def test_s3tables_iceberg_catalog_prefers_signed_region_for_duplicate_names():
     east = _make_s3tables_client(region_name="us-east-1")
     west = _make_s3tables_client(region_name="us-west-2")

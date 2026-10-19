@@ -295,6 +295,11 @@ def _rest_api_view(api):
     view = dict(api)
     if "policy" in view:
         view["policy"] = _encode_rest_api_policy(view["policy"])
+    # Nothing provisions in the background, so an API is AVAILABLE as soon as it exists.
+    view["apiStatus"] = "AVAILABLE"
+    root_id = next((r["id"] for r in (_resources.get(view.get("id")) or {}).values() if r.get("path") == "/"), None)
+    if root_id:
+        view["rootResourceId"] = root_id
     return view
 
 

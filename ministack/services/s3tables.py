@@ -690,12 +690,12 @@ def _in_bucket(bucket_arn: str, bucket_filter) -> bool:
 
 
 def _iceberg_allows_cross_region(headers, query_params=None):
-    """Whether a call names no signing region; under AUTH a presigned call names it in its query, as checks read it."""
-    if query_params and "X-Amz-Credential" in query_params:
-        from ministack.app import AUTH
+    """Whether a call names no signing region; under AUTH any call that names a key is held to its region, as checks are."""
+    from ministack.app import AUTH
+    from ministack.core.router import extract_access_key_id
 
-        if AUTH:
-            return False
+    if AUTH and extract_access_key_id(headers, query_params or {}):
+        return False
     return _SIGV4_CREDENTIAL_REGION_RE.search(headers.get("authorization", "")) is None
 
 

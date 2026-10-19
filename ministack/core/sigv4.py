@@ -322,13 +322,14 @@ def header_signature_failure(
     body: bytes,
     *,
     presigned: bool = False,
+    explain: bool = False,
 ) -> tuple[str, str] | None:
     """Recompute a header (or, ``presigned``, query-string) signature; S3 signs its path as sent, other services
     the normalized path encoded again."""
     if signature.date_stamp != signature.amz_date[:8]:
         return "CredentialDateMismatch", (
             "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP. ")
-    _, string_to_sign = header_signing_documents(
+    canonical_request, string_to_sign = header_signing_documents(
         signature, method, raw_path, query_params, headers, body, presigned=presigned,
     )
     # Only an explicit streaming marker requires chunk verification; an absent

@@ -2861,6 +2861,11 @@ async def _dispatch_service_request(
     if service == "unknown_query":
         return _unknown_query_error(body, request_id)
 
+    if AUTH and service == "s3":
+        upload_error = _get_module("s3").validate_upload_request(method, path, headers, query_params)
+        if upload_error is not None:
+            return upload_error
+
     # AppSync authorizes a GraphQL request by the API's own authorization types.
     appsync_graphql = service == "appsync" and method == "POST" and (
         _APPSYNC_GRAPHQL_RE.match(path)
