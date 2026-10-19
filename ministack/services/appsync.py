@@ -1064,8 +1064,7 @@ async def handle_request(method, path, headers, body, query_params):
     if path == "/graphql" and method == "POST":
         api_id = _api_from_graphql_host(headers, query_params)
         if not api_id and _graphql_host_names_event_api(headers):
-            return _json(404, {"errors": [{
-                "errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}]})
+            return _graphql_error(404, "ResourceNotFoundException", "Unable to find the Api.")
         if not api_id:
             api_id = _resolve_api_by_key(
                 headers.get("x-api-key", ""),
@@ -1073,7 +1072,9 @@ async def handle_request(method, path, headers, body, query_params):
             )
         if not api_id:
             return error_response_json("UnauthorizedException", "Valid API key required", 401)
-        data = json.loads(body) if body else {}
+        data = _graphql_request(body)
+        if data is None:
+            return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
         # Resolver execution blocks — an HTTP or Lambda data source may call
         # back into ministack, and a nested request cannot be served while
         # the event loop waits on it. Run it on a worker thread.
@@ -1085,7 +1086,9 @@ async def handle_request(method, path, headers, body, query_params):
             api_id = parts[3]
             if not _has_sigv4_credentials(headers, query_params):
                 _select_api_region(api_id)
-            data = json.loads(body) if body else {}
+            data = _graphql_request(body)
+            if data is None:
+                return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
             # Resolver execution blocks — an HTTP or Lambda data source may call
             # back into ministack, and a nested request cannot be served while
             # the event loop waits on it. Run it on a worker thread.
@@ -1475,15 +1478,31 @@ def _invoke_lambda_authorizer(
     return {}
 
 
+def _graphql_error(status, error_type, message):
+    """A GraphQL endpoint refusal: an `errors` envelope plus the `x-amzn-ErrorType` header."""
+    status, headers, body = _json(status, {"errors": [{"errorType": error_type, "message": message}]})
+    return status, {**headers, "x-amzn-errortype": error_type}, body
+
+
+def _graphql_request(body):
+    """The decoded GraphQL request body, or None when it is not a JSON object."""
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _malformed_graphql_request(message):
+    return _graphql_error(400, "MalformedHttpRequestException", message)
+
+
 def _unauthorized_response():
     """AppSync's wire-shape for an authorizer rejection: HTTP 401 with a
     GraphQL `errors` envelope carrying `UnauthorizedException`."""
-    return _json(401, {
-        "errors": [{
-            "errorType": "UnauthorizedException",
-            "message": "You are not authorized to make this call.",
-        }],
-    })
+    return _graphql_error(401, "UnauthorizedException", "You are not authorized to make this call.")
 
 
 def _auth_modes(api):
@@ -1571,6 +1590,8 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
             api_id, sdl, query, variables, operation_name, field_resolver, None)
     except appsync_graphql.SchemaUnavailable as exc:
         return _json(200, {"data": None, "errors": [{"message": str(exc)}]})
+    except appsync_graphql.QuerySyntaxError:
+        return _malformed_graphql_request("Unable to parse GraphQL query.")
 
     # util.appendError is non-fatal and rides alongside the data.
     for a in appended:
@@ -1588,8 +1609,10 @@ def _execute_graphql(api_id, data, request_headers=None):
     variables = data.get("variables", {})
     operation_name = data.get("operationName")
 
+    if data.get("query") is None:
+        return _malformed_graphql_request("Invalid request, `query` can't be null.")
     if not query.strip():
-        return _json(400, {"errors": [{"message": "Query is required"}]})
+        return _malformed_graphql_request("Invalid request, `query` can't be empty.")
 
     if api_id not in _apis:
         return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
