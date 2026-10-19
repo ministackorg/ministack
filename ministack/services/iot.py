@@ -5820,9 +5820,26 @@ def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> 
     return json_response({})
 
 
+def _error_rule_denied(name: str) -> tuple:
+    return error_response_json(
+        "UnauthorizedException", f"Access to topic rule '{name}' was denied", 401
+    )
+
+
+def _error_rule_name(name: str) -> tuple:
+    return error_response_json(
+        "InvalidRequestException",
+        f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
+        "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
+        400,
+    )
+
+
 def _replace_topic_rule(name: str, payload: dict) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     if name not in _topic_rules:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     try:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
@@ -5833,29 +5850,30 @@ def _replace_topic_rule(name: str, payload: dict) -> tuple:
 
 
 def _get_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
 
 
 def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
     """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
     if not _RULE_NAME_RE.match(name):
-        return error_response_json(
-            "InvalidRequestException",
-            f"1 validation error detected: Value '{name}' at 'ruleName' failed to satisfy "
-            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_]+$",
-            400,
-        )
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     rule["ruleDisabled"] = disabled
     return 200, {}, b""
 
 
 def _delete_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.match(name):
+        return _error_rule_name(name)
+    if name not in _topic_rules:
+        return _error_rule_denied(name)
     delete_topic_rule(name)
     return json_response({})
 
