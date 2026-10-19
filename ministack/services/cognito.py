@@ -808,7 +808,7 @@ def _id_token_granted(scope: str | None) -> bool:
 
 
 def _client_credentials_scope_error(pool: dict, client: dict, requested: str | None):
-    """invalid_scope for an undefined scope, invalid_grant for one the client doesn't allow; the whole grant fails."""
+    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one the client doesn't allow."""
     allowed = client.get("AllowedOAuthScopes") or []
     wanted = requested.split() if requested else [s for s in allowed if "/" in s]
     defined = {
@@ -816,10 +816,13 @@ def _client_credentials_scope_error(pool: dict, client: dict, requested: str | N
         for identifier, server in (pool.get("_resource_servers") or {}).items()
         for scope in server.get("Scopes", [])
     }
-    if (requested and not wanted) or any(scope not in defined for scope in wanted):
+    # An undefined resource server scope is dropped when a defined one is requested
+    if (requested and not wanted) or any("/" not in scope for scope in wanted):
         error = "invalid_scope"
-    elif any(scope not in allowed for scope in wanted):
+    elif any(scope in defined and scope not in allowed for scope in wanted):
         error = "invalid_grant"
+    elif wanted and not defined.intersection(wanted):
+        error = "invalid_scope"
     else:
         return None
     return 400, {"Content-Type": "application/json"}, json.dumps({"error": error}).encode()
@@ -5960,6 +5963,18 @@ def _oauth2_error(error: str, description: str, status: int = 400):
     return status, {"Content-Type": "application/json"}, body
 
 
+def _invalid_scope_redirect(client, redirect_uri: str, scope: str, state: str):
+    """The redirect back to the app for an authorize request with a scope the client does not allow, or None."""
+    allowed_scopes = client.get("AllowedOAuthScopes") or []
+    if not (redirect_uri and scope and allowed_scopes and any(s not in allowed_scopes for s in scope.split())):
+        return None
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}error=invalid_request&error_description=invalid_scope"
+    if state:
+        location += f"&state={quote(state)}"
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+
 def _use_choice_based_ui(client) -> bool:
     """True when the client's ExplicitAuthFlows opts into USER_AUTH (choice-based
     sign-in), which drives a multi-step Hosted UI instead of the single-page form."""
@@ -6169,6 +6184,9 @@ def _oauth2_authorize_federation(query_params):
     if callback_urls and redirect_uri not in callback_urls:
         return error_response_json("InvalidParameterException",
                                    f"redirect_uri {redirect_uri} is not in CallbackURLs.", 400)
+    invalid_scope = _invalid_scope_redirect(client, redirect_uri, _qp(query_params, "scope"), state)
+    if invalid_scope:
+        return invalid_scope
 
     if not identity_provider:
         return error_response_json("InvalidParameterException", "identity_provider is required.", 400)
@@ -6275,14 +6293,9 @@ def handle_oauth2_authorize(method, path, headers, query_params):
         return _oauth2_error("invalid_request", "redirect_uri is required.")
     if callback_urls and redirect_uri not in callback_urls:
         return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
-
-    allowed_scopes = client.get("AllowedOAuthScopes") or []
-    if scope and allowed_scopes and any(s not in allowed_scopes for s in scope.split()):
-        sep = "&" if "?" in redirect_uri else "?"
-        location = f"{redirect_uri}{sep}error=invalid_request&error_description=invalid_scope"
-        if state:
-            location += f"&state={quote(state)}"
-        return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+    invalid_scope = _invalid_scope_redirect(client, redirect_uri, scope, state)
+    if invalid_scope:
+        return invalid_scope
 
     if _use_choice_based_ui(client):
         html_body = _username_page_html(
@@ -7501,10 +7514,19 @@ def _update_identity_pool(data):
 
 
 def _get_id(data):
+    from ministack.app import AUTH
     iid = data.get("IdentityPoolId")
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    if AUTH:
+        logins = data.get("Logins") or {}
+        error = _identity_logins_error(pool, None, logins)
+        if error:
+            return error
+        owner = _login_owner(pool, logins)
+        if owner:
+            return json_response({"IdentityId": owner})
     identity_id = _identity_id(iid)
     pool["_identities"][identity_id] = {
         "IdentityId": identity_id,
@@ -7551,6 +7573,7 @@ def _get_credentials_for_identity(data):
     ``CognitoIdentityCredentials`` — GetCallerIdentity reports
     ``arn:aws:sts::<account>:assumed-role/<RoleName>/CognitoIdentityCredentials``.
     """
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     now = int(time.time())
     logins = data.get("Logins") or {}
@@ -7558,6 +7581,11 @@ def _get_credentials_for_identity(data):
     for _iid, candidate in _identity_pools.items():
         if identity_id in candidate.get("_identities", {}):
             pool = candidate
+            if AUTH:
+                error = _identity_logins_error(candidate, identity_id, logins)
+                if error:
+                    return error
+                _link_logins(candidate, identity_id, logins)
             if not logins:
                 logins = candidate["_identities"][identity_id].get("Logins") or {}
             break
@@ -7606,7 +7634,73 @@ def _get_credentials_for_identity(data):
     })
 
 
+_LOGIN_TOKEN_CLOCK_SKEW = 300
+
+
+def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
+    """The NotAuthorizedException for Logins AWS would not accept for an identity (None: a new one), or None."""
+    stored = (pool["_identities"][identity_id].get("Logins") or {}) if identity_id else {}
+    if not logins:
+        if not stored:
+            return None
+        return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
+    unsupported = "Token is not from a supported provider of this identity pool."
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
+    skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
+    for provider, token in logins.items():
+        clients = [p.get("ClientId") for p in pool.get("CognitoIdentityProviders") or []
+                   if p.get("ProviderName") == provider]
+        claims = _token_claims(token)
+        is_jwt = isinstance(token, str) and token.count(".") == 2 and bool(claims)
+        if provider == "accounts.google.com" and not is_jwt and provider in (pool.get("SupportedLoginProviders") or {}):
+            message = not_oidc
+        elif not provider.startswith("cognito-idp."):
+            # Other providers' tokens are opaque here.
+            continue
+        elif not clients:
+            message = unsupported
+        elif not is_jwt:
+            message = not_oidc
+        elif claims.get("iss") != f"https://{provider}":
+            message = "Invalid login token. Issuer doesn't match providerName"
+        elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
+            message = "Invalid login token. Token signature invalid."
+        elif "aud" not in claims:
+            message = "Invalid login token. Missing a required claim: aud"
+        elif claims["aud"] not in clients:
+            message = unsupported
+        elif not isinstance(claims.get("exp"), (int, float)) or skewed_now >= claims["exp"]:
+            message = f"Invalid login token. Token expired: {skewed_now} >= {claims.get('exp')}"
+        elif provider in stored and _token_claims(stored[provider]).get("sub") != claims.get("sub"):
+            message = ("Logins don't match. Please include at least one valid login "
+                       "for this identity or identity pool.")
+        else:
+            continue
+        return error_response_json("NotAuthorizedException", message, 400)
+    return None
+
+
+def _login_owner(pool: dict, logins: dict):
+    """The id of the pool's identity that already holds one of these logins, or None."""
+    for provider, token in logins.items():
+        sub = _token_claims(token).get("sub")
+        for identity_id, identity in pool["_identities"].items():
+            held = (identity.get("Logins") or {}).get(provider)
+            if held is not None and (held == token or (sub and _token_claims(held).get("sub") == sub)):
+                return identity_id
+    return None
+
+
+def _link_logins(pool: dict, identity_id: str, logins: dict) -> None:
+    """Give an identity without a login the call's Logins unless another identity holds them."""
+    identity = pool["_identities"][identity_id]
+    if logins and not identity.get("Logins") and not _login_owner(pool, logins):
+        identity["Logins"] = dict(logins)
+        identity["LastModifiedDate"] = _now_epoch()
+
+
 def _get_open_id_token(data):
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     # Find pool containing this identity
     pool_id = ""
@@ -7614,6 +7708,11 @@ def _get_open_id_token(data):
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
+            if AUTH:
+                error = _identity_logins_error(pool, identity_id, logins)
+                if error:
+                    return error
+                _link_logins(pool, identity_id, logins)
             logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
     if not pool_id:

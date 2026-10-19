@@ -269,10 +269,17 @@ def _collect_secretsmanager():
         yield secret.get("ARN", ""), _normalise_list(secret.get("Tags"))
 
 
+def _collect_iot():
+    import ministack.services.iot as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
 # ARN service -> collector, for resolving aws:ResourceTag
 _RESOURCE_TAG_COLLECTORS = {
     "dynamodb": _collect_dynamodb,
     "iam": _collect_iam,
+    "iot": _collect_iot,
     "kms": _collect_kms,
     "lambda": _collect_lambda,
     "secretsmanager": _collect_secretsmanager,
