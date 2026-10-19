@@ -285,6 +285,7 @@ def header_signature_failure(
     body: bytes,
     *,
     presigned: bool = False,
+    explain: bool = False,
 ) -> tuple[str, str] | None:
     """Recompute a header (or, ``presigned``, query-string) signature; S3 signs its path as sent, other services
     the normalized path encoded again."""
@@ -294,6 +295,9 @@ def header_signature_failure(
     path = raw_path if signature.service == "s3" else uri_encode(_remove_dot_segments(raw_path), encode_slash=False)
     payload_hash = headers.get("x-amz-content-sha256") or hashlib.sha256(body).hexdigest()
     excluded = ("x-amz-signature",) if presigned else ()
+    if presigned and signature.service == "iotdevicegateway":
+        # AWS IoT signs the URL without the session token and appends the token afterwards.
+        excluded += ("x-amz-security-token",)
     canonical_request = "\n".join([
         method, path, build_canonical_query_string(query_params, exclude=excluded),
         build_canonical_headers(headers, signature.signed_headers), signature.signed_headers, payload_hash,
@@ -307,6 +311,11 @@ def header_signature_failure(
         payload_hash.startswith("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
         and not _chunk_signatures_match(body, computed, signature, key)
     ):
+        if explain:  # API Gateway names the strings it expected
+            return "SignatureDoesNotMatch", (
+                f"{SIGNATURE_MISMATCH}\n\nThe Canonical String for this request should have been\n'{canonical_request}'"
+                f"\n\nThe String-to-Sign should have been\n'{string_to_sign}'\n"
+            )
         return "SignatureDoesNotMatch", SIGNATURE_MISMATCH
     return None
 

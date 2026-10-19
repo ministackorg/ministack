@@ -93,8 +93,8 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
     SigV4 signature *verification* is intentionally lax (any
-    well-formed credential is accepted); IoT policy enforcement is not yet
-    feature. The point here is multi-tenancy isolation, not auth.
+    well-formed credential is accepted) unless AUTH=true, which also evaluates the key's IAM
+    policies per MQTT action. The point here is multi-tenancy isolation, not auth.
     """
     qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
     qp = parse_qs(qs, keep_blank_values=True) if qs else {}
@@ -170,6 +170,10 @@ _BODY_METHODS = ("POST", "PUT", "PATCH")
 _COGNITO_USERINFO_PATHS = ("/oauth2/userInfo", "/oauth2/userinfo")
 _RDS_DATA_PATHS = ("/Execute", "/BeginTransaction", "/CommitTransaction", "/RollbackTransaction", "/BatchExecute")
 _S3_CONTROL_PREFIX = "/v20180820/"
+# S3 Control tagging calls on a bucket ARN; older SDKs send TagResource as PUT.
+_S3_CONTROL_TAG_ACTIONS = {
+    "GET": "s3:ListTagsForResource", "POST": "s3:TagResource", "PUT": "s3:TagResource", "DELETE": "s3:UntagResource",
+}
 _SES_V2_PREFIX = "/v2/email"
 _ALB_PATH_PREFIX = "/_alb/"
 _NON_S3_VHOST_NAMES = frozenset(
@@ -1614,6 +1618,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
                                              resource_arn=resource)
                 if denied:
                     return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
         if is_mrap:
             handler = s3.handle_mrap_control
         elif is_object_lambda:
@@ -1625,11 +1631,21 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             or handler(method, path, headers, body, query_params)
         )
         return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
         arn = unquote(raw_arn)
         bucket_name = arn.split(":::")[-1].split("/")[0] if ":::" in arn else arn.split("/")[0]
+        resource_arn = arn if arn.startswith("arn:") else f"arn:aws:s3:::{bucket_name}"
+        iam_action = _S3_CONTROL_TAG_ACTIONS.get(method)
+        if iam_action and (denied := _enforce_data_plane("s3", iam_action, headers, query_params, request_id,
+                                                         resource_arn=resource_arn,
+                                                         named_resource=f'"{resource_arn}"')):
+            return denied
+        if not iam_action and (failure := _authenticate_only("s3", headers, query_params, request_id)):
+            return failure
 
         if method == "GET":
             tags = _get_module("s3")._bucket_tags.get(bucket_name, {})
@@ -1710,6 +1726,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
     # An undefined /v20180820 path answers 400 InvalidURI inside an
     # <ErrorResponse> wrapper, with <URI> echoing the bad segment (measured eu-north-1 2026-09-19).
     from xml.sax.saxutils import escape as _xml_esc
@@ -1736,17 +1754,37 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
     )
 
 
-async def _handle_rds_data_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_rds_data_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle RDS Data API operations before generic routing."""
     if path not in _RDS_DATA_PATHS:
         return None
+    if AUTH and (denied := _enforce_rds_data(method, path, headers, body, query_params, request_id)):
+        return denied
     return await _get_module("rds_data").handle_request(method, path, headers, body, query_params)
 
 
-async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+def _enforce_rds_data(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an RDS Data call as rds-data:<operation> on the cluster its body names."""
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+
+    iam_action = extract_iam_action("rds-data", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("rds-data", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("rds-data", method, path, headers, body, query_params, "", "")
+    return _enforce_data_plane("rds-data", iam_action, headers, query_params, request_id,
+                               resource_arn=resource_arn, named_resource=resource_arn)
+
+
+async def _handle_ses_v2_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle SES v2 REST API operations before generic routing."""
     if not path.startswith(_SES_V2_PREFIX):
         return None
+    if denied := _enforce_ses_v2(method, path, headers, body, query_params, request_id):
+        return denied
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
@@ -2267,7 +2305,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
             denied = _enforce_data_plane(
                 "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource,
-                service_context=s3_service_context(f"s3:{s3_action}", query_params),
+                service_context=s3_service_context(f"s3:{s3_action}", query_params, vhost_path, headers),
             )
             if denied:
                 return denied
@@ -2327,19 +2365,31 @@ def _credential_failure(service: str, iam_action: str, request_id: str, denied, 
     return status, resp_headers, body
 
 
+def _authenticate_only(service: str, headers: dict, query_params: dict, request_id: str):
+    """Under AUTH, refuse a request no IAM action covers when its credentials fail."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import check_credentials
+
+    failure = check_credentials(extract_access_key_id(headers, query_params))
+    return _credential_failure(service, "", request_id, failure, headers) if failure else None
+
+
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
-    service_context: dict | None = None, auth_error_response=None,
+    service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
     ``service_context`` carries the request's own condition keys, for a path
     that has them. The generic router resolves those itself; a data-plane
     handler has to pass them, because it knows the resource the router does not.
+    ``named_resource`` is the resource an identity-policy denial names, in the
+    error Content-Type of the service, for the services that word it so.
     """
     if not AUTH:
         return None
-    from ministack.core.iam_actions import access_denied_response
+    from ministack.core.iam_actions import access_denied_response, identity_denial_message
     from ministack.core.iam_evaluator import AuthError, enforce
 
     access_key = extract_access_key_id(headers, query_params)
@@ -2349,10 +2399,33 @@ def _enforce_data_plane(
         if isinstance(denied, AuthError):
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
-        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
-                                      explicit_deny=denied.decision == "Deny",
-                                      resource_policy_arn=denied.resource_policy_arn)
+        explicit = denied.decision == "Deny"
+        message = ""
+        if named_resource and not (explicit and denied.resource_policy_arn):
+            message = identity_denial_message(iam_action, denied.principal_arn, named_resource, explicit)
+        response = access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
+                                          message=message, explicit_deny=explicit,
+                                          resource_policy_arn=denied.resource_policy_arn)
+        if named_resource:
+            fix_error_content_type(service, response[0], response[1])
+        return response
     return None
+
+
+def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an SES v2 call as ses:<operation> on the resource it names, which its denial names too."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+    from ministack.core.responses import get_account_id
+
+    iam_action = extract_iam_action("ses", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("sesv2", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("ses", method, path, headers, body, query_params,
+                                        extract_region(headers, query_params), get_account_id())
+    return _enforce_data_plane("sesv2", iam_action, headers, query_params, request_id, resource_arn=resource_arn,
+                               named_resource=resource_arn)
 
 
 def _iceberg_targets_glue_catalog(path, query_params):
@@ -2422,9 +2495,9 @@ async def _handle_special_data_plane_request(
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
     if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
-    if response := await _handle_rds_data_request(method, path, headers, body, query_params):
+    if response := await _handle_rds_data_request(method, path, headers, body, query_params, request_id):
         return response
-    if response := await _handle_ses_v2_request(method, path, headers, body, query_params):
+    if response := await _handle_ses_v2_request(method, path, headers, body, query_params, request_id):
         return response
     if response := await _handle_ecr_registry_request(method, path, headers, body, query_params):
         return _with_data_plane_headers(response, request_id)
@@ -2742,6 +2815,8 @@ async def _dispatch_service_request(
 
         pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
+        if iam_action is None and (failure := _authenticate_only(service, headers, query_params, request_id)):
+            return failure
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
             resource_arn = extract_resource_arn(
@@ -2749,7 +2824,7 @@ async def _dispatch_service_request(
             )
             service_context = (
                 dynamodb_service_context(body) if service == "dynamodb"
-                else s3_service_context(iam_action, query_params) if service == "s3"
+                else s3_service_context(iam_action, query_params, path, headers) if service == "s3"
                 else None
             )
             if service == "logs":
