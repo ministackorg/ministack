@@ -2797,14 +2797,24 @@ class TestResourceArn:
             async def send(message):
                 sent.append(message)
 
-            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(), "headers": [],
+            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(),
+                     "headers": [(b"host", b"d9506af4.execute-api.localhost")],
                      "extensions": {"websocket.http.response": {}}}
             asyncio.run(apigw_svc.handle_websocket(scope, receive, send, "d9506af4"))
             return sent[0].get("status"), json.loads(sent[1]["body"])["message"] if len(sent) > 1 else None
 
+        def presigned_query():
+            from botocore.auth import SigV4QueryAuth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+
+            request = AWSRequest(method="GET", url="https://d9506af4.execute-api.localhost/prod")
+            SigV4QueryAuth(Credentials(fake_key, "s"), "execute-api", "eu-central-1", 300).add_auth(request)
+            return request.url.split("?", 1)[1]
+
         try:
             unsigned = handshake("")
-            signed = handshake(f"X-Amz-Credential={fake_key}%2F20260101%2Feu-central-1%2Fexecute-api%2Faws4_request")
+            signed = handshake(presigned_query())
         finally:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("ws-user", None)

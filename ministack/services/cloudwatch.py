@@ -1103,13 +1103,15 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
 _RULE_TOKEN = re.compile(r'[(),]|"(?:[^"\\]|\\.)*"|[^\s(),"]+|\S')
 _RULE_STATES = ("ALARM", "OK", "INSUFFICIENT_DATA")
 _RULE_OPERAND = "'(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA"
+# Nesting cap, so the result never depends on the process recursion limit (jsonata raises it).
+_RULE_MAX_DEPTH = 256
 
 
 @functools.lru_cache(maxsize=512)
 def _parse_alarm_rule(rule):
     """Parse an AlarmRule into a tree of tuples, raising ValueError with the AWS message."""
     tokens = [(m.group(), m.start()) for m in _RULE_TOKEN.finditer(rule)] + [("<EOF>", len(rule))]
-    at = 0
+    at = depth = 0
 
     def word():
         return tokens[at][0]
@@ -1134,14 +1136,21 @@ def _parse_alarm_rule(rule):
         return re.sub(r"\\(.)", r"\1", text[1:-1]) if text.startswith('"') else text
 
     def operand():
-        nonlocal at
+        nonlocal at, depth
         w = word()
+        if w in ("NOT", "(") and depth >= _RULE_MAX_DEPTH:
+            fail()
         at += 1
         if w == "NOT":
-            return ("not", operand())
+            depth += 1
+            node = ("not", operand())
+            depth -= 1
+            return node
         if w == "(":
+            depth += 1
             node = disjunction()
             take(")")
+            depth -= 1
             return node
         if w in ("TRUE", "FALSE"):
             return ("const", w == "TRUE")
@@ -1177,19 +1186,19 @@ def _parse_alarm_rule(rule):
 
     def conjunction():
         nonlocal at
-        node = operand()
+        nodes = [operand()]
         while word() == "AND":
             at += 1
-            node = ("and", node, operand())
-        return node
+            nodes.append(operand())
+        return nodes[0] if len(nodes) == 1 else ("and", *nodes)
 
     def disjunction():
         nonlocal at
-        node = conjunction()
+        nodes = [conjunction()]
         while word() == "OR":
             at += 1
-            node = ("or", node, conjunction())
-        return node
+            nodes.append(conjunction())
+        return nodes[0] if len(nodes) == 1 else ("or", *nodes)
 
     try:
         tree = disjunction()
@@ -1216,9 +1225,9 @@ def _rule_true(node):
     if kind == "not":
         return not _rule_true(node[1])
     if kind == "and":
-        return _rule_true(node[1]) and _rule_true(node[2])
+        return all(_rule_true(child) for child in node[1:])
     if kind == "or":
-        return _rule_true(node[1]) or _rule_true(node[2])
+        return any(_rule_true(child) for child in node[1:])
     _, count, percent, negate, state, refs = node
     hits = sum((_rule_alarm_state(r) == state) != negate for r in refs)
     return hits * 100 >= count * len(refs) if percent else hits >= count
@@ -1236,7 +1245,7 @@ def _rule_matches(node, target):
         return _rule_matches(node[1], not target)
     if kind == "const":
         return []
-    return _rule_matches(node[1], target) + _rule_matches(node[2], target)
+    return [r for child in node[1:] for r in _rule_matches(child, target)]
 
 
 def _rule_refs(node):
