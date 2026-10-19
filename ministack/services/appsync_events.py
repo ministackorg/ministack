@@ -30,6 +30,7 @@ import time
 
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
+    REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
@@ -299,6 +300,17 @@ def _parse_json_body(body: bytes) -> tuple[dict, object]:
 
 def _not_found(msg: str):
     return error_response_json("NotFoundException", msg, 404)
+
+
+def _publish_error(status: int, error_type: str, message: str | None = None):
+    """An HTTP publish refusal in the data plane's ``errors`` envelope."""
+    error = {"errorType": error_type, **({"message": message} if message else {})}
+    headers = {"Content-Type": REST_JSON_CONTENT_TYPE, "x-amzn-errortype": error_type}
+    return status, headers, json.dumps({"errors": [error]}).encode("utf-8")
+
+
+def _publish_api_not_found():
+    return _publish_error(404, "ResourceNotFoundException", "Unable to find the Api.")
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +608,9 @@ async def handle_request(method, path, headers, body, query_params):
 
     if path.startswith("/v2/apis"):
         return await _handle_mgmt(method, path, headers, body, query_params)
+
+    if host_match:
+        return _publish_error(404, "UnknownOperationException", "Unknown Operation Request.")
 
     return error_response_json("BadRequestException", f"Unsupported AppSync Events path: {path}", 400)
 
@@ -902,7 +917,7 @@ async def _publish_from_host(
 
     api_scope = _discover_api_scope(api_id, get_account_id())
     if api_scope is None:
-        return _not_found(f"Api {api_id} not found")
+        return _publish_api_not_found()
 
     from ministack.core.responses import _request_region
 
@@ -913,7 +928,7 @@ async def _publish_from_host(
             and host_region is not None
             and api_scope[1] != host_region
         ):
-            return _not_found(f"Api {api_id} not found")
+            return _publish_api_not_found()
         return await _publish(api_id, headers, body)
     finally:
         _request_region.reset(region_token)
@@ -921,48 +936,43 @@ async def _publish_from_host(
 
 async def _publish(api_id: str, headers: dict, body: bytes):
     if api_id not in _apis:
-        return _not_found(f"Api {api_id} not found")
+        return _publish_api_not_found()
 
-    data, err = _parse_json_body(body)
-    if err:
-        return err
+    try:
+        data = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _publish_error(400, "SerializationException", "Unable to parse request body")
+    if not isinstance(data, dict):
+        return _publish_error(400, "BadRequestException", "Request body must be a JSON object")
 
     channel = data.get("channel")
     events = data.get("events")
-    if not channel or not isinstance(events, list):
-        return error_response_json(
-            "BadRequestException",
-            "Request body must include 'channel' and 'events' (array)",
-            400,
-        )
+    if events is not None and not isinstance(events, list):
+        return _publish_error(400, "SerializationException", "Expected list or null")
+    if not channel:
+        return _publish_error(400, "BadRequestException", "Missing channel")
+    if events is None:
+        return _publish_error(400, "BadRequestException", "Missing events")
     # AWS spec: max 5 events per publish.
     if len(events) > _MAX_EVENTS_PER_BATCH:
-        return error_response_json(
-            "BadRequestException",
-            f"events array may contain at most {_MAX_EVENTS_PER_BATCH} entries",
-            400,
-        )
+        return _publish_error(
+            400, "BadRequestException", f"Input exceeded {_MAX_EVENTS_PER_BATCH} event limit")
 
-    channel_err = _validate_channel(channel, allow_wildcard=False)
-    if channel_err:
-        return error_response_json("BadRequestException", channel_err, 400)
+    if _validate_channel(channel, allow_wildcard=False):
+        return _publish_error(400, "BadRequestException", "Invalid Channel Format")
 
     ns_name = _channel_namespace_for(channel)
     if ns_name is None or ns_name not in _channel_namespaces.get(api_id, {}):
-        return error_response_json(
-            "UnauthorizedException",
-            f"No channel namespace matches '{channel}'",
-            401,
-        )
+        return _publish_error(401, "UnauthorizedException")
 
     ok, message = await _authorize_event_op(
         api_id, str(channel), EVENT_PUBLISH, _auth_from_headers(headers), headers
     )
     if not ok:
-        return error_response_json("UnauthorizedException", message or "Unauthorized", 401)
+        return _publish_error(401, "UnauthorizedException", message or "Unauthorized")
 
     successful, failed = await _fanout_publish(api_id, channel, events)
-    return json_response({"successful": successful, "failed": failed})
+    return json_response({"successful": successful, "failed": failed}, content_type=REST_JSON_CONTENT_TYPE)
 
 
 async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list, list]:

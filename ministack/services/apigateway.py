@@ -3047,16 +3047,18 @@ _WS_DENY_REASONS = {
 }
 
 
-def _authorize_ws_iam(connect_arn, headers, query_params, region):
-    """``(status, message)`` refusing an AWS_IAM $connect, or None; the policy check runs under AUTH=true."""
+def _authorize_ws_iam(scope, connect_arn, headers, query_params, region):
+    """``(status, message)`` refusing an AWS_IAM $connect, or None; signature and policy are checked under AUTH=true."""
     from ministack.app import AUTH
-    from ministack.core.iam_evaluator import AuthError, enforce
+    from ministack.core.iam_evaluator import AuthError, authenticate_handshake, enforce
     from ministack.core.router import extract_access_key_id
 
     access_key = extract_access_key_id(headers, query_params)
     if not access_key:
         return 403, "Missing Authentication Token"
-    denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
+    denied = AUTH and authenticate_handshake(scope)
+    if not isinstance(denied, AuthError):
+        denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
     if isinstance(denied, AuthError):
         return 403, denied.message
     if denied:
@@ -3195,7 +3197,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 )
             elif auth_type == "AWS_IAM":
                 refusal = _authorize_ws_iam(
-                    execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
+                    scope, execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
                     headers, query_params, owner_region,
                 )
             elif auth_type == "JWT":
