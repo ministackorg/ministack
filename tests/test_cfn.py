@@ -2820,6 +2820,26 @@ def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
     assert urls_by_name == []
 
 
+def test_cfn_ssm_parameter_value_type_resolves_public_ami_parameter(cfn, ec2):
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "ImageId": {
+                "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
+                "Default": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+            }
+        },
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+        "Outputs": {"ImageId": {"Value": {"Ref": "ImageId"}}},
+    }
+    cfn.create_stack(StackName="cfn-public-ami", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-public-ami")
+    outputs = cfn.describe_stacks(StackName="cfn-public-ami")["Stacks"][0].get("Outputs", [])
+    image_id = next(o["OutputValue"] for o in outputs if o["OutputKey"] == "ImageId")
+    assert ec2.describe_images(ImageIds=[image_id])["Images"][0]["Name"].startswith("al2023-ami-")
+    cfn.delete_stack(StackName="cfn-public-ami")
+
+
 def test_cfn_ssm_parameter_value_type_use_previous_value_on_update(cfn, ssm, sqs):
     """A change set that re-sends an AWS::SSM::Parameter::Value<String>
     parameter as UsePreviousValue (the `aws cloudformation deploy`

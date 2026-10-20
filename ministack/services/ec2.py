@@ -1266,6 +1266,7 @@ def _reboot_instances(p):
 # (Terraform's aws_ami data source) select the same images it selects there.
 _STUB_AMIS = [
     ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2", "", "/dev/xvda", "137112412989", "amazon"),
+    ("ami-0c2023a1b2c3d4e5f", "al2023-ami-2023.6.20241010.0-kernel-6.1-x86_64", "Amazon Linux 2023 AMI", "", "/dev/xvda", "137112412989", "amazon"),
     ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04", "", "/dev/xvda", "099720109477", None),
     ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022", "windows", "/dev/sda1", "801119661308", "amazon"),
 ]
