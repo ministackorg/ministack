@@ -561,6 +561,9 @@ def _list_resources_for_web_acl(data):
 def _create_ip_set(data):
     name = data.get("Name", "")
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    for existing in _values_for_scope(_ip_sets, scope):
+        if existing["Name"] == name and existing.get("Scope", scope) == scope:
+            return _waf_err("WAFDuplicateItemException", f"An IPSet with name '{name}' already exists.")
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _ipset_arn(name, uid, scope)
@@ -706,6 +709,9 @@ def _list_regex_pattern_sets(data):
 def _create_rule_group(data):
     name = data.get("Name", "")
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    for existing in _values_for_scope(_rule_groups, scope):
+        if existing["Name"] == name and existing.get("Scope", scope) == scope:
+            return _waf_err("WAFDuplicateItemException", f"A RuleGroup with name '{name}' already exists.")
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _rg_arn(name, uid, scope)
