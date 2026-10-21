@@ -818,6 +818,7 @@ def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
 
 
 _API_TOKEN_SCOPE = "aws.cognito.signin.user.admin"
+_STANDARD_OAUTH_SCOPES = ("openid", "email", "phone", "profile", _API_TOKEN_SCOPE)
 
 
 def _aws_scope_order(scopes: list[str], presized: bool = True) -> list[str]:
@@ -859,7 +860,7 @@ def _id_token_granted(scope: str | None) -> bool:
 
 
 def _client_credentials_scope_error(pool: dict, client: dict, requested: str | None):
-    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one the client doesn't allow."""
+    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one or a flow the client lacks."""
     allowed = client.get("AllowedOAuthScopes") or []
     wanted = requested.split() if requested else [s for s in allowed if "/" in s]
     defined = {
@@ -867,8 +868,13 @@ def _client_credentials_scope_error(pool: dict, client: dict, requested: str | N
         for identifier, server in (pool.get("_resource_servers") or {}).items()
         for scope in server.get("Scopes", [])
     }
+    if "client_credentials" not in (client.get("AllowedOAuthFlows") or []):
+        # Unknown scopes fail first; known ones get invalid_grant without the flow
+        known = [scope for scope in wanted if scope in defined or scope in _STANDARD_OAUTH_SCOPES]
+        unknown = any("/" not in scope and scope not in _STANDARD_OAUTH_SCOPES for scope in wanted)
+        error = "invalid_scope" if unknown or not known else "invalid_grant"
     # An undefined resource server scope is dropped when a defined one is requested
-    if (requested and not wanted) or any("/" not in scope for scope in wanted):
+    elif (requested and not wanted) or any("/" not in scope for scope in wanted):
         error = "invalid_scope"
     elif any(scope in defined and scope not in allowed for scope in wanted):
         error = "invalid_grant"
@@ -7655,14 +7661,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         pool_id, pool, client = _find_pool_by_client_id(cid)
         if not pool or not client:
             return _oauth2_error("invalid_client", "Client not found.")
-        if not client.get("ClientSecret"):
-            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
-        if csec != client["ClientSecret"]:
+        if csec != (client.get("ClientSecret") or ""):
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         scope_error = _client_credentials_scope_error(pool, client, form.get("scope"))
         if scope_error:
             return scope_error
+        if not client.get("ClientSecret"):
+            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
 
         # M2M's own client-metadata channel — a JSON object, urlencoded, in
         # the aws_client_metadata POST field (there's no ClientMetadata

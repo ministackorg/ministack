@@ -5624,6 +5624,39 @@ def test_oauth2_token_client_credentials_refuses_scopes_it_cannot_grant(requeste
     assert 'access_token' not in response
 
 
+@pytest.mark.parametrize('flows,secret,requested,error', [
+    (['code'], True, None, 'invalid_grant'),
+    (['code'], True, 'api/read', 'invalid_grant'),
+    (['code'], True, 'openid', 'invalid_grant'),
+    (['code'], True, 'email', 'invalid_grant'),
+    (['code'], True, 'api/read bogus/x', 'invalid_grant'),
+    (['code'], True, 'bogus', 'invalid_scope'),
+    (['implicit'], True, 'api/read', 'invalid_grant'),
+    (['code'], False, None, 'invalid_grant'),
+    ([], True, None, 'invalid_scope'),
+])
+def test_oauth2_token_client_credentials_needs_the_flow(flows, secret, requested, error):
+    """A client without client_credentials in AllowedOAuthFlows gets no token; unknown scopes fail first."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _client_credentials_client(cognito_idp)
+    oauth = {'AllowedOAuthFlows': flows, 'AllowedOAuthScopes': ['openid', 'api/read'],
+             'AllowedOAuthFlowsUserPoolClient': True, 'CallbackURLs': ['https://example.com/cb']}
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='web', GenerateSecret=secret, **(oauth if flows else {}),
+    )['UserPoolClient']
+    form = {'grant_type': 'client_credentials', 'client_id': client['ClientId']}
+    if secret:
+        form['client_secret'] = client['ClientSecret']
+    if requested is not None:
+        form['scope'] = requested
+    try:
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', form)
+        assert status == 400, body
+        assert json.loads(body) == {'error': error}
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
 @pytest.mark.parametrize('basic', [False, True])
 @pytest.mark.parametrize('requested,error', [
     ('api/admin', 'invalid_grant'),
@@ -6767,7 +6800,6 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
         }},
     )
     client_id = client["ClientId"]
-    client_secret = client["ClientSecret"]
 
     # InitiateAuth(USER_PASSWORD_AUTH) — real AWS never forwards ClientMetadata
     # here, so the trigger must see none, even though the caller passed one.
@@ -6853,10 +6885,15 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
 
     # M2M client_credentials — carries client metadata via the separate
     # aws_client_metadata POST field, not a ClientMetadata request parameter.
+    cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier="api", Name="api",
+                                       Scopes=[{"ScopeName": "read", "ScopeDescription": "read"}])
+    machine = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="m2m", GenerateSecret=True, AllowedOAuthFlows=["client_credentials"],
+        AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]
     status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
         "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
+        "client_id": machine["ClientId"],
+        "client_secret": machine["ClientSecret"],
         "aws_client_metadata": json.dumps({"orgId": "org-m2m"}),
     })
     assert status == 200
