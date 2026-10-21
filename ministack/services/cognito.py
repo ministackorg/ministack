@@ -1049,6 +1049,9 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     # V1_0 only fires for id tokens.
     if not use_v2 and token_type != "id":
         return claims
+    # Client credentials grants only fire V3_0.
+    if trigger_source == "TokenGeneration_ClientCredentials" and v2_version != "V3_0":
+        return claims
 
     event = _build_pretoken_event(
         pool_id=pool_id,
