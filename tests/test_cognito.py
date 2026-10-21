@@ -6281,6 +6281,67 @@ def test_cognito_pretoken_lambda_failure_fail_open(cognito_idp, lam):
     assert access["client_id"] == cid  # token still issued
 
 
+@pytest.mark.parametrize("version", ["V1_0", "V2_0", "V3_0"])
+def test_cognito_pretoken_event_names_its_version(cognito_idp, lam, version):
+    """The event carries the trigger's major version, the new-password source and the M2M user name."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    seen = {'ev_version': event['version'], 'ev_source': event['triggerSource'],\n"
+        "            'ev_user': event['userName']}\n"
+        "    if 'scopes' in event['request']:\n"
+        "        event['response']['claimsAndScopeOverrideDetails'] = {\n"
+        "            'idTokenGeneration': {'claimsToAddOrOverride': seen},\n"
+        "            'accessTokenGeneration': {'claimsToAddOrOverride': seen}}\n"
+        "    else:\n"
+        "        event['response']['claimsOverrideDetails'] = {'claimsToAddOrOverride': seen}\n"
+        "    return event\n"
+    )
+    fn_name = f"ministack-pretoken-event-version-{version}"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp, generate_secret=False, explicit_auth_flows=["ALLOW_ADMIN_USER_PASSWORD_AUTH"])
+    config = ({"PreTokenGeneration": fn_arn} if version == "V1_0"
+              else {"PreTokenGenerationConfig": {"LambdaArn": fn_arn, "LambdaVersion": version}})
+    cognito_idp.update_user_pool(UserPoolId=pool_id, LambdaConfig=config)
+
+    def admin_sign_in(username, password):
+        return cognito_idp.admin_initiate_auth(
+            UserPoolId=pool_id, ClientId=client["ClientId"], AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": username, "PASSWORD": password})
+
+    signed_in = _decode_jwt_claims(admin_sign_in("testuser", "TestPass1!")["AuthenticationResult"]["IdToken"])
+    assert (signed_in["ev_version"], signed_in["ev_source"]) == (version[1], "TokenGeneration_Authentication")
+
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username="newcomer", TemporaryPassword="TempPass1!",
+                                  MessageAction="SUPPRESS")
+    challenge = admin_sign_in("newcomer", "TempPass1!")
+    answered = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pool_id, ClientId=client["ClientId"], ChallengeName="NEW_PASSWORD_REQUIRED",
+        Session=challenge["Session"], ChallengeResponses={"USERNAME": "newcomer", "NEW_PASSWORD": "FinalPass1!"},
+    )["AuthenticationResult"]
+    changed = _decode_jwt_claims(answered["IdToken"])
+    assert (changed["ev_source"], changed["ev_user"]) == ("TokenGeneration_NewPasswordChallenge", "newcomer")
+
+    if version == "V3_0":
+        cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier="api", Name="api",
+                                           Scopes=[{"ScopeName": "read", "ScopeDescription": "read"}])
+        machine = cognito_idp.create_user_pool_client(
+            UserPoolId=pool_id, ClientName="m2m", GenerateSecret=True, AllowedOAuthFlows=["client_credentials"],
+            AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]
+        status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+            "grant_type": "client_credentials", "client_id": machine["ClientId"],
+            "client_secret": machine["ClientSecret"]})
+        assert status == 200, body
+        m2m = _decode_jwt_claims(json.loads(body)["access_token"])
+        assert (m2m["ev_version"], m2m["ev_user"]) == ("3", "ClientCredentials")
+
+
 def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     """PreTokenGeneration's triggerSource should differ by call path, matching
     real AWS: InitiateAuth(USER_PASSWORD_AUTH) -> TokenGeneration_Authentication,

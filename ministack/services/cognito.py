@@ -1079,11 +1079,12 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
     )
 
     return {
-        "version": "1",
+        # The trigger's major version: "1", "2" or "3"
+        "version": version.split("_")[0].lstrip("V"),
         "triggerSource": trigger_source,
         "region": _pool_region(pool_id),
         "userPoolId": pool_id,
-        "userName": username or "",
+        "userName": "ClientCredentials" if trigger_source == "TokenGeneration_ClientCredentials" else username or "",
         "callerContext": {
             "awsSdkVersion": "ministack",
             "clientId": client_id or "",
@@ -4424,7 +4425,8 @@ def _admin_respond_to_auth_challenge(data):
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
         return json_response({"AuthenticationResult": _build_auth_result(
-            pid, cid, user, client_metadata=client_metadata)})
+            pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
+            client_metadata=client_metadata)})
 
     if challenge_name == "SMS_MFA":
         username = responses.get("USERNAME")
@@ -4744,7 +4746,8 @@ def _respond_to_auth_challenge(data):
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
         return json_response({"AuthenticationResult": _build_auth_result(
-            pid, cid, user, client_metadata=client_metadata)})
+            pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
+            client_metadata=client_metadata)})
 
     if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
         username = responses.get("USERNAME")
