@@ -1404,6 +1404,82 @@ def _s3_apply_notification(name, notif):
         )
 
 
+def _s3_cors_xml(cors):
+    """A ``CorsConfiguration`` as the PutBucketCors body."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    root = Element("CORSConfiguration", xmlns=_s3.S3_NS)
+    for rule in cors.get("CorsRules") or []:
+        rule_el = SubElement(root, "CORSRule")
+        if rule.get("Id"):
+            SubElement(rule_el, "ID").text = str(rule["Id"])
+        for prop, tag in (("AllowedHeaders", "AllowedHeader"), ("AllowedMethods", "AllowedMethod"),
+                          ("AllowedOrigins", "AllowedOrigin"), ("ExposedHeaders", "ExposeHeader")):
+            for value in rule.get(prop) or []:
+                SubElement(rule_el, tag).text = str(value)
+        # CloudFormation stores 0 when the rule has no MaxAge.
+        SubElement(rule_el, "MaxAgeSeconds").text = str(int(rule.get("MaxAge") or 0))
+    return tostring(root, encoding="utf-8")
+
+
+def _s3_public_access_block_xml(pab):
+    """A ``PublicAccessBlockConfiguration`` as the PutPublicAccessBlock body; absent settings are off."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    root = Element("PublicAccessBlockConfiguration", xmlns=_s3.S3_NS)
+    for field in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"):
+        SubElement(root, field).text = str(_cfn_bool(pab.get(field, False))).lower()
+    return tostring(root, encoding="utf-8")
+
+
+def _s3_website_xml(website):
+    """A ``WebsiteConfiguration`` as the PutBucketWebsite body."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    def _fields(parent, tag, source, names):
+        el = SubElement(parent, tag)
+        for name in names:
+            if source.get(name) is not None:
+                SubElement(el, name).text = str(source[name])
+        return el
+
+    root = Element("WebsiteConfiguration", xmlns=_s3.S3_NS)
+    if website.get("RedirectAllRequestsTo"):
+        _fields(root, "RedirectAllRequestsTo", website["RedirectAllRequestsTo"], ("HostName", "Protocol"))
+    if website.get("IndexDocument"):
+        SubElement(SubElement(root, "IndexDocument"), "Suffix").text = str(website["IndexDocument"])
+    if website.get("ErrorDocument"):
+        SubElement(SubElement(root, "ErrorDocument"), "Key").text = str(website["ErrorDocument"])
+    rules = website.get("RoutingRules") or []
+    if rules:
+        rules_el = SubElement(root, "RoutingRules")
+        for rule in rules:
+            rule_el = SubElement(rules_el, "RoutingRule")
+            if rule.get("RoutingRuleCondition"):
+                _fields(rule_el, "Condition", rule["RoutingRuleCondition"],
+                        ("HttpErrorCodeReturnedEquals", "KeyPrefixEquals"))
+            _fields(rule_el, "Redirect", rule.get("RedirectRule") or {},
+                    ("HostName", "HttpRedirectCode", "Protocol", "ReplaceKeyPrefixWith", "ReplaceKeyWith"))
+    return tostring(root, encoding="utf-8")
+
+
+_S3_BUCKET_CONFIGURATIONS = (
+    ("CorsConfiguration", _s3_cors_xml, _s3._put_bucket_cors, _s3._delete_bucket_cors),
+    ("PublicAccessBlockConfiguration", _s3_public_access_block_xml,
+     _s3._put_public_access_block, _s3._delete_public_access_block),
+    ("WebsiteConfiguration", _s3_website_xml, _s3._put_bucket_website, _s3._delete_bucket_website),
+)
+
+
+def _s3_apply_configurations(name, props, old_props=None):
+    """Store the CORS, Block Public Access and website properties through the S3 API; a dropped one is deleted."""
+    for prop, to_xml, put, delete in _S3_BUCKET_CONFIGURATIONS:
+        if prop in props:
+            put(name, to_xml(props[prop] or {}))
+        elif old_props and prop in old_props:
+            delete(name)
+
+
 # ---------------------------------------------------------------------------
 # S3 Multi-Region Access Point
 # ---------------------------------------------------------------------------
@@ -1599,6 +1675,7 @@ def _s3_create(logical_id, props, stack_name):
         _s3._bucket_versioning[name] = "Enabled"
     if "NotificationConfiguration" in props:
         _s3_apply_notification(name, props["NotificationConfiguration"])
+    _s3_apply_configurations(name, props)
     return name, _s3_attrs(name)
 
 
@@ -1622,6 +1699,7 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
         elif "NotificationConfiguration" in old_props:
             # Property removed on update — clear the configuration, as AWS does.
             _s3._bucket_notifications.pop(name, None)
+        _s3_apply_configurations(name, new_props, old_props)
     else:
         return _s3_create(name, new_props, stack_name)
     return name, _s3_attrs(name)
@@ -1661,6 +1739,7 @@ def _s3_delete(physical_id, props):
     _s3._bucket_encryption.pop(physical_id, None)
     _s3._bucket_lifecycle.pop(physical_id, None)
     _s3._bucket_cors.pop(physical_id, None)
+    _s3._bucket_websites.pop(physical_id, None)
     _s3._bucket_acl.pop(physical_id, None)
     _s3._bucket_notifications.pop(physical_id, None)
 
@@ -9648,6 +9727,121 @@ def _flatten_listener_rule_conditions(cfn_conditions):
     return out
 
 
+_LISTENER_RULE_TRANSFORM_CONFIGS = ("HostHeaderRewriteConfig", "UrlRewriteConfig")
+
+
+def _schema_type(value):
+    """The type name CloudFormation's schema check reports for a template value."""
+    return "JSONArray" if isinstance(value, list) else "JSONObject" if isinstance(value, dict) else "String"
+
+
+def _schema_string_errors(obj, keys, path):
+    """String members holding an object or a list; numbers and booleans reach
+    the schema check as strings."""
+    return [(f"{path}/{key}", f"Property [{key}] expected type: String, found: {_schema_type(obj[key])}")
+            for key in keys if isinstance(obj.get(key), (dict, list))]
+
+
+def _listener_rule_rewrite_config_errors(config, path):
+    errors = []
+    if not isinstance(config, dict):
+        return [(path, f"Property [{path.rsplit('/', 1)[-1]}] expected type: JSONObject, found: {_schema_type(config)}")]
+    errors += [(path, f"Unsupported property [{key}]") for key in config if key != "Rewrites"]
+    if "Rewrites" not in config:
+        return errors + [(path, "Required property [Rewrites] not found")]
+    rewrites = config["Rewrites"]
+    if not isinstance(rewrites, list):
+        return errors + [(f"{path}/Rewrites",
+                          f"Property [Rewrites] expected type: JSONArray, found: {_schema_type(rewrites)}")]
+    canonical = [json.dumps(rewrite, sort_keys=True) for rewrite in rewrites]
+    if len(set(canonical)) != len(canonical):
+        errors.append((f"{path}/Rewrites", f"#/{path}/Rewrites: array items are not unique"))
+    for j, rewrite in enumerate(rewrites):
+        at = f"{path}/Rewrites/{j}"
+        if not isinstance(rewrite, dict):
+            errors.append((at, f"Property [{j}] expected type: JSONObject, found: {_schema_type(rewrite)}"))
+            continue
+        errors += [(at, f"Required property [{key}] not found") for key in ("Regex", "Replace") if key not in rewrite]
+        errors += _schema_string_errors(rewrite, ("Regex", "Replace"), at)
+        errors += [(at, f"Unsupported property [{key}]") for key in rewrite if key not in ("Regex", "Replace")]
+    return errors
+
+
+def listener_rule_transforms_schema_errors(transforms):
+    """(path under Properties, reason) for each way ``Transforms`` breaks the
+    AWS::ElasticLoadBalancingV2::ListenerRule resource schema. CloudFormation
+    checks the schema before provisioning anything and reports each problem
+    as a PROPERTY_VALIDATION event; the reasons are AWS's."""
+    if transforms is _NO_VALUE_SENTINEL():
+        return []
+    if not isinstance(transforms, list):
+        return [("Transforms", f"Property [Transforms] expected type: JSONArray, found: {_schema_type(transforms)}")]
+    errors = []
+    # The schema marks Transforms "insertionOrder": false, and AWS reports the
+    # items' indices after sorting them by their JSON with sorted keys.
+    for i, item in enumerate(sorted(transforms, key=lambda t: json.dumps(t, sort_keys=True))):
+        path = f"Transforms/{i}"
+        if not isinstance(item, dict):
+            # Neither oneOf branch's "required" applies to a non-object, so both match.
+            errors += [(path, f"Property [{i}] expected type: JSONObject, found: {_schema_type(item)}"),
+                       (path, f"#/Transforms/{i}: #: 2 subschemas matched instead of one")]
+            continue
+        if "Type" not in item:
+            errors.append((path, "Required property [Type] not found"))
+        errors += _schema_string_errors(item, ("Type",), path)
+        errors += [(path, f"Unsupported property [{key}]") for key in item
+                   if key != "Type" and key not in _LISTENER_RULE_TRANSFORM_CONFIGS]
+        configs = [c for c in _LISTENER_RULE_TRANSFORM_CONFIGS if c in item]
+        if not configs:
+            errors += [(path, f"Required property [{c}] not found") for c in _LISTENER_RULE_TRANSFORM_CONFIGS]
+        elif len(configs) > 1:
+            errors.append((path, f"#/Transforms/{i}: #: 2 subschemas matched instead of one"))
+        for config in configs:
+            errors += _listener_rule_rewrite_config_errors(item[config], f"{path}/{config}")
+    canonical = [json.dumps(item, sort_keys=True) for item in transforms]
+    if len(set(canonical)) != len(canonical):
+        errors.append(("Transforms", "#/Transforms: array items are not unique"))
+    return errors
+
+
+def _template_string(value):
+    """A template scalar as the handler receives it: booleans as true/false."""
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def _elbv2_handler_error(message):
+    """The resource status reason AWS's ListenerRule handler reports for an
+    ELBv2 request it refuses: the service message with the SDK's details."""
+    return ValueError(f'Resource handler returned message: "{_sdk_error(message, "ElasticLoadBalancingV2", 400)}" '
+                      f"(RequestToken: {new_uuid()}, HandlerErrorCode: InvalidRequest)")
+
+
+def _elbv2_listener_rule_transforms(props):
+    """CFN ``Transforms`` in the API's RuleTransform shape, as the ALB service
+    stores CreateRule's. The stack has checked them against the resource
+    schema; the handler then sends them to the API, which refuses them with
+    its own messages. Template scalars reach it as strings. Transforms built
+    from another resource's values are only known here, so the schema is
+    checked again."""
+    schema = listener_rule_transforms_schema_errors(props.get("Transforms") or [])
+    if schema:
+        raise ValueError(schema[0][1])
+    transforms = []
+    for raw in props.get("Transforms") or []:
+        transform = {"Type": _template_string(raw["Type"])}
+        for config in _alb._TRANSFORM_CONFIG_KEYS.values():
+            if config in raw:
+                transform[config] = {"Rewrites": [
+                    {"Regex": _template_string(r["Regex"]), "Replace": _template_string(r["Replace"])}
+                    for r in raw[config]["Rewrites"]
+                ]}
+        transforms.append(transform)
+    problem = _alb._transforms_model_error(transforms) or _alb._transforms_problem(transforms)
+    if problem:
+        raise _elbv2_handler_error(problem)
+    return transforms
+
+
 def _elbv2_listener_rule_create(logical_id, props, stack_name):
     """Provision an AWS::ElasticLoadBalancingV2::ListenerRule. Conditions and
     Actions match the shape MS' ALB stores in `_alb._rules`.
@@ -9662,6 +9856,7 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
     lb_name = _alb._lbs[lb_arn]["LoadBalancerName"]
     lb_id = _alb._load_balancer_id_from_arn(lb_arn)
     l_id = _alb._listener_id_from_arn(l_arn)
+    transforms = _elbv2_listener_rule_transforms(props)
     import random as _random
     import string as _string
     rule_id = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=16))
@@ -9676,6 +9871,7 @@ def _elbv2_listener_rule_create(logical_id, props, stack_name):
         "Conditions": _flatten_listener_rule_conditions(props.get("Conditions") or []),
         "Actions": _elbv2_listener_actions(props, None, prop="Actions"),
         "IsDefault": False,
+        "Transforms": transforms,
     }
     _alb._rules[rule_arn] = rule
     return rule_arn, {"RuleArn": rule_arn}
@@ -9688,8 +9884,8 @@ def _elbv2_listener_rule_delete(physical_id, props):
 def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
                                 logical_id=None):
     """Update a listener rule in place, keeping its ARN (what ``Ref``
-    returns). ``Actions``, ``Conditions`` and ``Priority`` are "Update
-    requires: No interruption" and only ``ListenerArn`` requires replacement
+    returns). ``Actions``, ``Conditions``, ``Priority`` and ``Transforms`` are
+    "Update requires: No interruption" and only ``ListenerArn`` requires replacement
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-listenerrule.html);
     a rule ARN carries its listener, so moving one is a replacement under a
     new physical id. ``Tags`` are left alone, because the create handler does
@@ -9703,9 +9899,11 @@ def _elbv2_listener_rule_update(physical_id, old_props, new_props, stack_name,
             _delete_predecessor(_elbv2_listener_rule_delete, physical_id, old_props)
         return created
 
+    transforms = _elbv2_listener_rule_transforms(new_props)
     rule["Priority"] = str(new_props.get("Priority", 1))
     rule["Conditions"] = _flatten_listener_rule_conditions(new_props.get("Conditions") or [])
     rule["Actions"] = _elbv2_listener_actions(new_props, None, prop="Actions")
+    rule["Transforms"] = transforms
     return physical_id, {"RuleArn": physical_id}
 
 
