@@ -470,6 +470,43 @@ def test_sqs_fifo_deduplication(sqs):
     )
     assert r1["MessageId"] == r2["MessageId"]
 
+def test_sqs_fifo_dedup_hit_returns_md5_of_current_request(sqs):
+    """A dedup hit keeps the first message, but its response must carry the
+    MD5s of the request just sent, as AWS does. SDKs that verify the digests
+    (.NET, Java) reject a response that repeats the first message's."""
+    url = sqs.create_queue(
+        QueueName="intg-sqs-dedup-md5.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+    )["QueueUrl"]
+
+    def send(body, sent_at):
+        return sqs.send_message(
+            QueueUrl=url,
+            MessageBody=body,
+            MessageGroupId="g1",
+            MessageDeduplicationId="dedup-md5",
+            MessageAttributes={
+                "DateSent": {"DataType": "String", "StringValue": sent_at},
+            },
+        )
+
+    r1 = send("body-one", "2026-10-15T00:00:01Z")
+    r2 = send("body-one", "2026-10-15T00:00:02Z")  # same body, new attribute
+    r3 = send("body-two", "2026-10-15T00:00:03Z")  # new body and attribute
+
+    assert r1["MessageId"] == r2["MessageId"] == r3["MessageId"]
+    # Digests of the SQS binary encoding of each request's attributes.
+    assert r1["MD5OfMessageAttributes"] == "e9721848ab1db43af2ce7e25fce5d807"
+    assert r2["MD5OfMessageAttributes"] == "4079b5e9650ac7c7fd23793b2f8450d7"
+    assert r3["MD5OfMessageAttributes"] == "2a0cd9230604b4d3fcc365096e11817f"
+    assert r1["MD5OfMessageBody"] == r2["MD5OfMessageBody"] == "58bc92401b7ad098acdab54fad72e79a"
+    assert r3["MD5OfMessageBody"] == "6423099901cb7ed39e2a7a6517162e8d"
+
+    attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+    assert attrs["Attributes"]["ApproximateNumberOfMessages"] == "1"
+    sqs.delete_queue(QueueUrl=url)
+
+
 def test_sqs_fifo_dedup_survives_consumption(sqs):
     """A FIFO dedup id is honored for its full 5-minute window even after the
     original message is received and deleted — the Lambda-ESM consume pattern
