@@ -337,6 +337,44 @@ def test_sqs_message_attributes(sqs):
     assert attrs["color"]["StringValue"] == "blue"
     assert attrs["count"]["StringValue"] == "42"
 
+def test_sqs_receive_md5_of_filtered_message_attributes(sqs):
+    """MD5OfMessageAttributes on ReceiveMessage must be the digest of the
+    attributes actually returned, not of every attribute sent. SDKs that
+    validate it recompute it from the attributes in the response."""
+    url = sqs.create_queue(QueueName="intg-sqs-md5-filtered")["QueueUrl"]
+    sqs.send_message(
+        QueueUrl=url,
+        MessageBody="md5-filtered",
+        MessageAttributes={
+            "item.color": {"DataType": "String", "StringValue": "red"},
+            "size": {"DataType": "String", "StringValue": "large"},
+        },
+    )
+    # Digests of the SQS binary encoding of the returned attributes.
+    md5_color = "577bde534466fcc0f833e000d746308b"
+    md5_size = "293ff4145d6b9021065be848a611037b"
+    md5_all = "9906f4cd4d08bdd5cf9f22829f9e07f7"
+
+    def receive(**kwargs):
+        resp = sqs.receive_message(QueueUrl=url, VisibilityTimeout=0, **kwargs)
+        return resp["Messages"][0]
+
+    for names, returned, md5 in (
+        (["item.color"], ["item.color"], md5_color),
+        (["item.*"], ["item.color"], md5_color),
+        (["size"], ["size"], md5_size),
+        (["All"], ["item.color", "size"], md5_all),
+    ):
+        msg = receive(MessageAttributeNames=names)
+        assert sorted(msg["MessageAttributes"]) == returned, names
+        assert msg["MD5OfMessageAttributes"] == md5, names
+
+    for kwargs in ({}, {"MessageAttributeNames": ["missing"]}):
+        msg = receive(**kwargs)
+        assert "MessageAttributes" not in msg
+        assert "MD5OfMessageAttributes" not in msg
+    sqs.delete_queue(QueueUrl=url)
+
 def test_sqs_batch_send(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-batchsend")["QueueUrl"]
     resp = sqs.send_message_batch(

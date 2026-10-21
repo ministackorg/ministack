@@ -788,8 +788,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
         fa = _filter_msg_attrs(m["message_attributes"], msg_attr_names)
         if fa:
             entry["MessageAttributes"] = fa
-            if m["md5_attrs"]:
-                entry["MD5OfMessageAttributes"] = m["md5_attrs"]
+            entry["MD5OfMessageAttributes"] = _md5_msg_attrs(fa)
         out.append(entry)
 
     return {"Messages": out} if out else {}
