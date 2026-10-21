@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **S3 — bucket policy writes through an access point** — under `AUTH=true` `PutBucketPolicy` and `DeleteBucketPolicy` sent through an access point alias or ARN changed the bucket's policy; they now get 403 `AccessDenied` with an explicit deny on the access point, while `GetBucketPolicy` through it and both writes on the bucket itself work as before. Contributed by @iot-rocket.
 - **S3 — access point policies and unsigned requests** — an access point policy was stored but never applied, and an unsigned request through an access point was served. With `AUTH=true` a request through an access point alias or ARN is allowed on the access point by an identity policy or the access point policy (a Deny in either refuses it), and an unsigned one gets 400 `InvalidRequest`; S3 Control calls on the access point are unaffected. Contributed by @iot-rocket.
 
 ## [1.5.31] — 2026-10-21

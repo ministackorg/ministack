@@ -1620,6 +1620,10 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     result = evaluate(ctx, principal.policies, *principal.limits)
     found = _resource_policy(service, resource_arn)
     if found is None and service == "s3" and "s3:dataaccesspointarn" in context:
+        if (iam_action in ("s3:PutBucketPolicy", "s3:DeleteBucketPolicy") and result.decision != "Deny"
+                and resource_arn == context["s3:dataaccesspointarn"]):
+            # An access point refuses bucket policy writes as an explicit Deny of its own.
+            return EvalResult("Deny", principal_arn=principal.arn, resource_policy_arn=resource_arn)
         # A data request through an access point meets the access point policy on the access point ARN.
         from ministack.services.s3 import access_point_policy_for_arn
 
