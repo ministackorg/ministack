@@ -3322,6 +3322,76 @@ def test_s3_bucket_cors(s3):
         s3.get_bucket_cors(Bucket="intg-s3-cors")
     assert exc.value.response["Error"]["Code"] == "NoSuchCORSConfiguration"
 
+def _cors_headers(headers):
+    return {k.lower(): v for k, v in headers.items() if k.lower().startswith("access-control-") or k.lower() == "vary"}
+
+
+@pytest.mark.auth_contract
+def test_s3_cors_follows_the_bucket_configuration_contract(auth_enabled, s3):
+    """Under AUTH preflights and the CORS headers of a request follow the bucket's CORS rules, else the wildcard."""
+    bucket, plain = f"cors-rules-{uuid.uuid4().hex[:8]}", f"cors-none-{uuid.uuid4().hex[:8]}"
+    for name in (bucket, plain):
+        s3.create_bucket(Bucket=name)
+        s3.put_object(Bucket=name, Key="k", Body=b"k")
+    s3.put_bucket_cors(Bucket=bucket, CORSConfiguration={"CORSRules": [
+        {"AllowedOrigins": ["https://a.example"], "AllowedMethods": ["GET", "PUT"],
+         "AllowedHeaders": ["x-amz-meta-*"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 300},
+        {"AllowedOrigins": ["*"], "AllowedMethods": ["HEAD"]}]})
+    vary = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+
+    def preflight(name, vhost, origin="https://a.example", method="GET", **extra):
+        headers = {"Origin": origin, "Access-Control-Request-Method": method, **extra}
+        if vhost:
+            headers["Host"] = f"{name}.{urlparse(ENDPOINT).netloc}"
+        url = f"{ENDPOINT}/k" if vhost else f"{ENDPOINT}/{name}/k"
+        return requests.options(url, headers={k: v for k, v in headers.items() if v})
+
+    def get_from(origin, name, operation="get_object"):
+        def add_origin(request, **_):
+            request.headers["Origin"] = origin
+
+        event = f"before-sign.s3.{''.join(p.title() for p in operation.split('_'))}"
+        s3.meta.events.register(event, add_origin)
+        try:
+            return _cors_headers(getattr(s3, operation)(Bucket=name, Key="k")["ResponseMetadata"]["HTTPHeaders"])
+        finally:
+            s3.meta.events.unregister(event, add_origin)
+
+    try:
+        for vhost in (False, True):
+            allowed = preflight(bucket, vhost, method="PUT", **{"Access-Control-Request-Headers": "x-amz-meta-a"})
+            refused = [preflight(plain, vhost), preflight(bucket, vhost, method="DELETE"),
+                       preflight(bucket, vhost, origin="https://b.example"),
+                       preflight(bucket, vhost, **{"Access-Control-Request-Headers": "x-other"})]
+            assert allowed.status_code == 200
+            if not auth_enabled:
+                assert allowed.headers["Access-Control-Allow-Origin"] == "*"
+                assert [r.status_code for r in refused] == [200] * 4
+                continue
+            assert _cors_headers(allowed.headers) == {
+                "access-control-allow-origin": "https://a.example", "access-control-allow-credentials": "true",
+                "access-control-allow-methods": "GET, PUT", "access-control-allow-headers": "x-amz-meta-a",
+                "access-control-expose-headers": "ETag", "access-control-max-age": "300", "vary": vary}
+            assert [r.status_code for r in refused] == [403] * 4
+            assert "CORSResponse: CORS is not enabled for this bucket." in refused[0].text
+            assert all("<Code>AccessForbidden</Code>" in r.text and not _cors_headers(r.headers) for r in refused)
+        no_origin = requests.options(f"{ENDPOINT}/{bucket}/k", headers={"Access-Control-Request-Method": "GET"})
+        assert no_origin.status_code == (400 if auth_enabled else 200)
+
+        if auth_enabled:
+            assert get_from("https://a.example", bucket)["access-control-allow-origin"] == "https://a.example"
+            assert get_from("https://b.example", bucket, "head_object") == {
+                "access-control-allow-origin": "*", "access-control-allow-methods": "HEAD", "vary": vary}
+            assert get_from("https://b.example", bucket) == {}
+            assert get_from("https://a.example", plain) == {}
+        else:
+            assert get_from("https://b.example", plain)["access-control-allow-origin"] == "*"
+    finally:
+        for name in (bucket, plain):
+            s3.delete_object(Bucket=name, Key="k")
+            s3.delete_bucket(Bucket=name)
+
+
 def test_s3_bucket_acl(s3):
     s3.create_bucket(Bucket="intg-s3-acl")
     resp = s3.get_bucket_acl(Bucket="intg-s3-acl")
