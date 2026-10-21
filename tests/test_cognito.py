@@ -2353,6 +2353,46 @@ def test_cognito_change_password_actually_changes(cognito_idp):
         )
     assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
 
+def test_cognito_change_password_rejects_wrong_previous_password(cognito_idp):
+    """ChangePassword with a wrong or missing PreviousPassword fails and keeps the old password."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-changepwd-wrong")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="qa-changepwd-wrong-app",
+        ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-wrong-user", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="qa-wrong-user", Password="OldPwd1!", Permanent=True)
+
+    def sign_in(password):
+        return cognito_idp.admin_initiate_auth(
+            UserPoolId=pid,
+            ClientId=cid,
+            AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "qa-wrong-user", "PASSWORD": password},
+        )
+
+    token = sign_in("OldPwd1!")["AuthenticationResult"]["AccessToken"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.change_password(AccessToken=token, PreviousPassword="WrongPwd1!", ProposedPassword="NewPwd2!")
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert exc.value.response["Error"]["Message"] == "Incorrect username or password."
+
+    # The wrong PreviousPassword is reported before a ProposedPassword that breaks the policy.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.change_password(AccessToken=token, PreviousPassword="WrongPwd1!", ProposedPassword="short")
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.change_password(AccessToken=token, ProposedPassword="NewPwd2!")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "Missing required parameter OldPassword"
+
+    assert "AuthenticationResult" in sign_in("OldPwd1!")
+    with pytest.raises(ClientError) as exc:
+        sign_in("NewPwd2!")
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
 def test_cognito_refresh_token_returns_correct_user(cognito_idp):
     """REFRESH_TOKEN_AUTH must return tokens for the refreshing user, not users[0]."""
     pid = cognito_idp.create_user_pool(PoolName="qa-refresh-pool")["UserPool"]["Id"]

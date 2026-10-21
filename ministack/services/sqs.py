@@ -691,10 +691,15 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         _prune_dedup(q)
         cached = q["dedup_cache"].get(dedup_cache_key)
         if cached:
+            # A dedup hit keeps the first message, but AWS answers with the
+            # digests of *this* request's body and attributes, not the first
+            # message's. SDKs that verify the digests (e.g. .NET, Java) reject
+            # a response that carries the cached ones.
             r: dict = {"MessageId": cached["id"],
-                       "MD5OfMessageBody": cached["md5"]}
-            if cached.get("md5a"):
-                r["MD5OfMessageAttributes"] = cached["md5a"]
+                       "MD5OfMessageBody": hashlib.md5(body_text.encode()).hexdigest()}
+            md5a_now = _md5_msg_attrs(msg_attrs)
+            if md5a_now:
+                r["MD5OfMessageAttributes"] = md5a_now
             if cached.get("seq"):
                 r["SequenceNumber"] = cached["seq"]
             return r
@@ -788,8 +793,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
         fa = _filter_msg_attrs(m["message_attributes"], msg_attr_names)
         if fa:
             entry["MessageAttributes"] = fa
-            if m["md5_attrs"]:
-                entry["MD5OfMessageAttributes"] = m["md5_attrs"]
+            entry["MD5OfMessageAttributes"] = _md5_msg_attrs(fa)
         out.append(entry)
 
     return {"Messages": out} if out else {}
