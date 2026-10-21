@@ -31,6 +31,7 @@ import re
 import socket
 import string
 import time
+import warnings
 from urllib.parse import parse_qs, urlencode
 from xml.sax.saxutils import escape as _esc
 
@@ -412,7 +413,7 @@ def _error(code, message, status=400):
     body = (
         f'<ErrorResponse xmlns="{NS}">'
         f'<Error><Type>{"Sender" if status < 500 else "Receiver"}</Type>'
-        f'<Code>{code}</Code><Message>{message}</Message></Error>'
+        f'<Code>{code}</Code><Message>{_esc(message, {chr(34): "&quot;"})}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'
         f'</ErrorResponse>'
     ).encode("utf-8")
@@ -605,9 +606,211 @@ def _condition_xml(c):
     return xml + "</member>"
 
 
-def _rule_xml(r):
+# Rule transforms, stored and returned in the RuleTransform shape. The data
+# plane does not apply them: requests reach targets unrewritten. Codes,
+# messages and check order are as captured against AWS in us-east-1.
+_TRANSFORM_CONFIG_KEYS = {
+    "url-rewrite": "UrlRewriteConfig",
+    "host-header-rewrite": "HostHeaderRewriteConfig",
+}
+_REWRITE_MAX_LEN = 1024
+# Members in the order AWS lists their "validation error detected" messages.
+_TRANSFORM_MODEL_CONFIGS = (("HostHeaderRewriteConfig", "hostHeaderRewriteConfig"),
+                            ("UrlRewriteConfig", "urlRewriteConfig"))
+# Groups AWS refuses that Python's re accepts: lookarounds, atomic groups,
+# comments, conditionals and named backreferences.
+_REGEX_REFUSED_GROUPS = ("(?=", "(?!", "(?<=", "(?<!", "(?>", "(?#", "(?(", "(?P=", "(?|")
+
+
+def _parse_transforms(params, prefix="Transforms"):
+    """Read Transforms.member.N from Query params into
+    [{"Type", "UrlRewriteConfig"|"HostHeaderRewriteConfig": {"Rewrites": [{"Regex", "Replace"}]}}].
+    Returns None when the request carries no Transforms, and [] for an empty
+    list (a blank ``Transforms=``). An absent Type, Regex or Replace is None,
+    and a config is present when any of its keys is, even a blank ``Rewrites=``."""
+    members = {}
+    head = re.compile(rf"^{re.escape(prefix)}\.member\.(\d+)\.(.+)$")
+    for key in params:
+        m = head.match(key)
+        if m:
+            members.setdefault(int(m.group(1)), {})[m.group(2)] = _p(params, key)
+    if not members:
+        return [] if prefix in params else None
+    transforms = []
+    for i in sorted(members):
+        fields = members[i]
+        transform = {"Type": fields.get("Type")}
+        for config in _TRANSFORM_CONFIG_KEYS.values():
+            rewrites = {}
+            # A rewrite member exists when any of its keys does, even one AWS ignores.
+            rw = re.compile(rf"^{config}\.Rewrites\.member\.(\d+)\.(.+)$")
+            for field, value in fields.items():
+                m = rw.match(field)
+                if m:
+                    rewrites.setdefault(int(m.group(1)), {})[m.group(2)] = value
+            if rewrites or any(f.startswith(f"{config}.") for f in fields):
+                transform[config] = {"Rewrites": [
+                    {"Regex": rewrites[j].get("Regex"), "Replace": rewrites[j].get("Replace")}
+                    for j in sorted(rewrites)
+                ]}
+        transforms.append(transform)
+    return transforms
+
+
+def _transforms_model_error(transforms):
+    """The request-model check AWS runs before anything else: Type is set and
+    in the enum, and every rewrite has a Regex and a Replace. AWS lists at
+    most ten problems."""
+    errors = []
+    for i, transform in enumerate(transforms, 1):
+        member = f"transforms.{i}.member"
+        for config, path in _TRANSFORM_MODEL_CONFIGS:
+            for j, rewrite in enumerate((transform.get(config) or {}).get("Rewrites", []), 1):
+                for field in ("Regex", "Replace"):
+                    if rewrite.get(field) is None:
+                        errors.append(f"Value null at '{member}.{path}.rewrites.{j}.member.{field.lower()}' "
+                                      "failed to satisfy constraint: Member must not be null")
+        t_type = transform.get("Type")
+        if t_type is None:
+            errors.append(f"Value null at '{member}.type' failed to satisfy constraint: Member must not be null")
+        elif t_type not in _TRANSFORM_CONFIG_KEYS:
+            errors.append(f"Value '{t_type}' at '{member}.type' failed to satisfy constraint: "
+                          "Member must satisfy enum value set: [url-rewrite, host-header-rewrite]")
+    if not errors:
+        return None
+    errors = errors[:10]
+    return (f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+            + "; ".join(errors))
+
+
+def _regex_invalid(regex):
+    """Whether AWS refuses a rewrite Regex as invalid. Python's re checks the
+    syntax once the AWS spellings it lacks are rewritten: (?<name>...),
+    \\x{41}, \\z, (?R) and the inline flags i, m, s, x, u and U anywhere. AWS
+    refuses whitespace, backreferences, \\Z and a "{" that opens no {n} or
+    {n,m}, and accepts stacked quantifiers such as a** or a{2}{3}."""
+    if any(ch.isspace() for ch in regex):
+        return True
+    out, i, n, class_start = [], 0, len(regex), None
+    while i < n:
+        c = regex[i]
+        if c == "\\":
+            e = regex[i + 1:i + 2]
+            if not e or e in "0123456789kZ":
+                return True
+            m = re.match(r"\{([0-9A-Fa-f]{1,8})\}", regex[i + 2:]) if e == "x" else None
+            if m:
+                out.append(f"\\U{int(m.group(1), 16):08x}")
+                i += 2 + len(m.group(0))
+                continue
+            out.append("\\Z" if e == "z" and class_start is None else regex[i:i + 2])
+            i += 2
+            continue
+        if class_start is not None:
+            # A "]" right after "[" or "[^" is a literal; "[:alpha:]" is a POSIX class.
+            posix = re.match(r"\[:\^?[A-Za-z]*:\]", regex[i:]) if c == "[" else None
+            if posix:
+                out.append(posix.group(0))
+                i += len(posix.group(0))
+                continue
+            if c == "]" and i > class_start + 1 and not (i == class_start + 2 and regex[class_start + 1] == "^"):
+                class_start = None
+            out.append(c)
+            i += 1
+            continue
+        if c == "[":
+            class_start = i
+        elif regex.startswith(_REGEX_REFUSED_GROUPS, i):
+            return True
+        elif regex.startswith("(?R)", i):
+            i += 4
+            continue
+        elif regex.startswith("(?<", i):
+            out.append("(?P<")
+            i += 3
+            continue
+        elif c == "(" and (m := re.match(r"\(\?([a-zA-Z-]*)([:)])", regex[i:])):
+            # The flags AWS accepted; it refused Q, z, q, a, L, n, J and an empty (?).
+            if m.group(2) == ")" and not m.group(1) or set(m.group(1)) - set("imsxuU-"):
+                return True
+            out.append("(?:" if m.group(2) == ":" else "")
+            i += len(m.group(0))
+            continue
+        elif c == "{" and not re.match(r"\{\d+(?:,\d*)?\}", regex[i:]):
+            return True
+        out.append(c)
+        i += 1
+    if class_start is not None:
+        return True
+    # AWS accepts a quantifier stacked on another (a**, a{2}{3}); re refuses it,
+    # so drop each one re points at and look for any other error.
+    pattern = "".join(out)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        while True:
+            try:
+                re.compile(pattern)
+                return False
+            except re.error as exc:
+                if exc.msg != "multiple repeat" or exc.pos is None:
+                    return True
+                stacked = re.match(r"\{\d+(?:,\d*)?\}|[*+?]", pattern[exc.pos:])
+                if not stacked:
+                    return True
+                pattern = pattern[:exc.pos] + pattern[exc.pos + len(stacked.group(0)):]
+
+
+def _transforms_problem(transforms):
+    """Why AWS refuses a list of transforms that passed the model check, or None."""
+    types = [t["Type"] for t in transforms]
+    if len(set(types)) != len(types):
+        return "A rule can only have one transform of each type"
+    for transform in transforms:
+        t_type = transform["Type"]
+        config = _TRANSFORM_CONFIG_KEYS[t_type]
+        if config not in transform:
+            return f"For transforms of type '{t_type}', you must specify the following field(s): '{config}'"
+        other = [c for c in _TRANSFORM_CONFIG_KEYS.values() if c != config and c in transform]
+        if other:
+            return f"A transform of type '{t_type}' does not support the following field(s): '{other[0]}'"
+        rewrites = transform[config]["Rewrites"]
+        if len(rewrites) != 1:
+            return "Rule transforms must have exactly one Rewrite"
+        regex, replace = rewrites[0]["Regex"], rewrites[0]["Replace"]
+        if len(replace) > _REWRITE_MAX_LEN:
+            return "A transform rewrite Replace value must be between 0 and 1024 characters in length"
+        if not all("!" <= ch <= "~" for ch in replace):
+            return ("A transform rewrite Replace value may only consist of non-whitespace "
+                    "printable ASCII characters")
+        if not regex or len(regex) > _REWRITE_MAX_LEN:
+            return "A transform rewrite Regex value must be between 1 and 1024 characters in length"
+        if not regex.isascii():
+            return ("Transform rewrite regex values can not be empty, and can only contain "
+                    "non-whitespace ASCII 128 characters")
+        if _regex_invalid(regex):
+            return "One or more provided transform rewrite Regex values are invalid"
+    return None
+
+
+def _transform_xml(t):
+    inner = ""
+    for config in _TRANSFORM_CONFIG_KEYS.values():
+        if config in t:
+            rewrites = "".join(
+                f"<member><Regex>{_esc(r.get('Regex', ''))}</Regex>"
+                f"<Replace>{_esc(r.get('Replace', ''))}</Replace></member>"
+                for r in t[config].get("Rewrites", [])
+            )
+            inner += f"<{config}><Rewrites>{rewrites}</Rewrites></{config}>"
+    return f"<member>{inner}<Type>{_esc(t['Type'])}</Type></member>"
+
+
+def _rule_xml(r, with_transforms=True):
     conds = "".join(_condition_xml(c) for c in r.get("Conditions", []))
     acts = "".join(_action_xml(a) for a in r.get("Actions", []))
+    # SetRulePriorities' rules carry no Transforms element on AWS.
+    transforms = ("<Transforms>" + "".join(_transform_xml(t) for t in r.get("Transforms", []))
+                  + "</Transforms>") if with_transforms else ""
     return (
         f"<member>"
         f"<RuleArn>{r['RuleArn']}</RuleArn>"
@@ -615,6 +818,7 @@ def _rule_xml(r):
         f"<Conditions>{conds}</Conditions>"
         f"<Actions>{acts}</Actions>"
         f"<IsDefault>{str(r.get('IsDefault',False)).lower()}</IsDefault>"
+        f"{transforms}"
         f"</member>"
     )
 
@@ -982,8 +1186,26 @@ def _modify_listener_attrs(params):
 # Rule handlers
 # ---------------------------------------------------------------------------
 
+def _load_balancer_missing(arn):
+    """Whether a listener or rule ARN names a load balancer that doesn't
+    exist. AWS answers ListenerNotFound or RuleNotFound for that right after
+    the model check; on a load balancer that exists, a missing listener or
+    rule is only reported after every other check."""
+    m = re.match(r"^(arn:[^:]+:elasticloadbalancing:[^:]*:[^:]*:)listener(?:-rule)?/([^/]+/[^/]+/[^/]+)/", arn)
+    return bool(m) and f"{m.group(1)}loadbalancer/{m.group(2)}" not in _lbs
+
+
 def _create_rule(params):
     l_arn = _p(params, "ListenerArn")
+    transforms = _parse_transforms(params) or []
+    problem = _transforms_model_error(transforms)
+    if problem:
+        return _error("ValidationError", problem)
+    if _load_balancer_missing(l_arn):
+        return _error("ListenerNotFound", f"Listener '{l_arn}' not found.")
+    problem = _transforms_problem(transforms)
+    if problem:
+        return _error("ValidationError", problem)
     if l_arn not in _listeners:
         return _error("ListenerNotFound", f"Listener '{l_arn}' not found.")
     listener = _listeners[l_arn]
@@ -1000,6 +1222,7 @@ def _create_rule(params):
         "Conditions": _parse_conditions(params),
         "Actions": _parse_actions(params, "Actions"),
         "IsDefault": False,
+        "Transforms": transforms,
     }
     _rules[rule_arn] = rule
     _tags[rule_arn] = _parse_tags(params)
@@ -1019,15 +1242,36 @@ def _describe_rules(params):
 
 def _modify_rule(params):
     arn = _p(params, "RuleArn")
+    transforms = _parse_transforms(params)
+    reset_transforms = _p(params, "ResetTransforms").lower() == "true"
+    problem = _transforms_model_error(transforms or [])
+    if problem:
+        return _error("ValidationError", problem)
+    if _load_balancer_missing(arn):
+        return _error("RuleNotFound", f"Rule '{arn}' not found.")
+    # An empty Transforms list counts as given here, but changes nothing below.
+    if transforms is not None and reset_transforms:
+        return _error("ValidationError", "Transforms cannot be provided when resetting transforms")
+    problem = _transforms_problem(transforms or [])
+    if problem:
+        return _error("ValidationError", problem)
+    conds = _parse_conditions(params)
+    acts = _parse_actions(params, "Actions")
+    if not (conds or acts or transforms or reset_transforms):
+        return _error("ValidationError", "You must provide either conditions, actions, or transforms")
     rule = _rules.get(arn)
     if not rule:
         return _error("RuleNotFound", f"Rule '{arn}' not found.")
-    conds = _parse_conditions(params)
+    if rule.get("IsDefault"):
+        return _error("OperationNotPermitted", f"Default rule '{arn}' cannot be modified")
     if conds:
         rule["Conditions"] = conds
-    acts = _parse_actions(params, "Actions")
     if acts:
         rule["Actions"] = acts
+    if transforms:
+        rule["Transforms"] = transforms
+    elif reset_transforms:
+        rule["Transforms"] = []
     return _xml(200, "ModifyRule", f"<Rules>{_rule_xml(rule)}</Rules>")
 
 
@@ -1052,7 +1296,7 @@ def _set_rule_priorities(params):
             updated.append(_rules[arn])
         i += 1
     return _xml(200, "SetRulePriorities",
-                f"<Rules>{''.join(_rule_xml(r) for r in updated)}</Rules>")
+                f"<Rules>{''.join(_rule_xml(r, with_transforms=False) for r in updated)}</Rules>")
 
 
 # ---------------------------------------------------------------------------
@@ -1278,8 +1522,13 @@ async def handle_request(method, path, headers, body, query_params):
     params = dict(query_params)
     if method == "POST" and body:
         raw = body if isinstance(body, str) else body.decode("utf-8", errors="replace")
-        for k, v in parse_qs(raw).items():
-            params[k] = v
+        # Blank values are kept for Transforms only: an empty Replace, Regex,
+        # Rewrites or Transforms list is a different request from an absent one.
+        for k, v in parse_qs(raw, keep_blank_values=True).items():
+            if not k.startswith("Transforms"):
+                v = [x for x in v if x]
+            if v:
+                params[k] = v
     action = _p(params, "Action")
     handler = _ACTION_MAP.get(action)
     if not handler:

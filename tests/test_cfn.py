@@ -8248,7 +8248,7 @@ def _cfn_elbv2_template(uid, *, health_path="/a", idle_timeout="60",
                         priority=10, scheme="internet-facing", name=None,
                         tg_port=80, listener_port=80, listener_protocol="HTTP",
                         listener_actions=None, listener_lb="LB",
-                        second_lb=False):
+                        second_lb=False, rule_transforms=None):
     resources = {
         "LB": {
             "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
@@ -8292,6 +8292,7 @@ def _cfn_elbv2_template(uid, *, health_path="/a", idle_timeout="60",
                     {"Field": "path-pattern", "Values": [f"{health_path}*"]},
                 ],
                 "Actions": [{"Type": "forward", "TargetGroupArn": {"Ref": "TG"}}],
+                **({"Transforms": rule_transforms} if rule_transforms is not None else {}),
             },
         },
     }
@@ -8357,6 +8358,278 @@ def test_cfn_elbv2_update_keeps_the_arns_and_the_registered_targets(cfn, elbv2):
             ListenerArn=listener_arn)["Rules"]}
         assert rules[rule_arn]["Priority"] == "20"
         assert rules[rule_arn]["Conditions"][0]["Values"] == ["/b*"]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+_CFN_URL_REWRITE = {"Type": "url-rewrite", "UrlRewriteConfig": {
+    "Rewrites": [{"Regex": "^/a/(.*)$", "Replace": "/$1"}]}}
+_CFN_HOST_REWRITE = {"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {
+    "Rewrites": [{"Regex": "^www\\.example\\.com$", "Replace": "example.com"}]}}
+
+
+def _cfn_rewrite(regex="^/a$", replace="/b"):
+    return {"Regex": regex, "Replace": replace}
+
+
+def _cfn_validation_errors(cfn, stack_name):
+    return sorted((e["LogicalResourceId"], e["ValidationName"], e["ValidationPath"], e["ValidationStatusReason"])
+                  for e in cfn.describe_events(StackName=stack_name)["OperationEvents"]
+                  if e["EventType"] == "VALIDATION_ERROR")
+
+
+def _cfn_handler_reason(message):
+    """The ListenerRule handler's reason for a refused ELBv2 request, as a pattern."""
+    return re.compile(
+        r'Resource handler returned message: "' + re.escape(message)
+        + r' \(Service: ElasticLoadBalancingV2, Status Code: 400, Request ID: [0-9a-f-]{36}\) '
+          r'\(SDK Attempt Count: 1\)" \(RequestToken: [0-9a-f-]{36}, HandlerErrorCode: InvalidRequest\)$')
+
+
+def _cfn_rule_reasons(cfn, stack_name, status):
+    return [e["ResourceStatusReason"] for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+            if e["LogicalResourceId"] == "R" and e["ResourceStatus"] == status]
+
+
+def test_cfn_elbv2_listener_rule_transforms_are_created_updated_and_removed(cfn, elbv2):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C47-C49;
+    2310-uncertainties U10:cfn-create empty-list and empty-replace, U10:cfn-update
+    empty-list; 2310-uncertainties-4 X2:cfn novalue, replace-boolean, regex-boolean).
+    Transforms are "Update requires: No interruption", so each update
+    keeps the rule ARN."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-tx-{uid}"
+    empty_replace = {"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite(replace="")]}}
+
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_elbv2_template(uid, rule_transforms=[_CFN_URL_REWRITE]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        rule_arn = _output(stack, "RuleRef")
+        assert elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]["Transforms"] == [_CFN_URL_REWRITE]
+
+        booleans = {"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": False, "Replace": True}]}}
+        as_strings = {"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite("false", "true")]}}
+        for transforms, expected in (([_CFN_HOST_REWRITE], [_CFN_HOST_REWRITE]), ([], []),
+                                     ([empty_replace], [empty_replace]), ([booleans], [as_strings]),
+                                     ({"Ref": "AWS::NoValue"}, []), (None, [])):
+            cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(
+                uid, rule_transforms=transforms))
+            stack = _wait_stack(cfn, stack_name)
+            assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+            assert _output(stack, "RuleRef") == rule_arn
+            assert elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]["Transforms"] == expected
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+_T0 = "/Resources/R/Properties/Transforms/0"
+_T1 = "/Resources/R/Properties/Transforms/1"
+_BOTH_CONFIGS_MISSING = [(_T0, "Required property [HostHeaderRewriteConfig] not found"),
+                         (_T0, "Required property [UrlRewriteConfig] not found")]
+_CFN_SCHEMA_CASES = [
+    ("missing-config", [{"Type": "url-rewrite"}], _BOTH_CONFIGS_MISSING),
+    ("host-missing-config", [{"Type": "host-header-rewrite"}], _BOTH_CONFIGS_MISSING),
+    ("both-configs", [{**_CFN_URL_REWRITE, "HostHeaderRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     [(_T0, "#/Transforms/0: #: 2 subschemas matched instead of one")]),
+    ("identical-items", [_CFN_URL_REWRITE, _CFN_URL_REWRITE],
+     [("/Resources/R/Properties/Transforms", "#/Transforms: array items are not unique")]),
+    ("missing-type", [{"UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     [(_T0, "Required property [Type] not found")]),
+    ("missing-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {}}],
+     [(f"{_T0}/UrlRewriteConfig", "Required property [Rewrites] not found")]),
+    ("missing-regex", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Replace": "/b"}]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites/0", "Required property [Regex] not found")]),
+    ("missing-replace", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites/0", "Required property [Replace] not found")]),
+    ("extra-transform-property", [{**_CFN_URL_REWRITE, "Foo": "x"}], [(_T0, "Unsupported property [Foo]")]),
+    ("extra-rewrite-property",
+     [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{**_cfn_rewrite(), "Foo": "x"}]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites/0", "Unsupported property [Foo]")]),
+    ("not-an-array", _CFN_URL_REWRITE,
+     [("/Resources/R/Properties/Transforms", "Property [Transforms] expected type: JSONArray, found: JSONObject")]),
+    ("item-not-an-object", ["url-rewrite"],
+     [(_T0, "#/Transforms/0: #: 2 subschemas matched instead of one"),
+      (_T0, "Property [0] expected type: JSONObject, found: String")]),
+    ("rewrites-not-an-array", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": _cfn_rewrite()}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites", "Property [Rewrites] expected type: JSONArray, found: JSONObject")]),
+    # AWS reports indices after sorting the items by their JSON with sorted keys.
+    ("missing-config-at-index-1", [_CFN_URL_REWRITE, {"Type": "host-header-rewrite"}], _BOTH_CONFIGS_MISSING),
+    ("missing-and-both-configs",
+     [{"Type": "url-rewrite"}, {**_CFN_HOST_REWRITE, "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     [(_T1, "Required property [HostHeaderRewriteConfig] not found"),
+      (_T1, "Required property [UrlRewriteConfig] not found"),
+      (_T0, "#/Transforms/0: #: 2 subschemas matched instead of one")]),
+    ("sorted-both-configs-first",
+     [{"Type": "url-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [_cfn_rewrite()]},
+       "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}, {"Type": "host-header-rewrite"}],
+     [(_T0, "#/Transforms/0: #: 2 subschemas matched instead of one"),
+      (_T1, "Required property [HostHeaderRewriteConfig] not found"),
+      (_T1, "Required property [UrlRewriteConfig] not found")]),
+    ("sorted-unsupported-first", [{"Type": "url-rewrite"}, {"Type": "host-header-rewrite", "Foo": "x"}],
+     _BOTH_CONFIGS_MISSING + [(_T1, "Required property [HostHeaderRewriteConfig] not found"),
+                              (_T1, "Required property [UrlRewriteConfig] not found"),
+                              (_T0, "Unsupported property [Foo]")]),
+    ("sorted-by-key-not-type", [{"Type": "aaa", "UrlRewriteConfig": {"Rewrites": "x"}},
+                                {"HostHeaderRewriteConfig": {"Rewrites": "y"}, "Type": "zzz"}],
+     [(f"{_T0}/HostHeaderRewriteConfig/Rewrites", "Property [Rewrites] expected type: JSONArray, found: String"),
+      (f"{_T1}/UrlRewriteConfig/Rewrites", "Property [Rewrites] expected type: JSONArray, found: String")]),
+    ("identical-rewrites",
+     [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite(), _cfn_rewrite()]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites", "#/Transforms/0/UrlRewriteConfig/Rewrites: array items are not unique")]),
+    ("config-extra-property",
+     [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()], "Foo": "x"}}],
+     [(f"{_T0}/UrlRewriteConfig", "Unsupported property [Foo]")]),
+    ("type-object", [{"Type": {"a": 1}, "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     [(f"{_T0}/Type", "Property [Type] expected type: String, found: JSONObject")]),
+    ("replace-object",
+     [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$", "Replace": {"a": 1}}]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites/0/Replace", "Property [Replace] expected type: String, found: JSONObject")]),
+    ("missing-type-and-config", [{"Foo": "x"}],
+     _BOTH_CONFIGS_MISSING + [(_T0, "Required property [Type] not found"), (_T0, "Unsupported property [Foo]")]),
+    ("transforms-string", "x",
+     [("/Resources/R/Properties/Transforms", "Property [Transforms] expected type: JSONArray, found: String")]),
+    ("item-number", [5], [(_T0, "#/Transforms/0: #: 2 subschemas matched instead of one"),
+                          (_T0, "Property [0] expected type: JSONObject, found: String")]),
+    ("item-array", [[_CFN_URL_REWRITE]], [(_T0, "#/Transforms/0: #: 2 subschemas matched instead of one"),
+                                          (_T0, "Property [0] expected type: JSONObject, found: JSONArray")]),
+    ("config-string", [{"Type": "url-rewrite", "UrlRewriteConfig": "x"}],
+     [(f"{_T0}/UrlRewriteConfig", "Property [UrlRewriteConfig] expected type: JSONObject, found: String")]),
+    ("config-array", [{"Type": "url-rewrite", "UrlRewriteConfig": [{"Rewrites": [_cfn_rewrite()]}]}],
+     [(f"{_T0}/UrlRewriteConfig", "Property [UrlRewriteConfig] expected type: JSONObject, found: JSONArray")]),
+    ("rewrites-string", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": "x"}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites", "Property [Rewrites] expected type: JSONArray, found: String")]),
+    ("rewrite-string", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": ["x"]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites/0", "Property [0] expected type: JSONObject, found: String")]),
+    ("type-array", [{"Type": ["url-rewrite"], "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     [(f"{_T0}/Type", "Property [Type] expected type: String, found: JSONArray")]),
+    ("regex-array", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": ["a"], "Replace": "/b"}]}}],
+     [(f"{_T0}/UrlRewriteConfig/Rewrites/0/Regex", "Property [Regex] expected type: String, found: JSONArray")]),
+    ("identical-missing-config", [{"Type": "url-rewrite"}, {"Type": "url-rewrite"}],
+     _BOTH_CONFIGS_MISSING + [("/Resources/R/Properties/Transforms/1", f"Required property [{c}] not found")
+                              for c in ("HostHeaderRewriteConfig", "UrlRewriteConfig")]
+     + [("/Resources/R/Properties/Transforms", "#/Transforms: array items are not unique")]),
+    ("identical-with-unsupported", [{**_CFN_URL_REWRITE, "Foo": "x"}] * 2,
+     [(_T0, "Unsupported property [Foo]"), ("/Resources/R/Properties/Transforms/1", "Unsupported property [Foo]"),
+      ("/Resources/R/Properties/Transforms", "#/Transforms: array items are not unique")]),
+]
+
+
+@pytest.mark.parametrize("transforms, expected", [c[1:] for c in _CFN_SCHEMA_CASES],
+                         ids=[c[0] for c in _CFN_SCHEMA_CASES])
+def test_cfn_elbv2_listener_rule_transforms_fail_schema_validation(cfn, transforms, expected):
+    """AWS: captured 2026-10-20 and 2026-10-21 (repeats elbv2:C50 missing-config,
+    wrong-config, host-missing-config; 2310-uncertainties U10:cfn-create,
+    2310-uncertainties-3 W3:cfn-types, 2310-uncertainties-4 X2:cfn). Transforms
+    that break the resource schema fail the stack before anything is provisioned,
+    with one PROPERTY_VALIDATION event per problem."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-txv-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid, rule_transforms=transforms))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        events = [(e["ResourceStatus"], e.get("ResourceStatusReason"))
+                  for e in reversed(cfn.describe_stack_events(StackName=stack_name)["StackEvents"])]
+        assert events[1:3] == [
+            ("CREATE_FAILED", f"Validation failed with {len(expected)} error(s). Call DescribeEvents to retrieve "
+             "the full list of issues with resource and property details, resolve each error, then retry the "
+             "operation."),
+            ("ROLLBACK_IN_PROGRESS", "Validation failure detected. See the operation's FAILED event for details."),
+        ]
+        assert _cfn_validation_errors(cfn, stack_name) == sorted(
+            ("R", "PROPERTY_VALIDATION", path, reason) for path, reason in expected)
+        assert cfn.describe_stack_resources(StackName=stack_name)["StackResources"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+_CFN_HANDLER_CASES = [
+    ("unknown-type", [{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     "1 validation error detected: Value 'path-rewrite' at 'transforms.1.member.type' failed to satisfy "
+     "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    ("duplicate-type", [_CFN_URL_REWRITE, {"Type": "url-rewrite", "UrlRewriteConfig": {
+        "Rewrites": [_cfn_rewrite("^/b$")]}}], "A rule can only have one transform of each type"),
+    ("two-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [
+        _cfn_rewrite(), _cfn_rewrite("^/c$", "/d")]}}], "Rule transforms must have exactly one Rewrite"),
+    ("no-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("empty-regex", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite(regex="")]}}],
+     "A transform rewrite Regex value must be between 1 and 1024 characters in length"),
+    ("long-regex", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite(regex="a" * 1025)]}}],
+     "A transform rewrite Regex value must be between 1 and 1024 characters in length"),
+    ("long-replace", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite(replace="a" * 1025)]}}],
+     "A transform rewrite Replace value must be between 0 and 1024 characters in length"),
+    ("invalid-regex", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite(regex="([")]}}],
+     "One or more provided transform rewrite Regex values are invalid"),
+    ("type-number", [{"Type": 5, "UrlRewriteConfig": {"Rewrites": [_cfn_rewrite()]}}],
+     "1 validation error detected: Value '5' at 'transforms.1.member.type' failed to satisfy "
+     "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+]
+
+
+@pytest.mark.parametrize("transforms, message", [c[1:] for c in _CFN_HANDLER_CASES],
+                         ids=[c[0] for c in _CFN_HANDLER_CASES])
+def test_cfn_elbv2_listener_rule_refused_transforms_fail_the_resource(cfn, transforms, message):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C50, repeats
+    elbv2:C50, 2310-uncertainties U10:cfn-create invalid-regex, 2310-uncertainties-3
+    W3:cfn-types type-number, empty-rewrites, unknown-type). Transforms that pass
+    the schema reach the handler, which fails the rule with the API's message."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-txh-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid, rule_transforms=transforms))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        [reason] = _cfn_rule_reasons(cfn, stack_name, "CREATE_FAILED")
+        assert _cfn_handler_reason(message).match(reason), reason
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_elbv2_listener_rule_refused_transform_updates_roll_back(cfn, elbv2):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C51, repeats
+    elbv2:C51 identical-items and different-regex, 2310-uncertainties U10:cfn-update).
+    Schema problems fail the update before the rule is touched; the rest fail the
+    rule with the handler's reason. Either way the rule keeps its transforms."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-elbv2-txu-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid, rule_transforms=[_CFN_HOST_REWRITE]))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        rule_arn = _output(stack, "RuleRef")
+        other_host = {"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {
+            "Rewrites": [_cfn_rewrite("^b$", "c")]}}
+        for transforms, schema, message in (
+                ([_CFN_HOST_REWRITE, _CFN_HOST_REWRITE],
+                 [("/Resources/R/Properties/Transforms", "#/Transforms: array items are not unique")], None),
+                ([{"Type": "url-rewrite"}], _BOTH_CONFIGS_MISSING, None),
+                ([{"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [{"Regex": "^a$"}]}}],
+                 [(f"{_T0}/HostHeaderRewriteConfig/Rewrites/0", "Required property [Replace] not found")], None),
+                ([_CFN_HOST_REWRITE, other_host], None, "A rule can only have one transform of each type"),
+                ([{"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [_cfn_rewrite("([")]}}],
+                 None, "One or more provided transform rewrite Regex values are invalid")):
+            cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_elbv2_template(uid, rule_transforms=transforms))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+            events = [(e["ResourceStatus"], e.get("ResourceStatusReason"))
+                      for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                      if e["LogicalResourceId"] == stack_name]
+            if schema:
+                assert ("UPDATE_FAILED", f"Validation failed with {len(schema)} error(s). Call DescribeEvents to "
+                        "retrieve the full list of issues with resource and property details, resolve each error, "
+                        "then retry the operation.") in events
+                assert ("UPDATE_ROLLBACK_IN_PROGRESS",
+                        "Validation failure detected. See operation's FAILED event for details.") in events
+                latest = [e for e in cfn.describe_events(StackName=stack_name)["OperationEvents"]
+                          if e["EventType"] == "VALIDATION_ERROR"]
+                operation = latest[0]["OperationId"]
+                assert sorted((e["ValidationPath"], e["ValidationStatusReason"]) for e in latest
+                              if e["OperationId"] == operation) == sorted(schema)
+            else:
+                assert _cfn_handler_reason(message).match(_cfn_rule_reasons(cfn, stack_name, "UPDATE_FAILED")[0])
+                assert ("UPDATE_ROLLBACK_IN_PROGRESS", "The following resource(s) failed to update: [R]. ") in events
+            assert _output(_wait_stack(cfn, stack_name), "RuleRef") == rule_arn
+            assert elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]["Transforms"] == [_CFN_HOST_REWRITE]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
