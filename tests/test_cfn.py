@@ -819,6 +819,101 @@ def test_cfn_s3_bucket_notification_configuration(cfn, s3, sqs):
     _wait_stack(cfn, "cfn-notif")
 
 
+def test_cfn_s3_bucket_cors_public_access_block_and_website(cfn, s3):
+    """AWS::S3::Bucket CorsConfiguration, PublicAccessBlockConfiguration and
+    WebsiteConfiguration reach GetBucketCors, GetPublicAccessBlock and
+    GetBucketWebsite in the S3 API's shape, the template's BlockPublicPolicy
+    refuses a public bucket policy, an update replaces each one and removing a
+    property deletes it."""
+    bucket = "cfn-s3-configs-bucket"
+    created = {
+        "CorsConfiguration": {"CorsRules": [
+            {"Id": "rule-z", "AllowedMethods": ["GET", "PUT"], "AllowedOrigins": ["https://a.example"],
+             "AllowedHeaders": ["*"], "ExposedHeaders": ["ETag"], "MaxAge": 300},
+            {"AllowedMethods": ["POST"], "AllowedOrigins": ["*"]},
+        ]},
+        "PublicAccessBlockConfiguration": {
+            "BlockPublicAcls": True, "IgnorePublicAcls": False,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": False,
+        },
+        "WebsiteConfiguration": {
+            "IndexDocument": "index.html",
+            "ErrorDocument": "error.html",
+            "RoutingRules": [{
+                "RoutingRuleCondition": {"KeyPrefixEquals": "docs/"},
+                "RedirectRule": {"ReplaceKeyPrefixWith": "documents/", "HttpRedirectCode": "301"},
+            }],
+        },
+    }
+    changed = {
+        "CorsConfiguration": {"CorsRules": [
+            {"Id": "rule-y", "AllowedMethods": ["HEAD"], "AllowedOrigins": ["https://b.example"]},
+        ]},
+        "PublicAccessBlockConfiguration": {"BlockPublicAcls": False, "RestrictPublicBuckets": True},
+        "WebsiteConfiguration": {"RedirectAllRequestsTo": {"HostName": "example.com", "Protocol": "https"}},
+    }
+
+    def template(configs):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {"Bucket": {"Type": "AWS::S3::Bucket",
+                                     "Properties": {"BucketName": bucket, **configs}}},
+        })
+
+    def error_code(call):
+        with pytest.raises(ClientError) as exc:
+            call(Bucket=bucket)
+        return exc.value.response["Error"]["Code"]
+
+    cfn.create_stack(StackName="cfn-s3-configs", TemplateBody=template(created))
+    assert _wait_stack(cfn, "cfn-s3-configs")["StackStatus"] == "CREATE_COMPLETE"
+    # A rule without MaxAge reads back with MaxAgeSeconds 0.
+    assert s3.get_bucket_cors(Bucket=bucket)["CORSRules"] == [
+        {"ID": "rule-z", "AllowedHeaders": ["*"], "AllowedMethods": ["GET", "PUT"],
+         "AllowedOrigins": ["https://a.example"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 300},
+        {"AllowedMethods": ["POST"], "AllowedOrigins": ["*"], "MaxAgeSeconds": 0},
+    ]
+    assert s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"] == {
+        "BlockPublicAcls": True, "IgnorePublicAcls": False,
+        "BlockPublicPolicy": True, "RestrictPublicBuckets": False,
+    }
+    public_policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*"}]})
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_policy(Bucket=bucket, Policy=public_policy)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    website = s3.get_bucket_website(Bucket=bucket)
+    assert website["IndexDocument"] == {"Suffix": "index.html"}
+    assert website["ErrorDocument"] == {"Key": "error.html"}
+    assert website["RoutingRules"] == [{
+        "Condition": {"KeyPrefixEquals": "docs/"},
+        "Redirect": {"HttpRedirectCode": "301", "ReplaceKeyPrefixWith": "documents/"},
+    }]
+
+    cfn.update_stack(StackName="cfn-s3-configs", TemplateBody=template(changed))
+    assert _wait_stack(cfn, "cfn-s3-configs")["StackStatus"] == "UPDATE_COMPLETE"
+    assert s3.get_bucket_cors(Bucket=bucket)["CORSRules"] == [
+        {"ID": "rule-y", "AllowedMethods": ["HEAD"], "AllowedOrigins": ["https://b.example"], "MaxAgeSeconds": 0},
+    ]
+    # Settings the template leaves out are off.
+    assert s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"] == {
+        "BlockPublicAcls": False, "IgnorePublicAcls": False,
+        "BlockPublicPolicy": False, "RestrictPublicBuckets": True,
+    }
+    website = s3.get_bucket_website(Bucket=bucket)
+    assert website["RedirectAllRequestsTo"] == {"HostName": "example.com", "Protocol": "https"}
+    assert "IndexDocument" not in website and "RoutingRules" not in website
+
+    cfn.update_stack(StackName="cfn-s3-configs", TemplateBody=template({}))
+    assert _wait_stack(cfn, "cfn-s3-configs")["StackStatus"] == "UPDATE_COMPLETE"
+    assert error_code(s3.get_bucket_cors) == "NoSuchCORSConfiguration"
+    assert error_code(s3.get_public_access_block) == "NoSuchPublicAccessBlockConfiguration"
+    assert error_code(s3.get_bucket_website) == "NoSuchWebsiteConfiguration"
+
+    cfn.delete_stack(StackName="cfn-s3-configs")
+    _wait_stack(cfn, "cfn-s3-configs")
+
+
 def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
     """AWS::IoT::ThingType, AWS::IoT::Policy, and
     AWS::Cognito::IdentityPoolRoleAttachment provision onto their real services

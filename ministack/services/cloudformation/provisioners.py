@@ -1402,6 +1402,82 @@ def _s3_apply_notification(name, notif):
         )
 
 
+def _s3_cors_xml(cors):
+    """A ``CorsConfiguration`` as the PutBucketCors body."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    root = Element("CORSConfiguration", xmlns=_s3.S3_NS)
+    for rule in cors.get("CorsRules") or []:
+        rule_el = SubElement(root, "CORSRule")
+        if rule.get("Id"):
+            SubElement(rule_el, "ID").text = str(rule["Id"])
+        for prop, tag in (("AllowedHeaders", "AllowedHeader"), ("AllowedMethods", "AllowedMethod"),
+                          ("AllowedOrigins", "AllowedOrigin"), ("ExposedHeaders", "ExposeHeader")):
+            for value in rule.get(prop) or []:
+                SubElement(rule_el, tag).text = str(value)
+        # CloudFormation stores 0 when the rule has no MaxAge.
+        SubElement(rule_el, "MaxAgeSeconds").text = str(int(rule.get("MaxAge") or 0))
+    return tostring(root, encoding="utf-8")
+
+
+def _s3_public_access_block_xml(pab):
+    """A ``PublicAccessBlockConfiguration`` as the PutPublicAccessBlock body; absent settings are off."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    root = Element("PublicAccessBlockConfiguration", xmlns=_s3.S3_NS)
+    for field in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"):
+        SubElement(root, field).text = str(_cfn_bool(pab.get(field, False))).lower()
+    return tostring(root, encoding="utf-8")
+
+
+def _s3_website_xml(website):
+    """A ``WebsiteConfiguration`` as the PutBucketWebsite body."""
+    from xml.etree.ElementTree import Element, SubElement, tostring
+
+    def _fields(parent, tag, source, names):
+        el = SubElement(parent, tag)
+        for name in names:
+            if source.get(name) is not None:
+                SubElement(el, name).text = str(source[name])
+        return el
+
+    root = Element("WebsiteConfiguration", xmlns=_s3.S3_NS)
+    if website.get("RedirectAllRequestsTo"):
+        _fields(root, "RedirectAllRequestsTo", website["RedirectAllRequestsTo"], ("HostName", "Protocol"))
+    if website.get("IndexDocument"):
+        SubElement(SubElement(root, "IndexDocument"), "Suffix").text = str(website["IndexDocument"])
+    if website.get("ErrorDocument"):
+        SubElement(SubElement(root, "ErrorDocument"), "Key").text = str(website["ErrorDocument"])
+    rules = website.get("RoutingRules") or []
+    if rules:
+        rules_el = SubElement(root, "RoutingRules")
+        for rule in rules:
+            rule_el = SubElement(rules_el, "RoutingRule")
+            if rule.get("RoutingRuleCondition"):
+                _fields(rule_el, "Condition", rule["RoutingRuleCondition"],
+                        ("HttpErrorCodeReturnedEquals", "KeyPrefixEquals"))
+            _fields(rule_el, "Redirect", rule.get("RedirectRule") or {},
+                    ("HostName", "HttpRedirectCode", "Protocol", "ReplaceKeyPrefixWith", "ReplaceKeyWith"))
+    return tostring(root, encoding="utf-8")
+
+
+_S3_BUCKET_CONFIGURATIONS = (
+    ("CorsConfiguration", _s3_cors_xml, _s3._put_bucket_cors, _s3._delete_bucket_cors),
+    ("PublicAccessBlockConfiguration", _s3_public_access_block_xml,
+     _s3._put_public_access_block, _s3._delete_public_access_block),
+    ("WebsiteConfiguration", _s3_website_xml, _s3._put_bucket_website, _s3._delete_bucket_website),
+)
+
+
+def _s3_apply_configurations(name, props, old_props=None):
+    """Store the CORS, Block Public Access and website properties through the S3 API; a dropped one is deleted."""
+    for prop, to_xml, put, delete in _S3_BUCKET_CONFIGURATIONS:
+        if prop in props:
+            put(name, to_xml(props[prop] or {}))
+        elif old_props and prop in old_props:
+            delete(name)
+
+
 # ---------------------------------------------------------------------------
 # S3 Multi-Region Access Point
 # ---------------------------------------------------------------------------
@@ -1597,6 +1673,7 @@ def _s3_create(logical_id, props, stack_name):
         _s3._bucket_versioning[name] = "Enabled"
     if "NotificationConfiguration" in props:
         _s3_apply_notification(name, props["NotificationConfiguration"])
+    _s3_apply_configurations(name, props)
     return name, _s3_attrs(name)
 
 
@@ -1620,6 +1697,7 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
         elif "NotificationConfiguration" in old_props:
             # Property removed on update — clear the configuration, as AWS does.
             _s3._bucket_notifications.pop(name, None)
+        _s3_apply_configurations(name, new_props, old_props)
     else:
         return _s3_create(name, new_props, stack_name)
     return name, _s3_attrs(name)
@@ -1659,6 +1737,7 @@ def _s3_delete(physical_id, props):
     _s3._bucket_encryption.pop(physical_id, None)
     _s3._bucket_lifecycle.pop(physical_id, None)
     _s3._bucket_cors.pop(physical_id, None)
+    _s3._bucket_websites.pop(physical_id, None)
     _s3._bucket_acl.pop(physical_id, None)
     _s3._bucket_notifications.pop(physical_id, None)
 
