@@ -1574,23 +1574,20 @@ def _s3control_mrap_arn(s3, path: str) -> str:
     from ministack.core.responses import get_account_id
 
     account = get_account_id()
-    ref = unquote(path).rstrip("/").removeprefix("/v20180820/mrap/instances").strip("/")
-    ref = ref.removesuffix("/routes").removesuffix("/policy")
-    record = s3.find_mrap(ref) if ref and not path.startswith("/v20180820/async-requests/") else None
+    route = None if path.startswith("/v20180820/async-requests/") else s3.mrap_control_route(path)
+    record = s3.find_mrap(route[0]) if route and route[0] else None
     return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
 
 
 def _s3control_access_point_arn(s3, path: str) -> str:
     """IAM resource for an access point request: its regional ARN, or the
     account's wildcard for ListAccessPoints."""
-    name = unquote(path).rstrip("/").removeprefix("/v20180820/accesspoint").strip("/").removesuffix("/policy")
-    return s3.access_point_arn(name or "*")
+    return s3.access_point_arn(s3.access_point_control_route(path)[0] or "*")
 
 
 def _s3control_object_lambda_arn(s3, path: str) -> str:
     """IAM resource for an Object Lambda Access Point request."""
-    name = unquote(path).rstrip("/").removeprefix("/v20180820/accesspointforobjectlambda").strip("/")
-    return s3.object_lambda_arn(name.split("/", 1)[0] or "*")
+    return s3.object_lambda_arn(s3.object_lambda_control_route(path)[0] or "*")
 
 
 async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,

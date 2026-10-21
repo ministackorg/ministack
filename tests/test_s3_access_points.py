@@ -9,7 +9,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import patch_endpoint_dns
+from conftest import make_client, patch_endpoint_dns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 ACCOUNT = "000000000000"
@@ -158,9 +158,90 @@ def test_access_point_control_policy_round_trip(access_point):
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 
+@pytest.mark.parametrize("method,path,status,fields", [
+    ("POST", "/{ap}/policy", 405, {"Method": "POST", "ResourceType": "ACCESSPOINTPOLICY"}),
+    ("PATCH", "/{ap}/policy", 405, {"Method": "PATCH", "ResourceType": "ACCESSPOINTPOLICY"}),
+    ("POST", "/{ap}", 405, {"Method": "POST", "ResourceType": "ACCESSPOINT"}),
+    ("POST", "", 405, {"Method": "POST", "ResourceType": "ACCESSPOINTS"}),
+    ("GET", "/{ap}/x", 400, {"URI": "accesspoint/{ap}/x"}),
+    ("DELETE", "/{ap}/x", 400, {}),
+    ("DELETE", "/{ap}/policy/x", 400, {}),
+    ("GET", "/{ap}/", 400, {}),
+    ("GET", "//{ap}", 400, {}),
+    ("PUT", "//{ap}/policy", 400, {}),
+    ("GET", "/", 400, {}),    ("GET", "/{ap}/policyStatus", 404, {"AccessPointName": "{ap}/policyStatus"}),
+    ("GET", "/{ap}/scope", 404, {}),
+])
+def test_access_point_control_unserved_requests(access_point, method, path, status, fields):
+    """Unserved methods answer 405, unparsed paths 400, unemulated routes 404; none changes the access point."""
+    name, _ = access_point
+    ctl = _client("s3control", "us-east-1")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}/object/*"}]})
+    ctl.put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=policy)
+    body = b"<PutAccessPointPolicyRequest><Policy>{}</Policy></PutAccessPointPolicyRequest>"
+    got, _, data = _raw(method, ENDPOINT.split("://", 1)[1], "/v20180820/accesspoint" + path.format(ap=name),
+                        "us-east-1", body if method == "PUT" else b"", headers={"x-amz-account-id": ACCOUNT})
+    code = {405: "MethodNotAllowed", 400: "InvalidURI", 404: "NoSuchAccessPoint"}[status]
+    assert (got, re.search(rb"<Code>(\w+)</Code>", data).group(1).decode()) == (status, code)
+    for tag, value in fields.items():
+        assert f"<{tag}>{value.format(ap=name)}</{tag}>".encode() in data
+    assert ctl.get_access_point_policy(AccountId=ACCOUNT, Name=name)["Policy"] == policy
+
+
+@pytest.mark.auth_contract
+def test_access_point_named_policy_needs_the_access_point_action(auth_enabled, iam_user, bucket):
+    """/v20180820/accesspoint/policy names an access point called "policy"."""
+    ctl = _client("s3control", "us-east-1")
+    ctl.create_access_point(AccountId=ACCOUNT, Name="policy", Bucket=bucket)
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["s3:GetAccessPointPolicy", "s3:DeleteAccessPointPolicy"],
+            "Resource": "*"}]}).client("s3control", region="us-east-1")
+        user.delete_access_point_policy(AccountId=ACCOUNT, Name="policy")
+        if auth_enabled:
+            for call in (user.get_access_point, user.delete_access_point):
+                with pytest.raises(ClientError) as exc:
+                    call(AccountId=ACCOUNT, Name="policy")
+                assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert ctl.get_access_point(AccountId=ACCOUNT, Name="policy")["Bucket"] == bucket
+        else:
+            assert user.get_access_point(AccountId=ACCOUNT, Name="policy")["Bucket"] == bucket
+            user.delete_access_point(AccountId=ACCOUNT, Name="policy")
+    finally:
+        try:
+            ctl.delete_access_point(AccountId=ACCOUNT, Name="policy")
+        except ClientError:
+            pass
+
+
+@pytest.mark.auth_contract
+def test_access_point_policy_unserved_method_is_refused_before_authorization(auth_enabled, iam_user, access_point):
+    """POST on an access point policy answers 405 to any caller and returns no policy."""
+    name, _ = access_point
+    _client("s3control", "us-east-1").put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}/object/*"}]}))
+    user = iam_user()
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        signed = {"key": (key["AccessKeyId"], key["SecretAccessKey"]), "headers": {"x-amz-account-id": ACCOUNT}}
+        host, path = ENDPOINT.split("://", 1)[1], f"/v20180820/accesspoint/{name}/policy"
+        status, _, data = _raw("POST", host, path, "us-east-1", **signed)
+        assert status == 405 and b"<ResourceType>ACCESSPOINTPOLICY</ResourceType>" in data
+        assert b"<Policy>" not in data
+        assert _raw("GET", host, path, "us-east-1", **signed)[0] == (403 if auth_enabled else 200)
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
 # --- Data plane --------------------------------------------------------------
 
-def _raw(method, host, path, region, body=b""):
+def _raw(method, host, path, region, body=b"", key=("test", "test"), headers=None):
     """A SigV4-signed request with an explicit Host, no redirect handling."""
     import hashlib
     import http.client
@@ -170,9 +251,9 @@ def _raw(method, host, path, region, body=b""):
     from botocore.awsrequest import AWSRequest
     from botocore.credentials import Credentials
 
-    req = AWSRequest(method=method, url=f"http://{host}{path}", data=body)
+    req = AWSRequest(method=method, url=f"http://{host}{path}", data=body, headers=headers)
     req.headers["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
-    S3SigV4Auth(Credentials("test", "test"), "s3", region).add_auth(req)
+    S3SigV4Auth(Credentials(*key), "s3", region).add_auth(req)
     parsed = urlparse(ENDPOINT)
     conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
     conn.request(method, path, body=body or None, headers={**dict(req.headers.items()), "Host": host})

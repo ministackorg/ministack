@@ -16,7 +16,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import patch_endpoint_dns
+from conftest import make_client, patch_endpoint_dns
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 ACCOUNT = "000000000000"
@@ -188,6 +188,102 @@ def test_object_lambda_control_validation(supporting_access_point, upper_functio
             AccountId=ACCOUNT, Name=f"olap-{_uid()}", Configuration=config)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+
+
+@pytest.fixture
+def control_olap(supporting_access_point):
+    """An Object Lambda Access Point with a policy, for control-plane requests only."""
+    _, supporting_arn = supporting_access_point
+    ctl = _client("s3control")
+    name = f"olap-{_uid()}"
+    function_arn = f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:olap-unused"
+    arn = ctl.create_access_point_for_object_lambda(
+        AccountId=ACCOUNT, Name=name, Configuration=_configuration(supporting_arn, function_arn),
+    )["ObjectLambdaAccessPointArn"]
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"},
+        "Action": "s3-object-lambda:GetObject", "Resource": arn}]})
+    ctl.put_access_point_policy_for_object_lambda(AccountId=ACCOUNT, Name=name, Policy=policy)
+    yield name, policy
+    try:
+        ctl.delete_access_point_for_object_lambda(AccountId=ACCOUNT, Name=name)
+    except ClientError:
+        pass
+
+
+_OLAP_POLICY_BODY = (b"<PutAccessPointPolicyForObjectLambdaRequest><Policy>{}</Policy>"
+                     b"</PutAccessPointPolicyForObjectLambdaRequest>")
+
+
+def _control_raw(method, path, body=b"", key=("test", "test")):
+    """A SigV4-signed S3 Control request, the path sent as given: status and body."""
+    import hashlib
+    import http.client
+    from urllib.parse import urlparse
+
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", data=body, headers={"x-amz-account-id": ACCOUNT})
+    req.headers["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
+    S3SigV4Auth(Credentials(*key), "s3", "us-east-1").add_auth(req)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, path, body=body or None, headers=dict(req.headers.items()))
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+@pytest.mark.parametrize("method,path,status,fields", [
+    ("POST", "/{ol}/policy", 405, {"Method": "POST", "ResourceType": "OBJECT_LAMBDA_ACCESS_POINT_POLICY"}),
+    ("POST", "/{ol}", 405, {"Method": "POST", "ResourceType": "OBJECT_LAMBDA_ACCESS_POINT"}),
+    ("POST", "/{ol}/configuration", 405,
+     {"Method": "POST", "ResourceType": "OBJECT_LAMBDA_ACCESS_POINT_CONFIGURATION"}),
+    ("DELETE", "/{ol}/configuration", 405,
+     {"Method": "DELETE", "ResourceType": "OBJECT_LAMBDA_ACCESS_POINT_CONFIGURATION"}),
+    ("POST", "", 405, {"Method": "POST", "ResourceType": "OBJECT_LAMBDA_ACCESS_POINTS"}),
+    ("DELETE", "/{ol}/x", 400, {"URI": "accesspointforobjectlambda/{ol}/x"}),
+    ("GET", "/{ol}/x", 400, {}),
+    ("PUT", "//{ol}/policy", 400, {}),
+    ("GET", "//{ol}/policy", 400, {}),
+    ("GET", "/", 400, {}),    ("GET", "/{ol}/policyStatus", 404, {"AccessPointName": "{ol}/policyStatus"}),
+])
+def test_object_lambda_control_unserved_requests(control_olap, method, path, status, fields):
+    """Unserved methods answer 405, unparsed paths 400, unemulated routes 404; none changes the access point."""
+    name, policy = control_olap
+    got, data = _control_raw(method, "/v20180820/accesspointforobjectlambda" + path.format(ol=name),
+                             _OLAP_POLICY_BODY if method == "PUT" else b"")
+    code = {405: "MethodNotAllowed", 400: "InvalidURI", 404: "NoSuchAccessPoint"}[status]
+    assert (got, re.search(rb"<Code>(\w+)</Code>", data).group(1).decode()) == (status, code)
+    for tag, value in fields.items():
+        assert f"<{tag}>{value.format(ol=name)}</{tag}>".encode() in data
+    ctl = _client("s3control")
+    assert ctl.get_access_point_policy_for_object_lambda(AccountId=ACCOUNT, Name=name)["Policy"] == policy
+    assert ctl.get_access_point_configuration_for_object_lambda(AccountId=ACCOUNT, Name=name)["Configuration"]
+
+
+@pytest.mark.auth_contract
+def test_object_lambda_control_unparsed_paths_change_nothing(auth_enabled, iam_user, control_olap):
+    """An extra segment or a double slash neither deletes the access point nor sets its policy."""
+    name, policy = control_olap
+    user = iam_user()
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    creds = (key["AccessKeyId"], key["SecretAccessKey"])
+    prefix = "/v20180820/accesspointforobjectlambda"
+    try:
+        assert _control_raw("DELETE", f"{prefix}/{name}/x", key=creds)[0] == 400
+        assert _control_raw("PUT", f"{prefix}//{name}/policy", _OLAP_POLICY_BODY, key=creds)[0] == 400
+        assert _control_raw("POST", f"{prefix}/{name}/policy", key=creds)[0] == 405
+        assert _control_raw("GET", f"{prefix}/{name}", key=creds)[0] == (403 if auth_enabled else 200)
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+    ctl = _client("s3control")
+    assert ctl.get_access_point_for_object_lambda(AccountId=ACCOUNT, Name=name)["Name"] == name
+    assert ctl.get_access_point_policy_for_object_lambda(AccountId=ACCOUNT, Name=name)["Policy"] == policy
 
 
 # --- Routing and WriteGetObjectResponse ------------------------------------

@@ -9472,6 +9472,37 @@ def _mrap_submit_routes(record: dict, body: bytes) -> tuple:
     return 200, {"Content-Type": "application/xml"}, b""
 
 
+# Each Multi-Region Access Point instance resource, by the segment after the
+# reference (None for the collection): its ResourceType and the IAM action per
+# method. A documented resource MiniStack does not emulate has no ResourceType.
+_MRAP_RESOURCES = {
+    None: ("MULTI_REGION_ACCESS_POINTS", {"GET": "s3:ListMultiRegionAccessPoints"}),
+    "": ("MULTI_REGION_ACCESS_POINT", {"GET": "s3:GetMultiRegionAccessPoint"}),
+    "policy": ("GET_MULTI_REGION_ACCESS_POINT_POLICY", {"GET": "s3:GetMultiRegionAccessPointPolicy"}),
+    "policystatus": (None, {"GET": "s3:GetMultiRegionAccessPointPolicyStatus"}),
+    "routes": ("MULTI_REGION_ACCESS_POINT_ROUTES", {"GET": "s3:GetMultiRegionAccessPointRoutes",
+                                                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}),
+}
+
+
+def mrap_control_route(path: str) -> tuple | None:
+    """``(reference, sub-resource, resource type, IAM actions by method)`` of an MRAP instances path, or None."""
+    rest = url_unquote(path)[len(_MRAP_INSTANCES_PREFIX):]
+    if not rest:
+        ref, sub = "", None
+    elif not rest.startswith("/") or not all(segments := rest[1:].split("/")):
+        return None
+    elif len(segments) > 1 and segments[-1] == "routes":  # routes take the MRAP's ARN, which holds a slash
+        ref, sub = "/".join(segments[:-1]), "routes"
+    elif len(segments) == 1:
+        ref, sub = segments[0], ""
+    elif len(segments) == 2 and segments[1] in ("policy", "policystatus"):
+        ref, sub = segments
+    else:
+        return None
+    return ref, sub, *_MRAP_RESOURCES[sub]
+
+
 def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     """S3 Control's Multi-Region Access Point operations (``/v20180820/mrap/``
     and ``/v20180820/async-requests/mrap/``). Management is served from
@@ -9479,7 +9510,9 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
     without a signing region is let through, as S3's own region check does."""
     signed = _signed_region(headers, query_params)
     decoded = url_unquote(path)
-    is_routes = decoded.startswith(_MRAP_INSTANCES_PREFIX + "/") and decoded.endswith("/routes")
+    is_instances = decoded == _MRAP_INSTANCES_PREFIX or decoded.startswith(_MRAP_INSTANCES_PREFIX + "/")
+    route = mrap_control_route(path) if is_instances else None
+    is_routes = route is not None and route[1] == "routes"
     if signed is not None:
         if is_routes and signed not in _MRAP_ROUTE_REGIONS:
             return _mrap_region_error(path, routes=True)
@@ -9492,12 +9525,13 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
             return _mrap_async(tail, body, signed)
         if method == "GET":
             return _mrap_describe(tail)
-    elif decoded.rstrip("/") == _MRAP_INSTANCES_PREFIX and method == "GET":
-        return _mrap_list(query_params)
-    elif decoded.startswith(_MRAP_INSTANCES_PREFIX + "/"):
-        ref = decoded[len(_MRAP_INSTANCES_PREFIX) + 1:]
-        if is_routes:
-            ref = ref[: -len("/routes")]
+    elif is_instances:
+        if route is None or method not in route[3]:
+            return _control_route_error(method, path, route)
+        ref, sub = route[0], route[1]
+        if sub is None:
+            return _mrap_list(query_params)
+        if sub == "routes":
             if not ref.startswith("arn:"):
                 return s3control_error("InvalidRequest", "Request invalid", 400)
             record = find_mrap(ref)
@@ -9505,18 +9539,17 @@ def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, quer
                 return _no_such_mrap(ref.rsplit("/", 1)[-1])
             if method == "GET":
                 return _mrap_get_routes(ref, record)
-            if method == "PATCH":
-                return _mrap_submit_routes(record, body)
-        elif ref.endswith("/policy") and method == "GET":
-            record = find_mrap(ref[: -len("/policy")])
-            return _mrap_policy(record) if record else _no_such_mrap(ref[: -len("/policy")])
-        elif method == "GET":
-            record = find_mrap(ref)
-            if record is None:
-                return _no_such_mrap(ref)
-            out = Element("GetMultiRegionAccessPointResult", xmlns=S3CONTROL_NS)
-            _mrap_report_xml(out, record)
-            return _s3control_response(out)
+            return _mrap_submit_routes(record, body)
+        if route[2] is None:
+            return _no_such_mrap(f"{ref}/{sub}")
+        record = find_mrap(ref)
+        if record is None:
+            return _no_such_mrap(ref)
+        if sub == "policy":
+            return _mrap_policy(record)
+        out = Element("GetMultiRegionAccessPointResult", xmlns=S3CONTROL_NS)
+        _mrap_report_xml(out, record)
+        return _s3control_response(out)
     return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405)
 
 
@@ -9671,30 +9704,74 @@ def is_access_point_control_path(path: str) -> bool:
     return path.rstrip("/") == _ACCESS_POINT_PREFIX or path.startswith(_ACCESS_POINT_PREFIX + "/")
 
 
+# Each resource under an S3 Control prefix, by the segment after the name (None
+# for the collection): its ResourceType and the IAM action per method. A
+# documented resource MiniStack does not emulate has no ResourceType.
+_ACCESS_POINT_RESOURCES = {
+    None: ("ACCESSPOINTS", {"GET": "s3:ListAccessPoints"}),
+    "": ("ACCESSPOINT", {"PUT": "s3:CreateAccessPoint", "GET": "s3:GetAccessPoint", "DELETE": "s3:DeleteAccessPoint"}),
+    "policy": ("ACCESSPOINTPOLICY", {"PUT": "s3:PutAccessPointPolicy", "GET": "s3:GetAccessPointPolicy",
+                                     "DELETE": "s3:DeleteAccessPointPolicy"}),
+    "policyStatus": (None, {"GET": "s3:GetAccessPointPolicyStatus"}),
+    "scope": (None, {"PUT": "s3express:PutAccessPointScope", "GET": "s3express:GetAccessPointScope",
+                     "DELETE": "s3express:DeleteAccessPointScope"}),
+}
+
+
+def _control_route(path: str, prefix: str, resources: dict) -> tuple | None:
+    """``(name, sub-resource, resource type, IAM actions by method)`` of a path under ``prefix``, or None."""
+    parts = url_unquote(path)[len(prefix):].split("/")
+    if parts == [""]:
+        name, sub = "", None
+    elif len(parts) in (2, 3) and not parts[0] and all(parts[1:]):
+        name, sub = parts[1], parts[2] if len(parts) == 3 else ""
+    else:
+        return None
+    if sub not in resources:
+        return None
+    return name, sub, *resources[sub]
+
+
+def access_point_control_route(path: str) -> tuple | None:
+    """The route of an access point control request, as ``_control_route``."""
+    return _control_route(path, _ACCESS_POINT_PREFIX, _ACCESS_POINT_RESOURCES)
+
+
+def _control_route_error(method: str, path: str, route: tuple | None) -> tuple:
+    if route is None:
+        return s3control_error("InvalidURI", "Couldn't parse the specified URI.", 400,
+                               {"URI": path.split("/v20180820/", 1)[-1]})
+    extra = {"Method": method, "ResourceType": route[2]} if route[2] else {"Method": method}
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405,
+                           extra)
+
+
 def handle_access_point_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     """S3 Control access point operations in the request's region."""
-    tail = url_unquote(path).rstrip("/")[len(_ACCESS_POINT_PREFIX):].strip("/")
-    if not tail:
-        if method == "GET":
-            return _access_point_list(query_params)
-    elif tail.endswith("/policy"):
-        return _access_point_policy(tail[: -len("/policy")], method, body)
-    elif method == "PUT":
-        return _access_point_create_request(tail, body)
-    elif method == "GET":
-        record = _access_points.get(tail)
+    route = access_point_control_route(path)
+    if route is None or method not in route[3]:
+        return _control_route_error(method, path, route)
+    name, sub = route[0], route[1]
+    if route[2] is None:
+        return _no_such_access_point(f"{name}/{sub}").response()
+    if sub is None:
+        return _access_point_list(query_params)
+    if sub == "policy":
+        return _access_point_policy(name, method, body)
+    if method == "PUT":
+        return _access_point_create_request(name, body)
+    if method == "GET":
+        record = _access_points.get(name)
         if record is None:
-            return _no_such_access_point(tail).response()
+            return _no_such_access_point(name).response()
         out = Element("GetAccessPointResult", xmlns=S3CONTROL_NS)
         _access_point_xml(out, record, full=True)
         return _s3control_response(out)
-    elif method == "DELETE":
-        try:
-            delete_access_point(tail)
-        except AccessPointError as exc:
-            return exc.response()
-        return 204, {}, b""
-    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405)
+    try:
+        delete_access_point(name)
+    except AccessPointError as exc:
+        return exc.response()
+    return 204, {}, b""
 
 
 # ---------------------------------------------------------------------------
@@ -9821,6 +9898,26 @@ def is_object_lambda_control_path(path: str) -> bool:
     return path.rstrip("/") == _OBJECT_LAMBDA_PREFIX or path.startswith(_OBJECT_LAMBDA_PREFIX + "/")
 
 
+_OBJECT_LAMBDA_RESOURCES = {
+    None: ("OBJECT_LAMBDA_ACCESS_POINTS", {"GET": "s3:ListAccessPointsForObjectLambda"}),
+    "": ("OBJECT_LAMBDA_ACCESS_POINT", {"PUT": "s3:CreateAccessPointForObjectLambda",
+                                        "GET": "s3:GetAccessPointForObjectLambda",
+                                        "DELETE": "s3:DeleteAccessPointForObjectLambda"}),
+    "configuration": ("OBJECT_LAMBDA_ACCESS_POINT_CONFIGURATION", {
+        "PUT": "s3:PutAccessPointConfigurationForObjectLambda",
+        "GET": "s3:GetAccessPointConfigurationForObjectLambda"}),
+    "policy": ("OBJECT_LAMBDA_ACCESS_POINT_POLICY", {"PUT": "s3:PutAccessPointPolicyForObjectLambda",
+                                                     "GET": "s3:GetAccessPointPolicyForObjectLambda",
+                                                     "DELETE": "s3:DeleteAccessPointPolicyForObjectLambda"}),
+    "policyStatus": (None, {"GET": "s3:GetAccessPointPolicyStatusForObjectLambda"}),
+}
+
+
+def object_lambda_control_route(path: str) -> tuple | None:
+    """The route of an Object Lambda Access Point control request, as ``_control_route``."""
+    return _control_route(path, _OBJECT_LAMBDA_PREFIX, _OBJECT_LAMBDA_RESOURCES)
+
+
 def _object_lambda_request(name: str, method: str, body: bytes, sub: str) -> tuple:
     record = _object_lambda_access_points.get(name)
     if method == "PUT" and not sub:
@@ -9878,11 +9975,13 @@ def _object_lambda_request(name: str, method: str, body: bytes, sub: str) -> tup
 
 def handle_object_lambda_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     """S3 Control Object Lambda Access Point operations in the request's region."""
-    tail = url_unquote(path).rstrip("/")[len(_OBJECT_LAMBDA_PREFIX):].strip("/")
-    if not tail:
-        if method != "GET":
-            return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.",
-                                   405)
+    route = object_lambda_control_route(path)
+    if route is None or method not in route[3]:
+        return _control_route_error(method, path, route)
+    name, sub = route[0], route[1]
+    if route[2] is None:
+        return _no_such_object_lambda(f"{name}/{sub}").response()
+    if sub is None:
         records = sorted(_object_lambda_access_points.values(), key=lambda r: r["Name"])
         start = int(_qp(query_params, "nextToken", "0") or "0")
         max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
@@ -9896,7 +9995,6 @@ def handle_object_lambda_control(method: str, path: str, headers: dict, body: by
         if start + max_results < len(records):
             SubElement(out, "NextToken").text = str(start + max_results)
         return _s3control_response(out)
-    name, _, sub = tail.partition("/")
     return _object_lambda_request(name, method, body, sub)
 
 

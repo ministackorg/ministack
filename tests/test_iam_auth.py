@@ -2269,6 +2269,17 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/distribution/E123ABC", {}, b"", {}, "us-east-1", "123") == "arn:aws:cloudfront::123:distribution/E123ABC"
 
+    def test_cloudfront_vpc_origin(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        for method, action in (("GET", "GetVpcOrigin"), ("PUT", "UpdateVpcOrigin"), ("DELETE", "DeleteVpcOrigin")):
+            assert extract_resource_arn("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {},
+                                        "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/vo_abc"
+            assert extract_iam_action("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {}) == f"cloudfront:{action}"
+        # R2 U17/p1-create-on-A: CreateVpcOrigin authorizes on vpcorigin/*.
+        assert extract_resource_arn("cloudfront", "POST", "/2020-05-31/vpc-origin", {}, b"", {},
+                                    "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/*"
+        assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/vpc-origin", {}, b"", {}, "us-east-1", "123") == "*"
+
     def test_route53_hostedzone(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("route53", "GET", "/2013-04-01/hostedzone/Z123", {}, b"", {}, "us-east-1", "123") == "arn:aws:route53:::hostedzone/Z123"
@@ -6086,6 +6097,16 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
      "s3:GetMultiRegionAccessPointRoutes"),
     ("PATCH", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
      "s3:SubmitMultiRegionAccessPointRoutes"),
+    ("GET", "/v20180820/mrap/instances/policy", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/routes", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policystatus", "s3:GetMultiRegionAccessPointPolicyStatus"),
+    ("GET", "/v20180820/mrap/instances/", None),
+    ("GET", "/v20180820/mrap/instances/m1/", None),
+    ("GET", "/v20180820/mrap/instances/m1/policy/", None),
+    ("GET", "/v20180820/mrap/instances/m1/x", None),
+    ("POST", "/v20180820/mrap/instances/m1/policy", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes/", None),
 ])
 def test_s3control_mrap_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
@@ -6175,6 +6196,16 @@ def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
     ("PUT", "/v20180820/accesspoint/ap1/policy", "s3:PutAccessPointPolicy"),
     ("GET", "/v20180820/accesspoint/ap1/policy", "s3:GetAccessPointPolicy"),
     ("DELETE", "/v20180820/accesspoint/ap1/policy", "s3:DeleteAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/policy", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/policy", "s3:DeleteAccessPoint"),
+    ("POST", "/v20180820/accesspoint/ap1/policy", None),
+    ("POST", "/v20180820/accesspoint", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/x", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy/x", None),
+    ("PUT", "/v20180820/accesspoint//ap1/policy", None),
+    ("GET", "/v20180820/accesspoint/ap1/", None),
+    ("GET", "/v20180820/accesspoint/ap1/policyStatus", "s3:GetAccessPointPolicyStatus"),
+    ("PUT", "/v20180820/accesspoint/ap1/scope", "s3express:PutAccessPointScope"),
 ])
 def test_s3control_access_point_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action
@@ -6209,6 +6240,13 @@ def test_s3control_access_point_denied_without_the_action(monkeypatch):
     ("PUT", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:PutAccessPointPolicyForObjectLambda"),
     ("GET", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:GetAccessPointPolicyForObjectLambda"),
     ("DELETE", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:DeleteAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/policy", "s3:GetAccessPointForObjectLambda"),
+    ("POST", "/v20180820/accesspointforobjectlambda/ol/policy", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/configuration", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/x", None),
+    ("PUT", "/v20180820/accesspointforobjectlambda//ol/policy", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policyStatus", "s3:GetAccessPointPolicyStatusForObjectLambda"),
 ])
 def test_s3control_object_lambda_iam_action(method, path, action):
     from ministack.core.iam_actions import s3control_action

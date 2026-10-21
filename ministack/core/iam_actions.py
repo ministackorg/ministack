@@ -274,60 +274,29 @@ _S3CONTROL_MRAP_ASYNC_ACTIONS = {
 }
 
 
-_S3CONTROL_ACCESS_POINT_ACTIONS = {
-    ("PUT", False): "s3:CreateAccessPoint",
-    ("GET", False): "s3:GetAccessPoint",
-    ("DELETE", False): "s3:DeleteAccessPoint",
-    ("PUT", True): "s3:PutAccessPointPolicy",
-    ("GET", True): "s3:GetAccessPointPolicy",
-    ("DELETE", True): "s3:DeleteAccessPointPolicy",
-}
-
-
-_S3CONTROL_OBJECT_LAMBDA_ACTIONS = {
-    ("PUT", ""): "s3:CreateAccessPointForObjectLambda",
-    ("GET", ""): "s3:GetAccessPointForObjectLambda",
-    ("DELETE", ""): "s3:DeleteAccessPointForObjectLambda",
-    ("PUT", "configuration"): "s3:PutAccessPointConfigurationForObjectLambda",
-    ("GET", "configuration"): "s3:GetAccessPointConfigurationForObjectLambda",
-    ("PUT", "policy"): "s3:PutAccessPointPolicyForObjectLambda",
-    ("GET", "policy"): "s3:GetAccessPointPolicyForObjectLambda",
-    ("DELETE", "policy"): "s3:DeleteAccessPointPolicyForObjectLambda",
-}
-
-
 def s3control_action(method: str, path: str) -> str | None:
     """IAM action for an S3 Control Multi-Region Access Point or access point request, or None."""
     from urllib.parse import unquote
 
-    path = unquote(path).rstrip("/")
-    object_lambda = "/v20180820/accesspointforobjectlambda"
-    if path == object_lambda:
-        return "s3:ListAccessPointsForObjectLambda" if method == "GET" else None
-    if path.startswith(object_lambda + "/"):
-        sub = path[len(object_lambda) + 1:].partition("/")[2]
-        return _S3CONTROL_OBJECT_LAMBDA_ACTIONS.get((method, sub))
-    access_points = "/v20180820/accesspoint"
-    if path == access_points:
-        return "s3:ListAccessPoints" if method == "GET" else None
-    if path.startswith(access_points + "/"):
-        return _S3CONTROL_ACCESS_POINT_ACTIONS.get((method, path.endswith("/policy")))
-    async_prefix = "/v20180820/async-requests/mrap/"
+    from ministack.services import s3
+
+    # Access point and MRAP instance actions come from the route the handler serves.
+    for in_family, route_of in ((s3.is_object_lambda_control_path, s3.object_lambda_control_route),
+                                (s3.is_access_point_control_path, s3.access_point_control_route)):
+        if in_family(path):
+            route = route_of(path)
+            return route[3].get(method) if route else None
     instances = "/v20180820/mrap/instances"
+    if unquote(path) == instances or unquote(path).startswith(instances + "/"):
+        route = s3.mrap_control_route(path)
+        return route[3].get(method) if route else None
+    path = unquote(path).rstrip("/")
+    async_prefix = "/v20180820/async-requests/mrap/"
     if path.startswith(async_prefix):
         tail = path[len(async_prefix):]
         if method == "POST":
             return _S3CONTROL_MRAP_ASYNC_ACTIONS.get(tail)
         return "s3:DescribeMultiRegionAccessPointOperation" if method == "GET" else None
-    if path == instances:
-        return "s3:ListMultiRegionAccessPoints" if method == "GET" else None
-    if path.startswith(instances + "/"):
-        if path.endswith("/routes"):
-            return {"GET": "s3:GetMultiRegionAccessPointRoutes",
-                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}.get(method)
-        if path.endswith("/policy"):
-            return "s3:GetMultiRegionAccessPointPolicy" if method == "GET" else None
-        return "s3:GetMultiRegionAccessPoint" if method == "GET" else None
     return None
 
 
@@ -1447,12 +1416,19 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudfront":
-        # REST: /2020-05-31/distribution/{id}
+        # REST: /2020-05-31/distribution/{id}, /2020-05-31/vpc-origin/{id}
         parts = [p for p in path.split("/") if p]
         if "distribution" in parts:
             di = parts.index("distribution")
             if di + 1 < len(parts):
                 return f"arn:aws:cloudfront::{account_id}:distribution/{parts[di + 1]}"
+        if "vpc-origin" in parts:
+            vi = parts.index("vpc-origin")
+            if vi + 1 < len(parts):
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/{parts[vi + 1]}"
+            if method == "POST":
+                # CreateVpcOrigin authorizes on every VPC origin of the account.
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/*"
         return "*"
 
     if service in ("cognito-idp", "cognito_idp"):
