@@ -877,6 +877,29 @@ def test_s3_location_constraint_required_outside_us_east_1(s3):
         euw1.delete_bucket(Bucket=bkt)
 
 
+def test_s3_location_constraint_eu_is_eu_west_1(s3):
+    """EU is the legacy LocationConstraint for eu-west-1: eu-west-1 accepts it
+    and GetBucketLocation answers EU, other regional endpoints refuse it
+    (observed on AWS 2026-10-20)."""
+    euw1 = _regional_client("s3", "eu-west-1")
+    bkt = f"intg-s3-loc-eu-{_uuid_mod.uuid4().hex[:8]}"
+    euw1.create_bucket(Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "EU"})
+    try:
+        assert euw1.get_bucket_location(Bucket=bkt)["LocationConstraint"] == "EU"
+        euw1.put_object(Bucket=bkt, Key="k", Body=b"x")
+        assert euw1.get_object(Bucket=bkt, Key="k")["Body"].read() == b"x"
+    finally:
+        euw1.delete_object(Bucket=bkt, Key="k")
+        euw1.delete_bucket(Bucket=bkt)
+
+    euc1 = _regional_client("s3", "eu-central-1")
+    resp = _create_bucket_error(euc1, Bucket=f"intg-s3-loc-eu-c1-{_uuid_mod.uuid4().hex[:8]}",
+                                CreateBucketConfiguration={"LocationConstraint": "EU"})
+    assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+    assert resp["Error"]["Message"] == ("The EU location constraint is incompatible for the "
+                                        "region specific endpoint this request was sent to.")
+
+
 def test_s3_location_constraint_us_east_1_is_invalid(s3):
     bkt = f"intg-s3-loc-use1-{_uuid_mod.uuid4().hex[:8]}"
     for client in (s3, _regional_client("s3", "eu-west-1")):

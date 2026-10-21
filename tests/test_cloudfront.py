@@ -3066,3 +3066,33 @@ def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
         raw = resp.read()
     assert b"ns0:" not in raw, "namespace prefixes leaked into the response XML"
     assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw
+
+
+def test_cf_distribution_webacl_associate_disassociate(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    created = cloudfront.create_distribution(DistributionConfig=_custom_origin_distribution_config(f"acl-{sfx}"))
+    dist_id = created["Distribution"]["Id"]
+    acl_arn = f"arn:aws:wafv2:us-east-1:000000000000:global/webacl/test/{sfx}"
+
+    assoc = cloudfront.associate_distribution_web_acl(Id=dist_id, WebACLArn=acl_arn, IfMatch=created["ETag"])
+    assert assoc["Id"] == dist_id
+    assert assoc["ETag"] != created["ETag"]
+
+    cfg = cloudfront.get_distribution_config(Id=dist_id)
+    assert cfg["DistributionConfig"]["WebACLId"] == acl_arn
+    assert cfg["ETag"] == assoc["ETag"]
+    assert cloudfront.get_distribution(Id=dist_id)["Distribution"]["DistributionConfig"]["WebACLId"] == acl_arn
+
+    # a stale ETag is refused
+    with pytest.raises(ClientError) as exc:
+        cloudfront.associate_distribution_web_acl(Id=dist_id, WebACLArn=acl_arn, IfMatch=created["ETag"])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    dis = cloudfront.disassociate_distribution_web_acl(Id=dist_id, IfMatch=assoc["ETag"])
+    assert dis["Id"] == dist_id
+    assert dis["ETag"] != assoc["ETag"]
+    assert cloudfront.get_distribution_config(Id=dist_id)["DistributionConfig"].get("WebACLId", "") == ""
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.associate_distribution_web_acl(Id="E0000000000000", WebACLArn=acl_arn, IfMatch="x")
+    assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
