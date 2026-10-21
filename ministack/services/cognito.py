@@ -1069,8 +1069,10 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
             "iamRolesToOverride": [],
             "preferredRole": None,
         },
-        "clientMetadata": client_metadata or {},
     }
+    # AWS leaves clientMetadata out when the request sent none.
+    if client_metadata:
+        request_block["clientMetadata"] = client_metadata
     if version.startswith("V2") or version.startswith("V3"):
         request_block["scopes"] = _aws_scope_order(scope.split(), presized=False)
 
@@ -1088,7 +1090,7 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
         "userPoolId": pool_id,
         "userName": "ClientCredentials" if trigger_source == "TokenGeneration_ClientCredentials" else username or "",
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": client_id or "",
         },
         "request": request_block,
@@ -1217,7 +1219,7 @@ def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: st
         "region": _pool_region(pool_id),
         "userPoolId": pool_id,
         "userName": username or "",
-        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
         "request": {
             "providerName": provider_name,
             "providerType": provider_type,
@@ -1268,7 +1270,7 @@ def _build_presignup_event(pool_id: str, client_id: str, username: str,
         "userPoolId": pool_id,
         "userName": username or "",
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": client_id or "",
         },
         "request": {
@@ -1657,7 +1659,7 @@ def _build_define_auth_challenge_event(pool_id: str, client_id: str, username: s
         "userPoolId": pool_id,
         "userName": username,
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": client_id,
         },
         "request": {
@@ -1689,7 +1691,7 @@ def _build_create_auth_challenge_event(pool_id: str, client_id: str, username: s
         "userPoolId": pool_id,
         "userName": username,
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": client_id,
         },
         "request": {
@@ -1724,7 +1726,7 @@ def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: s
         "userPoolId": pool_id,
         "userName": username,
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": client_id,
         },
         "request": {
@@ -3529,7 +3531,7 @@ def _apply_custom_message_trigger(pool: dict, trigger_source: str, username: str
         "userPoolId": pool_id,
         "userName": username or "",
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": "CLIENT_ID_NOT_APPLICABLE",
         },
         "request": {
