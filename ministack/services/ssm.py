@@ -401,6 +401,8 @@ def resolve_parameter_value(name_or_arn, version=None, decrypt=False):
     if not name_or_arn:
         return None
     name, param = _lookup_parameter(name_or_arn, allow_arn_region=True, flexible_name=True)
+    if not param and version is None:
+        param = _public_parameter(name_or_arn)
     if not param:
         return None
     if version is not None and str(version) != str(param.get("Version")):
@@ -424,10 +426,28 @@ def _split_selector(name_or_arn):
     return base, selector
 
 
+# Public latest-AMI parameters every account can read, pointed at the stub images in ec2.py.
+_PUBLIC_AMI_PARAMETERS = {
+    "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64": "ami-0c2023a1b2c3d4e5f",
+    "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2": "ami-0abcdef1234567890",
+}
+
+
+def _public_parameter(name):
+    """A public parameter as AWS serves it, with no account in the ARN."""
+    image_id = _PUBLIC_AMI_PARAMETERS.get(name)
+    if image_id is None:
+        return None
+    return {"Name": name, "Type": "String", "Value": image_id, "Version": 1, "LastModifiedDate": 0,
+            "ARN": f"arn:aws:ssm:{get_region()}::parameter{name}"}
+
+
 def _select_parameter(name_or_arn):
     """(param, error) for GetParameter / GetParameters, honouring name:version and name:label."""
     base, selector = _split_selector(name_or_arn)
     name, param = _lookup_parameter(base)
+    if not param and selector is None:
+        param = _public_parameter(base)
     if not param:
         return None, "ParameterNotFound"
     if selector is None:
