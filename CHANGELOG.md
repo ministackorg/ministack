@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **CloudFront — web ACL association for distributions** — `AssociateDistributionWebACL` and `DisassociateDistributionWebACL` set and clear `WebACLId` in the distribution's config, so `GetDistribution`, `GetDistributionConfig` and `ListDistributions` report it, and answer with the new `ETag`. They need the current `If-Match` (`InvalidIfMatchVersion`, `PreconditionFailed`) and a `WebACLArn`, and a missing distribution answers `NoSuchDistribution`. The web ACL is not looked up and is not evaluated. Contributed by @OS-kiranmalsetty.
 - **Route 53 — VPC associations for private hosted zones** — `AssociateVPCWithHostedZone`, `DisassociateVPCFromHostedZone` and `ListHostedZonesByVPC` (paged with `MaxItems` and `NextToken`). They refuse a public zone (`PublicZoneVPCAssociation`), a VPC already associated with a zone of the same name (`ConflictingDomainExists`), a VPC the zone doesn't have (404 `VPCAssociationNotFound`) and the zone's last VPC (`LastVPCAssociation`). Contributed by @kharabasz.
 
 ### Fixed
