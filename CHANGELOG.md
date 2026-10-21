@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT — thing-group membership authorized on the group and the thing** — with `AUTH=true`, `AddThingToThingGroup` and `RemoveThingFromThingGroup` were authorized on `thinggroup/addThingToThingGroup` (the request path), so a policy granting exactly the thing group and the thing was denied; both calls are now checked on the thing group and then the thing named in the body (by name or ARN), and a denial names the resource that failed. Contributed by @iot-rocket.
+
 ## [1.5.31] — 2026-10-21
 
 ### Added

@@ -2875,6 +2875,7 @@ async def _dispatch_service_request(
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
+            iot_resource_arns,
             logs_service_context,
             request_tag_context,
             s3_access_point_resources,
@@ -2998,6 +2999,16 @@ async def _dispatch_service_request(
                         resource_arn=extra_arn,
                     )
                     if denied:
+                        break
+            # A thing-group membership call is also checked on the thing it names.
+            if service == "iot" and not denied:
+                for extra_arn in iot_resource_arns(method, path, body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn, service_context=service_context,
+                    )
+                    if denied:
+                        resource_arn = extra_arn  # named in the AccessDenied message
                         break
             if (
                 denied
