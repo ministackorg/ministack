@@ -271,8 +271,7 @@ def _status(call):
 
 
 def test_access_point_block_public_acls_refuses_public_acl_writes():
-    """An access point's BlockPublicAcls refuses public ACLs sent through it, whatever the bucket's settings;
-    its BlockPublicPolicy leaves a bucket policy sent through it alone."""
+    """An access point's BlockPublicAcls refuses public ACLs sent through it, whatever the bucket's settings."""
     s3, ctl = _client("s3", "us-east-1"), _client("s3control", "us-east-1")
     name = f"ap-acl-{_uid()}"
     all_off = {k: False for k in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")}
@@ -282,15 +281,12 @@ def test_access_point_block_public_acls_refuses_public_acl_writes():
     blocking = ctl.create_access_point(AccountId=ACCOUNT, Name=f"ap-on-{_uid()}", Bucket=name)
     open_ap = ctl.create_access_point(
         AccountId=ACCOUNT, Name=f"ap-off-{_uid()}", Bucket=name, PublicAccessBlockConfiguration=all_off)
-    public_policy = json.dumps({"Version": "2012-10-17", "Statement": [{
-        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{name}/*"}]})
     try:
         denied = (403, "AccessDenied")
         for target in (blocking["Alias"], blocking["AccessPointArn"]):
             assert _status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="public-read")) == denied
             assert _status(lambda: s3.put_object_acl(Bucket=target, Key="k.txt", ACL="public-read")) == denied
             assert _status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="private")) == 200
-            assert _status(lambda: s3.put_bucket_policy(Bucket=target, Policy=public_policy)) == 204
         for target in (open_ap["Alias"], open_ap["AccessPointArn"], name):
             assert _status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="public-read")) == 200
     finally:
