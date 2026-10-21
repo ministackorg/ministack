@@ -8720,6 +8720,89 @@ exports.handler = (event, ctx, cb) => {{
     assert received.get("body") == "test"
 
 
+@pytest.mark.parametrize("use_ssl", [False, True], ids=["plain", "use_ssl"])
+def test_nodejs_worker_https_call_forms_reach_the_gateway(tmp_path, use_ssl):
+    """Every https.request/https.get form and the SDK stubs reach the gateway, over TLS when its endpoint is https."""
+    import ssl
+    import subprocess
+    from http.server import ThreadingHTTPServer
+
+    seen = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _answer(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append((self.command, self.path, self.headers.get("X-Amz-Target")))
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-amz-json-1.1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_PUT = do_POST = _answer
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    env = {"AWS_ENDPOINT_URL": f"http://127.0.0.1:{port}"}
+    if use_ssl:
+        cert, key = tmp_path / "gw.crt", tmp_path / "gw.key"
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+            "-days", "1", "-subj", "/CN=gateway", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ], check=True, capture_output=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+        # A TLS-only listener, like the gateway under USE_SSL: a plain request fails the handshake.
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        env = {"AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}", "NODE_EXTRA_CA_CERTS": str(cert)}
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    handler_js = f"""\
+const https = require("https");
+const {{ SSMClient, DescribeParametersCommand }} = require("@aws-sdk/client-ssm");
+const base = "https://127.0.0.1:{port}";
+const call = (start) => new Promise((resolve) => {{
+  let req;
+  try {{
+    req = start((res) => {{ res.resume(); res.on("end", () => resolve(res.statusCode)); }});
+  }} catch (e) {{
+    return resolve(e.code || String(e));
+  }}
+  req.on("error", (e) => resolve(e.code || e.message));
+  if (!req.writableEnded) req.end();
+}});
+exports.handler = async () => ({{
+  urlOptions: await call((cb) => https.request(base + "/url-options", {{ method: "PUT" }}, cb)),
+  urlObject: await call((cb) => https.request(new URL(base + "/url-object"), cb)),
+  noPort: await call((cb) => https.request({{ hostname: "127.0.0.1", path: "/no-port", method: "PUT" }}, cb)),
+  port443: await call((cb) => https.request({{ hostname: "127.0.0.1", port: 443, path: "/port-443",
+    method: "PUT" }}, cb)),
+  getUrlOptions: await call((cb) => https.get(base + "/get", {{ headers: {{ "x-probe": "1" }} }}, cb)),
+  awsHost: await call((cb) => https.request({{ hostname: "ssm.us-east-1.amazonaws.com", path: "/aws-host",
+    method: "POST", headers: {{ host: "ssm.us-east-1.amazonaws.com" }} }}, cb)),
+  sdkStub: await new SSMClient({{}}).send(new DescribeParametersCommand({{}}))
+    .then(() => 200, (e) => e.code || String(e)),
+}});
+"""
+    try:
+        result = _run_nodejs_worker(handler_js, env_extra=env)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert result.get("status") == "ok", f"Handler failed: {result}"
+    assert set(result["result"].values()) == {200}, result["result"]
+    assert sorted(seen) == sorted([
+        ("PUT", "/url-options", None), ("GET", "/url-object", None), ("PUT", "/no-port", None),
+        ("PUT", "/port-443", None), ("GET", "/get", None), ("POST", "/aws-host", None),
+        ("POST", "/", "AmazonSSM.DescribeParameters"),
+    ])
+
+
 def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     """End-to-end: a Node.js Lambda using @aws-sdk/client-ssm's
     PutParameterCommand actually creates a parameter on MiniStack's SSM
@@ -12746,6 +12829,76 @@ def test_node_context_shim_keeps_https_to_a_tls_gateway(tmp_path):
         # Still TLS: the plain-HTTP listener never sees the request as HTTP.
         assert "error" in json.loads(proc.stdout)
         assert seen == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_node_context_shim_sends_the_https_default_port_to_a_tls_gateway(tmp_path):
+    """Under USE_SSL a CDK or cfn-response style PUT (no port, or 443) reaches the gateway port over TLS."""
+    import http.server
+    import ssl
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            seen.append((self.path, self.headers.get("Host")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    cert, key = tmp_path / "gw.crt", tmp_path / "gw.key"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+        "-days", "1", "-subj", "/CN=gateway", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+    ], check=True, capture_output=True)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve) => {\n"
+            "  const opts = {hostname: '127.0.0.1', path: '/_ministack/cfn-response/tok', method: 'PUT'};\n"
+            "  if (event.port) opts.port = event.port;\n"
+            "  const req = event.url ? https.request(event.url, {method: 'PUT'}) : https.request(opts);\n"
+            "  req.on('response', (res) => resolve({status: res.statusCode}));\n"
+            "  req.on('error', (e) => resolve({error: e.code || String(e)}));\n"
+            "  req.end('{}');\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {**os.environ, "LAMBDA_TASK_ROOT": str(code_dir), "_MS_REAL_HANDLER": "index.handler",
+               "AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}", "NODE_EXTRA_CA_CERTS": str(cert)}
+        script = ("require(process.argv[1]).handler(JSON.parse(process.argv[2]), {})"
+                  ".then((r) => process.stdout.write(JSON.stringify(r)));")
+
+        def run(event):
+            proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), json.dumps(event)],
+                                  env=env, capture_output=True, text=True, timeout=30)
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)
+
+        # The CDK shape (no port), the cfn-response shape (443) and a URL without a port.
+        assert run({}) == {"status": 200}
+        assert run({"port": 443}) == {"status": 200}
+        assert run({"url": "https://127.0.0.1/_ministack/cfn-response/tok"}) == {"status": 200}
+        assert [path for path, _host in seen] == ["/_ministack/cfn-response/tok"] * 3
+        assert all(host == f"127.0.0.1:{port}" for _path, host in seen)
+        # Any other explicit port is left alone.
+        assert "error" in run({"port": port + 1})
+        assert len(seen) == 3
     finally:
         server.shutdown()
         server.server_close()
