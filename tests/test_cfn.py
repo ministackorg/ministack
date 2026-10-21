@@ -24772,6 +24772,202 @@ def test_cfn_state_machine_update_keeps_arn_and_executions(cfn, sfn):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def _sfn_encryption_template(name, encryption=None, declared=True):
+    props = {
+        "StateMachineName": name,
+        "DefinitionString": _sfn_definition_json("enc"),
+        "RoleArn": "arn:aws:iam::000000000000:role/sfn-role",
+    }
+    if declared:
+        props["EncryptionConfiguration"] = encryption
+    return json.dumps({
+        "Resources": {"SM": {"Type": "AWS::StepFunctions::StateMachine", "Properties": props}},
+        "Outputs": {"Arn": {"Value": {"Ref": "SM"}}},
+    })
+
+
+def _sfn_cmk(key, period=300):
+    cfg = {"type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key}
+    if period is not None:
+        cfg["kmsDataKeyReusePeriodSeconds"] = period
+    return cfg
+
+
+def _cfn_sfn_update(cfn, stack_name, body):
+    cfn.update_stack(StackName=stack_name, TemplateBody=body)
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    return stack
+
+
+def test_cfn_state_machine_encryption_configuration_create_and_update(cfn, sfn, kms_client):
+    """CMK create, a string period updated in place, and a removed block that
+    keeps the configuration. AWS: captured 2026-10-20 (sfn-encryption-configuration
+    C44-C46; repeats sfn:C44, sfn:C45, sfn:C46:remove-block-after-600)."""
+    key = kms_client.create_key()["KeyMetadata"]["Arn"]
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-sfn-enc-{uid}"
+    cmk = {"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": key}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_sfn_encryption_template(
+        name, {**cmk, "KmsDataKeyReusePeriodSeconds": 300}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key)
+
+        stack = _cfn_sfn_update(cfn, stack_name, _sfn_encryption_template(
+            name, {**cmk, "KmsDataKeyReusePeriodSeconds": "600"}))
+        assert _output(stack, "Arn") == arn
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key, 600)
+
+        _cfn_sfn_update(cfn, stack_name, _sfn_encryption_template(name, declared=False))
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key, 600)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_encryption_configuration_period_defaults_to_300(cfn, sfn, kms_client):
+    """A block without KmsDataKeyReusePeriodSeconds stores 300, on create and on
+    an update from 600. AWS: captured 2026-10-20 (2308-cfn-period
+    5cfn:create-cmk-no-period, 5cfn:update-600-to-no-period)."""
+    key = kms_client.create_key()["KeyMetadata"]["Arn"]
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-sfn-enc-noper-{uid}"
+    cmk = {"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": key}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_sfn_encryption_template(name, cmk))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key, 300)
+
+        _cfn_sfn_update(cfn, stack_name, _sfn_encryption_template(
+            name, {**cmk, "KmsDataKeyReusePeriodSeconds": 600}))
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key, 600)
+
+        stack = _cfn_sfn_update(cfn, stack_name, _sfn_encryption_template(name, cmk))
+        assert _output(stack, "Arn") == arn
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key, 300)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_state_machine_without_encryption_configuration_is_aws_owned_key(cfn, sfn):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C47)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-sfn-enc-none-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_sfn_encryption_template(name, declared=False))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert sfn.describe_state_machine(stateMachineArn=_output(stack, "Arn"))[
+            "encryptionConfiguration"] == {"type": "AWS_OWNED_KEY"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+_UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_SFN_ANY_KEY = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000"
+_SFN_PERIOD_NOT_INTEGER = (
+    'Resource handler returned message: "Model validation failed (#/EncryptionConfiguration/'
+    "KmsDataKeyReusePeriodSeconds: expected type: Integer, found: String. This may occur when a numeric "
+    "value exceeds 32-bit integer max (2147483647). Consider using 'number' type or ensure value fits in "
+    'integer range.)" (RequestToken: ')
+
+
+@pytest.mark.parametrize("encryption,reason", [
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY"},
+     re.escape('Resource handler returned message: "Invalid Encryption Configuration: Must set a valid '
+               'kmsKeyId. (Service: Sfn, Status Code: 400, Request ID: ') + _UUID_RE
+     + re.escape(') (SDK Attempt Count: 1)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ("AWS_OWNED_KEY",
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: '
+               'expected type: JSONObject, found: String)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: '
+               'required key [Type] not found)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    # captures/2308-pr-uncertainties.json U16, U17, U18
+    ({"Type": "SOME_OTHER_KEY"},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration/Type: '
+               '#: only 1 subschema matches out of 2)\n#/EncryptionConfiguration/Type: failed validation '
+               'constraint for keyword [enum] (#/EncryptionConfiguration/Type)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": _SFN_ANY_KEY, "KmsDataKeyReusePeriodSeconds": 59},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration/'
+               'KmsDataKeyReusePeriodSeconds: failed validation constraint for keyword [minimum])" '
+               '(RequestToken: ') + _UUID_RE + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": ""},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration/'
+               'KmsKeyId: expected minLength: 1, actual: 0)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "AWS_OWNED_KEY", "KmsKeyId": _SFN_ANY_KEY},
+     re.escape('Resource handler returned message: "Invalid Encryption Configuration: Custom kmsKeyId is not '
+               'allowed when selecting AWS_OWNED_KEY. (Service: Sfn, Status Code: 400, Request ID: ') + _UUID_RE
+     + re.escape(') (SDK Attempt Count: 1)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    (5,
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: '
+               'expected type: JSONObject, found: String)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    (True,
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: '
+               'expected type: JSONObject, found: String)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ([],
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: '
+               'expected type: JSONObject, found: JSONArray)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": _SFN_ANY_KEY, "KmsDataKeyReusePeriodSeconds": "abc"},
+     re.escape(_SFN_PERIOD_NOT_INTEGER) + _UUID_RE + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": _SFN_ANY_KEY, "KmsDataKeyReusePeriodSeconds": "600.0"},
+     re.escape(_SFN_PERIOD_NOT_INTEGER) + _UUID_RE + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    # captures/2308-pr-uncertainties-2.json U23
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": _SFN_ANY_KEY, "KmsDataKeyReusePeriodSeconds": 901},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration/'
+               'KmsDataKeyReusePeriodSeconds: failed validation constraint for keyword [maximum])" '
+               '(RequestToken: ') + _UUID_RE + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": "k" * 2049},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration/'
+               'KmsKeyId: expected maxLength: 2048, actual: 2049)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "SOME_OTHER_KEY", "KmsKeyId": ""},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: 2 schema '
+               'violations found)\n#/EncryptionConfiguration/Type: #: only 1 subschema matches out of 2 '
+               '(#/EncryptionConfiguration/Type)\n#/EncryptionConfiguration/KmsKeyId: expected minLength: 1, '
+               'actual: 0 (#/EncryptionConfiguration/KmsKeyId)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+    ({"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": "", "KmsDataKeyReusePeriodSeconds": 59},
+     re.escape('Resource handler returned message: "Model validation failed (#/EncryptionConfiguration: 2 schema '
+               'violations found)\n#/EncryptionConfiguration/KmsKeyId: expected minLength: 1, actual: 0 '
+               '(#/EncryptionConfiguration/KmsKeyId)\n#/EncryptionConfiguration/KmsDataKeyReusePeriodSeconds: '
+               'failed validation constraint for keyword [minimum] '
+               '(#/EncryptionConfiguration/KmsDataKeyReusePeriodSeconds)" (RequestToken: ') + _UUID_RE
+     + re.escape(", HandlerErrorCode: InvalidRequest)")),
+], ids=["cmk-without-key", "string-block", "empty-block", "bad-type", "period-59", "empty-key",
+        "owned-with-key", "number-block", "bool-block", "list-block", "period-abc", "period-decimal-string",
+        "period-901", "long-key", "bad-type-and-empty-key", "empty-key-and-period-59"])
+def test_cfn_state_machine_invalid_encryption_configuration_fails(cfn, sfn, encryption, reason):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C48, C49, C51)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-sfn-enc-bad-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_sfn_encryption_template(name, encryption))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack["StackStatus"]
+        failed = [e["ResourceStatusReason"]
+                  for e in _all_pages(cfn, "describe_stack_events", "StackEvents", StackName=stack_name)
+                  if e["LogicalResourceId"] == "SM" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert len(failed) == 1, failed
+        assert re.fullmatch(reason, failed[0]), failed[0]
+        assert name not in [m["name"] for m in sfn.list_state_machines()["stateMachines"]]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_state_machine_type_change_under_custom_name_fails_loudly(cfn, sfn):
     """StateMachineType requires replacement, which CloudFormation refuses
     for a custom-named machine: the stack rolls back and the machine keeps
@@ -37079,3 +37275,33 @@ def test_cfn_other_resource_tag_reconciliation_remains_case_sensitive():
     assert _identity_tag_map(store) == {"Department": "External", "DEPARTMENT": "After"}
     _reconcile_tag_list(store, {"Tags": [{"Key": "DEPARTMENT", "Value": "After"}]}, {})
     assert _identity_tag_map(store) == {"Department": "External"}
+
+
+def test_cfn_state_machine_refused_encryption_update_rolls_back(cfn, sfn, kms_client):
+    """AWS: captured 2026-10-20 (captures/2308-pr-uncertainties.json U15:update-to-cmk-without-key)."""
+    key = kms_client.create_key()["KeyMetadata"]["Arn"]
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = name = f"cfn-sfn-enc-upd-bad-{uid}"
+    good = {"Type": "CUSTOMER_MANAGED_KMS_KEY", "KmsKeyId": key, "KmsDataKeyReusePeriodSeconds": 300}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_sfn_encryption_template(name, good))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        arn = _output(stack, "Arn")
+        cfn.update_stack(StackName=stack_name, TemplateBody=_sfn_encryption_template(
+            name, {"Type": "CUSTOMER_MANAGED_KMS_KEY"}))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE", stack["StackStatus"]
+        failed = [e["ResourceStatusReason"]
+                  for e in _all_pages(cfn, "describe_stack_events", "StackEvents", StackName=stack_name)
+                  if e["LogicalResourceId"] == "SM" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert len(failed) == 1, failed
+        assert re.fullmatch(
+            re.escape('Resource handler returned message: "Invalid Encryption Configuration: Must set a valid '
+                      'kmsKeyId. (Service: Sfn, Status Code: 400, Request ID: ') + _UUID_RE
+            + re.escape(') (SDK Attempt Count: 1)" (RequestToken: ') + _UUID_RE
+            + re.escape(", HandlerErrorCode: InvalidRequest)"), failed[0]), failed[0]
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _sfn_cmk(key)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+

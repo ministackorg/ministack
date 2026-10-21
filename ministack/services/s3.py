@@ -114,6 +114,8 @@ _mrap_operations = AccountScopedDict()
 # {Name, Bucket, BucketAccountId, Alias, CreationDate, NetworkOrigin, VpcConfiguration,
 #  PublicAccessBlockConfiguration, Policy, Tags}
 _access_points = AccountRegionScopedDict()
+# The access point record a data-plane request came through, while it is handled.
+_request_access_point: contextvars.ContextVar[dict | None] = contextvars.ContextVar("s3_access_point", default=None)
 
 # Object Lambda Access Points, by name within an account and region:
 # {Name, Alias: {Value, Status}, CreationDate, Configuration, Policy, PublicAccessBlockConfiguration}
@@ -1017,7 +1019,12 @@ def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str,
 
 
 def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
-    """Whether the bucket's Public Access Block turns *setting* on, e.g. ``IgnorePublicAcls``."""
+    """Whether the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    access_point = _request_access_point.get()
+    # An access point's BlockPublicPolicy does not cover the bucket's policy.
+    if access_point and access_point["Bucket"] == bucket_name and setting != "BlockPublicPolicy" and \
+            access_point["PublicAccessBlockConfiguration"].get(setting):
+        return True
     record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
     stored = record.get("_public_access_block")
     if not stored:
@@ -2367,9 +2374,11 @@ async def handle_request(
     enforce_bucket_region: bool = True,
     internal: bool = False,
     access_point_region: str | None = None,
+    access_point: dict | None = None,
 ) -> tuple:
-    """``access_point_region`` is set for a request that came through an access
-    point host; the region check then compares against the access point."""
+    """``access_point_region`` and ``access_point`` are set for a request that came
+    through an access point host; the region check then compares against the
+    access point."""
     bucket, key = _parse_bucket_key(path, headers)
 
     # A virtual-hosted request is rewritten to path-style before it reaches here
@@ -2408,7 +2417,7 @@ async def handle_request(
             account, access_point_region, record = resolved
             if account != get_account_id():
                 return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
-            bucket = record["Bucket"]
+            bucket, access_point = record["Bucket"], record
     headers, denied = _resolve_copy_source_alias(headers)
     if denied is not None:
         return denied
@@ -2423,7 +2432,11 @@ async def handle_request(
         resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
         return status, resp_headers, resp_body
 
-    result = _dispatch(method, bucket, key, headers, body, query_params)
+    token = _request_access_point.set(access_point)
+    try:
+        result = _dispatch(method, bucket, key, headers, body, query_params)
+    finally:
+        _request_access_point.reset(token)
 
     status, resp_headers, resp_body = result
     resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -2715,6 +2728,12 @@ def _location_constraint(body: bytes) -> str | None:
     return loc_el.text if loc_el is not None and loc_el.text else None
 
 
+def _constraint_region(constraint: str | None) -> str | None:
+    """``EU`` is the legacy LocationConstraint for eu-west-1, which still
+    accepts it (observed on AWS 2026-10-20); the AWS SDK for .NET sends it."""
+    return "eu-west-1" if constraint == "EU" else constraint
+
+
 def _location_constraint_error(name: str, constraint: str | None, endpoint_region: str):
     """CreateBucket's location-constraint rules for a request signed for
     ``endpoint_region`` (observed on AWS 2026-10-12): us-east-1 is never a
@@ -2723,7 +2742,7 @@ def _location_constraint_error(name: str, constraint: str | None, endpoint_regio
     if constraint == "us-east-1":
         return _error("InvalidLocationConstraint", "The specified location-constraint is not valid",
                       400, f"/{name}", extra={"LocationConstraint": constraint})
-    if endpoint_region != "us-east-1" and constraint != endpoint_region:
+    if endpoint_region != "us-east-1" and _constraint_region(constraint) != endpoint_region:
         return _error(
             "IllegalLocationConstraintException",
             f"The {constraint or 'unspecified'} location constraint is incompatible for the region "
@@ -2781,14 +2800,14 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
             extra={"BucketName": name},
         )
 
-    region = None
+    constraint = None
     tags = {}
     if body:
         try:
             xml_root = fromstring(body)
             loc_el = _find_xml_tag(xml_root, "LocationConstraint")
             if loc_el is not None and loc_el.text:
-                region = loc_el.text
+                constraint = loc_el.text
 
             err = _duplicate_tag_error(xml_root, resource=f"/{name}")
             if err is not None:
@@ -2804,8 +2823,11 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
 
     # No explicit LocationConstraint: the bucket lands in the region the
     # request was signed for, like real AWS.
-    region = region or get_region()
+    region = _constraint_region(constraint) or get_region()
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    if constraint == "EU":
+        # GetBucketLocation answers EU for a bucket created with EU (observed on AWS 2026-10-20).
+        _buckets[name]["location_constraint"] = constraint
     ownership = headers.get("x-amz-object-ownership")
     if ownership:
         # The same document PutBucketOwnershipControls stores.
@@ -2906,7 +2928,7 @@ def _get_bucket_location(name: str):
     # AWS returns an empty LocationConstraint only for us-east-1 buckets;
     # every other region is echoed back verbatim.
     if region != "us-east-1":
-        root.text = region
+        root.text = _buckets[name].get("location_constraint") or region
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 

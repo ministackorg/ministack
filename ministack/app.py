@@ -2322,11 +2322,15 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
                     return denied
 
     try:
+        # The access point an ARN host names, for its Block Public Access settings.
+        access_point = (s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"), access_point_region)
+                        if access_point_region else None)
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
         # virtual-hosted URL, which signed the canonical URI without the bucket,
         # verifies against what the client actually signed.
         return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path,
-                                                      access_point_region=access_point_region)
+                                                      access_point_region=access_point_region,
+                                                      access_point=access_point)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc
