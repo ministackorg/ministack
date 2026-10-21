@@ -10425,6 +10425,35 @@ def test_cognito_prevent_user_existence_errors_legacy_still_reports(cognito_idp)
     assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
 
 
+@pytest.mark.parametrize("call,params,message", [
+    ("initiate_auth", {"AuthFlow": "USER_PASSWORD_AUTH"}, "User does not exist."),
+    ("admin_initiate_auth", {"AuthFlow": "ADMIN_USER_PASSWORD_AUTH"}, "User does not exist."),
+    ("admin_get_user", {}, "User does not exist."),
+    ("forgot_password", {}, "Username/client id combination not found."),
+    ("confirm_forgot_password", {"ConfirmationCode": "000000", "Password": "Another1!"},
+     "Username/client id combination not found."),
+    ("resend_confirmation_code", {}, "Username/client id combination not found."),
+    ("confirm_sign_up", {"ConfirmationCode": "000000"}, "Username/client id combination not found."),
+])
+def test_cognito_prevent_user_existence_errors_legacy_messages(cognito_idp, call, params, message):
+    """LEGACY names no username: user calls say the user does not exist, code calls the client combination."""
+    pid, cid = _pool_with_client(cognito_idp, "LEGACY")
+    username = "unknown@example.test"
+    if "AuthFlow" in params:
+        params = {**params, "AuthParameters": {"USERNAME": username, "PASSWORD": "Wrong1!"}}
+    else:
+        params = {**params, "Username": username}
+    if call.startswith("admin_"):
+        params["UserPoolId"] = pid
+    if call != "admin_get_user":
+        params["ClientId"] = cid
+
+    with pytest.raises(ClientError) as exc:
+        getattr(cognito_idp, call)(**params)
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+    assert exc.value.response["Error"]["Message"] == message
+
+
 def test_cognito_prevent_user_existence_errors_masks_forgot_password(cognito_idp):
     """ForgotPassword answers as though a code was sent."""
     _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
@@ -10455,6 +10484,15 @@ def test_cognito_prevent_user_existence_errors_masks_confirm_forgot_password(cog
             ClientId=cid, Username="unknown@example.test",
             ConfirmationCode="000000", Password="Another1!",
         )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_confirm_sign_up(cognito_idp):
+    """ConfirmSignUp for an unknown username looks like a bad code too."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_sign_up(ClientId=cid, Username="unknown@example.test", ConfirmationCode="000000")
     assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
 
 

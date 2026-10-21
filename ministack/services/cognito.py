@@ -1404,7 +1404,7 @@ def _resolve_user(pool: dict, username: str):
 
     return None, error_response_json(
         "UserNotFoundException",
-        f"User {username} does not exist.", 400,
+        "User does not exist.", 400,
     )
 
 
@@ -1416,7 +1416,7 @@ def _hides_user_existence(pool: dict, client_id: str) -> bool:
     username indistinguishable from a wrong password across the flows it names:
     USER_PASSWORD_AUTH, USER_SRP_AUTH and ADMIN_USER_PASSWORD_AUTH answer
     NotAuthorizedException, ForgotPassword and ResendConfirmationCode answer a
-    normal CodeDeliveryDetails, and ConfirmForgotPassword answers
+    normal CodeDeliveryDetails, and ConfirmForgotPassword and ConfirmSignUp answer
     CodeMismatchException.
 
     The setting is a property of the app client, so it covers the admin
@@ -1449,6 +1449,11 @@ def _hidden_user_error(pool: dict, client_id: str, err):
             "NotAuthorizedException", "Incorrect username or password.", 400,
         )
     return err
+
+
+def _client_user_not_found():
+    """The UserNotFoundException of the sign-up confirmation and password recovery calls."""
+    return error_response_json("UserNotFoundException", "Username/client id combination not found.", 400)
 
 
 def _masked_destination(address: str) -> str:
@@ -3952,7 +3957,7 @@ def _resend_confirmation_code(data):
     if not user:
         if _hides_user_existence(pool, cid):
             return _code_delivery_response(_masked_destination(username))
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        return _client_user_not_found()
 
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
@@ -4958,7 +4963,12 @@ def _confirm_sign_up(data):
 
     user, err = _resolve_user(pool, username)
     if err:
-        return err
+        if _hides_user_existence(pool, cid):
+            return error_response_json(
+                "CodeMismatchException",
+                "Invalid verification code provided, please try again.", 400,
+            )
+        return _client_user_not_found()
 
     # Codes are checked under AUTH=true (_confirmation_code_error).
     user.pop("_confirmation_code", None)
@@ -4985,7 +4995,7 @@ def _forgot_password(data):
             # Answer as though a code had been sent. Nothing is delivered and no
             # state changes; only the response shape is preserved.
             return _code_delivery_response(_masked_destination(username))
-        return _err
+        return _client_user_not_found()
 
     code = "654321"
     user["_reset_code"] = code
@@ -5016,7 +5026,7 @@ def _confirm_forgot_password(data):
                 "CodeMismatchException",
                 "Invalid verification code provided, please try again.", 400,
             )
-        return _err
+        return _client_user_not_found()
 
     # Codes are checked under AUTH=true (_confirmation_code_error).
     pw_err = _validate_password(pool, new_password)
