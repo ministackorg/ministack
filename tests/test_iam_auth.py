@@ -6367,3 +6367,123 @@ def test_s3_sigv2_signatures_are_verified_contract(auth_enabled, iam_user):
     finally:
         admin.delete_object(Bucket=bucket, Key="k")
         admin.delete_bucket(Bucket=bucket)
+
+
+def _sigv4a_request(credentials, method, url, service, region_set, *, host=None, body=b"", headers=None,
+                    presign=False, signed_at=None):
+    """Send a SigV4a-signed request: botocore builds the canonical request, the key is the one SigV4a derives."""
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import quote
+
+    import requests
+    from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from ministack.core.sigv4 import SIGV4A, sigv4a_signing_key
+
+    base = (S3SigV4QueryAuth if presign else S3SigV4Auth) if service == "s3" else SigV4Auth
+
+    class SigV4aAuth(base):
+        def _modify_request_before_signing(self, request):
+            if not presign:
+                request.headers["X-Amz-Region-Set"] = region_set
+            super()._modify_request_before_signing(request)
+            if presign:
+                request.url = (request.url.replace("X-Amz-Algorithm=AWS4-HMAC-SHA256", f"X-Amz-Algorithm={SIGV4A}")
+                               + f"&X-Amz-Region-Set={quote(region_set, safe='')}")
+
+        def scope(self, request):
+            return f"{self.credentials.access_key}/{self.credential_scope(request)}"
+
+        def credential_scope(self, request):
+            return f"{request.context['timestamp'][:8]}/{self._service_name}/aws4_request"
+
+        def string_to_sign(self, request, canonical_request):
+            return SIGV4A + super().string_to_sign(request, canonical_request).removeprefix("AWS4-HMAC-SHA256")
+
+        def signature(self, string_to_sign, request):
+            key = sigv4a_signing_key(self.credentials.access_key, self.credentials.secret_key)
+            return key.sign(string_to_sign.encode(), ec.ECDSA(hashes.SHA256())).hex()
+
+        def _inject_signature_to_request(self, request, signature):
+            super()._inject_signature_to_request(request, signature)
+            if not presign:
+                authorization = request.headers["Authorization"].replace("AWS4-HMAC-SHA256", SIGV4A, 1)
+                del request.headers["Authorization"]
+                request.headers["Authorization"] = authorization
+
+    request = AWSRequest(method, url, data=body, headers={**({"host": host} if host else {}), **(headers or {})})
+    signer = SigV4aAuth(Credentials(*credentials), service, region_set, **({"expires": 60} if presign else {}))
+    with mock.patch("botocore.auth.get_current_datetime", lambda: signed_at or dt.datetime.now(dt.timezone.utc)):
+        signer.add_auth(request)
+    response = requests.request(method, request.url, data=body or None, headers=dict(request.headers.items()),
+                                timeout=30)
+    code = re.search(r"<Code>([^<]*)</Code>", response.text)
+    return response.status_code, code.group(1) if code else ""
+
+
+@pytest.mark.auth_contract
+def test_sigv4a_signatures_are_verified_contract(auth_enabled, iam_user):
+    """SigV4a header and presigned signatures are checked for an IAM user, with their date and region set."""
+    import datetime as dt
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    endpoint = ENDPOINT.rstrip("/")
+    bucket, name = f"sigv4a-{uuid.uuid4().hex[:8]}", f"sigv4a-{uuid.uuid4().hex[:8]}"
+    admin, account = make_client("s3"), make_client("sts").get_caller_identity()["Account"]
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key="k", Body=b"v")
+    control = boto3.client("s3control", endpoint_url=ENDPOINT, region_name="us-west-2", aws_access_key_id="test",
+                           aws_secret_access_key="test", config=Config(inject_host_prefix=False))
+    control.create_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                             Details={"Name": name, "Regions": [{"Bucket": bucket}]})
+    alias = control.get_multi_region_access_point(AccountId=account, Name=name)["AccessPoint"]["Alias"]
+    mrap = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "*"}]})
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=20)
+    sts_call = {"body": b"Action=GetCallerIdentity&Version=2011-06-15",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}}
+    try:
+        with second_access_key(user) as (key, secret):
+            cases = [
+                # (service, method, url, host, region set, extra, refused under AUTH=true as)
+                ("sts", "POST", f"{endpoint}/", None, "*", sts_call, None),
+                ("sts", "POST", f"{endpoint}/", None, "*", {**sts_call, "wrong": True},
+                 (403, "SignatureDoesNotMatch")),
+                ("sts", "POST", f"{endpoint}/", None, "ap-south-1,ap-east-1", sts_call, (403, "InvalidClientTokenId")),
+                ("sts", "POST", f"{endpoint}/", None, "*", {**sts_call, "signed_at": old},
+                 (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {}, None),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"wrong": True}, (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "ap-south-1", {}, (400, "RegionSetMismatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"signed_at": old}, (403, "RequestTimeTooSkewed")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True}, None),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True, "wrong": True},
+                 (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True, "signed_at": old},
+                 (403, "AccessDenied")),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {}, None),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {"presign": True}, None),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {"wrong": True}, (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/k", mrap, "ap-south-1", {}, (400, "RegionSetMismatch")),
+            ]
+            for service, method, url, host, region_set, extra, refused in cases:
+                extra = dict(extra)
+                credentials = (key, "wrong" + secret if extra.pop("wrong", False) else secret)
+                result = _sigv4a_request(credentials, method, url, service, region_set, host=host, **extra)
+                expected = refused if auth_enabled and refused else (200, "")
+                assert result == expected, (service, url, host, region_set, extra)
+    finally:
+        control.delete_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                                 Details={"Name": name})
+        admin.delete_object(Bucket=bucket, Key="k")
+        admin.delete_bucket(Bucket=bucket)

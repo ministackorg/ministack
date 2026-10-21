@@ -1292,6 +1292,26 @@ def _check_bucket_region(method: str, bucket: str, key: str, headers: dict, quer
     return region_mismatch_error(method, bucket, key, headers, query_params, signed, home)
 
 
+def _region_set_mismatch(bucket: str, key: str, headers: dict, query_params: dict, home: str | None = None):
+    """Under AUTH=true, refuse a SigV4a request whose region set leaves out the bucket's (or access point's) region."""
+    from ministack.app import AUTH
+    from ministack.core.sigv4 import SIGV4A, region_set_covers
+
+    if not AUTH or not bucket:
+        return None
+    if headers.get("authorization", "").startswith(SIGV4A):
+        region_set = headers.get("x-amz-region-set", "")
+    elif (_qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")) == SIGV4A:
+        region_set = _qp(query_params, "X-Amz-Region-Set", "") or _qp(query_params, "x-amz-region-set", "")
+    else:
+        return None
+    home = home or bucket_region(bucket)
+    if home is None or region_set_covers(region_set, home):
+        return None
+    return _error("RegionSetMismatch", "The provided X-Amz-Region-Set doesn't match against the requested S3 region.",
+                  400, f"/{bucket}/{key}" if key else f"/{bucket}")
+
+
 def region_mismatch_error(method: str, bucket: str, key: str, headers: dict, query_params: dict,
                           signed: str, home: str) -> tuple:
     """The response to a request signed for ``signed`` that belongs to ``home``."""
@@ -2468,6 +2488,8 @@ async def handle_request(
         return denied
 
     denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
+    if denied is None:
+        denied = _region_set_mismatch(bucket, key, headers, query_params, home=access_point_region)
     if denied is None and enforce_bucket_region:
         # After the scope is pinned, so the owner's record names the home region.
         denied = _check_bucket_region(method, bucket, key, headers, query_params, home=access_point_region)

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Auth — SigV4a signatures are verified under `AUTH=true`** — requests signed with `AWS4-ECDSA-P256-SHA256`, which SDKs use for Multi-Region Access Points, were refused for every IAM user. Header and presigned S3 signatures are now checked with the P-256 key SigV4a derives from the secret, with their date or expiry, and an `X-Amz-Region-Set` that leaves out the serving region is refused (`RegionSetMismatch` on S3, the unknown-key error elsewhere). Contributed by @iot-rocket.
+
 ### Fixed
 - **S3 — Multi-Region Access Point requests are authorized** — under `AUTH=true`, requests through an MRAP hostname were served without an IAM check. They are now authorized on the member bucket and then on the MRAP, whose policy is evaluated like a bucket policy, and answer `AccessDenied` naming the resource that refused them. Contributed by @iot-rocket.
 - **S3 — bucket policy writes through an access point** — under `AUTH=true` `PutBucketPolicy` and `DeleteBucketPolicy` sent through an access point alias or ARN changed the bucket's policy; they now get 403 `AccessDenied` with an explicit deny on the access point, while `GetBucketPolicy` through it and both writes on the bucket itself work as before. Contributed by @iot-rocket.

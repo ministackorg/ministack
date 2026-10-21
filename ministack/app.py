@@ -2247,15 +2247,13 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             return error
     mrap_bucket = _resolve_mrap_host(host)
     if mrap_bucket:
-        # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP and
-        # what MiniStack does not implement: verifying it means ECDSA P-256 key
-        # derivation, and the emulator does not verify header-signed SigV4
-        # requests either. So the presign parameters are dropped and the request
-        # is served unverified rather than rejected for a signature that could
-        # never have matched. A plain SigV4 presign is left alone and still
-        # verifies.
+        # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP.
+        # Under AUTH=true its signature is verified with the request's other
+        # credentials. Otherwise the presign parameters are dropped and the
+        # request is served unverified, as header-signed requests are. A plain
+        # SigV4 presign is left alone and still verifies.
         algorithm = (query_params.get("X-Amz-Algorithm") or [""])[0]
-        if "ECDSA" in str(algorithm).upper():
+        if "ECDSA" in str(algorithm).upper() and not AUTH:
             query_params = {
                 k: v for k, v in query_params.items()
                 if not k.lower().startswith("x-amz-")
