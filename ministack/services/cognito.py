@@ -20,6 +20,7 @@ User Pools operations:
   GetUser, UpdateUserAttributes, DeleteUser,
   AdminAddUserToGroup, AdminRemoveUserFromGroup,
   AdminListGroupsForUser, AdminListUserAuthEvents,
+  AdminUpdateAuthEventFeedback, UpdateAuthEventFeedback,
   CreateGroup, DeleteGroup, GetGroup, ListGroups,
   AdminConfirmSignUp, AdminDisableUser, AdminEnableUser,
   AdminResetUserPassword, AdminUserGlobalSignOut,
@@ -89,6 +90,7 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
+    get_request_client_ip,
     json_response,
     new_uuid,
     set_request_account_id,
@@ -2423,6 +2425,7 @@ _UNSIGNED_IDP_ACTIONS = {
     "RevokeToken",
     "SetUserMFAPreference",
     "SignUp",
+    "UpdateAuthEventFeedback",
     "UpdateUserAttributes",
     "VerifySoftwareToken",
 }
@@ -2662,6 +2665,8 @@ async def _dispatch_idp(action: str, data: dict):
         "AdminUserGlobalSignOut": _admin_user_global_sign_out,
         "AdminListGroupsForUser": _admin_list_groups_for_user,
         "AdminListUserAuthEvents": _admin_list_user_auth_events,
+        "AdminUpdateAuthEventFeedback": _admin_update_auth_event_feedback,
+        "UpdateAuthEventFeedback": _update_auth_event_feedback,
         "AdminAddUserToGroup": _admin_add_user_to_group,
         "AdminRemoveUserFromGroup": _admin_remove_user_from_group,
         # Auth flows
@@ -3997,27 +4002,95 @@ def _admin_list_groups_for_user(data):
     return json_response({"Groups": [_group_out(g) for g in groups]})
 
 
-def _admin_list_user_auth_events(data):
-    """List a user's auth events, gated on user-pool add-ons as real Cognito is.
+_AUTH_EVENTS_MAX_RESULTS = 60
+_AUTH_EVENT_ID_RE = re.compile(r"[\w+-]+")
 
-    Auth events are never recorded here (there is no event store), so a pool
-    with add-ons enabled always answers an empty list. A pool without add-ons
-    (AdvancedSecurityMode OFF or UserPoolAddOns absent) is refused with
-    UserPoolAddOnNotEnabledException. The add-on gate fires before the user is
-    resolved — measured against the live service (2026-08-26): an unknown user
-    in a pool without add-ons gets the add-on error, not UserNotFound.
-    """
+
+def _auth_events_add_on_error(pool: dict):
+    """UserPoolAddOnNotEnabledException for a pool without threat protection, else None."""
+    if _threat_protection_on(pool.get("UserPoolAddOns")):
+        return None
+    return error_response_json(
+        "UserPoolAddOnNotEnabledException",
+        "This is an add on feature. Please update AdvancedSecurityMode"
+        " for your user pool to access this API.",
+        400,
+    )
+
+
+def _record_auth_event(pool: dict, user: dict, data: dict, event_type: str, response: str,
+                       challenges: tuple = (), session: str | None = None) -> None:
+    """Log an auth event with the verdict AWS gives a low-risk request, when the pool logs events."""
+    if not _threat_protection_on(pool.get("UserPoolAddOns")):
+        return
+    event = {
+        "EventId": new_uuid(),
+        "EventType": event_type,
+        "CreationDate": round(_now_epoch(), 3),
+        "EventResponse": response,
+        "EventRisk": {"RiskDecision": "NoRisk", "CompromisedCredentialsDetected": False},
+        "ChallengeResponses": [{"ChallengeName": name, "ChallengeResponse": result}
+                               for name, result in challenges],
+        # The admin flows' ContextData names the user's address; "null" is what AWS
+        # reports for a place it cannot locate, and nothing here locates one.
+        "EventContextData": {
+            "IpAddress": (data.get("ContextData") or {}).get("IpAddress") or get_request_client_ip(),
+            "City": "null",
+            "Country": "null",
+        },
+    }
+    if session:
+        # The challenge session that will answer this InProgress sign-in.
+        event["_session"] = session
+    user.setdefault("_auth_events", []).append(event)
+
+
+def _finish_auth_event(user: dict, session: str | None, challenge: str, passed: bool) -> None:
+    """Close the sign-in event the answered challenge session left InProgress, with its result."""
+    for event in reversed(user.get("_auth_events", [])):
+        if session and event.get("_session") == session:
+            del event["_session"]
+            event["EventResponse"] = "Pass" if passed else "Fail"
+            event["ChallengeResponses"].append(
+                {"ChallengeName": challenge, "ChallengeResponse": "Success" if passed else "Failure"})
+            return
+
+
+_JSON_INTEGER_ERRORS = {
+    str: "STRING_VALUE can not be converted to an Integer",
+    list: "Start of list found where not expected",
+    dict: "Start of structure or map found where not expected.",
+}
+
+
+def _admin_list_user_auth_events(data):
+    """List a user's auth events newest first; pools without threat protection are refused first."""
+    raw = data.get("MaxResults")
+    if isinstance(raw, bool):
+        return error_response_json("SerializationException",
+                                   f"{str(raw).upper()}_VALUE can not be converted to an Integer", 400,
+                                   message_key="Message")
+    if type(raw) in _JSON_INTEGER_ERRORS:
+        return error_response_json("SerializationException", _JSON_INTEGER_ERRORS[type(raw)], 400,
+                                   message_key="Message")
+    max_results = int(raw or 0)
+    if not 0 <= max_results <= _AUTH_EVENTS_MAX_RESULTS:
+        bound = ("greater than or equal to 0" if max_results < 0
+                 else f"less than or equal to {_AUTH_EVENTS_MAX_RESULTS}")
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{max_results}' at 'maxResults' failed to satisfy"
+            f" constraint: Member must have value {bound}",
+            400,
+        )
+    max_results = max_results or _AUTH_EVENTS_MAX_RESULTS
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    if (pool.get("UserPoolAddOns") or {}).get("AdvancedSecurityMode", "OFF") == "OFF":
-        return error_response_json(
-            "UserPoolAddOnNotEnabledException",
-            "This is an add on feature. Please update AdvancedSecurityMode"
-            " for your user pool to access this API.",
-            400,
-        )
+    err = _auth_events_add_on_error(pool)
+    if err:
+        return err
     username = data.get("Username")
     user, _ = _resolve_user(pool, username)
     if user is None:
@@ -4025,7 +4098,78 @@ def _admin_list_user_auth_events(data):
         return error_response_json(
             "UserNotFoundException", "User does not exist.", 400,
         )
-    return json_response({"AuthEvents": []})
+    events = user.get("_auth_events", [])[::-1]
+    # The token names the last event listed, as AWS's does: <EventId>#<CreationDate>.
+    after = (data.get("NextToken") or "").split("#", 1)[0]
+    start = next((i + 1 for i, event in enumerate(events) if event["EventId"] == after), 0)
+    page = [{k: v for k, v in event.items() if not k.startswith("_")}
+            for event in events[start:start + max_results]]
+    resp = {"AuthEvents": page}
+    if start + max_results < len(events):
+        last = page[-1]
+        stamp = datetime.fromtimestamp(last["CreationDate"], timezone.utc).isoformat(timespec="milliseconds")
+        resp["NextToken"] = f"{last['EventId']}#{stamp.replace('+00:00', 'Z')}"
+    return json_response(resp)
+
+
+def _auth_event_feedback_error(data: dict):
+    """The input validation AWS applies to EventId and FeedbackValue."""
+    value = data.get("FeedbackValue")
+    if value not in ("Invalid", "Valid"):
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{value}' at 'feedbackValue' failed to satisfy"
+            " constraint: Member must satisfy enum value set: [Invalid, Valid]",
+            400,
+        )
+    event_id = data.get("EventId") or ""
+    if not _AUTH_EVENT_ID_RE.fullmatch(event_id):
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{event_id}' at 'eventId' failed to satisfy"
+            " constraint: Member must satisfy regular expression pattern: [\\w+-]+",
+            400,
+        )
+    return None
+
+
+def _admin_update_auth_event_feedback(data):
+    """Record the admin's Valid or Invalid verdict on one of a user's auth events."""
+    err = _auth_event_feedback_error(data)
+    if err:
+        return err
+    pool, err = _resolve_pool(data.get("UserPoolId"))
+    if err:
+        return err
+    err = _auth_events_add_on_error(pool)
+    if err:
+        return err
+    user, _ = _resolve_user(pool, data.get("Username"))
+    if user is None:
+        return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+    event = next((e for e in user.get("_auth_events", []) if e["EventId"] == data["EventId"]), None)
+    if event is None:
+        return error_response_json("InvalidParameterException", "EventId is invalid", 400)
+    event["EventFeedback"] = {
+        "FeedbackValue": data["FeedbackValue"],
+        "Provider": "Admin",
+        "FeedbackDate": round(_now_epoch(), 3),
+    }
+    return json_response({})
+
+
+def _update_auth_event_feedback(data):
+    """User feedback by a notification email's token; no notification is sent here, so no token is valid."""
+    err = _auth_event_feedback_error(data)
+    if err:
+        return err
+    pool, err = _resolve_pool(data.get("UserPoolId"))
+    if err:
+        return err
+    err = _auth_events_add_on_error(pool)
+    if err:
+        return err
+    return error_response_json("NotAuthorizedException", "Invalid session provided", 400)
 
 
 def _admin_add_user_to_group(data):
@@ -4120,8 +4264,13 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
 
 
 def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: str,
-                          client_metadata: dict | None = None):
+                          client_metadata: dict | None = None, data: dict | None = None):
     """What a verified password answers: NEW_PASSWORD_REQUIRED, an MFA challenge or tokens."""
+    mfa_challenge = None
+    if user.get("UserStatus") != "FORCE_CHANGE_PASSWORD":
+        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
+    _record_auth_event(pool, user, data or {}, "SignIn", "InProgress" if mfa_challenge else "Pass",
+                       (("Password", "Success"),), (mfa_challenge or {}).get("Session"))
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
         session = base64.b64encode(secrets.token_bytes(32)).decode()
         return json_response({
@@ -4133,7 +4282,6 @@ def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: 
                 "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
             },
         })
-    mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
     if mfa_challenge:
         return json_response(mfa_challenge)
     return json_response({"AuthenticationResult": _build_auth_result(
@@ -4209,6 +4357,8 @@ def _respond_to_password_verifier(data: dict, cid: str):
     user = _resolve_user(pool, session["username"])[0]
     # A challenge answers any number of proofs until the session expires, as on AWS.
     if user is None or not _srp_proof_valid(session["pool_id"], user, session["srp"], responses):
+        if user is not None and not custom:
+            _record_auth_event(pool, user, data, "SignIn", "Fail", (("Password", "Failure"),))
         return denied
     refused = _password_signin_refused(user)
     if refused:
@@ -4218,7 +4368,7 @@ def _respond_to_password_verifier(data: dict, cid: str):
     client_metadata = data.get("ClientMetadata", {})
     if not custom:
         return _password_auth_result(pool, session["pool_id"], cid, user, user["Username"],
-                                     client_metadata)
+                                     client_metadata, data)
     _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
     session["pending_builtin_challenge"] = None
     user_attrs = _attr_list_to_dict(user.get("Attributes", []))
@@ -4261,11 +4411,12 @@ def _admin_initiate_auth(data):
         if refused:
             return refused
         if user.get("_password") and user["_password"] != password:
+            _record_auth_event(pool, user, data, "SignIn", "Fail", (("Password", "Failure"),))
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
         # Only a correct password learns that a reset is required.
         if user.get("UserStatus") == "RESET_REQUIRED":
             return _password_reset_required()
-        return _password_auth_result(pool, pid, cid, user, username)
+        return _password_auth_result(pool, pid, cid, user, username, data=data)
 
     if auth_flow == "USER_SRP_AUTH":
         return _initiate_user_srp_auth(pool, pid, cid, auth_params)
@@ -4423,6 +4574,7 @@ def _admin_respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
+        _record_auth_event(pool, user, data, "PasswordChange", "Pass")
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -4448,8 +4600,10 @@ def _admin_respond_to_auth_challenge(data):
         totp_secret = user.get("_totp_secret")
         if totp_secret and not _totp_matches(
                 totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
+            _finish_auth_event(user, data.get("Session"), "Mfa", False)
             return error_response_json(
                 "CodeMismatchException", "Invalid code received for user", 400)
+        _finish_auth_event(user, data.get("Session"), "Mfa", True)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -4579,11 +4733,12 @@ def _initiate_auth(data):
         if refused:
             return refused
         if user.get("_password") and user["_password"] != password:
+            _record_auth_event(pool, user, data, "SignIn", "Fail", (("Password", "Failure"),))
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
         # Only a correct password learns that a reset is required.
         if user.get("UserStatus") == "RESET_REQUIRED":
             return _password_reset_required()
-        return _password_auth_result(pool, pid, cid, user, username)
+        return _password_auth_result(pool, pid, cid, user, username, data=data)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
@@ -4743,6 +4898,7 @@ def _respond_to_auth_challenge(data):
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
+        _record_auth_event(pool, user, data, "PasswordChange", "Pass")
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -4759,8 +4915,10 @@ def _respond_to_auth_challenge(data):
             totp_secret = user.get("_totp_secret")
             if totp_secret and not _totp_matches(
                     totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
+                _finish_auth_event(user, data.get("Session"), "Mfa", False)
                 return error_response_json(
                     "CodeMismatchException", "Invalid code received for user", 400)
+            _finish_auth_event(user, data.get("Session"), "Mfa", True)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -5062,6 +5220,7 @@ def _change_password(data):
         return pw_err
     user["_password"] = proposed
     user["UserLastModifiedDate"] = _now_epoch()
+    _record_auth_event(pool, user, data, "PasswordChange", "Pass")
     return json_response({})
 
 
