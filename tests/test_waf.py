@@ -978,3 +978,33 @@ def test_wafv2_get_web_acl_validates_id_shape_before_existence(wafv2):
             Name="nope", Scope="REGIONAL", Id=str(_uuid_mod.uuid4())
         )
     assert exc.value.response["Error"]["Code"] == "WAFNonexistentItemException"
+
+
+def test_waf_ip_set_and_rule_group_names_are_unique_per_scope(wafv2):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    ip_name, rg_name = f"dup-ipset-{sfx}", f"dup-rg-{sfx}"
+    ip = wafv2.create_ip_set(Name=ip_name, Scope="REGIONAL", IPAddressVersion="IPV4", Addresses=[])["Summary"]
+    rg = wafv2.create_rule_group(
+        Name=rg_name, Scope="REGIONAL", Capacity=10, Rules=[],
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+    )["Summary"]
+
+    # AWS refuses a second one with the same name and scope, so a client that retries a create sees the error.
+    with pytest.raises(wafv2.exceptions.WAFDuplicateItemException):
+        wafv2.create_ip_set(Name=ip_name, Scope="REGIONAL", IPAddressVersion="IPV4", Addresses=[])
+    with pytest.raises(wafv2.exceptions.WAFDuplicateItemException):
+        wafv2.create_rule_group(
+            Name=rg_name, Scope="REGIONAL", Capacity=10, Rules=[],
+            VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        )
+    assert [s["Id"] for s in wafv2.list_ip_sets(Scope="REGIONAL")["IPSets"] if s["Name"] == ip_name] == [ip["Id"]]
+    assert [s["Id"] for s in wafv2.list_rule_groups(Scope="REGIONAL")["RuleGroups"] if s["Name"] == rg_name] == [rg["Id"]]
+
+    # the name is only taken within its scope
+    other = wafv2.create_ip_set(Name=ip_name, Scope="CLOUDFRONT", IPAddressVersion="IPV4", Addresses=[])["Summary"]
+    assert other["Id"] != ip["Id"]
+    wafv2.delete_ip_set(Name=ip_name, Scope="CLOUDFRONT", Id=other["Id"], LockToken=other["LockToken"])
+
+    # deleting frees the name
+    wafv2.delete_ip_set(Name=ip_name, Scope="REGIONAL", Id=ip["Id"], LockToken=ip["LockToken"])
+    wafv2.create_ip_set(Name=ip_name, Scope="REGIONAL", IPAddressVersion="IPV4", Addresses=[])

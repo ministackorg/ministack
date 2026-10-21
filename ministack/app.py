@@ -235,6 +235,7 @@ from ministack.core.responses import (
     fix_error_content_type,
     fix_success_content_type,
     set_request_account_id,
+    set_request_client_ip,
     set_request_region,
 )
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
@@ -2322,11 +2323,15 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
                     return denied
 
     try:
+        # The access point an ARN host names, for its Block Public Access settings.
+        access_point = (s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"), access_point_region)
+                        if access_point_region else None)
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
         # virtual-hosted URL, which signed the canonical URI without the bucket,
         # verifies against what the client actually signed.
         return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path,
-                                                      access_point_region=access_point_region)
+                                                      access_point_region=access_point_region,
+                                                      access_point=access_point)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc
@@ -3142,6 +3147,7 @@ async def app(scope, receive, send):
     # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
     if scope.get("scheme") == "https":
         headers.setdefault("x-forwarded-proto", "https")
+    set_request_client_ip((scope.get("client") or ("127.0.0.1",))[0])
     if AUTH:
         pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
                            headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")

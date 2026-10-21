@@ -337,6 +337,44 @@ def test_sqs_message_attributes(sqs):
     assert attrs["color"]["StringValue"] == "blue"
     assert attrs["count"]["StringValue"] == "42"
 
+def test_sqs_receive_md5_of_filtered_message_attributes(sqs):
+    """MD5OfMessageAttributes on ReceiveMessage must be the digest of the
+    attributes actually returned, not of every attribute sent. SDKs that
+    validate it recompute it from the attributes in the response."""
+    url = sqs.create_queue(QueueName="intg-sqs-md5-filtered")["QueueUrl"]
+    sqs.send_message(
+        QueueUrl=url,
+        MessageBody="md5-filtered",
+        MessageAttributes={
+            "item.color": {"DataType": "String", "StringValue": "red"},
+            "size": {"DataType": "String", "StringValue": "large"},
+        },
+    )
+    # Digests of the SQS binary encoding of the returned attributes.
+    md5_color = "577bde534466fcc0f833e000d746308b"
+    md5_size = "293ff4145d6b9021065be848a611037b"
+    md5_all = "9906f4cd4d08bdd5cf9f22829f9e07f7"
+
+    def receive(**kwargs):
+        resp = sqs.receive_message(QueueUrl=url, VisibilityTimeout=0, **kwargs)
+        return resp["Messages"][0]
+
+    for names, returned, md5 in (
+        (["item.color"], ["item.color"], md5_color),
+        (["item.*"], ["item.color"], md5_color),
+        (["size"], ["size"], md5_size),
+        (["All"], ["item.color", "size"], md5_all),
+    ):
+        msg = receive(MessageAttributeNames=names)
+        assert sorted(msg["MessageAttributes"]) == returned, names
+        assert msg["MD5OfMessageAttributes"] == md5, names
+
+    for kwargs in ({}, {"MessageAttributeNames": ["missing"]}):
+        msg = receive(**kwargs)
+        assert "MessageAttributes" not in msg
+        assert "MD5OfMessageAttributes" not in msg
+    sqs.delete_queue(QueueUrl=url)
+
 def test_sqs_batch_send(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-batchsend")["QueueUrl"]
     resp = sqs.send_message_batch(
@@ -469,6 +507,43 @@ def test_sqs_fifo_deduplication(sqs):
         MessageDeduplicationId="dedup-001",
     )
     assert r1["MessageId"] == r2["MessageId"]
+
+def test_sqs_fifo_dedup_hit_returns_md5_of_current_request(sqs):
+    """A dedup hit keeps the first message, but its response must carry the
+    MD5s of the request just sent, as AWS does. SDKs that verify the digests
+    (.NET, Java) reject a response that repeats the first message's."""
+    url = sqs.create_queue(
+        QueueName="intg-sqs-dedup-md5.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+    )["QueueUrl"]
+
+    def send(body, sent_at):
+        return sqs.send_message(
+            QueueUrl=url,
+            MessageBody=body,
+            MessageGroupId="g1",
+            MessageDeduplicationId="dedup-md5",
+            MessageAttributes={
+                "DateSent": {"DataType": "String", "StringValue": sent_at},
+            },
+        )
+
+    r1 = send("body-one", "2026-10-15T00:00:01Z")
+    r2 = send("body-one", "2026-10-15T00:00:02Z")  # same body, new attribute
+    r3 = send("body-two", "2026-10-15T00:00:03Z")  # new body and attribute
+
+    assert r1["MessageId"] == r2["MessageId"] == r3["MessageId"]
+    # Digests of the SQS binary encoding of each request's attributes.
+    assert r1["MD5OfMessageAttributes"] == "e9721848ab1db43af2ce7e25fce5d807"
+    assert r2["MD5OfMessageAttributes"] == "4079b5e9650ac7c7fd23793b2f8450d7"
+    assert r3["MD5OfMessageAttributes"] == "2a0cd9230604b4d3fcc365096e11817f"
+    assert r1["MD5OfMessageBody"] == r2["MD5OfMessageBody"] == "58bc92401b7ad098acdab54fad72e79a"
+    assert r3["MD5OfMessageBody"] == "6423099901cb7ed39e2a7a6517162e8d"
+
+    attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+    assert attrs["Attributes"]["ApproximateNumberOfMessages"] == "1"
+    sqs.delete_queue(QueueUrl=url)
+
 
 def test_sqs_fifo_dedup_survives_consumption(sqs):
     """A FIFO dedup id is honored for its full 5-minute window even after the
