@@ -1469,6 +1469,45 @@ def test_s3_public_access_block(s3):
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
 
+
+@pytest.mark.auth_contract
+def test_s3_new_bucket_blocks_public_access_contract(auth_enabled, s3):
+    """Under AUTH=true a new bucket has all four Block Public Access settings on until they are changed or deleted."""
+    bkt = f"intg-s3-pab-new-{_uuid_mod.uuid4().hex[:8]}"
+    public_policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bkt}/*"}]})
+    s3.create_bucket(Bucket=bkt, ObjectOwnership="ObjectWriter")
+    try:
+        if not auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                s3.get_public_access_block(Bucket=bkt)
+            assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+            s3.create_bucket(Bucket=f"{bkt}-x", ObjectOwnership="ObjectWriter", ACL="public-read")
+            s3.delete_bucket(Bucket=f"{bkt}-x")
+            return
+        assert s3.get_public_access_block(Bucket=bkt)["PublicAccessBlockConfiguration"] == dict.fromkeys(
+            ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True)
+        for call, kwargs in ((s3.put_bucket_policy, {"Policy": public_policy}),
+                             (s3.put_bucket_acl, {"ACL": "public-read"}),
+                             (s3.put_object, {"Key": "k", "Body": b"k", "ACL": "public-read"})):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=bkt, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied", kwargs
+        with pytest.raises(ClientError) as exc:
+            s3.create_bucket(Bucket=f"{bkt}-x", ObjectOwnership="ObjectWriter", ACL="public-read")
+        assert exc.value.response["Error"]["Code"] == "InvalidBucketAclWithBlockPublicAccessError"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        s3.delete_public_access_block(Bucket=bkt)
+        with pytest.raises(ClientError) as exc:
+            s3.get_public_access_block(Bucket=bkt)
+        assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+        s3.put_bucket_policy(Bucket=bkt, Policy=public_policy)
+        s3.put_bucket_acl(Bucket=bkt, ACL="public-read")
+        s3.delete_bucket_policy(Bucket=bkt)
+    finally:
+        s3.delete_bucket(Bucket=bkt)
+
 def test_s3_block_public_policy_refuses_a_public_bucket_policy(s3):
     bkt = f"intg-s3-bpp-{_uuid_mod.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bkt)
@@ -9248,6 +9287,7 @@ def _anonymous_bucket(monkeypatch, auth=True, **bucket_headers):
     monkeypatch.setattr(app_mod, "AUTH", auth)
     bucket = f"anon-{uuid.uuid4().hex[:10]}"
     assert _lock_call("PUT", f"/{bucket}", bucket_headers)[0] == 200
+    assert _lock_call("DELETE", f"/{bucket}", query={"publicAccessBlock": [""]})[0] == 204
     assert _lock_call("PUT", f"/{bucket}/k", {}, b"secret")[0] == 200
     return bucket
 
@@ -10843,6 +10883,7 @@ def test_s3_anonymous_copy_source_and_policy_action_contract(auth_enabled, s3):
         s3.create_bucket(Bucket=bucket)
     s3.put_object(Bucket=secret, Key="c", Body=b"secret")
     s3.put_object(Bucket=upload, Key="kept", Body=b"kept")
+    s3.delete_public_access_block(Bucket=upload)
     s3.put_bucket_policy(Bucket=upload, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
         "Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]}))
     try:

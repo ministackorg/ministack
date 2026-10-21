@@ -1463,10 +1463,19 @@ def _s3_website_xml(website):
     return tostring(root, encoding="utf-8")
 
 
+def _s3_default_public_access_block(name):
+    """A removed PublicAccessBlockConfiguration leaves the settings of a new bucket (all four on under AUTH=true)."""
+    default = _s3._new_bucket_public_access_block()
+    if default:
+        _s3._put_public_access_block(name, default["_public_access_block"].encode())
+    else:
+        _s3._delete_public_access_block(name)
+
+
 _S3_BUCKET_CONFIGURATIONS = (
     ("CorsConfiguration", _s3_cors_xml, _s3._put_bucket_cors, _s3._delete_bucket_cors),
     ("PublicAccessBlockConfiguration", _s3_public_access_block_xml,
-     _s3._put_public_access_block, _s3._delete_public_access_block),
+     _s3._put_public_access_block, _s3_default_public_access_block),
     ("WebsiteConfiguration", _s3_website_xml, _s3._put_bucket_website, _s3._delete_bucket_website),
 )
 
@@ -1669,6 +1678,7 @@ def _s3_create(logical_id, props, stack_name):
         "created": now_iso(),
         "objects": {},
         "region": get_region(),
+        **_s3._new_bucket_public_access_block(),
     })
     versioning = props.get("VersioningConfiguration", {})
     if versioning.get("Status") == "Enabled":
