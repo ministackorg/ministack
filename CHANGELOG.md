@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **S3 — SigV2 requests through an access point** — under `AUTH=true` a SigV2 presigned URL for an access point ARN failed its signature check, because the check signed the access point host as a bucket, and a SigV2 `Authorization` header through an access point alias or ARN was served. The presigned URL is now checked on its path as the SDK signs it, and the header request gets 400 `InvalidRequest`. Contributed by @iot-rocket.
 - **S3 — access point policies and unsigned requests** — an access point policy was stored but never applied, and an unsigned request through an access point was served. With `AUTH=true` a request through an access point alias or ARN is allowed on the access point by an identity policy or the access point policy (a Deny in either refuses it), and an unsigned one gets 400 `InvalidRequest`; S3 Control calls on the access point are unaffected. Contributed by @iot-rocket.
 
 ## [1.5.31] — 2026-10-21

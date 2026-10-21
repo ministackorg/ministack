@@ -3,6 +3,8 @@ access point ARN or alias."""
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 import uuid
 
 import boto3
@@ -529,6 +531,34 @@ def test_access_point_refuses_unsigned_requests_contract(auth_enabled, bucket, a
             assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidRequest", 400)
         else:
             assert anon.get_object(Bucket=target, Key="pub.txt")["Body"].read() == b"public"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+def test_access_point_sigv2_requests_contract(auth_enabled, iam_user, bucket, access_point, via):
+    """Through an access point a SigV2 presigned URL is served, a SigV2 Authorization header is refused under AUTH."""
+    _name, created = access_point
+    user = iam_user(policy=_access_point_policy(bucket, created["AccessPointArn"], "both"))
+    client = user.client("s3", region="us-east-1", config=Config(signature_version="s3"))
+    url = client.generate_presigned_url("get_object", Params={"Bucket": created[via], "Key": "k.txt"})
+    assert "AWSAccessKeyId=" in url
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        assert resp.read() == b"hello"
+    tampered = re.sub(r"Signature=[^&]+", "Signature=AAAA", url)
+    if auth_enabled:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(tampered, timeout=10)
+        assert exc.value.code == 403
+        assert b"<Code>SignatureDoesNotMatch</Code>" in exc.value.read()
+        with pytest.raises(ClientError) as exc:
+            client.get_object(Bucket=created[via], Key="k.txt")
+        error = exc.value.response
+        assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidRequest", 400)
+    else:
+        with urllib.request.urlopen(tampered, timeout=10) as resp:
+            assert resp.read() == b"hello"
+        assert client.get_object(Bucket=created[via], Key="k.txt")["Body"].read() == b"hello"
+    assert client.get_object(Bucket=bucket, Key="k.txt")["Body"].read() == b"hello"
 
 
 @pytest.mark.auth_contract
