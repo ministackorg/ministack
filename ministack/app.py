@@ -2476,22 +2476,6 @@ def _enforce_iceberg(method: str, path: str, headers: dict, body: bytes, query_p
     return None
 
 
-def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
-    """Authorize an SES v2 call as ses:<operation> on the resource it names, which its denial names too."""
-    if not AUTH:
-        return None
-    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
-    from ministack.core.responses import get_account_id
-
-    iam_action = extract_iam_action("ses", method, path, headers, body, query_params)
-    if iam_action is None:
-        return _authenticate_only("sesv2", headers, query_params, request_id)
-    resource_arn = extract_resource_arn("ses", method, path, headers, body, query_params,
-                                        extract_region(headers, query_params), get_account_id())
-    return _enforce_data_plane("sesv2", iam_action, headers, query_params, request_id, resource_arn=resource_arn,
-                               named_resource=resource_arn)
-
-
 def _iceberg_targets_glue_catalog(path, query_params):
     """Decide whether an ``/iceberg`` REST request belongs to the Glue Data
     Catalog (Glue jobs + Firehose lakehouse) or to S3 Tables.
