@@ -8265,6 +8265,593 @@ def test_s3_replication_filter_round_trips_tag_and_and(s3):
     assert [r["Filter"] for r in got] == [r["Filter"] for r in rules]
 
 
+# Replication rule options (#2311). Capture keys refer to the AWS captures: "run1 C.." to
+# s3-replication-destination.json, "repeats ..." to repeats.json (keys s3:...), "U..", "M:..." to 2311-uncertainties.json, "r2 R.." to 2311-uncertainties-2.json
+# "r3 P.." to 2311-uncertainties-3.json, "r4 P.." to 2311-uncertainties-4.json, "r5 U7w.." to
+# 2311-uncertainties-5.json and "r7 .." to 2311-uncertainties-7.json.
+_REPL_KEY = "arn:aws:kms:us-east-1:000000000000:key/replica"  # AWS accepts it (U6:tests-fake-key)
+_REPL_MALFORMED = ("MalformedXML", "The XML you provided was not well-formed or did not validate "
+                                   "against our published schema", None)
+_REPL_RTC15 = {"Status": "Enabled", "Time": {"Minutes": 15}}
+_REPL_MET15 = {"Status": "Enabled", "EventThreshold": {"Minutes": 15}}
+_REPL_SSE_ON = {"SseKmsEncryptedObjects": {"Status": "Enabled"}}
+
+
+def _repl_rule(dst, dest=None, rid="r", **kw):
+    """A minimal rule AWS accepts (Filter, Priority, DeleteMarkerReplication), plus *kw*."""
+    rule = {"ID": rid, "Priority": 1, "Filter": {"Prefix": ""}, "Status": "Enabled",
+            "DeleteMarkerReplication": {"Status": "Disabled"}, "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}}
+    rule.update(kw)
+    rule["Destination"] = {**rule["Destination"], **(dest or {})}
+    return rule
+
+
+def _repl_v1_rule(dst, dest=None, rid="r", **kw):
+    """A rule in the older Prefix schema: no Filter, Priority or DeleteMarkerReplication."""
+    rule = {"ID": rid, "Prefix": "logs/", "Status": "Enabled", "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}}
+    rule.update(kw)
+    rule["Destination"] = {**rule["Destination"], **(dest or {})}
+    return rule
+
+
+def _repl_options_rule(dst):
+    """The reproduction rule of the issue, accepted and returned unchanged (repeats s3:C9:roundtrip-wire-order)."""
+    return _repl_rule(dst, rid="options", Filter={"Prefix": "kms/"}, DeleteMarkerReplication={"Status": "Enabled"},
+                      SourceSelectionCriteria={"SseKmsEncryptedObjects": {"Status": "Enabled"},
+                                               "ReplicaModifications": {"Status": "Enabled"}},
+                      dest={"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY},
+                            "ReplicationTime": _REPL_RTC15, "Metrics": _REPL_MET15})
+
+
+def _repl_key(key):
+    """The reproduction rule with *key* as its ReplicaKmsKeyID, the request AWS was sent for every key-form capture."""
+    return {"key": key}
+
+
+def _repl_case_rule(dst, extra):
+    extra = dict(extra)
+    if "key" in extra:
+        rule = _repl_options_rule(dst)
+        rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"] = extra["key"]
+        return rule
+    return (_repl_v1_rule if extra.pop("v1", False) else _repl_rule)(dst, **extra)
+
+
+@pytest.fixture
+def repl_pair(s3):
+    src, dst = _bucket(s3, versioned=True), _bucket(s3, versioned=True)
+    yield src, dst
+    s3.delete_bucket_replication(Bucket=src)
+    s3.delete_bucket(Bucket=src)
+    s3.delete_bucket(Bucket=dst)
+
+
+def test_s3_replication_round_trips_rule_and_destination_options(s3, repl_pair):
+    """Each rule comes back exactly as put, options included, and nothing is defaulted in
+    (repeats s3:C1:roundtrip-three-rule, U7:three-rule-round-trip). A second put replaces the
+    whole configuration (repeats s3:C4:second-put-replaces, U7:second-put-replaces)."""
+    src, dst = repl_pair
+    full = _repl_options_rule(dst)
+    plain = _repl_rule(dst, rid="plain", Priority=2, Filter={"Prefix": "plain/"})
+    metrics = _repl_rule(dst, rid="metrics", Priority=3, Filter={"Prefix": "m/"}, dest={"Metrics": {"Status": "Disabled"}})
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [full, plain, metrics]})
+    got = s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]
+    assert got["Rules"] == [full, plain, metrics]
+    assert got["Rules"][0]["Destination"]["ReplicationTime"]["Time"]["Minutes"] == 15
+
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+        "Role": _REPL_ROLE, "Rules": [{**plain, "ID": "options"}]})
+    assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [{**plain, "ID": "options"}]
+
+
+@pytest.mark.parametrize("extra", [
+    pytest.param({"dest": {"Metrics": {"Status": "Enabled"}}}, id="U7:metrics-enabled-bare-no-rtc"),
+    pytest.param({"dest": {"Metrics": {"Status": "Disabled"}}}, id="U7:metrics-disabled-bare-no-rtc"),
+    pytest.param({"SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Disabled"}}},
+                 id="U7:replicamods-disabled-only"),
+    pytest.param({"dest": {"ReplicationTime": {"Status": "Disabled", "Time": {"Minutes": 15}},
+                           "Metrics": {"Status": "Enabled"}}}, id="U3:rtc-disabled+metrics-enabled"),
+    pytest.param({"dest": {"ReplicationTime": {"Status": "Disabled", "Time": {"Minutes": 15}},
+                           "Metrics": {"Status": "Disabled", "EventThreshold": {"Minutes": 15}}}},
+                 id="U3:rtc-disabled+metrics-disabled-et15"),
+    pytest.param({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Disabled"}},
+                  "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, id="M:ssekms-disabled+enc"),
+    pytest.param({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON,
+                  "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, id="U7:v1-ssekms+enc"),
+    pytest.param({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"EncryptionConfiguration": {
+        "ReplicaKmsKeyID": "arn:aws:kms:us-east-1:000000000000:alias/replica"}}}, id="U6:alias-arn-nonexistent"),
+    *[pytest.param(_repl_key(key), id=f"r2 R3:{name}") for name, key in (
+        ("kms-key-empty-id", "arn:aws:kms:us-east-1:000000000000:key/"),
+        ("kms-alias-empty", "arn:aws:kms:us-east-1:000000000000:alias/"),
+        ("kms-no-account", "arn:aws:kms:us-east-1::key/5f0e8a54-1f6c-4d2a-9d55-2b8e3c1f0a11"),
+        ("kms-account-abc", "arn:aws:kms:us-east-1:abc:key/5f0e8a54-1f6c-4d2a-9d55-2b8e3c1f0a11"))],
+    *[pytest.param(_repl_key(key), id=f"r3 P2:{name}") for name, key in (
+        ("resource-with-colon", "arn:aws:kms:us-east-1:000000000000:key/abc:def"),
+        ("resource-with-slashes", "arn:aws:kms:us-east-1:000000000000:key/a/b"))],
+    pytest.param(_repl_key("arn:aws:kms:us-east-1:000000000000:key/abc\ndef"), id="r7 K:key-newline-in-resource"),
+])
+def test_s3_replication_accepts_option_combinations(s3, repl_pair, extra):
+    """Each of these single-rule configurations was accepted by AWS and came back unchanged
+    (capture key in the parameter id)."""
+    src, dst = repl_pair
+    rule = _repl_case_rule(dst, extra)
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+    assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [rule]
+
+
+def _repl_time(status, minutes):
+    return {"Status": status, "Time": {"Minutes": minutes}}
+
+
+def _repl_metrics(status, minutes=None):
+    return {"Status": status, **({"EventThreshold": {"Minutes": minutes}} if minutes is not None else {})}
+
+
+_REPL_TIME_MINUTES = ("InvalidArgument", "Invalid time minute value", "ReplicationTime")
+_REPL_EVENT_MINUTES = ("InvalidArgument", "Invalid event threshold minute value", "ReplicationMetrics")
+_REPL_BOTH_OR_NEITHER = ("InvalidRequest", "Replication destination must contain both ReplicationTime and "
+                                           "Metrics or neither.", None)
+_REPL_NO_THRESHOLD = ("InvalidArgument", "Metrics cannot contain an event threshold when ReplicationTime is "
+                                         "not specified or Disabled", "Metrics")
+_REPL_NEEDS_THRESHOLD = ("InvalidArgument", "ReplicationMetrics must contain an event threshold", "ReplicationMetrics")
+_REPL_SAME_STATUS = ("InvalidArgument", "ReplicationTime and ReplicationMetrics should have the same status",
+                     "ReplicationTime")
+_REPL_NEEDS_KEY = ("InvalidRequest", "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present.", None)
+_REPL_NEEDS_SSE = ("InvalidRequest", "SseKmsEncryptedObjects must be specified if EncryptionConfiguration is present.",
+                   None)
+_REPL_BAD_KEY = ("InvalidArgument", "Invalid ReplicaKmsKeyID ARN.", "ReplicaKmsKeyID")
+_REPL_KEY_REGION = ("InvalidRequest", "KMS key must be in the same region as the destination bucket.", None)
+_REPL_DEST_VERSIONING = ("InvalidRequest", "Destination bucket must have versioning enabled.", None)
+_REPL_V1 = "{} cannot be used for this version of the replication configuration schema.{}Please refer to the S3 " \
+           "Developer Guide for more information."
+
+
+def _repl_dest(**dest):
+    return {"dest": dest}
+
+
+_REPL_REFUSALS = [
+    # schema errors
+    ({"dest": {"Metrics": {"Status": "On"}}}, _REPL_MALFORMED, "U7:metrics-status-On"),
+    (_repl_dest(ReplicationTime=_repl_time("enabled", 15), Metrics=_REPL_MET15), _REPL_MALFORMED,
+     "U7:rtc-status-lowercase"),
+    ({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "On"}},
+      "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, _REPL_MALFORMED, "M:ssekms-status-on"),
+    ({"SourceSelectionCriteria": {"ReplicaModifications": {"Status": "On"}}}, _REPL_MALFORMED, "M:replicamods-status-on"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 2147483648), Metrics=_REPL_MET15), _REPL_MALFORMED,
+     "U4:rtc-minutes-2147483648"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", -2147483649), Metrics=_REPL_MET15), _REPL_MALFORMED,
+     "r2 R1:rtc-minutes-below-int"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Enabled", 2147483648)), _REPL_MALFORMED,
+     "U4:et-minutes-2147483648"),
+    (_repl_dest(ReplicationTime=_repl_time("On", 15)), _REPL_MALFORMED, "U2:rtc-status-on-no-metrics"),
+    # minutes
+    *[(_repl_dest(ReplicationTime=_repl_time("Enabled", n), Metrics=_REPL_MET15), _REPL_TIME_MINUTES, key)
+      for n, key in {-2147483648: 'r2 R1:rtc-minutes-min-int', -1: 'U7:rtc-minutes-minus1', 0: 'U7:rtc-minutes-0', 1: 'U4:rtc-minutes-1', 5: 'U4:rtc-minutes-5', 10: 'run1 C26:rtc-minutes-10', 14: 'U7:rtc-minutes-14', 16: 'repeats C26:rtc-minutes-16', 30: 'repeats C26:rtc-minutes-30', 45: 'U4:rtc-minutes-45', 60: 'repeats C26:rtc-minutes-60', 120: 'U4:rtc-minutes-120', 1440: 'U4:rtc-minutes-1440', 2147483647: 'U4:rtc-minutes-2147483647'}.items()],
+    *[(_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Enabled", n)), _REPL_EVENT_MINUTES, key)
+      for n, key in {-1: 'U4:et-minutes--1', 0: 'U7:et-minutes-0', 5: 'U4:et-minutes-5', 10: 'run1 C26:et-minutes-10', 14: 'repeats C26:metrics-minutes-14', 16: 'repeats C26:metrics-minutes-16', 30: 'U7:et-minutes-30', 45: 'U4:et-minutes-45', 60: 'repeats C26:metrics-minutes-60'}.items()],
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 10), Metrics=_repl_metrics("Enabled", 10)), _REPL_TIME_MINUTES,
+     "U2:et-10+rtc-10"),
+    # ReplicationTime and Metrics together
+    (_repl_dest(ReplicationTime=_REPL_RTC15), _REPL_BOTH_OR_NEITHER, "U7:rtc-without-metrics"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15)), _REPL_BOTH_OR_NEITHER, "U3:rtc-disabled-no-metrics"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 10)), _REPL_TIME_MINUTES, "U2:rtc-10-no-metrics"),
+    (_repl_dest(Metrics=_REPL_MET15), _REPL_NO_THRESHOLD, "U7:et15-no-rtc"),
+    (_repl_dest(Metrics=_repl_metrics("Disabled", 15)), _REPL_NO_THRESHOLD, "U3:metrics-disabled-et15-no-rtc"),
+    (_repl_dest(Metrics=_repl_metrics("Enabled", 10)), _REPL_NO_THRESHOLD, "U2:et-10+no-rtc"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_REPL_MET15), _REPL_NO_THRESHOLD,
+     "U3:rtc-disabled+metrics-enabled-et15"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_repl_metrics("Enabled", 10)), _REPL_NO_THRESHOLD,
+     "r2 R1:rtcD15+metE10"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 10), Metrics=_REPL_MET15), _REPL_TIME_MINUTES,
+     "r2 R1:rtcD10+metE15"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_repl_metrics("Disabled", 10)),
+     _REPL_EVENT_MINUTES, "r2 R1:rtcD15+metD10"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Disabled", 10)), _REPL_EVENT_MINUTES,
+     "U3:rtc-enabled+metrics-disabled-et10"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_repl_metrics("Disabled")), _REPL_NEEDS_THRESHOLD,
+     "U3:rtc-disabled+metrics-disabled"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Enabled")), _REPL_NEEDS_THRESHOLD,
+     "U3:rtc-enabled+metrics-enabled-bare"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Disabled")), _REPL_NEEDS_THRESHOLD,
+     "U3:rtc-enabled+metrics-disabled"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 10), Metrics=_repl_metrics("Disabled")), _REPL_TIME_MINUTES,
+     "U3:rtc-disabled-10+metrics-disabled"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 10), Metrics=_repl_metrics("Enabled")), _REPL_TIME_MINUTES,
+     "r2 R1:rtcE10+metE-bare"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Disabled", 15)), _REPL_SAME_STATUS,
+     "U3:rtc-enabled+metrics-disabled-et15"),
+    # SourceSelectionCriteria and EncryptionConfiguration
+    ({"SourceSelectionCriteria": _REPL_SSE_ON}, _REPL_NEEDS_KEY, "U7:ssekms-enabled-no-enc"),
+    ({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Disabled"}}}, _REPL_NEEDS_KEY,
+     "U7:ssekms-disabled-no-enc"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": _REPL_KEY}), _REPL_NEEDS_SSE, "U7:enc-no-ssc"),
+    ({"SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}},
+      "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, _REPL_NEEDS_SSE, "M:replicamods-only+enc"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": "not-a-key"}), _REPL_NEEDS_SSE, "r2 R3:garbage-key-no-ssc"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"ReplicationTime": _repl_time("Enabled", 10),
+                                                         "Metrics": _REPL_MET15}}, _REPL_NEEDS_KEY,
+     "U2:ssekms-no-enc+rtc-10"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"ReplicationTime": _REPL_RTC15}}, _REPL_NEEDS_KEY,
+     "r2 R2:ssekms-no-enc+rtc-no-metrics"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"Metrics": _REPL_MET15}}, _REPL_NEEDS_KEY,
+     "U2:et15-no-rtc+ssekms-no-enc"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": _REPL_KEY}, ReplicationTime=_REPL_RTC15), _REPL_NEEDS_SSE,
+     "U2:enc-no-ssc+rtc-no-metrics"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": _REPL_KEY}, ReplicationTime=_repl_time("Enabled", 10),
+                Metrics=_REPL_MET15), _REPL_NEEDS_SSE, "U2:enc-no-ssc+rtc-10"),
+    # the replica key
+    (_repl_key(""), ("InvalidArgument", "ReplicaKmsKeyID cannot be empty.", "ReplicaKmsKeyID"), "U6:empty-element"),
+    *[(_repl_key(key), _REPL_BAD_KEY, f"U6/r2 R3/r3 P2:{name}") for name, key in (
+        ("bare-random-uuid", "5f0e8a54-1f6c-4d2a-9d55-2b8e3c1f0a11"),
+        ("alias-name-nonexistent", "alias/replica"),
+        ("garbage", "not-a-key"),
+        ("s3-arn", "arn:aws:s3:::some-bucket"),
+        ("kms-other-resource", "arn:aws:kms:us-east-1:000000000000:grant/abc"),
+        ("kms-five-parts", "arn:aws:kms:us-east-1:000000000000"),
+        ("kms-padded", f" {_REPL_KEY} "),
+        ("key-no-arn-prefix", "aws:kms:us-east-1:000000000000:key/replica"),
+        ("key-no-slash", "arn:aws:kms:us-east-1:000000000000:key"),
+        ("service-uppercase", "arn:aws:KMS:us-east-1:000000000000:key/replica"),
+        ("arn-uppercase", "ARN:aws:kms:us-east-1:000000000000:key/replica"),
+        ("partition-empty", "arn::kms:us-east-1:000000000000:key/replica"),
+        ("whitespace-only", " "))],
+    *[(_repl_key(key), _REPL_BAD_KEY, f"r7 K:{name}") for name, key in (
+        ("key-resource-upper", "arn:aws:kms:us-east-1:000000000000:KEY/replica"),
+        ("alias-resource-capital", "arn:aws:kms:us-east-1:000000000000:Alias/x"))],
+    (_repl_key("arn:aws-cn:kms:us-east-1:000000000000:key/replica"),
+     ("InvalidRequest", "KMS key ARN partition must match the destination bucket ARN partition.", None),
+     "r2 R3:kms-partition-cn"),
+    (_repl_key("arn:aws-cn:kms:us-west-2:000000000000:key/replica"),
+     ("InvalidRequest", "KMS key ARN partition must match the destination bucket ARN partition.", None),
+     "r3 P2:partition-cn-and-west"),
+    ({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Disabled"}}, "dest": {
+        "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:us-west-2:000000000000:key/replica"}}},
+     _REPL_KEY_REGION, "r3 P2:ssekms-disabled+west-key"),
+    *[(_repl_key(key), _REPL_KEY_REGION, f"U6/r2 R3:{name}") for name, key in (
+        ("other-region-key-arn", "arn:aws:kms:us-west-2:000000000000:key/replica"),
+        ("kms-no-region", "arn:aws:kms::000000000000:key/replica"),
+        ("kms-bogus-region", "arn:aws:kms:mars-1:000000000000:key/replica"),
+        ("kms-other-region-alias", "arn:aws:kms:us-west-2:000000000000:alias/x"))],
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": "not-a-key"},
+                                                         "ReplicationTime": _repl_time("Enabled", 10),
+                                                         "Metrics": _REPL_MET15}}, _REPL_BAD_KEY,
+     "r2 R3:garbage-key+rtc10"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {
+        "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:us-west-2:000000000000:key/replica"},
+        "ReplicationTime": _REPL_RTC15}}, _REPL_KEY_REGION, "r2 R3:west-key+rtc-no-metrics"),
+    # the older Prefix schema, checked after the rule checks above
+    ({"v1": True, "dest": {"ReplicationTime": _REPL_RTC15, "Metrics": _REPL_MET15}},
+     ("InvalidRequest", _REPL_V1.format("ReplicationTime", ""), None), "M:v1-rtc+metrics"),
+    ({"v1": True, "dest": {"ReplicationTime": _repl_time("Disabled", 15), "Metrics": _repl_metrics("Enabled")}},
+     ("InvalidRequest", _REPL_V1.format("ReplicationTime", ""), None), "r2 R4:v1-rtc-disabled+metrics-enabled"),
+    ({"v1": True, "dest": {"Metrics": _repl_metrics("Enabled")}},
+     ("InvalidRequest", _REPL_V1.format("Metrics", ""), None), "M:v1-metrics-enabled"),
+    ({"v1": True, "dest": {"Metrics": _repl_metrics("Disabled")}},
+     ("InvalidRequest", _REPL_V1.format("Metrics", ""), None), "r2 R4:v1-metrics-disabled"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}}},
+     ("InvalidRequest", _REPL_V1.format("ReplicaModifications", " "), None), "M:v1-replicamods"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Disabled"}}},
+     ("InvalidRequest", _REPL_V1.format("ReplicaModifications", " "), None), "r2 R4:v1-replicamods-disabled"),
+    ({"v1": True, "SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Enabled"},
+                                              "ReplicaModifications": {"Status": "Enabled"}},
+      "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}, "ReplicationTime": _REPL_RTC15,
+               "Metrics": _REPL_MET15}},
+     ("InvalidRequest", _REPL_V1.format("ReplicaModifications", " "), None), "M:v1-full-order"),
+    ({"v1": True, "dest": {"ReplicationTime": _REPL_RTC15}}, _REPL_BOTH_OR_NEITHER, "M:v1-rtc-no-metrics"),
+    ({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON}, _REPL_NEEDS_KEY, "M:v1-ssekms-no-enc"),
+    ({"v1": True, "dest": {"ReplicationTime": _repl_time("Enabled", 10), "Metrics": _REPL_MET15}},
+     _REPL_TIME_MINUTES, "r2 R4:v1-rtc10+metrics"),
+    ({"v1": True, "dest": {"Metrics": _REPL_MET15}}, _REPL_NO_THRESHOLD, "r2 R4:v1-metrics-et15-no-rtc"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}},
+      "dest": {"ReplicationTime": _REPL_RTC15}}, _REPL_BOTH_OR_NEITHER, "r2 R4:v1-replicamods+rtc-no-metrics"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}, **_REPL_SSE_ON}},
+     _REPL_NEEDS_KEY, "r2 R4:v1-replicamods+ssekms-no-enc"),
+    ({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"ReplicationTime": _REPL_RTC15,
+                                                                    "Metrics": _REPL_MET15}},
+     _REPL_NEEDS_KEY, "r2 R4:v1-rtc+metrics+ssekms-no-enc"),
+    ({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"EncryptionConfiguration": {
+        "ReplicaKmsKeyID": "not-a-key"}}}, _REPL_BAD_KEY, "r2 R3:v1-garbage-key"),
+]
+
+
+@pytest.mark.parametrize("extra,expected", [pytest.param(e, x, id=k) for e, x, k in _REPL_REFUSALS])
+def test_s3_replication_refuses_options_like_aws(s3, repl_pair, extra, expected):
+    """One single-rule put per AWS capture (key in the parameter id): the same code, message,
+    status and ArgumentName, and nothing is stored."""
+    src, dst = repl_pair
+    rule = _repl_case_rule(dst, extra)
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+    code, message, argument = expected
+    err = exc.value.response["Error"]
+    assert (err["Code"], err["Message"], _status(exc)) == (code, message, 400)
+    assert err.get("ArgumentName") == argument
+    if argument == "ReplicaKmsKeyID" and rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"]:
+        assert err["ArgumentValue"] == rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"]
+    with pytest.raises(ClientError) as exc:
+        s3.get_bucket_replication(Bucket=src)
+    assert _code(exc) == "ReplicationConfigurationNotFoundError"
+
+
+def test_s3_replication_checks_options_document_first_then_rule_by_rule(s3, repl_pair):
+    """Schema errors anywhere in the document come first (U2:two-rules-crossfield-then-schema,
+    U2:unversioned-dest+metrics-on). Then each rule in turn gets the destination versioning
+    check and its option checks (r2 R5:rule1-crossfield+rule2-unversioned,
+    R5:rule1-unversioned+rule2-crossfield, R5:rule1-minutes+rule2-unversioned,
+    U2:unversioned-dest+rtc-no-metrics, U2:two-rules-minutes-then-crossfield,
+    U2:two-rules-crossfield-then-minutes, U2:two-rules-second-bad). The Prefix-schema checks
+    run after every rule (r2 R5:rule1-v1-rtc+rule2-unversioned)."""
+    src, dst = repl_pair
+    unv = _bucket(s3)
+    try:
+        cases = [
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _REPL_RTC15}),
+              _repl_rule(dst, rid="b", Priority=2, dest={"Metrics": {"Status": "On"}})], _REPL_MALFORMED),
+            ([_repl_rule(unv, dest={"Metrics": {"Status": "On"}})], _REPL_MALFORMED),
+            ([_repl_rule(unv, dest={"ReplicationTime": _REPL_RTC15})], _REPL_DEST_VERSIONING),
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _REPL_RTC15}),
+              _repl_rule(unv, rid="b", Priority=2)], _REPL_BOTH_OR_NEITHER),
+            ([_repl_rule(unv, rid="a"),
+              _repl_rule(dst, rid="b", Priority=2, dest={"ReplicationTime": _REPL_RTC15})], _REPL_DEST_VERSIONING),
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _repl_time("Enabled", 10), "Metrics": _REPL_MET15}),
+              _repl_rule(unv, rid="b", Priority=2)], _REPL_TIME_MINUTES),
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _repl_time("Enabled", 10), "Metrics": _REPL_MET15}),
+              _repl_rule(dst, rid="b", Priority=2, SourceSelectionCriteria=_REPL_SSE_ON)], _REPL_TIME_MINUTES),
+            ([_repl_rule(dst, rid="a", SourceSelectionCriteria=_REPL_SSE_ON),
+              _repl_rule(dst, rid="b", Priority=2, dest={"ReplicationTime": _repl_time("Enabled", 10),
+                                                         "Metrics": _REPL_MET15})], _REPL_NEEDS_KEY),
+            ([_repl_rule(dst, rid="a"), _repl_rule(dst, rid="b", Priority=2, dest={"ReplicationTime": _REPL_RTC15})],
+             _REPL_BOTH_OR_NEITHER),
+            ([_repl_v1_rule(dst, rid="a", Prefix="a/", dest={"ReplicationTime": _REPL_RTC15, "Metrics": _REPL_MET15}),
+              _repl_v1_rule(unv, rid="b", Prefix="b/")], _REPL_DEST_VERSIONING),
+        ]
+        for rules, (code, message, argument) in cases:
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": rules})
+            err = exc.value.response["Error"]
+            assert (err["Code"], err["Message"], err.get("ArgumentName")) == (code, message, argument), rules
+            with pytest.raises(ClientError) as exc:
+                s3.get_bucket_replication(Bucket=src)
+            assert _code(exc) == "ReplicationConfigurationNotFoundError"
+    finally:
+        s3.delete_bucket(Bucket=unv)
+
+
+def test_s3_replication_refused_put_keeps_the_stored_configuration(s3, repl_pair):
+    """A refused put leaves the configuration already stored (U2:existing-then-refused,
+    U2:existing-then-malformed)."""
+    src, dst = repl_pair
+    full = _repl_options_rule(dst)
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [full]})
+    for dest, code in (({"ReplicationTime": _REPL_RTC15}, "InvalidRequest"), ({"Metrics": {"Status": "On"}}, "MalformedXML")):
+        with pytest.raises(ClientError) as exc:
+            s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+                "Role": _REPL_ROLE, "Rules": [_repl_rule(dst, dest=dest)]})
+        assert _code(exc) == code
+        assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [full]
+
+
+def test_s3_replication_key_region_follows_the_destination_bucket(s3, repl_pair):
+    """The replica key must be in the destination bucket's region: for a us-west-2 destination
+    a us-east-1 key is refused and a us-west-2 key accepted (r5 U7w:west-dest+east-key,
+    U7w:west-dest+west-key)."""
+    src, _ = repl_pair
+    dst = _bucket(s3, versioned=True, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    try:
+        rule = _repl_rule(dst, SourceSelectionCriteria=_REPL_SSE_ON, dest={"EncryptionConfiguration": {
+            "ReplicaKmsKeyID": _REPL_KEY}})
+        with pytest.raises(ClientError) as exc:
+            s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+        assert exc.value.response["Error"]["Message"] == _REPL_KEY_REGION[1]
+        rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"] = _REPL_KEY.replace("us-east-1", "us-west-2")
+        s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+        assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [rule]
+    finally:
+        s3.delete_bucket(Bucket=dst)
+
+
+@pytest.fixture
+def replication_state(monkeypatch):
+    """A versioned bucket in fresh in-process S3 state, under account 000000000000."""
+    fresh = {"_buckets": AccountScopedDict(), "_bucket_versioning": AccountScopedDict(),
+             "_bucket_replication": AccountScopedDict()}
+    for attr, store in fresh.items():
+        monkeypatch.setattr(_s3_mod, attr, store)
+    monkeypatch.setitem(_s3_mod._PERSISTED_BUCKET_DICTS, "bucket_versioning", fresh["_bucket_versioning"])
+    monkeypatch.setitem(_s3_mod._PERSISTED_BUCKET_DICTS, "bucket_replication", fresh["_bucket_replication"])
+    with request_scope("000000000000", "us-east-1"):
+        _s3_mod._buckets["repl-options-src"] = {"objects": {}}
+        _s3_mod._bucket_versioning["repl-options-src"] = "Enabled"
+        yield "repl-options-src"
+
+
+# The accepted reproduction rule as botocore serialises it (repeats s3:C9:raw-accepted-rule).
+_REPL_OPTIONS_XML = (
+    '<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    "<Role>arn:aws:iam::000000000000:role/repl</Role>"
+    "<Rule><ID>options</ID><Priority>1</Priority><Filter><Prefix>kms/</Prefix></Filter><Status>Enabled</Status>"
+    "<SourceSelectionCriteria><SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>"
+    "<ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria>"
+    "<Destination><Bucket>arn:aws:s3:::repl-options-dst</Bucket>"
+    f"<EncryptionConfiguration><ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID></EncryptionConfiguration>"
+    "<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time></ReplicationTime>"
+    "<Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>"
+    "</Destination><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule>"
+    "</ReplicationConfiguration>")
+
+
+def _replication_tree(body):
+    def tree(el):
+        name = el.tag.split("}")[-1]
+        return {name: [tree(c) for c in el]} if len(el) else name
+    return tree(ElementTree.fromstring(body))
+
+
+def test_s3_replication_options_wire_form_and_persistence(replication_state):
+    """GetBucketReplication emits the options where AWS does: SourceSelectionCriteria after the
+    rule's existing members, and EncryptionConfiguration, Metrics, ReplicationTime last in the
+    destination (repeats s3:C9:roundtrip-wire-order, M:full-dest-order), with Minutes as 15. The
+    stored options survive a get_state/load round trip in the account that put them
+    (MiniStack-only)."""
+    bucket = replication_state
+    assert _s3_mod._put_bucket_replication(bucket, _REPL_OPTIONS_XML.encode())[0] == 200
+    state = _s3_mod.get_state()["bucket_replication"]
+    _s3_mod._bucket_replication.clear()
+    _s3_mod.load_persisted_state({"bucket_replication": state})
+
+    status, _headers, body = _s3_mod._get_bucket_replication(bucket)
+    assert status == 200
+    (rule,) = [c for c in _replication_tree(body)["ReplicationConfiguration"] if isinstance(c, dict)]
+    members = [next(iter(c)) if isinstance(c, dict) else c for c in rule["Rule"]]
+    assert members[-2:] == ["SourceSelectionCriteria", "Destination"]
+    assert rule["Rule"][-2] == {"SourceSelectionCriteria": [{"SseKmsEncryptedObjects": ["Status"]},
+                                                           {"ReplicaModifications": ["Status"]}]}
+    assert rule["Rule"][-1]["Destination"][-3:] == [
+        {"EncryptionConfiguration": ["ReplicaKmsKeyID"]},
+        {"Metrics": ["Status", {"EventThreshold": ["Minutes"]}]},
+        {"ReplicationTime": ["Status", {"Time": ["Minutes"]}]}]
+    root = ElementTree.fromstring(body)
+    assert [el.text for el in root.iter(f"{{{_s3_mod.S3_NS}}}Minutes")] == ["15", "15"]
+    with request_scope("111111111111", "us-east-1"):
+        assert _s3_mod._bucket_replication.get(bucket) is None
+
+
+def _repl_raw_error(bucket, body):
+    status, _headers, out = _s3_mod._put_bucket_replication(bucket, body.encode())
+    root = ElementTree.fromstring(out)
+    return status, {el.tag: el.text for el in root}
+
+
+_BOGUS = "<Bogus>x</Bogus>"
+
+
+@pytest.mark.parametrize("old,new,expected", [
+    pytest.param("<Metrics><Status>Enabled</Status>", "<Metrics>", _REPL_MALFORMED, id="U7:metrics-no-status"),
+    pytest.param("<SseKmsEncryptedObjects><Status>Enabled</Status>", "<SseKmsEncryptedObjects>", _REPL_MALFORMED,
+                 id="U7:ssekms-no-status"),
+    pytest.param("<ReplicaModifications><Status>Enabled</Status>", "<ReplicaModifications>", _REPL_MALFORMED,
+                 id="U7:replicamods-no-status"),
+    pytest.param("<Time><Minutes>15</Minutes></Time>", "", _REPL_MALFORMED, id="U7:rtc-no-time"),
+    pytest.param("<Time><Minutes>15</Minutes></Time>", "<Time></Time>", _REPL_MALFORMED, id="M:time-empty+metrics"),
+    pytest.param("<EventThreshold><Minutes>15</Minutes></EventThreshold>", "<EventThreshold></EventThreshold>",
+                 _REPL_MALFORMED, id="M:et-empty+rtc"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes>fifteen</Minutes>", _REPL_MALFORMED,
+                 id="U7:minutes-fifteen"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes>15.0</Minutes>", _REPL_MALFORMED,
+                 id="U4:rtc-minutes-15.0"),
+    pytest.param("<ReplicationTime><Status>Enabled</Status>", "<ReplicationTime><Status> Enabled </Status>",
+                 _REPL_MALFORMED, id="M:status-padded"),
+    pytest.param("<ReplicationTime><Status>Enabled</Status>", "<ReplicationTime><Status></Status>", _REPL_MALFORMED,
+                 id="M:rtc-empty-status"),
+    pytest.param("<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time></ReplicationTime>",
+                 "<ReplicationTime></ReplicationTime>", _REPL_MALFORMED, id="M:rtc-empty"),
+    pytest.param("<Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>",
+                 "<Metrics></Metrics>", _REPL_MALFORMED, id="M:metrics-empty+rtc"),
+    *[pytest.param(f"</{el}>", f"{_BOGUS}</{el}>", _REPL_MALFORMED, id=f"U5:bogus-in-{el}")
+      for el in ("SourceSelectionCriteria", "SseKmsEncryptedObjects", "ReplicaModifications", "EncryptionConfiguration",
+                 "ReplicationTime", "Time", "Metrics", "EventThreshold")],
+    pytest.param("<Metrics><Status>Enabled</Status>", "<Metrics><Status>Enabled</Status><Status>Enabled</Status>",
+                 _REPL_MALFORMED, id="r3 P1:dup-metrics-status"),
+    pytest.param("<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>",
+                 "<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>" * 2, _REPL_MALFORMED,
+                 id="r3 P1:dup-ssekms"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes>15</Minutes><Minutes>15</Minutes>", _REPL_MALFORMED,
+                 id="r3 P1:dup-time-minutes"),
+    pytest.param("</EncryptionConfiguration>", f"</EncryptionConfiguration><EncryptionConfiguration><ReplicaKmsKeyID>"
+                 f"{_REPL_KEY}</ReplicaKmsKeyID></EncryptionConfiguration>", _REPL_MALFORMED,
+                 id="r3 P1:dup-encryption-configuration"),
+    pytest.param("</ReplicationTime>", "</ReplicationTime><ReplicationTime><Status>Enabled</Status><Time><Minutes>15"
+                 "</Minutes></Time></ReplicationTime>", _REPL_MALFORMED, id="r3 P1:dup-replication-time"),
+    pytest.param("</SourceSelectionCriteria>", "</SourceSelectionCriteria><SourceSelectionCriteria>"
+                 "<ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria>",
+                 _REPL_MALFORMED, id="r3 P1:dup-ssc"),
+    *[pytest.param(old, new, _REPL_MALFORMED, id=f"r7 D:{name}") for name, old, new in (
+        ("dup-metrics", "</Metrics>", "</Metrics><Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes>"
+                                      "</EventThreshold></Metrics>"),
+        ("dup-replicamods", "</ReplicaModifications>",
+         "</ReplicaModifications><ReplicaModifications><Status>Enabled</Status></ReplicaModifications>"),
+        ("dup-replica-kms-key-id", "</ReplicaKmsKeyID>", f"</ReplicaKmsKeyID><ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID>"),
+        ("dup-event-threshold", "</EventThreshold>", "</EventThreshold><EventThreshold><Minutes>15</Minutes></EventThreshold>"),
+        ("dup-time", "</Time>", "</Time><Time><Minutes>15</Minutes></Time>"),
+        ("dup-rtc-status", "<ReplicationTime><Status>Enabled</Status>",
+         "<ReplicationTime><Status>Enabled</Status><Status>Enabled</Status>"),
+        ("dup-ssekms-status", "<SseKmsEncryptedObjects><Status>Enabled</Status>",
+         "<SseKmsEncryptedObjects><Status>Enabled</Status><Status>Enabled</Status>"),
+        ("dup-et-minutes", "<EventThreshold><Minutes>15</Minutes>", "<EventThreshold><Minutes>15</Minutes><Minutes>15</Minutes>"))],
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes></Minutes>", _REPL_TIME_MINUTES,
+                 id="U4:rtc-minutes-empty"),
+    pytest.param("<EventThreshold><Minutes>15</Minutes>", "<EventThreshold><Minutes></Minutes>", _REPL_EVENT_MINUTES,
+                 id="r2 R1:rtcE15+metE-empty-minutes"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes> </Minutes>", _REPL_TIME_MINUTES,
+                 id="r4 P7:rtc-minutes-whitespace-only"),
+    pytest.param("<EventThreshold><Minutes>15</Minutes>", "<EventThreshold><Minutes> </Minutes>", _REPL_EVENT_MINUTES,
+                 id="r4 P7:et-minutes-whitespace-only"),
+    pytest.param(f"<ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID>", "", (
+        "InvalidRequest", "ReplicaKmsKeyID tag must be specified in EncryptionConfiguration.", None),
+        id="U7:empty-enc+ssekms"),
+    pytest.param(f"<ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID>" + "</EncryptionConfiguration><ReplicationTime>"
+                 "<Status>Enabled</Status><Time><Minutes>15</Minutes>",
+                 "</EncryptionConfiguration><ReplicationTime><Status>Enabled</Status><Time><Minutes>10</Minutes>", (
+                     "InvalidRequest", "ReplicaKmsKeyID tag must be specified in EncryptionConfiguration.", None),
+                 id="r2 R2:empty-enc+ssekms+rtc10"),
+    pytest.param("<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>"
+                 "<ReplicaModifications><Status>Enabled</Status></ReplicaModifications>", "", (
+                     "InvalidRequest", "SourceSelectionCriteria cannot be empty.", None), id="U2:empty-ssc+enc"),
+])
+def test_s3_replication_raw_option_bodies_like_aws(replication_state, old, new, expected):
+    """Raw-XML variants of the accepted rule that botocore cannot send (capture key in the
+    parameter id): the same code, message and ArgumentName, and nothing is stored."""
+    assert old in _REPL_OPTIONS_XML
+    status, err = _repl_raw_error(replication_state, _REPL_OPTIONS_XML.replace(old, new, 1))
+    code, message, argument = expected
+    assert (status, err["Code"], err["Message"], err.get("ArgumentName")) == (400, code, message, argument)
+    assert _s3_mod._bucket_replication.get(replication_state) is None
+
+
+def test_s3_replication_raw_empty_selection_and_encryption(replication_state):
+    """Empty SourceSelectionCriteria and EncryptionConfiguration elements on a minimal rule
+    (U7:empty-ssc, U7:empty-enc-no-ssc, r2 R2:empty-ssc+rtc10)."""
+    def body(rule_extra="", dest_extra=""):
+        return ('<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                "<Role>arn:aws:iam::000000000000:role/repl</Role><Rule><ID>r</ID><Priority>1</Priority>"
+                f"<Filter><Prefix></Prefix></Filter><Status>Enabled</Status>{rule_extra}"
+                f"<Destination><Bucket>arn:aws:s3:::repl-options-dst</Bucket>{dest_extra}</Destination>"
+                "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication></Rule>"
+                "</ReplicationConfiguration>")
+    empty_ssc = ("InvalidRequest", "SourceSelectionCriteria cannot be empty.")
+    for raw, expected in (
+        (body("<SourceSelectionCriteria></SourceSelectionCriteria>"), empty_ssc),
+        (body("<SourceSelectionCriteria></SourceSelectionCriteria>",
+              "<ReplicationTime><Status>Enabled</Status><Time><Minutes>10</Minutes></Time></ReplicationTime>"
+              "<Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>"),
+         empty_ssc),
+        (body(dest_extra="<EncryptionConfiguration></EncryptionConfiguration>"), _REPL_NEEDS_SSE[:2]),
+    ):
+        status, err = _repl_raw_error(replication_state, raw)
+        assert (status, err["Code"], err["Message"]) == (400, *expected)
+        assert _s3_mod._bucket_replication.get(replication_state) is None
+
+
+@pytest.mark.parametrize("minutes", ["015", "+15", " 15 ", "\t15\n"])
+def test_s3_replication_reads_minutes_as_an_integer(replication_state, minutes):
+    """xs:int forms of 15 are accepted and returned as 15 (U4:rtc-minutes-015, U4:rtc-minutes-+15,
+    U4:rtc-minutes-padded-15, U4:et-minutes-015, r3 P1:minutes-tab-newline)."""
+    body = _REPL_OPTIONS_XML.replace("<Minutes>15</Minutes>", f"<Minutes>{minutes}</Minutes>")
+    assert _s3_mod._put_bucket_replication(replication_state, body.encode())[0] == 200
+    dest = _s3_mod._bucket_replication[replication_state]["Rules"][0]["Destination"]
+    assert dest["ReplicationTime"]["Time"] == dest["Metrics"]["EventThreshold"] == {"Minutes": 15}
+
+
+def test_s3_replication_empty_key_argument_value(replication_state):
+    """An empty ReplicaKmsKeyID answers InvalidArgument with an empty ArgumentValue (U6:empty-element)."""
+    body = _REPL_OPTIONS_XML.replace(_REPL_KEY, "", 1)
+    status, err = _repl_raw_error(replication_state, body)
+    assert (status, err["Code"], err["Message"], err["ArgumentName"]) == (
+        400, "InvalidArgument", "ReplicaKmsKeyID cannot be empty.", "ReplicaKmsKeyID")
+    assert err["ArgumentValue"] in (None, "")
+
+
 def test_s3_replication_config_round_trips_cross_account_fields(s3):
     """GetBucketReplication answers the cross-account fields the PUT stored."""
     src_client, dst_client, src, dst = _cross_account_pair("cfg")
