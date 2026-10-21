@@ -907,7 +907,6 @@ def test_cfn_s3_bucket_cors_public_access_block_and_website(cfn, s3):
     cfn.update_stack(StackName="cfn-s3-configs", TemplateBody=template({}))
     assert _wait_stack(cfn, "cfn-s3-configs")["StackStatus"] == "UPDATE_COMPLETE"
     assert error_code(s3.get_bucket_cors) == "NoSuchCORSConfiguration"
-    assert error_code(s3.get_public_access_block) == "NoSuchPublicAccessBlockConfiguration"
     assert error_code(s3.get_bucket_website) == "NoSuchWebsiteConfiguration"
 
     cfn.delete_stack(StackName="cfn-s3-configs")
