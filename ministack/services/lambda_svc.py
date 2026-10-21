@@ -4322,7 +4322,7 @@ def handler(event, context):
 
 _JS_CTX_ARN_SHIM = '''\
 // MiniStack shim: hand user code the control-plane ARN in its context, and
-// reach the gateway over plain HTTP (without USE_SSL) when a library insists on HTTPS.
+// reach the gateway port when a library insists on HTTPS (over plain HTTP without USE_SSL).
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
@@ -4372,8 +4372,15 @@ try {
     if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
       return origHttpsRequest.apply(https, original);
     }
-    // USE_SSL: the gateway serves only HTTPS, so a request to it keeps TLS.
-    if (EP.protocol === "https:") return origHttpsRequest.apply(https, original);
+    // USE_SSL: the gateway serves only HTTPS, so a request to it keeps TLS and
+    // only the https default port becomes the gateway port.
+    if (EP.protocol === "https:") {
+      if (rawPort && rawPort !== "443") return origHttpsRequest.apply(https, original);
+      opts.protocol = "https:";
+      opts.hostname = host;
+      opts.port = EP_PORT;
+      return origHttpsRequest.call(https, opts, callback);
+    }
     opts.protocol = "http:";
     opts.hostname = host;
     opts.host = host + ":" + EP_PORT;

@@ -114,6 +114,8 @@ _mrap_operations = AccountScopedDict()
 # {Name, Bucket, BucketAccountId, Alias, CreationDate, NetworkOrigin, VpcConfiguration,
 #  PublicAccessBlockConfiguration, Policy, Tags}
 _access_points = AccountRegionScopedDict()
+# The access point record a data-plane request came through, while it is handled.
+_request_access_point: contextvars.ContextVar[dict | None] = contextvars.ContextVar("s3_access_point", default=None)
 
 # Object Lambda Access Points, by name within an account and region:
 # {Name, Alias: {Value, Status}, CreationDate, Configuration, Policy, PublicAccessBlockConfiguration}
@@ -1017,7 +1019,12 @@ def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str,
 
 
 def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
-    """Whether the bucket's Public Access Block turns *setting* on, e.g. ``IgnorePublicAcls``."""
+    """Whether the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    access_point = _request_access_point.get()
+    # An access point's BlockPublicPolicy does not cover the bucket's policy.
+    if access_point and access_point["Bucket"] == bucket_name and setting != "BlockPublicPolicy" and \
+            access_point["PublicAccessBlockConfiguration"].get(setting):
+        return True
     record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
     stored = record.get("_public_access_block")
     if not stored:
@@ -2367,9 +2374,11 @@ async def handle_request(
     enforce_bucket_region: bool = True,
     internal: bool = False,
     access_point_region: str | None = None,
+    access_point: dict | None = None,
 ) -> tuple:
-    """``access_point_region`` is set for a request that came through an access
-    point host; the region check then compares against the access point."""
+    """``access_point_region`` and ``access_point`` are set for a request that came
+    through an access point host; the region check then compares against the
+    access point."""
     bucket, key = _parse_bucket_key(path, headers)
 
     # A virtual-hosted request is rewritten to path-style before it reaches here
@@ -2408,7 +2417,7 @@ async def handle_request(
             account, access_point_region, record = resolved
             if account != get_account_id():
                 return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
-            bucket = record["Bucket"]
+            bucket, access_point = record["Bucket"], record
     headers, denied = _resolve_copy_source_alias(headers)
     if denied is not None:
         return denied
@@ -2423,7 +2432,11 @@ async def handle_request(
         resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
         return status, resp_headers, resp_body
 
-    result = _dispatch(method, bucket, key, headers, body, query_params)
+    token = _request_access_point.set(access_point)
+    try:
+        result = _dispatch(method, bucket, key, headers, body, query_params)
+    finally:
+        _request_access_point.reset(token)
 
     status, resp_headers, resp_body = result
     resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -2715,6 +2728,12 @@ def _location_constraint(body: bytes) -> str | None:
     return loc_el.text if loc_el is not None and loc_el.text else None
 
 
+def _constraint_region(constraint: str | None) -> str | None:
+    """``EU`` is the legacy LocationConstraint for eu-west-1, which still
+    accepts it (observed on AWS 2026-10-20); the AWS SDK for .NET sends it."""
+    return "eu-west-1" if constraint == "EU" else constraint
+
+
 def _location_constraint_error(name: str, constraint: str | None, endpoint_region: str):
     """CreateBucket's location-constraint rules for a request signed for
     ``endpoint_region`` (observed on AWS 2026-10-12): us-east-1 is never a
@@ -2723,7 +2742,7 @@ def _location_constraint_error(name: str, constraint: str | None, endpoint_regio
     if constraint == "us-east-1":
         return _error("InvalidLocationConstraint", "The specified location-constraint is not valid",
                       400, f"/{name}", extra={"LocationConstraint": constraint})
-    if endpoint_region != "us-east-1" and constraint != endpoint_region:
+    if endpoint_region != "us-east-1" and _constraint_region(constraint) != endpoint_region:
         return _error(
             "IllegalLocationConstraintException",
             f"The {constraint or 'unspecified'} location constraint is incompatible for the region "
@@ -2781,14 +2800,14 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
             extra={"BucketName": name},
         )
 
-    region = None
+    constraint = None
     tags = {}
     if body:
         try:
             xml_root = fromstring(body)
             loc_el = _find_xml_tag(xml_root, "LocationConstraint")
             if loc_el is not None and loc_el.text:
-                region = loc_el.text
+                constraint = loc_el.text
 
             err = _duplicate_tag_error(xml_root, resource=f"/{name}")
             if err is not None:
@@ -2804,8 +2823,11 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
 
     # No explicit LocationConstraint: the bucket lands in the region the
     # request was signed for, like real AWS.
-    region = region or get_region()
+    region = _constraint_region(constraint) or get_region()
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    if constraint == "EU":
+        # GetBucketLocation answers EU for a bucket created with EU (observed on AWS 2026-10-20).
+        _buckets[name]["location_constraint"] = constraint
     ownership = headers.get("x-amz-object-ownership")
     if ownership:
         # The same document PutBucketOwnershipControls stores.
@@ -2906,7 +2928,7 @@ def _get_bucket_location(name: str):
     # AWS returns an empty LocationConstraint only for us-east-1 buckets;
     # every other region is echoed back verbatim.
     if region != "us-east-1":
-        root.text = region
+        root.text = _buckets[name].get("location_constraint") or region
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
@@ -7424,6 +7446,220 @@ def _replication_filter_xml(filter_el, rule_filter: dict) -> None:
             _tag(and_el, tag)
 
 
+# SourceSelectionCriteria on a rule and EncryptionConfiguration, ReplicationTime and
+# Metrics on its destination are stored and returned so IaC state matches; the data
+# plane ignores them (_replication_rule_for). The checks below follow AWS, in AWS's order.
+_REPLICATION_STATUSES = ("Enabled", "Disabled")
+_REPLICATION_MINUTES = 15  # the only Time and EventThreshold value AWS accepts
+_REPLICATION_V1_MESSAGE = ("{} cannot be used for this version of the replication configuration "
+                           "schema.{}Please refer to the S3 Developer Guide for more information.")
+
+
+class _MalformedReplication(Exception):
+    """An option that does not validate against the S3 schema (MalformedXML)."""
+
+
+def _replication_children(el, allowed: tuple) -> dict:
+    """Children of *el* by local name; an unknown or repeated child is a schema error."""
+    children = {}
+    for child in el:
+        name = child.tag.split("}")[-1]
+        if name not in allowed or name in children:
+            raise _MalformedReplication(name)
+        children[name] = child
+    return children
+
+
+def _replication_option(parent, name: str):
+    """The *name* child of *parent*, or None; more than one is a schema error."""
+    found = [child for child in parent if child.tag.split("}")[-1] == name]
+    if len(found) > 1:
+        raise _MalformedReplication(name)
+    return found[0] if found else None
+
+
+def _replication_status(children: dict) -> dict:
+    """The required Enabled|Disabled Status, matched exactly."""
+    status_el = children.get("Status")
+    if status_el is None or status_el.text not in _REPLICATION_STATUSES:
+        raise _MalformedReplication("Status")
+    return {"Status": status_el.text}
+
+
+def _replication_minutes(el) -> dict:
+    """A ReplicationTimeValue: Minutes is a required xs:int. An empty value parses and is
+    refused later by the 15-minute check, as on AWS."""
+    minutes_el = _replication_children(el, ("Minutes",)).get("Minutes")
+    if minutes_el is None:
+        raise _MalformedReplication("Minutes")
+    text = (minutes_el.text or "").strip()
+    if not text:
+        return {"Minutes": None}
+    if re.fullmatch(r"[+-]?\d+", text) is None or not -2**31 <= int(text) < 2**31:
+        raise _MalformedReplication("Minutes")
+    return {"Minutes": int(text)}
+
+
+def _parse_replication_options(rule_el) -> tuple[dict, dict]:
+    """(rule options, destination options) of one <Rule>; raises _MalformedReplication."""
+    rule_opts: dict = {}
+    dest_opts: dict = {}
+    ssc_el = _replication_option(rule_el, "SourceSelectionCriteria")
+    if ssc_el is not None:
+        rule_opts["SourceSelectionCriteria"] = {
+            name: _replication_status(_replication_children(el, ("Status",)))
+            for name, el in _replication_children(
+                ssc_el, ("SseKmsEncryptedObjects", "ReplicaModifications")).items()}
+    dest_el = _find_xml_tag(rule_el, "Destination")
+    if dest_el is None:
+        return rule_opts, dest_opts
+    enc_el = _replication_option(dest_el, "EncryptionConfiguration")
+    if enc_el is not None:
+        key_el = _replication_children(enc_el, ("ReplicaKmsKeyID",)).get("ReplicaKmsKeyID")
+        dest_opts["EncryptionConfiguration"] = {} if key_el is None else {"ReplicaKmsKeyID": key_el.text or ""}
+    rtc_el = _replication_option(dest_el, "ReplicationTime")
+    if rtc_el is not None:
+        children = _replication_children(rtc_el, ("Status", "Time"))
+        status = _replication_status(children)
+        if "Time" not in children:
+            raise _MalformedReplication("Time")
+        dest_opts["ReplicationTime"] = {**status, "Time": _replication_minutes(children["Time"])}
+    metrics_el = _replication_option(dest_el, "Metrics")
+    if metrics_el is not None:
+        children = _replication_children(metrics_el, ("Status", "EventThreshold"))
+        metrics = _replication_status(children)
+        if "EventThreshold" in children:
+            metrics["EventThreshold"] = _replication_minutes(children["EventThreshold"])
+        dest_opts["Metrics"] = metrics
+    return rule_opts, dest_opts
+
+
+def _replication_destination_region(dest_bucket: str) -> str | None:
+    name = dest_bucket.split(":::")[-1]
+    owner = _bucket_owner_account(name)
+    if owner is None:
+        return None
+    record = _buckets.get_scoped(owner, None, name) or {}
+    return record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _replica_kms_key_error(key: str, dest_bucket: str):
+    if not key:
+        return _error("InvalidArgument", "ReplicaKmsKeyID cannot be empty.", 400,
+                      extra={"ArgumentName": "ReplicaKmsKeyID", "ArgumentValue": key})
+    try:
+        spec = parse_arn(key)
+    except ArnParseError:
+        spec = None
+    # Any KMS key or alias ARN; AWS doesn't look the key up.
+    if spec is None or not spec.partition or spec.service != "kms" or not spec.resource.startswith(("key/", "alias/")):
+        return _error("InvalidArgument", "Invalid ReplicaKmsKeyID ARN.", 400,
+                      extra={"ArgumentName": "ReplicaKmsKeyID", "ArgumentValue": key})
+    try:
+        dest_partition = parse_arn(dest_bucket).partition
+    except ArnParseError:
+        dest_partition = "aws"
+    if spec.partition != dest_partition:
+        return _error("InvalidRequest",
+                      "KMS key ARN partition must match the destination bucket ARN partition.", 400)
+    dest_region = _replication_destination_region(dest_bucket)
+    if dest_region is not None and spec.region != dest_region:
+        return _error("InvalidRequest", "KMS key must be in the same region as the destination bucket.", 400)
+    return None
+
+
+def _replication_options_error(rule: dict):
+    """The first InvalidRequest or InvalidArgument for one rule's options, or None."""
+    ssc = rule.get("SourceSelectionCriteria")
+    dest = rule.get("Destination", {})
+    enc, rtc, metrics = dest.get("EncryptionConfiguration"), dest.get("ReplicationTime"), dest.get("Metrics")
+    if ssc == {}:
+        return _error("InvalidRequest", "SourceSelectionCriteria cannot be empty.", 400)
+    sse = (ssc or {}).get("SseKmsEncryptedObjects")
+    if sse is not None and enc is None:
+        return _error("InvalidRequest",
+                      "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present.", 400)
+    if enc is not None:
+        if sse is None:
+            return _error("InvalidRequest",
+                          "SseKmsEncryptedObjects must be specified if EncryptionConfiguration is present.", 400)
+        if "ReplicaKmsKeyID" not in enc:
+            return _error("InvalidRequest", "ReplicaKmsKeyID tag must be specified in EncryptionConfiguration.", 400)
+        key_error = _replica_kms_key_error(enc["ReplicaKmsKeyID"], dest.get("Bucket", ""))
+        if key_error is not None:
+            return key_error
+    if rtc is not None and rtc["Time"]["Minutes"] != _REPLICATION_MINUTES:
+        return _error("InvalidArgument", "Invalid time minute value", 400,
+                      extra={"ArgumentName": "ReplicationTime"})
+    if rtc is not None and metrics is None:
+        return _error("InvalidRequest",
+                      "Replication destination must contain both ReplicationTime and Metrics or neither.", 400)
+    if metrics is None:
+        return None
+    threshold = metrics.get("EventThreshold")
+    # Metrics without RTC: no ReplicationTime, or RTC Disabled with Metrics Enabled.
+    metrics_only = rtc is None or (rtc["Status"] == "Disabled" and metrics["Status"] == "Enabled")
+    if threshold is not None and metrics_only:
+        return _error("InvalidArgument",
+                      "Metrics cannot contain an event threshold when ReplicationTime is not specified or Disabled",
+                      400, extra={"ArgumentName": "Metrics"})
+    if threshold is not None and threshold["Minutes"] != _REPLICATION_MINUTES:
+        return _error("InvalidArgument", "Invalid event threshold minute value", 400,
+                      extra={"ArgumentName": "ReplicationMetrics"})
+    if metrics_only:
+        return None
+    if threshold is None:
+        return _error("InvalidArgument", "ReplicationMetrics must contain an event threshold", 400,
+                      extra={"ArgumentName": "ReplicationMetrics"})
+    if rtc["Status"] != metrics["Status"]:
+        return _error("InvalidArgument", "ReplicationTime and ReplicationMetrics should have the same status",
+                      400, extra={"ArgumentName": "ReplicationTime"})
+    return None
+
+
+def _replication_v1_options_error(rules: list):
+    """Rules without a Filter use the older Prefix schema, which AWS checks for these
+    options only after every rule passed the checks above."""
+    for rule in rules:
+        if "Filter" in rule:
+            continue
+        if "ReplicaModifications" in rule.get("SourceSelectionCriteria", {}):
+            return _error("InvalidRequest", _REPLICATION_V1_MESSAGE.format("ReplicaModifications", " "), 400)
+        for name in ("ReplicationTime", "Metrics"):
+            if name in rule.get("Destination", {}):
+                return _error("InvalidRequest", _REPLICATION_V1_MESSAGE.format(name, ""), 400)
+    return None
+
+
+def _replication_minutes_xml(parent, name: str, value: dict) -> None:
+    SubElement(SubElement(parent, name), "Minutes").text = str(value["Minutes"])
+
+
+def _replication_ssc_xml(rule_el, rule: dict) -> None:
+    if "SourceSelectionCriteria" not in rule:
+        return
+    ssc_el = SubElement(rule_el, "SourceSelectionCriteria")
+    for name in ("SseKmsEncryptedObjects", "ReplicaModifications"):
+        if name in rule["SourceSelectionCriteria"]:
+            SubElement(SubElement(ssc_el, name), "Status").text = rule["SourceSelectionCriteria"][name]["Status"]
+
+
+def _replication_destination_options_xml(dest_el, dest: dict) -> None:
+    """In AWS's order: EncryptionConfiguration, Metrics, ReplicationTime."""
+    if "EncryptionConfiguration" in dest:
+        enc_el = SubElement(dest_el, "EncryptionConfiguration")
+        SubElement(enc_el, "ReplicaKmsKeyID").text = dest["EncryptionConfiguration"]["ReplicaKmsKeyID"]
+    if "Metrics" in dest:
+        metrics_el = SubElement(dest_el, "Metrics")
+        SubElement(metrics_el, "Status").text = dest["Metrics"]["Status"]
+        if "EventThreshold" in dest["Metrics"]:
+            _replication_minutes_xml(metrics_el, "EventThreshold", dest["Metrics"]["EventThreshold"])
+    if "ReplicationTime" in dest:
+        rtc_el = SubElement(dest_el, "ReplicationTime")
+        SubElement(rtc_el, "Status").text = dest["ReplicationTime"]["Status"]
+        _replication_minutes_xml(rtc_el, "Time", dest["ReplicationTime"]["Time"])
+
+
 def _put_bucket_replication(bucket_name: str, body: bytes):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -7446,8 +7682,14 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
     role_el = _find_xml_tag(xml_root, "Role")
     role = role_el.text if role_el is not None and role_el.text else ""
 
+    rule_els = list(xml_root.findall("{%s}Rule" % S3_NS)) or list(xml_root.findall("Rule"))
+    try:
+        options = [_parse_replication_options(rule_el) for rule_el in rule_els]
+    except _MalformedReplication:
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+
     rules = []
-    for rule_el in list(xml_root.findall("{%s}Rule" % S3_NS)) or list(xml_root.findall("Rule")):
+    for rule_el, (rule_opts, dest_opts) in zip(rule_els, options):
         rule: dict = {}
         id_el = _find_xml_tag(rule_el, "ID")
         rule["ID"] = id_el.text if id_el is not None and id_el.text else new_uuid()[:8]
@@ -7497,11 +7739,18 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
             sc_el = _find_xml_tag(dest_el, "StorageClass")
             if sc_el is not None and sc_el.text:
                 dest["StorageClass"] = sc_el.text
-            rule["Destination"] = dest
+            rule["Destination"] = {**dest, **dest_opts}
+        rule.update(rule_opts)
+        options_error = _replication_options_error(rule)
+        if options_error is not None:
+            return options_error
         rules.append(rule)
 
     if not rules:
         return _error("MalformedXML", _MALFORMED_XML, 400)
+    v1_error = _replication_v1_options_error(rules)
+    if v1_error is not None:
+        return v1_error
 
     _bucket_replication[bucket_name] = {"Role": role, "Rules": rules}
     return 200, {"Content-Type": "application/xml"}, b""
@@ -7537,6 +7786,7 @@ def _get_bucket_replication(bucket_name: str):
             dmr_el = SubElement(rule_el, "DeleteMarkerReplication")
             SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(
                 "Status", "Disabled")
+        _replication_ssc_xml(rule_el, rule)
         dest = rule.get("Destination", {})
         if dest:
             dest_el = SubElement(rule_el, "Destination")
@@ -7550,6 +7800,7 @@ def _get_bucket_replication(bucket_name: str):
                 SubElement(dest_el, "Bucket").text = dest["Bucket"]
             if "StorageClass" in dest:
                 SubElement(dest_el, "StorageClass").text = dest["StorageClass"]
+            _replication_destination_options_xml(dest_el, dest)
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 

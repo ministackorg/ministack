@@ -263,6 +263,44 @@ def test_access_point_alias_upload_permission_contract(
             assert body.read() == b"via alias"
 
 
+def _status(call):
+    try:
+        return call()["ResponseMetadata"]["HTTPStatusCode"]
+    except ClientError as exc:
+        return exc.response["ResponseMetadata"]["HTTPStatusCode"], exc.response["Error"]["Code"]
+
+
+def test_access_point_block_public_acls_refuses_public_acl_writes():
+    """An access point's BlockPublicAcls refuses public ACLs sent through it, whatever the bucket's settings;
+    its BlockPublicPolicy leaves a bucket policy sent through it alone."""
+    s3, ctl = _client("s3", "us-east-1"), _client("s3control", "us-east-1")
+    name = f"ap-acl-{_uid()}"
+    all_off = {k: False for k in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")}
+    s3.create_bucket(Bucket=name, ObjectOwnership="BucketOwnerPreferred")
+    s3.put_public_access_block(Bucket=name, PublicAccessBlockConfiguration=all_off)
+    s3.put_object(Bucket=name, Key="k.txt", Body=b"hello")
+    blocking = ctl.create_access_point(AccountId=ACCOUNT, Name=f"ap-on-{_uid()}", Bucket=name)
+    open_ap = ctl.create_access_point(
+        AccountId=ACCOUNT, Name=f"ap-off-{_uid()}", Bucket=name, PublicAccessBlockConfiguration=all_off)
+    public_policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{name}/*"}]})
+    try:
+        denied = (403, "AccessDenied")
+        for target in (blocking["Alias"], blocking["AccessPointArn"]):
+            assert _status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="public-read")) == denied
+            assert _status(lambda: s3.put_object_acl(Bucket=target, Key="k.txt", ACL="public-read")) == denied
+            assert _status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="private")) == 200
+            assert _status(lambda: s3.put_bucket_policy(Bucket=target, Policy=public_policy)) == 204
+        for target in (open_ap["Alias"], open_ap["AccessPointArn"], name):
+            assert _status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="public-read")) == 200
+    finally:
+        for ap in (blocking, open_ap):
+            ctl.delete_access_point(AccountId=ACCOUNT, Name=ap["AccessPointArn"].rsplit("/", 1)[1])
+        for obj in s3.list_objects_v2(Bucket=name).get("Contents", []):
+            s3.delete_object(Bucket=name, Key=obj["Key"])
+        s3.delete_bucket(Bucket=name)
+
+
 def test_access_point_alias_from_another_account_is_denied(access_point):
     _name, created = access_point
     other = _client("s3", "us-east-1", account_key="111122223333")

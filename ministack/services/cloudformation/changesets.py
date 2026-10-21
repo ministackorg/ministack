@@ -43,6 +43,7 @@ from .helpers import (
     _page,
     _request_problems,
     _resolve_template,
+    _sdk_error,
     _xml,
     enum_problems,
     stack_name_problems,
@@ -98,13 +99,6 @@ def _extract_resources_to_import(params):
 # AWS's answer when a ResourceIdentifier names nothing, for the types that do
 # not answer with a message of their own.
 _IMPORT_NOT_FOUND = "Resource of type '{type}' with identifier '{value}' was not found."
-
-
-def _sdk_error(message, service, status, request_id=None):
-    """A service error as the import's resource handler words it in the
-    StatusReason: the service's own message, then its SDK's suffix."""
-    return (f"{message} (Service: {service}, Status Code: {status}, "
-            f"Request ID: {request_id or new_uuid()}) (SDK Attempt Count: 1)")
 
 
 def _queue_import_problem(url):

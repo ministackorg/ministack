@@ -388,7 +388,7 @@ fs.write = function(fd, ...args) {
       headers["__DEPTH_HEADER__"] = process.env.__DEPTH_ENV__;
     }
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
@@ -531,7 +531,7 @@ fs.write = function(fd, ...args) {
         headers["Content-Type"] = "application/json";
         headers["Content-Length"] = Buffer.byteLength(encodedBody);
       }
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
@@ -661,7 +661,7 @@ fs.write = function(fd, ...args) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
     const body = JSON.stringify(params || {});
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
@@ -819,20 +819,31 @@ function patchAwsSdk() {
     };
   } catch (_) {}
 
-  // Patch https.request for bundled SDK
+  // Patch https.request for bundled SDK. Under USE_SSL the gateway serves only
+  // HTTPS, so requests to it keep TLS and only their port is rewritten.
+  const msTls = parsed.protocol === "https:";
   const origHttpsReq = https.request;
-  https.request = function(options, callback) {
-    if (typeof options === "string") options = url.parse(options);
-    else if (options instanceof url.URL) options = url.parse(options.toString());
-    else options = Object.assign({}, options);
+  https.request = function(input, options, callback) {
+    // Node takes (url[, options][, callback]) and (options[, callback]).
+    const original = Array.prototype.slice.call(arguments);
+    if (typeof options === "function") { callback = options; options = undefined; }
+    if (typeof input === "string") input = url.parse(input);
+    else if (input instanceof url.URL) input = url.parse(input.toString());
+    options = Object.assign({}, input, options);
 
     const host = options.hostname || options.host || "";
     if (host.endsWith(".amazonaws.com") || host.endsWith(".amazonaws.com.cn")) {
-      options.protocol = "http:";
       options.hostname = msHost;
       options.host = msHost + ":" + msPort;
       options.port = msPort;
       options.path = options.path || "/";
+      if (msTls) {
+        // Verify the gateway's name, not the AWS host the Host header carries.
+        options.protocol = "https:";
+        options.servername = require("net").isIP(msHost) ? "" : msHost;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       if (options.agent instanceof https.Agent) {
         options.agent = new http.Agent({ keepAlive: true });
       } else if (options.agent === undefined) {
@@ -845,13 +856,18 @@ function patchAwsSdk() {
     // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
     // cfn-response.js calls https.request unconditionally for the ResponseURL
     // PUT, and also drops the port when constructing options.  Intercept here
-    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
+    // so the PUT reaches Ministack on msPort, not port 443 (over TLS under USE_SSL).
     const advertised = (process.env.MINISTACK_HOST || "").split(":")[0];
     if (host === "127.0.0.1" || host === "localhost" || host === msHost
         || (advertised && host === advertised)) {
-      options.protocol = "http:";
       // The https default port means the gateway port here, as in the container shim.
       options.port = options.port && String(options.port) !== "443" ? options.port : msPort;
+      if (msTls) {
+        options.protocol = "https:";
+        options.hostname = host;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       options.host = host + ":" + options.port;
       options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
@@ -872,10 +888,10 @@ function patchAwsSdk() {
       return http.request(options, callback);
     }
 
-    return origHttpsReq.call(https, options, callback);
+    return origHttpsReq.apply(https, original);
   };
-  https.get = function(options, callback) {
-    var req = https.request(options, callback);
+  https.get = function() {
+    var req = https.request.apply(https, arguments);
     req.end();
     return req;
   };

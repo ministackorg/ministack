@@ -5206,6 +5206,15 @@ def _change_password(data):
     user, pool = _user_pool_for_access_token(access_token)
     if not user:
         return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    # PreviousPassword is required when the user has a password
+    # and is checked before ProposedPassword's policy (measured).
+    # AWS names the missing parameter "OldPassword" in its message.
+    if user.get("_password"):
+        previous = data.get("PreviousPassword")
+        if not previous:
+            return error_response_json("InvalidParameterException", "Missing required parameter OldPassword", 400)
+        if previous != user["_password"]:
+            return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
     pw_err = _validate_password(pool, proposed)
     if pw_err:
         return pw_err

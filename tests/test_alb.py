@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import time
 import urllib.request as _req
 import uuid as _uuid_mod
@@ -2070,3 +2071,648 @@ def test_elbv2_listener_rejects_more_than_one_default_certificate(elbv2, tls_lb)
     described = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
     assert described["Port"] == 443
     assert described["Certificates"] == [{"CertificateArn": _TLS_CERT}]
+
+
+def _url_rewrite(regex="^/app/(.*)$", replace="/$1"):
+    return {"Type": "url-rewrite",
+            "UrlRewriteConfig": {"Rewrites": [{"Regex": regex, "Replace": replace}]}}
+
+
+def _host_rewrite(regex="^www\\.example\\.com$", replace="internal.example.com"):
+    return {"Type": "host-header-rewrite",
+            "HostHeaderRewriteConfig": {"Rewrites": [{"Regex": regex, "Replace": replace}]}}
+
+
+def _rewrite(regex="^/a$", replace="/b"):
+    return {"Regex": regex, "Replace": replace}
+
+
+@pytest.fixture
+def raw_elbv2():
+    """A client without boto3's client-side parameter validation, so invalid
+    transforms reach the server, as in the AWS captures."""
+    from conftest import make_client
+
+    return make_client("elbv2", {"parameter_validation": False})
+
+
+@pytest.fixture
+def transform_listener(elbv2):
+    """A load balancer and listener for rule-transform tests, torn down afterwards."""
+    name = f"tx-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn = elbv2.create_load_balancer(Name=name)["LoadBalancers"][0]["LoadBalancerArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404"}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        yield l_arn
+    finally:
+        for rule in elbv2.describe_rules(ListenerArn=l_arn)["Rules"]:
+            if not rule["IsDefault"]:
+                elbv2.delete_rule(RuleArn=rule["RuleArn"])
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
+_TX_PRIORITY = iter(range(1, 50000))
+
+
+def _transform_rule(client, l_arn, **kwargs):
+    return client.create_rule(
+        ListenerArn=l_arn, Priority=next(_TX_PRIORITY),
+        Conditions=[{"Field": "path-pattern", "Values": ["/app/*"]}],
+        Actions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200"}}],
+        **kwargs,
+    )["Rules"][0]
+
+
+def _described_rule(elbv2, rule_arn):
+    return elbv2.describe_rules(RuleArns=[rule_arn])["Rules"][0]
+
+
+def _default_rule(elbv2, l_arn):
+    return next(r for r in elbv2.describe_rules(ListenerArn=l_arn)["Rules"] if r["IsDefault"])
+
+
+def _non_default_rules(elbv2, l_arn):
+    return [r for r in elbv2.describe_rules(ListenerArn=l_arn)["Rules"] if not r["IsDefault"]]
+
+
+def _refused(exc_info, message, code="ValidationError"):
+    error = exc_info.value.response["Error"]
+    assert (exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"], error["Type"], error["Code"]) == (
+        400, "Sender", code)
+    if message is not None:
+        assert error["Message"] == message
+
+
+def _by_type(transforms):
+    """AWS returns a rule's transforms from DescribeRules and ModifyRule in an
+    order of its own, so comparisons outside CreateRule sort them."""
+    return sorted(transforms, key=lambda t: t["Type"])
+
+
+def test_elbv2_rule_transforms_are_stored_returned_replaced_and_reset(elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C1-C6, C37, C40;
+    2310-uncertainties U1:order)."""
+    both = [_url_rewrite(), _host_rewrite()]
+    rule = _transform_rule(elbv2, transform_listener, Transforms=both)
+    assert rule["Transforms"] == both
+    assert _by_type(_described_rule(elbv2, rule["RuleArn"])["Transforms"]) == _by_type(both)
+    # CreateRule echoes the request order, whichever type comes first.
+    reverse = _transform_rule(elbv2, transform_listener, Transforms=both[::-1])
+    assert reverse["Transforms"] == both[::-1]
+
+    replacement = [_url_rewrite(regex="^/app/legacy$", replace="")]
+    modified = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=replacement)["Rules"][0]
+    assert modified["Transforms"] == replacement
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == replacement
+
+    elbv2.modify_rule(RuleArn=rule["RuleArn"], Conditions=[{"Field": "path-pattern", "Values": ["/v2/*"]}])
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == replacement
+
+    reset = elbv2.modify_rule(RuleArn=rule["RuleArn"], ResetTransforms=True)["Rules"][0]
+    assert reset["Transforms"] == []
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == []
+    # Resetting a rule without transforms is accepted too.
+    assert elbv2.modify_rule(RuleArn=rule["RuleArn"], ResetTransforms=True)["Rules"][0]["Transforms"] == []
+
+    # ResetTransforms=False with Transforms is a plain replace.
+    replaced = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[_host_rewrite()],
+                                 ResetTransforms=False)["Rules"][0]
+    assert replaced["Transforms"] == [_host_rewrite()]
+
+
+def test_elbv2_rules_without_transforms_return_an_empty_list(elbv2, transform_listener):
+    """AWS: captured 2026-10-20 (elbv2-rule-transforms C7, C8, C39). The XML carries
+    an empty <Transforms/> element."""
+    assert _transform_rule(elbv2, transform_listener)["Transforms"] == []
+    assert _transform_rule(elbv2, transform_listener, Transforms=[])["Transforms"] == []
+    assert _default_rule(elbv2, transform_listener)["Transforms"] == []
+
+
+def test_elbv2_rule_transform_rewrite_bounds_are_accepted(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C4, C29;
+    2310-uncertainties U7:host empty-replace and max-lengths)."""
+    for transform in (_url_rewrite(regex="a" * 1024, replace="b" * 1024),
+                      _host_rewrite(regex="a" * 1024, replace="b" * 1024),
+                      _host_rewrite(replace="")):
+        rule = _transform_rule(raw_elbv2, transform_listener, Transforms=[transform])
+        assert rule["Transforms"] == [transform]
+        assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [transform]
+
+
+_INVALID_TRANSFORMS = [
+    ("unknown-type",
+     [{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value 'path-rewrite' at 'transforms.1.member.type' failed to satisfy "
+     "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    ("duplicate-type", [_url_rewrite(), _url_rewrite(regex="^/b$")],
+     "A rule can only have one transform of each type"),
+    ("duplicate-host", [_host_rewrite(), _host_rewrite(regex="^b$")],
+     "A rule can only have one transform of each type"),
+    ("missing-config", [{"Type": "url-rewrite"}],
+     "For transforms of type 'url-rewrite', you must specify the following field(s): 'UrlRewriteConfig'"),
+    ("host-missing-config", [{"Type": "host-header-rewrite"}],
+     "For transforms of type 'host-header-rewrite', you must specify the following field(s): "
+     "'HostHeaderRewriteConfig'"),
+    ("other-config-only",
+     [{"Type": "url-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "For transforms of type 'url-rewrite', you must specify the following field(s): 'UrlRewriteConfig'"),
+    ("wrong-config",
+     [{**_url_rewrite(), "HostHeaderRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "A transform of type 'url-rewrite' does not support the following field(s): 'HostHeaderRewriteConfig'"),
+    ("host-wrong-config",
+     [{**_host_rewrite(), "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "A transform of type 'host-header-rewrite' does not support the following field(s): 'UrlRewriteConfig'"),
+    ("two-rewrites",
+     [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite(), _rewrite("^/c$", "/d")]}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("no-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("empty-regex", [_url_rewrite(regex="")],
+     "A transform rewrite Regex value must be between 1 and 1024 characters in length"),
+    ("long-regex", [_url_rewrite(regex="a" * 1025)],
+     "A transform rewrite Regex value must be between 1 and 1024 characters in length"),
+    ("long-replace", [_url_rewrite(replace="a" * 1025)],
+     "A transform rewrite Replace value must be between 0 and 1024 characters in length"),
+    ("invalid-regex", [_url_rewrite(regex="([")],
+     "One or more provided transform rewrite Regex values are invalid"),
+    ("null-type", [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.type' failed to satisfy constraint: "
+     "Member must not be null"),
+    ("null-regex", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Replace": "/b"}]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null"),
+    ("null-replace", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null"),
+    ("host-null-regex",
+     [{"Type": "host-header-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [{"Replace": "b"}]}}],
+     "1 validation error detected: Value null at "
+     "'transforms.1.member.hostHeaderRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null"),
+]
+
+
+@pytest.mark.parametrize("transforms, message", [c[1:] for c in _INVALID_TRANSFORMS],
+                         ids=[c[0] for c in _INVALID_TRANSFORMS])
+def test_elbv2_invalid_rule_transforms_are_rejected(elbv2, raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C9-C26, C30-C34,
+    C45; 2310-uncertainties U7:host). CreateRule creates nothing and ModifyRule
+    leaves the rule as it was."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=transforms)
+    _refused(exc, message)
+    assert _non_default_rules(elbv2, transform_listener) == []
+
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    with pytest.raises(ClientError) as exc:
+        raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=transforms,
+                              Conditions=[{"Field": "path-pattern", "Values": ["/changed/*"]}])
+    _refused(exc, message)
+    after = _described_rule(elbv2, rule["RuleArn"])
+    assert after["Transforms"] == [_url_rewrite()]
+    assert after["Conditions"][0]["Values"] == ["/app/*"]
+
+
+_NULL_TYPE = "Value null at 'transforms.{}.member.type' failed to satisfy constraint: Member must not be null"
+
+
+@pytest.mark.parametrize("transforms, message", [
+    ([{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}] * 2,
+     f"2 validation errors detected: {_NULL_TYPE.format(1)}; {_NULL_TYPE.format(2)}"),
+    ([{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}] * 11,
+     "10 validation errors detected: " + "; ".join(_NULL_TYPE.format(i) for i in range(1, 11))),
+    ([{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "2 validation errors detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null; Value 'path-rewrite' at 'transforms.1.member.type' "
+     "failed to satisfy constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    ([{"Type": "url-rewrite", "HostHeaderRewriteConfig": {"Rewrites": [{"Replace": "b"}]},
+       "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "2 validation errors detected: Value null at 'transforms.1.member.hostHeaderRewriteConfig.rewrites.1.member."
+     "regex' failed to satisfy constraint: Member must not be null; Value null at 'transforms.1.member."
+     "urlRewriteConfig.rewrites.1.member.replace' failed to satisfy constraint: Member must not be null"),
+    ([{"HostHeaderRewriteConfig": {"Rewrites": [{"Replace": "b"}]},
+       "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "3 validation errors detected: Value null at 'transforms.1.member.hostHeaderRewriteConfig.rewrites.1.member."
+     "regex' failed to satisfy constraint: Member must not be null; Value null at 'transforms.1.member."
+     "urlRewriteConfig.rewrites.1.member.replace' failed to satisfy constraint: Member must not be null; "
+     f"{_NULL_TYPE.format(1)}"),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Replace": "/b"}, {"Replace": "/c"}]}}],
+     "2 validation errors detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null; Value null at "
+     "'transforms.1.member.urlRewriteConfig.rewrites.2.member.regex' failed to satisfy constraint: "
+     "Member must not be null"),
+    ([{"Type": "", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value '' at 'transforms.1.member.type' failed to satisfy constraint: "
+     "Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+    # The model check runs before any other: the unknown type wins over the duplicate.
+    ([_url_rewrite(), _url_rewrite(regex="^/b$"),
+      {"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "1 validation error detected: Value 'path-rewrite' at 'transforms.3.member.type' failed to satisfy "
+     "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]"),
+], ids=["two-null-types", "eleven-null-types", "replace-before-type", "host-before-url",
+        "type-last", "rewrite-order", "blank-type", "model-before-duplicate"])
+def test_elbv2_rule_transform_model_errors_are_listed_together(raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties U6:create, 2310-uncertainties-2
+    V3:order). Every missing or unknown member is listed, at most ten."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=transforms)
+    _refused(exc, message)
+
+
+_DUPLICATE = "A rule can only have one transform of each type"
+_REGEX_LENGTH = "A transform rewrite Regex value must be between 1 and 1024 characters in length"
+_REPLACE_LENGTH = "A transform rewrite Replace value must be between 0 and 1024 characters in length"
+_REGEX_INVALID = "One or more provided transform rewrite Regex values are invalid"
+_REGEX_ASCII = ("Transform rewrite regex values can not be empty, and can only contain "
+                "non-whitespace ASCII 128 characters")
+_REPLACE_CHARS = "A transform rewrite Replace value may only consist of non-whitespace printable ASCII characters"
+
+
+@pytest.mark.parametrize("transforms, message", [
+    ([_url_rewrite(regex=""), _url_rewrite()], _DUPLICATE),
+    ([_url_rewrite(regex="(["), _url_rewrite()], _DUPLICATE),
+    ([{"Type": "url-rewrite"}, _url_rewrite()], _DUPLICATE),
+    ([_url_rewrite(), host_rw := _host_rewrite(), _url_rewrite(regex="^/c$")], _DUPLICATE),
+    ([_url_rewrite(regex=""), {"Type": "host-header-rewrite"}], _REGEX_LENGTH),
+    ([_url_rewrite(replace="a" * 1025), {**host_rw, "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     _REPLACE_LENGTH),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite(), _rewrite()]}},
+      {"Type": "host-header-rewrite"}], "Rule transforms must have exactly one Rewrite"),
+    ([_url_rewrite(regex="(["), _host_rewrite(regex="")], _REGEX_INVALID),
+    ([_host_rewrite(regex=""), _url_rewrite(regex="([")], _REGEX_LENGTH),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []},
+       "HostHeaderRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     "A transform of type 'url-rewrite' does not support the following field(s): 'HostHeaderRewriteConfig'"),
+    ([{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite(regex=""), _rewrite()]}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ([_url_rewrite(regex="", replace="a" * 1025)], _REPLACE_LENGTH),
+    ([_url_rewrite(regex="([", replace="a" * 1025)], _REPLACE_LENGTH),
+    ([_url_rewrite(regex="([" + "a" * 1023)], _REGEX_LENGTH),
+    ([_url_rewrite(regex="\u20ac" * 1025)], _REGEX_LENGTH),
+    ([_url_rewrite(regex="\u00e9", replace="a" * 1025)], _REPLACE_LENGTH),
+    ([_url_rewrite(regex="\u00e9(")], _REGEX_ASCII),
+    ([_url_rewrite(regex="(\u00e9")], _REGEX_ASCII),
+    ([_url_rewrite(regex="\u00e9"), _host_rewrite(regex="")], _REGEX_ASCII),
+    ([_url_rewrite(regex="(["), _host_rewrite(regex="\u00e9")], _REGEX_INVALID),
+    ([_url_rewrite(regex="([", replace="a b")], _REPLACE_CHARS),
+    ([_url_rewrite(regex="", replace="a b")], _REPLACE_CHARS),
+    ([_url_rewrite(regex="\u00e9", replace="a b")], _REPLACE_CHARS),
+    ([_url_rewrite(replace="a b"), _url_rewrite()], _DUPLICATE),
+    ([_url_rewrite(replace="a b"), _host_rewrite(regex="")], _REPLACE_CHARS),
+    ([_url_rewrite(replace=" " * 1025)], _REPLACE_LENGTH),
+], ids=["duplicate-before-length", "duplicate-before-syntax", "duplicate-before-config", "duplicate-of-three",
+        "first-transform-first", "replace-length-first", "rewrite-count-first", "syntax-in-first",
+        "length-in-first", "unsupported-before-count", "count-before-length", "replace-before-regex",
+        "replace-before-syntax", "length-before-syntax", "length-before-ascii", "replace-before-ascii",
+        "ascii-before-syntax", "ascii-before-syntax-2", "ascii-in-first", "syntax-before-ascii-in-second",
+        "replace-chars-before-syntax", "replace-chars-before-length", "replace-chars-before-ascii",
+        "duplicate-before-replace-chars", "replace-chars-in-first", "replace-length-before-chars"])
+def test_elbv2_rule_transform_checks_run_in_aws_order(raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex and U6:create, 2310-uncertainties-2
+    V1:ascii and V3:order, 2310-uncertainties-3 W2:replace-order). The duplicate-type check
+    covers every transform first; the rest run transform by transform."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=transforms)
+    _refused(exc, message)
+
+
+# Regex values AWS accepted and refused, captured 2026-10-21.
+_REGEX_ACCEPTED = [
+    "\\d+", "\\w+", "\\s", "[[:alpha:]]", "(?<n>x)", "(?P<n>x)", "a+?", "a++", "a*+", "\\b", "(?i)a", "a{2,3}",
+    "a**", "a|", "|", "(?:a)", "\\x41", "\\u0041", "\\A", "\\z", "$", "^", ".*", "(?s).", "(?m)^a", "(?R)",
+    "a{1001}", "]", "}", "a\x7fb", "(?R)a", "a**b", "a{2}{3}", "(?i:a)", "(?-i)a", "(?U)a", "[a-z&&b]", "[\\w-]",
+    "x{1000}", "x{1001,}", "\\x{41}", "\\(?=a", "[(?=a]", "a{1,2}{3}", "(?i)(?x)a", "(?ix)a", "(?xi)a", "\\z\\A",
+    "\\B", "\\v", "\\f", "\\a", "\\t", "\\n", "\\r", "\\$", "\\/", "\\-", "(?u)a", "(?:)a",
+    "a*{2}", "a+*", "a?*", "a{2}*", "a**b(c)", "[[:foo:]]", "[[:ALPHA:]]", "[[:digit:][:space:]]", "[[:^alpha:]]",
+    "[[=a=]]", "[[.a.]]",
+]
+_REGEX_REFUSED = [
+    "(?=a)", "(?!a)", "(?<=a)b", "(?<!a)b", "(a)\\1", "(?>a)", "\\p{L}", "\\pL", "\\X", "\\Q.\\E", "a{,3}", "a{3,2}",
+    "\\", "*a", "[a-", "[z-a]", ")", "(", "(?<n>x)\\k<n>", "\\1", "\\cA", "\\Z", "(?#c)a", "(?x) a", "\\G", "\\R",
+    "\\h", "\\K", "(?|a)", "\\N", "[", "{", "a{", "a{1", "\\e", "\\o{101}", "\\101", "(?P=n)", "(?P<n>x)(?P=n)",
+    "\\Z\\z", "[\\d-z]", "[^]", "([" + "a" * 1022, "(?<n>x)(?P=n)", "\\Qa", "(?P<n>x)|(?P<n>y)", "(a)(?(1)b|c)",
+    "\\0", "\\08", "\\p{Greek}", "\\d{,3}", "(?=", "a b", "a\tb", " ", "a\nb", "( ",
+    "(?Q)a", "(?z)a", "(?q:a)", "(?a)a", "(?L)a", "(?n)a", "(?J)a", "(?)a",
+    "a**(", "a**[", "a**)", "a{2}{3}(", "[[:alpha:]",
+]
+
+
+def test_elbv2_rule_transform_regex_syntax_follows_aws(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex, 2310-uncertainties-2
+    V1:ascii and V2:regex-more, 2310-uncertainties-4 X1:api, 2310-uncertainties-5
+    Y1:regex). Each Regex is sent on its own url-rewrite."""
+    wrong = []
+    for regex in _REGEX_ACCEPTED + _REGEX_REFUSED:
+        try:
+            rule = _transform_rule(raw_elbv2, transform_listener, Transforms=[_url_rewrite(regex=regex)])
+            elbv2.delete_rule(RuleArn=rule["RuleArn"])
+            got = None
+        except ClientError as exc:
+            got = exc.response["Error"]["Message"]
+        if got != (None if regex in _REGEX_ACCEPTED else _REGEX_INVALID):
+            wrong.append((regex, got))
+    assert wrong == []
+
+
+@pytest.mark.parametrize("transform, message", [
+    (_url_rewrite(regex="\u00e9"), _REGEX_ASCII),
+    (_url_rewrite(regex="\u20ac" * 1024), _REGEX_ASCII),
+    (_url_rewrite(replace="/\u00e9"), _REPLACE_CHARS),
+    (_url_rewrite(replace="/a b"), _REPLACE_CHARS),
+    (_url_rewrite(replace=" "), _REPLACE_CHARS),
+    (_url_rewrite(replace="\t"), _REPLACE_CHARS),
+    (_url_rewrite(replace="a\x7fb"), _REPLACE_CHARS),
+    (_host_rewrite(regex="a b"), _REGEX_INVALID),
+    (_host_rewrite(replace="\u00e9"), _REPLACE_CHARS),
+    (_host_rewrite(regex="(["), _REGEX_INVALID),
+], ids=["regex-non-ascii", "regex-1024-non-ascii", "replace-non-ascii", "replace-space", "replace-only-space",
+        "replace-tab", "replace-del", "host-regex-space", "host-replace-non-ascii", "host-invalid-regex"])
+def test_elbv2_rule_transform_characters_are_checked(raw_elbv2, transform_listener, transform, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex, 2310-uncertainties-2 V1:ascii,
+    2310-uncertainties-3 W2:replace-order)."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener, Transforms=[transform])
+    _refused(exc, message)
+
+
+def test_elbv2_rule_transform_replace_takes_any_printable_ascii(raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U2:regex replace_with_regex_^/a$,
+    2310-uncertainties-3 W2:replace-order replace-tilde-bang)."""
+    for replace in ("$1", "$10", "${1}", "${name}", "$", "\\1", "\\", "$$", "{host}", "#{host}", "~!"):
+        rule = _transform_rule(raw_elbv2, transform_listener, Transforms=[_url_rewrite(regex="^/a$", replace=replace)])
+        assert rule["Transforms"][0]["UrlRewriteConfig"]["Rewrites"][0]["Replace"] == replace
+
+
+def test_elbv2_modify_rule_transforms_and_reset_transforms_conflict(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C27;
+    2310-uncertainties U4:nothing-to-modify, U6:modify). The conflict comes after
+    the model check and before the other transform checks, and an empty
+    Transforms list counts."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    conflict = "Transforms cannot be provided when resetting transforms"
+    for transforms, message in (
+            ([_host_rewrite()], conflict),
+            ([], conflict),
+            ([_url_rewrite(), _url_rewrite(regex="")], conflict),
+            ([_url_rewrite(regex="([")], conflict),
+            ([{"Type": "path-rewrite", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+             "1 validation error detected: Value 'path-rewrite' at 'transforms.1.member.type' failed to satisfy "
+             "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]")):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=transforms, ResetTransforms=True)
+        _refused(exc, message)
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+
+def test_elbv2_modify_rule_needs_something_to_change(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C38;
+    2310-uncertainties U4:nothing-to-modify). An empty Transforms list changes
+    nothing, alone or next to Conditions or Actions."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    nothing = "You must provide either conditions, actions, or transforms"
+    for params in ({}, {"ResetTransforms": False}, {"Transforms": []},
+                   {"Transforms": [], "ResetTransforms": False}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], **params)
+        _refused(exc, nothing)
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+    changed = elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[],
+                                Conditions=[{"Field": "path-pattern", "Values": ["/u4/*"]}])["Rules"][0]
+    assert changed["Transforms"] == [_url_rewrite()]
+    assert changed["Conditions"][0]["Values"] == ["/u4/*"]
+    elbv2.modify_rule(RuleArn=rule["RuleArn"], Transforms=[],
+                      Actions=[{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "201"}}])
+    after = _described_rule(elbv2, rule["RuleArn"])
+    assert after["Transforms"] == [_url_rewrite()]
+    assert after["Actions"][0]["FixedResponseConfig"]["StatusCode"] == "201"
+
+
+def test_elbv2_default_rule_cannot_be_modified(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C28, C35, C36;
+    2310-uncertainties U3:default-rule). The transform checks, the conflict and
+    "You must provide ..." come first."""
+    default = _default_rule(elbv2, transform_listener)
+    arn = default["RuleArn"]
+    not_permitted = f"Default rule '{arn}' cannot be modified"
+    for params, code, message in (
+            ({"Transforms": [_url_rewrite()]}, "OperationNotPermitted", not_permitted),
+            ({"ResetTransforms": True}, "OperationNotPermitted", not_permitted),
+            ({"Conditions": [{"Field": "path-pattern", "Values": ["/d/*"]}]}, "OperationNotPermitted",
+             not_permitted),
+            ({"Actions": [{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "404"}}]},
+             "OperationNotPermitted", not_permitted),
+            ({"Conditions": [{"Field": "path-pattern", "Values": ["/d/*"]}], "Transforms": [_url_rewrite()]},
+             "OperationNotPermitted", not_permitted),
+            ({"Transforms": [_url_rewrite()], "ResetTransforms": True}, "ValidationError",
+             "Transforms cannot be provided when resetting transforms"),
+            ({"Transforms": [], "ResetTransforms": True}, "ValidationError",
+             "Transforms cannot be provided when resetting transforms"),
+            ({"Transforms": [_url_rewrite(), _url_rewrite(regex="^/b$")]}, "ValidationError", _DUPLICATE),
+            ({"Transforms": [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}]}, "ValidationError",
+             f"1 validation error detected: {_NULL_TYPE.format(1)}"),
+            ({}, "ValidationError", "You must provide either conditions, actions, or transforms"),
+            ({"ResetTransforms": False}, "ValidationError",
+             "You must provide either conditions, actions, or transforms"),
+            ({"Transforms": []}, "ValidationError", "You must provide either conditions, actions, or transforms")):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=arn, **params)
+        _refused(exc, message, code)
+    assert _default_rule(elbv2, transform_listener) == default
+
+
+_LOOKUP_INPUTS = [
+    ("missing-config", [{"Type": "url-rewrite"}],
+     "For transforms of type 'url-rewrite', you must specify the following field(s): 'UrlRewriteConfig'"),
+    ("no-rewrites", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": []}}],
+     "Rule transforms must have exactly one Rewrite"),
+    ("empty-regex", [_url_rewrite(regex="")], _REGEX_LENGTH),
+    ("long-replace", [_url_rewrite(replace="a" * 1025)], _REPLACE_LENGTH),
+    ("invalid-regex", [_url_rewrite(regex="([")], _REGEX_INVALID),
+    ("duplicate-type", [_url_rewrite(), _url_rewrite(regex="^/b$")], _DUPLICATE),
+    ("null-type", [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}],
+     f"1 validation error detected: {_NULL_TYPE.format(1)}"),
+    ("null-replace", [{"Type": "url-rewrite", "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/a$"}]}}],
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null"),
+]
+
+
+@pytest.mark.parametrize("transforms, message", [c[1:] for c in _LOOKUP_INPUTS], ids=[c[0] for c in _LOOKUP_INPUTS])
+def test_elbv2_rule_transforms_are_checked_before_the_lookup(raw_elbv2, transform_listener, transforms, message):
+    """AWS: captured 2026-10-20 and 2026-10-21 (elbv2-rule-transforms C41, C42;
+    2310-uncertainties U5:missing-listener, U5:missing-rule). On a load balancer
+    that exists, a missing listener or rule is reported after the transforms."""
+    missing_listener = transform_listener.rsplit("/", 1)[0] + "/0123456789abcdef"
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, missing_listener, Transforms=transforms)
+    _refused(exc, message)
+    default = _default_rule(raw_elbv2, transform_listener)["RuleArn"]
+    with pytest.raises(ClientError) as exc:
+        raw_elbv2.modify_rule(RuleArn=default.rsplit("/", 1)[0] + "/0123456789abcdef", Transforms=transforms)
+    _refused(exc, message)
+
+
+def test_elbv2_missing_listener_or_rule_after_the_transform_checks(raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U5:missing-listener, U5:missing-rule,
+    2310-uncertainties-3 W1:unknown-lb). The not-found messages are MiniStack's
+    own, shared with other calls, so only the codes are checked. A load balancer
+    that doesn't exist is reported right after the model check."""
+    missing_listener = transform_listener.rsplit("/", 1)[0] + "/0123456789abcdef"
+    for transforms in ([_url_rewrite()], [], None):
+        with pytest.raises(ClientError) as exc:
+            _transform_rule(raw_elbv2, missing_listener, **({} if transforms is None else {"Transforms": transforms}))
+        _refused(exc, None, "ListenerNotFound")
+    parts = transform_listener.split("/")
+    parts[3] = "0000000000000000"
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, "/".join(parts), Transforms=[_url_rewrite(), _url_rewrite(regex="^/b$")])
+    _refused(exc, None, "ListenerNotFound")
+
+    missing_rule = _default_rule(raw_elbv2, transform_listener)["RuleArn"].rsplit("/", 1)[0] + "/0123456789abcdef"
+    for params in ({"Transforms": [_url_rewrite()]}, {"ResetTransforms": True},
+                   {"Conditions": [{"Field": "path-pattern", "Values": ["/x/*"]}]}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=missing_rule, **params)
+        _refused(exc, None, "RuleNotFound")
+    for params, message in (({"Transforms": [_url_rewrite()], "ResetTransforms": True},
+                             "Transforms cannot be provided when resetting transforms"),
+                            ({}, "You must provide either conditions, actions, or transforms"),
+                            ({"Transforms": []}, "You must provide either conditions, actions, or transforms")):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=missing_rule, **params)
+        _refused(exc, message)
+    parts = missing_rule.split("/")
+    parts[3] = "0000000000000000"
+    unknown_lb_rule = "/".join(parts)
+    for params in ({"Transforms": [_url_rewrite(), _url_rewrite(regex="^/b$")]},
+                   {"Transforms": [{"Type": "url-rewrite"}]},
+                   {"Transforms": [_url_rewrite()], "ResetTransforms": True}, {}, {"Transforms": []},
+                   {"ResetTransforms": True}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=unknown_lb_rule, **params)
+        _refused(exc, None, "RuleNotFound")
+    null_type = [{"UrlRewriteConfig": {"Rewrites": [_rewrite()]}}]
+    with pytest.raises(ClientError) as exc:
+        raw_elbv2.modify_rule(RuleArn=unknown_lb_rule, Transforms=null_type)
+    _refused(exc, f"1 validation error detected: {_NULL_TYPE.format(1)}")
+    parts = transform_listener.split("/")
+    parts[3] = "0000000000000000"
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, "/".join(parts), Transforms=null_type)
+    _refused(exc, f"1 validation error detected: {_NULL_TYPE.format(1)}")
+    for transforms in ([{"Type": "url-rewrite"}], [_url_rewrite(regex="([")]):
+        with pytest.raises(ClientError) as exc:
+            _transform_rule(raw_elbv2, "/".join(parts), Transforms=transforms)
+        _refused(exc, None, "ListenerNotFound")
+
+
+def test_elbv2_set_rule_priorities_returns_rules_without_transforms(elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties U8:set-rule-priorities). The
+    response's rules carry no Transforms element, with or without transforms."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite(), _host_rewrite()])
+    moved = elbv2.set_rule_priorities(RulePriorities=[{"RuleArn": rule["RuleArn"], "Priority": 40000}])["Rules"][0]
+    assert moved["Priority"] == "40000"
+    assert "Transforms" not in moved
+    assert _by_type(_described_rule(elbv2, rule["RuleArn"])["Transforms"]) == _by_type(
+        [_url_rewrite(), _host_rewrite()])
+
+
+def test_elbv2_rule_transforms_survive_a_state_round_trip(monkeypatch, tmp_path):
+    """Rules persist as dicts, so their Transforms come back after a save and restore."""
+    from ministack.core import persistence
+    from ministack.services import alb
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    alb.reset()
+    try:
+        lb_arn = re.search(rb"<LoadBalancerArn>([^<]+)", alb._create_lb(
+            {"Name": ["persist-tx"]})[2]).group(1).decode()
+        l_arn = re.search(rb"<ListenerArn>([^<]+)", alb._create_listener(
+            {"LoadBalancerArn": [lb_arn], "Port": ["80"]})[2]).group(1).decode()
+        prefix = "Transforms.member.1.UrlRewriteConfig.Rewrites.member.1"
+        status, _, body = alb._create_rule({
+            "ListenerArn": [l_arn], "Priority": ["5"],
+            "Transforms.member.1.Type": ["url-rewrite"],
+            f"{prefix}.Regex": ["^/app/(.*)$"], f"{prefix}.Replace": ["/$1"],
+        })
+        assert status == 200, body
+        rule_arn = re.search(rb"<RuleArn>([^<]+)", body).group(1).decode()
+
+        persistence.save_state("alb", alb.get_state())
+        alb.reset()
+        alb.load_persisted_state(persistence.load_state("alb"))
+
+        assert alb._rules[rule_arn]["Transforms"] == [
+            {"Type": "url-rewrite",
+             "UrlRewriteConfig": {"Rewrites": [{"Regex": "^/app/(.*)$", "Replace": "/$1"}]}},
+        ]
+    finally:
+        alb.reset()
+
+
+def _elbv2_query(params):
+    """POST a raw ELBv2 Query request, for wire forms boto3 never sends."""
+    from urllib.parse import urlencode as _urlencode
+
+    req = _req.Request(_endpoint + "/", data=_urlencode({"Version": "2015-12-01", **params}).encode(), headers={
+        "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/elasticloadbalancing/aws4_request, "
+                         "SignedHeaders=host, Signature=0"})
+    try:
+        with _req.urlopen(req) as resp:
+            return resp.status, resp.read().decode()
+    except HTTPError as exc:
+        return exc.code, exc.read().decode()
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({"Type": "url-rewrite", "UrlRewriteConfig.Rewrites.member.1.Foo": "x"},
+     "2 validation errors detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.regex' "
+     "failed to satisfy constraint: Member must not be null; Value null at "
+     "'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' failed to satisfy constraint: "
+     "Member must not be null"),
+    ({"Type": "url-rewrite", "UrlRewriteConfig.Rewrites.member.1.Regex": "^/a$",
+      "UrlRewriteConfig.Rewrites.member.1.Foo": "x"},
+     "1 validation error detected: Value null at 'transforms.1.member.urlRewriteConfig.rewrites.1.member.replace' "
+     "failed to satisfy constraint: Member must not be null"),
+    ({"Type": "url-rewrite", "UrlRewriteConfig.Foo": "x"}, "Rule transforms must have exactly one Rewrite"),
+    ({"Foo": "x"}, f"1 validation error detected: {_NULL_TYPE.format(1)}"),
+], ids=["rewrite-only-unknown", "rewrite-regex-and-unknown", "config-only-unknown", "transform-only-unknown"])
+def test_elbv2_rule_transform_members_with_unknown_fields(transform_listener, fields, message):
+    """AWS: captured 2026-10-21 (2310-uncertainties-2 V3:order raw-regex-and-replace-null,
+    2310-uncertainties-4 X1:api raw-*). A member counts as sent when any of its
+    keys is, and the unknown keys are ignored."""
+    status, body = _elbv2_query({
+        "Action": "CreateRule", "ListenerArn": transform_listener, "Priority": str(next(_TX_PRIORITY)),
+        "Conditions.member.1.Field": "path-pattern", "Conditions.member.1.Values.member.1": "/raw/*",
+        "Actions.member.1.Type": "fixed-response", "Actions.member.1.FixedResponseConfig.StatusCode": "200",
+        **{f"Transforms.member.1.{k}": v for k, v in fields.items()}})
+    assert status == 400, body
+    assert re.search(r"<Code>(.*?)</Code><Message>(.*?)</Message>", body).groups() == (
+        "ValidationError", message.replace("'", "'"))
+
+
+def test_elbv2_rule_transform_message_echoes_the_type_escaped(raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties-4 X1:api type-xml-chars)."""
+    with pytest.raises(ClientError) as exc:
+        _transform_rule(raw_elbv2, transform_listener,
+                        Transforms=[{"Type": "a&b<c>'\"", "UrlRewriteConfig": {"Rewrites": [_rewrite()]}}])
+    _refused(exc, "1 validation error detected: Value 'a&b<c>'\"' at 'transforms.1.member.type' failed to satisfy "
+                  "constraint: Member must satisfy enum value set: [url-rewrite, host-header-rewrite]")
+
+
+def test_elbv2_modify_rule_with_empty_conditions_or_actions_changes_nothing(elbv2, raw_elbv2, transform_listener):
+    """AWS: captured 2026-10-21 (2310-uncertainties-4 X1:api modify-conditions-empty,
+    modify-actions-empty, modify-conditions-and-actions-empty)."""
+    rule = _transform_rule(elbv2, transform_listener, Transforms=[_url_rewrite()])
+    for params in ({"Conditions": []}, {"Actions": []}, {"Conditions": [], "Actions": []}):
+        with pytest.raises(ClientError) as exc:
+            raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], **params)
+        _refused(exc, "You must provide either conditions, actions, or transforms")
+    assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
