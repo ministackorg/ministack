@@ -1087,8 +1087,17 @@ def _bucket_owner_account(name: str) -> str | None:
     return None
 
 
+# A Multi-Region Access Point or an object through it: arn:aws:s3::<account>:accesspoint/<alias>[/object/<key>].
+_MRAP_RESOURCE_ARN_RE = re.compile(
+    r"^arn:aws:s3::(\d{12}):accesspoint/([a-z][a-z0-9]*\.mrap)(?:/object/.*)?$", re.DOTALL)
+
+
 def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
-    """The bucket policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    """The bucket (or MRAP) policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    mrap = _MRAP_RESOURCE_ARN_RE.match(resource_arn)
+    if mrap:
+        record = find_mrap(mrap.group(2)) if mrap.group(1) == get_account_id() else None
+        return (record.get("Policy") or "", mrap.group(1)) if record else None
     if not resource_arn.startswith("arn:aws:s3:::"):
         return None
     bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]

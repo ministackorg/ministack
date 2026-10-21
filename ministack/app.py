@@ -2210,6 +2210,33 @@ def _resolve_mrap_host(host: str):
         return None
 
 
+def _enforce_mrap_request(host: str, bucket: str, method: str, mrap_path: str, headers: dict, body: bytes,
+                          query_params: dict):
+    """Under AUTH=true, authorize an MRAP request on its member bucket and then on the MRAP itself."""
+    from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks, s3_service_context
+    from ministack.core.responses import get_account_id
+
+    s3_action = _s3_action(method, mrap_path, query_params)
+    if not AUTH or not s3_action:
+        return None
+    s3 = _get_module("s3")
+    s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
+    bucket_arn = extract_resource_arn("s3", method, mrap_path, s3_headers, body, query_params, "", "")
+    key = bucket_arn[len(f"arn:aws:s3:::{bucket}"):]
+    mrap_arn = f"arn:aws:s3::{get_account_id()}:accesspoint/{_MRAP_HOST_RE.match(host).group(1).lower()}"
+    service_context = s3_service_context(f"s3:{s3_action}", query_params, mrap_path, s3_headers)
+    for resource in (bucket_arn, mrap_arn + (f"/object{key}" if key else "")):
+        denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
+                                     service_context=service_context, named_resource=f'"{resource}"')
+        if denied:
+            return denied
+    for extra_action, extra_arn in s3_additional_checks(method, mrap_path, s3_headers, body, query_params):
+        denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+        if denied:
+            return denied
+    return None
+
+
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
     if _MRAP_HOST_RE.match(host.split(":")[0].strip()):
@@ -2234,6 +2261,11 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
                 if not k.lower().startswith("x-amz-")
             }
         mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
+        # The MRAP and its bucket both have to allow the request.
+        denied = _enforce_mrap_request(host.split(":")[0].strip(), mrap_bucket, method, mrap_path, headers, body,
+                                       query_params)
+        if denied:
+            return denied
         return await _get_module("s3").handle_request(
             method, mrap_path, headers, body, query_params, signed_path=path,
             enforce_bucket_region=False,
