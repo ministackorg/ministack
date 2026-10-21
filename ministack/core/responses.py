@@ -103,6 +103,23 @@ def get_region() -> str:
     return _request_region.get()
 
 
+# Request-scoped caller address, for records that report where a request came from.
+_request_client_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_client_ip",
+    default="127.0.0.1",
+)
+
+
+def set_request_client_ip(address: str) -> None:
+    """Set the caller's address for the current request."""
+    _request_client_ip.set(address)
+
+
+def get_request_client_ip() -> str:
+    """Return the caller's address for the current request."""
+    return _request_client_ip.get()
+
+
 @contextlib.contextmanager
 def request_scope(account_id: str, region: str):
     """Pin the request-scoped account and region around a block that reaches

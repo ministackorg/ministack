@@ -621,10 +621,14 @@ def _static_property(raw, resources_defs, param_values, conditions, mappings, st
 def _validation_errors(resources_defs, ordered, param_values, conditions, mappings, stack_name, stack_id,
                        owned_buckets=frozenset()):
     """Pre-deployment validation errors as ``(logical_id, type, validation name,
-    path, reason)``: properties outside their schema enum, and AWS::S3::Bucket
-    names the stack can't take (NAME_CONFLICT_VALIDATION, observed on AWS); a
-    bucket the stack already owns is not a conflict for its update."""
-    from ministack.services.cloudformation.provisioners import s3_bucket_name_conflict
+    path, reason)``: properties outside their schema enum, ListenerRule
+    Transforms that break the resource schema, and AWS::S3::Bucket names the
+    stack can't take (NAME_CONFLICT_VALIDATION, observed on AWS); a bucket the
+    stack already owns is not a conflict for its update."""
+    from ministack.services.cloudformation.provisioners import (
+        listener_rule_transforms_schema_errors,
+        s3_bucket_name_conflict,
+    )
 
     errors = []
     for logical_id in ordered:
@@ -643,6 +647,12 @@ def _validation_errors(resources_defs, ordered, param_values, conditions, mappin
         # The enum check's validation name is not observed; PROPERTY_VALIDATION is inferred.
         errors += [(logical_id, rtype, "PROPERTY_VALIDATION", f"/Resources/{logical_id}/Properties/{prop}", reason)
                    for prop, reason in _property_enum_errors(rtype, props)]
+        if (rtype == "AWS::ElasticLoadBalancingV2::ListenerRule" and "Transforms" in raw_props
+                and not any(name in resources_defs for name, _ in _intrinsic_references(raw_props["Transforms"]))):
+            transforms = _static_property(raw_props["Transforms"], resources_defs, param_values, conditions,
+                                          mappings, stack_name, stack_id)
+            errors += [(logical_id, rtype, "PROPERTY_VALIDATION", f"/Resources/{logical_id}/Properties/{path}", reason)
+                       for path, reason in listener_rule_transforms_schema_errors(transforms)]
         if rtype == "AWS::S3::Bucket" and raw_props.get("BucketName"):
             name = _static_property(raw_props["BucketName"], resources_defs, param_values, conditions,
                                     mappings, stack_name, stack_id)
