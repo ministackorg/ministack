@@ -1124,7 +1124,7 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
     ACL, a grant to the caller's canonical ID on the object ACL, or an allow
     in the bucket policy. Nothing granted means the request is denied, which
     is S3's default for a bucket nobody has opened up. IgnorePublicAcls drops
-    the Group grants and RestrictPublicBuckets the policy.
+    the Group grants and RestrictPublicBuckets a public policy.
     """
     object_acl, object_wants = _foreign_object_acl(owner_account, bucket_name, key, method, query_params)
     caller_id = _canonical_owner_id(caller) if caller else ""
@@ -1144,7 +1144,8 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
                     return True
 
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
-    if policy and not _public_access_blocked(owner_account, bucket_name, "RestrictPublicBuckets"):
+    if policy and not (_public_access_blocked(owner_account, bucket_name, "RestrictPublicBuckets")
+                       and _policy_is_public(policy)):
         from ministack.core.iam_actions import _s3_action, s3_service_context
         from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
