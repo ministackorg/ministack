@@ -8861,6 +8861,108 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
             pass
 
 
+@pytest.mark.skipif(os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+                    reason="the SDK stubs belong to the local Node executor")
+def test_nodejs_worker_aws_sdk_v3_stub_calls_the_functions_own_account():
+    """A stub call signs with the function's credentials, so it lands in the function's account."""
+    from conftest import make_client
+
+    if not shutil.which("node"):
+        pytest.skip("node not found on PATH")
+    account = "123456789012"
+    own = {name: boto3.client(name, endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=account,
+                              aws_secret_access_key="test") for name in ("lambda", "ssm", "iam")}
+    fname = f"sdk-account-{_uuid_mod.uuid4().hex[:8]}"
+    param_name = f"/ministack-test/{fname}"
+    code = (
+        "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
+        "exports.handler = async (event) => {\n"
+        "  await new SSMClient({}).send(new PutParameterCommand({\n"
+        "    Name: event.name, Value: 'v', Type: 'String', Overwrite: true }));\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    role = own["iam"].create_role(RoleName=fname, AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))["Role"]
+    own["iam"].put_role_policy(RoleName=fname, PolicyName="ssm", PolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "ssm:PutParameter", "Resource": "*"}]}))
+    own["lambda"].create_function(FunctionName=fname, Runtime="nodejs20.x", Role=role["Arn"],
+                                  Handler="index.handler", Code={"ZipFile": _make_zip_js(code, "index.js")})
+    try:
+        resp = own["lambda"].invoke(FunctionName=fname, Payload=json.dumps({"name": param_name}).encode())
+        assert json.loads(resp["Payload"].read()) == {"ok": True}
+        assert own["ssm"].get_parameter(Name=param_name)["Parameter"]["Value"] == "v"
+        with pytest.raises(ClientError):
+            make_client("ssm").get_parameter(Name=param_name)
+    finally:
+        own["lambda"].delete_function(FunctionName=fname)
+        with contextlib.suppress(ClientError):
+            own["ssm"].delete_parameter(Name=param_name)
+        own["iam"].delete_role_policy(RoleName=fname, PolicyName="ssm")
+        own["iam"].delete_role(RoleName=fname)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.skipif(os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+                    reason="the SDK stubs belong to the local Node executor")
+def test_nodejs_sdk_stub_calls_run_as_the_execution_role_contract(auth_enabled, lam):
+    """The Node SDK stubs sign with the function's credentials, so the execution role's policy decides."""
+    from conftest import make_client
+
+    if not shutil.which("node"):
+        pytest.skip("node not found on PATH")
+    iam, suffix = make_client("iam"), _uuid_mod.uuid4().hex[:8]
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    roles = {}
+    for kind in ("allowed", "bare"):
+        roles[kind] = iam.create_role(RoleName=f"stub-{kind}-{suffix}", AssumeRolePolicyDocument=trust)["Role"]
+    iam.put_role_policy(RoleName=roles["allowed"]["RoleName"], PolicyName="calls", PolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["lambda:InvokeFunction", "ssm:PutParameter"], "Resource": "*"}]}))
+    callee = f"stub-callee-{suffix}"
+    code = (
+        "const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');\n"
+        "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
+        "exports.handler = async (event) => {\n"
+        "  const r = await new LambdaClient({}).send(\n"
+        "    new InvokeCommand({ FunctionName: event.target, Payload: '{}' }));\n"
+        "  let ssm = 'ok';\n"
+        "  try {\n"
+        "    await new SSMClient({}).send(new PutParameterCommand({\n"
+        "      Name: event.name, Value: 'v', Type: 'String', Overwrite: true }));\n"
+        "  } catch (e) { ssm = e.name; }\n"
+        "  return { status: r.StatusCode, ssm: ssm };\n"
+        "};\n"
+    )
+    callers = {kind: f"stub-{kind}-{suffix}" for kind in roles}
+    try:
+        lam.create_function(FunctionName=callee, Runtime="python3.12", Role=roles["allowed"]["Arn"],
+                            Handler="index.handler",
+                            Code={"ZipFile": _make_zip("def handler(event, context):\n    return 1\n")})
+        answers = {}
+        for kind, name in callers.items():
+            lam.create_function(FunctionName=name, Runtime="nodejs20.x", Role=roles[kind]["Arn"],
+                                Handler="index.handler", Code={"ZipFile": _make_zip_js(code, "index.js")})
+            resp = lam.invoke(FunctionName=name, Payload=json.dumps(
+                {"target": callee, "name": f"/stub-roles/{suffix}/{kind}"}).encode())
+            answers[kind] = json.loads(resp["Payload"].read())
+        assert answers["allowed"] == {"status": 200, "ssm": "ok"}
+        assert answers["bare"] == ({"status": 403, "ssm": "AccessDeniedException"} if auth_enabled
+                                   else {"status": 200, "ssm": "ok"})
+    finally:
+        for name in (callee, *callers.values()):
+            with contextlib.suppress(Exception):
+                lam.delete_function(FunctionName=name)
+        for kind in callers:
+            with contextlib.suppress(Exception):
+                make_client("ssm").delete_parameter(Name=f"/stub-roles/{suffix}/{kind}")
+        iam.delete_role_policy(RoleName=roles["allowed"]["RoleName"], PolicyName="calls")
+        for role in roles.values():
+            iam.delete_role(RoleName=role["RoleName"])
+
+
 def test_lambda_ruby_4_0_runtime_maps_to_official_image():
     """Lambda Ruby 4.0 runtime support (botocore 1.42.94 added the runtime).
     Maps to AWS's official Lambda Ruby 4.0 base image."""

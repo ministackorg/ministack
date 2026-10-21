@@ -8966,6 +8966,9 @@ def _subscription_matches(filter_: str, topic: str) -> bool:
     """Whether a subscription's or rule's filter matches; ``$aws/events`` skips filters that start with a wildcard."""
     if topic.startswith("$aws/events/") and filter_[:1] in ("#", "+"):
         return False
+    # AWS IoT delivers nothing to `a/#` from the level above it, `a`.
+    if filter_.endswith("/#") and topic.count("/") < filter_.count("/"):
+        return False
     return _topic_matches(filter_, topic)
 
 
