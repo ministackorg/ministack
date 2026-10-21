@@ -2048,6 +2048,19 @@ def _tag_operations(service: str) -> frozenset[str]:
     return _TAG_OPERATIONS[service]
 
 
+_UNSIGNED_OPERATIONS: dict[str, frozenset[str]] = {}
+
+
+def unsigned_operations(service: str) -> frozenset[str]:
+    """The operations of *service* its SDK model sends without credentials."""
+    if service not in _UNSIGNED_OPERATIONS:
+        _UNSIGNED_OPERATIONS[service] = frozenset(
+            op_name for name in _BOTOCORE_SERVICE_MAP.get(service) or [service]
+            for op_name, op in _load_botocore_model(name).get("operations", {}).items()
+            if op.get("authtype") == "none" or op.get("auth") == ["smithy.api#noAuth"])
+    return _UNSIGNED_OPERATIONS[service]
+
+
 def request_tag_context(service: str, iam_action: str, body: bytes, params: dict) -> dict:
     """aws:RequestTag/<key> for every tag a request sets and aws:TagKeys for every key it sets or removes."""
     if iam_action.split(":", 1)[-1] not in _tag_operations(service):
@@ -2124,6 +2137,10 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
     ),
     "IncompleteSignature": _INCOMPLETE,
     "MissingAuthorizationParameter": _INCOMPLETE,
+    "MissingAuthenticationToken": (
+        "MissingAuthenticationToken", 403, "MissingAuthenticationTokenException",
+        ("AccessDenied", 403, "Access Denied"),
+    ),
     "UnsupportedSignature": (
         "IncompleteSignature", 400, "IncompleteSignatureException",
         ("InvalidRequest", 400, "The authorization mechanism you have provided is not supported. "
@@ -2137,10 +2154,37 @@ _EC2_AUTH_FAILURE = ("AuthFailure", 401, "AWS was not able to validate the provi
 _EC2_FAILURES = {"ExpiredTokenException": ("RequestExpired", 400, "Request has expired.")}
 
 
+_MISSING_TOKEN_FAILURES = {
+    "secretsmanager": ("UnrecognizedClientException", 400, "The security token included in the request is invalid."),
+    "ec2": ("MissingParameter", 400, "The request must contain the parameter AWSAccessKeyId"),
+}
+
+
+def anonymous_denial_message(service: str, iam_action: str, resource_arn: str) -> str:
+    """The message of a refused request without credentials; SQS names the anonymous caller and the queue."""
+    if service == "sqs" and resource_arn.startswith("arn:"):
+        action = iam_action.lower()
+        return (f"User: anonymous is not authorized to perform: {action} on resource: {resource_arn} "
+                f"because no resource-based policy allows the {action} action")
+    return "Request is missing Authentication Token"
+
+
 def _auth_failure(service: str, code: str, message: str, headers: dict) -> tuple[str, int, str]:
     """The code, status and message a service answers for a failed authentication."""
     if service == "lambda" and code == "MissingAuthorizationParameter":
         return "MissingAuthenticationTokenException", 403, "Missing Authentication Token"
+    if code == "MissingAuthenticationToken":
+        if service == "sqs":
+            from ministack.core.iam_evaluator import _request_origin
+
+            if not message.startswith("User: anonymous"):
+                scheme = "https" if _request_origin.get()[1] else "http"
+                message = f"Access to the resource {scheme}://{headers.get('host', '')}/ is denied."
+            return "AccessDenied", 403, message
+        if service in _MISSING_TOKEN_FAILURES:
+            return _MISSING_TOKEN_FAILURES[service]
+        if _SERVICE_PROTOCOL.get(service) is None and service != "dynamodb":
+            message = "Missing Authentication Token"
     query_code, query_status, json_code, s3_failure = _AUTH_FAILURES[code]
     protocol = _SERVICE_PROTOCOL.get(service)
     if service == "s3":
@@ -2179,6 +2223,9 @@ def identity_denial_message(action: str, principal_arn: str, resource: str, expl
     return f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource} {reason}"
 
 
+_IOT_DATA_FAILURES = {"MissingAuthenticationToken": "Missing authentication"}
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
@@ -2204,7 +2251,8 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         # for a failed authentication, no message for a policy denial.
         return (
             403, {"Content-Type": "application/json", "x-amzn-errortype": "ForbiddenException:"},
-            json.dumps({"message": "Forbidden" if error_code else None, "traceId": str(uuid.uuid4())}).encode(),
+            json.dumps({"message": _IOT_DATA_FAILURES.get(error_code, "Forbidden") if error_code else None,
+                        "traceId": str(uuid.uuid4())}).encode(),
         )
     if not message and explicit_deny and resource_policy_arn:
         message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
