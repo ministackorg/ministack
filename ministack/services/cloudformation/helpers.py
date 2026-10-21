@@ -334,3 +334,10 @@ def _page(items, params, action, page_size=PAGE_SIZE):
     if start + page_size < len(items):
         next_token_xml = f"<NextToken>{action}:{start + page_size}</NextToken>"
     return page, next_token_xml, None
+
+
+def _sdk_error(message, service, status, request_id=None):
+    """A service error as a resource handler words it in the
+    StatusReason: the service's own message, then its SDK's suffix."""
+    return (f"{message} (Service: {service}, Status Code: {status}, "
+            f"Request ID: {request_id or new_uuid()}) (SDK Attempt Count: 1)")

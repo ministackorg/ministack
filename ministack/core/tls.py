@@ -64,7 +64,8 @@ def iot_endpoint_hosts() -> "list[str]":
 
 
 def _generated_cert_names() -> "list[str]":
-    return cognito_idp_hosts() + iot_endpoint_hosts()
+    # Docker Lambda containers reach the gateway as host.docker.internal.
+    return ["host.docker.internal"] + cognito_idp_hosts() + iot_endpoint_hosts()
 
 
 def ca_bundle_path(cert_path: str) -> "str | None":

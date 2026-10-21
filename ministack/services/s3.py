@@ -2728,6 +2728,12 @@ def _location_constraint(body: bytes) -> str | None:
     return loc_el.text if loc_el is not None and loc_el.text else None
 
 
+def _constraint_region(constraint: str | None) -> str | None:
+    """``EU`` is the legacy LocationConstraint for eu-west-1, which still
+    accepts it (observed on AWS 2026-10-20); the AWS SDK for .NET sends it."""
+    return "eu-west-1" if constraint == "EU" else constraint
+
+
 def _location_constraint_error(name: str, constraint: str | None, endpoint_region: str):
     """CreateBucket's location-constraint rules for a request signed for
     ``endpoint_region`` (observed on AWS 2026-10-12): us-east-1 is never a
@@ -2736,7 +2742,7 @@ def _location_constraint_error(name: str, constraint: str | None, endpoint_regio
     if constraint == "us-east-1":
         return _error("InvalidLocationConstraint", "The specified location-constraint is not valid",
                       400, f"/{name}", extra={"LocationConstraint": constraint})
-    if endpoint_region != "us-east-1" and constraint != endpoint_region:
+    if endpoint_region != "us-east-1" and _constraint_region(constraint) != endpoint_region:
         return _error(
             "IllegalLocationConstraintException",
             f"The {constraint or 'unspecified'} location constraint is incompatible for the region "
@@ -2794,14 +2800,14 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
             extra={"BucketName": name},
         )
 
-    region = None
+    constraint = None
     tags = {}
     if body:
         try:
             xml_root = fromstring(body)
             loc_el = _find_xml_tag(xml_root, "LocationConstraint")
             if loc_el is not None and loc_el.text:
-                region = loc_el.text
+                constraint = loc_el.text
 
             err = _duplicate_tag_error(xml_root, resource=f"/{name}")
             if err is not None:
@@ -2817,8 +2823,11 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
 
     # No explicit LocationConstraint: the bucket lands in the region the
     # request was signed for, like real AWS.
-    region = region or get_region()
+    region = _constraint_region(constraint) or get_region()
     _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    if constraint == "EU":
+        # GetBucketLocation answers EU for a bucket created with EU (observed on AWS 2026-10-20).
+        _buckets[name]["location_constraint"] = constraint
     ownership = headers.get("x-amz-object-ownership")
     if ownership:
         # The same document PutBucketOwnershipControls stores.
@@ -2919,7 +2928,7 @@ def _get_bucket_location(name: str):
     # AWS returns an empty LocationConstraint only for us-east-1 buckets;
     # every other region is echoed back verbatim.
     if region != "us-east-1":
-        root.text = region
+        root.text = _buckets[name].get("location_constraint") or region
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 

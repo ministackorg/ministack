@@ -52,6 +52,7 @@ Supports:
                  VerifyDnsConfiguration, GetManagedCertificateDetails,
                  ListDomainConflicts, UpdateDomainAssociation,
                  ListDistributionsByConnectionMode
+  Web ACL: AssociateDistributionWebACL, DisassociateDistributionWebACL
 """
 
 import base64
@@ -128,6 +129,8 @@ _CONN_GROUP_RE = re.compile(r"^/2020-05-31/connection-group/?$")
 _CONN_GROUP_ID_RE = re.compile(r"^/2020-05-31/connection-group/(.+?)/?$")
 _CONN_GROUPS_LIST_RE = re.compile(r"^/2020-05-31/connection-groups/?$")
 _TENANT_RE = re.compile(r"^/2020-05-31/distribution-tenant/?$")
+_DIST_WEBACL_ASSOC_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/associate-web-acl/?$")
+_DIST_WEBACL_DISASSOC_RE = re.compile(r"^/2020-05-31/distribution/([^/]+)/disassociate-web-acl/?$")
 _TENANT_WEBACL_ASSOC_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/associate-web-acl/?$")
 _TENANT_WEBACL_DISASSOC_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/disassociate-web-acl/?$")
 _TENANT_INV_RE = re.compile(r"^/2020-05-31/distribution-tenant/([^/]+)/invalidation/?$")
@@ -2656,6 +2659,16 @@ async def handle_request(method, path, headers, body, query_params):
 
     # SaaS Manager routes. Tenant sub-resource routes must be matched before
     # the greedy _TENANT_ID_RE / _CONN_GROUP_ID_RE identifier routes.
+    m = _DIST_WEBACL_ASSOC_RE.match(path)
+    if m:
+        if method == "PUT":
+            return _associate_distribution_webacl(m.group(1), headers, body)
+
+    m = _DIST_WEBACL_DISASSOC_RE.match(path)
+    if m:
+        if method == "PUT":
+            return _disassociate_distribution_webacl(m.group(1), headers)
+
     m = _TENANT_WEBACL_ASSOC_RE.match(path)
     if m:
         if method == "PUT":
@@ -4224,6 +4237,72 @@ def _tenant_list_response(tenants, root_tag):
             _build_distribution_tenant_summary_xml(summary, tenant)
 
     return _xml_response(root_tag, build)
+
+
+def _set_distribution_webacl(dist, webacl_id):
+    """Set (or clear, with "") ``WebACLId`` in a stored DistributionConfig, and bump the ETag."""
+    config_el = fromstring(dist["config_xml"])
+    el = _find(config_el, "WebACLId")
+    if el is None:
+        ns = config_el.tag.split("}")[0] + "}" if config_el.tag.startswith("{") else ""
+        el = Element(ns + "WebACLId")
+        # WebACLId follows Restrictions in the DistributionConfig, so SDKs that read in order are not surprised.
+        restrictions = _find(config_el, "Restrictions")
+        children = list(config_el)
+        config_el.insert(children.index(restrictions) + 1 if restrictions is not None else len(children), el)
+    el.text = webacl_id
+    dist["config_xml"] = tostring(config_el, encoding="unicode")
+    dist["ETag"] = new_uuid()
+    dist["LastModifiedTime"] = _now_iso()
+
+
+def _distribution_webacl_precondition(dist, headers):
+    if_match = headers.get("if-match", "")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != dist["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    return None
+
+
+def _associate_distribution_webacl(dist_id, headers, body):
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    err = _distribution_webacl_precondition(dist, headers)
+    if err:
+        return err
+    el = _parse_body(body)
+    webacl_arn = _text(el, "WebACLArn") if el is not None else ""
+    if not webacl_arn:
+        return _error("InvalidArgument", "WebACLArn is required.", 400)
+    _set_distribution_webacl(dist, webacl_arn)
+    logger.info("AssociateDistributionWebACL id=%s", dist_id)
+
+    def build(root):
+        SubElement(root, "Id").text = dist_id
+
+    return _xml_response("AssociateDistributionWebACLResult", build, extra_headers={"ETag": dist["ETag"]})
+
+
+def _disassociate_distribution_webacl(dist_id, headers):
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    err = _distribution_webacl_precondition(dist, headers)
+    if err:
+        return err
+    _set_distribution_webacl(dist, "")
+    logger.info("DisassociateDistributionWebACL id=%s", dist_id)
+
+    def build(root):
+        SubElement(root, "Id").text = dist_id
+
+    return _xml_response("DisassociateDistributionWebACLResult", build, extra_headers={"ETag": dist["ETag"]})
 
 
 def _associate_tenant_webacl(tenant_id, headers, body):

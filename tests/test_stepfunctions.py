@@ -12,7 +12,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT, LoopProbe, concurrent_burst, sqs_policy_allow_sns
+from conftest import ENDPOINT, LoopProbe, concurrent_burst, make_client, sqs_policy_allow_sns
 
 
 def _make_zip(code: str) -> bytes:
@@ -9298,3 +9298,683 @@ def test_sdk_lambda_get_function_missing_function_exact_catch(sfn):
                       "Lambda.ResourceNotFoundException")
     assert result["status"] == "SUCCEEDED", result
     assert json.loads(result["output"])["caught"]["Error"] == "Lambda.ResourceNotFoundException"
+
+
+
+# ---------------------------------------------------------------------------
+# encryptionConfiguration on state machines. Every expectation below is what
+# AWS answered in us-east-1 on 2026-10-20 (issue #2308 captures). MiniStack
+# does not look the key up in KMS; these tests use a MiniStack KMS key so they
+# would hold either way.
+# ---------------------------------------------------------------------------
+
+_ENC_DEFINITION = json.dumps({"StartAt": "Done", "States": {"Done": {"Type": "Succeed"}}})
+_ENC_NEW_DEFINITION = json.dumps({"StartAt": "P", "States": {"P": {"Type": "Pass", "End": True}}})
+_ENC_ROLE = "arn:aws:iam::000000000000:role/sfn-role"
+_ENC_DEFAULT = {"type": "AWS_OWNED_KEY"}
+_CMK = "CUSTOMER_MANAGED_KMS_KEY"
+_KEY = "<key>"  # stands for the module's KMS key ARN in the tables below
+
+
+@pytest.fixture(scope="module")
+def enc_key(kms_client):
+    return kms_client.create_key()["KeyMetadata"]["Arn"]
+
+
+def _cmk(key, period=300):
+    cfg = {"type": _CMK, "kmsKeyId": key}
+    if period is not None:
+        cfg["kmsDataKeyReusePeriodSeconds"] = period
+    return cfg
+
+
+def _with_key(cfg, key):
+    if isinstance(cfg, dict):
+        return {k: key if v == _KEY else v for k, v in cfg.items()}
+    return cfg
+
+
+def _enc_name(prefix):
+    return f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+
+
+def _sm_arn(name):
+    return f"arn:aws:states:us-east-1:000000000000:stateMachine:{name}"
+
+
+@contextmanager
+def _enc_machine(sfn, prefix, **kwargs):
+    arn = sfn.create_state_machine(
+        name=_enc_name(prefix), definition=_ENC_DEFINITION,
+        roleArn=_ENC_ROLE, **kwargs)["stateMachineArn"]
+    try:
+        yield arn
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def _sfn_unvalidated():
+    """A client without boto3's client-side parameter validation, so
+    out-of-range values reach the server."""
+    return make_client("stepfunctions", {"parameter_validation": False})
+
+
+def _sfn_raw(action, body):
+    """POST a raw JSON 1.0 request, for values boto3 refuses to serialize."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": f"AWSStepFunctions.{action}",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/states/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=00",
+            "X-Amz-Date": "20200101T000000Z",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.getcode(), json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def _assert_sfn_error(exc_info, code, message=None):
+    """The error code and HTTP status, and the exact message when given. The
+    StateMachineAlreadyExists and StateMachineDoesNotExist wording is shared
+    with other Step Functions calls and outside this change, so those checks
+    pass no message."""
+    response = exc_info.value.response
+    assert response["Error"]["Code"] == code
+    if message is not None:
+        assert response["Error"]["Message"] == message
+    assert response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def _sfn_exists(sfn, arn):
+    try:
+        sfn.describe_state_machine(stateMachineArn=arn)
+    except ClientError as exc:
+        assert exc.response["Error"]["Code"] == "StateMachineDoesNotExist"
+        return False
+    return True
+
+
+def _encryption(sfn, arn):
+    return sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"]
+
+
+def test_sfn_encryption_configuration_defaults_to_aws_owned_key(sfn):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C1, C5)."""
+    with _enc_machine(sfn, "enc-default") as arn:
+        assert _encryption(sfn, arn) == _ENC_DEFAULT
+    with _enc_machine(sfn, "enc-owned", encryptionConfiguration=_ENC_DEFAULT) as arn:
+        assert _encryption(sfn, arn) == _ENC_DEFAULT
+
+
+def test_sfn_encryption_configuration_null_is_absent(sfn):
+    """AWS: captured 2026-10-20 (2308-followup 6:config-null, raw request)."""
+    name = _enc_name("enc-null")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": name, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": None})
+    assert status == 200, body
+    try:
+        assert _encryption(sfn, body["stateMachineArn"]) == _ENC_DEFAULT
+    finally:
+        sfn.delete_state_machine(stateMachineArn=body["stateMachineArn"])
+
+
+def test_sfn_encryption_configuration_customer_managed_key_round_trip(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C2)."""
+    with _enc_machine(sfn, "enc-cmk", encryptionConfiguration=_cmk(enc_key)) as arn:
+        assert _encryption(sfn, arn) == _cmk(enc_key)
+
+
+def test_sfn_encryption_configuration_create_defaults_period_to_300(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C4)."""
+    with _enc_machine(sfn, "enc-noper", encryptionConfiguration=_cmk(enc_key, None)) as arn:
+        assert _encryption(sfn, arn) == _cmk(enc_key, 300)
+
+
+@pytest.mark.parametrize("created_with", [None, 600], ids=["over-aws-owned-key", "over-600"])
+def test_sfn_encryption_configuration_update_defaults_period_to_300(sfn, enc_key, created_with):
+    """AWS: captured 2026-10-20 (2308-followup 5:update-owned-to-cmk-no-period,
+    5:update-cmk600-to-cmk-no-period)."""
+    kwargs = {} if created_with is None else {"encryptionConfiguration": _cmk(enc_key, created_with)}
+    with _enc_machine(sfn, "enc-upd-noper", **kwargs) as arn:
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_NEW_DEFINITION,
+                                 encryptionConfiguration=_cmk(enc_key, None))
+        assert _encryption(sfn, arn) == _cmk(enc_key, 300)
+
+
+def test_sfn_encryption_configuration_update_replaces_or_keeps_it(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C8, C9)."""
+    with _enc_machine(sfn, "enc-upd", encryptionConfiguration=_cmk(enc_key)) as arn:
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_DEFINITION,
+                                 encryptionConfiguration=_ENC_DEFAULT)
+        assert _encryption(sfn, arn) == _ENC_DEFAULT
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_DEFINITION,
+                                 encryptionConfiguration=_cmk(enc_key, 600))
+        sfn.update_state_machine(stateMachineArn=arn, roleArn=_ENC_ROLE)
+        assert _encryption(sfn, arn) == _cmk(enc_key, 600)
+
+
+def test_sfn_encryption_configuration_update_without_definition_is_refused(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C42)."""
+    with _enc_machine(sfn, "enc-nodef", encryptionConfiguration=_cmk(enc_key)) as arn:
+        with pytest.raises(ClientError) as exc:
+            sfn.update_state_machine(stateMachineArn=arn, encryptionConfiguration=_cmk(enc_key, 600))
+        _assert_sfn_error(exc, "MissingRequiredParameter",
+                          "The definition must be specified when updating the EncryptionConfiguration")
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert described["encryptionConfiguration"] == _cmk(enc_key)
+        assert described["definition"] == _ENC_DEFINITION
+
+
+def test_sfn_encryption_configuration_versions_keep_their_snapshot(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C10-C12)."""
+    with _enc_machine(sfn, "enc-ver", encryptionConfiguration=_cmk(enc_key), publish=True) as arn:
+        v1 = f"{arn}:1"
+        v2 = sfn.update_state_machine(
+            stateMachineArn=arn, definition=_ENC_DEFINITION,
+            encryptionConfiguration=_ENC_DEFAULT, publish=True)["stateMachineVersionArn"]
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_DEFINITION,
+                                 encryptionConfiguration=_cmk(enc_key, 120))
+        v3 = sfn.publish_state_machine_version(stateMachineArn=arn)["stateMachineVersionArn"]
+        try:
+            assert _encryption(sfn, v3) == _cmk(enc_key, 120)
+            assert _encryption(sfn, v1) == _cmk(enc_key)
+            assert _encryption(sfn, v2) == _ENC_DEFAULT
+        finally:
+            for version in (v1, v2, v3):
+                sfn.delete_state_machine_version(stateMachineVersionArn=version)
+
+
+def test_sfn_encryption_configuration_on_describe_for_execution(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C14)."""
+    with _enc_machine(sfn, "enc-exec", encryptionConfiguration=_cmk(enc_key)) as arn:
+        execution = sfn.start_execution(stateMachineArn=arn, input="{}")["executionArn"]
+        described = sfn.describe_state_machine_for_execution(executionArn=execution)
+        assert described["encryptionConfiguration"] == _cmk(enc_key)
+
+
+def test_sfn_encryption_configuration_is_part_of_create_idempotency(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C15-C19)."""
+    name = _enc_name("enc-idem")
+    created = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                       encryptionConfiguration=_cmk(enc_key))
+    arn = created["stateMachineArn"]
+    try:
+        again = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                         encryptionConfiguration=_cmk(enc_key))
+        assert again["stateMachineArn"] == arn
+        assert again["creationDate"] == created["creationDate"]
+        for different in ({"encryptionConfiguration": _ENC_DEFAULT},
+                          {"encryptionConfiguration": _cmk(enc_key, 900)},
+                          {}):
+            with pytest.raises(ClientError) as exc:
+                sfn.create_state_machine(name=name, definition=_ENC_DEFINITION,
+                                         roleArn=_ENC_ROLE, **different)
+            _assert_sfn_error(exc, "StateMachineAlreadyExists")
+        assert _encryption(sfn, arn) == _cmk(enc_key)
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def _enc_kwargs(form, key):
+    return {
+        "omitted": {},
+        "aws-owned-key": {"encryptionConfiguration": _ENC_DEFAULT},
+        "cmk-300": {"encryptionConfiguration": _cmk(key, 300)},
+        "cmk-no-period": {"encryptionConfiguration": _cmk(key, None)},
+    }[form]
+
+
+@pytest.mark.parametrize("first,second", [
+    ("omitted", "aws-owned-key"),
+    ("cmk-300", "cmk-no-period"),
+    ("cmk-no-period", "cmk-300"),
+])
+def test_sfn_encryption_configuration_equivalent_forms_are_idempotent(sfn, enc_key, first, second):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C20; 2308-followup
+    5:recreate-no-period-on-stored-300, 5:recreate-300-on-created-without-period)."""
+    name = _enc_name("enc-idem-eq")
+    created = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                       **_enc_kwargs(first, enc_key))
+    try:
+        again = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                         **_enc_kwargs(second, enc_key))
+        assert again["stateMachineArn"] == created["stateMachineArn"]
+        assert again["creationDate"] == created["creationDate"]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=created["stateMachineArn"])
+
+
+def _period_min(value):
+    return (f"Value '{value}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+            "failed to satisfy constraint: Member must have value greater than or equal to 60")
+
+
+def _period_max(value):
+    return (f"Value '{value}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+            "failed to satisfy constraint: Member must have value less than or equal to 900")
+
+
+_KEY_EMPTY = ("Value '' at 'encryptionConfiguration.kmsKeyId' failed to satisfy constraint: "
+              "Member must have length greater than or equal to 1")
+_LONG_KEY = "k" * 2049
+_KEY_LONG = (f"Value '{_LONG_KEY}' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+             "constraint: Member must have length less than or equal to 2048")
+_TYPE_NULL = ("Value null at 'encryptionConfiguration.type' failed to satisfy constraint: "
+              "Member must not be null")
+_TYPE_ENUM = ("Value 'SOME_OTHER_KEY' at 'encryptionConfiguration.type' failed to satisfy "
+              "constraint: Member must satisfy enum value set: [AWS_OWNED_KEY, CUSTOMER_MANAGED_KMS_KEY]")
+_NO_KEY = "Invalid Encryption Configuration: Must set a valid kmsKeyId."
+_OWNED_WITH_KEY = ("Invalid Encryption Configuration: Custom kmsKeyId is not allowed "
+                   "when selecting AWS_OWNED_KEY.")
+_OWNED_WITH_PERIOD = ("Invalid Encryption Configuration: Custom kmsDataKeyReusePeriodSeconds "
+                      "is not allowed when selecting AWS_OWNED_KEY.")
+
+
+def _one_error(problem):
+    return f"1 validation error detected: {problem}"
+
+
+# (id, encryptionConfiguration, code, message, also captured on UpdateStateMachine)
+# Create: sfn-encryption-configuration C6, C21-C27; 2308-followup 2:owned-period-*,
+# 4:create-multi-*. Update: C33-C39; 2308-followup 4:update-multi-*.
+_ENC_VALIDATION_ROWS = [
+    ("no-type", {}, "ValidationException", _one_error(_TYPE_NULL), True),
+    ("bad-type", {"type": "SOME_OTHER_KEY"}, "ValidationException", _one_error(_TYPE_ENUM), True),
+    ("empty-key", {"type": _CMK, "kmsKeyId": ""}, "ValidationException", _one_error(_KEY_EMPTY), True),
+    ("long-key", {"type": _CMK, "kmsKeyId": _LONG_KEY}, "ValidationException", _one_error(_KEY_LONG), True),
+    ("period-59-alias", {"type": _CMK, "kmsKeyId": "alias/k", "kmsDataKeyReusePeriodSeconds": 59},
+     "ValidationException", _one_error(_period_min(59)), True),
+    ("period-59-key", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": 59},
+     "ValidationException", _one_error(_period_min(59)), True),
+    ("period-901-alias", {"type": _CMK, "kmsKeyId": "alias/k", "kmsDataKeyReusePeriodSeconds": 901},
+     "ValidationException", _one_error(_period_max(901)), True),
+    ("period-901-key", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": 901},
+     "ValidationException", _one_error(_period_max(901)), True),
+    ("cmk-without-key", {"type": _CMK}, "InvalidEncryptionConfiguration", _NO_KEY, True),
+    ("aws-owned-key-with-key", {"type": "AWS_OWNED_KEY", "kmsKeyId": _KEY},
+     "InvalidEncryptionConfiguration", _OWNED_WITH_KEY, False),
+    ("aws-owned-key-period-300", {"type": "AWS_OWNED_KEY", "kmsDataKeyReusePeriodSeconds": 300},
+     "InvalidEncryptionConfiguration", _OWNED_WITH_PERIOD, False),
+    ("aws-owned-key-period-30", {"type": "AWS_OWNED_KEY", "kmsDataKeyReusePeriodSeconds": 30},
+     "ValidationException", _one_error(_period_min(30)), False),
+    ("aws-owned-key-period-1000", {"type": "AWS_OWNED_KEY", "kmsDataKeyReusePeriodSeconds": 1000},
+     "ValidationException", _one_error(_period_max(1000)), False),
+    ("empty-key-period-59", {"type": _CMK, "kmsKeyId": "", "kmsDataKeyReusePeriodSeconds": 59},
+     "ValidationException",
+     f"2 validation errors detected: {_period_min(59)}; {_KEY_EMPTY}", True),
+    ("bad-type-empty-key-period-59",
+     {"type": "SOME_OTHER_KEY", "kmsKeyId": "", "kmsDataKeyReusePeriodSeconds": 59},
+     "ValidationException",
+     f"3 validation errors detected: {_period_min(59)}; {_KEY_EMPTY}; {_TYPE_ENUM}", True),
+]
+
+# (id, encryptionConfiguration as sent on the wire, Message, also captured on Update)
+# Create: sfn-encryption-configuration C28-C30; 2308-followup 6:config-number-1,
+# 6:config-array-empty. Update: 2308-followup 4:update-serialization-*.
+_ENC_SERIALIZATION_ROWS = [
+    ("config-string", "AWS_OWNED_KEY", "Expected null", True),
+    ("period-string", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": "300"},
+     "STRING_VALUE can not be converted to an Integer", True),
+    ("period-true", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": True},
+     "TRUE_VALUE can not be converted to an Integer", True),
+    ("config-number", 1, "Expected null", False),
+    ("config-list", [], "Start of list found where not expected", False),
+    # 2308-pr-uncertainties U1, U2, U3 (Create only)
+    ("config-true", True, "Expected null", False),
+    ("config-false", False, "Expected null", False),
+    ("period-false", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": False},
+     "FALSE_VALUE can not be converted to an Integer", False),
+    ("period-list", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": []},
+     "Start of list found where not expected", False),
+    ("period-object", {"type": _CMK, "kmsKeyId": _KEY, "kmsDataKeyReusePeriodSeconds": {}},
+     "Start of structure or map found where not expected.", False),
+    ("type-number", {"type": 5}, "NUMBER_VALUE can not be converted to a String", False),
+    ("type-list", {"type": []}, "Start of list found where not expected", False),
+    ("type-object", {"type": {}}, "Start of structure or map found where not expected.", False),
+    ("key-number", {"type": _CMK, "kmsKeyId": 5}, "NUMBER_VALUE can not be converted to a String", False),
+    ("key-true", {"type": _CMK, "kmsKeyId": True}, "TRUE_VALUE can not be converted to a String", False),
+    # 2308-pr-uncertainties-2 U21, U22: false in a String member; the member AWS reports
+    # when two are mistyped is fixed (period, kmsKeyId, type), whatever the request order.
+    ("key-false", {"type": _CMK, "kmsKeyId": False}, "FALSE_VALUE can not be converted to a String", False),
+    ("type-false", {"type": False}, "FALSE_VALUE can not be converted to a String", False),
+    ("type-then-key", {"type": 5, "kmsKeyId": True}, "TRUE_VALUE can not be converted to a String", False),
+    ("key-then-type", {"kmsKeyId": True, "type": 5}, "TRUE_VALUE can not be converted to a String", False),
+    ("period-then-type", {"kmsDataKeyReusePeriodSeconds": "x", "type": 5},
+     "STRING_VALUE can not be converted to an Integer", False),
+]
+
+
+def _rows(rows, update_only=False):
+    return [pytest.param(*row[1:-1], id=row[0]) for row in rows if row[-1] or not update_only]
+
+
+@pytest.mark.parametrize("cfg,code,message", _rows(_ENC_VALIDATION_ROWS))
+def test_sfn_create_refuses_invalid_encryption_configuration(sfn, enc_key, cfg, code, message):
+    """AWS: captured 2026-10-20 (rows in _ENC_VALIDATION_ROWS)."""
+    name = _enc_name("enc-bad")
+    with pytest.raises(ClientError) as exc:
+        _sfn_unvalidated().create_state_machine(
+            name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+            encryptionConfiguration=_with_key(cfg, enc_key))
+    _assert_sfn_error(exc, code, message)
+    assert not _sfn_exists(sfn, _sm_arn(name))
+
+
+@pytest.mark.parametrize("cfg,code,message", _rows(_ENC_VALIDATION_ROWS, update_only=True))
+def test_sfn_update_refuses_invalid_encryption_configuration(sfn, enc_key, cfg, code, message):
+    """A refused update changes neither the definition nor the configuration.
+    AWS: captured 2026-10-20 (rows in _ENC_VALIDATION_ROWS marked for Update)."""
+    with _enc_machine(sfn, "enc-bad-upd", encryptionConfiguration=_cmk(enc_key)) as arn:
+        with pytest.raises(ClientError) as exc:
+            _sfn_unvalidated().update_state_machine(
+                stateMachineArn=arn, definition=_ENC_NEW_DEFINITION,
+                encryptionConfiguration=_with_key(cfg, enc_key))
+        _assert_sfn_error(exc, code, message)
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert described["encryptionConfiguration"] == _cmk(enc_key)
+        assert described["definition"] == _ENC_DEFINITION
+
+
+def _assert_serialization_error(status, body, message):
+    assert status == 400, body
+    assert body["__type"].rsplit("#", 1)[-1] == "SerializationException"
+    assert body["Message"] == message
+    assert "message" not in body
+
+
+@pytest.mark.parametrize("cfg,message", _rows(_ENC_SERIALIZATION_ROWS))
+def test_sfn_create_refuses_mistyped_encryption_configuration(sfn, enc_key, cfg, message):
+    """AWS: captured 2026-10-20 (rows in _ENC_SERIALIZATION_ROWS, raw requests)."""
+    name = _enc_name("enc-ser")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": name, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": _with_key(cfg, enc_key)})
+    _assert_serialization_error(status, body, message)
+    assert not _sfn_exists(sfn, _sm_arn(name))
+
+
+@pytest.mark.parametrize("cfg,message", _rows(_ENC_SERIALIZATION_ROWS, update_only=True))
+def test_sfn_update_refuses_mistyped_encryption_configuration(sfn, enc_key, cfg, message):
+    """AWS: captured 2026-10-20 (2308-followup 4:update-serialization-*, raw requests)."""
+    with _enc_machine(sfn, "enc-ser-upd", encryptionConfiguration=_cmk(enc_key)) as arn:
+        status, body = _sfn_raw("UpdateStateMachine", {
+            "stateMachineArn": arn, "definition": _ENC_NEW_DEFINITION,
+            "encryptionConfiguration": _with_key(cfg, enc_key)})
+        _assert_serialization_error(status, body, message)
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert described["encryptionConfiguration"] == _cmk(enc_key)
+        assert described["definition"] == _ENC_DEFINITION
+
+
+def test_sfn_create_checks_encryption_shape_before_definition(sfn):
+    """AWS: captured 2026-10-20 (2308-followup 4:create-empty-config-invalid-definition)."""
+    name = _enc_name("enc-order-shape")
+    with pytest.raises(ClientError) as exc:
+        _sfn_unvalidated().create_state_machine(
+            name=name, definition="this is not json", roleArn=_ENC_ROLE, encryptionConfiguration={})
+    _assert_sfn_error(exc, "ValidationException", _one_error(_TYPE_NULL))
+    assert not _sfn_exists(sfn, _sm_arn(name))
+
+
+def test_sfn_create_checks_encryption_before_existing_machine(sfn, enc_key):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C32)."""
+    with _enc_machine(sfn, "enc-order-exists", encryptionConfiguration=_cmk(enc_key)) as arn:
+        name = arn.rsplit(":", 1)[-1]
+        for cfg, code, message in (
+                ({"type": "SOME_OTHER_KEY"}, "ValidationException", _one_error(_TYPE_ENUM)),
+                ({"type": _CMK}, "InvalidEncryptionConfiguration", _NO_KEY)):
+            with pytest.raises(ClientError) as exc:
+                sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                         encryptionConfiguration=cfg)
+            _assert_sfn_error(exc, code, message)
+        assert _encryption(sfn, arn) == _cmk(enc_key)
+
+
+def test_sfn_update_checks_encryption_shape_before_missing_machine(sfn):
+    """AWS: captured 2026-10-20 (2308-followup 4:update-missing-machine-empty-config)."""
+    with pytest.raises(ClientError) as exc:
+        _sfn_unvalidated().update_state_machine(stateMachineArn=_sm_arn(_enc_name("enc-never")),
+                                                definition=_ENC_DEFINITION, encryptionConfiguration={})
+    _assert_sfn_error(exc, "ValidationException", _one_error(_TYPE_NULL))
+
+
+def test_sfn_update_checks_missing_machine_before_encryption_type_fit(sfn):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C40)."""
+    arn = _sm_arn(_enc_name("enc-never"))
+    with pytest.raises(ClientError) as exc:
+        sfn.update_state_machine(stateMachineArn=arn, definition=_ENC_DEFINITION,
+                                 encryptionConfiguration={"type": _CMK})
+    _assert_sfn_error(exc, "StateMachineDoesNotExist")
+
+
+@pytest.mark.parametrize("definition", [{"definition": "this is not json"}, {}],
+                         ids=["invalid-definition", "no-definition"])
+def test_sfn_update_checks_encryption_type_fit_before_definition(sfn, enc_key, definition):
+    """AWS: captured 2026-10-20 (sfn-encryption-configuration C41; 2308-followup
+    4:update-no-definition-invalid-config)."""
+    with _enc_machine(sfn, "enc-order-upd", encryptionConfiguration=_cmk(enc_key)) as arn:
+        with pytest.raises(ClientError) as exc:
+            sfn.update_state_machine(stateMachineArn=arn, encryptionConfiguration={"type": _CMK},
+                                     **definition)
+        _assert_sfn_error(exc, "InvalidEncryptionConfiguration", _NO_KEY)
+        described = sfn.describe_state_machine(stateMachineArn=arn)
+        assert described["encryptionConfiguration"] == _cmk(enc_key)
+        assert described["definition"] == _ENC_DEFINITION
+
+
+def test_sfn_encryption_configuration_persists_and_defaults_for_older_records(enc_key):
+    """get_state/restore keeps the configuration; a record saved before the
+    field existed describes as AWS_OWNED_KEY, and so do its versions.
+    AWS: captured 2026-10-20 (sfn-encryption-configuration C1, C2 for the
+    described values)."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import stepfunctions as m
+
+    original_account, original_region = get_account_id(), get_region()
+    saved = m.get_state()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        m.reset()
+        status, _, body = m._create_state_machine({
+            "name": "enc-persist", "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+            "encryptionConfiguration": _cmk(enc_key)})
+        assert status == 200
+        cmk_arn = json.loads(body)["stateMachineArn"]
+        status, _, body = m._create_state_machine({
+            "name": "enc-legacy", "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+            "publish": True})
+        assert status == 200
+        legacy_arn = json.loads(body)["stateMachineArn"]
+
+        state = m.get_state()
+        scope = ("000000000000", "us-east-1")
+        del state["state_machines"].get_scoped(*scope, legacy_arn)["encryptionConfiguration"]
+        del state["state_machine_versions"].get_scoped(
+            *scope, f"{legacy_arn}:1")["encryptionConfiguration"]
+        m.reset()
+        m.load_persisted_state(state)
+
+        def described(arn):
+            return json.loads(m._describe_state_machine({"stateMachineArn": arn})[2])
+
+        assert described(cmk_arn)["encryptionConfiguration"] == _cmk(enc_key)
+        assert described(legacy_arn)["encryptionConfiguration"] == _ENC_DEFAULT
+        assert described(f"{legacy_arn}:1")["encryptionConfiguration"] == _ENC_DEFAULT
+    finally:
+        m.reset()
+        m.load_persisted_state(saved)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+# --- Captured 2026-10-20, captures/2308-pr-uncertainties.json -------------------------------
+
+
+@pytest.mark.parametrize("period,stored", [(60, 60), (900, 900), (300.5, 300), (300.0, 300),
+                                           (60.5, 60), (900.5, 900)],
+                         ids=["60", "900", "float", "integral-float", "60.5", "900.5"])
+def test_sfn_encryption_period_bounds_and_numbers(sfn, enc_key, period, stored):
+    """AWS: U4:period-60, U4:period-900, U3:period-float, U3:period-float-integral,
+    and 2308-pr-uncertainties-2 U26:period-60.5, U26:period-900.5."""
+    name = _enc_name("enc-period")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": name, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": {"type": _CMK, "kmsKeyId": enc_key,
+                                    "kmsDataKeyReusePeriodSeconds": period}})
+    assert status == 200, body
+    try:
+        assert sfn.describe_state_machine(stateMachineArn=_sm_arn(name))["encryptionConfiguration"] == \
+            _cmk(enc_key, stored)
+    finally:
+        sfn.delete_state_machine(stateMachineArn=_sm_arn(name))
+
+
+def test_sfn_encryption_null_type_joins_other_constraint_errors(sfn):
+    """AWS: U5:null-type-empty-key-period59."""
+    name = _enc_name("enc-multi-null")
+    with pytest.raises(ClientError) as exc:
+        _sfn_unvalidated().create_state_machine(
+            name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+            encryptionConfiguration={"kmsKeyId": "", "kmsDataKeyReusePeriodSeconds": 59})
+    _assert_sfn_error(exc, "ValidationException", "3 validation errors detected: "
+                      + "; ".join([_period_min(59), _KEY_EMPTY, _TYPE_NULL]))
+    assert not _sfn_exists(sfn, _sm_arn(name))
+
+
+def test_sfn_aws_owned_key_with_key_and_period_reports_the_key(sfn, enc_key):
+    """AWS: U6:owned-key-and-period."""
+    name = _enc_name("enc-owned-both")
+    with pytest.raises(ClientError) as exc:
+        sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                 encryptionConfiguration={"type": "AWS_OWNED_KEY", "kmsKeyId": enc_key,
+                                                          "kmsDataKeyReusePeriodSeconds": 300})
+    _assert_sfn_error(exc, "InvalidEncryptionConfiguration",
+                      "Invalid Encryption Configuration: Custom kmsKeyId is not allowed when selecting "
+                      "AWS_OWNED_KEY.")
+
+
+def test_sfn_encryption_explicit_nulls(sfn):
+    """AWS: U7:cmk-kmsKeyId-null, U7:owned-kmsKeyId-null."""
+    name = _enc_name("enc-null-key")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": name, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": {"type": _CMK, "kmsKeyId": None}})
+    assert status == 400
+    assert body["__type"].rsplit("#", 1)[-1] == "InvalidEncryptionConfiguration"
+    assert body["message"] == "Invalid Encryption Configuration: Must set a valid kmsKeyId."
+    owned = _enc_name("enc-null-owned")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": owned, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": {"type": "AWS_OWNED_KEY", "kmsKeyId": None,
+                                    "kmsDataKeyReusePeriodSeconds": None}})
+    assert status == 200, body
+    try:
+        assert sfn.describe_state_machine(stateMachineArn=_sm_arn(owned))["encryptionConfiguration"] == \
+            {"type": "AWS_OWNED_KEY"}
+    finally:
+        sfn.delete_state_machine(stateMachineArn=_sm_arn(owned))
+
+
+def test_sfn_encryption_unknown_member_is_ignored(sfn, enc_key):
+    """AWS: U9:unknown-member."""
+    name = _enc_name("enc-extra")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": name, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": {**_cmk(enc_key), "extra": "x"}})
+    assert status == 200, body
+    try:
+        assert sfn.describe_state_machine(stateMachineArn=_sm_arn(name))["encryptionConfiguration"] == \
+            _cmk(enc_key)
+    finally:
+        sfn.delete_state_machine(stateMachineArn=_sm_arn(name))
+
+
+def test_sfn_encryption_serialization_comes_first(sfn):
+    """AWS: U10:serialization-vs-invalid-definition, U10:serialization-vs-missing-machine."""
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": _enc_name("enc-ser-first"), "definition": "this is not json", "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": "AWS_OWNED_KEY"})
+    _assert_serialization_error(status, body, "Expected null")
+    status, body = _sfn_raw("UpdateStateMachine", {
+        "stateMachineArn": _sm_arn(_enc_name("enc-never")), "definition": _ENC_DEFINITION,
+        "encryptionConfiguration": "AWS_OWNED_KEY"})
+    _assert_serialization_error(status, body, "Expected null")
+
+
+def test_sfn_encryption_update_with_role_but_no_definition_is_refused(sfn, enc_key):
+    """AWS: U12:update-encryption-and-roleArn-no-definition, U13:missing-definition-raw-body."""
+    with _enc_machine(sfn, "enc-role-only", encryptionConfiguration=_cmk(enc_key)) as arn:
+        with pytest.raises(ClientError) as exc:
+            sfn.update_state_machine(stateMachineArn=arn, roleArn=_ENC_ROLE,
+                                     encryptionConfiguration=_cmk(enc_key, 600))
+        _assert_sfn_error(exc, "MissingRequiredParameter",
+                          "The definition must be specified when updating the EncryptionConfiguration")
+        status, body = _sfn_raw("UpdateStateMachine", {
+            "stateMachineArn": arn, "encryptionConfiguration": _cmk(enc_key, 600)})
+        assert status == 400
+        assert body["message"] == "The definition must be specified when updating the EncryptionConfiguration"
+        assert sfn.describe_state_machine(stateMachineArn=arn)["encryptionConfiguration"] == _cmk(enc_key)
+
+
+def test_sfn_describe_for_execution_keeps_the_configuration_the_execution_started_with(sfn, enc_key):
+    """AWS: U14:for-execution-base-after-update, U14:for-execution-version-after-update."""
+    name = _enc_name("enc-exec-snap")
+    created = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                       encryptionConfiguration=_cmk(enc_key), publish=True)
+    try:
+        on_base = sfn.start_execution(stateMachineArn=created["stateMachineArn"])["executionArn"]
+        on_version = sfn.start_execution(stateMachineArn=created["stateMachineVersionArn"])["executionArn"]
+        sfn.update_state_machine(stateMachineArn=created["stateMachineArn"], definition=_ENC_NEW_DEFINITION,
+                                 encryptionConfiguration={"type": "AWS_OWNED_KEY"})
+        for execution_arn in (on_base, on_version):
+            described = sfn.describe_state_machine_for_execution(executionArn=execution_arn)
+            assert described["encryptionConfiguration"] == _cmk(enc_key)
+    finally:
+        sfn.delete_state_machine(stateMachineArn=created["stateMachineArn"])
+
+
+def test_sfn_encryption_float_period_is_truncated_before_the_range_check(sfn, enc_key):
+    """AWS: captured 2026-10-20 (2308-pr-uncertainties-2 U26:period-59.9)."""
+    name = _enc_name("enc-period-trunc")
+    status, body = _sfn_raw("CreateStateMachine", {
+        "name": name, "definition": _ENC_DEFINITION, "roleArn": _ENC_ROLE,
+        "encryptionConfiguration": {"type": _CMK, "kmsKeyId": enc_key, "kmsDataKeyReusePeriodSeconds": 59.9}})
+    assert status == 400
+    assert body["__type"].rsplit("#", 1)[-1] == "ValidationException"
+    assert body["message"] == _one_error(_period_min(59))
+    assert not _sfn_exists(sfn, _sm_arn(name))
+
+
+def test_sfn_describe_for_execution_through_an_alias_reports_the_version(sfn, enc_key):
+    """AWS: captured 2026-10-20 (2308-pr-uncertainties-2 U25:for-execution-via-alias)."""
+    name = _enc_name("enc-exec-alias")
+    created = sfn.create_state_machine(name=name, definition=_ENC_DEFINITION, roleArn=_ENC_ROLE,
+                                       encryptionConfiguration=_cmk(enc_key), publish=True)
+    alias = sfn.create_state_machine_alias(name="live", routingConfiguration=[
+        {"stateMachineVersionArn": created["stateMachineVersionArn"], "weight": 100}])["stateMachineAliasArn"]
+    try:
+        sfn.update_state_machine(stateMachineArn=created["stateMachineArn"], definition=_ENC_NEW_DEFINITION,
+                                 encryptionConfiguration={"type": "AWS_OWNED_KEY"})
+        execution_arn = sfn.start_execution(stateMachineArn=alias)["executionArn"]
+        described = sfn.describe_state_machine_for_execution(executionArn=execution_arn)
+        assert described["encryptionConfiguration"] == _cmk(enc_key)
+    finally:
+        sfn.delete_state_machine_alias(stateMachineAliasArn=alias)
+        sfn.delete_state_machine(stateMachineArn=created["stateMachineArn"])
+
