@@ -422,6 +422,25 @@ def test_generated_cert_is_a_server_certificate_not_a_ca(tmp_path, monkeypatch):
     assert verify.returncode == 0, verify.stdout + verify.stderr
 
 
+def test_generated_cert_names_the_docker_gateway_host(tmp_path, monkeypatch):
+    """Docker Lambdas dial https://host.docker.internal:<port>; a cert cached without that name is replaced."""
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    names = "".join(f"DNS:{h}," for h in tls.cognito_idp_hosts() + tls.iot_endpoint_hosts())
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "basicConstraints=critical,CA:FALSE",
+        "-addext", f"subjectAltName={names}DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert cert == str(tls_dir / "server.crt")
+    assert _checkhost(cert, "host.docker.internal")
+
+
 def test_cached_ca_certificate_is_regenerated(tmp_path, monkeypatch):
     from ministack.core import tls
 
