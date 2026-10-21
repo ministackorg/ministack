@@ -438,7 +438,7 @@ def _public_parameter(name):
     image_id = _PUBLIC_AMI_PARAMETERS.get(name)
     if image_id is None:
         return None
-    return {"Name": name, "Type": "String", "Value": image_id, "Version": 1, "LastModifiedDate": 0,
+    return {"Name": name, "Type": "String", "Value": image_id, "Version": 1, "LastModifiedDate": 1728518400,
             "ARN": f"arn:aws:ssm:{get_region()}::parameter{name}"}
 
 

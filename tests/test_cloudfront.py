@@ -3076,6 +3076,7 @@ def test_cf_distribution_webacl_associate_disassociate(cloudfront):
 
     assoc = cloudfront.associate_distribution_web_acl(Id=dist_id, WebACLArn=acl_arn, IfMatch=created["ETag"])
     assert assoc["Id"] == dist_id
+    assert assoc["WebACLArn"] == acl_arn
     assert assoc["ETag"] != created["ETag"]
 
     cfg = cloudfront.get_distribution_config(Id=dist_id)
@@ -3095,4 +3096,4 @@ def test_cf_distribution_webacl_associate_disassociate(cloudfront):
 
     with pytest.raises(ClientError) as exc:
         cloudfront.associate_distribution_web_acl(Id="E0000000000000", WebACLArn=acl_arn, IfMatch="x")
-    assert exc.value.response["Error"]["Code"] == "NoSuchDistribution"
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"

@@ -4272,7 +4272,7 @@ def _distribution_webacl_precondition(dist, headers):
 def _associate_distribution_webacl(dist_id, headers, body):
     dist = _distributions.get(dist_id)
     if not dist:
-        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+        return _error("EntityNotFound", "The specified distribution does not exist.", 404)
     err = _distribution_webacl_precondition(dist, headers)
     if err:
         return err
@@ -4285,6 +4285,7 @@ def _associate_distribution_webacl(dist_id, headers, body):
 
     def build(root):
         SubElement(root, "Id").text = dist_id
+        SubElement(root, "WebACLArn").text = webacl_arn
 
     return _xml_response("AssociateDistributionWebACLResult", build, extra_headers={"ETag": dist["ETag"]})
 
@@ -4292,7 +4293,7 @@ def _associate_distribution_webacl(dist_id, headers, body):
 def _disassociate_distribution_webacl(dist_id, headers):
     dist = _distributions.get(dist_id)
     if not dist:
-        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+        return _error("EntityNotFound", "The specified distribution does not exist.", 404)
     err = _distribution_webacl_precondition(dist, headers)
     if err:
         return err

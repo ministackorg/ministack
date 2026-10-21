@@ -446,6 +446,10 @@ async def handle_request(method, path, headers, body, query_params):
 # WebACL
 # ---------------------------------------------------------------------------
 
+_DUPLICATE_ITEM_MESSAGE = ("AWS WAF couldn’t perform the operation because some resource in your "
+                          "request is a duplicate of an existing one.")
+
+
 def _create_web_acl(data):
     name = data.get("Name", "")
     if not name:
@@ -453,7 +457,7 @@ def _create_web_acl(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     for existing in _values_for_scope(_web_acls, scope):
         if existing["Name"] == name and existing.get("Scope") == scope:
-            return _waf_err("WAFDuplicateItemException", f"A WebACL with name '{name}' already exists.")
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid, arn, acl = create_web_acl_record(name, scope, data)
     logger.info("CreateWebACL: %s (%s)", name, uid)
     return json_response({"Summary": {
@@ -563,7 +567,7 @@ def _create_ip_set(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     for existing in _values_for_scope(_ip_sets, scope):
         if existing["Name"] == name and existing.get("Scope", scope) == scope:
-            return _waf_err("WAFDuplicateItemException", f"An IPSet with name '{name}' already exists.")
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _ipset_arn(name, uid, scope)
@@ -638,7 +642,7 @@ def _create_regex_pattern_set(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     for existing in _values_for_scope(_regex_pattern_sets, scope):
         if existing["Name"] == name and existing.get("Scope") == scope:
-            return _waf_err("WAFDuplicateItemException", f"A RegexPatternSet with name '{name}' already exists.")
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _regex_pattern_set_arn(name, uid, scope)
@@ -711,7 +715,7 @@ def _create_rule_group(data):
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
     for existing in _values_for_scope(_rule_groups, scope):
         if existing["Name"] == name and existing.get("Scope", scope) == scope:
-            return _waf_err("WAFDuplicateItemException", f"A RuleGroup with name '{name}' already exists.")
+            return _waf_err("WAFDuplicateItemException", _DUPLICATE_ITEM_MESSAGE)
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _rg_arn(name, uid, scope)
