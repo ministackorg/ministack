@@ -2269,6 +2269,17 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/distribution/E123ABC", {}, b"", {}, "us-east-1", "123") == "arn:aws:cloudfront::123:distribution/E123ABC"
 
+    def test_cloudfront_vpc_origin(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        for method, action in (("GET", "GetVpcOrigin"), ("PUT", "UpdateVpcOrigin"), ("DELETE", "DeleteVpcOrigin")):
+            assert extract_resource_arn("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {},
+                                        "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/vo_abc"
+            assert extract_iam_action("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {}) == f"cloudfront:{action}"
+        # R2 U17/p1-create-on-A: CreateVpcOrigin authorizes on vpcorigin/*.
+        assert extract_resource_arn("cloudfront", "POST", "/2020-05-31/vpc-origin", {}, b"", {},
+                                    "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/*"
+        assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/vpc-origin", {}, b"", {}, "us-east-1", "123") == "*"
+
     def test_route53_hostedzone(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("route53", "GET", "/2013-04-01/hostedzone/Z123", {}, b"", {}, "us-east-1", "123") == "arn:aws:route53:::hostedzone/Z123"

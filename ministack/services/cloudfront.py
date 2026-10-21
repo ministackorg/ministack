@@ -37,6 +37,7 @@ Supports:
                  UpdatePublicKey, DeletePublicKey, ListPublicKeys
   Key groups: CreateKeyGroup, GetKeyGroup, GetKeyGroupConfig,
                  UpdateKeyGroup, DeleteKeyGroup, ListKeyGroups
+  VPC origins: CreateVpcOrigin, GetVpcOrigin, UpdateVpcOrigin, DeleteVpcOrigin, ListVpcOrigins
   Tags: TagResource, UntagResource, ListTagsForResource
   SaaS Manager (multi-tenant distributions):
                  CreateConnectionGroup, GetConnectionGroup,
@@ -89,6 +90,10 @@ _TAG_RE = re.compile(r"^/2020-05-31/tagging/?$")
 _OAC_RE = re.compile(r"^/2020-05-31/origin-access-control/?$")
 _OAC_CFG_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/config$")
 _OAC_ID_RE = re.compile(r"^/2020-05-31/origin-access-control/([^/]+)/?$")
+
+# VPC origin path regexes
+_VPC_ORIGIN_RE = re.compile(r"^/2020-05-31/vpc-origin/?$")
+_VPC_ORIGIN_ID_RE = re.compile(r"^/2020-05-31/vpc-origin/([^/]+)/?$")
 
 _FUN_LIST_RE = re.compile(r"^/2020-05-31/function/?$")
 _FUN_DESCRIBE_RE = re.compile(r"^/2020-05-31/function/([^/]+)/describe/?$")
@@ -157,7 +162,6 @@ _FLE_PROFILE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption-profile/
 _CDP_LIST_RE = re.compile(r"^/2020-05-31/continuous-deployment-policy/?$")
 _OAI_LIST_RE = re.compile(r"^/2020-05-31/origin-access-identity/cloudfront/?$")
 _STREAMING_DIST_LIST_RE = re.compile(r"^/2020-05-31/streaming-distribution/?$")
-_VPC_ORIGIN_LIST_RE = re.compile(r"^/2020-05-31/vpc-origin/?$")
 _REALTIME_LOG_LIST_RE = re.compile(r"^/2020-05-31/realtime-log-config/?$")
 _ANYCAST_IP_LIST_RE = re.compile(r"^/2020-05-31/anycast-ip-list/?$")
 _MONITORING_SUB_RE = re.compile(r"^/2020-05-31/distributions/([^/]+)/monitoring-subscription/?$")
@@ -179,6 +183,7 @@ _key_groups = AccountScopedDict()  # Id -> key group record
 _connection_groups = AccountScopedDict()  # Id -> connection group record (SaaS Manager)
 _distribution_tenants = AccountScopedDict()  # Id -> distribution tenant record (SaaS Manager)
 _tenant_invalidations = AccountScopedDict()  # tenant_id -> [invalidation record, ...]
+_vpc_origins = AccountScopedDict()  # Id -> VPC origin record
 
 
 def reset():
@@ -196,6 +201,8 @@ def reset():
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
+    _vpc_origins.clear()
+    _vpc_origin_etags_issued.clear()
     # Drop the JS workers so their compiled-function cache does not outlive a
     # reset (mirrors appsync.reset()'s appsync_js.reset()).
     from ministack.core import cloudfront_js
@@ -219,6 +226,8 @@ def get_state():
             "connection_groups": _connection_groups,
             "distribution_tenants": _distribution_tenants,
             "tenant_invalidations": _tenant_invalidations,
+            "vpc_origins": _vpc_origins,
+            "vpc_origin_max_version": max(_vpc_origin_etags_issued.values(), default=0),
         }
     )
 
@@ -241,6 +250,11 @@ def _restore_state(data):
     _key_groups.update(data.get("key_groups", {}))
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
+    _vpc_origins.update(data.get("vpc_origins", {}))
+    # An ETag issued before the restart, also by an origin deleted since, stays a valid If-Match.
+    stored = max((vo.get("Version", 0) for vo in _vpc_origins._data.values()), default=0)
+    for version in range(1, max(stored, data.get("vpc_origin_max_version", 0)) + 1):
+        _vpc_origin_etag(version)
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
@@ -316,13 +330,15 @@ def _xml_response(root_tag: str, builder_fn, status: int = 200, extra_headers: d
     return status, headers, body
 
 
-def _error(code: str, message: str, status: int) -> tuple:
+def _error(code: str, message, status: int) -> tuple:
     # rest-xml error envelope: <?xml?> declaration and <Type> (AWS captures).
+    # A message of None leaves <Message> out, as AWS does for some MalformedInput errors.
     root = Element("ErrorResponse", xmlns=NS)
     err = SubElement(root, "Error")
     SubElement(err, "Type").text = "Sender" if status < 500 else "Receiver"
     SubElement(err, "Code").text = code
-    SubElement(err, "Message").text = message
+    if message is not None:
+        SubElement(err, "Message").text = message
     SubElement(root, "RequestId").text = new_uuid()
     body = b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(root, encoding="unicode").encode("utf-8")
     return status, {"Content-Type": "text/xml"}, body
@@ -467,6 +483,32 @@ def _ensure_distribution_config_sdk_compat(config_el):
     if _find(config_el, "OriginGroups") is None:
         og = SubElement(config_el, "OriginGroups")
         SubElement(og, "Quantity").text = "0"
+    # AWS fills in a VPC origin's timeouts when the request leaves them out.
+    for vpc_cfg in _config_vpc_origin_configs(config_el):
+        for tag, default in (("OriginReadTimeout", "30"), ("OriginKeepaliveTimeout", "5")):
+            if _find(vpc_cfg, tag) is None:
+                SubElement(vpc_cfg, tag).text = default
+        # Keep the API's member order when only one timeout was sent.
+        order = ("VpcOriginId", "OwnerAccountId", "OriginReadTimeout", "OriginKeepaliveTimeout")
+        vpc_cfg[:] = sorted(vpc_cfg, key=lambda c: order.index(_local_tag_name(c)) if _local_tag_name(c) in order else len(order))
+
+
+def _distribution_vpc_origin_error(config_el):
+    """An empty VpcOriginId, then one that names no origin."""
+    ids = [_text(vpc_cfg, "VpcOriginId") for vpc_cfg in _config_vpc_origin_configs(config_el)]
+    if any(not vo_id for vo_id in ids):
+        return _error("InvalidArgument", "The parameter vpcOriginId must not be empty for VPC Origin.", 400)
+    if any(vo_id not in _vpc_origins for vo_id in ids):
+        return _error("EntityNotFound", _VPC_ORIGIN_NOT_FOUND, 404)
+    return None
+
+
+def _config_vpc_origin_configs(config_el):
+    """The VpcOriginConfig elements of a DistributionConfig's origins."""
+    origins = _find(config_el, "Origins")
+    items = _find(origins, "Items") if origins is not None else None
+    found = (_find(origin, "VpcOriginConfig") for origin in (items if items is not None else ()))
+    return [vpc_cfg for vpc_cfg in found if vpc_cfg is not None]
 
 
 # CloudFormation's DistributionConfig is the API's, in JSON, with a few
@@ -687,6 +729,8 @@ def _resolve_taggable_cloudfront_arn(arn: str):
         "key-value-store": (_kvstores, "EntityNotFound", f"The key value store {name} was not found.", "ARN"),
         "distribution-tenant": (_distribution_tenants, "EntityNotFound", "The distribution tenant was not found.", "Arn"),
         "connection-group": (_connection_groups, "EntityNotFound", "The connection group was not found.", "Arn"),
+        "vpcorigin": (_vpc_origins, "NoSuchResource",
+                      "The specified resource doesn't exist. Update your request and try again.", "Arn"),
     }
     entry = resources.get(resource_type)
     if not entry:
@@ -2448,6 +2492,22 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "POST" and operation == "Untag":
             return _untag_resource(resource, body)
 
+    # VPC origin routes
+    m = _VPC_ORIGIN_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_vpc_origin(body)
+        if method == "GET":
+            return _list_vpc_origins(query_params)
+    m = _VPC_ORIGIN_ID_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_vpc_origin(m.group(1))
+        if method == "PUT":
+            return _update_vpc_origin(m.group(1), headers, body)
+        if method == "DELETE":
+            return _delete_vpc_origin(m.group(1), headers)
+
     # OAC routes
     m = _OAC_RE.match(path)
     if m:
@@ -2767,7 +2827,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # Read-only list surface for resource families with no backing store.
     # Family split matches botocore: KeyGroupList-style carry no Marker/
-    # IsTruncated; the OAI/StreamingDistribution/VpcOrigin family does.
+    # IsTruncated; the OAI/StreamingDistribution family does.
     m = _FLE_LIST_RE.match(path)
     if m and method == "GET":
         return _empty_marker_list(query_params, "FieldLevelEncryptionList", with_marker=False)
@@ -2787,10 +2847,6 @@ async def handle_request(method, path, headers, body, query_params):
     m = _STREAMING_DIST_LIST_RE.match(path)
     if m and method == "GET":
         return _empty_marker_list(query_params, "StreamingDistributionList", with_marker=True)
-
-    m = _VPC_ORIGIN_LIST_RE.match(path)
-    if m and method == "GET":
-        return _empty_marker_list(query_params, "VpcOriginList", with_marker=True)
 
     m = _REALTIME_LOG_LIST_RE.match(path)
     if m and method == "GET":
@@ -2839,6 +2895,9 @@ def _create_distribution(headers, body):
         return _error("InvalidArgument", "Origins is required.", 400)
     if _find(config_el, "DefaultCacheBehavior") is None:
         return _error("InvalidArgument", "DefaultCacheBehavior is required.", 400)
+    err = _distribution_vpc_origin_error(config_el)
+    if err:
+        return err
 
     dist_id = _dist_id()
     etag = new_uuid()
@@ -2978,6 +3037,9 @@ def _update_distribution(dist_id, headers, body):
     config_el = _parse_body(body)
     if config_el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
+    err = _distribution_vpc_origin_error(config_el)
+    if err:
+        return err
 
     new_etag = new_uuid()
     dist["config_xml"] = tostring(config_el, encoding="unicode")
@@ -3149,6 +3211,9 @@ def _list_tags(resource_arn):
     if err:
         return err
     tags = _tags.get(resource_arn, [])
+    if ":vpcorigin/" in resource_arn:
+        # AWS lists a VPC origin's tags sorted by key.
+        tags = sorted(tags, key=lambda t: t["Key"])
     root = Element("Tags", xmlns=NS)
     items = SubElement(root, "Items")
     for t in tags:
@@ -3194,6 +3259,447 @@ def _untag_resource(resource_arn, body):
             remove_keys.add(child.text or "")
     _tags[resource_arn] = [t for t in _tags.get(resource_arn, []) if t["Key"] not in remove_keys]
     return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# VPC origin handlers
+# ---------------------------------------------------------------------------
+# Control plane only. Codes, messages and the order of checks follow captures
+# from AWS (ministackorg/ministack#2312). AWS answers a create, update or delete
+# with Status Deploying and finishes it minutes later; MiniStack finishes it at
+# once, so a later read shows Deployed and a deleted origin is gone; AWS's
+# LastModifiedTime also moves on when a deployment ends, MiniStack's doesn't. The endpoint
+# ARN's format and account are checked, and the load balancer or instance must exist
+# in MiniStack's ELBv2 or EC2 state. Viewer requests are never routed to the VPC endpoint.
+
+_VPC_ORIGIN_POLICIES = ("https-only", "http-only", "match-viewer")
+_VPC_ORIGIN_SSL_PROTOCOLS = ("SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2")
+_VPC_ORIGIN_DEFAULT_SSL_PROTOCOLS = ["TLSv1", "TLSv1.1", "TLSv1.2"]
+_VPC_ORIGIN_IP_ADDRESS_TYPES = ("ipv4", "dualstack")
+_VPC_ORIGIN_ID_FORMAT_RE = re.compile(r"^[a-z]+_[A-Za-z0-9]{22}$")
+_VPC_ORIGIN_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_VPC_ORIGIN_NAME_MAX = 64
+_VPC_ORIGIN_INTEGER_RE = re.compile(r"^[-+]?[0-9]+$")
+_VPC_ORIGIN_ENDPOINT_RESOURCE_RE = {
+    "elasticloadbalancing": re.compile(r"^loadbalancer/(app|net)/[^/]+/[^/]+$"),
+    "ec2": re.compile(r"^instance/i-[0-9A-Za-z]+$"),
+}
+_vpc_origin_etags_issued = {}  # ETag -> version, for every version an origin has reached
+_VPC_ORIGIN_LOCATION = "https://cloudfront.amazonaws.com/2020-05-31/vpc-origin/"
+_VPC_ORIGIN_MAX_ITEMS = 100
+_VPC_ORIGIN_NOT_FOUND = "The specified vpc origin does not exist"
+_VPC_ORIGIN_BAD_IF_MATCH = "The If-Match version is missing or not valid for the resource."
+_VPC_ORIGIN_STALE_IF_MATCH = "The request failed because it didn't meet the preconditions in one or more request-header fields."
+_VPC_ORIGIN_NAME_TAKEN = "Another vpc origin with the same name already exists within the aws account."
+_VPC_ORIGIN_IN_USE = ("The specified VPC origin is currently associated with one or more distributions. Please "
+                      "disassociate the VPC origin from all distributions before updating or deleting")
+
+
+def _vpc_origin_etag(version):
+    """AWS's ETag follows the origin's version, so origins at the same version share
+    it. The version counts every change: a create, update or delete, and the end of
+    the deployment that follows it. The value is a uuid5 of the version, like
+    ``_managed_etag`` (real AWS ETags are opaque)."""
+    etag = str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-vpc-origin/version/{version}"))
+    _vpc_origin_etags_issued.setdefault(etag, version)
+    return etag
+
+
+def _vpc_origin_validation_error(problems):
+    count = len(problems)
+    noun = "error" if count == 1 else "errors"
+    return _error("MalformedXML", f"{count} validation {noun} detected: " + "; ".join(problems), 400)
+
+
+def _vpc_origin_null(path):
+    return f"Value null at '{path}' failed to satisfy constraint: Member must not be null"
+
+
+def _vpc_origin_int(el, tag):
+    """(value, error) for an integer member; (None, None) when it is absent."""
+    child = _find(el, tag) if el is not None else None
+    if child is None:
+        return None, None
+    raw = child.text or ""
+    if not raw:
+        return None, _error("MalformedInput", "missing value for decimal type", 400)
+    if not _VPC_ORIGIN_INTEGER_RE.match(raw) or not -2**31 <= int(raw) < 2**31:
+        return None, _error("MalformedInput", None, 400)
+    return int(raw), None
+
+
+def _vpc_origin_body(body, root_tag):
+    """(element, error) for a request body. An empty body has no element."""
+    if not body:
+        return None, None
+    el = _parse_body(body)
+    if el is None:
+        return None, _error("MalformedInput", "Could not parse XML", 400)
+    if _local_tag_name(el) != root_tag:
+        return None, _error("MalformedInput", f"{_local_tag_name(el)} is not valid, expected {root_tag}", 400)
+    return el, None
+
+
+def _parse_vpc_origin_endpoint_config(cfg_el, path="vpcOriginEndpointConfig"):
+    """(fields, problems, error) for a VpcOriginEndpointConfig element.
+
+    An integer that doesn't parse is an error at once (MalformedInput). The null and
+    enum problems come back as a list, in AWS's member order, so Update can add its
+    own ``ifMatch`` problem to the same MalformedXML message."""
+    if cfg_el is None:
+        return None, [_vpc_origin_null(path)], None
+    http_port, err = _vpc_origin_int(cfg_el, "HTTPPort")
+    if err:
+        return None, [], err
+    https_port, err = _vpc_origin_int(cfg_el, "HTTPSPort")
+    if err:
+        return None, [], err
+    ssl_el = _find(cfg_el, "OriginSslProtocols")
+    quantity, err = _vpc_origin_int(ssl_el, "Quantity")
+    if err:
+        return None, [], err
+    name_el, arn_el, policy_el = (_find(cfg_el, t) for t in ("Name", "Arn", "OriginProtocolPolicy"))
+    # AWS lists the problems in this member order.
+    problems = []
+    if http_port is None:
+        problems.append(_vpc_origin_null(f"{path}.hTTPPort"))
+    protocols = None
+    if ssl_el is not None:
+        items_el = _find(ssl_el, "Items")
+        if quantity is None:
+            problems.append(_vpc_origin_null(f"{path}.originSslProtocols.quantity"))
+        if items_el is None:
+            problems.append(_vpc_origin_null(f"{path}.originSslProtocols.items"))
+        else:
+            protocols = [i.text or "" for i in items_el if _local_tag_name(i) == "SslProtocol"]
+            if any(p not in _VPC_ORIGIN_SSL_PROTOCOLS for p in protocols):
+                problems.append(
+                    f"Value '[{', '.join(protocols)}]' at '{path}.originSslProtocols.items' failed to satisfy "
+                    "constraint: Member must satisfy constraint: [Member must satisfy enum value set: "
+                    f"[{', '.join(_VPC_ORIGIN_SSL_PROTOCOLS)}]]")
+    if name_el is None:
+        problems.append(_vpc_origin_null(f"{path}.name"))
+    policy = (policy_el.text or "") if policy_el is not None else None
+    if policy is None:
+        problems.append(_vpc_origin_null(f"{path}.originProtocolPolicy"))
+    elif policy not in _VPC_ORIGIN_POLICIES:
+        problems.append(f"Value '{policy}' at '{path}.originProtocolPolicy' failed to satisfy constraint: "
+                        f"Member must satisfy enum value set: [{', '.join(_VPC_ORIGIN_POLICIES)}]")
+    if https_port is None:
+        problems.append(_vpc_origin_null(f"{path}.hTTPSPort"))
+    if arn_el is None:
+        problems.append(_vpc_origin_null(f"{path}.arn"))
+    ip_el = _find(cfg_el, "IpAddressType")
+    ip_type = (ip_el.text or "") if ip_el is not None else "ipv4"
+    if ip_type not in _VPC_ORIGIN_IP_ADDRESS_TYPES:
+        problems.append(f"Value '{ip_type}' at '{path}.ipAddressType' failed to satisfy constraint: "
+                        f"Member must satisfy enum value set: [{', '.join(_VPC_ORIGIN_IP_ADDRESS_TYPES)}]")
+    fields = {
+        "Name": (name_el.text or "") if name_el is not None else "",
+        "Arn": (arn_el.text or "") if arn_el is not None else "",
+        "HTTPPort": http_port,
+        "HTTPSPort": https_port,
+        "OriginProtocolPolicy": policy,
+        "Quantity": quantity,
+        "OriginSslProtocols": protocols,
+        "IpAddressType": ip_type,
+    }
+    return fields, problems, None
+
+
+def _vpc_origin_region_known(region):
+    """AWS refuses a region it doesn't have (xx-fake-1) as an invalid format."""
+    from ministack.services import ec2
+
+    return any(name == region for name, _ in ec2._AWS_REGIONS)
+
+
+def _vpc_origin_endpoint_error(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    pattern = _VPC_ORIGIN_ENDPOINT_RESOURCE_RE.get(spec.service) if spec else None
+    if (not pattern or spec.partition != "aws" or not _vpc_origin_region_known(spec.region)
+            or not spec.account_id or not pattern.match(spec.resource)):
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn Invalid Format.", 400)
+    if spec.account_id != get_account_id():
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn contains a mismatched AWS account.",
+                      400)
+    return _vpc_origin_endpoint_missing(spec, arn)
+
+
+def _vpc_origin_endpoint_missing(spec, arn):
+    """The load balancer or instance must exist in the ARN's account and region."""
+    if spec.service == "elasticloadbalancing":
+        from ministack.services import alb
+
+        if alb._lbs.contains_scoped(spec.account_id, spec.region, arn):
+            return None
+        return _error("InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.", 400)
+    from ministack.services import ec2
+
+    instance_id = spec.resource.split("/", 1)[1]
+    if ec2._instances.contains_scoped(spec.account_id, spec.region, instance_id):
+        return None
+    # AWS answers NotFound for a short (8-character) id and Malformed for a long one.
+    reason = "InvalidInstanceID.NotFound" if len(instance_id) == len("i-12345678") else "InvalidInstanceID.Malformed"
+    return _error("InvalidArgument", f"The parameter VpcOriginEndpointConfig Arn {reason}.", 400)
+
+
+def _check_vpc_origin_endpoint_config(fields):
+    """(config, error) for the checks AWS makes after the schema and the If-Match:
+    the ports, the name, the protocol list, then the endpoint ARN."""
+    if not all(p in (80, 443) or 1024 <= p <= 65535 for p in (fields["HTTPPort"], fields["HTTPSPort"])):
+        return None, _error("InvalidArgument", "The parameter origin port is not within allowed range.", 400)
+    name = fields["Name"]
+    if not name:
+        return None, _error("InvalidArgument", "The parameter VPC Origin Name is too small or empty.", 400)
+    if len(name) > _VPC_ORIGIN_NAME_MAX:
+        return None, _error("InvalidArgument", "The parameter VPC Origin Name is too big.", 400)
+    if not _VPC_ORIGIN_NAME_RE.match(name):
+        return None, _error("InvalidArgument",
+                            "The parameter Name contains characters other than alphanumericals, dashes, and underscores.",
+                            400)
+    protocols, quantity = fields["OriginSslProtocols"], fields["Quantity"]
+    if protocols is None:
+        protocols = list(_VPC_ORIGIN_DEFAULT_SSL_PROTOCOLS)
+    elif quantity != len(protocols):
+        return None, _error("InconsistentQuantities",
+                            f"The specified quantity of OriginSslProtocols ({quantity}) does not match the actual "
+                            f"quantity supplied ({len(protocols)}).", 400)
+    elif not protocols:
+        return None, _error("InvalidArgument",
+                            "The parameter OriginSslProtocols is not valid! Should be one or more from SSLv3, TLSv1, "
+                            "TLSv1.1, and TLSv1.2.", 400)
+    err = _vpc_origin_endpoint_error(fields["Arn"])
+    if err:
+        return None, err
+    # Stored once each, in the order of the enum.
+    protocols = [p for p in _VPC_ORIGIN_SSL_PROTOCOLS if p in protocols]
+    return {
+        "Name": name,
+        "Arn": fields["Arn"],
+        "HTTPPort": fields["HTTPPort"],
+        "HTTPSPort": fields["HTTPSPort"],
+        "OriginProtocolPolicy": fields["OriginProtocolPolicy"],
+        "OriginSslProtocols": protocols,
+        "IpAddressType": fields["IpAddressType"],
+    }, None
+
+
+def _vpc_origin_name_taken(name, exclude_id=None):
+    return any(vo["Id"] != exclude_id and vo["VpcOriginEndpointConfig"]["Name"] == name
+               for vo in _vpc_origins.values())
+
+
+def _build_vpc_origin_xml(root, vo):
+    SubElement(root, "Id").text = vo["Id"]
+    SubElement(root, "Arn").text = vo["Arn"]
+    SubElement(root, "AccountId").text = vo["AccountId"]
+    SubElement(root, "Status").text = vo["Status"]
+    SubElement(root, "CreatedTime").text = vo["CreatedTime"]
+    SubElement(root, "LastModifiedTime").text = vo["LastModifiedTime"]
+    cfg = vo["VpcOriginEndpointConfig"]
+    cfg_el = SubElement(root, "VpcOriginEndpointConfig")
+    SubElement(cfg_el, "Name").text = cfg["Name"]
+    SubElement(cfg_el, "Arn").text = cfg["Arn"]
+    SubElement(cfg_el, "HTTPPort").text = str(cfg["HTTPPort"])
+    SubElement(cfg_el, "HTTPSPort").text = str(cfg["HTTPSPort"])
+    SubElement(cfg_el, "OriginProtocolPolicy").text = cfg["OriginProtocolPolicy"]
+    ssl_el = SubElement(cfg_el, "OriginSslProtocols")
+    SubElement(ssl_el, "Quantity").text = str(len(cfg["OriginSslProtocols"]))
+    items_el = SubElement(ssl_el, "Items")
+    for proto in cfg["OriginSslProtocols"]:
+        SubElement(items_el, "SslProtocol").text = proto
+    SubElement(cfg_el, "IpAddressType").text = cfg.get("IpAddressType", "ipv4")
+
+
+def _vpc_origin_response(vo, status=200, deploying=False):
+    """The origin as stored, or, for a create, update or delete, as AWS answers it:
+    Deploying, at the version before its deployment finishes."""
+    version = vo["Version"] - 1 if deploying else vo["Version"]
+    view = dict(vo, Status="Deploying") if deploying else vo
+    return _xml_response("VpcOrigin", lambda root: _build_vpc_origin_xml(root, view), status=status,
+                         extra_headers={"ETag": _vpc_origin_etag(version)})
+
+
+def _create_vpc_origin(body):
+    el, err = _vpc_origin_body(body, "CreateVpcOriginRequest")
+    if err:
+        return err
+    fields, problems, err = _parse_vpc_origin_endpoint_config(
+        _find(el, "VpcOriginEndpointConfig") if el is not None else None)
+    if err:
+        return err
+    if problems:
+        return _vpc_origin_validation_error(problems)
+    cfg, err = _check_vpc_origin_endpoint_config(fields)
+    if err:
+        return err
+    if _vpc_origin_name_taken(cfg["Name"]):
+        return _error("EntityAlreadyExists", _VPC_ORIGIN_NAME_TAKEN, 409)
+    vo_id = "vo_" + "".join(random.choices(_KSUID_CHARS, k=22))
+    now = _now_iso()
+    vo = {
+        "Id": vo_id,
+        "Arn": f"arn:aws:cloudfront::{get_account_id()}:vpcorigin/{vo_id}",
+        "AccountId": get_account_id(),
+        "Status": "Deployed",
+        "CreatedTime": now,
+        "LastModifiedTime": now,
+        "VpcOriginEndpointConfig": cfg,
+        "Version": 2,
+    }
+    _vpc_origins[vo_id] = vo
+    _ingest_distribution_tags_from_xml(vo["Arn"], _find(el, "Tags"))
+    status, headers, payload = _vpc_origin_response(vo, status=202, deploying=True)
+    headers["Location"] = _VPC_ORIGIN_LOCATION + vo_id
+    return status, headers, payload
+
+
+def _vpc_origin_lookup(vo_id):
+    vo = _vpc_origins.get(vo_id)
+    if not vo:
+        return None, _error("EntityNotFound", _VPC_ORIGIN_NOT_FOUND, 404)
+    return vo, None
+
+
+def _vpc_origin_bad_if_match(if_match):
+    """An If-Match that is no version's ETag; checked before the origin is looked up.
+    AWS refuses a well-formed ETag it never issued, and accepts an issued one on any id."""
+    if if_match not in _vpc_origin_etags_issued:
+        return _error("InvalidIfMatchVersion", _VPC_ORIGIN_BAD_IF_MATCH, 400)
+    return None
+
+
+def _vpc_origin_current(vo_id, if_match):
+    """(record, error): the origin, then an If-Match that isn't its current ETag."""
+    vo, err = _vpc_origin_lookup(vo_id)
+    if err:
+        return None, err
+    if if_match != _vpc_origin_etag(vo["Version"]):
+        return None, _error("PreconditionFailed", _VPC_ORIGIN_STALE_IF_MATCH, 412)
+    return vo, None
+
+
+def _get_vpc_origin(vo_id):
+    if not _VPC_ORIGIN_ID_FORMAT_RE.match(vo_id):
+        return _error("InvalidArgument", "Id format is invalid", 400)
+    vo, err = _vpc_origin_lookup(vo_id)
+    if err:
+        return err
+    return _vpc_origin_response(vo)
+
+
+def _update_vpc_origin(vo_id, headers, body):
+    # Errors reading the body come before the id format.
+    el, err = _vpc_origin_body(body, "VpcOriginEndpointConfig")
+    if err:
+        return err
+    fields, problems, err = _parse_vpc_origin_endpoint_config(el)
+    if err:
+        return err
+    if not _VPC_ORIGIN_ID_FORMAT_RE.match(vo_id):
+        return _error("InvalidArgument", "Id format is invalid", 400)
+    if_match = headers.get("if-match")
+    if if_match is None:
+        problems.append(_vpc_origin_null("ifMatch"))
+    if problems:
+        return _vpc_origin_validation_error(problems)
+    err = _vpc_origin_bad_if_match(if_match)
+    if err:
+        return err
+    cfg, err = _check_vpc_origin_endpoint_config(fields)
+    if err:
+        return err
+    vo, err = _vpc_origin_current(vo_id, if_match)
+    if err:
+        return err
+    if _vpc_origin_in_use(vo_id):
+        if cfg != vo["VpcOriginEndpointConfig"]:
+            return _error("CannotUpdateEntityWhileInUse", _VPC_ORIGIN_IN_USE, 409)
+        # An unchanged config is accepted without a new version.
+        return _vpc_origin_response(vo, status=202)
+    if _vpc_origin_name_taken(cfg["Name"], exclude_id=vo_id):
+        return _error("EntityAlreadyExists", _VPC_ORIGIN_NAME_TAKEN, 409)
+    vo["VpcOriginEndpointConfig"] = cfg
+    vo["LastModifiedTime"] = _now_iso()
+    vo["Version"] += 2
+    return _vpc_origin_response(vo, status=202, deploying=True)
+
+
+def _vpc_origin_ids_in(dist):
+    """VpcOriginId values named by a stored distribution's origins."""
+    try:
+        root = fromstring(dist.get("config_xml") or "")
+    except Exception:
+        return set()
+    return {_text(vpc_cfg, "VpcOriginId") for vpc_cfg in _config_vpc_origin_configs(root)}
+
+
+def _vpc_origin_in_use(vo_id):
+    return any(vo_id in _vpc_origin_ids_in(d) for d in _distributions.values())
+
+
+def _delete_vpc_origin(vo_id, headers):
+    if not _VPC_ORIGIN_ID_FORMAT_RE.match(vo_id):
+        return _error("InvalidArgument", "Id format is invalid", 400)
+    if_match = headers.get("if-match")
+    if if_match is None:
+        return _vpc_origin_validation_error([_vpc_origin_null("ifMatch")])
+    err = _vpc_origin_bad_if_match(if_match)
+    if err:
+        return err
+    vo, err = _vpc_origin_current(vo_id, if_match)
+    if err:
+        return err
+    if _vpc_origin_in_use(vo_id):
+        return _error("CannotDeleteEntityWhileInUse", _VPC_ORIGIN_IN_USE, 409)
+    del _vpc_origins[vo_id]
+    _tags.pop(vo["Arn"], None)
+    gone = dict(vo, LastModifiedTime=_now_iso(), Version=vo["Version"] + 2)
+    return _vpc_origin_response(gone, status=202, deploying=True)
+
+
+def _list_vpc_origins(query_params):
+    max_items_raw = _qval(query_params, "MaxItems", "")
+    marker = _qval(query_params, "Marker", "")
+    if max_items_raw:
+        if not _VPC_ORIGIN_INTEGER_RE.match(max_items_raw) or not 0 <= int(max_items_raw) < 2**31:
+            return _error("InvalidArgument", "MaxItems must be a non-zero positive integer.", 400)
+        max_items = min(int(max_items_raw), _VPC_ORIGIN_MAX_ITEMS)
+    else:
+        max_items = _VPC_ORIGIN_MAX_ITEMS
+    items = sorted(_vpc_origins.values(), key=lambda vo: vo["Id"])
+    if marker:
+        ids = [vo["Id"] for vo in items]
+        if marker not in ids:
+            return _error("EntityNotFound", "The request contains an invalid marker.", 404)
+        items = items[ids.index(marker) + 1:]
+    page = items[:max_items]
+    # NextMarker is the last id on a page that leaves items behind; Marker is exclusive.
+    more = bool(page) and len(items) > len(page)
+
+    def build(root):
+        if more:
+            SubElement(root, "NextMarker").text = page[-1]["Id"]
+        SubElement(root, "MaxItems").text = str(max_items)
+        SubElement(root, "Quantity").text = str(len(page))
+        items_el = SubElement(root, "Items")
+        for vo in page:
+            summary = SubElement(items_el, "VpcOriginSummary")
+            SubElement(summary, "Id").text = vo["Id"]
+            SubElement(summary, "Name").text = vo["VpcOriginEndpointConfig"]["Name"]
+            SubElement(summary, "Status").text = vo["Status"]
+            SubElement(summary, "CreatedTime").text = vo["CreatedTime"]
+            SubElement(summary, "LastModifiedTime").text = vo["LastModifiedTime"]
+            SubElement(summary, "Arn").text = vo["Arn"]
+            SubElement(summary, "AccountId").text = vo["AccountId"]
+            SubElement(summary, "OriginEndpointArn").text = vo["VpcOriginEndpointConfig"]["Arn"]
+            SubElement(summary, "IpAddressType").text = vo["VpcOriginEndpointConfig"].get("IpAddressType", "ipv4")
+
+    return _xml_response("VpcOriginList", build)
 
 
 # ---------------------------------------------------------------------------

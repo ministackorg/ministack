@@ -5034,6 +5034,32 @@ def test_iot_broker_wildcard_region_does_not_widen_its_own_filters():
     reset()
 
 
+def test_iot_broker_trailing_hash_does_not_match_the_level_above():
+    """``a/c2/#`` gets ``a/c2/`` and ``a/c2/x`` but, as on AWS, not ``a/c2``; ``a/#`` and ``#`` get all three."""
+    reset()
+
+    async def _run():
+        account_id = "123456789012"
+        received = {}
+        for topic_filter in ("a/c2", "a/c2/#", "+/c2/#", "a/#", "#"):
+            async def callback(topic, payload, qos, key=topic_filter):
+                received.setdefault(key, []).append(topic)
+
+            await broker_subscribe(account_id, _TEST_REGION, topic_filter, callback)
+        for topic in ("a/c2", "a/c2/", "a/c2/x"):
+            await broker_publish(account_id, _TEST_REGION, topic, b"x")
+        assert received == {
+            "a/c2": ["a/c2"],
+            "a/c2/#": ["a/c2/", "a/c2/x"],
+            "+/c2/#": ["a/c2/", "a/c2/x"],
+            "a/#": ["a/c2", "a/c2/", "a/c2/x"],
+            "#": ["a/c2", "a/c2/", "a/c2/x"],
+        }
+
+    asyncio.run(_run())
+    reset()
+
+
 def test_iot_broker_leading_wildcard_does_not_match_aws_events():
     """``#`` and ``+/...`` get ``$aws/things`` but not ``$aws/events``, live and queued."""
     reset()
@@ -5121,6 +5147,37 @@ def test_iot_topic_rule_leading_wildcard_does_not_match_aws_events(monkeypatch):
         ("r2", "$aws/events/presence/connected/dev"),
         ("r3", "$aws/things/dev/shadow/update/accepted"),
     ]
+
+
+def test_iot_topic_rule_trailing_hash_does_not_fire_on_the_level_above(monkeypatch):
+    """A rule ``FROM 'a/c2/#'`` fires on ``a/c2/`` and ``a/c2/x`` but, as on AWS, not on ``a/c2``."""
+    from ministack.services import iot as iot_module
+
+    reset()
+    iot_module._topic_rules.clear()
+    account_id = "123456789012"
+    iot_module._topic_rules.set_scoped(account_id, _TEST_REGION, "hash", {
+        "ruleName": "hash", "sql": "SELECT * FROM 'a/c2/#'", "ruleDisabled": False, "actions": [],
+    })
+    fired = []
+
+    async def _capture_rule_action(
+        dispatched_account_id, dispatched_region, rule, payload, topic="", client_id=None
+    ):
+        fired.append(topic)
+
+    monkeypatch.setattr(iot_module, "_run_rule_actions", _capture_rule_action)
+
+    async def _run():
+        for topic in ("a/c2", "a/c2/", "a/c2/x"):
+            await broker_publish(account_id, _TEST_REGION, topic, b"{}")
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module._topic_rules.clear()
+        reset()
+    assert fired == ["a/c2/", "a/c2/x"]
 
 
 def test_iot_broker_persistent_sessions_are_region_isolated():
