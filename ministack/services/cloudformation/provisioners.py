@@ -10633,8 +10633,7 @@ def _cw_metric_alarm_record(name, props):
         "Unit": props.get("Unit"),
         "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
-    # As with PutMetricAlarm, AWS describes DatapointsToAlarm only while the
-    # template sets it, on create and on update.
+    # AWS describes DatapointsToAlarm only while the template sets it.
     if dta is not None:
         alarm["DatapointsToAlarm"] = int(dta)
     return alarm
