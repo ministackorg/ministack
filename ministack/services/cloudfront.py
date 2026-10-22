@@ -62,6 +62,7 @@ import logging
 import random
 import re
 import string
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote
@@ -828,16 +829,143 @@ def _cf_decode_function_code(code_b64: str):
     try:
         return base64.b64decode(code_b64.encode("ascii"), validate=True), None
     except Exception:
-        return None, _error("InvalidArgument", "FunctionCode is not valid base64.", 400)
+        return None, _error("MalformedInput", "Invalid Base64 encoding", 400)
+
+
+_FUNCTION_RUNTIMES = ("cloudfront-js-1.0", "cloudfront-js-2.0")
+_TAG_PATTERN = "([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)"
+_TAG_SPECIAL_CHARS = "_.:/=+-@"
+_MAX_LISTED_VALIDATION_ERRORS = 10
+_FUNCTION_TAG_LIMIT = 50
+
+
+def _last_child(el, tag):
+    """The last direct child with this local name (AWS keeps the last of a
+    repeated member)."""
+    found = None
+    for child in el:
+        if _local_tag_name(child) == tag:
+            found = child
+    return found
+
+
+def _function_request_tags(el):
+    """CreateFunctionRequest's Tags/Items in order as (Key, Value), None for a
+    missing element, and AWS's parse error for a malformed tag or None. AWS
+    reads every child of the last Items as a tag, whatever its name, keeps the
+    last of a repeated Key or Value, and ignores tags placed directly under
+    Tags."""
+    tags_el = _find(el, "Tags")
+    items_el = _last_child(tags_el, "Items") if tags_el is not None else None
+    tags = []
+    for tag_el in items_el if items_el is not None else []:
+        # Text in a tag without child elements is malformed, even whitespace;
+        # next to children it is ignored.
+        if not len(tag_el) and tag_el.text is not None:
+            return [], "Unexpected complex element termination"
+        if any(len(child) for child in tag_el if _local_tag_name(child) in ("Key", "Value")):
+            return [], "Start of list found where not expected"
+        key_el, value_el = _last_child(tag_el, "Key"), _last_child(tag_el, "Value")
+        tags.append((None if key_el is None else key_el.text or "",
+                     None if value_el is None else value_el.text or ""))
+    return tags, None
+
+
+def _function_tag_constraint_errors(tags):
+    """AWS's member constraints on CreateFunction tags: per tag Value, then
+    Key; per member length, then pattern. Value may be absent."""
+    errors = []
+    for i, (key, value) in enumerate(tags, 1):
+        for field, text, limit in (("value", value, 256), ("key", key, 128)):
+            at = f"at 'tags.items.{i}.member.{field}' failed to satisfy constraint:"
+            if text is None:
+                if field == "key":
+                    errors.append(f"Value null {at} Member must not be null")
+                continue
+            if field == "key" and not text:
+                errors.append(f"Value '' {at} Member must have length greater than or equal to 1")
+            elif len(text) > limit:
+                errors.append(f"Value '{text}' {at} Member must have length less than or equal to {limit}")
+            if not all(unicodedata.category(ch)[0] in "LNZ" or ch in _TAG_SPECIAL_CHARS for ch in text):
+                errors.append(f"Value '{text}' {at} Member must satisfy regular expression pattern: {_TAG_PATTERN}")
+    return errors
+
+
+def _function_code_and_runtime_errors(el):
+    """The functionCode, functionConfig and runtime constraint messages, in
+    that order, which AWS lists before the tag messages."""
+    errors = []
+    code_el = _find(el, "FunctionCode")
+    if code_el is None:
+        errors.append("Value at 'functionCode' failed to satisfy constraint: Member must not be null")
+    elif not code_el.text:
+        errors.append("Value at 'functionCode' failed to satisfy constraint: "
+                      "Member must have length greater than or equal to 1")
+    cfg_el = _find(el, "FunctionConfig")
+    runtime_el = _find(cfg_el, "Runtime") if cfg_el is not None else None
+    if cfg_el is None:
+        errors.append("Value null at 'functionConfig' failed to satisfy constraint: Member must not be null")
+    elif runtime_el is None:
+        errors.append("Value null at 'functionConfig.runtime' failed to satisfy constraint: Member must not be null")
+    elif (runtime_el.text or "") not in _FUNCTION_RUNTIMES:
+        errors.append(f"Value '{runtime_el.text or ''}' at 'functionConfig.runtime' failed to satisfy constraint: "
+                      f"Member must satisfy enum value set: [{', '.join(_FUNCTION_RUNTIMES)}]")
+    return errors
+
+
+def _function_name_errors(el):
+    """AWS's constraint messages for a missing or empty Name."""
+    name_el = _find(el, "Name")
+    if name_el is None:
+        return ["Value null at 'name' failed to satisfy constraint: Member must not be null"]
+    if not name_el.text:
+        return ["Value '' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 1",
+                "Value '' at 'name' failed to satisfy constraint: "
+                "Member must satisfy regular expression pattern: [a-zA-Z0-9-_]{1,64}"]
+    return []
+
+
+def _function_tagging_error(tags):
+    """AWS's InvalidTagging checks, after the constraints: a repeated key, then
+    an aws: key, then more than 50 tags."""
+    seen = set()
+    for key, _ in tags:
+        if key in seen:
+            return f"Duplicate tag key: '{key}'."
+        seen.add(key)
+    # A lowercase aws: key anywhere is reported before one in another case.
+    if any(key.startswith("aws:") for key, _ in tags):
+        return "Tag key cannot start with 'aws:'."
+    for key, _ in tags:
+        if key.lower().startswith("aws:"):
+            return f'Invalid System Tag: {key} must be prefixed with "aws:" in lowercase.'
+    if len(tags) > _FUNCTION_TAG_LIMIT:
+        return "Too many tags."
+    return None
 
 
 def _cf_create_function(headers, body):
     el = _parse_body(body)
     if el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
+    # Parse errors first (a malformed tag before invalid base64, wherever
+    # each sits in the document), then the member constraints.
+    tags, tags_parse_error = _function_request_tags(el)
+    if tags_parse_error:
+        return _error("MalformedInput", tags_parse_error, 400)
+    code_el = _find(el, "FunctionCode")
+    if code_el is not None and code_el.text:
+        _, err = _cf_decode_function_code(code_el.text)
+        if err is not None:
+            return err
     name = _text(el, "Name")
-    if not name:
-        return _error("InvalidArgument", "Name is required.", 400)
+    # AWS checks the members before it looks the name up: the code, the
+    # config and runtime, the name and the tags, in one MalformedXML.
+    errors = _function_code_and_runtime_errors(el) + _function_name_errors(el) + _function_tag_constraint_errors(tags)
+    if errors:
+        errors = errors[:_MAX_LISTED_VALIDATION_ERRORS]
+        count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected"
+        return _error("MalformedXML", f"{count}: {'; '.join(errors)}", 400)
     if name in _functions:
         return _error("FunctionAlreadyExists", "A function with the same name already exists in this account.", 409)
 
@@ -848,6 +976,9 @@ def _cf_create_function(headers, body):
     code, err = _cf_decode_function_code(_text(el, "FunctionCode"))
     if err is not None:
         return err
+    tagging_error = _function_tagging_error(tags)
+    if tagging_error:
+        return _error("InvalidTagging", tagging_error, 400)
 
     now = _now_iso()
     dev_etag = new_uuid()
@@ -868,6 +999,9 @@ def _cf_create_function(headers, body):
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
+    # The validated Tags/Items, as AWS reads them; ListTagsForResource lists
+    # them on the ARN, and a missing Value is an empty one.
+    _tags[fn["arn"]] = [{"Key": key, "Value": value or ""} for key, value in tags]
     _functions[name] = fn
     logger.info("CreateFunction name=%s", name)
 
@@ -1041,6 +1175,7 @@ def _cf_delete_function(name: str, headers):
         )
 
     del _functions[name]
+    _tags.pop(fn["arn"], None)
     logger.info("DeleteFunction name=%s", name)
     return 204, {}, b""
 

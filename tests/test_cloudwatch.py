@@ -1,3 +1,4 @@
+import html
 import json
 import re
 import time
@@ -1509,3 +1510,873 @@ def test_cloudwatch_parse_ts_accepts_cbor_datetime():
     assert _parse_ts(ts) == ts.timestamp()
     assert _parse_ts(ts.replace(tzinfo=None)) == ts.timestamp()
 
+
+_ALARM_BASE = dict(MetricName="CPUUtilization", Namespace="AWS/EC2", Statistic="Average", Period=60,
+                   EvaluationPeriods=3, Threshold=80, ComparisonOperator="GreaterThanThreshold")
+
+
+def _cw_tag_set(cw, arn):
+    """ListTagsForResource as a {Key: Value} dict: AWS lists alarm tags in no
+    order we could pin down, so tests compare sets."""
+    return {t["Key"]: t["Value"] for t in cw.list_tags_for_resource(ResourceARN=arn)["Tags"]}
+
+
+def _cw_raw(protocol, action, params):
+    """A CloudWatch call over Query or JSON 1.0 (boto3 speaks CBOR). Returns
+    (status, body text)."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from conftest import ENDPOINT
+    auth = ("AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/monitoring/aws4_request, "
+            "SignedHeaders=host, Signature=x")
+    if protocol == "query":
+        body = urllib.parse.urlencode({"Action": action, "Version": "2010-08-01", **params}).encode()
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "Authorization": auth}
+    else:
+        body = json.dumps(params).encode()
+        headers = {"Content-Type": "application/x-amz-json-1.0", "x-amzn-query-mode": "true",
+                   "X-Amz-Target": f"GraniteServiceVersion20100801.{action}", "Authorization": auth}
+    req = urllib.request.Request(ENDPOINT, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def test_cloudwatch_put_metric_alarm_applies_tags_on_create_only(cw):
+    """PutMetricAlarm's Tags are stored when it creates the alarm and ignored
+    on an existing one; TagResource still adds to them.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C8, C9, C10)."""
+    name = f"tagged-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "team", "Value": "platform"}], **_ALARM_BASE)
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert _cw_tag_set(cw, arn) == {"team": "platform"}
+
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "other", "Value": "x"}], **_ALARM_BASE)
+        assert _cw_tag_set(cw, arn) == {"team": "platform"}
+
+        cw.tag_resource(ResourceARN=arn, Tags=[{"Key": "other", "Value": "x"}])
+        assert _cw_tag_set(cw, arn) == {"team": "platform", "other": "x"}
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_tags_ignored_on_alarm_created_without_tags(cw):
+    """AWS: captured 2026-10-21 (2309-uncertainties U9:cbor-created-untagged-then-update-with-tags)."""
+    name = f"untagged-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, **_ALARM_BASE)
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "team", "Value": "platform"}], **_ALARM_BASE)
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == []
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_create_tags_empty_and_repeated_keys(cw):
+    """An empty Tags list stores nothing. A key sent twice keeps the last
+    value, and keys that differ only in case are two tags.
+    AWS: captured 2026-10-21 (2309-uncertainties U7:cbor-empty-tags-on-create,
+    U6:cbor-duplicate-keys, U6:cbor-keys-differing-in-case)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    names = [f"empty-tags-{uid}", f"dup-tags-{uid}", f"case-tags-{uid}"]
+    try:
+        cw.put_metric_alarm(AlarmName=names[0], Tags=[], **_ALARM_BASE)
+        cw.put_metric_alarm(AlarmName=names[1], Tags=[{"Key": "dup", "Value": "a"}, {"Key": "dup", "Value": "b"}],
+                            **_ALARM_BASE)
+        cw.put_metric_alarm(AlarmName=names[2], Tags=[{"Key": "dup", "Value": "a"}, {"Key": "DUP", "Value": "b"}],
+                            **_ALARM_BASE)
+        by_name = {a["AlarmName"]: a["AlarmArn"] for a in cw.describe_alarms(AlarmNames=names)["MetricAlarms"]}
+        assert cw.list_tags_for_resource(ResourceARN=by_name[names[0]])["Tags"] == []
+        assert _cw_tag_set(cw, by_name[names[1]]) == {"dup": "b"}
+        assert _cw_tag_set(cw, by_name[names[2]]) == {"dup": "a", "DUP": "b"}
+    finally:
+        cw.delete_alarms(AlarmNames=names)
+
+
+def test_cloudwatch_alarm_created_again_after_delete_has_only_its_own_tags(cw):
+    """AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C12)."""
+    name = f"recreated-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "team", "Value": "platform"}], **_ALARM_BASE)
+        cw.delete_alarms(AlarmNames=[name])
+        cw.put_metric_alarm(AlarmName=name, Tags=[{"Key": "contact", "Value": ""}], **_ALARM_BASE)
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == [{"Key": "contact", "Value": ""}]
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_returns_datapoints_to_alarm_only_when_set(cw):
+    """An update that leaves DatapointsToAlarm out clears it; a value equal to
+    EvaluationPeriods is still returned.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C13, C14, C15)
+    and 2026-10-21 (2309-uncertainties U8:cbor-dta-equal-to-evaluation-periods)."""
+    name = f"m-of-n-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(AlarmName=name, **_ALARM_BASE)
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+
+        cw.put_metric_alarm(AlarmName=name, DatapointsToAlarm=2, **_ALARM_BASE)
+        assert cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["DatapointsToAlarm"] == 2
+
+        cw.put_metric_alarm(AlarmName=name, **_ALARM_BASE)
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+
+        cw.put_metric_alarm(AlarmName=name, DatapointsToAlarm=3, **_ALARM_BASE)
+        assert cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["DatapointsToAlarm"] == 3
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+_QUERY_ALARM = {"MetricName": "Errors", "Namespace": "AWS/Lambda", "Statistic": "Sum", "Period": "60",
+                "EvaluationPeriods": "3", "Threshold": "1", "ComparisonOperator": "GreaterThanThreshold"}
+
+
+def test_cloudwatch_query_put_metric_alarm_tags_and_datapoints_to_alarm(cw):
+    """Query: Tags.member.N are stored on create, an empty value included;
+    DescribeAlarms has no <DatapointsToAlarm> until an update sets it, and that
+    update's Tags are ignored.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C16, C17, C18)."""
+    name = f"query-alarm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        status, body = _cw_raw("query", "PutMetricAlarm", {
+            "AlarmName": name, **_QUERY_ALARM, "Tags.member.1.Key": "team", "Tags.member.1.Value": "platform",
+            "Tags.member.2.Key": "contact", "Tags.member.2.Value": ""})
+        assert status == 200
+        assert re.search(r"<PutMetricAlarmResponse[^>]*>\s*<ResponseMetadata>", body)
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        status, body = _cw_raw("query", "ListTagsForResource", {"ResourceARN": arn})
+        assert status == 200
+        members = re.findall(r"<member>(.*?)</member>", body, re.S)
+        tags = {re.search(r"<Key>(.*?)</Key>", m).group(1): re.search(r"<Value>(.*?)</Value>|<Value/>", m).group(1) or ""
+                for m in members}
+        assert tags == {"team": "platform", "contact": ""}
+        status, body = _cw_raw("query", "DescribeAlarms", {"AlarmNames.member.1": name})
+        assert status == 200 and "<EvaluationPeriods>3</EvaluationPeriods>" in body
+        assert "<DatapointsToAlarm>" not in body
+
+        status, _ = _cw_raw("query", "PutMetricAlarm", {
+            "AlarmName": name, **_QUERY_ALARM, "DatapointsToAlarm": "2",
+            "Tags.member.1.Key": "other", "Tags.member.1.Value": "x"})
+        assert status == 200
+        _, body = _cw_raw("query", "DescribeAlarms", {"AlarmNames.member.1": name})
+        assert "<DatapointsToAlarm>2</DatapointsToAlarm>" in body
+        assert _cw_tag_set(cw, arn) == {"team": "platform", "contact": ""}
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_query_put_metric_alarm_tags_ignored_on_alarm_created_without_tags(cw):
+    """AWS: captured 2026-10-21 (2309-uncertainties U9:query-created-untagged-then-update-with-tags)."""
+    name = f"query-untagged-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        assert _cw_raw("query", "PutMetricAlarm", {"AlarmName": name, **_QUERY_ALARM})[0] == 200
+        assert _cw_raw("query", "PutMetricAlarm", {"AlarmName": name, **_QUERY_ALARM, "Tags.member.1.Key": "team",
+                                                   "Tags.member.1.Value": "platform"})[0] == 200
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == []
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_json_put_metric_alarm_tags_and_datapoints_to_alarm(cw):
+    """JSON 1.0: Tags are stored on create and ignored by an update, whether
+    the alarm had tags or not; DescribeAlarms leaves DatapointsToAlarm out when
+    it is absent or null.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C19) and
+    2026-10-21 (2309-uncertainties U4:json-update-different-tags,
+    U9:json-created-untagged-then-update-with-tags, U8:json-dta-null)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    tagged, untagged = f"json-tagged-{uid}", f"json-untagged-{uid}"
+    base = {**_ALARM_BASE}
+    try:
+        status, _ = _cw_raw("json", "PutMetricAlarm", {"AlarmName": tagged, **base,
+                                                       "Tags": [{"Key": "team", "Value": "platform"}]})
+        assert status == 200
+        status, body = _cw_raw("json", "DescribeAlarms", {"AlarmNames": [tagged]})
+        alarm = json.loads(body)["MetricAlarms"][0]
+        assert alarm["EvaluationPeriods"] == 3 and "DatapointsToAlarm" not in alarm
+        status, body = _cw_raw("json", "ListTagsForResource", {"ResourceARN": alarm["AlarmArn"]})
+        assert status == 200 and json.loads(body) == {"Tags": [{"Key": "team", "Value": "platform"}]}
+
+        assert _cw_raw("json", "PutMetricAlarm", {"AlarmName": tagged, **base,
+                                                  "Tags": [{"Key": "other", "Value": "x"}]})[0] == 200
+        assert _cw_tag_set(cw, alarm["AlarmArn"]) == {"team": "platform"}
+
+        assert _cw_raw("json", "PutMetricAlarm", {"AlarmName": untagged, **base, "DatapointsToAlarm": None})[0] == 200
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[untagged])["MetricAlarms"][0]
+        assert _cw_raw("json", "PutMetricAlarm", {"AlarmName": untagged, **base,
+                                                  "Tags": [{"Key": "team", "Value": "platform"}]})[0] == 200
+        arn = cw.describe_alarms(AlarmNames=[untagged])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == []
+    finally:
+        cw.delete_alarms(AlarmNames=[tagged, untagged])
+
+
+def test_cloudwatch_put_metric_alarm_repeated_key_keeps_last_value_over_json_and_query(cw):
+    """AWS: captured 2026-10-21 (2309-uncertainties U15:json-duplicate-keys,
+    U15:query-duplicate-keys)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    json_name, query_name = f"json-dup-{uid}", f"query-dup-{uid}"
+    try:
+        assert _cw_raw("json", "PutMetricAlarm", {"AlarmName": json_name, **_ALARM_BASE, "Tags": [
+            {"Key": "dup", "Value": "a"}, {"Key": "dup", "Value": "b"}]})[0] == 200
+        assert _cw_raw("query", "PutMetricAlarm", {
+            "AlarmName": query_name, **_QUERY_ALARM, "Tags.member.1.Key": "dup", "Tags.member.1.Value": "a",
+            "Tags.member.2.Key": "dup", "Tags.member.2.Value": "b"})[0] == 200
+        by_name = {a["AlarmName"]: a["AlarmArn"]
+                   for a in cw.describe_alarms(AlarmNames=[json_name, query_name])["MetricAlarms"]}
+        assert _cw_tag_set(cw, by_name[json_name]) == {"dup": "b"}
+        assert _cw_tag_set(cw, by_name[query_name]) == {"dup": "b"}
+    finally:
+        cw.delete_alarms(AlarmNames=[json_name, query_name])
+
+
+def test_cloudwatch_json_put_metric_alarm_null_tags(cw):
+    """"Tags": null creates the alarm without tags, and on an update leaves the
+    alarm's tags as they were.
+    AWS: captured 2026-10-21 (2309-uncertainties U14:json-tags-null-on-create,
+    U14:json-tags-null-on-update)."""
+    name = f"json-null-tags-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        assert _cw_raw("json", "PutMetricAlarm", {"AlarmName": name, **_ALARM_BASE, "Tags": None})[0] == 200
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert cw.list_tags_for_resource(ResourceARN=arn)["Tags"] == []
+
+        cw.tag_resource(ResourceARN=arn, Tags=[{"Key": "team", "Value": "platform"}])
+        assert _cw_raw("json", "PutMetricAlarm", {"AlarmName": name, **_ALARM_BASE, "Tags": None})[0] == 200
+        assert _cw_tag_set(cw, arn) == {"team": "platform"}
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+# Two leading tags put the tag under test at index 3, as in the captures.
+_FILLER_TAGS = [{"Key": "f1", "Value": "v"}, {"Key": "f2", "Value": "v"}]
+_NULL_KEY = "Value null at 'tags.{}.member.key' failed to satisfy constraint: Member must not be null"
+_NULL_VALUE = "Value null at 'tags.{}.member.value' failed to satisfy constraint: Member must not be null"
+_DTA_MIN = ("Value '{}' at 'datapointsToAlarm' failed to satisfy constraint: "
+            "Member must have value greater than or equal to 1")
+_AWS_PREFIX = 'The provided tag keys must not start with any case of "aws:"'
+_TAG_LIMIT = "The resultant tag set must not have more than 50 user tags."
+
+
+def _cw_unvalidated():
+    """boto3 over CBOR without client-side checks, so it sends what AWS refuses."""
+    return __import__("conftest").make_client("cloudwatch", additional_config_kwargs={"parameter_validation": False})
+
+
+def _cw_json_put(name, tags, **extra):
+    """JSON 1.0 PutMetricAlarm; returns (status, message). The message is read
+    as botocore reads it: "message" or "Message", "" when there is none (AWS
+    sends no message for some errors), None on success."""
+    status, body = _cw_raw("json", "PutMetricAlarm", {"AlarmName": name, **_ALARM_BASE, "Tags": tags, **extra})
+    if status < 300:
+        return status, None
+    payload = json.loads(body)
+    return status, payload.get("message", payload.get("Message")) or ""
+
+
+def _cw_alarm_exists(cw, name):
+    return bool(cw.describe_alarms(AlarmNames=[name])["MetricAlarms"])
+
+
+def test_cloudwatch_put_metric_alarm_refuses_tag_constraint_violations(cw):
+    """Each tag is checked Value first, then Key; datapointsToAlarm comes after
+    the tags; all violations are joined in one message, and nothing is created.
+    AWS: captured 2026-10-21 (2309-uncertainties V:json-two-missing-key,
+    V:json-missing-key-and-value-same-tag, V:json-missing-value-then-missing-key,
+    V:json-missing-key-first, V:json-empty-key, V:json-key-129, V:json-value-257,
+    V:json-four-missing-values, V:json-missing-value-and-dta-0, X:json-dta-negative,
+    X:json-value-explicit-null, U5:json-tag-without-value, U19:json-tag-without-key,
+    U18:json-dta-0)."""
+    cases = [
+        (_FILLER_TAGS + [{"Value": "x"}, {"Value": "y"}], {},
+         f"2 validation errors detected: {_NULL_KEY.format(3)}; {_NULL_KEY.format(4)}"),
+        (_FILLER_TAGS + [{}], {}, f"2 validation errors detected: {_NULL_VALUE.format(3)}; {_NULL_KEY.format(3)}"),
+        (_FILLER_TAGS + [{"Key": "a"}, {"Value": "y"}], {},
+         f"2 validation errors detected: {_NULL_VALUE.format(3)}; {_NULL_KEY.format(4)}"),
+        ([{"Value": "x"}] + _FILLER_TAGS, {}, f"1 validation error detected: {_NULL_KEY.format(1)}"),
+        (_FILLER_TAGS + [{"Key": "a", "Value": None}], {}, f"1 validation error detected: {_NULL_VALUE.format(3)}"),
+        (_FILLER_TAGS + [{"Key": "", "Value": "x"}], {},
+         "1 validation error detected: Value '' at 'tags.3.member.key' failed to satisfy constraint: "
+         "Member must have length greater than or equal to 1"),
+        (_FILLER_TAGS + [{"Key": "k" * 129, "Value": "x"}], {},
+         f"1 validation error detected: Value '{'k' * 129}' at 'tags.3.member.key' failed to satisfy constraint: "
+         "Member must have length less than or equal to 128"),
+        (_FILLER_TAGS + [{"Key": "a", "Value": "v" * 257}], {},
+         f"1 validation error detected: Value '{'v' * 257}' at 'tags.3.member.value' failed to satisfy constraint: "
+         "Member must have length less than or equal to 256"),
+        (_FILLER_TAGS + [{"Key": k} for k in "abcd"], {},
+         "4 validation errors detected: " + "; ".join(_NULL_VALUE.format(i) for i in range(3, 7))),
+        (_FILLER_TAGS + [{"Key": "a"}], {"DatapointsToAlarm": 0},
+         f"2 validation errors detected: {_NULL_VALUE.format(3)}; {_DTA_MIN.format(0)}"),
+        (_FILLER_TAGS, {"DatapointsToAlarm": -1}, f"1 validation error detected: {_DTA_MIN.format(-1)}"),
+        (_FILLER_TAGS, {"DatapointsToAlarm": 0}, f"1 validation error detected: {_DTA_MIN.format(0)}"),
+    ]
+    for i, (tags, extra, message) in enumerate(cases):
+        name = f"tag-constraint-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cw_json_put(name, tags, **extra) == (400, message), i
+        assert not _cw_alarm_exists(cw, name), i
+
+
+def test_cloudwatch_put_metric_alarm_tag_constraint_bounds_are_accepted(cw):
+    """A 128-character key, a 256-character value, an empty value and an
+    unknown member inside a tag are accepted.
+    AWS: captured 2026-10-21 (2309-uncertainties V:json-key-128, V:json-value-256,
+    X:json-unknown-tag-member) and 2026-10-20 (cloudfront-function-and-alarm-tags C12)."""
+    name = f"tag-bounds-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        tags = [{"Key": "k" * 128, "Value": "x"}, {"Key": "a", "Value": "v" * 256}, {"Key": "e", "Value": ""},
+                {"Key": "b", "Value": "c", "Extra": "d"}]
+        assert _cw_json_put(name, tags)[0] == 200
+        arn = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["AlarmArn"]
+        assert _cw_tag_set(cw, arn) == {"k" * 128: "x", "a": "v" * 256, "e": "", "b": "c"}
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_tag_errors_over_cbor(cw):
+    """boto3's codes and messages over CBOR, as AWS answered them.
+    AWS: captured 2026-10-21 through boto3 (2309-uncertainties Z:boto3-cbor-missing-key,
+    Z:boto3-cbor-aws-prefix, Z:boto3-cbor-dta-0, Z:boto3-cbor-missing-value) and
+    2026-10-20 (I11:cbor-51-tags); messages also V:cbor-two-missing-key,
+    V:cbor-missing-key-and-value-same-tag."""
+    raw = _cw_unvalidated()
+    cases = [
+        (_FILLER_TAGS + [{"Value": "x"}, {"Value": "y"}], "ValidationError", 400,
+         f"2 validation errors detected: {_NULL_KEY.format(3)}; {_NULL_KEY.format(4)}"),
+        (_FILLER_TAGS + [{}], "ValidationError", 400,
+         f"2 validation errors detected: {_NULL_VALUE.format(3)}; {_NULL_KEY.format(3)}"),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}], "AccessDenied", 403, _AWS_PREFIX),
+        (_FILLER_TAGS + [{"Key": f"k{i:02d}", "Value": "v"} for i in range(49)], "ValidationError", 400, _TAG_LIMIT),
+        (_FILLER_TAGS + [{"Key": "a"}], "ValidationError", 400, f"1 validation error detected: {_NULL_VALUE.format(3)}"),
+        (_FILLER_TAGS + [{"Value": "x"}], "ValidationError", 400, f"1 validation error detected: {_NULL_KEY.format(3)}"),
+    ]
+    for i, (tags, code, status, message) in enumerate(cases):
+        name = f"cbor-tag-error-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        with pytest.raises(ClientError) as exc:
+            raw.put_metric_alarm(AlarmName=name, Tags=tags, **_ALARM_BASE)
+        err = exc.value.response
+        assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Message"]) == (
+            code, status, message), i
+        assert not _cw_alarm_exists(cw, name), i
+    name = f"cbor-dta-0-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        raw.put_metric_alarm(AlarmName=name, Tags=_FILLER_TAGS, DatapointsToAlarm=0, **_ALARM_BASE)
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "ValidationError", f"1 validation error detected: {_DTA_MIN.format(0)}")
+
+
+def test_cloudwatch_put_metric_alarm_aws_prefix_refused_on_create_only(cw):
+    """An aws: key (any case) is refused with 403 on create, before the tag
+    constraints and datapointsToAlarm; an update ignores it. A value or a key
+    like "awsx" is fine.
+    AWS: captured 2026-10-21 (2309-uncertainties W:json-aws-prefix,
+    W:json-AWS-upper-prefix, W:json-aws-prefix-and-missing-value,
+    W:json-aws-prefix-and-51-tags, X:json-aws-prefix-and-dta-0,
+    W:json-aws-prefix-in-value-only, W:json-key-awsx-no-colon, W:json-update-aws-prefix,
+    X:json-update-missing-value-and-aws-prefix)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    for i, (tags, extra) in enumerate([
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}], {}),
+        (_FILLER_TAGS + [{"Key": "AWS:x", "Value": "x"}], {}),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}, {"Key": "a"}], {}),
+        (_FILLER_TAGS + [{"Key": f"k{n:02d}", "Value": "v"} for n in range(48)] + [{"Key": "aws:x", "Value": "x"}], {}),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}], {"DatapointsToAlarm": 0}),
+    ]):
+        name = f"aws-prefix-{i}-{uid}"
+        assert _cw_json_put(name, tags, **extra) == (403, _AWS_PREFIX), i
+        assert not _cw_alarm_exists(cw, name), i
+
+    ok, existing = f"aws-in-value-{uid}", f"aws-update-{uid}"
+    try:
+        assert _cw_json_put(ok, [{"Key": "a", "Value": "aws:x"}, {"Key": "awsx", "Value": "x"}])[0] == 200
+        assert _cw_json_put(existing, [{"Key": "team", "Value": "platform"}])[0] == 200
+        assert _cw_json_put(existing, [{"Key": "aws:x", "Value": "x"}], Threshold=82)[0] == 200
+        alarm = cw.describe_alarms(AlarmNames=[existing])["MetricAlarms"][0]
+        assert alarm["Threshold"] == 82
+        assert _cw_tag_set(cw, alarm["AlarmArn"]) == {"team": "platform"}
+        assert _cw_json_put(existing, [{"Key": "aws:x", "Value": "x"}, {"Key": "a"}], Threshold=84) == (
+            400, f"1 validation error detected: {_NULL_VALUE.format(2)}")
+        assert cw.describe_alarms(AlarmNames=[existing])["MetricAlarms"][0]["Threshold"] == 82
+    finally:
+        cw.delete_alarms(AlarmNames=[ok, existing])
+
+
+def test_cloudwatch_put_metric_alarm_tag_limit_on_create_only(cw):
+    """More than 50 unique keys are refused on create, after the tag
+    constraints; repeated keys count once; an update with 51 tags succeeds and
+    keeps the alarm's tags; a refused update changes nothing.
+    AWS: captured 2026-10-21 (2309-uncertainties W:json-51-tags,
+    V:json-51-tags-and-missing-value, V:json-51-tags-and-key-129,
+    V:json-51-tags-repeated-key-50-unique, V:json-update-51-tags,
+    V:json-update-missing-key, X:json-update-dta-0) and 2026-10-20 (I11:cbor-50-tags)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    fifty_one = _FILLER_TAGS + [{"Key": f"k{n:02d}", "Value": "v"} for n in range(49)]
+    assert _cw_json_put(f"limit-51-{uid}", fifty_one) == (400, _TAG_LIMIT)
+    assert not _cw_alarm_exists(cw, f"limit-51-{uid}")
+    assert _cw_json_put(f"limit-mv-{uid}", fifty_one[:50] + [{"Key": "z"}]) == (
+        400, f"1 validation error detected: {_NULL_VALUE.format(51)}")
+    names = [f"limit-dup-{uid}", f"limit-upd-{uid}"]
+    try:
+        assert _cw_json_put(names[0], fifty_one[:50] + [{"Key": "k00", "Value": "again"}])[0] == 200
+        arn = cw.describe_alarms(AlarmNames=[names[0]])["MetricAlarms"][0]["AlarmArn"]
+        assert len(_cw_tag_set(cw, arn)) == 50
+
+        assert _cw_json_put(names[1], [{"Key": "team", "Value": "platform"}])[0] == 200
+        assert _cw_json_put(names[1], fifty_one, Threshold=81)[0] == 200
+        alarm = cw.describe_alarms(AlarmNames=[names[1]])["MetricAlarms"][0]
+        assert alarm["Threshold"] == 81 and _cw_tag_set(cw, alarm["AlarmArn"]) == {"team": "platform"}
+        assert _cw_json_put(names[1], _FILLER_TAGS + [{"Value": "x"}], Threshold=85) == (
+            400, f"1 validation error detected: {_NULL_KEY.format(3)}")
+        assert _cw_json_put(names[1], [], DatapointsToAlarm=0, Threshold=86) == (
+            400, f"1 validation error detected: {_DTA_MIN.format(0)}")
+        assert cw.describe_alarms(AlarmNames=[names[1]])["MetricAlarms"][0]["Threshold"] == 81
+    finally:
+        cw.delete_alarms(AlarmNames=names)
+
+
+def test_cloudwatch_put_metric_alarm_refuses_wrong_json_types_in_tags(cw):
+    """The first wrong JSON type in Tags, in document order, before any other
+    check; an update is refused the same way and changes nothing.
+    AWS: captured 2026-10-21 (2309-uncertainties V:json-tags-not-a-list,
+    V:json-tag-not-an-object, V:json-key-number, W:json-value-number, X:json-key-true,
+    Y:json-key-false, X:json-key-list, X:json-key-object, X:json-value-float,
+    Y:json-value-true, Y:json-value-list, Y:json-value-object, X:json-tags-object,
+    Y:json-tags-number, Y:json-tags-true, Y:json-element-number, Y:json-element-list,
+    Y:json-element-true, X:json-tag-null-element, X:json-key-number-and-aws-prefix,
+    Y:json-key-number-then-value-true, Y:json-value-true-then-key-number,
+    W:json-update-key-number)."""
+    t = _FILLER_TAGS
+    cases = [
+        ("x", 400, "Unexpected field type"),
+        (5, 400, "Unexpected field type"),
+        (True, 400, "Unexpected field type"),
+        ({"Key": "a", "Value": "b"}, 400, "Start of structure or map found where not expected"),
+        (t + ["x"], 400, "Unexpected value type in payload"),
+        (t + [5], 400, "Unexpected value type in payload"),
+        (t + [True], 400, "Unexpected value type in payload"),
+        (t + [["a"]], 400, ""),
+        (t + [None], 500, ""),
+        (t + [{"Key": 5, "Value": "x"}], 400, "NUMBER_VALUE cannot be converted to String"),
+        (t + [{"Key": "a", "Value": 5}], 400, "NUMBER_VALUE cannot be converted to String"),
+        (t + [{"Key": "a", "Value": 1.5}], 400, "DECIMAL_VALUE cannot be converted to String"),
+        (t + [{"Key": True, "Value": "x"}], 400, "TRUE_VALUE cannot be converted to String"),
+        (t + [{"Key": False, "Value": "x"}], 400, "FALSE_VALUE cannot be converted to String"),
+        (t + [{"Key": "a", "Value": True}], 400, "TRUE_VALUE cannot be converted to String"),
+        (t + [{"Key": ["a"], "Value": "x"}], 400, ""),
+        (t + [{"Key": "a", "Value": ["x"]}], 400, ""),
+        (t + [{"Key": {"a": 1}, "Value": "x"}], 400, "Start of structure or map found where not expected"),
+        (t + [{"Key": "a", "Value": {"x": 1}}], 400, "Start of structure or map found where not expected"),
+        (t + [{"Key": "aws:x", "Value": "x"}, {"Key": 5, "Value": "x"}], 400, "NUMBER_VALUE cannot be converted to String"),
+        (t + [{"Key": 5, "Value": True}], 400, "NUMBER_VALUE cannot be converted to String"),
+        (t + [{"Value": True, "Key": 5}], 400, "TRUE_VALUE cannot be converted to String"),
+    ]
+    for i, (tags, status, message) in enumerate(cases):
+        name = f"tag-type-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cw_json_put(name, tags) == (status, message), i
+        assert not _cw_alarm_exists(cw, name), i
+
+    name = f"tag-type-update-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        assert _cw_json_put(name, [{"Key": "team", "Value": "platform"}])[0] == 200
+        assert _cw_json_put(name, t + [{"Key": 5, "Value": "x"}], Threshold=82) == (
+            400, "NUMBER_VALUE cannot be converted to String")
+        assert cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]["Threshold"] == 80
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_query_put_metric_alarm_tag_and_datapoints_errors(cw):
+    """Query: a member without Key or Value is null; DatapointsToAlarm 0 breaks
+    the minimum.
+    AWS: captured 2026-10-21 (2309-uncertainties V:query-member-3-key-only-empty-value-param,
+    U5:query-tag-without-value, U19:query-tag-without-key, U18:query-dta-0, W:query-51-tags,
+    W:query-aws-prefix)."""
+    def put(name, **params):
+        status, body = _cw_raw("query", "PutMetricAlarm", {"AlarmName": name, **_QUERY_ALARM, **params})
+        code = re.search(r"<Code>(.*?)</Code>", body)
+        message = re.search(r"<Message>(.*?)</Message>", body, re.S)
+        return status, code and code.group(1), message and html.unescape(message.group(1))
+
+    filler = {"Tags.member.1.Key": "f1", "Tags.member.1.Value": "v", "Tags.member.2.Key": "f2", "Tags.member.2.Value": "v"}
+    fifty_one = {}
+    for n in range(51):
+        fifty_one.update({f"Tags.member.{n + 1}.Key": f"k{n:02d}", f"Tags.member.{n + 1}.Value": "v"})
+    cases = [
+        ({**filler, "Tags.member.3.Key": "team"}, 400, "ValidationError",
+         f"1 validation error detected: {_NULL_VALUE.format(3)}"),
+        ({**filler, "Tags.member.3.Value": "x"}, 400, "ValidationError",
+         f"1 validation error detected: {_NULL_KEY.format(3)}"),
+        ({**filler, "DatapointsToAlarm": "0"}, 400, "ValidationError", f"1 validation error detected: {_DTA_MIN.format(0)}"),
+        (fifty_one, 400, "ValidationError", _TAG_LIMIT),
+        ({**filler, "Tags.member.3.Key": "aws:x", "Tags.member.3.Value": "x"}, 403, "AccessDenied",
+         _AWS_PREFIX),
+    ]
+    for i, (params, status, code, message) in enumerate(cases):
+        name = f"query-tag-error-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert put(name, **params) == (status, code, message), i
+        assert not _cw_alarm_exists(cw, name), i
+
+
+def _cw_cbor_put(name, tags, **extra):
+    """A raw CBOR PutMetricAlarm with query mode, for values boto3 can't send;
+    returns (status, __type, message)."""
+    import urllib.error
+    import urllib.request
+
+    import cbor2
+    from conftest import ENDPOINT
+    req = urllib.request.Request(
+        f"{ENDPOINT}/service/GraniteServiceVersion20100801/operation/PutMetricAlarm",
+        data=cbor2.dumps({"AlarmName": name, **_ALARM_BASE, "Tags": tags, **extra}),
+        headers={"Content-Type": "application/cbor", "Accept": "application/cbor", "smithy-protocol": "rpc-v2-cbor",
+                 "x-amzn-query-mode": "true",
+                 "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/monitoring/aws4_request, "
+                                  "SignedHeaders=host, Signature=x"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, None, None
+    except urllib.error.HTTPError as e:
+        payload = cbor2.loads(e.read())
+        return e.code, payload.get("__type"), payload.get("message", payload.get("Message")) or ""
+
+
+def test_cloudwatch_cbor_put_metric_alarm_wrong_types_in_tags(cw):
+    """Over CBOR a wrong type is MalformedInput with no message, a null tag is
+    a 500, and bytes count as a wrong type.
+    AWS: captured 2026-10-21 (2309-uncertainties Z:cbor-qm-key-number,
+    Z:cbor-qm-tags-not-a-list, Z:cbor-qm-null-element, Z:cbor-qm-key-bytes,
+    Z:cbor-qm-value-bytes; x-amzn-query-error MalformedInput;Sender and
+    InternalFailure;Receiver)."""
+    for i, (tags, status, code) in enumerate([
+        (_FILLER_TAGS + [{"Key": 5, "Value": "x"}], 400, "MalformedInput"),
+        ("x", 400, "MalformedInput"),
+        (_FILLER_TAGS + [None], 500, "InternalFailure"),
+        (_FILLER_TAGS + [{"Key": b"ab", "Value": "x"}], 400, "MalformedInput"),
+        (_FILLER_TAGS + [{"Key": "a", "Value": b"ab"}], 400, "MalformedInput"),
+    ]):
+        name = f"cbor-type-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cw_cbor_put(name, tags) == (status, code, ""), i
+        assert not _cw_alarm_exists(cw, name), i
+
+
+def test_cloudwatch_put_metric_alarm_lists_at_most_ten_validation_errors(cw):
+    """AWS: captured 2026-10-21 (2309-uncertainties S:json-10-missing-values,
+    S:json-11-missing-values, S:json-12-missing-values, S:json-5-missing-and-dta-0)."""
+    for n in (10, 11, 12):
+        name = f"ten-errors-{n}-{_uuid_mod.uuid4().hex[:8]}"
+        message = "10 validation errors detected: " + "; ".join(_NULL_VALUE.format(i) for i in range(3, 13))
+        assert _cw_json_put(name, _FILLER_TAGS + [{"Key": f"m{i}"} for i in range(n)]) == (400, message), n
+    name = f"ten-errors-dta-{_uuid_mod.uuid4().hex[:8]}"
+    assert _cw_json_put(name, _FILLER_TAGS + [{"Key": f"m{i}"} for i in range(10)], DatapointsToAlarm=0) == (
+        400, "10 validation errors detected: " + "; ".join(_NULL_VALUE.format(i) for i in range(3, 13)))
+
+
+def test_cloudwatch_put_metric_alarm_tag_character_and_utf16_length_rules(cw):
+    """On create, keys and values may hold letters, numbers and spaces of any
+    script plus _ . : / = + - @; length is counted in UTF-16 units. The check
+    runs after the member constraints and datapointsToAlarm, before the tag
+    limit, on the tags de-duplicated by key; a character error anywhere wins,
+    then the first too-long value, then the first too-long key, in Java
+    HashMap order of the keys; an update ignores it.
+    AWS: captured 2026-10-21 (2309-uncertainties C:json-key-*, C:json-value-*,
+    C:json-key-127-plus-emoji, C:json-key-hash-and-missing-value, C:json-key-hash-and-51,
+    C:json-key-hash-and-dta-0, C:json-two-bad-char-keys, C:json-key-65-emoji-and-hash,
+    C:json-update-key-hash, Z:json-key-128-e-acute, Z:json-key-129-e-acute,
+    Z:json-key-64-emoji, Z:json-key-65-emoji, S:json-key-and-value-too-long-same-tag,
+    S:json-value-too-long-and-key-bad-char-same-tag, S:json-too-long-then-bad-char-next-tag,
+    S:query-key-hash; which too-long tag is named: M:json-two-too-long-keys,
+    M:json-too-long-value-then-too-long-key, N:json-three-too-long-keys,
+    N:json-two-too-long-keys-reversed-letters, N:json-too-long-key-then-too-long-value,
+    L:json-keys-c-a-b, L:json-value-then-key-repeat-1, L:json-value-then-key-repeat-2,
+    L:json-value-under-z-and-key-a, L:json-key-m-value-b-key-x, L:json-values-under-a-and-b,
+    L:json-values-under-b-and-a, E:json-keys-a-and-e, E:json-keys-e-and-a, E:json-keys-a-d-e-q,
+    E:json-values-under-i-and-x, E:json-values-under-x-and-i, E:json-values-under-k-m-z,
+    E:json-dup-key-short-then-long-value, E:json-bad-char-value-next-to-long-key,
+    E:json-dup-key-long-value-then-short, E:json-dup-key-bad-char-value-then-ok;
+    past twelve keys: Z9:metric-13-keys-long-b-and-a)."""
+    chars = ("Tags can only contain letters, numbers, spaces, and the following special characters: "
+             "_ . : / = + - @")
+    emoji = "\U0001F600"
+
+    def too_long(text, kind):
+        return f"'{text}' is not a valid value for com.amazon.aws.platform.billing.tagset.type.{kind} - it is too long"
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    accepted = [("a b", "x"), ("é", "x"), ("123", "x"), ("_.:/=+-@", "x"), ("日本", "x"),
+                ("a b", "x"), ("１", "x"), ("é" * 128, "x")]
+    names = []
+    try:
+        for i, (key, value) in enumerate(accepted):
+            names.append(f"chars-ok-{i}-{uid}")
+            assert _cw_json_put(names[-1], _FILLER_TAGS + [{"Key": key, "Value": value}])[0] == 200, i
+        refused = [
+            ([{"Key": k, "Value": "x"}], chars) for k in ("a&b", "a<b", "a#b", emoji, "a\tb", "a,b", "a*b")
+        ] + [
+            ([{"Key": "a", "Value": v}], chars) for v in ("a&b", emoji, "a#b", emoji * 128)
+        ] + [
+            ([{"Key": "a", "Value": emoji * 129}], too_long(emoji * 129, "TagValue")),
+            ([{"Key": "k" * 127 + emoji, "Value": "x"}], too_long("k" * 127 + emoji, "TagKey")),
+            ([{"Key": emoji * 64, "Value": "x"}], chars),
+            ([{"Key": emoji * 65, "Value": "x"}], too_long(emoji * 65, "TagKey")),
+            ([{"Key": "k" * 127 + emoji, "Value": emoji * 129}], too_long("k" * 127 + emoji, "TagKey")),
+            ([{"Key": "a#b", "Value": emoji * 129}], chars),
+            ([{"Key": "k" * 127 + emoji, "Value": "x"}, {"Key": "a#b", "Value": "x"}], chars),
+            ([{"Key": "a#b", "Value": "x"}, {"Key": emoji * 65, "Value": "x"}], chars),
+            ([{"Key": "a" * 127 + emoji, "Value": "x"}, {"Key": "b" * 127 + emoji, "Value": "x"},
+              {"Key": "c" * 127 + emoji, "Value": "x"}], too_long("c" * 127 + emoji, "TagKey")),
+            ([{"Key": "c" * 127 + emoji, "Value": "x"}, {"Key": "a" * 127 + emoji, "Value": "x"},
+              {"Key": "b" * 127 + emoji, "Value": "x"}], too_long("c" * 127 + emoji, "TagKey")),
+            ([{"Key": "a" * 127 + emoji, "Value": "x"}, {"Key": "e" * 127 + emoji, "Value": "x"}],
+             too_long("a" * 127 + emoji, "TagKey")),
+            ([{"Key": "e" * 127 + emoji, "Value": "x"}, {"Key": "a" * 127 + emoji, "Value": "x"}],
+             too_long("a" * 127 + emoji, "TagKey")),
+            ([{"Key": c * 127 + emoji, "Value": "x"} for c in "adeq"], too_long("d" * 127 + emoji, "TagKey")),
+            ([{"Key": "i", "Value": emoji * 129}, {"Key": "x", "Value": emoji * 130}], too_long(emoji * 130, "TagValue")),
+            ([{"Key": "x", "Value": emoji * 129}, {"Key": "i", "Value": emoji * 130}], too_long(emoji * 129, "TagValue")),
+            ([{"Key": "k", "Value": emoji * 129}, {"Key": "m", "Value": emoji * 130}, {"Key": "z", "Value": emoji * 131}],
+             too_long(emoji * 131, "TagValue")),
+            ([{"Key": "a", "Value": "x"}, {"Key": "a", "Value": emoji * 129}], too_long(emoji * 129, "TagValue")),
+            ([{"Key": "a" * 127 + emoji, "Value": "x"}, {"Key": "b", "Value": "c#d"}], chars),
+            ([{"Key": f"g{n:02d}", "Value": "v"} for n in range(9)] + [{"Key": "b" * 127 + emoji, "Value": "x"},
+              {"Key": "a" * 127 + emoji, "Value": "x"}], too_long("a" * 127 + emoji, "TagKey")),
+            ([{"Key": "a", "Value": emoji * 129}, {"Key": "b" * 127 + emoji, "Value": "x"}], too_long(emoji * 129, "TagValue")),
+            ([{"Key": "m" * 127 + emoji, "Value": "x"}, {"Key": "b", "Value": emoji * 129},
+              {"Key": "x" * 127 + emoji, "Value": "x"}], too_long(emoji * 129, "TagValue")),
+            ([{"Key": "b", "Value": emoji * 129}, {"Key": "a", "Value": emoji * 130}], too_long(emoji * 130, "TagValue")),
+            ([{"Key": "a#b", "Value": "x"}, {"Key": "c*d", "Value": "x"}], chars),
+            ([{"Key": "a#b", "Value": "x"}] + [{"Key": f"k{n:02d}", "Value": "v"} for n in range(48)], chars),
+            ([{"Key": "a#b", "Value": "x"}, {"Key": "c"}], f"1 validation error detected: {_NULL_VALUE.format(4)}"),
+            ([{"Key": "é" * 129, "Value": "x"}],
+             f"1 validation error detected: Value '{chr(0xe9) * 129}' at 'tags.3.member.key' failed to satisfy "
+             "constraint: Member must have length less than or equal to 128"),
+        ]
+        for i, (tags, message) in enumerate(refused):
+            name = f"chars-bad-{i}-{uid}"
+            assert _cw_json_put(name, _FILLER_TAGS + tags) == (400, message), i
+            assert not _cw_alarm_exists(cw, name), i
+        for tags in ([{"Key": "a", "Value": emoji * 129}, {"Key": "a", "Value": "x"}],
+                     [{"Key": "a", "Value": "a#b"}, {"Key": "a", "Value": "x"}]):
+            names.append(f"chars-dup-{len(names)}-{uid}")
+            assert _cw_json_put(names[-1], _FILLER_TAGS + tags)[0] == 200
+        name = f"chars-dta-{uid}"
+        assert _cw_json_put(name, _FILLER_TAGS + [{"Key": "a#b", "Value": "x"}], DatapointsToAlarm=0) == (
+            400, f"1 validation error detected: {_DTA_MIN.format(0)}")
+
+        names.append(f"chars-update-{uid}")
+        assert _cw_json_put(names[-1], [{"Key": "team", "Value": "platform"}])[0] == 200
+        assert _cw_json_put(names[-1], [{"Key": "a#b", "Value": "x"}], Threshold=87)[0] == 200
+        alarm = cw.describe_alarms(AlarmNames=[names[-1]])["MetricAlarms"][0]
+        assert alarm["Threshold"] == 87 and _cw_tag_set(cw, alarm["AlarmArn"]) == {"team": "platform"}
+
+        status, body = _cw_raw("query", "PutMetricAlarm", {
+            "AlarmName": f"chars-query-{uid}", **_QUERY_ALARM, "Tags.member.1.Key": "a#b", "Tags.member.1.Value": "x"})
+        assert status == 400 and html.unescape(re.search(r"<Message>(.*?)</Message>", body).group(1)) == chars
+    finally:
+        cw.delete_alarms(AlarmNames=names)
+
+
+def test_cloudwatch_query_put_metric_alarm_escapes_and_blank_values(cw):
+    """An echoed key is XML-escaped in a Query error, and a member's Value sent
+    with no "=" is an empty value.
+    AWS: captured 2026-10-21 (2309-uncertainties Z:query-key-amp-lt-129, Z:query-bare-value)."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from conftest import ENDPOINT
+    auth = ("AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/monitoring/aws4_request, "
+            "SignedHeaders=host, Signature=x")
+
+    def put(name, tail):
+        body = (f"Action=PutMetricAlarm&Version=2010-08-01&{urllib.parse.urlencode(_QUERY_ALARM)}"
+                f"&AlarmName={name}{tail}").encode()
+        req = urllib.request.Request(ENDPOINT, data=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded", "Authorization": auth})
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, None, None
+        except urllib.error.HTTPError as e:
+            text = e.read().decode()
+            return (e.code, re.search(r"<Code>(.*?)</Code>", text).group(1),
+                    re.search(r"<Message>(.*?)</Message>", text, re.S).group(1))
+
+    two = "&Tags.member.1.Key=f1&Tags.member.1.Value=v&Tags.member.2.Key=f2&Tags.member.2.Value=v"
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"query-escape-{uid}"
+    status, code, raw_message = put(name, two + "&Tags.member.3.Key=" + urllib.parse.quote("&<" + "k" * 127)
+                                    + "&Tags.member.3.Value=x")
+    assert (status, code) == (400, "ValidationError")
+    assert raw_message.startswith("1 validation error detected: Value '&amp;&lt;kkk")
+    assert html.unescape(raw_message) == (f"1 validation error detected: Value '&<{'k' * 127}' at 'tags.3.member.key' "
+                                          "failed to satisfy constraint: Member must have length less than or equal to 128")
+    assert not _cw_alarm_exists(cw, name)
+
+    bare = f"query-bare-{uid}"
+    try:
+        assert put(bare, two + "&Tags.member.3.Key=a&Tags.member.3.Value")[0] == 200
+        arn = cw.describe_alarms(AlarmNames=[bare])["MetricAlarms"][0]["AlarmArn"]
+        assert _cw_tag_set(cw, arn) == {"f1": "v", "f2": "v", "a": ""}
+    finally:
+        cw.delete_alarms(AlarmNames=[bare])
+
+
+def _cw_composite_base(cw, uid):
+    name = f"composite-base-{uid}"
+    cw.put_metric_alarm(AlarmName=name, **_ALARM_BASE)
+    return name, f'ALARM("{name}")'
+
+
+def test_cloudwatch_put_composite_alarm_applies_tags_on_create_only(cw):
+    """PutCompositeAlarm stores Tags when it creates the alarm and ignores them
+    on an update, whether the alarm had tags or not; a repeated key keeps its
+    last value; an empty list or null stores none.
+    AWS: captured 2026-10-21 (2309-uncertainties I11:put-composite-alarm-tags-on-create,
+    I11:put-composite-alarm-update-different-tags) and 2026-10-22 (K:json-create-with-tags,
+    K:json-update-other-tags, K:json-create-untagged, K:json-untagged-then-update-with-tags,
+    K:json-dup-keys, K:json-tags-empty, K:json-tags-null, K:query-create-with-tags)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    base, rule = _cw_composite_base(cw, uid)
+    names = [f"composite-{n}-{uid}" for n in ("tagged", "untagged", "dup", "empty", "null", "query")]
+
+    def arn(name):
+        return f"arn:aws:cloudwatch:us-east-1:000000000000:alarm:{name}"
+
+    try:
+        cw.put_composite_alarm(AlarmName=names[0], AlarmRule=rule, Tags=[{"Key": "team", "Value": "platform"}])
+        assert _cw_tag_set(cw, arn(names[0])) == {"team": "platform"}
+        cw.put_composite_alarm(AlarmName=names[0], AlarmRule=rule, Tags=[{"Key": "other", "Value": "x"}])
+        assert _cw_tag_set(cw, arn(names[0])) == {"team": "platform"}
+
+        cw.put_composite_alarm(AlarmName=names[1], AlarmRule=rule)
+        cw.put_composite_alarm(AlarmName=names[1], AlarmRule=rule, Tags=[{"Key": "team", "Value": "platform"}])
+        assert _cw_tag_set(cw, arn(names[1])) == {}
+
+        cw.put_composite_alarm(AlarmName=names[2], AlarmRule=rule,
+                               Tags=[{"Key": "d", "Value": "1"}, {"Key": "d", "Value": "2"}])
+        assert _cw_tag_set(cw, arn(names[2])) == {"d": "2"}
+        cw.put_composite_alarm(AlarmName=names[3], AlarmRule=rule, Tags=[])
+        assert _cw_tag_set(cw, arn(names[3])) == {}
+        assert _cw_raw("json", "PutCompositeAlarm", {"AlarmName": names[4], "AlarmRule": rule, "Tags": None})[0] == 200
+        assert _cw_tag_set(cw, arn(names[4])) == {}
+        assert _cw_raw("query", "PutCompositeAlarm", {"AlarmName": names[5], "AlarmRule": rule,
+                                                      "Tags.member.1.Key": "team", "Tags.member.1.Value": ""})[0] == 200
+        assert _cw_tag_set(cw, arn(names[5])) == {"team": ""}
+    finally:
+        for name in names:  # DeleteAlarms takes one composite alarm per call
+            cw.delete_alarms(AlarmNames=[name])
+        cw.delete_alarms(AlarmNames=[base])
+
+
+def test_cloudwatch_put_composite_alarm_refuses_invalid_tags(cw):
+    """PutCompositeAlarm checks Tags like PutMetricAlarm (types, member
+    constraints, the tag-set check, then at most 50 tags), before its
+    AlarmRule; an aws: key is a ValidationError after the tag-set check, not
+    PutMetricAlarm's AccessDenied. An update checks the member constraints
+    only. Nothing is created or changed on a refusal.
+    AWS: captured 2026-10-22 (2309-uncertainties K:json-missing-value, K:json-missing-key,
+    K:json-key-129, K:json-key-hash, K:json-value-129-emoji, K:json-51-tags, K:json-50-tags,
+    K:json-aws-prefix, K:json-tags-string, K:json-key-number, K:json-bad-rule-and-missing-value,
+    K:json-missing-child-and-missing-value, K:json-missing-child-and-aws-prefix,
+    K:json-missing-child-and-51-tags, K:json-missing-child-and-key-hash,
+    K:json-bad-rule-and-key-number, K:query-missing-value, K:cbor-missing-key,
+    K:json-update-missing-key, K:json-update-aws-prefix, K:json-update-51-tags,
+    K2:json-AWS-upper, K2:json-aws-vendor-key, K2:json-aws-colon-only,
+    K2:json-aws-and-missing-value, K2:json-aws-and-key-hash, K2:json-key-hash-then-aws,
+    K2:json-aws-and-51-tags, K2:json-aws-and-too-long-value, K2:json-aws-and-key-number,
+    Z9:composite-AWS-x-then-aws-y, Z9:composite-aws-zz-then-aws-a-b, Z9:composite-Aws-q-then-AWS-b)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    base, rule = _cw_composite_base(cw, uid)
+    emoji = "\U0001F600"
+    many = [{"Key": f"k{n:02d}", "Value": "v"} for n in range(49)]
+    chars = ("Tags can only contain letters, numbers, spaces, and the following special characters: "
+             "_ . : / = + - @")
+    missing = f'ALARM("composite-missing-{uid}")'
+
+    def put(name, tags, alarm_rule=rule):
+        status, body = _cw_raw("json", "PutCompositeAlarm", {"AlarmName": name, "AlarmRule": alarm_rule, "Tags": tags})
+        if status < 300:
+            return status, None
+        payload = json.loads(body)
+        return status, payload.get("message", payload.get("Message")) or ""
+
+    cases = [
+        (_FILLER_TAGS + [{"Key": "a"}], rule, (400, f"1 validation error detected: {_NULL_VALUE.format(3)}")),
+        (_FILLER_TAGS + [{"Value": "x"}], rule, (400, f"1 validation error detected: {_NULL_KEY.format(3)}")),
+        (_FILLER_TAGS + [{"Key": "k" * 129, "Value": "x"}], rule,
+         (400, f"1 validation error detected: Value '{'k' * 129}' at 'tags.3.member.key' failed to satisfy constraint: "
+               "Member must have length less than or equal to 128")),
+        (_FILLER_TAGS + [{"Key": "a#b", "Value": "x"}], rule, (400, chars)),
+        (_FILLER_TAGS + [{"Key": "a", "Value": emoji * 129}], rule,
+         (400, f"'{emoji * 129}' is not a valid value for com.amazon.aws.platform.billing.tagset.type.TagValue - it is too long")),
+        (_FILLER_TAGS + many, rule, (400, _TAG_LIMIT)),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}], rule, (400, "Invalid System Tag: aws:x is missing Vendor Id.")),
+        (_FILLER_TAGS + [{"Key": "aws:", "Value": "x"}], rule, (400, "Invalid System Tag: aws: is missing Vendor Id.")),
+        (_FILLER_TAGS + [{"Key": "aws:vendor:x", "Value": "x"}], rule,
+         (400, "Invalid System Tag: aws:vendor:x is not whitelisted for vendor:cloudwatch")),
+        (_FILLER_TAGS + [{"Key": "AWS:x", "Value": "x"}], rule,
+         (400, 'Invalid System Tag: AWS:x must be prefixed with "aws:" in lowercase.')),
+        ([{"Key": "AWS:x", "Value": "x"}, {"Key": "aws:y", "Value": "x"}], rule,
+         (400, "Invalid System Tag: aws:y is missing Vendor Id.")),
+        ([{"Key": "aws:zz", "Value": "x"}, {"Key": "aws:a:b", "Value": "x"}], rule,
+         (400, "Invalid System Tag: aws:a:b is not whitelisted for vendor:cloudwatch")),
+        ([{"Key": "Aws:q", "Value": "x"}, {"Key": "AWS:b", "Value": "x"}], rule,
+         (400, 'Invalid System Tag: AWS:b must be prefixed with "aws:" in lowercase.')),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}, {"Key": "a"}], rule,
+         (400, f"1 validation error detected: {_NULL_VALUE.format(4)}")),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}, {"Key": "a#b", "Value": "x"}], rule, (400, chars)),
+        (_FILLER_TAGS + [{"Key": "a#b", "Value": "x"}, {"Key": "aws:x", "Value": "x"}], rule, (400, chars)),
+        (_FILLER_TAGS + many[:48] + [{"Key": "aws:x", "Value": "x"}], rule,
+         (400, "Invalid System Tag: aws:x is missing Vendor Id.")),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}, {"Key": "b", "Value": emoji * 129}], rule,
+         (400, f"'{emoji * 129}' is not a valid value for com.amazon.aws.platform.billing.tagset.type.TagValue - it is too long")),
+        ("x", rule, (400, "Unexpected field type")),
+        (_FILLER_TAGS + [{"Key": 5, "Value": "x"}], rule, (400, "NUMBER_VALUE cannot be converted to String")),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}, {"Key": 5, "Value": "x"}], rule,
+         (400, "NUMBER_VALUE cannot be converted to String")),
+        (_FILLER_TAGS + [{"Key": "a"}], "NOT A RULE (((", (400, f"1 validation error detected: {_NULL_VALUE.format(3)}")),
+        (_FILLER_TAGS + [{"Key": "a"}], missing, (400, f"1 validation error detected: {_NULL_VALUE.format(3)}")),
+        (_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}], missing, (400, "Invalid System Tag: aws:x is missing Vendor Id.")),
+        (_FILLER_TAGS + many, missing, (400, _TAG_LIMIT)),
+        (_FILLER_TAGS + [{"Key": "a#b", "Value": "x"}], missing, (400, chars)),
+        (_FILLER_TAGS + [{"Key": 5, "Value": "x"}], "NOT A RULE (((", (400, "NUMBER_VALUE cannot be converted to String")),
+    ]
+    for i, (tags, alarm_rule, expected) in enumerate(cases):
+        name = f"composite-refused-{i}-{uid}"
+        assert put(name, tags, alarm_rule) == expected, i
+        assert not cw.describe_alarms(AlarmNames=[name], AlarmTypes=["CompositeAlarm"])["CompositeAlarms"], i
+
+    status, body = _cw_raw("query", "PutCompositeAlarm", {"AlarmName": f"composite-q-{uid}", "AlarmRule": rule,
+                                                          "Tags.member.1.Key": "f1", "Tags.member.1.Value": "v",
+                                                          "Tags.member.2.Key": "f2", "Tags.member.2.Value": "v",
+                                                          "Tags.member.3.Key": "a"})
+    assert status == 400 and html.unescape(re.search(r"<Message>(.*?)</Message>", body).group(1)) == (
+        f"1 validation error detected: {_NULL_VALUE.format(3)}")
+    with pytest.raises(ClientError) as exc:
+        _cw_unvalidated().put_composite_alarm(AlarmName=f"composite-c-{uid}", AlarmRule=rule,
+                                              Tags=_FILLER_TAGS + [{"Value": "x"}])
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "ValidationError", f"1 validation error detected: {_NULL_KEY.format(3)}")
+
+    existing = f"composite-update-{uid}"
+    try:
+        assert put(existing, [{"Key": "team", "Value": "platform"}])[0] == 200
+        assert put(existing, _FILLER_TAGS + [{"Value": "x"}], f'OK("{base}")') == (
+            400, f"1 validation error detected: {_NULL_KEY.format(3)}")
+        alarm = cw.describe_alarms(AlarmNames=[existing], AlarmTypes=["CompositeAlarm"])["CompositeAlarms"][0]
+        assert alarm["AlarmRule"] == rule
+        for tags, new_rule in ((_FILLER_TAGS + [{"Key": "aws:x", "Value": "x"}], f'OK("{base}")'),
+                               (_FILLER_TAGS + many, f'INSUFFICIENT_DATA("{base}")')):
+            assert put(existing, tags, new_rule)[0] == 200
+            alarm = cw.describe_alarms(AlarmNames=[existing], AlarmTypes=["CompositeAlarm"])["CompositeAlarms"][0]
+            assert alarm["AlarmRule"] == new_rule
+            assert _cw_tag_set(cw, alarm["AlarmArn"]) == {"team": "platform"}
+    finally:
+        cw.delete_alarms(AlarmNames=[existing])
+        cw.delete_alarms(AlarmNames=[base])

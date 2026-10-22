@@ -25811,6 +25811,40 @@ def test_cfn_cloudwatch_alarm_update_drops_omitted_properties(cfn, cw):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+def test_cfn_cloudwatch_alarm_datapoints_to_alarm_only_when_declared(cfn, cw):
+    """The alarm reports DatapointsToAlarm only while the template sets it.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C20, C21, C22)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-dta-{uid}"
+    alarm_name = f"cfn-alarm-dta-{uid}"
+    base = {
+        "AlarmName": alarm_name, "MetricName": "Errors", "Namespace": f"CfnAlarmDta/{uid}",
+        "Statistic": "Sum", "Period": 60, "EvaluationPeriods": 3,
+        "Threshold": 1, "ComparisonOperator": "GreaterThanThreshold",
+    }
+
+    def template(**extra):
+        return json.dumps({"Resources": {"Alarm": {
+            "Type": "AWS::CloudWatch::Alarm", "Properties": {**base, **extra}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template())
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(DatapointsToAlarm=2))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]["DatapointsToAlarm"] == 2
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template())
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_cloudwatch_alarm_update_recreates_an_alarm_deleted_out_of_band(cfn, cw):
     """An alarm removed through DeleteAlarms while its stack still declares it
     is created again by the next update (the replacement path), under the

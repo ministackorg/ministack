@@ -4784,6 +4784,73 @@ def test_apigwv1_methods_without_aws_iam_read_no_credentials(auth_enabled, iam_u
         cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
 
 
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_refuses_an_authorization_header_that_is_not_sigv4(auth_enabled, iam_user, apigw_v1):
+    """An AWS_IAM method refuses an Authorization header that is not SigV4, with API Gateway's message for each."""
+    import http.client as _http
+    from urllib.parse import urlsplit
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    api = apigw_v1.create_rest_api(name="foreign-authorization")["id"]
+    try:
+        root = apigw_v1.get_resources(restApiId=api)["items"][0]["id"]
+        for part, kind in (("iam", "AWS_IAM"), ("open", "NONE")):
+            resource = apigw_v1.create_resource(restApiId=api, parentId=root, pathPart=part)["id"]
+            method = {"restApiId": api, "resourceId": resource, "httpMethod": "GET"}
+            apigw_v1.put_method(**method, authorizationType=kind)
+            apigw_v1.put_integration(
+                **method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+            apigw_v1.put_method_response(**method, statusCode="200")
+            apigw_v1.put_integration_response(**method, statusCode="200", responseTemplates={"application/json": "{}"})
+        apigw_v1.create_deployment(restApiId=api, stageName="s")
+        host = f"{api}.execute-api.localhost:{_EXECUTE_PORT}"
+
+        edits = {
+            "bearer": lambda v: "Bearer x",
+            "lower-case": lambda v: v.replace("AWS4-HMAC-SHA256", "aws4-hmac-sha256", 1),
+            "sha512": lambda v: v.replace("AWS4-HMAC-SHA256", "AWS4-HMAC-SHA512", 1),
+            "sigv4a-name": lambda v: v.replace("AWS4-HMAC-SHA256", "AWS4-ECDSA-P256-SHA256", 1),
+            "leading-space": lambda v: " " + v,
+        }
+
+        def call(path, credentials, change=""):
+            request = AWSRequest(method="GET", url=f"http://{host}{path}", headers={"Host": host})
+            SigV4Auth(credentials, "execute-api", "us-east-1").add_auth(request)
+            if change:
+                request.headers.replace_header("Authorization", edits[change](request.headers["Authorization"]))
+            conn = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT, timeout=10)
+            try:
+                conn.request("GET", urlsplit(request.url).path, headers=dict(request.headers))
+                response = conn.getresponse()
+                body = json.loads(response.read() or b"{}")
+                return response.status, response.getheader("x-amzn-ErrorType"), body.get("message")
+            finally:
+                conn.close()
+
+        user = iam_user(policy=_ALLOW_INVOKE)
+        with _contract_signing_credentials(user) as key:
+            assert call("/s/iam", key)[0] == 200
+            assert call("/s/iam", key, "leading-space")[0] == 200
+            foreign = {change: call("/s/iam", key, change) for change in list(edits)[:4]}
+            if auth_enabled:
+                assert {change: answer[:2] for change, answer in foreign.items()} == dict.fromkeys(
+                    foreign, (403, "IncompleteSignatureException"))
+                assert foreign["bearer"][2].startswith("Invalid key=value pair (missing equal-sign) in Authorization")
+                assert foreign["lower-case"][2] == "Algorithm must start with 'AWS4-'; got 'aws4-hmac-sha256'"
+                assert foreign["sha512"][2] == "Unsupported AWS 'algorithm': 'AWS4-HMAC-SHA512'. "
+                assert foreign["sigv4a-name"][2] == (
+                    "'x-amz-region-set' must be a 'SignedHeader' in Authorization or passed as a Query Parameter "
+                    "'X-Amz-Region-Set'")
+            else:
+                assert {answer[0] for answer in foreign.values()} == {200}
+            for change in edits:
+                assert call("/s/open", key, change)[0] == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api)
+
+
 def _v1_signed_token(claims: dict) -> str:
     """Mint an RS256 token signed with the local Cognito pool key."""
     import base64 as _b64

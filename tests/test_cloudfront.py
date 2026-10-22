@@ -4197,3 +4197,462 @@ def test_cloudfront_vpc_origin_list_max_items_bounds(cloudfront, max_items, expe
         assert _vo_error(exc) == (400, "InvalidArgument", "MaxItems must be a non-zero positive integer.")
     else:
         assert cloudfront.list_vpc_origins(MaxItems=max_items)["VpcOriginList"]["MaxItems"] == expected
+
+
+def _cf_create_tagged_function(cloudfront, name, **kwargs):
+    return cloudfront.create_function(
+        Name=name, FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; }", **kwargs)
+
+
+def _cf_delete_function_if_present(cloudfront, name):
+    try:
+        etag = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["ETag"]
+    except ClientError:
+        return
+    cloudfront.delete_function(Name=name, IfMatch=etag)
+
+
+def _cf_tag_items(cloudfront, arn):
+    return cloudfront.list_tags_for_resource(Resource=arn)["Tags"].get("Items", [])
+
+
+def test_cloudfront_create_function_stores_request_tags(cloudfront):
+    """CreateFunctionRequest's Tags are listed on the function ARN, and
+    TagResource / UntagResource then change that same set.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C1, C2, C3)."""
+    name = f"tagged-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "environment", "Value": "dev"}]})
+        assert fn["ResponseMetadata"]["HTTPStatusCode"] == 201
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        assert arn.endswith(f":function/{name}") and arn.startswith("arn:aws:cloudfront::")
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "environment", "Value": "dev"}]
+
+        cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        cloudfront.untag_resource(Resource=arn, TagKeys={"Items": ["environment"]})
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_with_empty_tags_has_none(cloudfront):
+    """AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C4)."""
+    name = f"untagged-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name, Tags={"Items": []})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        assert _cf_tag_items(cloudfront, arn) == []
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_tag_without_value_lists_empty_value(cloudfront):
+    """AWS: captured 2026-10-21 (2309-uncertainties U1:cf-tag-without-value,
+    U1:cf-tag-empty-value)."""
+    name = f"novalue-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "novalue"}, {"Key": "empty", "Value": ""}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        items = {t["Key"]: t["Value"] for t in _cf_tag_items(cloudfront, arn)}
+        assert items == {"novalue": "", "empty": ""}
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_already_exists_keeps_existing_tags(cloudfront):
+    """A refused second CreateFunction under the same name leaves the first
+    function's tags alone.
+    AWS: captured 2026-10-21 (2309-uncertainties U3:cf-already-exists-with-other-tags)."""
+    name = f"exists-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        with pytest.raises(ClientError) as exc:
+            _cf_create_tagged_function(cloudfront, name, Tags={"Items": [{"Key": "other", "Value": "x"}]})
+        assert exc.value.response["Error"]["Code"] == "FunctionAlreadyExists"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_delete_function_drops_its_tags(cloudfront):
+    """A function created again under a deleted function's name (same ARN)
+    starts without the old function's tags.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C5, C6, C7)."""
+    name = f"recreated-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "environment", "Value": "dev"}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        deleted = cloudfront.delete_function(Name=name, IfMatch=fn["ETag"])
+        assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+        again = _cf_create_tagged_function(cloudfront, name, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        assert again["ResponseMetadata"]["HTTPStatusCode"] == 201
+        assert again["FunctionSummary"]["FunctionMetadata"]["FunctionARN"] == arn
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+_CF_PATTERN = "Member must satisfy regular expression pattern: ([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)"
+_CF_FILLER = [{"Key": "f1", "Value": "v"}, {"Key": "f2", "Value": "v"}]
+
+
+def _cf_unvalidated():
+    """boto3 without client-side checks, so it sends what AWS refuses."""
+    return __import__("conftest").make_client("cloudfront", additional_config_kwargs={"parameter_validation": False})
+
+
+def _cf_create_error(client, name, tags, **over):
+    kwargs = {"Name": name, "FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-2.0"},
+              "FunctionCode": b"function handler(event) { return event.request; }", "Tags": {"Items": tags}, **over}
+    with pytest.raises(ClientError) as exc:
+        client.create_function(**kwargs)
+    err = exc.value.response
+    return err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]
+
+
+def _cf_function_exists(cloudfront, name):
+    try:
+        cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")
+        return True
+    except ClientError:
+        return False
+
+
+def test_cloudfront_create_function_refuses_tag_constraint_violations(cloudfront):
+    """Member constraints come back as one MalformedXML: the code and runtime
+    first, then per tag Value before Key, per member length before pattern, at
+    most ten; nothing is created, and they come before FunctionAlreadyExists.
+    AWS: captured 2026-10-21 (2309-uncertainties F:empty-key, F:missing-key,
+    F:key-129, F:value-257, F:key-hash, F:key-amp, F:key-emoji, F:value-hash,
+    F:key-127-plus-emoji, F:key-hash-and-key-129, F:dup-and-key-129,
+    F:aws-prefix-and-key-129, F:dup-and-key-hash, F:dup-and-empty-code,
+    F:dup-and-bad-runtime, F:key-129-and-already-exists,
+    G:key-hash-and-value-hash-same-tag, G:key-129-and-value-257-same-tag,
+    G:key-129-hashes, G:missing-key-and-value-hash, G:eleven-bad-keys,
+    G:key-129-and-empty-code, G:key-129-and-bad-runtime; U10:cf-create-refused-empty-code;
+    H:bad-key-then-bad-value-next-tag, H:bad-value-then-bad-key-next-tag, H:key-combining-mark,
+    H:empty-code-and-bad-runtime)."""
+    raw = _cf_unvalidated()
+    dup = [{"Key": "dup", "Value": "a"}, {"Key": "dup", "Value": "b"}]
+
+    def at(i, field):
+        return f"at 'tags.items.{i}.member.{field}' failed to satisfy constraint:"
+
+    def one(text):
+        return f"1 validation error detected: {text}"
+
+    long_key, long_value = "k" * 129, "v" * 257
+    length_key = f"Value '{long_key}' {at(3, 'key')} Member must have length less than or equal to 128"
+    code_error = "Value at 'functionCode' failed to satisfy constraint: Member must have length greater than or equal to 1"
+    runtime_error = ("Value 'cloudfront-js-9.9' at 'functionConfig.runtime' failed to satisfy constraint: "
+                     "Member must satisfy enum value set: [cloudfront-js-1.0, cloudfront-js-2.0]")
+    cases = [
+        ([{"Key": "", "Value": "x"}], {}, one(f"Value '' {at(3, 'key')} Member must have length greater than or equal to 1")),
+        ([{"Value": "x"}], {}, one(f"Value null {at(3, 'key')} Member must not be null")),
+        ([{"Key": long_key, "Value": "x"}], {}, one(length_key)),
+        ([{"Key": "a", "Value": long_value}], {},
+         one(f"Value '{long_value}' {at(3, 'value')} Member must have length less than or equal to 256")),
+        ([{"Key": "a#b", "Value": "x"}], {}, one(f"Value 'a#b' {at(3, 'key')} {_CF_PATTERN}")),
+        ([{"Key": "a&b", "Value": "x"}], {}, one(f"Value 'a&b' {at(3, 'key')} {_CF_PATTERN}")),
+        ([{"Key": "a", "Value": "a#b"}], {}, one(f"Value 'a#b' {at(3, 'value')} {_CF_PATTERN}")),
+        ([{"Key": "k" * 127 + "\U0001F600", "Value": "x"}], {},
+         one(f"Value '{'k' * 127}\U0001F600' {at(3, 'key')} {_CF_PATTERN}")),
+        ([{"Key": "a#b", "Value": "c#d"}], {}, f"2 validation errors detected: Value 'c#d' {at(3, 'value')} {_CF_PATTERN}; "
+                                               f"Value 'a#b' {at(3, 'key')} {_CF_PATTERN}"),
+        ([{"Key": "#" * 129, "Value": "x"}], {},
+         f"2 validation errors detected: Value '{'#' * 129}' {at(3, 'key')} Member must have length less than or equal to 128; "
+         f"Value '{'#' * 129}' {at(3, 'key')} {_CF_PATTERN}"),
+        ([{"Value": "c#d"}], {}, f"2 validation errors detected: Value 'c#d' {at(3, 'value')} {_CF_PATTERN}; "
+                                 f"Value null {at(3, 'key')} Member must not be null"),
+        ([{"Key": "a#b", "Value": "x"}, {"Key": long_key, "Value": "x"}], {},
+         f"2 validation errors detected: Value 'a#b' {at(3, 'key')} {_CF_PATTERN}; "
+         f"Value '{long_key}' {at(4, 'key')} Member must have length less than or equal to 128"),
+        ([{"Key": f"a#{n}", "Value": "x"} for n in range(11)], {},
+         "10 validation errors detected: " + "; ".join(f"Value 'a#{n}' {at(n + 3, 'key')} {_CF_PATTERN}" for n in range(10))),
+        (dup + [{"Key": long_key, "Value": "x"}], {},
+         one(f"Value '{long_key}' {at(5, 'key')} Member must have length less than or equal to 128")),
+        ([{"Key": long_key, "Value": "x"}], {"FunctionCode": b""}, f"2 validation errors detected: {code_error}; {length_key}"),
+        ([{"Key": long_key, "Value": "x"}], {"FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-9.9"}},
+         f"2 validation errors detected: {runtime_error}; {length_key}"),
+        ([{"Key": "a#b", "Value": "x"}, {"Key": "c", "Value": "d#e"}], {},
+         f"2 validation errors detected: Value 'a#b' {at(3, 'key')} {_CF_PATTERN}; Value 'd#e' {at(4, 'value')} {_CF_PATTERN}"),
+        ([{"Key": "a", "Value": "b#c"}, {"Key": "d#e", "Value": "x"}], {},
+         f"2 validation errors detected: Value 'b#c' {at(3, 'value')} {_CF_PATTERN}; Value 'd#e' {at(4, 'key')} {_CF_PATTERN}"),
+        ([{"Key": "e\u0301", "Value": "x"}], {}, one(f"Value 'e\u0301' {at(3, 'key')} {_CF_PATTERN}")),
+        ([], {"FunctionCode": b"", "FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-9.9"}},
+         f"2 validation errors detected: {code_error}; {runtime_error}"),
+        (dup, {"FunctionCode": b""}, one(code_error)),
+        (dup, {"FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-9.9"}}, one(runtime_error)),
+    ]
+    for i, (tags, over, message) in enumerate(cases):
+        name = f"cf-constraint-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_create_error(raw, name, _CF_FILLER + tags, **over) == (400, "MalformedXML", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+
+    name = f"cf-constraint-exists-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _cf_create_tagged_function(cloudfront, name)
+        assert _cf_create_error(raw, name, _CF_FILLER + [{"Key": long_key, "Value": "x"}]) == (
+            400, "MalformedXML", one(length_key))
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_refuses_invalid_tagging(cloudfront):
+    """After the constraints and the name lookup, InvalidTagging: a repeated
+    key, then an aws: key, then more than 50 tags; nothing is created.
+    AWS: captured 2026-10-21 (2309-uncertainties F:dup-keys, U2:cf-duplicate-keys,
+    F:key-aws-prefix, F:key-AWS-prefix, F:51-tags, F:dup-and-aws-prefix,
+    F:51-tags-and-dup, F:51-tags-and-aws-prefix, F:dup-and-invalid-code,
+    F:dup-and-already-exists, H:two-dup-pairs-abba, H:mixed-case-Aws, H:AWS-then-aws,
+    H:aws-then-AWS)."""
+    raw = _cf_unvalidated()
+    many = [{"Key": f"k{n:02d}", "Value": "v"} for n in range(48)]
+    dup = [{"Key": "dup", "Value": "a"}, {"Key": "dup", "Value": "b"}]
+    cases = [
+        (dup, "Duplicate tag key: 'dup'."),
+        ([{"Key": "aws:x", "Value": "x"}], "Tag key cannot start with 'aws:'."),
+        ([{"Key": "AWS:x", "Value": "x"}], 'Invalid System Tag: AWS:x must be prefixed with "aws:" in lowercase.'),
+        (many + [{"Key": "k48", "Value": "v"}], "Too many tags."),
+        (dup + [{"Key": "aws:x", "Value": "x"}], "Duplicate tag key: 'dup'."),
+        (many + [{"Key": "k00", "Value": "again"}], "Duplicate tag key: 'k00'."),
+        (many + [{"Key": "aws:x", "Value": "x"}], "Tag key cannot start with 'aws:'."),
+        ([{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}, {"Key": "b", "Value": "3"}, {"Key": "a", "Value": "4"}],
+         "Duplicate tag key: 'b'."),
+        ([{"Key": "Aws:x", "Value": "x"}], 'Invalid System Tag: Aws:x must be prefixed with "aws:" in lowercase.'),
+        ([{"Key": "AWS:x", "Value": "x"}, {"Key": "aws:y", "Value": "y"}], "Tag key cannot start with 'aws:'."),
+        ([{"Key": "aws:y", "Value": "y"}, {"Key": "AWS:x", "Value": "x"}], "Tag key cannot start with 'aws:'."),
+    ]
+    for i, (tags, message) in enumerate(cases):
+        name = f"cf-tagging-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_create_error(raw, name, _CF_FILLER + tags) == (400, "InvalidTagging", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+    name = f"cf-tagging-code-{_uuid_mod.uuid4().hex[:8]}"
+    assert _cf_create_error(raw, name, _CF_FILLER + dup, FunctionCode=b"this is not javascript {{{") == (
+        400, "InvalidTagging", "Duplicate tag key: 'dup'.")
+
+    name = f"cf-tagging-exists-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _cf_create_tagged_function(cloudfront, name)
+        status, code, _ = _cf_create_error(raw, name, _CF_FILLER + dup)
+        assert (status, code) == (409, "FunctionAlreadyExists")
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_tag_values_aws_accepts(cloudfront):
+    """AWS: captured 2026-10-21 (2309-uncertainties F:key-128, F:value-256,
+    F:key-space-e-acute, F:key-specials, F:value-aws-prefix,
+    F:dup-keys-differing-case, F:50-tags, F:tags-without-items, G:missing-value,
+    U1:cf-tag-without-value, H:key-roman-numeral-Nl, H:key-superscript-No,
+    H:key-line-separator-Zl, I:raw-key-with-spaces-around)."""
+    cases = [
+        ([{"Key": "k" * 128, "Value": "x"}, {"Key": "a", "Value": "v" * 256}], {"k" * 128: "x", "a": "v" * 256}),
+        ([{"Key": "a b\u00e9", "Value": "x"}, {"Key": "_.:/=+-@", "Value": "x"}], {"a b\u00e9": "x", "_.:/=+-@": "x"}),
+        ([{"Key": "a", "Value": "aws:x"}, {"Key": "dup", "Value": "a"}, {"Key": "DUP", "Value": "b"}],
+         {"a": "aws:x", "dup": "a", "DUP": "b"}),
+        ([{"Key": f"k{n:02d}", "Value": "v"} for n in range(50)], {f"k{n:02d}": "v" for n in range(50)}),
+        ([{"Key": "novalue"}], {"novalue": ""}),
+        ([{"Key": "\u2160", "Value": "x"}, {"Key": "\u00b2", "Value": "x"}, {"Key": "a\u2028b", "Value": "x"},
+          {"Key": " a ", "Value": " b "}], {"\u2160": "x", "\u00b2": "x", "a\u2028b": "x", " a ": " b "}),
+    ]
+    raw = _cf_unvalidated()
+    for i, (tags, expected) in enumerate(cases):
+        name = f"cf-accepted-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        try:
+            fn = _cf_create_tagged_function(raw, name, Tags={"Items": tags})
+            arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+            assert {t["Key"]: t["Value"] for t in _cf_tag_items(cloudfront, arn)} == expected, i
+        finally:
+            _cf_delete_function_if_present(cloudfront, name)
+    name = f"cf-accepted-noitems-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(raw, name, Tags={})
+        assert _cf_tag_items(cloudfront, fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]) == []
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def _cf_raw_create_function(body):
+    """CreateFunction with an exact REST-XML body; returns (status, code, message)."""
+    import urllib.error
+    import urllib.request
+
+    from conftest import ENDPOINT
+    req = urllib.request.Request(f"{ENDPOINT}/2020-05-31/function", data=body.encode(), method="POST", headers={
+        "Content-Type": "application/xml",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/cloudfront/aws4_request, "
+                         "SignedHeaders=host, Signature=x"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, None, None
+    except urllib.error.HTTPError as e:
+        text = e.read().decode()
+        code = re.search(r"<Code>(.*?)</Code>", text)
+        message = re.search(r"<Message>(.*?)</Message>", text, re.S)
+        return e.code, code and code.group(1), message and message.group(1)
+
+
+def test_cloudfront_create_function_raw_xml_shapes(cloudfront):
+    """Shapes boto3 can't send: a missing FunctionCode, FunctionConfig or
+    Runtime and an empty Runtime join the MalformedXML list (code, config,
+    runtime, then tags); Tag elements directly under Tags are ignored; every
+    child of the last Items is a tag, whatever its name, and the last of two
+    Keys or Values counts; text in a tag without children, or an element
+    inside a Key or Value, is MalformedInput, then invalid base64 code, before
+    everything else; a missing or empty Name joins the MalformedXML list.
+    AWS: captured 2026-10-21 (2309-uncertainties H:raw-missing-code,
+    H:raw-missing-code-and-key-129, H:raw-missing-config, H:raw-missing-config-and-key-129,
+    H:raw-missing-runtime, H:raw-missing-runtime-and-key-129, H:raw-empty-runtime,
+    I:raw-empty-runtime-and-key-129, I:raw-missing-code-and-missing-config,
+    I:raw-missing-code-and-missing-runtime, H:raw-tags-direct-tag-children,
+    H:raw-tags-direct-valid-children, H:raw-items-non-tag-child,
+    I:raw-items-other-child-name-and-dup, N:cf-items-child-with-text-only,
+    N:cf-key-with-child-element, N:cf-items-child-without-key-or-value,
+    N:cf-key-nested-in-wrapper, N:cf-text-directly-in-items, N:cf-tag-with-two-keys,
+    L:cf-whitespace-only-tag, L:cf-value-with-child-element, L:cf-key-text-and-child,
+    L:cf-first-key-child-last-plain, L:cf-two-values, L:cf-pretty-printed-tag,
+    L:cf-text-before-child, L:cf-text-after-child, L:cf-two-items-elements,
+    L:cf-parse-error-without-name, L:cf-bad-base64-and-key-hash, L:cf-bad-base64-alone,
+    E:cf-tags-before-bad-base64-with-tag-parse-error, E:cf-bad-base64-before-tags-with-tag-parse-error,
+    E:cf-no-name-alone, E:cf-no-name-and-key-129, E:cf-empty-name-and-key-129)."""
+    import base64
+    from xml.sax.saxutils import escape
+    code = base64.b64encode(b"function handler(event) { return event.request; }").decode()
+    config = "<FunctionConfig><Comment></Comment><Runtime>cloudfront-js-2.0</Runtime></FunctionConfig>"
+    long_key = "k" * 129
+    key_error = (f"Value '{long_key}' at 'tags.items.1.member.key' failed to satisfy constraint: "
+                 "Member must have length less than or equal to 128")
+    long_items = f"<Tags><Items><Tag><Key>{long_key}</Key><Value>x</Value></Tag></Items></Tags>"
+    missing_code = "Value at 'functionCode' failed to satisfy constraint: Member must not be null"
+    missing_config = "Value null at 'functionConfig' failed to satisfy constraint: Member must not be null"
+    missing_runtime = "Value null at 'functionConfig.runtime' failed to satisfy constraint: Member must not be null"
+    empty_runtime = ("Value '' at 'functionConfig.runtime' failed to satisfy constraint: "
+                     "Member must satisfy enum value set: [cloudfront-js-1.0, cloudfront-js-2.0]")
+    no_runtime = "<FunctionConfig><Comment></Comment></FunctionConfig>"
+    blank_runtime = "<FunctionConfig><Comment></Comment><Runtime></Runtime></FunctionConfig>"
+
+    def body(name, code_xml, config_xml, tags_xml=""):
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<CreateFunctionRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">'
+                f"{code_xml}{config_xml}<Name>{escape(name)}</Name>{tags_xml}</CreateFunctionRequest>")
+
+    with_code = f"<FunctionCode>{code}</FunctionCode>"
+    refused = [
+        ("", config, "", f"1 validation error detected: {missing_code}"),
+        ("", config, long_items, f"2 validation errors detected: {missing_code}; {key_error}"),
+        (with_code, "", "", f"1 validation error detected: {missing_config}"),
+        (with_code, "", long_items, f"2 validation errors detected: {missing_config}; {key_error}"),
+        (with_code, no_runtime, "", f"1 validation error detected: {missing_runtime}"),
+        (with_code, no_runtime, long_items, f"2 validation errors detected: {missing_runtime}; {key_error}"),
+        (with_code, blank_runtime, "", f"1 validation error detected: {empty_runtime}"),
+        (with_code, blank_runtime, long_items, f"2 validation errors detected: {empty_runtime}; {key_error}"),
+        ("", "", "", f"2 validation errors detected: {missing_code}; {missing_config}"),
+        ("", no_runtime, "", f"2 validation errors detected: {missing_code}; {missing_runtime}"),
+    ]
+    for i, (code_xml, config_xml, tags_xml, message) in enumerate(refused):
+        name = f"cf-raw-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, code_xml, config_xml, tags_xml)) == (400, "MalformedXML", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+
+    for i, (items, message) in enumerate([
+        ("<Tag>just text</Tag>", "Unexpected complex element termination"),
+        ("<Tag>   </Tag>", "Unexpected complex element termination"),
+        ("<Tag><Key><b>x</b></Key><Value>v</Value></Tag>", "Start of list found where not expected"),
+        ("<Tag><Key>k</Key><Value><b>x</b></Value></Tag>", "Start of list found where not expected"),
+        ("<Tag><Key>a<b>x</b></Key><Value>v</Value></Tag>", "Start of list found where not expected"),
+        ("<Tag><Key><b>x</b></Key><Key>k</Key><Value>v</Value></Tag>", "Start of list found where not expected"),
+    ]):
+        name = f"cf-raw-parse-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, with_code, config, f"<Tags><Items>{items}</Items></Tags>")) == (
+            400, "MalformedInput", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+    for i, items in enumerate(["<Tag></Tag>", "<Tag><Wrap><Key>k</Key></Wrap><Value>v</Value></Tag>"]):
+        name = f"cf-raw-nokey-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, with_code, config, f"<Tags><Items>{items}</Items></Tags>")) == (
+            400, "MalformedXML", "1 validation error detected: Value null at 'tags.items.1.member.key' "
+                                 "failed to satisfy constraint: Member must not be null"), i
+    for i, tags_xml in enumerate(["", "<Tags><Items><Tag><Key>a#b</Key><Value>x</Value></Tag></Items></Tags>"]):
+        name = f"cf-raw-b64-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, "<FunctionCode>!!!not-base64!!!</FunctionCode>", config, tags_xml)) == (
+            400, "MalformedInput", "Invalid Base64 encoding"), i
+    assert _cf_raw_create_function(body("", with_code, config, "<Tags><Items><Tag>x</Tag></Items></Tags>").replace(
+        "<Name></Name>", "")) == (400, "MalformedInput", "Unexpected complex element termination")
+    bad_code = "<FunctionCode>!!!not-base64!!!</FunctionCode>"
+    parse_tags = "<Tags><Items><Tag>x</Tag></Items></Tags>"
+    for i, xml in enumerate([body(f"cf-b64-a-{i}", bad_code, config, parse_tags),
+                             body(f"cf-b64-b-{i}", "", config, parse_tags).replace(config, parse_tags + bad_code + config, 1)
+                             .replace(parse_tags + "</CreateFunctionRequest>", "</CreateFunctionRequest>")]):
+        assert _cf_raw_create_function(xml) == (400, "MalformedInput", "Unexpected complex element termination"), i
+    null_name = "Value null at 'name' failed to satisfy constraint: Member must not be null"
+    empty_name = ("Value '' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 1; "
+                  "Value '' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: "
+                  "[a-zA-Z0-9-_]{1,64}")
+    no_name = body("x", with_code, config, "").replace("<Name>x</Name>", "")
+    assert _cf_raw_create_function(no_name) == (400, "MalformedXML", f"1 validation error detected: {null_name}")
+    assert _cf_raw_create_function(body("x", with_code, config, long_items).replace("<Name>x</Name>", "")) == (
+        400, "MalformedXML", f"2 validation errors detected: {null_name}; {key_error}")
+    assert _cf_raw_create_function(body("", with_code, config, long_items)) == (
+        400, "MalformedXML", f"3 validation errors detected: {empty_name}; {key_error}")
+    name = f"cf-raw-dup-{_uuid_mod.uuid4().hex[:8]}"
+    assert _cf_raw_create_function(body(name, with_code, config, "<Tags><Items><Foo><Key>d</Key><Value>1</Value></Foo>"
+                                        "<Tag><Key>d</Key><Value>2</Value></Tag></Items></Tags>")) == (
+        400, "InvalidTagging", "Duplicate tag key: 'd'.")
+    accepted = [
+        ("<Tags><Tag><Key>aws:x</Key><Value>x</Value></Tag><Tag><Key>dup</Key><Value>a</Value></Tag>"
+         "<Tag><Key>dup</Key><Value>b</Value></Tag></Tags>", []),
+        ("<Tags><Tag><Key>team</Key><Value>edge</Value></Tag></Tags>", []),
+        ("<Tags><Items><Tag><Key>a</Key><Value>b</Value></Tag><Foo><Key>x</Key></Foo></Items></Tags>",
+         [{"Key": "a", "Value": "b"}, {"Key": "x", "Value": ""}]),
+        ("<Tags><Items><Tag><Key>a</Key><Value>b</Value></Tag>stray text</Items></Tags>", [{"Key": "a", "Value": "b"}]),
+        ("<Tags><Items><Tag><Key>first</Key><Key>second</Key><Value>v</Value></Tag></Items></Tags>",
+         [{"Key": "second", "Value": "v"}]),
+        ("<Tags><Items><Tag><Key>k</Key><Value>v1</Value><Value>v2</Value></Tag></Items></Tags>",
+         [{"Key": "k", "Value": "v2"}]),
+        ("<Tags><Items><Tag>\n  <Key>k</Key>\n  <Value>v</Value>\n</Tag></Items></Tags>", [{"Key": "k", "Value": "v"}]),
+        ("<Tags><Items><Tag>junk<Key>k</Key>junk<Value>v</Value></Tag></Items></Tags>", [{"Key": "k", "Value": "v"}]),
+        ("<Tags><Items><Tag><Key>first</Key><Value>v</Value></Tag></Items>"
+         "<Items><Tag><Key>second</Key><Value>v</Value></Tag></Items></Tags>", [{"Key": "second", "Value": "v"}]),
+    ]
+    for i, (tags_xml, expected) in enumerate(accepted):
+        name = f"cf-raw-ok-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        try:
+            assert _cf_raw_create_function(body(name, with_code, config, tags_xml))[0] == 201, i
+            arn = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+            assert sorted(_cf_tag_items(cloudfront, arn), key=lambda t: t["Key"]) == expected, i
+        finally:
+            _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_update_function_invalid_base64(cloudfront):
+    """AWS: captured 2026-10-21 (2309-uncertainties L:cf-update-function-bad-base64)."""
+    import urllib.error
+    import urllib.request
+
+    from conftest import ENDPOINT
+    name = f"cf-update-b64-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<UpdateFunctionRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">'
+                "<FunctionCode>!!!not-base64!!!</FunctionCode><FunctionConfig><Comment></Comment>"
+                "<Runtime>cloudfront-js-2.0</Runtime></FunctionConfig></UpdateFunctionRequest>")
+        req = urllib.request.Request(f"{ENDPOINT}/2020-05-31/function/{name}", data=body.encode(), method="PUT", headers={
+            "Content-Type": "application/xml", "If-Match": fn["ETag"],
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/cloudfront/aws4_request, "
+                             "SignedHeaders=host, Signature=x"})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req)
+        text = exc.value.read().decode()
+        assert exc.value.code == 400
+        assert re.search(r"<Code>(.*?)</Code>", text).group(1) == "MalformedInput"
+        assert re.search(r"<Message>(.*?)</Message>", text).group(1) == "Invalid Base64 encoding"
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)

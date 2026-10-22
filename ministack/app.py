@@ -1881,12 +1881,22 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
     which AWS authorizes under that separate action.
     """
     from ministack.core.arn import execute_api_arn
+    from ministack.core.iam_evaluator import AuthError
     from ministack.core.responses import get_account_id
+    from ministack.core.sigv4 import foreign_authorization_failure
 
+    authorization = _execute_api_authorization_type(
+        api_id, stage, method, execute_path) if AUTH and iam_action == "execute-api:Invoke" else None
     # Only an AWS_IAM method reads the caller's signature and policies.
-    if AUTH and iam_action == "execute-api:Invoke" and _execute_api_authorization_type(
-            api_id, stage, method, execute_path) not in (None, "AWS_IAM"):
+    if authorization not in (None, "AWS_IAM"):
         return None
+    header = headers.get("authorization", "")
+    if authorization == "AWS_IAM" and header and not header.startswith("AWS4-HMAC-SHA256"):
+        # A REST method with AWS_IAM refuses an Authorization header that is not SigV4.
+        apigw_v1 = _get_module("apigateway_v1")
+        refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
+        if refused:
+            return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
     return _enforce_data_plane(
         "apigateway", iam_action, headers, query_params, "",
         resource_arn=execute_api_arn(
@@ -2232,7 +2242,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
-    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3`.
+    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3` or unsigned.
     access_point_region = access_point_alias = None
     ap_match = _ACCESS_POINT_HOST_RE.match(bucket)
     s3 = _get_module("s3")
@@ -2257,7 +2267,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         url = f"http://{host}{path}" + (f"?{query}" if query else "")
         return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
                                                      query_params, url)
-    if ap_match and s3.signed_service(headers, query_params) == "s3":
+    if ap_match and s3.signed_service(headers, query_params) in ("s3", None):
         target = s3.resolve_access_point_host(ap_match.group("name"), ap_match.group("account"),
                                               s3._signed_region(headers, query_params))
         if target is not None:
@@ -2875,6 +2885,7 @@ async def _dispatch_service_request(
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
+            iot_resource_arns,
             logs_service_context,
             request_tag_context,
             s3_access_point_resources,
@@ -2998,6 +3009,16 @@ async def _dispatch_service_request(
                         resource_arn=extra_arn,
                     )
                     if denied:
+                        break
+            # A thing-group membership call is also checked on the thing it names.
+            if service == "iot" and not denied:
+                for extra_arn in iot_resource_arns(method, path, body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn, service_context=service_context,
+                    )
+                    if denied:
+                        resource_arn = extra_arn  # named in the AccessDenied message
                         break
             if (
                 denied
