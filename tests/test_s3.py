@@ -18,7 +18,14 @@ import pytest
 import requests
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import inprocess_iam_user, make_client, patch_endpoint_dns, routed_request, sqs_policy_allow_s3
+from conftest import (
+    inprocess_iam_user,
+    make_client,
+    patch_endpoint_dns,
+    routed_request,
+    second_access_key,
+    sqs_policy_allow_s3,
+)
 
 from ministack.core.responses import AccountScopedDict, request_scope
 from ministack.services import iam as _iam_mod
@@ -10120,6 +10127,67 @@ def test_s3_mrap_end_to_end_routing_failover_and_replication(s3control_dns, mrap
     finally:
         _mrap_delete(ctl, name)
     assert _mrap_request(alias, "GET", "who.txt")[0] in (403, 404)
+
+
+def _mrap_signed_request(credentials, alias, method, target, body=b""):
+    """A SigV4-signed request through the MRAP hostname: status and body."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    host = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    request = AWSRequest(method, f"{ENDPOINT.rstrip('/')}{target}", data=body,
+                         headers={"host": host, "x-amz-content-sha256": hashlib.sha256(body).hexdigest()})
+    S3SigV4Auth(Credentials(*credentials), "s3", "us-east-1").add_auth(request)
+    response = requests.request(method, request.url, data=body, headers=dict(request.headers.items()), timeout=30)
+    return response.status_code, response.content
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("grant,denied_on", [
+    ("none", "bucket"), ("mrap", "bucket"), ("bucket", "mrap"), ("both", None), ("mrap-policy", None),
+])
+def test_s3_mrap_requests_are_authorized_on_the_bucket_and_the_mrap(
+        auth_enabled, iam_user, s3control_dns, mrap_members, grant, denied_on):
+    """Through an MRAP, S3 checks the member bucket first and then the MRAP; an MRAP policy can allow the latter."""
+    _, use1_bucket, _, _ = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    name = _mrap_name()
+    _mrap_create(ctl, name, [use1_bucket])
+    alias = ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)["AccessPoint"]["Alias"]
+    mrap_arn = f"arn:aws:s3::{_ACCOUNT}:accesspoint/{alias}"
+    bucket_arn = f"arn:aws:s3:::{use1_bucket}"
+
+    def allow(prefix):
+        return [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"{prefix}/*"},
+                {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": prefix}]
+
+    identity = {"none": [], "mrap": allow(mrap_arn), "bucket": allow(bucket_arn), "both": allow(mrap_arn)
+                + allow(bucket_arn), "mrap-policy": allow(bucket_arn)}[grant]
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": identity} if identity else None)
+        if grant == "mrap-policy":
+            statements = [{**s, "Principal": {"AWS": user.arn}} for s in allow(mrap_arn)]
+            ctl.put_multi_region_access_point_policy(
+                AccountId=_ACCOUNT, ClientToken=_uuid_mod.uuid4().hex,
+                Details={"Name": name, "Policy": json.dumps({"Version": "2012-10-17", "Statement": statements})})
+        with second_access_key(user) as credentials:
+            for action, method, target, body, resource in [
+                ("GetObject", "GET", "/who.txt", b"", "/who.txt"),
+                ("PutObject", "PUT", "/mrap-put.txt", b"x", "/mrap-put.txt"),
+                ("ListBucket", "GET", "/?list-type=2", b"", ""),
+            ]:
+                status, data = _mrap_signed_request(credentials, alias, method, target, body)
+                if not auth_enabled or denied_on is None:
+                    assert status == 200, data
+                    continue
+                arn = (bucket_arn if denied_on == "bucket" else mrap_arn + ("/object" if resource else "")) + resource
+                assert status == 403 and ElementTree.fromstring(data).findtext("Code") == "AccessDenied"
+                assert ElementTree.fromstring(data).findtext("Message") == (
+                    f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" '
+                    f"because no identity-based policy allows the s3:{action} action")
+    finally:
+        _mrap_delete(ctl, name)
 
 
 # IAM contracts, run by CI with AUTH=false and AUTH=true.

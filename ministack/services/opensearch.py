@@ -140,10 +140,10 @@ def reset():
     _domain_packages.clear()
     docker = _get_docker()
     if docker is not None:
-        for c in docker.containers.list(
-            all=True,
-            filters={"label": "com.ministack.service=opensearch"},
-        ):
+        for c in docker.containers.list(all=True, filters={"label": [
+            "com.ministack.service=opensearch",
+            f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]}):
             try:
                 c.stop(timeout=2)
                 c.remove(force=True, v=True)

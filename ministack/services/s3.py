@@ -1087,8 +1087,17 @@ def _bucket_owner_account(name: str) -> str | None:
     return None
 
 
+# A Multi-Region Access Point or an object through it: arn:aws:s3::<account>:accesspoint/<alias>[/object/<key>].
+_MRAP_RESOURCE_ARN_RE = re.compile(
+    r"^arn:aws:s3::(\d{12}):accesspoint/([a-z][a-z0-9]*\.mrap)(?:/object/.*)?$", re.DOTALL)
+
+
 def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
-    """The bucket policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    """The bucket (or MRAP) policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    mrap = _MRAP_RESOURCE_ARN_RE.match(resource_arn)
+    if mrap:
+        record = find_mrap(mrap.group(2)) if mrap.group(1) == get_account_id() else None
+        return (record.get("Policy") or "", mrap.group(1)) if record else None
     if not resource_arn.startswith("arn:aws:s3:::"):
         return None
     bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]
@@ -1285,6 +1294,26 @@ def _check_bucket_region(method: str, bucket: str, key: str, headers: dict, quer
     if home is None or home == signed:
         return None
     return region_mismatch_error(method, bucket, key, headers, query_params, signed, home)
+
+
+def _region_set_mismatch(bucket: str, key: str, headers: dict, query_params: dict, home: str | None = None):
+    """Under AUTH=true, refuse a SigV4a request whose region set leaves out the bucket's (or access point's) region."""
+    from ministack.app import AUTH
+    from ministack.core.sigv4 import SIGV4A, region_set_covers
+
+    if not AUTH or not bucket:
+        return None
+    if headers.get("authorization", "").startswith(SIGV4A):
+        region_set = headers.get("x-amz-region-set", "")
+    elif (_qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")) == SIGV4A:
+        region_set = _qp(query_params, "X-Amz-Region-Set", "") or _qp(query_params, "x-amz-region-set", "")
+    else:
+        return None
+    home = home or bucket_region(bucket)
+    if home is None or region_set_covers(region_set, home):
+        return None
+    return _error("RegionSetMismatch", "The provided X-Amz-Region-Set doesn't match against the requested S3 region.",
+                  400, f"/{bucket}/{key}" if key else f"/{bucket}")
 
 
 def region_mismatch_error(method: str, bucket: str, key: str, headers: dict, query_params: dict,
@@ -2463,6 +2492,8 @@ async def handle_request(
         return denied
 
     denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
+    if denied is None:
+        denied = _region_set_mismatch(bucket, key, headers, query_params, home=access_point_region)
     if denied is None and enforce_bucket_region:
         # After the scope is pinned, so the owner's record names the home region.
         denied = _check_bucket_region(method, bucket, key, headers, query_params, home=access_point_region)

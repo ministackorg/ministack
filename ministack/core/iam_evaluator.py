@@ -1282,11 +1282,14 @@ def pin_signed_request(
 
     _verified_key.set("")
     authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
-    presigned = not authorization.startswith("AWS4-HMAC-SHA256") and _query_signed(query_params)
+    payload_hash = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"x-amz-content-sha256"), b""))
+    presigned = not authorization.startswith("AWS4-HMAC-SHA256") and (
+        _query_signed(query_params) or _sigv4a_s3_presign(query_params))
     access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
     # The key the policy check will use; it must be the one the signature is checked for.
     claimed = extract_access_key_id({"authorization": authorization}, query_params)
-    verifiable = (authorization.startswith("AWS4-HMAC-SHA256") or presigned) and bool(claimed) and access_key_id == claimed
+    header_signed = authorization.startswith("AWS4-HMAC-SHA256") or _sigv4a_header(authorization, payload_hash)
+    verifiable = (header_signed or presigned) and bool(claimed) and access_key_id == claimed
     sigv2 = authorization.startswith("AWS ") or bool(
         _query_value(query_params or {}, "AWSAccessKeyId") and _query_value(query_params or {}, "Signature")
         and not _query_value(query_params or {}, "SignatureVersion"))
@@ -1386,6 +1389,25 @@ def _s3_presigned_query(query_params: dict) -> bool:
             and len(scope) == 5 and scope[3] == "s3" and bool(_query_value(query_params, "X-Amz-Signature")))
 
 
+def _sigv4a_header(authorization: str, payload_hash: str) -> bool:
+    """A SigV4a header signature that signs its region set and does not sign its body in chunks."""
+    from ministack.core.sigv4 import SIGV4A
+
+    if not authorization.startswith(SIGV4A + " "):
+        return False
+    fields = dict(part.strip().partition("=")[::2] for part in authorization.split(" ", 1)[1].split(","))
+    return ("x-amz-region-set" in fields.get("SignedHeaders", "").split(";")
+            and not payload_hash.startswith("STREAMING-AWS4-ECDSA"))
+
+
+def _sigv4a_s3_presign(query_params: dict) -> bool:
+    """A SigV4a presigned S3 URL; the S3 handler checks only SigV4 ones itself."""
+    from ministack.core.sigv4 import SIGV4A
+
+    scope = _query_value(query_params or {}, "X-Amz-Credential").split("/")
+    return _query_value(query_params or {}, "X-Amz-Algorithm") == SIGV4A and len(scope) == 4 and scope[2] == "s3"
+
+
 def _query_signed(query_params: dict) -> bool:
     """A SigV4 query-string signature; S3 checks its own presigned URLs."""
     def value(name):
@@ -1424,11 +1446,13 @@ def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None
 
 def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
     """Check the pinned request's time, session token and signature: its credential, a failure, or None."""
-    from ministack.core.responses import _account_from_sts_session
+    from ministack.core.responses import _account_from_sts_session, get_region
     from ministack.core.sigv4 import (
         header_signature_failure,
         parse_header_signature,
         parse_query_signature,
+        presigned_request_is_expired,
+        region_set_covers,
         request_time_failure,
     )
 
@@ -1446,9 +1470,24 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
         signature = parse_header_signature(request.headers)
     if isinstance(signature, tuple):
         return AuthError(*signature)
-    skewed = request_time_failure(signature)
-    if skewed:
-        return AuthError(*skewed)
+    if request.presigned and signature.region_set is not None:
+        # A SigV4a presigned URL is good until its X-Amz-Expires, however long ago it was signed.
+        expires = _query_value(request.query_params, "X-Amz-Expires")
+        try:
+            expired = bool(expires) and presigned_request_is_expired(signature.amz_date, expires)
+        except ValueError:
+            expired = True
+        if expired:
+            return AuthError("RequestExpired", "Request has expired")
+    else:
+        skewed = request_time_failure(signature)
+        if skewed:
+            return AuthError(*skewed)
+    if signature.region_set is not None and signature.service != "s3" and not region_set_covers(
+            signature.region_set, get_region()):
+        # A region set without the region serving the request is refused like an unknown key; S3 checks its own.
+        unknown = _unknown_access_key()
+        return AuthError(unknown.code, unknown.message)
     if request.presigned:
         token = (request.query_params.get("X-Amz-Security-Token") or [""])[0]
     else:

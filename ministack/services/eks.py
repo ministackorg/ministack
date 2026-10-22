@@ -631,12 +631,15 @@ def _start_k3s_container(
 
 
 def _stop_all_k3s():
-    """Stop all k3s containers managed by MiniStack."""
+    """Stop the k3s containers this MiniStack manages."""
     client = _get_docker()
     if not client:
         return
     try:
-        for c in client.containers.list(filters={"label": "ministack=eks"}):
+        for c in client.containers.list(filters={"label": [
+            "ministack=eks",
+            f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]}):
             try:
                 c.stop(timeout=5)
                 c.remove(v=True, force=True)
