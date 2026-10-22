@@ -5732,6 +5732,32 @@ def test_s3_put_object_with_explicit_sha256_value_validated(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def test_s3_complete_multipart_upload_checks_mpu_object_size(s3):
+    """CompleteMultipartUpload compares x-amz-mp-object-size (MpuObjectSize) with
+    the assembled size: a mismatch is 400 InvalidRequest, creates no object and
+    leaves the upload open, and the right size completes as usual."""
+    bucket = "mpu-object-size-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"x" * 10
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="obj")["UploadId"]
+    etag = s3.upload_part(Bucket=bucket, Key="obj", UploadId=uid, PartNumber=1, Body=body)["ETag"]
+    parts = {"Parts": [{"PartNumber": 1, "ETag": etag}]}
+
+    with pytest.raises(ClientError) as exc:
+        s3.complete_multipart_upload(Bucket=bucket, Key="obj", UploadId=uid,
+                                     MultipartUpload=parts, MpuObjectSize=len(body) + 1)
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="obj")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert s3.list_parts(Bucket=bucket, Key="obj", UploadId=uid)["Parts"][0]["Size"] == len(body)
+
+    s3.complete_multipart_upload(Bucket=bucket, Key="obj", UploadId=uid,
+                                 MultipartUpload=parts, MpuObjectSize=len(body))
+    assert s3.head_object(Bucket=bucket, Key="obj")["ContentLength"] == len(body)
+
+
 def test_s3_multipart_checksum_sha256_composite(s3):
     """A checksummed multipart upload carries its parts' checksums through to
     a composite on the completed object: the part echoes its own, the
