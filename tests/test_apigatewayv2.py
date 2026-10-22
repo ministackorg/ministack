@@ -92,17 +92,19 @@ def _start_echo_server():
 def _make_signed_token(claims: dict) -> str:
     from ministack.services import cognito as _cognito
 
-    if _cognito._RSA_PRIVATE_KEY is None:
+    pool_id = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    key, jwk = _cognito._pool_signing_key(pool_id, "id" if claims.get("token_use") == "id" else "access")
+    if key is None:
         pytest.skip("cryptography-backed Cognito signing key unavailable")
 
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    header = {"alg": "RS256", "kid": "ministack-key-1"}
+    header = {"alg": "RS256", "kid": jwk["kid"]}
     h = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
     p = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
     signed = f"{h}.{p}".encode()
-    sig = _cognito._RSA_PRIVATE_KEY.sign(signed, padding.PKCS1v15(), hashes.SHA256())
+    sig = key.sign(signed, padding.PKCS1v15(), hashes.SHA256())
     s = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
     return f"{h}.{p}.{s}"
 
