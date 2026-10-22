@@ -8544,6 +8544,24 @@ def _complete_multipart_upload(
         # functionality) for the completed multipart object.
         part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
 
+    # A declared x-amz-mp-object-size that differs from the parts' total is refused.
+    declared_size = (headers or {}).get("x-amz-mp-object-size")
+    if declared_size is not None:
+        try:
+            declared = int(declared_size)
+        except ValueError:
+            return _error("InvalidRequest", f"Value for x-amz-mp-object-size header is invalid: '{declared_size}'",
+                          400, f"/{bucket_name}/{key}")
+        actual_size = sum(len(part_body) for part_body in combined_parts)
+        if declared != actual_size:
+            return _error(
+                "InvalidRequest",
+                f"The provided 'x-amz-mp-object-size' header value {declared_size} does not match "
+                f"what was computed: {actual_size}",
+                400,
+                f"/{bucket_name}/{key}",
+            )
+
     composite = _composite_checksum(checksum_algorithm, part_digests)
     if checksum_algorithm:
         requested = (headers or {}).get(f"x-amz-checksum-{checksum_algorithm.lower()}")
