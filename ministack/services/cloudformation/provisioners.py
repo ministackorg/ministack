@@ -10836,7 +10836,17 @@ def _apigw_v2_stage_props(props):
         "description": props.get("Description", ""),
         "defaultRouteSettings": props.get("DefaultRouteSettings", {}),
         "routeSettings": props.get("RouteSettings", {}),
+        "accessLogSettings": _apigw_v2_access_log_settings(props.get("AccessLogSettings")),
+        "clientCertificateId": props.get("ClientCertificateId"),
+        "deploymentId": props.get("DeploymentId"),
     }
+
+
+def _apigw_v2_access_log_settings(settings):
+    if not settings:
+        return None
+    return {k: settings[key] for k, key in (("destinationArn", "DestinationArn"), ("format", "Format"))
+            if settings.get(key)}
 
 
 def _apigw_v2_stage_create(logical_id, props, stack_name):
@@ -11063,6 +11073,8 @@ def _apigw_v2_route_props(props):
         "operationName": props.get("OperationName", ""),
         "requestModels": props.get("RequestModels", {}),
         "requestParameters": props.get("RequestParameters", {}),
+        "modelSelectionExpression": props.get("ModelSelectionExpression"),
+        "routeResponseSelectionExpression": props.get("RouteResponseSelectionExpression"),
     }
 
 
