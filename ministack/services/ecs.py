@@ -3537,7 +3537,7 @@ def reset():
 
     docker_client = _get_docker()
     if docker_client:
-        # Stop + remove every ministack=ecs container (running OR exited).
+        # Stop + remove this instance's ministack=ecs containers (running OR exited).
         # Including exited ones matters because short-lived commands
         # (echo, wget probes) leave Exited containers behind that otherwise
         # only the background reaper would remove.
@@ -3547,7 +3547,10 @@ def reset():
             # run's worth of tasks one at a time is tens of seconds during which
             # every other request is blocked.
             container_reaper.drop_containers(
-                docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}),
+                docker_client.containers.list(all=True, filters={"label": [
+                    "ministack=ecs",
+                    f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+                ]}),
                 stop_timeout=2, force=True)
         except Exception:
             pass

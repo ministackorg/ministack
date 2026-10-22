@@ -1877,15 +1877,53 @@ def _delete_thing_group(name: str) -> tuple:
     return json_response({})
 
 
+_MEMBERSHIP_ARN_ERRORS = {
+    "thingGroup": ("thinggroup", "Invalid ThingGroupArn",
+                   "ThingGroupName from thingGroupArn does not match specified thingGroupName in request"),
+    "thing": ("thing", "Invalid ThingArn", "ThingName in thingArn does not match specified thingName in request"),
+}
+
+
+def _membership_name(payload: dict, field: str) -> tuple[str, tuple | None]:
+    """The thing group or thing (``field``) a membership call names by name or ARN, or the call's refusal."""
+    rtype, invalid, mismatch = _MEMBERSHIP_ARN_ERRORS[field]
+    name, arn = payload.get(f"{field}Name"), payload.get(f"{field}Arn")
+    if not arn:
+        if name:
+            return name, None
+        message = f"Both {field}Arn and {field}Name are empty. Need to specify at least one of them"
+        return "", error_response_json("InvalidRequestException", message, 400)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return "", error_response_json("InvalidRequestException", "Invalid arn in request", 400)
+    if spec.account_id != get_account_id():
+        return "", error_response_json(
+            "InvalidRequestException", "ResourceArn doesn't belong in requester's account", 400)
+    # The ARN's region is not checked: the call acts on the resource of its own region.
+    if spec.service != "iot" or not spec.resource.startswith(f"{rtype}/"):
+        return "", error_response_json("InvalidRequestException", invalid, 400)
+    arn_name = spec.resource[len(rtype) + 1:]
+    if name and name != arn_name:
+        return "", error_response_json("InvalidRequestException", mismatch, 400)
+    return arn_name, None
+
+
+def _membership_names(payload: dict) -> tuple[str, str, tuple | None]:
+    """The thing group and the thing a membership call names, or its refusal (the group's first)."""
+    gname, error = _membership_name(payload, "thingGroup")
+    if error:
+        return "", "", error
+    tname, error = _membership_name(payload, "thing")
+    return gname, tname, error
+
+
 async def _add_thing_to_group(payload: dict) -> tuple:
     """Async because a CONTINUOUS job the thing joins publishes
     jobs/notify(-next) through the broker."""
-    gname = payload.get("thingGroupName")
-    tname = payload.get("thingName")
-    if not gname or not tname:
-        return error_response_json(
-            "InvalidRequestException", "thingGroupName and thingName are required", 400
-        )
+    gname, tname, error = _membership_names(payload)
+    if error:
+        return error
     group = _thing_groups.get(gname)
     if group is None:
         return _error_not_found("ThingGroupMember", gname)
@@ -1909,15 +1947,16 @@ async def _add_thing_to_group(payload: dict) -> tuple:
 async def _remove_thing_from_group(payload: dict) -> tuple:
     """Async because a QUEUED CONTINUOUS execution the removal retires
     publishes jobs/notify(-next) through the broker."""
-    gname = payload.get("thingGroupName")
-    tname = payload.get("thingName")
-    group = _thing_groups.get(gname) if gname else None
-    thing = _things.get(tname) if tname else None
+    gname, tname, error = _membership_names(payload)
+    if error:
+        return error
+    group = _thing_groups.get(gname)
+    thing = _things.get(tname)
     if thing is None:
-        return _error_not_found("Thing", tname or "")
+        return _error_not_found("Thing", tname)
     if group is None:
-        # Only a named group that does not exist answers 200; a group ARN is not resolved.
-        return json_response({}) if gname else _error_not_found("ThingGroup", "")
+        # A group that does not exist answers 200.
+        return json_response({})
     prev_next = jobs_first_pending_job_id(tname)
     left = tname in group.get("things", [])
     if left:

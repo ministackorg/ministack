@@ -956,8 +956,57 @@ def test_iot_thing_group_membership(iot_client):
     iot_client.delete_thing_group(thingGroupName=gname)
 
 
+def test_iot_thing_group_membership_by_arn(iot_client):
+    """Either side may be named by ARN; a name and an ARN must agree, and the ARN's region is not checked."""
+    gname, other, tname = _unique("group"), _unique("group"), _unique("thing")
+    group = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    other_group = iot_client.create_thing_group(thingGroupName=other)["thingGroupArn"]
+    thing = iot_client.create_thing(thingName=tname)["thingArn"]
+    _, _, _, region, account, _ = group.split(":", 5)
+    elsewhere = group.replace(f":{region}:", ":eu-west-3:" if region != "eu-west-3" else ":us-east-1:")
+    foreign = group.replace(f":{account}:", ":123456789012:" if account != "123456789012" else ":210987654321:")
+    try:
+        for kwargs in ({"thingGroupArn": group, "thingArn": thing},
+                       {"thingGroupArn": elsewhere, "thingName": tname},
+                       {"thingGroupName": gname, "thingGroupArn": group, "thingName": tname, "thingArn": thing}):
+            iot_client.add_thing_to_thing_group(**kwargs)
+            assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+            iot_client.remove_thing_from_thing_group(**kwargs)
+            assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        refused = (
+            ({"thingGroupName": gname, "thingGroupArn": other_group, "thingName": tname},
+             "ThingGroupName from thingGroupArn does not match specified thingGroupName in request"),
+            ({"thingGroupName": gname, "thingName": _unique("thing"), "thingArn": thing},
+             "ThingName in thingArn does not match specified thingName in request"),
+            ({"thingName": tname},
+             "Both thingGroupArn and thingGroupName are empty. Need to specify at least one of them"),
+            ({"thingGroupName": gname}, "Both thingArn and thingName are empty. Need to specify at least one of them"),
+            ({"thingGroupArn": thing, "thingName": tname}, "Invalid ThingGroupArn"),
+            ({"thingGroupName": gname, "thingArn": group}, "Invalid ThingArn"),
+            ({"thingGroupArn": gname, "thingName": tname}, "Invalid arn in request"),
+            ({"thingGroupArn": foreign, "thingName": tname}, "ResourceArn doesn't belong in requester's account"),
+        )
+        for kwargs, message in refused:
+            for call in (iot_client.add_thing_to_thing_group, iot_client.remove_thing_from_thing_group):
+                with pytest.raises(ClientError) as ei:
+                    call(**kwargs)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 400
+                assert (error["Error"]["Code"], error["Error"]["Message"]) == ("InvalidRequestException", message)
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        unknown = f"{group.rsplit('/', 1)[0]}/{_unique('group')}"
+        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+            iot_client.add_thing_to_thing_group(thingGroupArn=unknown, thingName=tname)
+    finally:
+        iot_client.delete_thing_group(thingGroupName=gname)
+        iot_client.delete_thing_group(thingGroupName=other)
+        iot_client.delete_thing(thingName=tname)
+
+
 def test_iot_remove_thing_from_an_unknown_thing_group_succeeds(iot_client):
-    """An unknown group name answers 200; an unknown thing, or no group name at all, is refused."""
+    """An unknown group, by name or by ARN, answers 200; an unknown thing is refused."""
     tname, gname = _unique("thing"), _unique("group")
     iot_client.create_thing(thingName=tname)
     resp = iot_client.remove_thing_from_thing_group(thingGroupName=_unique("group"), thingName=tname)
@@ -965,11 +1014,12 @@ def test_iot_remove_thing_from_an_unknown_thing_group_succeeds(iot_client):
     with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
         iot_client.remove_thing_from_thing_group(thingGroupName=_unique("group"), thingName=_unique("thing"))
     group_arn = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    unknown_arn = f"{group_arn.rsplit('/', 1)[0]}/{_unique('group')}"
+    resp = iot_client.remove_thing_from_thing_group(thingGroupArn=unknown_arn, thingName=tname)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
     iot_client.add_thing_to_thing_group(thingGroupName=gname, thingName=tname)
-    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
-        iot_client.remove_thing_from_thing_group(thingGroupArn=group_arn, thingName=tname)
-    assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
-    iot_client.remove_thing_from_thing_group(thingGroupName=gname, thingName=tname)
+    iot_client.remove_thing_from_thing_group(thingGroupArn=group_arn, thingName=tname)
+    assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
     iot_client.delete_thing_group(thingGroupName=gname)
     iot_client.delete_thing(thingName=tname)
 
@@ -1009,6 +1059,48 @@ def test_iot_thing_group_membership_authorizes_on_the_group_and_the_thing(auth_e
                     assert f" iot:{action} on resource: {denied_on} " in error["Error"]["Message"]
                 else:
                     assert call(thingGroupName=gname, thingName=tname)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+    finally:
+        iot_client.delete_thing_group(thingGroupName=gname)
+        iot_client.delete_thing(thingName=tname)
+
+
+@pytest.mark.auth_contract
+def test_iot_thing_group_membership_by_arn_authorizes_the_resources_it_names(auth_enabled, iam_user, iot_client):
+    """A group ARN of another region is checked, and acted on, as the group of the request's region."""
+    gname, tname = _unique("group"), _unique("thing")
+    group = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    thing = iot_client.create_thing(thingName=tname)["thingArn"]
+    region = group.split(":")[3]
+    elsewhere = group.replace(f":{region}:", ":eu-west-3:" if region != "eu-west-3" else ":us-east-1:")
+
+    def client(*resources):
+        return iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["iot:AddThingToThingGroup", "iot:RemoveThingFromThingGroup"],
+            "Resource": list(resources),
+        }]}).client("iot")
+
+    try:
+        allowed = client(group, thing)
+        for body in ({"thingGroupArn": group, "thingArn": thing}, {"thingGroupArn": elsewhere, "thingArn": thing}):
+            allowed.add_thing_to_thing_group(**body)
+            assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+            allowed.remove_thing_from_thing_group(**body)
+            assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        # A grant on the other region's ARN does not cover the group the call acts on.
+        user = client(elsewhere, thing)
+        for action, call in (("AddThingToThingGroup", user.add_thing_to_thing_group),
+                             ("RemoveThingFromThingGroup", user.remove_thing_from_thing_group)):
+            if auth_enabled:
+                with pytest.raises(ClientError) as ei:
+                    call(thingGroupArn=elsewhere, thingName=tname)
+                error = ei.value.response
+                assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert error["Error"]["Code"] == "AccessDeniedException"
+                assert f" iot:{action} on resource: {group} " in error["Error"]["Message"]
+            else:
+                assert call(thingGroupArn=elsewhere, thingName=tname)["ResponseMetadata"]["HTTPStatusCode"] == 200
         assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
     finally:
         iot_client.delete_thing_group(thingGroupName=gname)

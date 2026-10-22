@@ -2448,6 +2448,7 @@ class TestResourceArn:
         for path in ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup"):
             for body in ({"thingGroupName": "fleet", "thingName": "dev-1"},
                          {"thingGroupArn": group, "thingArn": thing},
+                         {"thingGroupArn": group.replace("us-east-1", "eu-west-3"), "thingArn": thing},
                          {"thingGroupName": "fleet", "thingGroupArn": f"{head}:thinggroup/x", "thingName": "dev-1"}):
                 raw = json.dumps(body).encode()
                 assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == [group, thing]
