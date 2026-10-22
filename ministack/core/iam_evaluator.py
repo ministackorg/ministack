@@ -1619,6 +1619,11 @@ def enforce(access_key_id: str, iam_action: str, service: str,
 
     result = evaluate(ctx, principal.policies, *principal.limits)
     found = _resource_policy(service, resource_arn)
+    if found is None and service == "s3" and "s3:dataaccesspointarn" in context:
+        # A data request through an access point meets the access point policy on the access point ARN.
+        from ministack.services.s3 import access_point_policy_for_arn
+
+        found = access_point_policy_for_arn(resource_arn)
     if found is not None:
         result = combine_resource_policy(result, ctx, *found, required=service in _POLICY_REQUIRED,
                                          limits=principal.limits)
