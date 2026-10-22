@@ -5639,6 +5639,23 @@ def test_s3_block_public_access_settings_each_cover_their_own_grants(s3):
         _purge_foreign(owner, bucket)
 
 
+def test_s3_restrict_public_buckets_keeps_a_policy_that_is_not_public(s3):
+    """RestrictPublicBuckets drops only a public policy; a policy naming another account still grants it."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"bpa-named-{uuid.uuid4().hex[:8]}"
+    owner.create_bucket(Bucket=bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"k")
+        owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={"RestrictPublicBuckets": True})
+        owner.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::222222222222:root"}, "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bucket}/*"}]}))
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"k"
+    finally:
+        owner.delete_bucket_policy(Bucket=bucket)
+        _purge_foreign(owner, bucket)
+
+
 def test_s3_public_bucket_acl_grants_only_what_the_bucket_permissions_cover(s3):
     """Bucket READ lists and WRITE adds and removes objects; neither opens objects, configuration or the ACL."""
     owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
