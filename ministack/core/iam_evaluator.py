@@ -1662,6 +1662,8 @@ def enforce(access_key_id: str, iam_action: str, service: str,
 
     result = evaluate(ctx, principal.policies, *principal.limits)
     found = _resource_policy(service, resource_arn)
+    if found is not None and service == "s3" and "MultiRegionAccessPoint" in iam_action:
+        found = None  # The MRAP policy governs data requests, not S3 Control's MRAP calls.
     if found is None and service == "s3" and "s3:dataaccesspointarn" in context:
         if (iam_action in ("s3:PutBucketPolicy", "s3:DeleteBucketPolicy") and result.decision != "Deny"
                 and resource_arn == context["s3:dataaccesspointarn"]):

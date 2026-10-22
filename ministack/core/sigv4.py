@@ -145,9 +145,12 @@ def sigv4a_signing_key(access_key_id: str, secret: str):
 
 def sigv4a_signature_matches(access_key_id: str, secret: str, string_to_sign: str, signature: str) -> bool:
     """Whether a hex DER ECDSA signature signs the string with the key SigV4a derives."""
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+    except ImportError:  # cryptography ships in the images and the [full] extra; without it nothing verifies
+        return False
 
     try:
         sigv4a_signing_key(access_key_id, secret).public_key().verify(

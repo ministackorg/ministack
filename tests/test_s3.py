@@ -4550,6 +4550,9 @@ def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_t
     (3600, 840, None, None, None),
     (3600, 960, None, 403, "Request is not yet valid"),
     (3600, 0, ("X-Amz-Expires", "abc"), 400, "X-Amz-Expires should be a number"),
+    (3600, 0, ("X-Amz-Expires", "-1"), 400, "X-Amz-Expires must be non-negative"),
+    (3600, 0, ("X-Amz-Expires", None), 400, "requires the X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature, "
+                                            "X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters."),
     (3600, 0, ("X-Amz-Date", "2026"), 400, "X-Amz-Date must be in the ISO8601 Long Format"),
 ])
 def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, skew, change, status, code):
@@ -4574,7 +4577,9 @@ def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, s
         url = urlsplit(client.generate_presigned_url(
             "get_object", Params={"Bucket": "test-bucket", "Key": "object"}, ExpiresIn=expires))
     query = parse_qs(url.query)
-    if change:
+    if change and change[1] is None:
+        query.pop(change[0])
+    elif change:
         query[change[0]] = [change[1]]
 
     error = s3_svc._verify_presigned_sigv4("GET", url.path, {"host": url.netloc}, query)
@@ -4582,7 +4587,7 @@ def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, s
     if auth_enabled and status:
         assert error[0] == status and code in error[2].decode()
     elif change:
-        assert b"SignatureDoesNotMatch" in error[2]
+        assert error[0] == 403  # SignatureDoesNotMatch, or Request has expired for a negative X-Amz-Expires
     else:
         assert error is None
 

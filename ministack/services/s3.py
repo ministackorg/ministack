@@ -2232,9 +2232,15 @@ def _presign_time_error(amz_date: str, expires: str, path: str) -> tuple | None:
     except ValueError:
         return _error("AuthorizationQueryParametersError",
                       "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"", 400, path)
-    if expires and not expires.isdigit():
+    if not expires:
+        return _error("AuthorizationQueryParametersError",
+                      "Query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, "
+                      "X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters.", 400, path)
+    if expires.startswith("-") and expires[1:].isdigit():
+        return _error("AuthorizationQueryParametersError", "X-Amz-Expires must be non-negative", 400, path)
+    if not expires.isdigit():
         return _error("AuthorizationQueryParametersError", "X-Amz-Expires should be a number", 400, path)
-    if expires and int(expires) > _PRESIGN_MAX_EXPIRES:
+    if int(expires) > _PRESIGN_MAX_EXPIRES:
         return _error("AuthorizationQueryParametersError",
                       "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires "
                       f"must be less than {_PRESIGN_MAX_EXPIRES} seconds", 400, path)
@@ -2256,6 +2262,11 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     if not signature:
         return None  # not a presigned URL
     algorithm = _qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        # The IAM layer verifies a SigV4a signature; its query parameters follow the same rules.
+        return _presign_time_error(_qp(query_params, "X-Amz-Date", "") or _qp(query_params, "x-amz-date", ""),
+                                   _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", ""),
+                                   path)
     if algorithm != "AWS4-HMAC-SHA256":
         return None  # only SigV4 presigned URLs are verified
 
