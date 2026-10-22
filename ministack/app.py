@@ -2242,7 +2242,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
-    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3`.
+    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3` or unsigned.
     access_point_region = access_point_alias = None
     ap_match = _ACCESS_POINT_HOST_RE.match(bucket)
     s3 = _get_module("s3")
@@ -2267,7 +2267,7 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         url = f"http://{host}{path}" + (f"?{query}" if query else "")
         return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
                                                      query_params, url)
-    if ap_match and s3.signed_service(headers, query_params) == "s3":
+    if ap_match and s3.signed_service(headers, query_params) in ("s3", None):
         target = s3.resolve_access_point_host(ap_match.group("name"), ap_match.group("account"),
                                               s3._signed_region(headers, query_params))
         if target is not None:

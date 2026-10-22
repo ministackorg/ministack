@@ -204,6 +204,19 @@ def access_point_for_alias(alias: str) -> tuple[str, str, dict] | None:
                                    "s3:AccessPointNetworkOrigin": record["NetworkOrigin"]}
 
 
+def access_point_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The access point policy and owner for an IAM check on an access point ARN."""
+    try:
+        arn = parse_arn(resource_arn)
+    except ArnParseError:
+        return None
+    kind, _, rest = arn.resource.partition("/")
+    if arn.service != "s3" or kind != "accesspoint":
+        return None
+    record = resolve_access_point(rest.split("/", 1)[0], arn.account_id, arn.region)
+    return (record.get("Policy") or "", arn.account_id) if record else None
+
+
 def _resolve_copy_source_alias(headers: dict) -> tuple:
     """``(headers, denied)``: an ``x-amz-copy-source`` access point alias rewritten to its bucket."""
     source = headers.get("x-amz-copy-source", "")
@@ -228,7 +241,7 @@ def resolve_access_point_host(name: str, account_id: str, signed_region: str | N
     if not regions:
         return None
     if account_id != get_account_id():
-        # Access point policies aren't evaluated; another account is refused.
+        # Requests from another account through an access point are refused.
         return None, None, _error("AccessDenied", "Access Denied", 403, f"/{name}")
     region = signed_region if signed_region in regions else regions[0]
     return resolve_access_point(name, account_id, region)["Bucket"], region, None
@@ -2410,6 +2423,15 @@ async def handle_request(
     # them back in before routing so metadata, ACL, storage class and friends
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
+
+    if (access_point_region is not None or bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX)) and not internal:
+        from ministack.app import AUTH
+
+        if (AUTH and not _request_access_key(method, key, headers, query_params, body)
+                and (access_point_region is not None or resolve_access_point_alias(bucket))):
+            # Access points take signed requests only.
+            return _error("InvalidRequest", "The authorization mechanism you have provided is not supported. "
+                          "Please use Signature Version 4.", 400)
 
     # An Object Lambda Access Point alias goes to the Object Lambda flow.
     if bucket.endswith(_OBJECT_LAMBDA_ALIAS_SUFFIX):
