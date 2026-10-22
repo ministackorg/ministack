@@ -1988,6 +1988,10 @@ def _ws_route_authorization_error(api_id, route_key, authorization_type):
     return _apigw_error("BadRequestException", message, 400) if message else None
 
 
+_ROUTE_SELECTION_EXPRESSIONS = ("modelSelectionExpression", "routeResponseSelectionExpression")
+_STAGE_OPTIONAL_FIELDS = ("accessLogSettings", "clientCertificateId", "deploymentId")
+
+
 def _create_route(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
@@ -2010,6 +2014,9 @@ def _create_route(api_id, data):
         route["requestModels"] = data["requestModels"]
     if data.get("requestParameters"):
         route["requestParameters"] = data["requestParameters"]
+    for k in _ROUTE_SELECTION_EXPRESSIONS:
+        if data.get(k):
+            route[k] = data[k]
     _routes.setdefault(api_id, {})[route_id] = route
     return _apigw_response(route, 201)
 
@@ -2063,7 +2070,7 @@ def _update_route(api_id, route_id, data):
                 route.pop("authorizationScopes", None)
         else:
             route[k] = v
-    for rk in ("requestModels", "requestParameters"):
+    for rk in ("requestModels", "requestParameters", *_ROUTE_SELECTION_EXPRESSIONS):
         if rk not in data:
             continue
         v = data.get(rk)
@@ -2181,6 +2188,7 @@ def _create_stage(api_id, data):
         "routeSettings": data.get("routeSettings", {}),
         "tags": data.get("tags", {}),
     }
+    stage.update({k: data[k] for k in _STAGE_OPTIONAL_FIELDS if data.get(k)})
     _stages.setdefault(api_id, {})[stage_name] = stage
     if data.get("tags"):
         _api_tags[_api_resource_arn(api_id, "stages", stage_name)] = dict(data.get("tags", {}))
@@ -2212,6 +2220,13 @@ def _update_stage(api_id, stage_name, data):
               "defaultRouteSettings", "routeSettings"):
         if k in data:
             stage[k] = data[k]
+    for k in _STAGE_OPTIONAL_FIELDS:
+        if k not in data:
+            continue
+        if data[k]:
+            stage[k] = data[k]
+        else:
+            stage.pop(k, None)
     stage["lastUpdatedDate"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return _apigw_response(stage)
 
@@ -3050,8 +3065,11 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         if result.get("status") == "error":
             return {"statusCode": 500, "body": result.get("error", "")}
         return result.get("result", {})
-    # Image/unsupported runtime stub — success without body.
-    return {"statusCode": 200, "body": ""}
+    # Image and other runtimes run through the central dispatcher, as HTTP API routes do.
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-ws-invoke")
+    return lambda_svc.lambda_execute_result_to_api_proxy_response(result)[0]
 
 
 _WS_DENY_REASONS = {
@@ -3276,9 +3294,16 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
 
         disconnect_code = 1005  # 1005 = "no status rcvd" per RFC 6455, matches AWS default
         disconnect_reason = ""
+        # DeleteConnection sets close_event; the server then closes the socket.
+        closed_by_delete = asyncio.ensure_future(close_event.wait())
         try:
             while True:
-                message = await receive()
+                receiving = asyncio.ensure_future(receive())
+                await asyncio.wait({receiving, closed_by_delete}, return_when=asyncio.FIRST_COMPLETED)
+                if not receiving.done():
+                    receiving.cancel()
+                    break
+                message = receiving.result()
                 mtype = message.get("type")
                 if mtype == "websocket.disconnect":
                     disconnect_code = int(message.get("code", 1005) or 1005)
@@ -3317,12 +3342,17 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                         await send({"type": "websocket.send", "text": str(body)})
         finally:
             close_event.set()
+            closed_by_delete.cancel()
             try:
                 await drain_task
             except Exception:
                 pass
             _ws_connections.pop(connection_id, None)
-            # Fire $disconnect route best-effort.
+            # "The $disconnect route is executed after the connection is closed."
+            try:
+                await send({"type": "websocket.close", "code": 1000})
+            except Exception:
+                pass
             disconnect_route = _match_ws_route(api_id, "$disconnect")
             if disconnect_route is not None:
                 try:
@@ -3335,10 +3365,6 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     )
                 except Exception:
                     logger.exception("error firing $disconnect")
-            try:
-                await send({"type": "websocket.close", "code": 1000})
-            except Exception:
-                pass
     finally:
         try:
             _request_region.reset(region_token)
@@ -3367,7 +3393,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
     """
     conn = _ws_connections.get(connection_id)
     if not conn or conn.get("apiId") != api_id:
-        return 410, {"Content-Type": "application/json"}, json.dumps(
+        return 410, {"Content-Type": "application/json", "x-amzn-ErrorType": "GoneException"}, json.dumps(
             {"message": "GoneException"}
         ).encode()
 
@@ -3391,6 +3417,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
         return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
 
     if method == "DELETE":
+        _ws_connections.pop(connection_id, None)
         ev = conn.get("close_event")
         if ev is not None:
             try:

@@ -3127,13 +3127,12 @@ def test_lambda_rejects_cross_region_layers_on_create_and_update():
         east.delete_function(FunctionName=update_name)
 
 
-def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
-    """A foreign-account ARN with no grant behind it is refused.
-
-    The layer store is keyed by account and region, so rewriting the account
-    field of an ARN this account published must not hand back that layer's
-    content — and with no AddLayerVersionPermission statement naming the
-    caller, the attachment is denied on create and on update alike.
+def test_lambda_wrong_account_layer_attaches_empty_not_local_content(lam):
+    """Rewriting the account field of an ARN this account published must not hand
+    back that layer's content. The store is keyed by account and region, and
+    MiniStack holds no layer of that name in the other account, so the ARN
+    attaches as an empty layer, {Arn, CodeSize: 0}, on create and on update alike
+    (#2313 maintainer (3) and (4); the key set AWS gives an unsigned layer, C12).
     """
     suffix = _uuid_mod.uuid4().hex[:8]
 
@@ -3150,17 +3149,17 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
 
     create_name = f"wrong-account-layer-create-{suffix}"
     update_name = f"wrong-account-layer-update-{suffix}"
+    empty = [{"Arn": wrong_account_arn, "CodeSize": 0}]
     try:
-        with pytest.raises(ClientError) as create_exc:
-            lam.create_function(
-                FunctionName=create_name,
-                Runtime="python3.12",
-                Role=_LAMBDA_ROLE,
-                Handler="index.handler",
-                Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
-                Layers=[wrong_account_arn],
-            )
-        assert create_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        created = lam.create_function(
+            FunctionName=create_name,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            Layers=[wrong_account_arn],
+        )
+        assert created["Layers"] == empty
 
         lam.create_function(
             FunctionName=update_name,
@@ -3169,9 +3168,8 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
             Handler="index.handler",
             Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
         )
-        with pytest.raises(ClientError) as update_exc:
-            lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
-        assert update_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        updated = lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
+        assert updated["Layers"] == empty
 
         # The layer this account really published still resolves to its bytes.
         lam.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
@@ -3512,7 +3510,6 @@ def test_lambda_layer_version_arn_errors_do_not_fallback_to_local_layer(lam):
 
     bad_refs = [
         (wrong_region, "ResourceNotFoundException"),
-        (wrong_account, "AccessDeniedException"),
         (wrong_service, "ValidationException"),
         (missing_version, "ValidationException"),
     ]
@@ -3520,6 +3517,13 @@ def test_lambda_layer_version_arn_errors_do_not_fallback_to_local_layer(lam):
         with pytest.raises(ClientError) as exc:
             lam.get_layer_version_by_arn(Arn=layer_ref)
         assert exc.value.response["Error"]["Code"] == expected_code
+
+    # The same name in another account is a layer MiniStack does not hold: it reads
+    # as an empty version, never as this account's content (#2313 maintainer (3)).
+    other = lam.get_layer_version_by_arn(Arn=wrong_account)
+    other.pop("ResponseMetadata")
+    assert other == {"LayerArn": wrong_account.rsplit(":", 1)[0], "LayerVersionArn": wrong_account,
+                     "Version": pub["Version"], "Content": {"CodeSize": 0}}
 
     same_layer = lam.get_layer_version_by_arn(Arn=arn)
     assert same_layer["LayerVersionArn"] == arn
@@ -4828,6 +4832,10 @@ def test_esm_response_no_function_name_field(lam, sqs):
         sqs.delete_queue(QueueUrl=q_url)
 
 
+# Cross-account layers (#2313). Capture keys refer to the AWS captures listed in the issue's
+# evidence comment: "C.." (lambda-public-layer-accounts), "U.." (2313-uncertainties, -2),
+# "X:.." (2313-uncertainties-4) and "Y:.." (2313-uncertainties-5). "Maintainer (n)" is a
+# decision on the issue for what MiniStack cannot know offline.
 # CloudWatch Lambda Insights, the layer people reference cross-account; nothing resolves the version locally.
 _AWS_MANAGED_LAYER = "arn:aws:lambda:us-east-1:580247275435:layer:LambdaInsightsExtension:38"
 _OTHER_REGION_LAYER = "arn:aws:lambda:eu-central-1:580247275435:layer:LambdaInsightsExtension:38"
@@ -4915,27 +4923,52 @@ _DENIED = "AccessDeniedException"
     pytest.param("root-granted", f"arn:aws:iam::{_CALLER_ACCOUNT}:root", None, None, None,
                  id="account-root-arn-grant"),
     pytest.param("everyone-granted", "*", None, None, None, id="wildcard-grant"),
-    pytest.param("ungranted", None, None, _DENIED, _DENIED, id="no-grant"),
+    pytest.param("ungranted", None, None, _DENIED, _DENIED, id="no-grant"),  # C11
     pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
+    # A layer MiniStack holds refuses a version it does not hold, as AWS refuses a
+    # version that does not exist (C5, U10) (maintainer (1)).
     pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
-                 id="missing-version-of-known-layer"),
-    # A name AWS does not publish, under the same account: the gate is the layer
-    # NAME, so this is still denied.
-    pytest.param(None, None, _foreign_arn("not-an-aws-extension", 38), _DENIED, _DENIED,
-                 id="unknown-foreign-layer"),
-    # An extension AWS publishes itself carries a public grant on AWS, so a
-    # template referencing it deploys there. It resolves here too; the bytes are
-    # not available offline, so CodeSize is 0 and the extension does not run.
+                 id="missing-version-of-held-layer"),
+    # A layer MiniStack does not hold resolves as an empty version (maintainer (4)):
+    # a public vendor layer (Datadog, C1) or an AWS extension (C3) answers 200 on
+    # AWS, and offline a made-up ARN looks the same as a real one, though AWS
+    # refuses the made-up one (C5, C6). CodeSize is 0 and the layer does not run.
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "464622532012"), None, None,
+                 id="unheld-vendor-layer"),
+    pytest.param(None, None, _foreign_arn("example-missing", 99999, "111111111111"), None, None,
+                 id="unheld-made-up-layer"),
+    # C3 captured :68 on AWS (200); any version resolves here (maintainer (4)).
     pytest.param(None, None, _AWS_MANAGED_LAYER, None, None, id="aws-published-extension"),
+    # Another region is refused with the same denial on read and attach (C13, U6:cross-region).
     pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
+    # Versions and names that cannot exist on AWS are refused with the same denial,
+    # on read and attach (X:version-0, X:version-leading-zero, X:name-141-chars).
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 0, "464622532012"), _DENIED, _DENIED,
+                 id="version-0"),
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", "0101", "464622532012"), _DENIED, _DENIED,
+                 id="version-leading-zero"),
+    pytest.param(None, None, _foreign_arn("a" * 141, 1, "464622532012"), _DENIED, _DENIED, id="name-141-chars"),
+    # An ARN AWS rejects on shape (X:account-11-digits: 400 ValidationException) is not
+    # resolved empty; it keeps the denial it had before #2313.
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "46462253201"), _DENIED, _DENIED,
+                 id="malformed-account-keeps-denial"),
+    # 12 non-ASCII digits: AWS's \d is ASCII, so presumably 400 there too (inferred from X:account-letters).
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "\u0664" * 12), _DENIED, _DENIED,
+                 id="non-ascii-digit-account-keeps-denial"),
+    pytest.param(None, None, _foreign_arn("Datadog.Extension", 101, "464622532012"), _DENIED, _DENIED,
+                 id="name-with-dot-keeps-denial"),  # X:name-with-dot (AWS: 400 ValidationException)
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "464622532012").replace("arn:aws:", "arn:aws-cn:"),
+                 _DENIED, _DENIED, id="partition-cn-keeps-denial"),  # X:partition-cn (AWS: 400 / 500)
     pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
                  "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
 ])
 def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach_error, read_error):
-    """A grant makes stored foreign content attachable and readable. Without
-    one — no statement, a statement naming another account, or no layer of that
-    name at all — the attachment and the read are denied. The resolver does not
-    read AUTH (see the next test)."""
+    """A held foreign layer answers through its grant: AWS resolves a `*` grant (C12)
+    and denies an unshared layer (C11); account and root-ARN grants and a grant to
+    another account follow the policy evaluator. Denials carry AWS's
+    AccessDeniedException message (C11, C5, C13). A layer MiniStack does not hold
+    resolves empty (maintainer (4)). The resolver does not read AUTH (see the next
+    tests)."""
     arn = arn or _foreign_arn(layer_name)
     with _foreign_layer(layer_name, granted_to=granted_to):
         version_config, attach, payload, read = _layer_verdicts(arn)
@@ -4950,6 +4983,133 @@ def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach
         expected_size = _FOREIGN_CODE_SIZE if layer_name else 0
         assert (payload["LayerVersionArn"], payload["Content"]["CodeSize"]) == (arn, expected_size)
         assert not [key for key in payload if key.startswith("_")]
+
+
+_UNHELD_LAYER = "arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Extension-ARM:101"
+
+
+def test_lambda_unheld_cross_account_layer_reads_as_empty_version(caplog):
+    """GetLayerVersionByArn, and GetLayerVersion with the layer ARN as LayerName,
+    answer the same body, as on AWS (C14 calls[0] equals C1 calls[0]; maintainer (2)).
+    The body is the maintainer's empty layer (maintainer (3)): LayerArn derived from
+    the ARN as AWS derives it (C1), LayerVersionArn, Version, and Content.CodeSize 0
+    where AWS reports the real size. What only the publisher knows (C1: CodeSha256,
+    Location, CreatedDate, Description, CompatibleArchitectures, signing ARNs) is
+    left out. The log says the layer will not run."""
+    import ministack.services.lambda_svc as _lsvc
+    from ministack.core.responses import request_scope
+
+    expected = {"LayerArn": _UNHELD_LAYER.rsplit(":", 1)[0], "LayerVersionArn": _UNHELD_LAYER,
+                "Version": 101, "Content": {"CodeSize": 0}}
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION), caplog.at_level("WARNING", logger="lambda"):
+        by_arn = _lsvc._get_layer_version_by_arn(_UNHELD_LAYER)
+        by_name = _lsvc._get_layer_version(_UNHELD_LAYER.rsplit(":", 1)[0], 101)
+    for status, _headers, body in (by_arn, by_name):
+        assert status == 200, body
+        assert json.loads(body) == expected
+    assert any("is not held by MiniStack" in record.getMessage() and _UNHELD_LAYER in record.getMessage()
+               for record in caplog.records)
+
+
+def test_lambda_unheld_cross_account_layer_attaches(monkeypatch):
+    """CreateFunction, GetFunction, GetFunctionConfiguration and
+    UpdateFunctionConfiguration accept an unheld layer, as AWS does (C7 to C10: 201
+    and 200). AWS reports its real CodeSize and, for a signed layer, both signing
+    ARNs (C7 to C10). MiniStack reports {Arn, CodeSize: 0} (maintainer (3)), the key
+    set AWS gives an unsigned layer (C12)."""
+    import ministack.app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import lambda_svc
+
+    # In process, so the execution role is not created; AUTH=true would refuse it.
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    monkeypatch.setattr(lambda_svc, "_functions", AccountRegionScopedDict())
+    x86_layer = "arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Extension:101"
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        status, _headers, body = lambda_svc._create_function({
+            "FunctionName": "unheld-layer-fn", "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+            "Handler": "index.handler", "Layers": [_UNHELD_LAYER],
+            "Code": {"ZipFile": base64.b64encode(_make_zip("def handler(e, c): return 1")).decode()}})
+        assert status == 201, body
+        created = json.loads(body)
+        assert created["Layers"] == [{"Arn": _UNHELD_LAYER, "CodeSize": 0}]
+        _status, _headers, body = lambda_svc._get_function("unheld-layer-fn")
+        assert json.loads(body)["Configuration"]["Layers"] == [{"Arn": _UNHELD_LAYER, "CodeSize": 0}]
+        status, _headers, body = lambda_svc._update_config(
+            "unheld-layer-fn", {"Layers": [x86_layer]})
+        assert status == 200, body
+        assert json.loads(body)["Layers"] == [{"Arn": x86_layer, "CodeSize": 0}]
+        _status, _headers, body = lambda_svc._get_function_config("unheld-layer-fn")
+        assert json.loads(body)["Layers"] == [{"Arn": x86_layer, "CodeSize": 0}]
+
+
+_LAYER_ARN_PREFIX = "arn:aws:lambda:us-east-1:464622532012:layer:"  # 44 characters
+
+
+@pytest.mark.parametrize(("layer_name", "version", "expected_status"), [
+    pytest.param(_LAYER_ARN_PREFIX + "a" * 96, 1, 200, id="arn-140-chars"),   # Y:arn-total-140 (AWS 403; M(4))
+    pytest.param(_LAYER_ARN_PREFIX + "a" * 97, 1, 400, id="arn-141-chars"),   # Y:arn-total-141
+    pytest.param(_LAYER_ARN_PREFIX + "a" * 97, 0, 400, id="arn-141-chars-version-0"),  # Y:arn-total-141-version-0
+    pytest.param("a" * 141, 1, 400, id="bare-name-141-chars"),                # Y:bare-name-141
+    pytest.param("a" * 140, 1, 404, id="bare-name-140-chars"),                # Y:bare-name-140
+])
+def test_lambda_get_layer_version_layer_name_length(lam, layer_name, version, expected_status):
+    """GetLayerVersion limits the whole LayerName, a layer ARN included, to 140
+    characters, before it checks the version (Y:*). A layer ARN of 140 characters
+    goes on to the by-ARN path, where an unheld layer resolves empty (maintainer (4);
+    AWS answers 403 for this made-up name, Y:arn-total-140)."""
+    if expected_status == 200:
+        assert lam.get_layer_version(LayerName=layer_name, VersionNumber=version)["Content"] == {"CodeSize": 0}
+        return
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version(LayerName=layer_name, VersionNumber=version)
+    error = exc.value.response
+    assert error["ResponseMetadata"]["HTTPStatusCode"] == expected_status
+    if expected_status == 400:
+        assert error["Error"]["Code"] == "ValidationException"
+        assert error["Error"]["Message"] == (
+            f"1 validation error detected: Value '{layer_name}' at 'layerName' failed to satisfy "
+            "constraint: Member must have length less than or equal to 140")
+    else:
+        assert error["Error"]["Message"] == "The resource you requested does not exist."
+
+
+def test_lambda_get_layer_version_by_arn_has_no_layer_name_limit(lam):
+    """GetLayerVersionByArn has no LayerName member, so a 141-character name in
+    this account's ARN keeps the not-found answer it had before. AWS applies no
+    length check on the by-ARN path (X:name-141-chars, Y:arn-total-141 by_arn: 403
+    for a foreign ARN, past validation); the own-account 404 is main's behavior,
+    inferred to match, not captured."""
+    arn = f"arn:aws:lambda:us-east-1:{_CALLER_ACCOUNT}:layer:{'a' * 141}:1"
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_by_arn(Arn=arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_held_cross_account_layer_with_every_version_deleted_is_denied():
+    """A layer MiniStack holds whose versions were all deleted is still held, so the
+    reference is denied (maintainer (1)), as AWS denies a version that does not
+    exist (C5)."""
+    arn = _foreign_arn("all-deleted")
+    with _foreign_layer("all-deleted", granted_to="*") as version_config:
+        version_config["_deleted"] = True
+        _config, attach, payload, read = _layer_verdicts(arn)
+    assert attach == read == (_DENIED, _layer_access_denied(arn))
+    assert payload is None
+
+
+def test_lambda_layer_attached_empty_never_loads_content_later():
+    """A layer attached while MiniStack did not hold it stays empty at cold start,
+    even if a version is published under that ARN afterwards: its content was never
+    granted at attach time. MiniStack-only, following maintainer (0) ("not run");
+    nothing on AWS corresponds."""
+    import ministack.services.lambda_svc as _lsvc
+
+    arn = _foreign_arn("published-later")
+    with _foreign_layer("published-later", granted_to="*") as version_config:
+        version_config["_zip_data"] = b"layer-bytes"
+        assert _lsvc._resolve_layer_zip({"Arn": arn, "CodeSize": 0}) is None
+        assert _lsvc._resolve_layer_zip({"Arn": arn, "CodeSize": _FOREIGN_CODE_SIZE}) == b"layer-bytes"
 
 
 def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatch):

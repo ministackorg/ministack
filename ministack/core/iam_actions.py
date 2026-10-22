@@ -17,6 +17,8 @@ from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
 
+from ministack.core.arn import ArnParseError, parse_arn
+
 logger = logging.getLogger("ministack")
 
 # ---------------------------------------------------------------------------
@@ -1836,10 +1838,17 @@ def iot_resource_arns(method: str, path: str, body: bytes, region: str, account_
         data = {}
     arns = []
     for field, rtype in (("thingGroup", "thinggroup"), ("thing", "thing")):
-        # The handler acts on the name when the body carries both.
+        # The handler refuses a body whose name and ARN differ, and an ARN of
+        # another region names the resource of the request's region.
         name, arn = data.get(f"{field}Name"), data.get(f"{field}Arn")
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            spec = None
         if isinstance(name, str) and name:
             arns.append(f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}")
+        elif spec and spec.service == "iot" and spec.account_id == account_id and spec.resource.startswith(f"{rtype}/"):
+            arns.append(f"arn:aws:iot:{region}:{account_id}:{spec.resource}")
         else:
             arns.append(arn if isinstance(arn, str) and arn else "*")
     return arns
@@ -2108,6 +2117,10 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
     "RequestTimeTooSkewed": (
         "SignatureDoesNotMatch", 403, "InvalidSignatureException",
         ("RequestTimeTooSkewed", 403, "The difference between the request time and the current time is too large."),
+    ),
+    "RequestExpired": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("AccessDenied", 403, "Request has expired"),
     ),
     "IncompleteSignature": _INCOMPLETE,
     "MissingAuthorizationParameter": _INCOMPLETE,

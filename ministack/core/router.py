@@ -1446,12 +1446,19 @@ def extract_region(headers: dict, query_params=None) -> str:
     return extract_signed_region(headers, query_params) or os.environ.get("MINISTACK_REGION", "us-east-1")
 
 
+def _sigv4a_verified() -> bool:
+    """SigV4a header signatures name their key only where they are verified, under AUTH=true."""
+    from ministack.app import AUTH
+
+    return AUTH
+
+
 def extract_access_key_id(headers: dict, query_params=None) -> str:
     """Extract the AWS access key ID from the Authorization header, or from the
     query-string credentials of a presigned URL — SigV4 ``X-Amz-Credential`` or
     SigV2 ``AWSAccessKeyId``."""
     auth = headers.get("authorization", "")
-    if auth.startswith("AWS4-HMAC"):
+    if auth.startswith("AWS4-HMAC") or (auth.startswith("AWS4-ECDSA-P256-SHA256") and _sigv4a_verified()):
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)

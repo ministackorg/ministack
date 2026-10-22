@@ -92,17 +92,19 @@ def _start_echo_server():
 def _make_signed_token(claims: dict) -> str:
     from ministack.services import cognito as _cognito
 
-    if _cognito._RSA_PRIVATE_KEY is None:
+    pool_id = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    key, jwk = _cognito._pool_signing_key(pool_id, "id" if claims.get("token_use") == "id" else "access")
+    if key is None:
         pytest.skip("cryptography-backed Cognito signing key unavailable")
 
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    header = {"alg": "RS256", "kid": "ministack-key-1"}
+    header = {"alg": "RS256", "kid": jwk["kid"]}
     h = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
     p = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
     signed = f"{h}.{p}".encode()
-    sig = _cognito._RSA_PRIVATE_KEY.sign(signed, padding.PKCS1v15(), hashes.SHA256())
+    sig = key.sign(signed, padding.PKCS1v15(), hashes.SHA256())
     s = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
     return f"{h}.{p}.{s}"
 
@@ -2898,31 +2900,57 @@ def test_ws_get_connection_returns_metadata(apigw, lam):
         ws.close()
 
 
-def test_ws_delete_connection_closes_socket(apigw, lam):
-    """@connections DeleteConnection terminates the WS session."""
+def test_ws_delete_connection_closes_socket(apigw, lam, sqs):
+    """DeleteConnection sends the client a close frame, forgets the connection and runs $disconnect."""
+    import urllib.error
     import urllib.request
 
-    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="delc")
-    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod",
-                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
+    qname = _v2_auth_counter_queue(sqs)
+    disconnect = (_V2_AUTH_MARK_PRELUDE + (
+        f"def handler(event, context):\n    _mark('{qname}')\n    return {{'statusCode': 200}}\n").encode()).decode()
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="delc", disconnect_code=disconnect)
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    warmed = _v2_auth_count(sqs, qname)  # _make_fn's warm-up call
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod", headers={"Host": host})
     try:
         ws.send(json.dumps({"action": "x"}))
-        reply = ws.recv()
-        conn_id = json.loads(reply)["connectionId"]
+        conn_id = json.loads(ws.recv())["connectionId"]
+        url = f"http://{host}/prod/@connections/{conn_id}"
+        r = urllib.request.urlopen(urllib.request.Request(url, method="DELETE", headers={"Host": host}), timeout=30)
+        assert r.status == 204
 
-        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/@connections/{conn_id}"
-        req = urllib.request.Request(
-            url, method="DELETE",
-            headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
-        )
-        r = urllib.request.urlopen(req, timeout=30)
-        assert r.status in (200, 204)
-
-        # Give the server a moment to close, then subsequent recv returns None.
-        time.sleep(0.5)
-        assert ws.recv(timeout=1.5) is None
+        ws._sock.settimeout(5)
+        assert ws._recv_frame()[0] == 0x8
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(urllib.request.Request(url, method="GET", headers={"Host": host}), timeout=30)
+        assert exc_info.value.code == 410
+        assert exc_info.value.headers["x-amzn-ErrorType"] == "GoneException"
+        deadline = time.time() + 30
+        while _v2_auth_count(sqs, qname) < warmed + 1 and time.time() < deadline:
+            time.sleep(0.5)
+        assert _v2_auth_count(sqs, qname) == warmed + 1
     finally:
         ws.close()
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_ws_route_and_stage_keep_their_optional_fields(apigw):
+    api_id = apigw.create_api(Name="ws-fields", ProtocolType="WEBSOCKET")["ApiId"]
+    route = apigw.create_route(ApiId=api_id, RouteKey="send", RouteResponseSelectionExpression="$default",
+                               ModelSelectionExpression="$request.body.type")
+    got = apigw.get_route(ApiId=api_id, RouteId=route["RouteId"])
+    for answer in (route, got):
+        assert answer["RouteResponseSelectionExpression"] == "$default"
+        assert answer["ModelSelectionExpression"] == "$request.body.type"
+    updated = apigw.update_route(ApiId=api_id, RouteId=route["RouteId"], RouteResponseSelectionExpression="")
+    assert "RouteResponseSelectionExpression" not in updated
+
+    logs = {"DestinationArn": "arn:aws:logs:us-east-1:000000000000:log-group:ws", "Format": "$context.requestId"}
+    stage = apigw.create_stage(ApiId=api_id, StageName="prod", AccessLogSettings=logs)
+    assert stage["AccessLogSettings"] == logs
+    assert apigw.get_stage(ApiId=api_id, StageName="prod")["AccessLogSettings"] == logs
+    changed = {**logs, "Format": "$context.requestId $context.status"}
+    assert apigw.update_stage(ApiId=api_id, StageName="prod", AccessLogSettings=changed)["AccessLogSettings"] == changed
 
 
 def test_ws_post_to_unknown_connection_returns_410(apigw, lam):

@@ -71,8 +71,10 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import string
 import struct
+import threading
 import time
 import zlib
 from datetime import datetime, timezone
@@ -124,9 +126,9 @@ try:
     except ImportError:
         fcntl = None
 
-    def _load_rsa_key_from_disk():
+    def _load_rsa_key_from_disk(path=_RSA_KEY_PATH):
         try:
-            with open(_RSA_KEY_PATH, "rb") as _f:
+            with open(path, "rb") as _f:
                 return serialization.load_pem_private_key(_f.read(), password=None)
         except Exception:
             return None
@@ -146,14 +148,14 @@ try:
                     continue
                 continue
 
-    def _persist_or_load_rsa_key(_key):
-        os.makedirs(_STATE_DIR, exist_ok=True)
+    def _persist_or_load_rsa_key(_key, path=_RSA_KEY_PATH):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         _pem = _key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        _tmp_path = f"{_RSA_KEY_PATH}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        _tmp_path = f"{path}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         try:
             # A file lock gives process-safe creation/repair without relying
             # on hard links, and the OS releases it if a process exits mid-repair.
@@ -163,26 +165,26 @@ try:
                     # Another process may have generated or repaired the shared
                     # key first. Reload that winner so pytest workers and the
                     # server expose the same JWKS.
-                    _disk_key = _load_rsa_key_from_disk()
+                    _disk_key = _load_rsa_key_from_disk(path)
                     if _disk_key is not None:
                         return _disk_key
                     with open(_tmp_path, "xb") as _f:
                         _f.write(_pem)
                         _f.flush()
                         os.fsync(_f.fileno())
-                    os.replace(_tmp_path, _RSA_KEY_PATH)
+                    os.replace(_tmp_path, path)
                     _tmp_path = None
                     return _key
             # Platforms without fcntl still get a stable signing key in-process
             # and best-effort atomic persistence across restarts.
-            _disk_key = _load_rsa_key_from_disk()
+            _disk_key = _load_rsa_key_from_disk(path)
             if _disk_key is not None:
                 return _disk_key
             with open(_tmp_path, "xb") as _f:
                 _f.write(_pem)
                 _f.flush()
                 os.fsync(_f.fileno())
-            os.replace(_tmp_path, _RSA_KEY_PATH)
+            os.replace(_tmp_path, path)
             _tmp_path = None
             return _key
         finally:
@@ -192,9 +194,9 @@ try:
                 except FileNotFoundError:
                     pass
 
-    def _persist_or_load_rsa_key_best_effort(_key):
+    def _persist_or_load_rsa_key_best_effort(_key, path=_RSA_KEY_PATH):
         try:
-            return _persist_or_load_rsa_key(_key)
+            return _persist_or_load_rsa_key(_key, path)
         except Exception:
             # Persistence is best-effort — if it fails, fall back to in-memory key.
             return _key
@@ -237,9 +239,56 @@ except ImportError:
     }
 
 
+# Each user pool has two keys of its own, one for access tokens and one for ID
+# tokens. They live in STATE_DIR beside the shared key so other processes sign alike.
+_POOL_KEYS_DIR = os.path.join(_STATE_DIR, "cognito-pool-keys")
+_POOL_KEY_USES = ("access", "id")
+_pool_keys: dict = {}  # (pool id, use) -> (private key, JWK), a cache of the key files
+_pool_keys_lock = threading.Lock()
+
+
+def _pool_signing_key(pool_id: str, use: str):
+    """The private key and JWK the pool signs `use` tokens with, or (None, None) without cryptography."""
+    if _RSA_PRIVATE_KEY is None or not re.fullmatch(r"[\w-]+", pool_id or ""):
+        return None, None
+    with _pool_keys_lock:
+        cached = _pool_keys.get((pool_id, use))
+        if cached:
+            return cached
+        path = os.path.join(_POOL_KEYS_DIR, f"{pool_id}-{use}.pem")
+        key = _load_rsa_key_from_disk(path) if os.path.exists(path) else None
+        if key is None:
+            key = _persist_or_load_rsa_key_best_effort(
+                rsa.generate_private_key(public_exponent=65537, key_size=2048), path)
+        public = key.public_key()
+        der = public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        numbers = public.public_numbers()
+        jwk = {
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "kid": base64.b64encode(hashlib.sha256(der).digest()).decode(),
+            "n": _int_to_base64url(numbers.n, 256),
+            "e": _int_to_base64url(numbers.e, 3),
+        }
+        _pool_keys[(pool_id, use)] = (key, jwk)
+        return key, jwk
+
+
+def _drop_pool_keys(pool_id: str) -> None:
+    for use in _POOL_KEY_USES:
+        _pool_keys.pop((pool_id, use), None)
+        try:
+            os.unlink(os.path.join(_POOL_KEYS_DIR, f"{pool_id}-{use}.pem"))
+        except OSError:
+            pass
+
+
 def well_known_jwks(pool_id: str):
     """Return JWKS JSON for /{poolId}/.well-known/jwks.json."""
-    return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
+    keys = [_pool_signing_key(pool_id, use)[1] for use in _POOL_KEY_USES]
+    keys = [k for k in keys if k] or [_JWKS_KEY]
+    return 200, {"Content-Type": "application/json"}, json.dumps({"keys": keys}).encode()
 
 
 def well_known_openid_configuration(pool_id: str, region: str | None = None,
@@ -878,11 +927,14 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                 if k == "identities":
                     # "Your user's ID token contains all of their associated
                     # providers in the identities claim" — as an array, while
-                    # the user attribute itself carries JSON text.
+                    # the user attribute itself carries JSON text. The claim
+                    # carries primary and dateCreated as strings.
                     try:
-                        claims[k] = json.loads(v)
+                        parsed = json.loads(v)
                     except (TypeError, ValueError):
                         claims[k] = v
+                        continue
+                    claims[k] = [_identity_claim(i) for i in parsed] if isinstance(parsed, list) else parsed
                     continue
                 if k in ("email_verified", "phone_number_verified"):
                     # AWS carries the standard verified flags as JSON booleans in the ID token
@@ -920,22 +972,37 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             client_metadata=client_metadata,
             scope=granted,
         )
-    return _signed_jwt(claims)
+    return _signed_jwt(claims, pool_id, "id" if token_type == "id" else "access")
 
 
-def _signed_jwt(claims: dict) -> str:
-    """A JWT over *claims*, signed with the RSA key when cryptography is available."""
+def _identity_claim(identity):
+    """An identities entry as the ID token carries it, with primary and dateCreated as strings."""
+    if not isinstance(identity, dict):
+        return identity
+    out = dict(identity)
+    if "primary" in out:
+        out["primary"] = str(out["primary"]).lower()
+    if out.get("dateCreated") is not None:
+        out["dateCreated"] = str(out["dateCreated"])
+    return out
+
+
+def _signed_jwt(claims: dict, pool_id: str = "", use: str = "") -> str:
+    """A JWT over *claims*, signed with the pool's `use` key, else the shared key, when cryptography is available."""
+    key, jwk = _pool_signing_key(pool_id, use) if pool_id else (None, None)
+    if key is None:
+        key, jwk = _RSA_PRIVATE_KEY, _JWKS_KEY
     header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
+        json.dumps({"alg": "RS256", "kid": jwk["kid"]}).encode()
     ).rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(
         json.dumps(claims).encode()
     ).rstrip(b"=").decode()
     signing_input = f"{header}.{payload}".encode()
-    if _RSA_PRIVATE_KEY is not None:
+    if key is not None:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
-        sig_bytes = _RSA_PRIVATE_KEY.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        sig_bytes = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
         sig = base64.urlsafe_b64encode(sig_bytes).rstrip(b"=").decode()
     else:
         sig = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
@@ -1296,13 +1363,27 @@ def _token_claims(token) -> dict:
 
 
 def _signature_valid(token: str) -> bool:
-    """Whether a JWT is signed with this emulator's signing key."""
+    """Whether a JWT is signed with the key its issuer signs with: its user pool's, else the shared one."""
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
+    pool_id = str(_token_claims(token).get("iss", "")).rsplit("/", 1)[-1]
+    if _get_pool_unscoped(pool_id) is not None:
+        head = token.split(".", 1)[0]
+        try:
+            kid = json.loads(base64.urlsafe_b64decode(head + "=" * (-len(head) % 4))).get("kid")
+        except (ValueError, AttributeError):
+            return False
+        keys = [k for k, jwk in (_pool_signing_key(pool_id, use) for use in _POOL_KEY_USES)
+                if k is not None and jwk["kid"] == kid]
+        if not keys:
+            return False
+        key = keys[0]
+    else:
+        key = _RSA_PRIVATE_KEY
     signing_input, _, sig = token.rpartition(".")
     try:
-        _RSA_PRIVATE_KEY.public_key().verify(
+        key.public_key().verify(
             base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)), signing_input.encode(),
             padding.PKCS1v15(), hashes.SHA256())
     except (InvalidSignature, ValueError):
@@ -2359,12 +2440,25 @@ def _cleanup_expired_codes():
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
-    if method == "S256":
-        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-        computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-        return computed == code_challenge
-    # plain
-    return code_verifier == code_challenge
+    # Cognito supports only S256.
+    if method != "S256":
+        return False
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return computed == code_challenge
+
+
+def _pkce_error_redirect(redirect_uri: str, code_challenge: str, code_challenge_method: str, state: str):
+    """The invalid_request redirect for PKCE parameters Cognito refuses, or None."""
+    if not (code_challenge or code_challenge_method):
+        return None
+    if code_challenge and code_challenge_method == "S256":
+        return None
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}error=invalid_request"
+    if state:
+        location += f"&state={quote(state)}"
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
 
 
 def _qp(query_params: dict, key: str, default: str = "") -> str:
@@ -2901,6 +2995,7 @@ def _delete_user_pool(data):
         if configured:
             _pool_domain_map.pop(configured, None)
     del _user_pools[pid]
+    _drop_pool_keys(pid)
     return json_response({})
 
 
@@ -5578,6 +5673,7 @@ def _create_identity_provider(data):
         "LastModifiedDate": now,
     }
     providers[provider_name] = provider
+    _provider_group(pool, pid, provider_name)
     logger.info("Cognito: CreateIdentityProvider %s in pool %s", provider_name, pid)
     return json_response({"IdentityProvider": provider})
 
@@ -5774,6 +5870,37 @@ def _provider_user_identifier(data, field):
 def _federated_profile_username(provider_name, attribute_value):
     """Auto-created federated profiles are named `{Provider name}_identifier`."""
     return f"{provider_name}_{attribute_value}"
+
+
+def _provider_group(pool, pool_id, provider_name):
+    """The group `{user pool id}_{IdP name}` that holds the IdP's auto-created profiles."""
+    name = f"{pool_id}_{provider_name}"
+    group = pool["_groups"].get(name)
+    if group is None:
+        now = _now_epoch()
+        group = pool["_groups"][name] = {
+            "GroupName": name,
+            "UserPoolId": pool_id,
+            "CreationDate": now,
+            "LastModifiedDate": now,
+            "_members": [],
+        }
+    return group
+
+
+def _start_federated_profile(pool, pool_id, user, provider_name, user_id):
+    """Record a new IdP profile's own identity and add it to the IdP's group."""
+    _set_user_identities(user, [{
+        "userId": user_id,
+        "providerName": provider_name,
+        "providerType": _provider_type_for(pool, provider_name),
+        "issuer": None,
+        "primary": True,
+        "dateCreated": int(time.time() * 1000),
+    }])
+    group = _provider_group(pool, pool_id, provider_name)
+    group["_members"].append(user["Username"])
+    user["_groups"].append(group["GroupName"])
 
 
 def _admin_link_provider_for_user(data):
@@ -6441,9 +6568,8 @@ def _oauth2_authorize_federation(query_params):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {client_id} not found.", 400)
 
-    # Validate redirect_uri against CallbackURLs (skip if empty for dev convenience)
     callback_urls = client.get("CallbackURLs", [])
-    if callback_urls and redirect_uri not in callback_urls:
+    if redirect_uri not in callback_urls:
         return error_response_json("InvalidParameterException",
                                    f"redirect_uri {redirect_uri} is not in CallbackURLs.", 400)
     invalid_scope = _invalid_scope_redirect(client, redirect_uri, _qp(query_params, "scope"), state)
@@ -6553,11 +6679,14 @@ def handle_oauth2_authorize(method, path, headers, query_params):
         redirect_uri = client.get("DefaultRedirectURI", "")
     if not redirect_uri:
         return _oauth2_error("invalid_request", "redirect_uri is required.")
-    if callback_urls and redirect_uri not in callback_urls:
+    if redirect_uri not in callback_urls:
         return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
     invalid_scope = _invalid_scope_redirect(client, redirect_uri, scope, state)
     if invalid_scope:
         return invalid_scope
+    pkce_error = _pkce_error_redirect(redirect_uri, code_challenge, code_challenge_method, state)
+    if pkce_error:
+        return pkce_error
 
     if _use_choice_based_ui(client):
         html_body = _username_page_html(
@@ -6700,6 +6829,7 @@ def _saml2_idp_response(body: bytes, query_params):
             }
             pool["_users"][username] = user
             pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+            _start_federated_profile(pool, pool_id, user, provider_name, name_id)
 
     # Generate authorization code
     _cleanup_expired_relay_codes()
@@ -6940,6 +7070,7 @@ def _oauth2_idp_response(method, body, query_params):
             }
             pool["_users"][username] = user
             pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+            _start_federated_profile(pool, pool_id, user, provider_name, name_id)
 
     # Issue MiniStack auth code so the app's /oauth2/token call works.
     _cleanup_expired_relay_codes()
@@ -6970,6 +7101,12 @@ def _oauth2_idp_response(method, body, query_params):
 def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
                                code_challenge, code_challenge_method, state):
     """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
+    client = _find_pool_by_client_id(client_id)[2] or {}
+    if redirect_uri not in client.get("CallbackURLs", []):
+        return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
+    pkce_error = _pkce_error_redirect(redirect_uri, code_challenge, code_challenge_method, state)
+    if pkce_error:
+        return pkce_error
     code = _generate_auth_code()
     _authorization_codes[code] = {
         "client_id": client_id,
@@ -7360,7 +7497,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if entry.get("code_challenge"):
                 if not code_verifier:
                     return _oauth2_error("invalid_grant", "code_verifier is required.")
-                method = entry.get("code_challenge_method", "plain")
+                method = entry.get("code_challenge_method", "")
                 if not _verify_pkce(code_verifier, entry["code_challenge"], method):
                     return _oauth2_error("invalid_grant", "PKCE verification failed.")
 
@@ -7553,14 +7690,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
-    # ── fallback (legacy behaviour for unrecognised grant_type) ──
-    pool_id, pool, client = _find_pool_by_client_id(cid)
-    access_token = _fake_token(cid or new_uuid(), pool_id or "", cid or "", "access")
-    return json_response({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-    })
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": "unsupported_grant_type"}).encode()
 
 
 async def handle_oauth2_token(method, path, headers, body, query_params):
@@ -8302,6 +8432,8 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
 
 def reset():
     _user_pools.clear()
+    _pool_keys.clear()
+    shutil.rmtree(_POOL_KEYS_DIR, ignore_errors=True)
     _pool_domain_map.clear()
     _identity_pools.clear()
     _identity_tags.clear()
