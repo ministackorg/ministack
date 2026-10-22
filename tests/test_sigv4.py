@@ -11,11 +11,15 @@ from ministack.core.sigv4 import (
     calculate_signature,
     derive_signing_key,
     header_signature_failure,
+    header_signing_documents,
     parse_header_signature,
     parse_query_signature,
     presigned_request_is_expired,
+    region_set_covers,
     request_time_failure,
     signatures_match,
+    sigv4a_signature_matches,
+    sigv4a_signing_key,
     uri_encode,
 )
 
@@ -132,6 +136,62 @@ def test_signing_helpers_match_botocore_fixed_vector():
         "s3",
         string_to_sign,
     ) == "ca6159ff16837c055653a722d9f10b6a529b7c62c84174a2859958324bc78766"
+
+
+# AWS's published SigV4a test vector "get-vanilla" (aws-c-auth v4a signing test suite).
+_V4A_KEY_ID, _V4A_SECRET = "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+_V4A_HEADERS = {
+    "host": "example.amazonaws.com",
+    "x-amz-date": "20150830T123600Z",
+    "x-amz-region-set": "us-east-1",
+    "authorization": (
+        "AWS4-ECDSA-P256-SHA256 Credential=AKIDEXAMPLE/20150830/service/aws4_request, "
+        "SignedHeaders=host;x-amz-date;x-amz-region-set, Signature=3046022100fddaaf816a31e30d04973875b13bc27b98da1"
+        "0907a3a1872fd5819a221334abc022100de2ee81d83b54f31efc82834de07e6cd4d5c6f25bfa08e0f29a15bb0977c343e"),
+}
+_V4A_HEADER_STRING_TO_SIGN = (
+    "AWS4-ECDSA-P256-SHA256\n20150830T123600Z\n20150830/service/aws4_request\n"
+    "cf59db423e841c8b7e3444158185aa261b724a5c27cbe762676f3eed19f4dc02"
+)
+_V4A_QUERY_STRING_TO_SIGN = (
+    "AWS4-ECDSA-P256-SHA256\n20150830T123600Z\n20150830/service/aws4_request\n"
+    "890c4ed28c1a1ac10b5862719b537afbe392e987dc1aab1efa16fe7de41d3c81"
+)
+_V4A_QUERY_SIGNATURE = (
+    "3045022100b3246f8e1442dd58e73292ae1294720c3256ee58f6cea50f3a3f83b4a4b0331a0220329693f7745c9008a5887c0529ce"
+    "ccb0fae4e16d707b712ea66acdbaf963769a"
+)
+
+
+def test_sigv4a_key_derivation_matches_the_published_vector():
+    public = sigv4a_signing_key(_V4A_KEY_ID, _V4A_SECRET).public_key().public_numbers()
+
+    assert (f"{public.x:064x}", f"{public.y:064x}") == (
+        "b6618f6a65740a99e650b33b6b4b5bd0d43b176d721a3edfea7e7d2d56d936b1",
+        "865ed22a7eadc9c5cb9d2cbaca1b3699139fedc5043dc6661864218330c8e518",
+    )
+    assert sigv4a_signature_matches(_V4A_KEY_ID, _V4A_SECRET, _V4A_QUERY_STRING_TO_SIGN, _V4A_QUERY_SIGNATURE)
+    assert not sigv4a_signature_matches(_V4A_KEY_ID, _V4A_SECRET, _V4A_HEADER_STRING_TO_SIGN, _V4A_QUERY_SIGNATURE)
+    assert not sigv4a_signature_matches(_V4A_KEY_ID, "other", _V4A_QUERY_STRING_TO_SIGN, _V4A_QUERY_SIGNATURE)
+    assert not sigv4a_signature_matches(_V4A_KEY_ID, _V4A_SECRET, _V4A_QUERY_STRING_TO_SIGN, "not hex")
+
+
+def test_sigv4a_header_signature_of_the_published_vector_verifies():
+    signature = parse_header_signature(_V4A_HEADERS)
+
+    assert (signature.access_key_id, signature.service, signature.region_set) == (_V4A_KEY_ID, "service", "us-east-1")
+    assert header_signing_documents(signature, "GET", "/", {}, _V4A_HEADERS, b"")[1] == _V4A_HEADER_STRING_TO_SIGN
+    assert header_signature_failure(signature, _V4A_SECRET, "GET", "/", {}, _V4A_HEADERS, b"") is None
+    assert header_signature_failure(signature, _V4A_SECRET, "GET", "/x", {}, _V4A_HEADERS, b"")[0] == (
+        "SignatureDoesNotMatch")
+
+
+@pytest.mark.parametrize("region_set, covered", [
+    ("*", True), ("eu-central-1", True), ("us-west-2,eu-central-1", True), ("eu-*", True),
+    ("us-west-2", False), ("eu-west-*", False),
+])
+def test_region_set_covers_lists_and_wildcards(region_set, covered):
+    assert region_set_covers(region_set, "eu-central-1") is covered
 
 
 def test_presigned_request_expiry_is_exclusive_at_boundary():
