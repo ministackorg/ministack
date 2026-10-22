@@ -1641,6 +1641,11 @@ def extract_resource_arn(service: str, method: str, path: str,
             arn = (_safe_json_field(body, "resourceArn") if method == "POST"
                    else _query_param(query_params, "resourceArn"))
             return arn if isinstance(arn, str) and arn else "*"
+        # A membership call is checked on the thing group and the thing its body
+        # names: the group here, the thing in iot_resource_arns()[1:].
+        membership = iot_resource_arns(method, path, body, region, account_id)
+        if membership:
+            return membership[0]
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1814,6 +1819,30 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
         for name in tables
         if isinstance(name, str) and name
     ]
+
+
+_IOT_MEMBERSHIP_PATHS = ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup")
+
+
+def iot_resource_arns(method: str, path: str, body: bytes, region: str, account_id: str) -> list[str]:
+    """The thing group and the thing a thing-group membership call names, in the order AWS checks them."""
+    if method not in ("PUT", "POST") or path not in _IOT_MEMBERSHIP_PATHS:
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    arns = []
+    for field, rtype in (("thingGroup", "thinggroup"), ("thing", "thing")):
+        # The handler acts on the name when the body carries both.
+        name, arn = data.get(f"{field}Name"), data.get(f"{field}Arn")
+        if isinstance(name, str) and name:
+            arns.append(f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}")
+        else:
+            arns.append(arn if isinstance(arn, str) and arn else "*")
+    return arns
 
 
 def logs_service_context(action: str, body: bytes, resource_arn: str,

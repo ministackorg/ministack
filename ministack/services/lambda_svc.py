@@ -1731,45 +1731,42 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
-# The extensions AWS publishes from its own accounts and grants
-# lambda:GetLayerVersion on to everyone. Keyed by LAYER NAME, not by publisher
-# account: the name is stable while the account differs in every region, so one
-# short list replaces ~190 account ids that go stale as regions are added.
-_AWS_PUBLISHED_LAYER_PREFIXES = (
-    "LambdaInsightsExtension",
-    "AWS-Parameters-and-Secrets-Lambda-Extension",
-    "AWS-AppConfig-Extension",
-    "AWSOpenTelemetryDistro",
-    "aws-otel-",
-    "AWSSDKPandas-",
+# The shape of a layer version ARN that can exist on AWS: a 12-digit account, a
+# name of at most 140 of [a-zA-Z0-9-_], and a version from 1 with no leading zero.
+_POSSIBLE_LAYER_VERSION_ARN_RE = re.compile(
+    r"arn:aws:lambda:[a-z0-9-]+:[0-9]{12}:layer:[a-zA-Z0-9-_]{1,140}:[1-9][0-9]*"
 )
 
 
-def _is_aws_published_layer(layer_name: str) -> bool:
-    return layer_name.startswith(_AWS_PUBLISHED_LAYER_PREFIXES)
-
-
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Another account's layer through its grant; an unknown account passes by
-    name, and the bytes are not available offline (CodeSize 0, does not run)."""
+    """Another account's layer. A layer MiniStack holds answers through its grant,
+    so a version it does not hold or does not grant is denied, as on AWS. A layer
+    it does not hold resolves as an empty version: on AWS it may be a public
+    vendor or AWS extension, and offline a real ARN looks like a made-up one, so
+    any account and version that could exist resolve. Its bytes are not
+    available, so it has CodeSize 0, leaves out what only the publisher knows,
+    and does not run. An ARN that cannot name a layer version on AWS is denied."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
-    vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
-    if vc is not None and _layer_policy_allows(vc, get_account_id()):
-        return vc, None
-    if vc is None and _is_aws_published_layer(layer_name):
-        logger.warning(
-            "Layer %s is an AWS-published extension: the reference resolves so "
-            "the stack deploys, but the bytes are not available offline and the "
-            "extension will not run", layer_arn,
-        )
-        return {
-            "LayerVersionArn": layer_arn,
-            "Version": version,
-            "Content": {"CodeSize": 0},
-        }, None
-    return _layer_access_denied(layer_arn)
+    if not _POSSIBLE_LAYER_VERSION_ARN_RE.fullmatch(layer_arn):
+        return _layer_access_denied(layer_arn)
+    if _layers.get_scoped(spec.account_id, spec.region, layer_name) is not None:
+        vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+        if vc is not None and _layer_policy_allows(vc, get_account_id()):
+            return vc, None
+        return _layer_access_denied(layer_arn)
+    logger.warning(
+        "Layer %s is not held by MiniStack: the reference resolves so the stack "
+        "deploys, but the bytes are not available offline and the layer will not run",
+        layer_arn,
+    )
+    return {
+        "LayerArn": layer_arn.rsplit(":", 1)[0],
+        "LayerVersionArn": layer_arn,
+        "Version": version,
+        "Content": {"CodeSize": 0},
+    }, None
 
 
 def _resolve_layer_version_for_attachment(layer_arn: str):
@@ -2112,7 +2109,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
                             layer_name, ver_num, policy_sid, query_params
                         )
                 if method == "GET":
-                    return _get_layer_version(layer_name, ver_num)
+                    return _layer_name_too_long(layer_name) or _get_layer_version(layer_name, ver_num)
                 if method == "DELETE":
                     return _delete_layer_version(layer_name, ver_num)
 
@@ -5868,6 +5865,10 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
 def _resolve_layer_zip(attachment: str | dict) -> bytes | None:
     """Return attached content, including versions deleted since attachment."""
     if isinstance(attachment, dict):
+        if attachment.get("CodeSize") == 0:
+            # Attached as an empty layer MiniStack did not hold; a version
+            # published under that ARN later must not load without its grant.
+            return None
         attachment = attachment.get("Arn", "")
     try:
         spec = parse_arn(attachment)
@@ -6473,6 +6474,20 @@ def _list_layer_versions(layer_name: str, query_params: dict):
     if start + max_items < len(all_versions):
         result["NextMarker"] = str(page[-1]["Version"]) if page else ""
     return json_response(result)
+
+
+def _layer_name_too_long(layer_name: str):
+    """GetLayerVersion's LayerName limit. It covers the whole value, a layer ARN
+    included, and is checked before the version. GetLayerVersionByArn has no
+    LayerName member and no such limit."""
+    if len(layer_name) <= 140:
+        return None
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value '{layer_name}' at 'layerName' failed to "
+        "satisfy constraint: Member must have length less than or equal to 140",
+        400,
+    )
 
 
 def _get_layer_version(layer_name: str, version: int):

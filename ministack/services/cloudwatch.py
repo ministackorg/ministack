@@ -20,9 +20,11 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
+from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
@@ -524,7 +526,9 @@ async def handle_request(method, path, headers, body, query_params):
                 logger.error("JSON decode error: %s", e)
                 cbor_data = {}
         else:
-            for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
+            # Blank values kept: "Tags.member.2.Value=" is an empty value on
+            # AWS, while an absent member is null.
+            for k, v in parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True).items():
                 params[k] = v
 
     action = ""
@@ -994,10 +998,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": cbor_data.get("ExtendedStatistic"),
             "Period": int(cbor_data.get("Period", 60)),
             "EvaluationPeriods": int(cbor_data.get("EvaluationPeriods", 1)),
-            "DatapointsToAlarm": int(
-                cbor_data.get("DatapointsToAlarm")
-                or cbor_data.get("EvaluationPeriods", 1)
-            ),
+            "DatapointsToAlarm": _optional_int(cbor_data.get("DatapointsToAlarm")),
             "Threshold": float(cbor_data.get("Threshold", 0)),
             "ComparisonOperator": cbor_data.get("ComparisonOperator"),
             "TreatMissingData": cbor_data.get("TreatMissingData", "missing"),
@@ -1050,11 +1051,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": _p(params, "ExtendedStatistic") or None,
             "Period": int(_p(params, "Period") or "60"),
             "EvaluationPeriods": int(_p(params, "EvaluationPeriods") or "1"),
-            "DatapointsToAlarm": int(
-                _p(params, "DatapointsToAlarm")
-                or _p(params, "EvaluationPeriods")
-                or "1"
-            ),
+            "DatapointsToAlarm": _optional_int(_p(params, "DatapointsToAlarm") or None),
             "Threshold": float(_p(params, "Threshold") or "0"),
             "ComparisonOperator": _p(params, "ComparisonOperator"),
             "TreatMissingData": _p(params, "TreatMissingData") or "missing",
@@ -1077,7 +1074,22 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
         }
 
     is_new = name not in _alarms
+    tags = _alarm_request_tags(params, cbor_data, is_cbor, is_json)
+    refused = _alarm_tags_refusal(tags, alarm["DatapointsToAlarm"], is_new, is_cbor, is_json)
+    if refused:
+        return refused
+
+    # AWS describes DatapointsToAlarm only when the request sets it (absent
+    # and null alike); keep it off the record otherwise.
+    if alarm["DatapointsToAlarm"] is None:
+        del alarm["DatapointsToAlarm"]
+
     _alarms[name] = alarm
+    # PutMetricAlarm applies Tags on creation only; on an existing alarm they
+    # are ignored on every protocol (TagResource and UntagResource change them).
+    # A key sent twice keeps its last value.
+    if is_new and tags:
+        _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
 
     if is_new:
         _record_history(
@@ -1094,6 +1106,189 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     if is_json:
         return _json_ok({})
     return _xml(200, "PutMetricAlarmResponse", "")
+
+
+_ALARM_TAG_LIMIT = 50
+
+
+_QUERY_TAG_MEMBER = re.compile(r"Tags\.member\.([1-9][0-9]*)\.(Key|Value)")
+
+
+def _alarm_request_tags(params, cbor_data, is_cbor, is_json=False):
+    """An alarm request's Tags as sent, or None when absent. Query members are
+    read in index order, and one sent without Key or Value keeps that member
+    missing (AWS reports it as null)."""
+    if is_cbor or is_json:
+        return cbor_data.get("Tags")
+    members = {}
+    for param in params:
+        match = _QUERY_TAG_MEMBER.fullmatch(param)
+        if match:
+            members.setdefault(int(match.group(1)), {})[match.group(2)] = _p(params, param)
+    return [members[index] for index in sorted(members)] if members else None
+
+
+def _string_member_type_error(value):
+    """AWS's SerializationException text for a JSON/CBOR value sent where a
+    String is expected ("" where AWS sends no message), or None for a string
+    or null."""
+    if value is None or isinstance(value, str):
+        return None
+    if isinstance(value, bool):
+        return f"{'TRUE' if value else 'FALSE'}_VALUE cannot be converted to String"
+    if isinstance(value, int):
+        return "NUMBER_VALUE cannot be converted to String"
+    if isinstance(value, float):
+        return "DECIMAL_VALUE cannot be converted to String"
+    if isinstance(value, dict):
+        return "Start of structure or map found where not expected"
+    return ""
+
+
+def _tags_serialization_error(tags):
+    """The first wrong JSON type in Tags, in document order, as (code, message,
+    status), or None."""
+    if tags is None:
+        return None
+    if isinstance(tags, dict):
+        return "MalformedInput", "Start of structure or map found where not expected", 400
+    if not isinstance(tags, list):
+        return "MalformedInput", "Unexpected field type", 400
+    for tag in tags:
+        if tag is None:
+            return "InternalFailure", "", 500
+        if isinstance(tag, list):
+            return "MalformedInput", "", 400
+        if not isinstance(tag, dict):
+            return "MalformedInput", "Unexpected value type in payload", 400
+        for field in tag:
+            if field in ("Key", "Value"):
+                message = _string_member_type_error(tag[field])
+                if message is not None:
+                    return "MalformedInput", message, 400
+    return None
+
+
+def _tag_constraint_errors(tags):
+    """Constraint messages for each tag in order, Value before Key."""
+    errors = []
+    for i, tag in enumerate(tags or [], 1):
+        value, key = tag.get("Value"), tag.get("Key")
+        if value is None:
+            errors.append(f"Value null at 'tags.{i}.member.value' failed to satisfy constraint: Member must not be null")
+        elif len(value) > 256:
+            errors.append(f"Value '{value}' at 'tags.{i}.member.value' failed to satisfy constraint: "
+                          "Member must have length less than or equal to 256")
+        if key is None:
+            errors.append(f"Value null at 'tags.{i}.member.key' failed to satisfy constraint: Member must not be null")
+        elif not key:
+            errors.append(f"Value '' at 'tags.{i}.member.key' failed to satisfy constraint: "
+                          "Member must have length greater than or equal to 1")
+        elif len(key) > 128:
+            errors.append(f"Value '{key}' at 'tags.{i}.member.key' failed to satisfy constraint: "
+                          "Member must have length less than or equal to 128")
+    return errors
+
+
+_TAG_SPECIAL_CHARS = "_.:/=+-@"
+_TAG_CHARS_MESSAGE = ("Tags can only contain letters, numbers, spaces, and the following special characters: "
+                      "_ . : / = + - @")
+_MAX_LISTED_VALIDATION_ERRORS = 10
+
+
+def _java_hashmap_order(keys):
+    """Distinct keys in the iteration order of a java.util.HashMap they were
+    put into: String.hashCode over UTF-16 units, spread (h ^ h >>> 16), default
+    capacity 16 doubled past a 0.75 load, insertion order within a bucket."""
+    unique = list(dict.fromkeys(keys))
+    capacity = 16
+    while len(unique) > capacity * 0.75:
+        capacity *= 2
+
+    def bucket(key):
+        units = key.encode("utf-16-be")
+        h = 0
+        for i in range(0, len(units), 2):
+            h = (31 * h + int.from_bytes(units[i:i + 2], "big")) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (capacity - 1)
+
+    return sorted(unique, key=lambda key: (bucket(key), unique.index(key)))
+
+
+def _tagset_error(tags):
+    """The tag-set check AWS runs on create after the member constraints, on
+    the tags de-duplicated by key (a later value replaces an earlier one): a
+    character error anywhere, then the first too-long value, then the first
+    too-long key, in the tag map's iteration order. Length counts UTF-16
+    units; a tag whose key is too long is not checked further."""
+    def too_long(text, limit):
+        return len(text.encode("utf-16-le")) // 2 > limit
+
+    def bad_chars(text):
+        return not all(unicodedata.category(ch)[0] in "LNZ" or ch in _TAG_SPECIAL_CHARS for ch in text)
+
+    values = {tag["Key"]: tag["Value"] for tag in tags or []}
+    order = _java_hashmap_order(tag["Key"] for tag in tags or [])
+    usable = [key for key in order if not too_long(key, 128)]
+    if any(bad_chars(key) or (not too_long(values[key], 256) and bad_chars(values[key])) for key in usable):
+        return _TAG_CHARS_MESSAGE
+    long_value = next((values[key] for key in usable if too_long(values[key], 256)), None)
+    if long_value is not None:
+        text, type_name = long_value, "TagValue"
+    else:
+        text = next((key for key in order if too_long(key, 128)), None)
+        if text is None:
+            return None
+        type_name = "TagKey"
+    return f"'{text}' is not a valid value for com.amazon.aws.platform.billing.tagset.type.{type_name} - it is too long"
+
+
+def _composite_system_tag_error(tags):
+    """PutCompositeAlarm's check of aws: keys, after the tag-set check, in the
+    same tag-map order (the first aws: key in that order is named)."""
+    for key in _java_hashmap_order(tag["Key"] for tag in tags or []):
+        if key.startswith("aws:"):
+            if ":" not in key[4:]:
+                return f"Invalid System Tag: {key} is missing Vendor Id."
+            return f"Invalid System Tag: {key} is not whitelisted for vendor:cloudwatch"
+        if key.lower().startswith("aws:"):
+            return f'Invalid System Tag: {key} must be prefixed with "aws:" in lowercase.'
+    return None
+
+
+def _alarm_tags_refusal(tags, datapoints, is_new, is_cbor, is_json, composite=False):
+    """The error AWS answers for an alarm's Tags (and PutMetricAlarm's
+    DatapointsToAlarm), in AWS's order, or None. A refused call stores
+    nothing. The two calls differ only in how they refuse an aws: key."""
+    def refuse(code, message, status):
+        return _error(code, "" if is_cbor and code == "MalformedInput" else message, status,
+                      use_json=is_json, use_cbor=is_cbor)
+
+    if is_cbor or is_json:
+        wrong_type = _tags_serialization_error(tags)
+        if wrong_type:
+            return refuse(*wrong_type)
+    # The aws: prefix is refused only when the call creates the alarm (an
+    # update ignores its Tags), and before the member constraints.
+    if is_new and not composite and any(isinstance(t.get("Key"), str) and t["Key"].lower().startswith("aws:")
+                                        for t in tags or []):
+        return refuse("AccessDenied", 'The provided tag keys must not start with any case of "aws:"', 403)
+    errors = _tag_constraint_errors(tags)
+    if datapoints is not None and datapoints < 1:
+        errors.append(f"Value '{datapoints}' at 'datapointsToAlarm' failed to satisfy constraint: "
+                      "Member must have value greater than or equal to 1")
+    if errors:
+        # AWS lists at most ten, and counts only those.
+        errors = errors[:_MAX_LISTED_VALIDATION_ERRORS]
+        count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected"
+        return refuse("ValidationError", f"{count}: {'; '.join(errors)}", 400)
+    if is_new:
+        invalid = _tagset_error(tags) or (_composite_system_tag_error(tags) if composite else None)
+        if invalid:
+            return refuse("ValidationError", invalid, 400)
+    if is_new and len({t["Key"] for t in tags or []}) > _ALARM_TAG_LIMIT:
+        return refuse("ValidationError", "The resultant tag set must not have more than 50 user tags.", 400)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1561,14 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
             insuff_actions.append(_p(params, f"InsufficientDataActions.member.{ii}"))
             ii += 1
 
+    # Tags are checked before the rule, and stored only when the call creates
+    # the alarm (an update ignores them), as with PutMetricAlarm.
+    is_new = name not in _composite_alarms
+    tags = _alarm_request_tags(params, cbor_data, is_cbor, is_json)
+    refused = _alarm_tags_refusal(tags, None, is_new, is_cbor, is_json, composite=True)
+    if refused:
+        return refused
+
     try:
         refs = _rule_refs(_parse_alarm_rule(alarm_rule))
     except ValueError as exc:
@@ -1405,6 +1608,8 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
             if key in existing:
                 alarm[key] = existing[key]
     _composite_alarms[name] = alarm
+    if is_new and tags:
+        _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
     new_state = _composite_rule_state(alarm)
     if not existing or new_state != alarm["StateValue"]:
         verb = "was updated and its new alarm rule evaluates to" if existing else \
@@ -1536,7 +1741,8 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
         f"<Namespace>{a.get('Namespace','')}</Namespace><Threshold>{a.get('Threshold','')}</Threshold>"
         f"<ComparisonOperator>{a.get('ComparisonOperator','')}</ComparisonOperator>"
         f"<EvaluationPeriods>{a.get('EvaluationPeriods','')}</EvaluationPeriods>"
-        f"<StateReason>{a.get('StateReason','')}</StateReason>"
+        + (f"<DatapointsToAlarm>{a['DatapointsToAlarm']}</DatapointsToAlarm>" if "DatapointsToAlarm" in a else "")
+        + f"<StateReason>{a.get('StateReason','')}</StateReason>"
         f"</member>"
         for a in metric_alarms
     )
@@ -2080,6 +2286,11 @@ def _p(params, key, default=""):
     return val[0] if isinstance(val, list) else val
 
 
+def _optional_int(value):
+    """``int(value)``, or ``None`` when the request leaves the member unset."""
+    return None if value is None else int(value)
+
+
 def _cbor_timestamp(value):
     """Encode an epoch/ISO timestamp as CBOR tag 1 (epoch date-time).
 
@@ -2234,6 +2445,10 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
+# AWS escapes the Query error message, quotes included (&quot;).
+_XML_QUOTE = {'"': "&quot;"}
+
+
 def _error(code, message, status, use_json=False, use_cbor=False):
     if use_cbor:
         try:
@@ -2252,7 +2467,8 @@ def _error(code, message, status, use_json=False, use_cbor=False):
     fault_type = "Sender" if status < 500 else "Receiver"
     body = (
         f'<ErrorResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
-        f"    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>\n"
+        f"    <Error><Type>{fault_type}</Type><Code>{code}</Code>"
+        f"<Message>{_xml_escape(message, _XML_QUOTE)}</Message></Error>\n"
         f"    <RequestId>{new_uuid()}</RequestId>\n"
         f"</ErrorResponse>"
     ).encode("utf-8")

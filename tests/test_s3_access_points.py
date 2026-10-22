@@ -3,6 +3,8 @@ access point ARN or alias."""
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 import uuid
 
 import boto3
@@ -509,6 +511,34 @@ def test_access_point_policy_contract(auth_enabled, iam_user, bucket, access_poi
 
 
 @pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+def test_access_point_refuses_bucket_policy_writes_contract(auth_enabled, iam_user, bucket, access_point, via):
+    """Under AUTH an access point refuses PutBucketPolicy and DeleteBucketPolicy and serves GetBucketPolicy."""
+    _name, created = access_point
+    arn = created["AccessPointArn"]
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": ["s3:PutBucketPolicy", "s3:GetBucketPolicy", "s3:DeleteBucketPolicy"],
+        "Resource": [f"arn:aws:s3:::{bucket}", arn]}]}).client("s3", region="us-east-1")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*"}]})
+    client.put_bucket_policy(Bucket=bucket, Policy=policy)
+    assert client.get_bucket_policy(Bucket=created[via])["Policy"] == policy
+    for write in (lambda: client.delete_bucket_policy(Bucket=created[via]),
+                  lambda: client.put_bucket_policy(Bucket=created[via], Policy=policy)):
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                write()
+            error = exc.value.response["Error"]
+            assert error["Code"] == "AccessDenied"
+            assert error["Message"].endswith(f'on resource: "{arn}" with an explicit deny in a resource-based policy')
+            assert client.get_bucket_policy(Bucket=bucket)["Policy"] == policy
+        else:
+            write()
+    client.delete_bucket_policy(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
 def test_access_point_refuses_unsigned_requests_contract(auth_enabled, bucket, access_point):
     """Under AUTH an unsigned request through an access point is refused; the bucket still serves it."""
     _name, created = access_point
@@ -529,6 +559,34 @@ def test_access_point_refuses_unsigned_requests_contract(auth_enabled, bucket, a
             assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidRequest", 400)
         else:
             assert anon.get_object(Bucket=target, Key="pub.txt")["Body"].read() == b"public"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+def test_access_point_sigv2_requests_contract(auth_enabled, iam_user, bucket, access_point, via):
+    """Through an access point a SigV2 presigned URL is served, a SigV2 Authorization header is refused under AUTH."""
+    _name, created = access_point
+    user = iam_user(policy=_access_point_policy(bucket, created["AccessPointArn"], "both"))
+    client = user.client("s3", region="us-east-1", config=Config(signature_version="s3"))
+    url = client.generate_presigned_url("get_object", Params={"Bucket": created[via], "Key": "k.txt"})
+    assert "AWSAccessKeyId=" in url
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        assert resp.read() == b"hello"
+    tampered = re.sub(r"Signature=[^&]+", "Signature=AAAA", url)
+    if auth_enabled:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(tampered, timeout=10)
+        assert exc.value.code == 403
+        assert b"<Code>SignatureDoesNotMatch</Code>" in exc.value.read()
+        with pytest.raises(ClientError) as exc:
+            client.get_object(Bucket=created[via], Key="k.txt")
+        error = exc.value.response
+        assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidRequest", 400)
+    else:
+        with urllib.request.urlopen(tampered, timeout=10) as resp:
+            assert resp.read() == b"hello"
+        assert client.get_object(Bucket=created[via], Key="k.txt")["Body"].read() == b"hello"
+    assert client.get_object(Bucket=bucket, Key="k.txt")["Body"].read() == b"hello"
 
 
 @pytest.mark.auth_contract

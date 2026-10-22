@@ -17947,6 +17947,40 @@ def test_cfn_lambda_function_foreign_layer_follows_the_layer_policy(granted):
         owner.delete_layer_version(LayerName="foreign", VersionNumber=published["Version"])
 
 
+def test_cfn_lambda_function_unheld_foreign_layer_attaches_empty():
+    """A template attaching a public vendor layer MiniStack does not hold deploys, as
+    on AWS (#2313 C7), with the layer reported as {Arn, CodeSize: 0} (#2313
+    maintainer (3)), the same as CreateFunction."""
+    consumer_id = str(100000000000 + _uuid_mod.uuid4().int % 800000000000)
+
+    def client(service):
+        return boto3.client(
+            service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            region_name="us-east-1", aws_access_key_id=consumer_id, aws_secret_access_key="test",
+        )
+
+    lam, cfn = client("lambda"), client("cloudformation")
+    arn = "arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Extension-ARM:101"
+    stack_name = "cfn-unheld-layer"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps({"Resources": {"Fn": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+            "FunctionName": "unheld-layer-fn", "Runtime": "python3.12",
+            "Handler": "index.handler", "Role": f"arn:aws:iam::{consumer_id}:role/cfn-role",
+            "Code": {"ZipFile": "def handler(event, context):\n    return {}\n"},
+            "Layers": [arn],
+        },
+    }}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert lam.get_function_configuration(FunctionName="unheld-layer-fn")["Layers"] == [
+            {"Arn": arn, "CodeSize": 0}]
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+
+
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
     """A layer plus the permission resource that grants another account access
     to it — the shape serverless-python-requirements emits for a layer with
@@ -25807,6 +25841,40 @@ def test_cfn_cloudwatch_alarm_update_drops_omitted_properties(cfn, cw):
         assert after["TreatMissingData"] == "missing"
         assert after["OKActions"] == []
         assert "Unit" not in after
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_cloudwatch_alarm_datapoints_to_alarm_only_when_declared(cfn, cw):
+    """The alarm reports DatapointsToAlarm only while the template sets it.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C20, C21, C22)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-alarm-dta-{uid}"
+    alarm_name = f"cfn-alarm-dta-{uid}"
+    base = {
+        "AlarmName": alarm_name, "MetricName": "Errors", "Namespace": f"CfnAlarmDta/{uid}",
+        "Statistic": "Sum", "Period": 60, "EvaluationPeriods": 3,
+        "Threshold": 1, "ComparisonOperator": "GreaterThanThreshold",
+    }
+
+    def template(**extra):
+        return json.dumps({"Resources": {"Alarm": {
+            "Type": "AWS::CloudWatch::Alarm", "Properties": {**base, **extra}}}})
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template())
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(DatapointsToAlarm=2))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]["DatapointsToAlarm"] == 2
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template())
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert "DatapointsToAlarm" not in cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 

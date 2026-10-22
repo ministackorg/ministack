@@ -974,6 +974,47 @@ def test_iot_remove_thing_from_an_unknown_thing_group_succeeds(iot_client):
     iot_client.delete_thing(thingName=tname)
 
 
+@pytest.mark.auth_contract
+def test_iot_thing_group_membership_authorizes_on_the_group_and_the_thing(auth_enabled, iam_user, iot_client):
+    gname, tname = _unique("group"), _unique("thing")
+    group = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    thing = iot_client.create_thing(thingName=tname)["thingArn"]
+    head = group.rsplit(":", 1)[0]
+    literals = [f"{head}:thinggroup/addThingToThingGroup", f"{head}:thinggroup/removeThingFromThingGroup"]
+
+    def client(*resources):
+        return iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["iot:AddThingToThingGroup", "iot:RemoveThingFromThingGroup"],
+            "Resource": list(resources),
+        }]}).client("iot")
+
+    try:
+        allowed = client(group, thing)
+        allowed.add_thing_to_thing_group(thingGroupName=gname, thingName=tname)
+        assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+        allowed.remove_thing_from_thing_group(thingGroupName=gname, thingName=tname)
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+
+        # The group is checked first, then the thing; a denial names the resource that failed.
+        for resources, denied_on in (([thing], group), ([group], thing), (literals, group)):
+            user = client(*resources)
+            for action, call in (("AddThingToThingGroup", user.add_thing_to_thing_group),
+                                 ("RemoveThingFromThingGroup", user.remove_thing_from_thing_group)):
+                if auth_enabled:
+                    with pytest.raises(ClientError) as ei:
+                        call(thingGroupName=gname, thingName=tname)
+                    error = ei.value.response
+                    assert error["ResponseMetadata"]["HTTPStatusCode"] == 403
+                    assert error["Error"]["Code"] == "AccessDeniedException"
+                    assert f" iot:{action} on resource: {denied_on} " in error["Error"]["Message"]
+                else:
+                    assert call(thingGroupName=gname, thingName=tname)["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert tname not in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+    finally:
+        iot_client.delete_thing_group(thingGroupName=gname)
+        iot_client.delete_thing(thingName=tname)
+
+
 def test_iot_list_thing_groups_for_thing(iot_client):
     tname = _unique("thing")
     g1 = _unique("group")
