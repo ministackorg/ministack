@@ -1292,8 +1292,12 @@ def pin_signed_request(
         and not _query_value(query_params or {}, "SignatureVersion"))
     if sigv2 and claimed and not _is_root_key(claimed) and not authorization.startswith("AWS4-"):
         headers = {name.decode("latin-1").lower(): decode_header_value(value) for name, value in raw_headers}
-        from ministack.app import _extract_s3_vhost_bucket
+        from ministack.app import _ACCESS_POINT_HOST_RE, _extract_s3_vhost_bucket
+        from ministack.services.s3 import resolve_access_point_host
         bucket = _extract_s3_vhost_bucket(headers.get("host", ""))
+        access_point = _ACCESS_POINT_HOST_RE.match(bucket or "")
+        if access_point and resolve_access_point_host(access_point["name"], access_point["account"], None):
+            bucket = None  # an access point host signs its path without a bucket
         _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, headers, sigv2=True,
                                           auth_path=f"/{bucket}{raw_path}" if bucket else raw_path))
         return

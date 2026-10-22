@@ -2441,6 +2441,25 @@ class TestResourceArn:
         bad = json.dumps({"resourceArn": [group]}).encode()
         assert extract_resource_arn("iot", "POST", "/untag", {}, bad, {}, "us-east-1", "123") == "*"
 
+    def test_iot_thing_group_membership_names_the_group_then_the_thing(self):
+        from ministack.core.iam_actions import extract_resource_arn, iot_resource_arns
+        head = "arn:aws:iot:us-east-1:123"
+        group, thing = f"{head}:thinggroup/fleet", f"{head}:thing/dev-1"
+        for path in ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup"):
+            for body in ({"thingGroupName": "fleet", "thingName": "dev-1"},
+                         {"thingGroupArn": group, "thingArn": thing},
+                         {"thingGroupName": "fleet", "thingGroupArn": f"{head}:thinggroup/x", "thingName": "dev-1"}):
+                raw = json.dumps(body).encode()
+                assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == [group, thing]
+                assert extract_resource_arn("iot", "PUT", path, {}, raw, {}, "us-east-1", "123") == group
+            for raw in (b"{}", b"[]", b"not json", json.dumps({"thingGroupName": 1, "thingName": ["x"]}).encode()):
+                assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == ["*", "*"]
+        # DescribeThingGroup of a group with that name keeps its own resource.
+        assert iot_resource_arns("GET", "/thing-groups/addThingToThingGroup", b"", "us-east-1", "123") == []
+        assert extract_resource_arn(
+            "iot", "GET", "/thing-groups/addThingToThingGroup", {}, b"", {}, "us-east-1", "123"
+        ) == f"{head}:thinggroup/addThingToThingGroup"
+
     def test_iot_job_policy_from_the_cdk_actually_allows_the_call(self):
         """The two halves together, which is where this showed up. The CDK's
         AwsCustomResource emits exactly this policy for an IoT job, and every

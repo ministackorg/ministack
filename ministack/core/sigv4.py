@@ -204,6 +204,30 @@ def parse_header_signature(headers: Mapping[str, Any]) -> HeaderSignature | tupl
     return HeaderSignature(*scope[:4], fields["SignedHeaders"], fields["Signature"], amz_date)
 
 
+def foreign_authorization_failure(headers: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Why API Gateway refuses an Authorization header that is not a SigV4 one, or None for a SigV4a header."""
+    authorization = headers.get("authorization", "")
+    algorithm, _, rest = authorization.partition(" ")
+    if any("=" not in part for part in rest.split(",") if part.strip()):
+        digest = base64.b64encode(hashlib.sha256(authorization.encode("utf-8")).digest()).decode()
+        return "IncompleteSignature", (
+            f"Invalid key=value pair (missing equal-sign) in Authorization header "
+            f"(hashed with SHA-256 and encoded with Base64): '{digest}'.")
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        fields = dict(part.strip().partition("=")[::2] for part in rest.split(","))
+        if "x-amz-region-set" in fields.get("SignedHeaders", "").split(";"):
+            return None
+        return "IncompleteSignature", (
+            "'x-amz-region-set' must be a 'SignedHeader' in Authorization or passed as a Query Parameter "
+            "'X-Amz-Region-Set'")
+    signature = parse_header_signature(headers)
+    if isinstance(signature, tuple):
+        return signature
+    if not algorithm.startswith("AWS4-"):
+        return "IncompleteSignature", f"Algorithm must start with 'AWS4-'; got '{algorithm}'"
+    return "IncompleteSignature", f"Unsupported AWS 'algorithm': '{algorithm}'. "
+
+
 def _query_value(query_params: Mapping[str, Any], name: str) -> str:
     value = query_params.get(name, query_params.get(name.lower(), ""))
     return (value[0] if value else "") if isinstance(value, list) else value
