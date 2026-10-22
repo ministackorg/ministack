@@ -11658,7 +11658,7 @@ def test_cognito_federation_access_token_pretoken_event_has_user_attributes(cogn
 
     access = _decode_jwt_claims(tokens["access_token"])
     assert access["seen_sub"] == access["sub"]
-    assert access["seen_groups"] == "admins"
+    assert access["seen_groups"] == f"{pid}_TestSAML,admins"
 
 
 # Secret-hash checks run under AUTH=true; server tests need a MiniStack started with it.
@@ -12468,3 +12468,102 @@ def test_cognito_unsupported_login_and_forged_refresh_token_contract(auth_enable
         assert exc.value.response["Error"]["Message"] == "Invalid Refresh Token"
     assert cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={
         "REFRESH_TOKEN": refresh})["AuthenticationResult"]["AccessToken"]
+
+
+def test_cognito_pools_sign_with_their_own_keys(cognito_idp):
+    """Each pool publishes two keys of its own, and its tokens carry their kids."""
+    published, kids = [], []
+    for name in ("own-keys-one", "own-keys-two"):
+        pid = cognito_idp.create_user_pool(PoolName=name)["UserPool"]["Id"]
+        cid = cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="c", ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        )["UserPoolClient"]["ClientId"]
+        cognito_idp.admin_create_user(UserPoolId=pid, Username="u", MessageAction="SUPPRESS")
+        cognito_idp.admin_set_user_password(UserPoolId=pid, Username="u", Password="Example-Password-1", Permanent=True)
+        result = cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Example-Password-1"},
+        )["AuthenticationResult"]
+        with urllib.request.urlopen(f"{ENDPOINT}/{pid}/.well-known/jwks.json") as r:
+            keys = json.loads(r.read())["keys"]
+        assert len(keys) == 2
+        heads = [json.loads(base64.urlsafe_b64decode(h + "=" * (-len(h) % 4)))
+                 for h in (result["IdToken"].split(".")[0], result["AccessToken"].split(".")[0])]
+        assert heads[0]["kid"] != heads[1]["kid"]
+        assert {h["kid"] for h in heads} == {k["kid"] for k in keys}
+        cognito_idp.get_user(AccessToken=result["AccessToken"])
+        published.append({k["n"] for k in keys})
+        kids.append(heads[0]["kid"])
+    assert not published[0] & published[1]
+    assert kids[0] != kids[1]
+
+
+def test_oauth2_refuses_plain_pkce_unregistered_redirect_and_unknown_grant():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    client_id = client['ClientId']
+    authorize = (f'{ENDPOINT}/oauth2/authorize?response_type=code&client_id={client_id}'
+                 f'&redirect_uri=http://localhost:3000/callback&state=s&scope=openid')
+    for pkce in ('&code_challenge=v&code_challenge_method=plain', '&code_challenge=v'):
+        try:
+            _no_redirect_opener.open(authorize + pkce)
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            assert e.code == 302
+            assert e.headers['Location'] == 'http://localhost:3000/callback?error=invalid_request&state=s'
+    status, headers, _ = _post_form(f'{ENDPOINT}/login', {
+        'username': 'testuser', 'password': 'TestPass1!', 'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback', 'response_type': 'code',
+        'code_challenge': 'v', 'code_challenge_method': 'plain',
+    }, follow_redirects=False)
+    assert status == 302 and 'code=' not in headers['location']
+
+    bare = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='bare', AllowedOAuthFlows=['code'], AllowedOAuthScopes=['openid'],
+        AllowedOAuthFlowsUserPoolClient=True, SupportedIdentityProviders=['COGNITO'],
+    )['UserPoolClient']['ClientId']
+    try:
+        _no_redirect_opener.open(f'{ENDPOINT}/oauth2/authorize?response_type=code&client_id={bare}'
+                                 f'&redirect_uri=https://elsewhere.example.org/cb&scope=openid')
+        assert False, "Expected 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+    status, _, _ = _post_form(f'{ENDPOINT}/login', {
+        'username': 'testuser', 'password': 'TestPass1!', 'client_id': bare,
+        'redirect_uri': 'https://elsewhere.example.org/cb', 'response_type': 'code',
+    }, follow_redirects=False)
+    assert status == 400
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {'grant_type': 'example', 'client_id': client_id})
+    assert status == 400
+    assert json.loads(body) == {'error': 'unsupported_grant_type'}
+
+
+def test_cognito_oidc_federated_user_has_identities_and_provider_group(cognito_idp):
+    """A new IdP profile joins `<pool id>_<IdP name>` and its ID token carries identities."""
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "fed-sub", "email": "fed@example.com"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url)
+        group = f"{pid}_TestOIDC"
+        assert [g["GroupName"] for g in cognito_idp.list_groups(UserPoolId=pid)["Groups"]] == [group]
+        try:
+            _no_redirect_opener.open(
+                f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+                f"&redirect_uri=http://localhost:3000/callback&identity_provider=TestOIDC&state=s&scope=openid")
+            assert False, "Expected 302"
+        except urllib.error.HTTPError as e:
+            relay_state = _parse_qs(urlparse(e.headers.get("Location", "")).query)["state"][0]
+        try:
+            _no_redirect_opener.open(f"{ENDPOINT}/oauth2/idpresponse?code=idp-code&state={relay_state}")
+            assert False, "Expected 302 back to the app"
+        except urllib.error.HTTPError as e:
+            claims = _federation_id_claims(cid, e.headers.get("Location", ""))
+        assert claims["cognito:groups"] == [group]
+        [identity] = claims["identities"]
+        assert {k: identity[k] for k in ("userId", "providerName", "providerType", "issuer", "primary")} == {
+            "userId": "fed-sub", "providerName": "TestOIDC", "providerType": "OIDC", "issuer": None, "primary": "true"}
+        assert identity["dateCreated"].isdigit()
+        users = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName=group)["Users"]
+        assert [u["Username"] for u in users] == ["TestOIDC_fed-sub"]
+    finally:
+        stop()
