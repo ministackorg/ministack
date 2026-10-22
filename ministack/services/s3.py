@@ -2427,9 +2427,10 @@ async def handle_request(
     if (access_point_region is not None or bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX)) and not internal:
         from ministack.app import AUTH
 
-        if (AUTH and not _request_access_key(method, key, headers, query_params, body)
+        if (AUTH and (not _request_access_key(method, key, headers, query_params, body)
+                      or headers.get("authorization", "").startswith("AWS "))
                 and (access_point_region is not None or resolve_access_point_alias(bucket))):
-            # Access points take signed requests only.
+            # Access points take signed requests only, a header signature in Signature Version 4.
             return _error("InvalidRequest", "The authorization mechanism you have provided is not supported. "
                           "Please use Signature Version 4.", 400)
 
