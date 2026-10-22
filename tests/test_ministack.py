@@ -817,6 +817,34 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("service,labels", [
+    ("opensearch", {"com.ministack.service": "opensearch"}),
+    ("opensearchserverless", {"com.ministack.service": "opensearchserverless"}),
+    ("dsql", {}),
+    ("ecs", {}),
+    ("eks", {}),
+])
+def test_service_reset_spares_other_instances_containers(fake_docker, monkeypatch, service, labels):
+    """A reset clears this instance's containers; another MiniStack on the daemon keeps its own."""
+    import importlib
+
+    from ministack.core import container_reaper
+    from ministack.services import rds
+
+    mod = importlib.import_module(f"ministack.services.{service}")
+    for name, port in (("theirs", "4777"), ("ours", "4566")):
+        monkeypatch.setenv("GATEWAY_PORT", port)
+        fake_docker.containers.run(name=name, labels={**container_reaper.own_labels(service), **labels})
+    monkeypatch.setattr(rds if service == "dsql" else mod, "_get_docker", lambda: fake_docker)
+    if service == "dsql":
+        monkeypatch.setattr(mod, "_docker_available", lambda: True)
+
+    mod.reset()
+
+    assert fake_docker.live() == ["theirs"], f"{service} reset removed another instance's container"
+
+
+@pytest.mark.serial
 def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monkeypatch):
     """A full listing inspects every container, so one failed inspect used to cost the whole sweep."""
     from ministack.core import container_reaper

@@ -2118,6 +2118,10 @@ _AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
         "SignatureDoesNotMatch", 403, "InvalidSignatureException",
         ("RequestTimeTooSkewed", 403, "The difference between the request time and the current time is too large."),
     ),
+    "RequestExpired": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("AccessDenied", 403, "Request has expired"),
+    ),
     "IncompleteSignature": _INCOMPLETE,
     "MissingAuthorizationParameter": _INCOMPLETE,
     "UnsupportedSignature": (

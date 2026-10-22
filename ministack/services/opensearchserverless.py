@@ -95,9 +95,10 @@ def reset():
     if docker is None:
         return
     try:
-        containers = docker.containers.list(
-            all=True, filters={"label": f"com.ministack.service={_CONTAINER_LABEL}"}
-        )
+        containers = docker.containers.list(all=True, filters={"label": [
+            f"com.ministack.service={_CONTAINER_LABEL}",
+            f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]})
     except Exception:
         return
     container_reaper.drop_containers(containers, force=True)
