@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **DynamoDB — `TransactWriteItems` follows DynamoDB's check order** — an `Update` whose `ConditionExpression` failed was cancelled with `ValidationError` when its `UpdateExpression` could not be applied to the item (for example `SET #c = #c + :one` on a missing item); it now cancels with `ConditionalCheckFailed`, as `UpdateItem` answers `ConditionalCheckFailedException` for the same request. Such an update-expression error on one member no longer hides a failed condition on another: both reasons are returned, while wrong-typed keys and index keys still cancel before any condition. A missing table answers `ResourceNotFoundException` even when another member has a `ValidationError`, and a `begins_with` condition with a number operand answers `ValidationException` instead of an internal error, as on AWS. Contributed by @jun-ut.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
