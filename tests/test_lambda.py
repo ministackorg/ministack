@@ -12892,6 +12892,9 @@ def _fresh_extract_cache(monkeypatch, tmp_path):
     """Point the extraction cache at an empty per-test root."""
     monkeypatch.setattr(lsvc, "_DOCKER_EXTRACT_CACHE", str(tmp_path / "extract"))
     monkeypatch.setattr(lsvc, "_docker_extract_dirs", {})
+    # reset() below also removes the provided-runtime cache, which this process shares with its server.
+    monkeypatch.setattr(lsvc, "_PROVIDED_CODE_CACHE", str(tmp_path / "provided"))
+    monkeypatch.setattr(lsvc, "_provided_code_dirs", {})
 
 
 def _count_extractions(monkeypatch):
@@ -15682,3 +15685,12 @@ def test_lambda_function_url_event_and_response_follow_aws(lam):
         assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=0;Lineage=1:[0-9a-f]{8}:0", trace)
     finally:
         lam.delete_function(FunctionName=name)
+
+
+def test_lambda_code_caches_belong_to_this_instance():
+    """The code caches are named for the instance's gateway port, so two MiniStacks on one host keep apart."""
+    from ministack.services import lambda_svc as lsvc
+
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    assert os.path.basename(lsvc._PROVIDED_CODE_CACHE) == f"ministack-provided-code-{port}"
+    assert os.path.basename(lsvc._DOCKER_EXTRACT_CACHE) == f"ministack-lambda-extract-{port}"

@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — two MiniStacks on one host no longer remove each other's function code** — the provided-runtime and Docker-executor extraction caches lived at fixed paths in the shared temp directory, so a second instance on the same host deleted a tree the first was still running from ("leftover from a previous process") and its `reset()` removed the first one's caches; an invocation then failed with `No such file or directory: .../bootstrap`. Both caches are now named for the instance's `GATEWAY_PORT`. Contributed by @skialpine.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
