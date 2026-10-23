@@ -1342,6 +1342,42 @@ def test_elbv2_dataplane_streams_target_response(elbv2):
 
 
 @pytest.mark.serial
+def test_elbv2_dataplane_response_carries_the_load_balancers_date_once(elbv2):
+    """A load balancer writes its own Date in place of the target's; the response carries one."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _StaleDate(BaseHTTPRequestHandler):
+        def date_time_string(self, timestamp=None):
+            return "Mon, 01 Jan 2001 00:00:00 GMT"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StaleDate)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    lb_name = "dp-alb-date"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        resp.read()
+        dates = resp.headers.get_all("Date")
+        assert len(dates) == 1 and "2001" not in dates[0]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
 def test_elbv2_dataplane_non_streaming_body_is_intact(elbv2):
     """A plain Content-Length response survives the read loop unchanged.
 

@@ -32,6 +32,7 @@ import socket
 import string
 import time
 import warnings
+from email.utils import formatdate
 from urllib.parse import parse_qs, urlencode
 from xml.sax.saxutils import escape as _esc
 
@@ -2256,6 +2257,8 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         out_headers.setdefault(name.lower(), []).append(value)
     out_headers = {name: values[0] if len(values) == 1 else values
                    for name, values in out_headers.items()}
+    # The load balancer writes its own Date in place of the target's.
+    out_headers["date"] = formatdate(usegmt=True)
     status = resp.status
 
     async def _stream(send, receive):

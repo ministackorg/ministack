@@ -107,6 +107,56 @@ def test_responses_do_not_advertise_the_emulator_server():
     assert not (resp.headers.get("Server") or "").startswith("hypercorn")
 
 
+def test_http_and_websocket_responses_carry_one_date_header():
+    """Regression guard: with Hypercorn's own Date off, an http response and a WebSocket handshake
+    response each still carry exactly one."""
+    import asyncio
+    import urllib.request
+    from urllib.parse import urlparse
+
+    websockets = pytest.importorskip("websockets")
+    parsed = urlparse(ENDPOINT)
+
+    async def handshake():
+        url = f"ws://prefix-ats.iot.us-east-1.{parsed.hostname}:{parsed.port}/mqtt"
+        async with websockets.connect(url, subprotocols=["mqtt"]) as ws:
+            return ws.response.headers.get_all("Date")
+
+    assert len(urllib.request.urlopen(f"{ENDPOINT}/_ministack/health").headers.get_all("Date")) == 1
+    assert len(asyncio.run(handshake())) == 1
+
+
+def test_a_malformed_request_is_answered_with_one_date():
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(ENDPOINT)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\n")
+        head = sock.recv(65536).split(b"\r\n\r\n")[0].lower().split(b"\r\n")
+    assert head[0].startswith(b"http/1.1 400")
+    assert sum(line.startswith(b"date:") for line in head) == 1
+
+
+def test_a_refused_websocket_handshake_carries_one_date():
+    import asyncio
+    from urllib.parse import urlparse
+
+    websockets = pytest.importorskip("websockets")
+    parsed = urlparse(ENDPOINT)
+
+    async def refused():
+        url = f"ws://{parsed.hostname}:{parsed.port}/_aws/execute-api/nosuchapi/stage"
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+            async with websockets.connect(url):
+                pass
+        return exc.value.response
+
+    response = asyncio.run(refused())
+    assert response.status_code == 403
+    assert len(response.headers.get_all("Date")) == 1
+
+
 def test_localstack_health_still_returns_200():
     """/_localstack/health must still return 200 after the interceptor is wired in."""
     import urllib.request

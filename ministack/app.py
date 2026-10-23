@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+from email.utils import formatdate
 from urllib.parse import parse_qs, quote, unquote, urlencode
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -250,6 +251,34 @@ _install_hypercorn_compat()
 from hypercorn.config import Config as _HypercornConfig
 
 _HypercornConfig.include_server_header = False
+# Hypercorn appends its own Date even when the response has one; the app adds one when it is missing.
+_HypercornConfig.include_date_header = False
+
+import h11 as _h11
+from hypercorn.protocol.events import EndBody as _EndBody
+from hypercorn.protocol.events import Response as _StreamResponse
+from hypercorn.protocol.h11 import H11Protocol as _H11Protocol
+from hypercorn.protocol.ws_stream import WSStream as _WSStream
+
+
+async def _send_error_response(self, status_code: int) -> None:
+    """Hypercorn's own error response (a malformed request's 400), with the Date its config no longer adds."""
+    await self._send_h11_event(_h11.Response(status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"),
+        (b"date", formatdate(usegmt=True).encode()), *self.config.response_headers("h11")]))
+    await self._send_h11_event(_h11.EndOfMessage())
+
+
+async def _send_ws_error_response(self, status_code: int) -> None:
+    """Hypercorn's own WebSocket handshake refusal (websocket.close before accept), with its Date."""
+    await self.send(_StreamResponse(stream_id=self.stream_id, status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"), (b"date", formatdate(usegmt=True).encode())]))
+    await self.send(_EndBody(stream_id=self.stream_id))
+    await self.config.log.access(self.scope, {"status": status_code, "headers": []}, time.time() - self.start_time)
+
+
+_H11Protocol._send_error_response = _send_error_response
+_WSStream._send_error_response = _send_ws_error_response
 
 # ---------------------------------------------------------------------------
 # Lazy service loader — modules are imported on first request, not at startup.
@@ -3176,8 +3205,25 @@ async def _dispatch_service_request(
 # ---------------------------------------------------------------------------
 
 
+_RESPONSE_START_MESSAGES = ("http.response.start", "websocket.accept", "websocket.http.response.start")
+
+
+def _with_date_header(send):
+    """AWS sends one Date per response: a proxied target's, or the endpoint's own when there is none."""
+    async def send_with_date(message):
+        if message["type"] in _RESPONSE_START_MESSAGES and not any(
+            name.lower() == b"date" for name, _ in message.get("headers", [])
+        ):
+            message = {**message, "headers": [*message.get("headers", []), (b"date", formatdate(usegmt=True).encode("ascii"))]}
+        await send(message)
+
+    return send_with_date
+
+
 async def app(scope, receive, send):
     """ASGI application entry point."""
+    if scope["type"] in ("http", "websocket"):
+        send = _with_date_header(send)
     if scope["type"] == "lifespan":
         await _handle_lifespan(scope, receive, send)
         return
