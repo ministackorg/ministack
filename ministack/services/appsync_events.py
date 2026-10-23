@@ -125,8 +125,8 @@ def _restore_state(data):
     _restore_api_child_store(_api_keys, data.get("api_keys", {}))
 
 
-# Same contract as apigateway.py (used by app.py persistence loader)
-load_persisted_state = _restore_state
+def load_persisted_state(data):
+    return _restore_state(data)
 
 
 

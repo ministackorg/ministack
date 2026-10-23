@@ -300,6 +300,7 @@ def _ensure_live_containers_locked():
             host, port, cid = _spawn_redis_container(
                 name=f"ministack-elasticache-{account_id}-{region}-{name}",
                 engine=engine, engine_version=version,
+                transit=cl.get("TransitEncryptionEnabled", False), auth_token=_record_auth(cl),
                 labels={
                     **container_reaper.own_labels("elasticache"),
                     "cluster_id": name,
@@ -332,6 +333,7 @@ def _ensure_live_containers_locked():
                 _, _, cid = _spawn_redis_container(
                     name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                     engine=engine, engine_version=engine_version,
+                    transit=rg.get("TransitEncryptionEnabled", False), auth_token=_record_auth(rg),
                     labels={
                         **container_reaper.own_labels("elasticache"), "rg_id": rg_id,
                         "node_group": ng_id, "account_id": account_id,
@@ -516,7 +518,57 @@ def _image_is_local(docker_client, image: str) -> bool:
         return False
 
 
-def _spawn_redis_container(name, engine, engine_version, labels):
+_NODE_TLS_DIR = "/ministack-elasticache-tls"
+# The certificate names the container's address, known only once it runs, so the
+# server waits for the material; `ready` is the archive's last member.
+_NODE_TLS_WRAPPER = (
+    f"d={_NODE_TLS_DIR}; "
+    'while [ ! -e "$d/ready" ]; do sleep 0.1; done; '
+    'chown -R "$(stat -c %u:%g /data)" "$d"; '
+    'exec docker-entrypoint.sh "$@"'
+)
+
+
+def _node_server_args(port, transit, auth_token):
+    args = []
+    if transit:
+        args += ["--port", "0", "--tls-port", str(port),
+                 "--tls-cert-file", f"{_NODE_TLS_DIR}/server.crt",
+                 "--tls-key-file", f"{_NODE_TLS_DIR}/server.key",
+                 "--tls-ca-cert-file", f"{_NODE_TLS_DIR}/ca.crt",
+                 "--tls-auth-clients", "no", "--tls-replication", "yes"]
+    if auth_token:
+        args += ["--requirepass", auth_token, "--masterauth", auth_token]
+    return args
+
+
+def _node_cli_args(transit, auth_token):
+    args = ["--tls", "--cacert", f"{_NODE_TLS_DIR}/ca.crt", "-h", "127.0.0.1"] if transit else []
+    if auth_token:
+        args += ["-a", auth_token, "--no-auth-warning"]
+    return args
+
+
+def _install_node_tls(container, name, container_ip):
+    from ministack.core.x509_utils import sign_leaf_certificate
+
+    candidates = ("localhost", _MINISTACK_HOST, name, "127.0.0.1", "::1", container_ip)
+    dns_names = [n for n in dict.fromkeys(candidates) if n and not _is_ip(n)]
+    ips = [n for n in dict.fromkeys(candidates) if n and _is_ip(n)]
+    ca_pem, ca_key = _ensure_serverless_ca()
+    cert_pem, key_pem, _public = sign_leaf_certificate(
+        ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
+    if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, "")):
+        raise RuntimeError("Docker rejected the TLS material")
+
+
+def _record_auth(record):
+    """The token a node starts with: the required one, or none while it is optional."""
+    tokens = record.get("_auth_tokens") or []
+    return tokens[-1] if tokens and not record.get("_auth_optional") else None
+
+
+def _spawn_redis_container(name, engine, engine_version, labels, transit=False, auth_token=None):
     """Start a redis/valkey/memcached container.
 
     Returns ``(host, port, container_id)``. On any failure (docker unavailable,
@@ -535,6 +587,9 @@ def _spawn_redis_container(name, engine, engine_version, labels):
     endpoint_port = host_port
 
     image, container_port = _engine_image_and_port(engine, engine_version)
+    redis_like = engine in ("redis", "valkey")
+    tls = transit and redis_like
+    container = None
 
     try:
         run_kwargs = dict(
@@ -544,13 +599,22 @@ def _spawn_redis_container(name, engine, engine_version, labels):
             labels=labels,
             volumes={},
         )
+        server_args = _node_server_args(container_port, tls, auth_token if redis_like else None)
+        if server_args:
+            run_kwargs["command"] = server_args
+        if tls:
+            run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
         container = docker_client.containers.run(**run_kwargs)
+        container_ip = ""
         if DOCKER_NETWORK:
             container.reload()
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
+        if tls:
+            _install_node_tls(container, name, container_ip)
+        if DOCKER_NETWORK:
             if container_ip:
                 endpoint_host = container_ip
                 endpoint_port = container_port
@@ -563,10 +627,12 @@ def _spawn_redis_container(name, engine, engine_version, labels):
         return endpoint_host, endpoint_port, container.id
     except Exception as e:
         logger.warning("ElastiCache: Docker failed for %s: %s", name, e)
+        if container is not None:
+            _teardown_containers(docker_client, [container.id])
         return REDIS_DEFAULT_HOST, default_port, None
 
 
-def _spawn_redis_cluster_node(name, engine, engine_version, labels):
+def _spawn_redis_cluster_node(name, engine, engine_version, labels, transit=False, auth_token=None):
     """Spawn a redis/valkey container with cluster-mode enabled.
 
     Requires DOCKER_NETWORK to be set so nodes can reach each other on the
@@ -589,7 +655,10 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels):
         "--port", str(port),
         "--appendonly", "no",
         "--protected-mode", "no",
+        *_node_server_args(port, transit, auth_token),
     ]
+    if transit:
+        cmd += ["--tls-cluster", "yes"]
     try:
         run_kwargs = dict(
             image=image,
@@ -599,6 +668,8 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels):
             labels=labels,
             network=DOCKER_NETWORK,
         )
+        if transit:
+            run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         container = docker_client.containers.run(**run_kwargs)
         container.reload()
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
@@ -611,6 +682,12 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels):
                 pass
             logger.warning("ElastiCache: cluster node %s has no IP on network %s", name, DOCKER_NETWORK)
             return None, None, None
+        if transit:
+            try:
+                _install_node_tls(container, name, container_ip)
+            except Exception:
+                _teardown_containers(docker_client, [container.id])
+                raise
         logger.info("ElastiCache: started cluster node %s at %s:%s", name, container_ip, port)
         return container_ip, port, container.id
     except Exception as e:
@@ -636,7 +713,7 @@ def _wait_redis_ready(container, timeout=15, cli_args=()):
     return False
 
 
-def _bootstrap_redis_cluster(bootstrap_container, node_addrs, replicas_per_shard):
+def _bootstrap_redis_cluster(bootstrap_container, node_addrs, replicas_per_shard, cli_args=()):
     """Run ``redis-cli --cluster create`` inside one of the nodes.
 
     ``node_addrs`` is a list of ``"ip:port"`` strings with primaries first,
@@ -644,7 +721,7 @@ def _bootstrap_redis_cluster(bootstrap_container, node_addrs, replicas_per_shard
     ``--cluster-replicas N`` is set).
     """
     cmd = (
-        ["redis-cli", "--cluster", "create"]
+        ["redis-cli", *cli_args, "--cluster", "create"]
         + node_addrs
         + ["--cluster-replicas", str(replicas_per_shard), "--cluster-yes"]
     )
@@ -690,7 +767,8 @@ def _teardown_containers(docker_client, container_ids):
             logger.warning("ElastiCache: cleanup failed for %s: %s", cid, e)
 
 
-def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, replicas_per_shard):
+def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, replicas_per_shard,
+                           transit=False, auth_token=None):
     """Spawn cluster-enabled nodes and run ``redis-cli --cluster create``.
 
     Returns ``(node_groups, container_ids)`` on success, or
@@ -730,6 +808,7 @@ def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, repli
             engine=engine,
             engine_version=engine_version,
             labels={**common_labels, "node_group": ng_id, "role": "primary"},
+            transit=transit, auth_token=auth_token,
         )
         if not cid:
             return None, container_ids
@@ -751,17 +830,19 @@ def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, repli
                     "role": "replica",
                     "replica_idx": str(r),
                 },
+                transit=transit, auth_token=auth_token,
             )
             if not cid:
                 return None, container_ids
             container_ids.append(cid)
             replicas.append({"ng_id": ng_id, "replica_idx": r, "ip": ip, "port": port, "cid": cid})
 
+    cli_args = _node_cli_args(transit, auth_token)
     # Wait for every node to accept connections before bootstrapping.
     for node in primaries + replicas:
         try:
             container = docker_client.containers.get(node["cid"])
-            if not _wait_redis_ready(container):
+            if not _wait_redis_ready(container, cli_args=cli_args):
                 logger.warning("ElastiCache: cluster node %s never reported PONG", node["cid"])
                 return None, container_ids
         except Exception as e:
@@ -776,10 +857,10 @@ def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, repli
         logger.warning("ElastiCache: bootstrap container lookup failed: %s", e)
         return None, container_ids
 
-    if not _bootstrap_redis_cluster(bootstrap, addrs, replicas_per_shard):
+    if not _bootstrap_redis_cluster(bootstrap, addrs, replicas_per_shard, cli_args=cli_args):
         return None, container_ids
 
-    if not _wait_cluster_ok(bootstrap):
+    if not _wait_cluster_ok(bootstrap, cli_args=cli_args):
         logger.warning("ElastiCache: cluster %s did not reach state:ok", rg_id)
         return None, container_ids
 
@@ -989,6 +1070,11 @@ def _create_cache_cluster(p):
 
     if cluster_id in _clusters:
         return _error("CacheClusterAlreadyExists", f"Cluster {cluster_id} already exists", 400)
+    transit = _p(p, "TransitEncryptionEnabled", "false").lower() == "true"
+    auth_token = _p(p, "AuthToken")
+    if auth_token and not transit:
+        return _error("InvalidParameterValue",
+                      "The AUTH token is only supported when encryption-in-transit is enabled", 400)
 
     arn = _arn_cluster(cluster_id)
     account_id = get_account_id()
@@ -997,6 +1083,8 @@ def _create_cache_cluster(p):
         name=f"ministack-elasticache-{account_id}-{region}-{cluster_id}",
         engine=engine,
         engine_version=engine_version,
+        transit=transit,
+        auth_token=auth_token or None,
         labels={
             **container_reaper.own_labels("elasticache"),
             "cluster_id": cluster_id,
@@ -1039,6 +1127,11 @@ def _create_cache_cluster(p):
         "SnapshotRetentionLimit": int(_p(p, "SnapshotRetentionLimit") or "0"),
         "SnapshotWindow": _p(p, "SnapshotWindow") or "05:00-06:00",
         "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        "AuthTokenEnabled": bool(auth_token),
+        "TransitEncryptionEnabled": transit,
+        "TransitEncryptionMode": (_p(p, "TransitEncryptionMode") or "required") if transit else None,
+        "AtRestEncryptionEnabled": False,
+        "_auth_tokens": [auth_token] if auth_token else [],
         "CacheNodes": [
             {
                 "CacheNodeId": f"{i:04d}",
@@ -1239,6 +1332,16 @@ def _create_replication_group(p):
     validation_error = _validate_create_replication_group_request(p)
     if validation_error:
         return validation_error
+    transit = _p(p, "TransitEncryptionEnabled", "false").lower() == "true"
+    transit_mode = (_p(p, "TransitEncryptionMode") or "required") if transit else None
+    auth_token = _p(p, "AuthToken")
+    if auth_token and not transit:
+        return _error("InvalidParameterValue",
+                      "The AUTH token is only supported when encryption-in-transit is enabled", 400)
+    if auth_token and transit_mode == "preferred":
+        return _error("InvalidParameterCombination",
+                      "Transit encryption preferred is not supported with access control enabled clusters.", 400)
+    at_rest = _p(p, "AtRestEncryptionEnabled", "true" if engine == "valkey" else "false").lower() == "true"
 
     # AWS rejects NumNodeGroups=2: cluster-mode-enabled requires the redis-
     # cluster minimum of 3 masters; cluster-mode-disabled requires 1.
@@ -1281,6 +1384,7 @@ def _create_replication_group(p):
     if use_real_cluster:
         node_groups, container_ids = _build_real_cluster_rg(
             rg_id, engine, engine_version, num_node_groups, replicas_per_node_group,
+            transit=transit, auth_token=auth_token or None,
         )
         if node_groups is None:
             # Bootstrap failed — clean up partial state and fall back.
@@ -1300,6 +1404,8 @@ def _create_replication_group(p):
                 name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                 engine=engine,
                 engine_version=engine_version,
+                transit=transit,
+                auth_token=auth_token or None,
                 labels={
                     **container_reaper.own_labels("elasticache"),
                     "rg_id": rg_id,
@@ -1371,9 +1477,11 @@ def _create_replication_group(p):
         "CacheSubnetGroupName": subnet_group,
         "PreferredMaintenanceWindow": maintenance_window,
         "SecurityGroups": security_groups,
-        "AuthTokenEnabled": _p(p, "AuthToken") != "",
-        "TransitEncryptionEnabled": _p(p, "TransitEncryptionEnabled", "false").lower() == "true",
-        "AtRestEncryptionEnabled": _p(p, "AtRestEncryptionEnabled", "false").lower() == "true",
+        "AuthTokenEnabled": bool(auth_token),
+        "TransitEncryptionEnabled": transit,
+        "TransitEncryptionMode": transit_mode,
+        "AtRestEncryptionEnabled": at_rest,
+        "_auth_tokens": [auth_token] if auth_token else [],
         "AutoMinorVersionUpgrade": _p(p, "AutoMinorVersionUpgrade", "true").lower() == "true",
         "AutomaticFailover": "enabled" if _p(p, "AutomaticFailoverEnabled", "false").lower() == "true" else "disabled",
         "MultiAZ": "enabled" if _p(p, "MultiAZEnabled", "false").lower() == "true" else "disabled",
@@ -1415,9 +1523,10 @@ def _create_replication_group(p):
                 "SnapshotWindow": snapshot_window,
                 "PreferredMaintenanceWindow": maintenance_window,
                 "LogDeliveryConfigurations": log_delivery_configs,
-                "AtRestEncryptionEnabled": _p(p, "AtRestEncryptionEnabled", "false").lower() == "true",
-                "AuthTokenEnabled": _p(p, "AuthToken") != "",
-                "TransitEncryptionEnabled": _p(p, "TransitEncryptionEnabled", "false").lower() == "true",
+                "AtRestEncryptionEnabled": at_rest,
+                "AuthTokenEnabled": bool(auth_token),
+                "TransitEncryptionEnabled": transit,
+                "TransitEncryptionMode": transit_mode,
                 "CacheNodes": [
                     {
                         "CacheNodeId": m.get("CacheNodeId", "0001"),
@@ -1508,6 +1617,11 @@ def _modify_replication_group(p):
         rg["EngineVersion"] = _p(p, "EngineVersion")
     if _p(p, "CacheParameterGroupName"):
         rg["CacheParameterGroupName"] = _p(p, "CacheParameterGroupName")
+    if _p(p, "AuthToken") or _p(p, "AuthTokenUpdateStrategy") == "DELETE":
+        if not rg.get("TransitEncryptionEnabled"):
+            return _error("InvalidParameterValue",
+                          "The AUTH token modification is only supported when encryption-in-transit is enabled", 400)
+        _update_auth_token(rg, _p(p, "AuthToken"), _p(p, "AuthTokenUpdateStrategy") or "ROTATE")
 
     user_group_ids_to_add = _extract_configs(p, "UserGroupIdsToAdd", ("member",))
     user_group_ids_to_remove = _extract_configs(p, "UserGroupIdsToRemove", ("member",))
@@ -1526,6 +1640,40 @@ def _modify_replication_group(p):
     _record_event(rg_id, "replication-group", "Replication group modified")
     return _xml(200, "ModifyReplicationGroupResponse",
         f"<ModifyReplicationGroupResult><ReplicationGroup>{_rg_xml(rg)}</ReplicationGroup></ModifyReplicationGroupResult>")
+
+
+def _update_auth_token(rg, token, strategy):
+    """ROTATE keeps the newest previous token beside the new one (none before: the
+    token is optional), SET leaves only the new one, DELETE removes AUTH."""
+    tokens = rg.get("_auth_tokens") or []
+    login = tokens[-1] if tokens else None
+    if strategy == "DELETE":
+        rg["_auth_tokens"], rg["_auth_optional"] = [], False
+        rules = ["resetpass", "nopass"]
+    elif strategy == "SET":
+        rg["_auth_tokens"], rg["_auth_optional"] = [token], False
+        rules = ["resetpass", f">{token}"]
+    else:
+        optional = rg.get("_auth_optional") or not rg.get("AuthTokenEnabled")
+        rg["_auth_tokens"], rg["_auth_optional"] = tokens[-1:] + [token], optional
+        rules = ["resetpass", "nopass"] if optional else ["resetpass", *(f">{t}" for t in rg["_auth_tokens"])]
+    rg["AuthTokenEnabled"] = strategy != "DELETE"
+    for cluster_id in rg.get("MemberClusters") or []:
+        if cluster_id in _clusters:
+            _clusters[cluster_id]["AuthTokenEnabled"] = rg["AuthTokenEnabled"]
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    new_login = rg["_auth_tokens"][-1] if rg["_auth_tokens"] else None
+    for cid in rg.get("_docker_container_ids") or []:
+        try:
+            container = docker_client.containers.get(cid)
+            container.exec_run(["redis-cli", *_node_cli_args(True, login), "-p", "6379",
+                                "ACL", "SETUSER", "default", "on", *rules])
+            container.exec_run(["redis-cli", *_node_cli_args(True, new_login), "-p", "6379",
+                                "CONFIG", "SET", "masterauth", new_login or ""])
+        except Exception as e:
+            logger.warning("ElastiCache: AUTH token update failed on %s: %s", cid, e)
 
 
 def _increase_replica_count(p):
@@ -2923,8 +3071,17 @@ def _cluster_xml_inner(c):
         f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
         f"<SnapshotWindow>{c.get('SnapshotWindow', '')}</SnapshotWindow>"
         f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
+        f"<AuthTokenEnabled>{str(c.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{str(c.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"{_transit_mode_xml(c)}"
+        f"<AtRestEncryptionEnabled>{str(c.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
         f"<CacheNodes>{nodes_xml}</CacheNodes>"
     )
+
+
+def _transit_mode_xml(record):
+    mode = record.get("TransitEncryptionMode")
+    return f"<TransitEncryptionMode>{mode}</TransitEncryptionMode>" if mode else ""
 
 
 def _cluster_xml(c):
@@ -2995,6 +3152,7 @@ def _rg_xml(rg):
         f"<ClusterMode>{rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')}</ClusterMode>"
         f"<AuthTokenEnabled>{str(rg.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
         f"<TransitEncryptionEnabled>{str(rg.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"{_transit_mode_xml(rg)}"
         f"<AtRestEncryptionEnabled>{str(rg.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
         f"<SnapshotRetentionLimit>{rg.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
         f"<SnapshotWindow>{rg.get('SnapshotWindow', '')}</SnapshotWindow>"
