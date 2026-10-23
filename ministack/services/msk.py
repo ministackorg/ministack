@@ -327,7 +327,6 @@ def _delete_cluster(arn: str) -> tuple:
     validation_error = _validate_existing_cluster_arn(arn)
     if validation_error:
         return validation_error
-    info = _clusters.get(arn)
     _clusters.pop(arn, None)
     _scram_secrets.pop(arn, None)
     _tags.pop(arn, None)

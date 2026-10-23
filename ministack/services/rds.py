@@ -5033,7 +5033,6 @@ def _create_db_instance_impl(p):
         "ProcessorFeatures": [],
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
         "AssociatedRoles": [],
-        "MaxAllocatedStorage": int(_p(p, "MaxAllocatedStorage") or str(allocated_storage)),
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
@@ -5052,6 +5051,9 @@ def _create_db_instance_impl(p):
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
     }
+    # Only a request that turns storage autoscaling on sets the threshold.
+    if _p(p, "MaxAllocatedStorage"):
+        instance["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
     if parent and reader_launch:
         # A replicating reader keeps its own endpoint and container fields;
         # the marker excludes it from shared-container aliasing and makes
@@ -5557,6 +5559,9 @@ def _modify_db_instance(p):
             instance[instance_key] = val
         else:
             pending[instance_key] = val
+    # A threshold equal to the allocated storage turns storage autoscaling off.
+    if instance.get("MaxAllocatedStorage") == instance.get("AllocatedStorage"):
+        instance.pop("MaxAllocatedStorage", None)
 
     if new_pass:
         old_pass = instance.get("_MasterUserPassword", "password")
@@ -5782,6 +5787,9 @@ def _create_read_replica(p):
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{replica_id}"
     replica = dict(source)
+    replica.pop("MaxAllocatedStorage", None)
+    if _p(p, "MaxAllocatedStorage"):
+        replica["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
     replica.update({
         "DBInstanceIdentifier": replica_id,
         "DBInstanceArn": arn,
@@ -9606,7 +9614,7 @@ def _instance_xml(i):
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
-        <MaxAllocatedStorage>{i.get('MaxAllocatedStorage',i.get('AllocatedStorage',20))}</MaxAllocatedStorage>
+        {f"<MaxAllocatedStorage>{i['MaxAllocatedStorage']}</MaxAllocatedStorage>" if i.get('MaxAllocatedStorage') else ""}
         <TagList>{tag_xml}</TagList>
         {cert_xml}
         <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled',False)).lower()}</CustomerOwnedIpEnabled>

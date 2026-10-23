@@ -3676,8 +3676,8 @@ def test_mqtt5_property_block_longer_than_127_bytes_round_trips():
     assert [p for p in props if p[0] == PROP_USER_PROPERTY] == user_properties
 
 
-def test_mqtt5_no_local_withholds_a_publisher_its_own_message():
-    """No Local is defined against the publishing client, not the connection."""
+def test_mqtt5_no_local_still_delivers_a_publisher_its_own_message():
+    """AWS IoT ignores No Local: the subscriber gets its own message and everyone else's."""
     topic = _unique("options/nolocal")
 
     async def scenario():
@@ -3692,19 +3692,21 @@ def test_mqtt5_no_local_withholds_a_publisher_its_own_message():
                 _make_publish(topic, b"mine", qos=1, packet_id=7,
                               protocol_level=MQTT_5)
             )
-            # The next packet, not the next PUBACK: a self-delivery would
-            # arrive ahead of the acknowledgement and be skipped past.
-            own_reply = await subscriber.packet(timeout=5.0)
+            # The own message and the PUBACK, in either order.
+            own = sorted([await subscriber.packet(timeout=5.0), await subscriber.packet(timeout=5.0)])
 
             async with _connect(MQTT_5) as (other, _c2):
                 await other.send(
                     _make_publish(topic, b"theirs", protocol_level=MQTT_5)
                 )
                 _flags, delivered = await subscriber.await_packet(PKT_PUBLISH)
-            return own_reply, delivered
+            return own, delivered
 
-    (pkt_type, _flags, puback), delivered = _run(scenario())
-    assert pkt_type == PKT_PUBACK, "the publisher's own message must not come back"
+    ((pub_type, pub_flags, mine), (ack_type, _ack_flags, puback)), delivered = _run(scenario())
+    assert (pub_type, ack_type) == (PKT_PUBLISH, PKT_PUBACK)
+    # Delivered at the subscription's QoS 0.
+    assert pub_flags & 0x06 == 0
+    assert _parse_publish(mine, MQTT_5)[:2] == (topic, b"mine")
     assert puback == b"\x00\x07\x00\x00", "packet id 7, Success, no properties"
     assert _parse_publish(delivered, MQTT_5)[1] == b"theirs"
 

@@ -36370,7 +36370,7 @@ def _ec_cache_stack(s, *, rg_description="sessions", num_cache_clusters=2,
         "Subnets": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
             "CacheSubnetGroupName": f"subnets-{s}",
             "Description": subnet_description,
-            "SubnetIds": ["subnet-aaa", "subnet-bbb"],
+            "SubnetIds": ["subnet-00000001", "subnet-00000002"],
         }},
         "Params": {"Type": "AWS::ElastiCache::ParameterGroup", "Properties": {
             "CacheParameterGroupFamily": "redis7",
@@ -36445,7 +36445,7 @@ def test_cfn_elasticache_stack_create_and_delete(cfn, ec):
     try:
         groups = ec.describe_cache_subnet_groups(CacheSubnetGroupName=f"subnets-{s}")
         subnets = groups["CacheSubnetGroups"][0]["Subnets"]
-        assert [n["SubnetIdentifier"] for n in subnets] == ["subnet-aaa", "subnet-bbb"]
+        assert [n["SubnetIdentifier"] for n in subnets] == ["subnet-00000001", "subnet-00000002"]
         assert _ec_params(ec, out["Params"])["maxmemory-policy"] == "allkeys-lru"
 
         user = ec.describe_users(UserId=f"app-{s}")["Users"][0]
@@ -36552,9 +36552,9 @@ def test_cfn_elasticache_generated_cluster_replaced_on_create_only_change(cfn, e
         return {
             "Resources": {
                 "A": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
-                    "Description": "a", "SubnetIds": ["subnet-a"]}},
+                    "Description": "a", "SubnetIds": ["subnet-00000001"]}},
                 "B": {"Type": "AWS::ElastiCache::SubnetGroup", "Properties": {
-                    "Description": "b", "SubnetIds": ["subnet-b"]}},
+                    "Description": "b", "SubnetIds": ["subnet-00000002"]}},
                 "C": {"Type": "AWS::ElastiCache::CacheCluster", "Properties": {
                     "Engine": "redis", "CacheNodeType": "cache.t3.micro", "NumCacheNodes": 1,
                     "CacheSubnetGroupName": {"Ref": subnet_ref}, "SnapshotRetentionLimit": retention}},

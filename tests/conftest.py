@@ -442,7 +442,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mqtt5_property_block_truncated_at_the_packet_end_is_refused",
     "tests/test_iot_data.py::test_mqtt5_malformed_connect_is_refused_with_a_connack_reason_code",
     "tests/test_iot_data.py::test_mqtt5_property_block_longer_than_127_bytes_round_trips",
-    "tests/test_iot_data.py::test_mqtt5_no_local_withholds_a_publisher_its_own_message",
+    "tests/test_iot_data.py::test_mqtt5_no_local_still_delivers_a_publisher_its_own_message",
     "tests/test_iot_data.py::test_mqtt5_retain_as_published_keeps_the_publishers_retain_flag",
     "tests/test_iot_data.py::test_mqtt5_retain_handling_2_suppresses_the_retained_replay",
     "tests/test_iot_data.py::test_mqtt5_retain_handling_1_replays_only_for_a_new_subscription",

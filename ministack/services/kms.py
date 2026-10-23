@@ -821,7 +821,6 @@ def _verify(data):
                 public_key.verify(signature, message, pad, utils.Prehashed(hash_algo))
             else:
                 public_key.verify(signature, message, pad, hash_algo)
-        valid = True
     except InvalidSignature:
         return error_response_json(
             "KMSInvalidSignatureException",

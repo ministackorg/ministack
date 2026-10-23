@@ -2236,9 +2236,15 @@ def _presign_time_error(amz_date: str, expires: str, path: str) -> tuple | None:
     except ValueError:
         return _error("AuthorizationQueryParametersError",
                       "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"", 400, path)
-    if expires and not expires.isdigit():
+    if not expires:
+        return _error("AuthorizationQueryParametersError",
+                      "Query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, "
+                      "X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters.", 400, path)
+    if expires.startswith("-") and expires[1:].isdigit():
+        return _error("AuthorizationQueryParametersError", "X-Amz-Expires must be non-negative", 400, path)
+    if not expires.isdigit():
         return _error("AuthorizationQueryParametersError", "X-Amz-Expires should be a number", 400, path)
-    if expires and int(expires) > _PRESIGN_MAX_EXPIRES:
+    if int(expires) > _PRESIGN_MAX_EXPIRES:
         return _error("AuthorizationQueryParametersError",
                       "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires "
                       f"must be less than {_PRESIGN_MAX_EXPIRES} seconds", 400, path)
@@ -2260,6 +2266,11 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     if not signature:
         return None  # not a presigned URL
     algorithm = _qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        # The IAM layer verifies a SigV4a signature; its query parameters follow the same rules.
+        return _presign_time_error(_qp(query_params, "X-Amz-Date", "") or _qp(query_params, "x-amz-date", ""),
+                                   _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", ""),
+                                   path)
     if algorithm != "AWS4-HMAC-SHA256":
         return None  # only SigV4 presigned URLs are verified
 
@@ -3490,6 +3501,100 @@ def _delete_bucket_cors(name: str):
         return _no_such_bucket(name)
     _bucket_cors.pop(name, None)
     return 204, {}, b""
+
+
+_CORS_VARY = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+_CORS_NOT_ALLOWED = (
+    "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, "
+    "request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted "
+    "by the resource's CORS spec."
+)
+
+
+def _cors_rules(bucket_name: str) -> list[dict] | None:
+    """The bucket's CORS rules as ``{element: [values]}`` in its owner's account, or None without a configuration."""
+    owner = _bucket_owner_account(bucket_name)
+    stored = _bucket_cors.get_scoped(owner, None, bucket_name) if owner else None
+    if not stored:
+        return None
+    try:
+        root = fromstring(stored.encode() if isinstance(stored, str) else stored)
+    except Exception:
+        return None
+    rules = []
+    for rule in root.iter():
+        if rule.tag.rsplit("}", 1)[-1] == "CORSRule":
+            values = {}
+            for child in rule:
+                values.setdefault(child.tag.rsplit("}", 1)[-1], []).append((child.text or "").strip())
+            rules.append(values)
+    return rules
+
+
+def _cors_pattern_matches(pattern: str, value: str, flags: int = 0) -> bool:
+    """Whether *value* matches an AllowedOrigin or AllowedHeader, where ``*`` stands for any characters."""
+    return re.fullmatch(re.escape(pattern).replace(r"\*", ".*"), value, flags) is not None
+
+
+def _cors_answer(rules: list[dict], origin: str, method: str, request_headers: list[str]) -> dict | None:
+    """The Access-Control-* headers of the first rule that allows the origin, method and headers, or None."""
+    for rule in rules:
+        origins = [o for o in rule.get("AllowedOrigin", []) if _cors_pattern_matches(o, origin)]
+        if not origins or method not in rule.get("AllowedMethod", []):
+            continue
+        allowed_headers = rule.get("AllowedHeader", [])
+        if not all(any(_cors_pattern_matches(allowed, wanted, re.IGNORECASE) for allowed in allowed_headers)
+                   for wanted in request_headers):
+            continue
+        answer = {"Access-Control-Allow-Origin": "*"} if origins == ["*"] else {
+            "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true"}
+        answer["Access-Control-Allow-Methods"] = ", ".join(rule["AllowedMethod"])
+        if request_headers:
+            answer["Access-Control-Allow-Headers"] = ", ".join(request_headers)
+        if rule.get("ExposeHeader"):
+            answer["Access-Control-Expose-Headers"] = ", ".join(rule["ExposeHeader"])
+        if rule.get("MaxAgeSeconds"):
+            answer["Access-Control-Max-Age"] = rule["MaxAgeSeconds"][0]
+        answer["Vary"] = _CORS_VARY
+        return answer
+    return None
+
+
+def _cors_error(code: str, message: str, status: int, method: str = "", resource_type: str = "") -> tuple:
+    """A CORS refusal, which names the method and resource type instead of a resource."""
+    root = Element("Error")
+    SubElement(root, "Code").text = code
+    SubElement(root, "Message").text = message
+    if method:
+        SubElement(root, "Method").text = method
+        SubElement(root, "ResourceType").text = resource_type
+    SubElement(root, "RequestId").text = new_uuid()
+    return status, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def cors_preflight(bucket_name: str, key: str, headers: dict) -> tuple:
+    """The answer to a browser preflight (OPTIONS) from the bucket's CORS configuration."""
+    origin = headers.get("origin")
+    if not origin:
+        return _cors_error("BadRequest", "Insufficient information. Origin request header needed.", 400)
+    method = headers.get("access-control-request-method", "")
+    rules = _cors_rules(bucket_name)
+    if rules is None:
+        return _cors_error("AccessForbidden", "CORSResponse: CORS is not enabled for this bucket.", 403,
+                           method or "OPTIONS", "BUCKET")
+    wanted = [h.strip() for h in headers.get("access-control-request-headers", "").split(",") if h.strip()]
+    answer = _cors_answer(rules, origin, method, wanted) if method else None
+    if answer is None:
+        return _cors_error("AccessForbidden", _CORS_NOT_ALLOWED, 403, method or "OPTIONS",
+                           "OBJECT" if key else "BUCKET")
+    return 200, {**answer, "Content-Length": "0"}, b""
+
+
+def cors_response_headers(bucket_name: str, method: str, headers: dict) -> dict:
+    """The Access-Control-* headers for a request with an Origin that one of the bucket's CORS rules allows."""
+    origin = headers.get("origin")
+    rules = _cors_rules(bucket_name) if origin else None
+    return (_cors_answer(rules, origin, method, []) if rules else None) or {}
 
 
 def _get_bucket_acl(name: str):
@@ -8653,6 +8758,24 @@ def _complete_multipart_upload(
         # Retained so GetObjectAttributes can report ObjectParts (ListParts
         # functionality) for the completed multipart object.
         part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
+
+    # A declared x-amz-mp-object-size that differs from the parts' total is refused.
+    declared_size = (headers or {}).get("x-amz-mp-object-size")
+    if declared_size is not None:
+        try:
+            declared = int(declared_size)
+        except ValueError:
+            return _error("InvalidRequest", f"Value for x-amz-mp-object-size header is invalid: '{declared_size}'",
+                          400, f"/{bucket_name}/{key}")
+        actual_size = sum(len(part_body) for part_body in combined_parts)
+        if declared != actual_size:
+            return _error(
+                "InvalidRequest",
+                f"The provided 'x-amz-mp-object-size' header value {declared_size} does not match "
+                f"what was computed: {actual_size}",
+                400,
+                f"/{bucket_name}/{key}",
+            )
 
     composite = _composite_checksum(checksum_algorithm, part_digests)
     if checksum_algorithm:

@@ -8797,9 +8797,9 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 #
 # MQTT 5 support is deliberately partial: enough that a real SDK connects,
 # subscribes, publishes, receives and disconnects cleanly. Implemented are
-# property blocks on every packet that carries one, all four fields of the
-# subscription-options byte (QoS, No Local, Retain As Published, Retain
-# Handling), v5 reason codes on CONNACK/SUBACK/PUBACK/UNSUBACK/DISCONNECT, an
+# property blocks on every packet that carries one, the subscription-options
+# byte (QoS, Retain As Published, Retain Handling; No Local is ignored, as
+# AWS IoT does), v5 reason codes on CONNACK/SUBACK/PUBACK/UNSUBACK/DISCONNECT, an
 # assigned client identifier, message expiry, and pass-through of the
 # PUBLISH properties a subscriber may echo back. Out of scope, and advertised
 # as unavailable in CONNACK where the protocol has a flag for it: shared
@@ -8930,7 +8930,6 @@ class _Subscription:
         "deliver",
         "granted_qos",
         "client_id",
-        "no_local",
         "retain_as_published",
     )
 
@@ -8942,7 +8941,6 @@ class _Subscription:
         deliver: Callable[[str, bytes, int], Awaitable[None]],
         granted_qos: int = 0,
         client_id: str | None = None,
-        no_local: bool = False,
         retain_as_published: bool = False,
     ):
         self.subscription_id = uuid.uuid4().hex
@@ -8951,14 +8949,11 @@ class _Subscription:
         self.region = region
         self.deliver = deliver
         self.granted_qos = granted_qos
-        # Owning MQTT client, when there is one. iot_data's HTTP publishes and
-        # in-process subscribers have no client identity, which is what No
-        # Local compares against — a subscriber with no identity can never be
-        # the publisher.
+        # Owning MQTT client, when there is one; in-process subscribers have
+        # no client identity.
         self.client_id = client_id
         # MQTT 5 subscription options (§3.8.3.1). Retain Handling is consumed
         # at subscribe time and so is not kept here.
-        self.no_local = no_local
         self.retain_as_published = retain_as_published
 
     def __hash__(self) -> int:
@@ -10090,11 +10085,10 @@ async def broker_publish(
     ``properties`` is an encoded MQTT 5 property block forwarded verbatim to
     v5 subscribers (empty for a 3.1.1 publisher or an HTTP publish).
 
-    ``client_id`` names the publishing MQTT client, which is what a No Local
-    subscription is defined against (§3.8.3.1): that subscriber does not want
-    its own messages back. A publish with no client identity — iot_data's HTTP
-    Publish, a rule, an in-process caller — matches no subscriber's identity
-    and so is delivered to all of them.
+    ``client_id`` names the publishing MQTT client, what the rule SQL
+    ``clientid()`` returns. Every matching subscriber gets the message, the
+    publisher included, also when its subscription asked for No Local: AWS
+    IoT ignores that option.
 
     ``principal`` is who published the message, what the rule SQL
     ``principal()`` returns; rules also see a fresh trace id per message.
@@ -10133,8 +10127,6 @@ async def broker_publish(
     try:
         for sub in subs:
             if sub.account_id != account_id or sub.region != region:
-                continue
-            if sub.no_local and client_id is not None and sub.client_id == client_id:
                 continue
             if _subscription_matches(
                 _unscope_topic(sub.account_id, sub.region, sub.filter_prefixed), topic
@@ -10218,24 +10210,22 @@ async def broker_subscribe(
     callback: Callable[[str, bytes, int], Awaitable[None]],
     granted_qos: int = 0,
     client_id: str | None = None,
-    no_local: bool = False,
     retain_as_published: bool = False,
     retain_handling: int = RETAIN_HANDLING_SEND_ALWAYS,
 ) -> str:
     """Register a subscriber and hand it any matching retained message.
 
-    The last four arguments are the MQTT 5 subscription options (§3.8.3.1);
+    The last two arguments are MQTT 5 subscription options (§3.8.3.1);
     their defaults are what an MQTT 3.1.1 SUBSCRIBE means, so an existing
     caller keeps its behaviour. ``retain_handling`` is acted on here and
     nowhere else — it only decides whether this call replays retained
-    messages — while No Local and Retain As Published are stored on the
-    subscription because they apply to every later delivery.
+    messages — while Retain As Published is stored on the subscription
+    because it applies to every later delivery.
     """
     filter_prefixed = _scoped_topic(account_id, region, topic_filter)
     sub = _Subscription(
         filter_prefixed, account_id, region, callback, granted_qos,
-        client_id=client_id, no_local=no_local,
-        retain_as_published=retain_as_published,
+        client_id=client_id, retain_as_published=retain_as_published,
     )
     async with _broker_lock:
         existing_subscribers = _subscriptions.setdefault(filter_prefixed, set())
@@ -10459,9 +10449,9 @@ RC5_TOPIC_NAME_INVALID = 0x90
 
 # Layout of the MQTT 5 SUBSCRIBE options byte (§3.8.3.1). MQTT 3.1.1 sends a
 # bare QoS byte with the upper bits reserved zero, so the same masks read both
-# and a 3.1.1 subscription comes out with every option off.
+# and a 3.1.1 subscription comes out with every option off. Bit 2, No Local,
+# is not read: AWS IoT delivers a client's own messages to it regardless.
 SUB_OPT_QOS_MASK = 0x03
-SUB_OPT_NO_LOCAL = 0x04
 SUB_OPT_RETAIN_AS_PUBLISHED = 0x08
 SUB_OPT_RETAIN_HANDLING_SHIFT = 4
 SUB_OPT_RETAIN_HANDLING_MASK = 0x03
@@ -11551,7 +11541,6 @@ class _WSSession:
                     self.deliver_to_client,
                     granted_qos,
                     client_id=self._client_id or None,
-                    no_local=bool(subscription_options & SUB_OPT_NO_LOCAL),
                     retain_as_published=bool(
                         subscription_options & SUB_OPT_RETAIN_AS_PUBLISHED
                     ),
