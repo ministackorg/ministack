@@ -3088,7 +3088,7 @@ def _authorize_ws_iam(scope, connect_arn, headers, query_params, region):
     access_key = extract_access_key_id(headers, query_params)
     if not access_key:
         return 403, "Missing Authentication Token"
-    denied = AUTH and authenticate_handshake(scope)
+    denied = AUTH and authenticate_handshake(scope, "execute-api")
     if not isinstance(denied, AuthError):
         denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
     if isinstance(denied, AuthError):

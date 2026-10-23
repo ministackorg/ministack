@@ -11740,7 +11740,7 @@ def _ws_handshake_check(scope: dict) -> AuthError | ResolvedCredential | None:
     from ministack.app import AUTH
     from ministack.core.iam_evaluator import authenticate_handshake
 
-    return authenticate_handshake(scope) if AUTH else None
+    return authenticate_handshake(scope, "iotdevicegateway") if AUTH else None
 
 
 async def _refuse_ws_handshake(scope: dict, send) -> None:

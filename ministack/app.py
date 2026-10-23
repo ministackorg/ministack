@@ -2434,7 +2434,7 @@ def _authenticate_only(service: str, headers: dict, query_params: dict, request_
         return None
     from ministack.core.iam_evaluator import check_credentials
 
-    failure = check_credentials(extract_access_key_id(headers, query_params))
+    failure = check_credentials(extract_access_key_id(headers, query_params), service)
     return _credential_failure(service, "", request_id, failure, headers) if failure else None
 
 

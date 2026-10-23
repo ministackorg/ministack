@@ -1255,6 +1255,8 @@ class SignedRequest:
     # A SigV2 (HmacV1) header or query signature, checked against the path S3 signs.
     sigv2: bool = False
     auth_path: str = ""
+    # A SigV4 presigned query scoped to s3: S3 checks its own, any other service refuses its scope.
+    s3_scoped: bool = False
 
 
 _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
@@ -1308,6 +1310,9 @@ def pin_signed_request(
             bucket = None  # an access point host signs its path without a bucket
         _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, headers, sigv2=True,
                                           auth_path=f"/{bucket}{raw_path}" if bucket else raw_path))
+        return
+    if not authorization and claimed and not _is_root_key(claimed) and _s3_presigned_query(query_params):
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, presigned=True, s3_scoped=True))
         return
     # A SigV4 signature that names no key is checked too: it is incomplete or names an unknown key.
     names_no_key = not claimed and (authorization.startswith("AWS4-HMAC-SHA256") or presigned)
@@ -1430,7 +1435,21 @@ def pin_signed_body(body: bytes) -> None:
         _signed_request.set(replace(request, body=body))
 
 
-def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None:
+def _s3_scope_failure(service: str | None) -> AuthError | None:
+    """An s3-scoped presigned query: S3 verifies it itself, any other service refuses the scope."""
+    request = _signed_request.get()
+    if request is None or not request.s3_scoped:
+        return None
+    _signed_request.set(None)
+    if service == "s3":
+        return None
+    from ministack.core.iam_actions import SERVICE_TO_IAM_NAMESPACE
+
+    name = SERVICE_TO_IAM_NAMESPACE.get(service or "", service or "")
+    return AuthError("SignatureDoesNotMatch", f"Credential should be scoped to correct service: '{name}'")
+
+
+def authenticate_handshake(scope: dict, service: str | None = None) -> AuthError | ResolvedCredential | None:
     """Check a WebSocket upgrade signed in its Authorization header or query string, as ``authenticate`` does."""
     from urllib.parse import parse_qs, quote
 
@@ -1439,6 +1458,9 @@ def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None
     raw_path = scope.get("raw_path") or quote(scope.get("path", "")).encode()
     query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
     pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
+    failure = _s3_scope_failure(service)
+    if failure:
+        return failure
     request = _signed_request.get()
     if request is None:
         return None
@@ -1534,10 +1556,13 @@ def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCre
     return credential
 
 
-def check_credentials(access_key_id: str) -> AuthError | None:
+def check_credentials(access_key_id: str, service: str | None = None) -> AuthError | None:
     """Authenticate a request no IAM action covers, with the checks enforce() makes before any policy."""
     from ministack.core.responses import get_account_id
 
+    failure = _s3_scope_failure(service)
+    if failure:
+        return failure
     account_id = get_account_id()
     checked = authenticate(access_key_id or "", account_id)
     if checked is None:
@@ -1637,6 +1662,9 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     from ministack.core.responses import get_account_id
 
     account_id = get_account_id()
+    failure = _s3_scope_failure(service)
+    if failure:
+        return failure
     # S3, API Gateway methods and function URLs can be called anonymously: an unsigned request is not checked.
     anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
     if _anonymous.get() and not anonymous_ok and not _served_unsigned(service, iam_action):

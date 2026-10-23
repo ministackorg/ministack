@@ -5507,6 +5507,13 @@ class TestQuerySignatures:
         assert (code, status) == ("IncompleteSignature", 400)
         assert "Credential must have exactly 5 slash-delimited elements" in body
 
+    @pytest.mark.parametrize("query,service", [(_LIST_USERS, "iam"), (_LIST_QUEUES, "sqs")])
+    def test_s3_scoped_signature_is_refused_by_another_service(self, user_key, query, service):
+        """Only S3 takes a query signed for s3; a correct one is refused anywhere else (#2338)."""
+        code, status, body = _presigned(*user_key, "s3", query)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert f"Credential should be scoped to correct service: '{service}'" in body
+
     def test_root_key_signs_with_any_secret(self, user_key):
         assert _presigned("test", "anything", "iam", _LIST_USERS)[:2] == (None, 200)
 
