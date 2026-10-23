@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **API Gateway — an HTTP API's `rawQueryString` is the query string as the client sent it** — a bare key gained an `=` (`?flag` reached the function as `flag=`). Both the Lambda proxy event and the REQUEST authorizer event now carry the request's own query string. Contributed by @skialpine.
 - **ALB — an OPTIONS request reaches the target** — the gateway answered every preflight to a load balancer address with its own wildcard CORS response. The request is now forwarded to the target like any other method. Contributed by @skialpine.
 - **ALB — the query string reaches HTTP targets unchanged** — it was rebuilt from the first value of each key, so `?page=1&page=2` arrived as `?page=1`. The request's own query string is now forwarded, including from a CloudFront distribution whose origin is the load balancer. Contributed by @skialpine.
 - **ALB — instance and IP targets receive the client's `Host`** — they got their own address as `Host`. They now get the client's, as an Application Load Balancer sends it: on a listener on port 80 or 443 without a port, on any other listener with the listener's port in place of any port the client sent; `routing.http.preserve_host_header.enabled` sends it unmodified. Lambda targets keep the `Host` exactly as sent, and authentication uses the client's `Host`. Contributed by @skialpine.

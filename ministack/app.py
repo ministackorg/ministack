@@ -1992,7 +1992,7 @@ async def _handle_cloudfront_dataplane_request(
 
 async def _handle_execute_api_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
-    raw_path: str | None = None,
+    raw_path: str | None = None, raw_query_string: str | None = None,
 ):
     """Handle API Gateway execute-api data plane requests (Host-based,
     path-based, and registered custom domains)."""
@@ -2062,7 +2062,9 @@ async def _handle_execute_api_request(
             http_api_path = apigw_v2.decode_http_api_path(raw_path)
             if http_api_path.startswith(prefix):
                 execute_path = http_api_path[len(prefix):]
-        status, resp_headers, resp_body = await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        status, resp_headers, resp_body = await apigw_v2.handle_execute(
+            api_id, stage, execute_path, method, headers, body, query_params, raw_query_string=raw_query_string,
+        )
         # An HTTP API names its request id apigw-requestid (16 base64 characters); x-amzn-requestid is a REST API's.
         resp_headers.setdefault("apigw-requestid", base64.b64encode(os.urandom(11)).decode())
         return status, resp_headers, resp_body
@@ -2646,7 +2648,7 @@ async def _handle_special_data_plane_request(
     ):
         return _with_data_plane_headers(response, request_id)
     if response := await _handle_execute_api_request(
-        host, path, method, headers, body, query_params, raw_path=raw_path
+        host, path, method, headers, body, query_params, raw_path=raw_path, raw_query_string=raw_query_string
     ):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):

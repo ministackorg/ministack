@@ -1001,10 +1001,23 @@ async def _invoke_request_authorizer_lambda(authorizer, event, account_id, regio
     return payload if isinstance(payload, dict) else None
 
 
+def _raw_query_string(query_params, raw_query_string=None):
+    """rawQueryString: the query string as the client sent it. Without one (an internal caller),
+    re-encode the URL-decoded parameters: a raw space breaks lambda_http (http::Uri rejects it ->
+    502), and a decoded '='/'&' inside a value would corrupt the query structure. safe="" encodes
+    everything except RFC-3986 unreserved (#1035)."""
+    if raw_query_string is not None:
+        return raw_query_string
+    return "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
+        for k, vals in (query_params or {}).items() for val in vals
+    )
+
+
 async def _authorize_request_v2(
     api_id, stage, route, method, path, resource_path,
     headers, query_params, path_params, stage_vars,
-    owner_account_id, owner_region,
+    owner_account_id, owner_region, raw_query_string=None,
 ):
     """Enforce a REQUEST-type Lambda authorizer before an HTTP API route's
     integration runs.
@@ -1079,10 +1092,7 @@ async def _authorize_request_v2(
         }
     else:
         qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
-        raw_qs = "&".join(
-            f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
-            for k, vals in (query_params or {}).items() for val in vals
-        )
+        raw_qs = _raw_query_string(query_params, raw_query_string)
         event = {
             "version": "2.0",
             "type": "REQUEST",
@@ -1316,7 +1326,7 @@ def _apply_request_parameter_mappings(
     return out_headers, out_query, out_path
 
 
-async def handle_execute(api_id, stage, path, method, headers, body, query_params):
+async def handle_execute(api_id, stage, path, method, headers, body, query_params, raw_query_string=None):
     """Execute an API request through a deployed API (data plane)."""
     scope = find_api_scope(api_id)
     if scope is None:
@@ -1330,7 +1340,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     try:
         return await _handle_execute_in_scope(
             api_id, stage, path, method, headers, body, query_params,
-            owner_account_id, owner_region,
+            owner_account_id, owner_region, raw_query_string,
         )
     finally:
         _request_account_id.reset(account_token)
@@ -1344,7 +1354,7 @@ def _http_api_not_found():
 
 async def _handle_execute_in_scope(
     api_id, stage, path, method, headers, body, query_params,
-    owner_account_id, owner_region,
+    owner_account_id, owner_region, raw_query_string=None,
 ):
     api = _apis.get(api_id)
     if not api:
@@ -1409,7 +1419,7 @@ async def _handle_execute_in_scope(
         auth_error, authorizer_lambda_ctx = await _authorize_request_v2(
             api_id, stage, route, method, path, (route_path or path),
             request_headers, query_params or {}, path_params, stage_vars,
-            owner_account_id, owner_region,
+            owner_account_id, owner_region, raw_query_string,
         )
         if auth_error is not None:
             return auth_error
@@ -1453,6 +1463,7 @@ async def _handle_execute_in_scope(
             authorizer_iam=authorizer_iam,
             owner_account_id=owner_account_id,
             owner_region=owner_region,
+            raw_query_string=raw_query_string,
         )
     elif integration_type == "HTTP_PROXY":
         mapped_headers, mapped_query, mapped_path = _apply_request_parameter_mappings(
@@ -1630,6 +1641,7 @@ async def _invoke_lambda_proxy(
     authorizer_iam=None,
     owner_account_id=None,
     owner_region=None,
+    raw_query_string=None,
 ):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
     from ministack.services import lambda_svc
@@ -1652,14 +1664,7 @@ async def _invoke_lambda_proxy(
     # Build API Gateway v2 proxy event (payload format 2.0)
     # AWS API Gateway v2 joins multi-value query params with commas
     qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
-    # rawQueryString must stay percent-encoded like real AWS. query_params here are
-    # already URL-decoded, so re-encode each key/value: a raw space breaks lambda_http
-    # (http::Uri rejects it -> 502), and a decoded '='/'&' inside a value would corrupt
-    # the query structure. safe="" encodes everything except RFC-3986 unreserved (#1035).
-    raw_qs = "&".join(
-        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
-        for k, vals in query_params.items() for val in vals
-    )
+    raw_qs = _raw_query_string(query_params, raw_query_string)
     # Binary request bodies are base64-encoded with isBase64Encoded=true; only
     # the text content types AWS recognizes are passed through as UTF-8 strings.
     if body:
