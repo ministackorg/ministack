@@ -1583,63 +1583,70 @@ def _decrease_replica_count(p):
 
 # ---- Subnet Groups ----
 
+def _resolve_subnets(p):
+    """Subnets and VPC of the SubnetIds in the request, or None when one is unknown or they span VPCs."""
+    from ministack.services import ec2
+
+    ec2._ensure_defaults_initialized()
+    subnets, vpc_ids = [], set()
+    for subnet_id in _extract_configs(p, "SubnetIds", ("SubnetIdentifier", "member")):
+        subnet = ec2._subnets.get(subnet_id)
+        if not subnet:
+            return None
+        vpc_ids.add(subnet["VpcId"])
+        subnets.append({
+            "SubnetIdentifier": subnet_id,
+            "SubnetAvailabilityZone": {"Name": subnet.get("AvailabilityZone", f"{get_region()}a")},
+        })
+    if len(vpc_ids) != 1:
+        return None
+    return subnets, vpc_ids.pop()
+
+
+def _subnet_group_xml(sg):
+    subnets_xml = "".join(
+        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
+        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></Subnet>"
+        for s in sg.get("Subnets", [])
+    )
+    return (
+        f"<CacheSubnetGroupName>{sg['CacheSubnetGroupName']}</CacheSubnetGroupName>"
+        f"<CacheSubnetGroupDescription>{xml_escape(sg.get('CacheSubnetGroupDescription', ''))}</CacheSubnetGroupDescription>"
+        f"<VpcId>{sg.get('VpcId', '')}</VpcId>"
+        f"<Subnets>{subnets_xml}</Subnets>"
+        f"<ARN>{sg.get('ARN', '')}</ARN>"
+    )
+
+
 def _create_subnet_group(p):
     name = _p(p, "CacheSubnetGroupName")
-    desc = _p(p, "CacheSubnetGroupDescription") or ""
+    if name in _subnet_groups:
+        return _error("CacheSubnetGroupAlreadyExists", f"Cache subnet group {name} already exists.", 400)
+    resolved = _resolve_subnets(p)
+    if resolved is None:
+        return _error("InvalidSubnet", "The requested subnet is invalid, or multiple subnets were requested "
+                      "that are not all in a common VPC.", 400)
+    subnets, vpc_id = resolved
     arn = _arn_subnet_group(name)
-
-    subnets = []
-    idx = 1
-    while _p(p, f"SubnetIds.member.{idx}"):
-        subnets.append({
-            "SubnetIdentifier": _p(p, f"SubnetIds.member.{idx}"),
-            "SubnetAvailabilityZone": {"Name": f"{get_region()}{'abcdef'[(idx - 1) % 6]}"},
-        })
-        idx += 1
-
     _subnet_groups[name] = {
         "CacheSubnetGroupName": name,
-        "CacheSubnetGroupDescription": desc,
-        "VpcId": "vpc-00000000",
+        "CacheSubnetGroupDescription": _p(p, "CacheSubnetGroupDescription") or "",
+        "VpcId": vpc_id,
         "Subnets": subnets,
         "ARN": arn,
     }
-    _tags[arn] = []
-    subnets_xml = "".join(
-        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
-        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone>"
-        f"</Subnet>" for s in subnets
-    )
+    _tags[arn] = _extract_tags(p)
     return _xml(200, "CreateCacheSubnetGroupResponse",
-        f"<CreateCacheSubnetGroupResult><CacheSubnetGroup>"
-        f"<CacheSubnetGroupName>{name}</CacheSubnetGroupName>"
-        f"<CacheSubnetGroupDescription>{desc}</CacheSubnetGroupDescription>"
-        f"<Subnets>{subnets_xml}</Subnets>"
-        f"<ARN>{arn}</ARN>"
+        f"<CreateCacheSubnetGroupResult><CacheSubnetGroup>{_subnet_group_xml(_subnet_groups[name])}"
         f"</CacheSubnetGroup></CreateCacheSubnetGroupResult>")
 
 
 def _describe_subnet_groups(p):
     name = _p(p, "CacheSubnetGroupName")
     if name and name not in _subnet_groups:
-        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 404)
-    groups = [_subnet_groups[name]] if name and name in _subnet_groups else list(_subnet_groups.values())
-    members = ""
-    for g in groups:
-        # SubnetList.member.locationName = "Subnet"
-        subnets_xml = "".join(
-            f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
-            f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></Subnet>"
-            for s in g.get("Subnets", [])
-        )
-        # CacheSubnetGroups.member.locationName = "CacheSubnetGroup"
-        members += (
-            f"<CacheSubnetGroup><CacheSubnetGroupName>{g['CacheSubnetGroupName']}</CacheSubnetGroupName>"
-            f"<CacheSubnetGroupDescription>{g.get('CacheSubnetGroupDescription', '')}</CacheSubnetGroupDescription>"
-            f"<VpcId>{g.get('VpcId', '')}</VpcId>"
-            f"<Subnets>{subnets_xml}</Subnets>"
-            f"<ARN>{g.get('ARN', '')}</ARN></CacheSubnetGroup>"
-        )
+        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 400)
+    groups = [_subnet_groups[name]] if name else list(_subnet_groups.values())
+    members = "".join(f"<CacheSubnetGroup>{_subnet_group_xml(g)}</CacheSubnetGroup>" for g in groups)
     return _xml(200, "DescribeCacheSubnetGroupsResponse",
         f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
 
@@ -1647,7 +1654,11 @@ def _describe_subnet_groups(p):
 def _delete_subnet_group(p):
     name = _p(p, "CacheSubnetGroupName")
     if name not in _subnet_groups:
-        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 404)
+        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 400)
+    in_use = any(r.get("CacheSubnetGroupName") == name
+                 for r in list(_clusters.values()) + list(_replication_groups.values()))
+    if in_use:
+        return _error("CacheSubnetGroupInUse", f"Cache subnet group {name} is currently in use.", 400)
     sg = _subnet_groups.pop(name, None)
     if sg:
         _tags.pop(sg.get("ARN", ""), None)
@@ -1658,28 +1669,17 @@ def _modify_subnet_group(p):
     name = _p(p, "CacheSubnetGroupName")
     sg = _subnet_groups.get(name)
     if not sg:
-        return _error("CacheSubnetGroupNotFoundFault", f"Subnet group {name} not found", 404)
-
+        return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 400)
+    if _extract_configs(p, "SubnetIds", ("SubnetIdentifier", "member")):
+        resolved = _resolve_subnets(p)
+        if resolved is None:
+            return _error("InvalidSubnet", "The requested subnet is invalid, or multiple subnets were requested "
+                          "that are not all in a common VPC.", 400)
+        sg["Subnets"], sg["VpcId"] = resolved
     if _p(p, "CacheSubnetGroupDescription"):
         sg["CacheSubnetGroupDescription"] = _p(p, "CacheSubnetGroupDescription")
-
-    subnets = []
-    idx = 1
-    while _p(p, f"SubnetIds.member.{idx}"):
-        subnets.append({
-            "SubnetIdentifier": _p(p, f"SubnetIds.member.{idx}"),
-            "SubnetAvailabilityZone": {"Name": f"{get_region()}{'abcdef'[(idx - 1) % 6]}"},
-        })
-        idx += 1
-    if subnets:
-        sg["Subnets"] = subnets
-
-    arn = sg.get("ARN", _arn_subnet_group(name))
     return _xml(200, "ModifyCacheSubnetGroupResponse",
-        f"<ModifyCacheSubnetGroupResult><CacheSubnetGroup>"
-        f"<CacheSubnetGroupName>{name}</CacheSubnetGroupName>"
-        f"<CacheSubnetGroupDescription>{sg.get('CacheSubnetGroupDescription', '')}</CacheSubnetGroupDescription>"
-        f"<ARN>{arn}</ARN>"
+        f"<ModifyCacheSubnetGroupResult><CacheSubnetGroup>{_subnet_group_xml(sg)}"
         f"</CacheSubnetGroup></ModifyCacheSubnetGroupResult>")
 
 

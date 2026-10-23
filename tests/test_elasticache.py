@@ -128,12 +128,12 @@ def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
         CacheSubnetGroupDescription="Test EC SG",
-        SubnetIds=["subnet-aaa"],
+        SubnetIds=["subnet-00000001"],
     )
     ec.modify_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
         CacheSubnetGroupDescription="Updated EC SG",
-        SubnetIds=["subnet-bbb"],
+        SubnetIds=["subnet-00000002"],
     )
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName="test-mod-ecsg")
     assert resp["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "Updated EC SG"
@@ -609,12 +609,12 @@ def test_elasticache_subnet_and_param_groups_are_region_scoped():
     east.create_cache_subnet_group(
         CacheSubnetGroupName=subnet_name,
         CacheSubnetGroupDescription="east subnet",
-        SubnetIds=["subnet-east"],
+        SubnetIds=["subnet-00000001"],
     )
     west.create_cache_subnet_group(
         CacheSubnetGroupName=subnet_name,
         CacheSubnetGroupDescription="west subnet",
-        SubnetIds=["subnet-west"],
+        SubnetIds=["subnet-00000001"],
     )
     east.create_cache_parameter_group(
         CacheParameterGroupName=param_name,
@@ -1093,7 +1093,7 @@ def test_delete_cache_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName=name,
         CacheSubnetGroupDescription="To be deleted",
-        SubnetIds=["subnet-aaa"],
+        SubnetIds=["subnet-00000001"],
     )
     # verify exists
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
@@ -1106,6 +1106,44 @@ def test_delete_cache_subnet_group(ec):
     with pytest.raises(ClientError) as exc:
         ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
     assert "CacheSubnetGroupNotFoundFault" in str(exc.value)
+
+
+def test_cache_subnet_group_keeps_subnets_and_tags(ec):
+    name = f"sg-keep-{_uid()}"
+    group = ec.create_cache_subnet_group(
+        CacheSubnetGroupName=name,
+        CacheSubnetGroupDescription="two subnets",
+        SubnetIds=["subnet-00000001", "subnet-00000002"],
+        Tags=[{"Key": "env", "Value": "dev"}],
+    )["CacheSubnetGroup"]
+    try:
+        described = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)["CacheSubnetGroups"][0]
+        for g in (group, described):
+            assert g["VpcId"] == "vpc-00000001"
+            assert [(s["SubnetIdentifier"], s["SubnetAvailabilityZone"]["Name"]) for s in g["Subnets"]] == [
+                ("subnet-00000001", "us-east-1a"), ("subnet-00000002", "us-east-1b")]
+        assert ec.list_tags_for_resource(ResourceName=group["ARN"])["TagList"] == [{"Key": "env", "Value": "dev"}]
+
+        with pytest.raises(ClientError) as exc:
+            ec.create_cache_subnet_group(CacheSubnetGroupName=name, CacheSubnetGroupDescription="again",
+                                         SubnetIds=["subnet-00000001"])
+        assert exc.value.response["Error"]["Code"] == "CacheSubnetGroupAlreadyExists"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        modified = ec.modify_cache_subnet_group(
+            CacheSubnetGroupName=name, SubnetIds=["subnet-00000003"])["CacheSubnetGroup"]
+        assert modified["VpcId"] == "vpc-00000001"
+        assert [s["SubnetIdentifier"] for s in modified["Subnets"]] == ["subnet-00000003"]
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_cache_subnet_group(CacheSubnetGroupName=name, SubnetIds=["subnet-doesnotexist"])
+        assert exc.value.response["Error"]["Code"] == "InvalidSubnet"
+    finally:
+        ec.delete_cache_subnet_group(CacheSubnetGroupName=name)
+
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 # ---------------------------------------------------------------------------
