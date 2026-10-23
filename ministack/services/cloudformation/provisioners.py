@@ -1685,7 +1685,6 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
     Auto-named buckets (no explicit ``BucketName``) must keep their existing
     physical resource id so that ``Ref`` keeps resolving to the same bucket
     where artifacts were uploaded."""
-    old_name = old_props.get("BucketName")
     new_name = new_props.get("BucketName")
     if new_name and new_name != physical_id:
         return _s3_create(new_name, new_props, stack_name)
@@ -5071,7 +5070,6 @@ def _cfn_nested_stack_delete(physical_id, props):
     if not child_stack:
         return
 
-    child_stack_id = child_stack.get("StackId", physical_id)
     resources = child_stack.get("_resources", {})
     template = child_stack.get("_template", {})
     res_defs = template.get("Resources", {}) if template else {}
@@ -7976,7 +7974,6 @@ def _ec2_vpc_create(logical_id, props, stack_name):
     }
     _ec2_vpc_dns_attributes(_ec2._vpcs[vpc_id], props)
     _ec2_apply_tags(vpc_id, props)
-    arn = f"arn:aws:ec2:{get_region()}:{get_account_id()}:vpc/{vpc_id}"
     return vpc_id, {"VpcId": vpc_id, "DefaultSecurityGroup": sg_id, "DefaultNetworkAcl": acl_id}
 
 

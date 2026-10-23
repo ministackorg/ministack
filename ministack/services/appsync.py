@@ -537,11 +537,6 @@ def _get_type(api_id, type_name, query_params):
     if api_id not in _apis:
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
 
-    fmt = "SDL"
-    if query_params.get("format"):
-        fmt_val = query_params["format"]
-        fmt = fmt_val[0] if isinstance(fmt_val, list) else fmt_val
-
     t = _types.get(api_id, {}).get(type_name)
     if not t:
         return error_response_json("NotFoundException", f"Type {type_name} not found", 404)
@@ -2507,7 +2502,6 @@ def _ddb_scan(table, table_name, args, sub_fields):
     """Scan/list items, optionally with filters and pagination."""
     items = []
     limit = args.get("limit", 100)
-    next_token = args.get("nextToken")
 
     count = 0
     for pk in sorted(table["items"].keys()):

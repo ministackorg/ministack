@@ -1371,7 +1371,6 @@ def invoke_durable_resume(function_name: str, durable_arn: str, original_event: 
     func = _functions.get(canonical)
     if not func:
         return
-    config = func.get("config") or func
     # Set the durable context to the SAME ARN/token so the SDK reads the
     # accumulated operations as InitialExecutionState (replay path).
     _durable_ctx.set({

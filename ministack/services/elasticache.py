@@ -2866,7 +2866,6 @@ def _log_delivery_configs_xml(configs):
 
 def _cluster_xml_inner(c):
     """Render cluster fields — no wrapping element."""
-    ep = c.get("_endpoint", {})
     nodes_xml = ""
     # CacheNodeList.member.locationName = "CacheNode"
     az = c.get("PreferredAvailabilityZone", "")

@@ -323,7 +323,6 @@ def _ddb_canonicalize_number(s: str) -> str | None:
         return None
     # Canonical string: use Decimal's normalize but format without trailing zeros
     # and without unnecessary leading zeros.
-    norm = d.normalize()
     # Decimal's normalize() returns scientific notation for very large/small;
     # we want the human-readable form when reasonable. Format manually.
     sign_str = "-" if sign else ""
@@ -1306,7 +1305,6 @@ def _create_table(data):
 
     # Validate index Projection settings.
     for idx in gsis + lsis:
-        idx_name = idx.get("IndexName", "<unnamed>")
         proj = idx.get("Projection") or {}
         ptype = proj.get("ProjectionType", "ALL")
         if ptype not in _VALID_PROJECTION_TYPES:
