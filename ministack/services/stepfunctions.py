@@ -142,6 +142,7 @@ _task_tokens = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _activities = AccountRegionScopedDict()
 _activity_tasks = AccountRegionScopedDict()
+_map_runs = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
@@ -165,6 +166,7 @@ def get_state():
         "activities": copy.deepcopy(_activities),
         "state_machine_versions": copy.deepcopy(_state_machine_versions),
         "state_machine_aliases": copy.deepcopy(_state_machine_aliases),
+        "map_runs": copy.deepcopy(_map_runs),
     }
 
 
@@ -177,6 +179,7 @@ def _restore_state(data):
         return
     _state_machines.update(data.get("state_machines", {}))
     _executions.update(data.get("executions", {}))
+    _map_runs.update(data.get("map_runs", {}))
     _tags.update(data.get("tags", {}))
     _activities.update(data.get("activities", {}))
     _state_machine_versions.update(data.get("state_machine_versions", {}))
@@ -295,6 +298,9 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteStateMachineAlias": _delete_state_machine_alias,
         "DescribeStateMachineAlias": _describe_state_machine_alias,
         "ListStateMachineAliases": _list_state_machine_aliases,
+        "ListMapRuns": _list_map_runs,
+        "DescribeMapRun": _describe_map_run,
+        "UpdateMapRun": _update_map_run,
     }
 
     handler = handlers.get(action)
@@ -962,7 +968,40 @@ def _describe_execution(data):
         result["error"] = execution["error"]
     if execution.get("cause"):
         result["cause"] = execution["cause"]
+    if execution.get("mapRunArn"):
+        result["mapRunArn"] = execution["mapRunArn"]
     return json_response(result)
+
+
+def _map_run_view(run):
+    return {k: v for k, v in run.items() if not k.startswith("_")}
+
+
+def _list_map_runs(data):
+    exec_arn = data.get("executionArn")
+    if exec_arn not in _executions:
+        return error_response_json("ExecutionDoesNotExist", f"Execution Does Not Exist: '{exec_arn}'", 400)
+    runs = [{"executionArn": r["executionArn"], "mapRunArn": r["mapRunArn"], "stateMachineArn": r["_stateMachineArn"],
+             "startDate": r["startDate"], **({"stopDate": r["stopDate"]} if r.get("stopDate") else {})}
+            for r in _map_runs.values() if r["executionArn"] == exec_arn]
+    return json_response({"mapRuns": runs})
+
+
+def _describe_map_run(data):
+    run = _map_runs.get(data.get("mapRunArn"))
+    if run is None:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{data.get('mapRunArn')}'", 400)
+    return json_response(_map_run_view(run))
+
+
+def _update_map_run(data):
+    run = _map_runs.get(data.get("mapRunArn"))
+    if run is None:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{data.get('mapRunArn')}'", 400)
+    for field in ("maxConcurrency", "toleratedFailurePercentage", "toleratedFailureCount"):
+        if field in data:
+            run[field] = data[field]
+    return json_response({})
 
 
 def _execution_sort_key(execution):
@@ -995,21 +1034,29 @@ def _list_executions(data):
         if cursor is None:
             return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
     sm_arn = data.get("stateMachineArn")
+    map_run_arn = data.get("mapRunArn")
+    if map_run_arn and map_run_arn not in _map_runs:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{map_run_arn}'", 400)
     status_filter = data.get("statusFilter")
     all_execs = []
     for ex in _executions.values():
         if sm_arn and ex["stateMachineArn"] != sm_arn:
             continue
+        if map_run_arn and ex.get("mapRunArn") != map_run_arn:
+            continue
         if status_filter and ex["status"] != status_filter:
             continue
-        all_execs.append({
+        item = {
             "executionArn": ex["executionArn"],
             "stateMachineArn": ex["stateMachineArn"],
             "name": ex["name"],
             "status": ex["status"],
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
-        })
+        }
+        if ex.get("mapRunArn"):
+            item["mapRunArn"] = ex["mapRunArn"]
+        all_execs.append(item)
     all_execs.sort(key=_execution_sort_key, reverse=True)
     if cursor is not None:
         all_execs = [e for e in all_execs if _execution_sort_key(e) < cursor]
@@ -2595,6 +2642,8 @@ def _run_map_items(state_def, raw_input, execution, ctx):
         items = [items]
 
     iterator = state_def.get("Iterator") or state_def.get("ItemProcessor", {})
+    if (iterator.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return _run_distributed_map(state_def, raw_input, effective, iterator, execution, ctx)
     iter_states = iterator.get("States", {})
     iter_start = iterator.get("StartAt")
     max_conc = state_def.get("MaxConcurrency", 0)
@@ -2634,6 +2683,169 @@ def _run_map_items(state_def, raw_input, execution, ctx):
             raise err if isinstance(err, _ExecutionError) else _ExecutionError(
                 "States.MapFailed", str(err))
 
+    result = _apply_result_selector(state_def, results)
+    output = _apply_result_path(state_def, raw_input, result)
+    output = _apply_output_path(state_def, output, ctx)
+    return output, _next_or_end(state_def)
+
+
+_CSV_DELIMITERS = {"COMMA": ",", "PIPE": "|", "SEMICOLON": ";", "SPACE": " ", "TAB": "\t"}
+
+
+def _s3_object_text(bucket, key):
+    from ministack.services import s3
+
+    status, _headers, body = s3._get_object(bucket, key, {}, {})
+    if status != 200:
+        raise _ExecutionError("States.ItemReaderFailed", f"The specified key does not exist. (Bucket: {bucket}, Key: {key})")
+    return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+
+
+def _parse_reader_items(text, config):
+    """Items of a JSON, JSONL or CSV dataset, as the Distributed Map reads them."""
+    import csv
+    import io
+
+    input_type = config.get("InputType", "JSON")
+    if input_type == "JSONL":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    if input_type == "CSV":
+        rows = list(csv.reader(io.StringIO(text), delimiter=_CSV_DELIMITERS.get(config.get("CSVDelimiter", "COMMA"), ",")))
+        if config.get("CSVHeaderLocation") == "GIVEN":
+            headers = list(config.get("CSVHeaders") or [])
+        else:
+            headers, rows = (rows[0], rows[1:]) if rows else ([], [])
+        # Missing fields are empty strings and extra fields are dropped.
+        return [{h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)} for row in rows if row]
+    data = json.loads(text)
+    pointer = config.get("ItemsPointer")
+    if pointer:
+        for part in pointer.strip("/").split("/"):
+            data = data[int(part)] if isinstance(data, list) else data[part]
+    return data
+
+
+def _read_map_items(reader, effective, ctx):
+    from ministack.services import s3
+
+    params = _resolve_params_obj(reader.get("Parameters") or reader.get("Arguments") or {}, effective, ctx)
+    config = reader.get("ReaderConfig") or {}
+    resource = reader.get("Resource", "")
+    if resource.endswith("s3:listObjectsV2"):
+        bucket = s3._buckets.get(params.get("Bucket"))
+        if bucket is None:
+            raise _ExecutionError("States.ItemReaderFailed", f"The specified bucket does not exist. (Bucket: {params.get('Bucket')})")
+        prefix = params.get("Prefix", "")
+        items = []
+        for key in sorted(k for k in bucket["objects"] if k.startswith(prefix)):
+            obj = bucket["objects"][key]
+            if config.get("Transformation") == "LOAD_AND_FLATTEN":
+                items.extend(_parse_reader_items(_s3_object_text(params["Bucket"], key), config))
+                continue
+            items.append({"Etag": obj.get("etag", ""), "Key": key, "LastModified": _epoch_seconds(obj.get("last_modified")),
+                          "Size": obj.get("size", 0), "StorageClass": obj.get("storage_class") or "STANDARD"})
+    else:
+        items = _parse_reader_items(_s3_object_text(params.get("Bucket"), params.get("Key")), config)
+    max_items = config.get("MaxItems")
+    if config.get("MaxItemsPath"):
+        max_items = _resolve_path_or_ctx(config["MaxItemsPath"], effective, ctx)
+    return items[:int(max_items)] if max_items else items
+
+
+def _epoch_seconds(stamp):
+    from datetime import datetime
+
+    if isinstance(stamp, (int, float)):
+        return int(stamp)
+    try:
+        return int(datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def _run_distributed_map(state_def, raw_input, effective, iterator, execution, ctx):
+    """Each item runs as a child workflow execution of a Map Run, which ListMapRuns, DescribeMapRun and
+    ListExecutions(mapRunArn) report."""
+    if state_def.get("ItemReader"):
+        items = _read_map_items(state_def["ItemReader"], effective, ctx)
+    else:
+        items = _resolve_path_or_ctx(state_def.get("ItemsPath", "$"), effective, ctx)
+    if not isinstance(items, list):
+        items = [items]
+
+    parent_sm = execution["stateMachineArn"].split(":")
+    sm_name, region, account = parent_sm[6], parent_sm[3], parent_sm[4]
+    label = state_def.get("Label") or new_uuid()
+    child_sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{sm_name}/{label}"
+    map_run_arn = f"arn:aws:states:{region}:{account}:mapRun:{sm_name}/{label}:{new_uuid()}"
+    max_conc = int(state_def.get("MaxConcurrency") or 0)
+    tolerated_pct = float(state_def.get("ToleratedFailurePercentage") or 0)
+    tolerated_count = int(state_def.get("ToleratedFailureCount") or 0)
+    zero = {k: 0 for k in ("pending", "running", "succeeded", "failed", "timedOut", "aborted", "total", "resultsWritten",
+                          "failuresNotRedrivable", "pendingRedrive")}
+    run = {
+        "mapRunArn": map_run_arn, "executionArn": execution["executionArn"], "status": "RUNNING",
+        "startDate": now_iso(), "maxConcurrency": max_conc, "toleratedFailurePercentage": tolerated_pct,
+        "toleratedFailureCount": tolerated_count, "itemCounts": dict(zero, total=len(items), pending=len(items)),
+        "executionCounts": dict(zero, total=len(items), pending=len(items)), "redriveCount": 0,
+        "_stateMachineArn": child_sm_arn,
+    }
+    _map_runs[map_run_arn] = run
+    item_selector = state_def.get("ItemSelector") or state_def.get("Parameters")
+    results = [None] * len(items)
+    failures = [None] * len(items)
+    lock = threading.Lock()
+
+    def run_child(idx, item):
+        item_ctx = copy.deepcopy(ctx)
+        item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
+        child_input = _resolve_params_obj(item_selector, effective, item_ctx) if item_selector else item
+        name = new_uuid()
+        child = {
+            "executionArn": f"arn:aws:states:{region}:{account}:execution:{sm_name}/{label}:{name}",
+            "stateMachineArn": child_sm_arn, "name": name, "status": "RUNNING", "startDate": now_iso(),
+            "stopDate": None, "input": json.dumps(child_input), "inputDetails": {"included": True}, "output": None,
+            "outputDetails": {"included": True}, "mapRunArn": map_run_arn, "events": [],
+            "testCase": execution.get("testCase"), "mockAttempts": {},
+        }
+        _executions[child["executionArn"]] = child
+        with lock:
+            for counts in (run["itemCounts"], run["executionCounts"]):
+                counts["pending"] -= 1
+                counts["running"] += 1
+        try:
+            results[idx] = _run_sub_machine(iterator.get("States", {}), iterator.get("StartAt"),
+                                            child_input, child, item_ctx)
+            child.update(status="SUCCEEDED", output=json.dumps(results[idx]))
+            outcome = "succeeded"
+        except Exception as exc:
+            err = exc if isinstance(exc, _ExecutionError) else _ExecutionError("States.TaskFailed", str(exc))
+            failures[idx] = err
+            child.update(status="FAILED", error=err.error, cause=err.cause)
+            outcome = "failed"
+        child["stopDate"] = now_iso()
+        with lock:
+            for counts in (run["itemCounts"], run["executionCounts"]):
+                counts["running"] -= 1
+                counts[outcome] += 1
+
+    workers = max_conc if max_conc > 0 else (min(len(items), 64) or 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures_wait([pool.submit(contextvars.copy_context().run, run_child, i, item) for i, item in enumerate(items)])
+
+    failed = sum(1 for f in failures if f is not None)
+    limits = []
+    if "ToleratedFailureCount" in state_def:
+        limits.append(failed > tolerated_count)
+    if "ToleratedFailurePercentage" in state_def:
+        limits.append(failed * 100 > tolerated_pct * len(items))
+    # With no threshold set, any failed item fails the Map Run.
+    exceeded = bool(failed) and (any(limits) if limits else True)
+    run["status"] = "FAILED" if exceeded else "SUCCEEDED"
+    run["stopDate"] = now_iso()
+    if exceeded:
+        raise _ExecutionError("States.ExceedToleratedFailureThreshold",
+                              "The specified tolerated failure threshold was exceeded")
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
@@ -5329,6 +5541,7 @@ def reset():
     _activity_tasks.clear()
     _state_machine_versions.clear()
     _state_machine_aliases.clear()
+    _map_runs.clear()
 
 
 # ---------------------------------------------------------------------------

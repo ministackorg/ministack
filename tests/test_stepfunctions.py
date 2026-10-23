@@ -9978,3 +9978,47 @@ def test_sfn_describe_for_execution_through_an_alias_reports_the_version(sfn, en
         sfn.delete_state_machine_alias(stateMachineAliasArn=alias)
         sfn.delete_state_machine(stateMachineArn=created["stateMachineArn"])
 
+
+
+def test_sfn_distributed_map_runs_child_executions_of_a_map_run(sfn, s3):
+    """A DISTRIBUTED Map creates a Map Run of child executions and reads an ItemReader dataset (#2366)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket = f"dmap-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="items.json", Body=b"[1, 2, 3]")
+    s3.put_object(Bucket=bucket, Key="rows.csv", Body=b"a,b\n1,2\n3\n")
+    processor = {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                 "StartAt": "P", "States": {"P": {"Type": "Pass", "End": True}}}
+
+    def run(name, map_fields, payload):
+        definition = {"StartAt": "Map", "States": {"Map": {**map_fields, "Type": "Map", "ItemProcessor": processor,
+                                                           "End": True}}}
+        arn = sfn.create_state_machine(name=f"{name}-{uid}", definition=json.dumps(definition),
+                                       roleArn="arn:aws:iam::000000000000:role/r")["stateMachineArn"]
+        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(payload))["executionArn"]
+        return arn, execution, _wait_sfn(sfn, execution, timeout=20)
+
+    arn, execution, desc = run("dmap-input", {"ItemsPath": "$.items", "Label": "lbl"}, {"items": [1, 2, 3]})
+    assert desc["status"] == "SUCCEEDED" and json.loads(desc["output"]) == [1, 2, 3]
+    (map_run,) = sfn.list_map_runs(executionArn=execution)["mapRuns"]
+    assert map_run["mapRunArn"].startswith(f"{arn.replace(':stateMachine:', ':mapRun:')}/lbl:")
+    assert map_run["stateMachineArn"] == f"{arn}/lbl"
+    described = sfn.describe_map_run(mapRunArn=map_run["mapRunArn"])
+    assert described["status"] == "SUCCEEDED"
+    assert (described["itemCounts"]["succeeded"], described["executionCounts"]["total"]) == (3, 3)
+    children = sfn.list_executions(mapRunArn=map_run["mapRunArn"])["executions"]
+    assert len(children) == 3 and all(c["stateMachineArn"] == f"{arn}/lbl" for c in children)
+    assert len(sfn.list_executions(stateMachineArn=arn)["executions"]) == 1
+
+    reader = {"Resource": "arn:aws:states:::s3:getObject", "Parameters": {"Bucket": bucket, "Key": "items.json"},
+              "ReaderConfig": {"InputType": "JSON"}}
+    _, _, desc = run("dmap-json", {"ItemReader": reader}, {"note": "the items are in S3"})
+    assert json.loads(desc["output"]) == [1, 2, 3]
+    csv_reader = {"Resource": "arn:aws:states:::s3:getObject", "Parameters": {"Bucket": bucket, "Key": "rows.csv"},
+                  "ReaderConfig": {"InputType": "CSV", "CSVHeaderLocation": "FIRST_ROW"}}
+    _, _, desc = run("dmap-csv", {"ItemReader": csv_reader}, {})
+    assert json.loads(desc["output"]) == [{"a": "1", "b": "2"}, {"a": "3", "b": ""}]
+    list_reader = {"Resource": "arn:aws:states:::s3:listObjectsV2", "Parameters": {"Bucket": bucket}}
+    _, _, desc = run("dmap-list", {"ItemReader": list_reader}, {})
+    assert [o["Key"] for o in json.loads(desc["output"])] == ["items.json", "rows.csv"]
+    assert set(json.loads(desc["output"])[0]) == {"Etag", "Key", "LastModified", "Size", "StorageClass"}
