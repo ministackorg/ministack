@@ -1446,7 +1446,7 @@ def _s3_scope_failure(service: str | None) -> AuthError | None:
     from ministack.core.iam_actions import SERVICE_TO_IAM_NAMESPACE
 
     name = SERVICE_TO_IAM_NAMESPACE.get(service or "", service or "")
-    return AuthError("SignatureDoesNotMatch", f"Credential should be scoped to correct service: '{name}'")
+    return AuthError("SignatureDoesNotMatch", f"Credential should be scoped to correct service: '{name}'. ")
 
 
 def authenticate_handshake(scope: dict, service: str | None = None) -> AuthError | ResolvedCredential | None:

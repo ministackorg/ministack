@@ -5512,7 +5512,7 @@ class TestQuerySignatures:
         """Only S3 takes a query signed for s3; a correct one is refused anywhere else (#2338)."""
         code, status, body = _presigned(*user_key, "s3", query)
         assert (code, status) == ("SignatureDoesNotMatch", 403)
-        assert f"Credential should be scoped to correct service: '{service}'" in body
+        assert f"Credential should be scoped to correct service: '{service}'. " in body
 
     def test_root_key_signs_with_any_secret(self, user_key):
         assert _presigned("test", "anything", "iam", _LIST_USERS)[:2] == (None, 200)
