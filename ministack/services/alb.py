@@ -2234,8 +2234,7 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     try:
         resp, sock, err = await asyncio.shield(opening)
     except asyncio.CancelledError:
-        # The caller stopped waiting (a CloudFront origin timeout, say): wake a
-        # blocked read and close the connection once the opening thread returns.
+        # The caller gave up: unblock the read and close once the thread returns.
         with contextlib.suppress(Exception):
             conn.sock.shutdown(socket.SHUT_RDWR)
         opening.add_done_callback(lambda _: conn.close())

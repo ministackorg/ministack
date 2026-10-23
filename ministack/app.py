@@ -1981,7 +1981,7 @@ async def _handle_cloudfront_dataplane_request(
     if dist is None:
         return None
     try:
-        return await _get_module("cloudfront_dataplane").handle_request(
+        return await _get_module("cloudfront").handle_viewer_request(
             dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
         )
     except Exception as e:

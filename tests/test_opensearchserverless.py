@@ -492,7 +492,7 @@ def test_aoss_data_plane_denylist(method, path, query, ctype, supported):
 
 def _gateway_request(host_header, method, path, headers=None, body=b""):
     """Connect to the gateway's own address, sending ``host_header`` as Host —
-    the way test_cloudfront_dataplane.py's ``_get`` reaches a virtual host
+    the way test_cloudfront.py's ``_get`` reaches a virtual host
     that doesn't resolve locally."""
     conn = http.client.HTTPConnection(urllib.parse.urlparse(ENDPOINT).hostname, int(GATEWAY_PORT), timeout=10)
     try:
