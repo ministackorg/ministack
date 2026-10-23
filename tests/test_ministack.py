@@ -99,6 +99,14 @@ def test_localstack_unknown_paths_return_json_404():
             )
 
 
+def test_responses_do_not_advertise_the_emulator_server():
+    """No AWS endpoint answers with Hypercorn's Server value."""
+    import urllib.request
+
+    resp = urllib.request.urlopen(f"{ENDPOINT}/_ministack/health")
+    assert not (resp.headers.get("Server") or "").startswith("hypercorn")
+
+
 def test_localstack_health_still_returns_200():
     """/_localstack/health must still return 200 after the interceptor is wired in."""
     import urllib.request

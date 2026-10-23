@@ -245,6 +245,12 @@ from ministack.core.sigv4 import decode_header_value
 # See ministack/core/hypercorn_compat.py for the rationale (issue #389).
 _install_hypercorn_compat()
 
+# AWS endpoints never answer with Hypercorn's Server header; a service that sends one sets its own.
+# Set on the class so every start path (ministack, ministack -d, python -m hypercorn) gets it.
+from hypercorn.config import Config as _HypercornConfig
+
+_HypercornConfig.include_server_header = False
+
 # ---------------------------------------------------------------------------
 # Lazy service loader — modules are imported on first request, not at startup.
 # This saves ~20 MB of idle RAM and speeds up boot.
