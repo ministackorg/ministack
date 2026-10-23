@@ -873,6 +873,76 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
+def _start_echo_server():
+    """Answer every GET with the request target and headers the target received, as JSON."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            headers = {}
+            for name, value in self.headers.items():
+                headers.setdefault(name.lower(), []).append(value)
+            body = json.dumps({"path": self.path, "headers": headers}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _stop_server(server):
+    server.shutdown()
+    server.server_close()
+
+
+def test_elbv2_dataplane_forwards_the_client_host_header(elbv2):
+    """The target sees the client's Host, not its own address. On a default listener port (80)
+    AWS removes a port the client sent."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-host"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        for sent, received in (("app.example.test", "app.example.test"), ("app.example.test:8443", "app.example.test")):
+            req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": sent})
+            assert json.loads(_req.urlopen(req).read())["headers"]["host"] == [received]
+        elbv2.modify_load_balancer_attributes(LoadBalancerArn=lb_arn, Attributes=[
+            {"Key": "routing.http.preserve_host_header.enabled", "Value": "true"}])
+        req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": "app.example.test:8443"})
+        assert json.loads(_req.urlopen(req).read())["headers"]["host"] == ["app.example.test:8443"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_lambda_target_gets_the_host_as_sent(elbv2, lam):
+    fn_code = ("import json\n"
+               "def handler(event, context):\n"
+               "    return {'statusCode': 200, 'body': json.dumps(event['headers'])}\n")
+    lb_arn, tg_arn, l_arn, _fn_arn = _alb_setup(elbv2, lam, "dp-alb-lhost", "dp-alb-lhost-fn", fn_code)
+    try:
+        req = _req.Request(f"{_endpoint}/_alb/dp-alb-lhost/", headers={"Host": "app.example.test:9000"})
+        assert json.loads(_req.urlopen(req).read())["host"] == "app.example.test:9000"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-lhost-fn")
+
+
+def test_elbv2_target_host_follows_the_listener_port():
+    from ministack.services import alb
+
+    assert alb._target_host_header("app.example.test:8443", 443) == "app.example.test"
+    assert alb._target_host_header("app.example.test", 8080) == "app.example.test:8080"
+    assert alb._target_host_header("app.example.test:9000", 8080) == "app.example.test:8080"
+    assert alb._target_host_header("[::1]:8080", 80) == "[::1]"
+    assert alb._target_host_header("[::1]", 8080) == "[::1]:8080"
+
+
 def _start_chunked_server(chunks, delay):
     """Serve `chunks` with `delay` seconds between them and no Content-Length."""
     import threading
@@ -1688,7 +1758,7 @@ def test_unauthenticated_request_redirects_to_the_identity_provider(elbv2, lam):
         assert q["client_id"] == ["client-abc"]
         assert q["response_type"] == ["code"]
         assert q["scope"] == ["openid email"]
-        assert q["redirect_uri"][0].endswith("/oauth2/idpresponse")
+        assert q["redirect_uri"] == [f"http://{name}.alb.localhost:{_EXECUTE_PORT}/oauth2/idpresponse"]
         assert q["state"], "the provider must be given a state to return"
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")

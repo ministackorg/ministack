@@ -1986,7 +1986,7 @@ def _oidc_first(value):
 # ---------------------------------------------------------------------------
 
 async def _execute_actions(actions, method, path, headers, body, query_params, listener_port=80,
-                           lb_arn=""):
+                           lb_arn="", target_host=None):
     """Run a rule's actions in Order until one produces a response.
 
     Authentication actions are gates: they either short-circuit with a redirect
@@ -2013,6 +2013,10 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
             # request to a target that assumes the load balancer checked.
             return (501, {"Content-Type": "application/json"},
                     json.dumps({"message": "authenticate-cognito is not implemented"}).encode())
+        tg = _tgs.get(action.get("TargetGroupArn", "")) if atype == "forward" else None
+        if target_host and tg and tg.get("TargetType", "instance") in ("instance", "ip"):
+            # Authentication used the client's Host; an instance or IP target gets the load balancer's.
+            forwarded["host"] = target_host
         return await _execute_action(action, method, path, forwarded, body, query_params)
 
     # Every action was a gate that passed and none of them was terminal.
@@ -2205,7 +2209,7 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     qs = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
     target_path = path + (f"?{urlencode(qs)}" if qs else "")
 
-    hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
+    hop_by_hop = {"content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
     fwd = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
 
@@ -2306,6 +2310,16 @@ def _lb_attr(lb_arn, key, default):
     return next((a["Value"] for a in _lb_attrs.get(lb_arn, []) if a.get("Key") == key), default)
 
 
+def _target_host_header(host, listener_port):
+    """The Host an ALB sends an instance or IP target: on listener port 80 or 443 the client's port is
+    dropped; on any other listener port it becomes the listener's, whatever port the client sent.
+    Observed on AWS (us-east-1, 2026-10-23); Lambda targets get the Host unmodified."""
+    name, sep, port = host.rpartition(":")
+    if not (sep and port.isdigit()):
+        name = host
+    return name if int(listener_port) in (80, 443) else f"{name}:{listener_port}"
+
+
 def _target_headers(lb_arn, listener, headers, client_ip):
     """The request fields a target receives: X-Forwarded-* and X-Amzn-Trace-Id set by the load balancer.
 
@@ -2364,9 +2378,12 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
             if actions:
                 target_headers = _target_headers(lb_arn, listener, headers,
                                                  client_ip or get_request_client_ip())
+                target_host = target_headers.get("host")
+                if target_host and _lb_attr(lb_arn, "routing.http.preserve_host_header.enabled", "false") != "true":
+                    target_host = _target_host_header(target_host, listener.get("Port", 80))
                 return await _execute_actions(actions, method, path,
                                               target_headers, body, query_params, port,
-                                              lb_arn=lb.get("LoadBalancerArn", ""))
+                                              lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "No matching ALB rule found"}).encode())
