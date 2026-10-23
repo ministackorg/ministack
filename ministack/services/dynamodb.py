@@ -1282,8 +1282,18 @@ def _older_validation_region() -> bool:
     return get_region() in _OLDER_VALIDATION_REGIONS
 
 
-def _older_member_errors(data) -> tuple | None:
-    """Where PutItem and UpdateItem still join their member errors in the older per-value form."""
+def _older_member_errors(data, op: str) -> tuple | None:
+    """Where PutItem (empty table name and bad ReturnValues) and UpdateItem (bad ReturnValues and
+    ReturnConsumedCapacity) still join their member errors in the older per-value form."""
+    rv, rcc = data.get("ReturnValues"), data.get("ReturnConsumedCapacity")
+    bad_rv = rv is not None and rv not in _UPDATE_RV_VALUES
+    bad_rcc = rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES
+    if op == "put" and not (data.get("TableName") == "" and bad_rv and not bad_rcc
+                            and data.get("ReturnItemCollectionMetrics") is None):
+        return None
+    if op == "update" and not (bad_rv and bad_rcc and data.get("TableName") and "Key" in data
+                               and data.get("ReturnItemCollectionMetrics") is None):
+        return None
     pieces = []
     rcc = data.get("ReturnConsumedCapacity")
     if rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES:
@@ -2267,7 +2277,7 @@ def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: di
 
 
 def _put_item(data):
-    err = (_older_validation_region() and _older_member_errors(data)) or _older_layer_error(data, "put")
+    err = (_older_validation_region() and _older_member_errors(data, "put")) or _older_layer_error(data, "put")
     if err:
         return err
     name = _normalize_table_name(data.get("TableName"))
@@ -2457,7 +2467,7 @@ def _key_attribute_update_error(table, updated_attrs):
 
 
 def _update_item(data):
-    err = (_older_validation_region() and _older_member_errors(data)) or _older_layer_error(data, "update")
+    err = (_older_validation_region() and _older_member_errors(data, "update")) or _older_layer_error(data, "update")
     if err:
         return err
     name = _normalize_table_name(data.get("TableName"))
@@ -2503,7 +2513,7 @@ def _update_item(data):
     old_item = copy.deepcopy(existing) if existing else None
     item = copy.deepcopy(existing) if existing else dict(key)
     update_text = data.get("UpdateExpression")
-    if update_text and not _older_validation_region() and _update_request_charge(update_text, data.get("ExpressionAttributeValues"),
+    if update_text and _update_request_charge(update_text, data.get("ExpressionAttributeValues"),
                                               data.get("ExpressionAttributeNames"), existing or {}) > _DDB_ITEM_MAX_BYTES:
         return error_response_json("ValidationException", _UPDATE_SIZE_MSG, 400)
 
