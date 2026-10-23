@@ -37,7 +37,14 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    get_request_client_ip,
+    new_uuid,
+)
 
 logger = logging.getLogger("alb")
 
@@ -2186,8 +2193,8 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     ip target groups, or any resolvable hostname for instance target
     groups (an emulator has no EC2 metadata to resolve instance ids
     against, so a hostname is the useful interpretation). Mirrors ALB
-    behavior: hop-by-hop headers are stripped, X-Forwarded-* and
-    X-Amzn-Trace-Id are injected, target HTTP errors pass through, and
+    behavior: hop-by-hop headers are stripped (dispatch_request has already
+    set X-Forwarded-* and X-Amzn-Trace-Id), target HTTP errors pass through, and
     connection failures surface as 502.
     """
     import http.client
@@ -2200,14 +2207,7 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
-    fwd = {k: v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
-    fwd["X-Forwarded-For"] = (headers or {}).get("x-forwarded-for") or "127.0.0.1"
-    fwd.setdefault("X-Forwarded-Proto", "http")
-    fwd.setdefault("X-Forwarded-Port", "80")
-    fwd["X-Amzn-Trace-Id"] = "Root=1-%08x-%s" % (
-        int(time.time()),
-        "".join(random.choices("0123456789abcdef", k=24)),
-    )
+    fwd = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
 
@@ -2215,8 +2215,9 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
+    conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
+
     def _open():
-        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
         try:
             conn.connect()
             sock = conn.sock
@@ -2226,10 +2227,19 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         except Exception as e:
             with contextlib.suppress(Exception):
                 conn.close()
-            return None, None, None, e
-        return conn, resp, sock, None
+            return None, None, e
+        return resp, sock, None
 
-    conn, resp, sock, err = await asyncio.to_thread(_open)
+    opening = asyncio.ensure_future(asyncio.to_thread(_open))
+    try:
+        resp, sock, err = await asyncio.shield(opening)
+    except asyncio.CancelledError:
+        # The caller stopped waiting (a CloudFront origin timeout, say): wake a
+        # blocked read and close the connection once the opening thread returns.
+        with contextlib.suppress(Exception):
+            conn.sock.shutdown(socket.SHUT_RDWR)
+        opening.add_done_callback(lambda _: conn.close())
+        raise
     if resp is None:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
@@ -2289,7 +2299,43 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 # Data-plane: main dispatcher
 # ---------------------------------------------------------------------------
 
-async def dispatch_request(lb, method, path, headers, body, query_params, port=80):
+def _trace_id():
+    return "1-%08x-%s" % (int(time.time()), "".join(random.choices("0123456789abcdef", k=24)))
+
+
+def _lb_attr(lb_arn, key, default):
+    return next((a["Value"] for a in _lb_attrs.get(lb_arn, []) if a.get("Key") == key), default)
+
+
+def _target_headers(lb_arn, listener, headers, client_ip):
+    """The request fields a target receives: X-Forwarded-* and X-Amzn-Trace-Id set by the load balancer.
+
+    https://docs.aws.amazon.com/elasticloadbalancing/latest/application/x-forwarded-headers.html
+    https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-request-tracing.html
+    """
+    out = {k.lower(): v for k, v in (headers or {}).items()}
+    mode = _lb_attr(lb_arn, "routing.http.xff_header_processing.mode", "append")
+    xff = out.pop("x-forwarded-for", None)
+    if mode == "preserve" and xff:
+        out["x-forwarded-for"] = xff
+    elif mode == "append":
+        # An IPv6 address appended to an existing header is bracketed.
+        out["x-forwarded-for"] = f"{xff}, [{client_ip}]" if xff and ":" in client_ip else (
+            f"{xff}, {client_ip}" if xff else client_ip)
+    out["x-forwarded-proto"] = (listener.get("Protocol") or "HTTP").lower()
+    out["x-forwarded-port"] = str(listener.get("Port", 80))
+    fields = [f.strip() for f in (out.get("x-amzn-trace-id") or "").split(";") if f.strip()]
+    if any(f.startswith("Self=") for f in fields):
+        fields = [f"Self={_trace_id()}" if f.startswith("Self=") else f for f in fields]
+    elif any(f.startswith("Root=") for f in fields):
+        fields.insert(0, f"Self={_trace_id()}")
+    else:
+        fields.insert(0, f"Root={_trace_id()}")
+    out["x-amzn-trace-id"] = ";".join(fields)
+    return out
+
+
+async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
@@ -2317,8 +2363,10 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
             if actions:
+                target_headers = _target_headers(lb_arn, listener, headers,
+                                                 client_ip or get_request_client_ip())
                 return await _execute_actions(actions, method, path,
-                                              headers, body, query_params, port,
+                                              target_headers, body, query_params, port,
                                               lb_arn=lb.get("LoadBalancerArn", ""))
 
     return (502, {"Content-Type": "application/json"},

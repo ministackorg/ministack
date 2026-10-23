@@ -3,9 +3,11 @@
 """CloudFront data plane: serves viewer requests to ``<label>.cloudfront.net`` / ``<label>.cloudfront.<MINISTACK_HOST>``.
 
 Not modelled: caching, WAF, logging, geo restrictions, signed URLs and cookies,
-Lambda@Edge, CORS preflight, synthetic ``CloudFront-Viewer-*`` headers, origins at AWS hostnames (502).
+Lambda@Edge, CORS preflight, synthetic ``CloudFront-Viewer-*`` headers, origins at AWS hostnames (502)
+other than a load balancer registered in this MiniStack, which is served in-process through its listener.
 """
 
+import asyncio
 import base64
 import fnmatch
 import http.client
@@ -16,11 +18,11 @@ import ssl
 import string
 from re import compile as _re_compile
 from re import escape as _re_escape
-from urllib.parse import quote, unquote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode
 
 from ministack.core import cloudfront_js
 from ministack.core.concurrency import run_offloop, run_reentrant
-from ministack.core.responses import new_uuid
+from ministack.core.responses import StreamingResponse, new_uuid
 from ministack.services import cloudfront, s3
 
 logger = logging.getLogger("cloudfront_dataplane")
@@ -531,16 +533,8 @@ def _origin_x_forwarded_for(viewer_xff: str, client_ip: str) -> str:
     return f"{viewer_xff}, {client_ip}" if viewer_xff else client_ip
 
 
-def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
-                        headers: dict, body: bytes, viewer_is_https: bool, client_ip: str = "127.0.0.1",
-                        viewer_x_forwarded_for: str = "") -> tuple:
-    """Blocking: run under core.concurrency.run_reentrant (the origin may be
-    MiniStack itself). Returns (status, reason, headers, body)."""
-    conn_host, conn_port, use_https = _origin_connect_target(origin, viewer_is_https)
-    if _is_aws_owned_host(_normalize_origin_host(conn_host)):
-        raise OriginUnreachable(f"refusing to dial AWS-owned origin host {conn_host!r}")
-    target_path = uri + (f"?{query_string}" if query_string else "")
-
+def _origin_request_headers(origin: dict, headers: dict, client_ip: str, viewer_x_forwarded_for: str) -> dict:
+    """The header fields sent to a custom origin, one value per name."""
     fwd_headers = {k: v for k, v in headers.items() if k not in _CONNECTION_MANAGEMENT_HEADERS}
     for name, value in origin.get("custom_headers") or []:
         _set_header_ci(fwd_headers, name, value)
@@ -552,10 +546,22 @@ def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
     _set_header_ci(fwd_headers, "X-Forwarded-For",
                     _origin_x_forwarded_for(viewer_x_forwarded_for, client_ip))
     # RFC 9110 §5.3: a repeated field value is one comma-joined line.
-    send_headers = {
+    return {
         name: ", ".join(str(v) for v in value) if isinstance(value, list) else value
         for name, value in fwd_headers.items()
     }
+
+
+def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
+                        headers: dict, body: bytes, viewer_is_https: bool, client_ip: str = "127.0.0.1",
+                        viewer_x_forwarded_for: str = "") -> tuple:
+    """Blocking: run under core.concurrency.run_reentrant (the origin may be
+    MiniStack itself). Returns (status, reason, headers, body)."""
+    conn_host, conn_port, use_https = _origin_connect_target(origin, viewer_is_https)
+    if _is_aws_owned_host(_normalize_origin_host(conn_host)):
+        raise OriginUnreachable(f"refusing to dial AWS-owned origin host {conn_host!r}")
+    target_path = uri + (f"?{query_string}" if query_string else "")
+    send_headers = _origin_request_headers(origin, headers, client_ip, viewer_x_forwarded_for)
 
     conn_cls = http.client.HTTPSConnection if use_https else http.client.HTTPConnection
     timeout = origin.get("read_timeout", 30)
@@ -595,6 +601,94 @@ def _serve_s3_origin(origin: dict, method: str, uri: str, headers: dict, dist_ar
 
 
 # ---------------------------------------------------------------------------
+# Registered ALB origin — an ALB's DNSName is AWS-owned and never dialed, so
+# the request goes through the ALB data plane in-process instead.
+# ---------------------------------------------------------------------------
+
+
+def _registered_alb(origin: dict):
+    """The load balancer an origin's AWS-owned DomainName belongs to, or None."""
+    host = _normalize_origin_host(origin["domain_name"])
+    if not _is_aws_owned_host(host):
+        return None
+    # Imported here so distributions without such an origin never load the ALB module.
+    from ministack.services import alb
+
+    return alb.find_lb_for_host(host)
+
+
+async def _fetch_from_alb_origin(lb: dict, origin: dict, method: str, uri: str, query_string: str, headers: dict,
+                                 body: bytes, viewer_is_https: bool, client_ip: str, viewer_xff: str) -> tuple:
+    """(status, reason, headers, body) from the listener on the origin's port; raises OriginTimeout /
+    OriginUnreachable. The listener's rules and targets answer, as they would a request on the wire."""
+    from ministack.services import alb
+
+    _host, port, use_https = _origin_connect_target(origin, viewer_is_https)
+    # Without a TLS handshake there is no certificate for CloudFront to check, so only HTTP is served.
+    if use_https or not any(
+        listener["LoadBalancerArn"] == lb["LoadBalancerArn"] and listener.get("Port") == port
+        and listener.get("Protocol") == "HTTP" for listener in alb._listeners.values()
+    ):
+        raise OriginUnreachable(f"no HTTP listener on port {port} of {lb['DNSName']}")
+
+    # The ALB data plane takes the gateway's request shape: lowercase header names, parsed query.
+    alb_headers = {k.lower(): v for k, v in _origin_request_headers(origin, headers, client_ip, viewer_xff).items()}
+    read_timeout = origin.get("read_timeout", 30)
+    try:
+        status, response_headers, data = await asyncio.wait_for(
+            alb.dispatch_request(lb, method, uri, alb_headers, body or b"",
+                                 parse_qs(query_string, keep_blank_values=True), port,
+                                 client_ip="127.0.0.1"),
+            read_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise OriginTimeout(f"no response from {lb['DNSName']} within {read_timeout}s") from e
+    except Exception as e:
+        raise OriginUnreachable(str(e)) from e
+    if isinstance(data, StreamingResponse):
+        data = await _collect_streaming_body(data, read_timeout)
+    pairs = [(name, value) for name, values in response_headers.items()
+             for value in (values if isinstance(values, list) else [values])]
+    return status, http.client.responses.get(status, ""), pairs, data
+
+
+async def _collect_streaming_body(stream: StreamingResponse, read_timeout: float) -> bytes:
+    """Buffer a body relayed as it arrives (an ALB ip or instance target).
+
+    As on a socket origin, ``read_timeout`` bounds each wait for the next
+    chunk, and a body whose final frame never arrives is truncated.
+    """
+    frames: asyncio.Queue = asyncio.Queue()
+    finished = object()
+
+    async def receive():
+        # No viewer disconnect to report; the whole body is buffered.
+        await asyncio.Event().wait()
+
+    async def run():
+        try:
+            await stream.runner(frames.put, receive)
+        finally:
+            frames.put_nowait(finished)
+
+    runner = asyncio.ensure_future(run())
+    chunks, complete = [], False
+    try:
+        while (frame := await asyncio.wait_for(frames.get(), read_timeout)) is not finished:
+            chunks.append(frame.get("body", b""))
+            complete = not frame.get("more_body", False)
+    except asyncio.TimeoutError as e:
+        raise OriginTimeout(f"no response data within {read_timeout}s") from e
+    finally:
+        # Cancelling the runner closes the target connection behind it.
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+    if not complete:
+        raise OriginUnreachable("origin response ended before its final body frame")
+    return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
 # Multi-value header handling — a name -> value map where a repeated name
 # (duplicate response headers, multiple Set-Cookie) becomes a name -> list.
 # ---------------------------------------------------------------------------
@@ -607,6 +701,13 @@ async def _fetch_from_origin(origin: dict, method: str, uri: str, query_string: 
         status, header_pairs, data = await run_offloop(_serve_s3_origin, origin, method, uri, headers, dist_arn)
         pairs = header_pairs.items() if isinstance(header_pairs, dict) else header_pairs
         return status, http.client.responses.get(status, ""), _multidict_from_pairs(pairs), data
+    lb = _registered_alb(origin)
+    if lb is not None:
+        status, reason, header_pairs, data = await _fetch_from_alb_origin(
+            lb, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
+            viewer_is_https, client_ip, viewer_xff,
+        )
+        return status, reason, _multidict_from_pairs(header_pairs), data
     # The origin may be MiniStack's own gateway, so the call must be reentrant.
     status, reason, header_pairs, data = await run_reentrant(
         _forward_to_origin, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,

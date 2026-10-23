@@ -32,6 +32,7 @@ import pytest
 from conftest import GATEWAY_PORT
 
 from ministack.core import cloudfront_js
+from ministack.core.responses import StreamingResponse
 from ministack.services import cloudfront_dataplane
 
 # Managed policy ids (CloudFront Developer Guide, "Managed origin request
@@ -1457,3 +1458,174 @@ def test_untrusted_origin_certificate_answers_502(cloudfront, untrusted_https_or
     status, headers, _body = _get(dist["DomainName"], "/anything")
     assert status == 502
     assert headers.get("X-Cache") == "Error from cloudfront"
+
+
+# ---------------------------------------------------------------------------
+# Registered ALB origin — an ALB's DNSName is AWS-shaped, so it is served
+# in-process through the ALB data plane instead of being dialed.
+# ---------------------------------------------------------------------------
+
+
+def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, read_timeout: int = 30) -> str:
+    suffix = _uuid_mod.uuid4().hex[:10]
+    origin = {
+        "Id": "alb-origin",
+        "DomainName": lb_dns,
+        "CustomOriginConfig": {
+            "HTTPPort": port, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
+            "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+            "OriginReadTimeout": read_timeout, "OriginKeepaliveTimeout": 5,
+        },
+    }
+    if custom_headers:
+        origin["CustomHeaders"] = {
+            "Quantity": len(custom_headers),
+            "Items": [{"HeaderName": name, "HeaderValue": value} for name, value in custom_headers],
+        }
+    dist_config = {
+        "CallerReference": f"cf-dp-alb-{suffix}",
+        "Comment": "cloudfront_dataplane registered-ALB-origin test",
+        "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [origin]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "alb-origin", "ViewerProtocolPolicy": "allow-all",
+            "CachePolicyId": _CACHING_DISABLED,
+        },
+    }
+    return cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]["DomainName"]
+
+
+def _alb_fixed(status: str, body: str) -> dict:
+    return {"Type": "fixed-response",
+            "FixedResponseConfig": {"StatusCode": status, "ContentType": "text/plain", "MessageBody": body}}
+
+
+@pytest.fixture
+def alb_origin(elbv2):
+    """A load balancer with one HTTP:80 listener whose default action answers 403."""
+    name = f"cf-alb-{_uuid_mod.uuid4().hex[:8]}"
+    lb = elbv2.create_load_balancer(Name=name, Subnets=["subnet-1"])["LoadBalancers"][0]
+    listener_arn = elbv2.create_listener(
+        LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+        DefaultActions=[_alb_fixed("403", "denied")],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        yield {"dns": lb["DNSName"], "listener_arn": listener_arn}
+    finally:
+        elbv2.delete_listener(ListenerArn=listener_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+
+
+def test_registered_alb_origin_is_served_through_its_listener_rules(cloudfront, elbv2, alb_origin):
+    # Restricting an ALB to CloudFront with an origin custom header
+    # (restrict-access-to-load-balancer.html).
+    elbv2.create_rule(
+        ListenerArn=alb_origin["listener_arn"], Priority=1,
+        Conditions=[{"Field": "http-header",
+                     "HttpHeaderConfig": {"HttpHeaderName": "X-Origin-Verify", "Values": ["origin-token"]}}],
+        Actions=[_alb_fixed("200", "registered-alb-origin")],
+    )
+    with_header = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [("X-Origin-Verify", "origin-token")])
+    without_header = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [])
+
+    status, _headers, body = _get(with_header, "/anything")
+    assert (status, body) == (200, b"registered-alb-origin")
+    status, _headers, body = _get(without_header, "/anything")
+    assert (status, body) == (403, b"denied")
+
+
+def test_registered_alb_origin_without_a_listener_on_the_origin_port_answers_502(cloudfront, alb_origin):
+    dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 8080, [])
+    status, headers, _body = _get(dist_host, "/anything")
+    assert status == 502
+    assert headers.get("X-Cache") == "Error from cloudfront"
+
+
+def test_unregistered_alb_hostname_is_still_refused(cloudfront):
+    dist_host = _alb_origin_dist(cloudfront, "cf-alb-missing-1234567890.us-east-1.elb.amazonaws.com", 80, [])
+    status, headers, _body = _get(dist_host, "/anything")
+    assert status == 502
+    assert headers.get("X-Cache") == "Error from cloudfront"
+
+
+def test_registered_alb_origin_relays_an_ip_target_response(cloudfront, elbv2, alb_origin, raw_header_server):
+    tg_arn = elbv2.create_target_group(
+        Name=f"cf-alb-{_uuid_mod.uuid4().hex[:8]}", Protocol="HTTP", Port=raw_header_server.port,
+        VpcId="vpc-00000001", TargetType="ip",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    try:
+        elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": "127.0.0.1", "Port": raw_header_server.port}])
+        elbv2.modify_listener(ListenerArn=alb_origin["listener_arn"],
+                              DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}])
+        dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [("X-Origin-Verify", "origin-token")])
+
+        status, _headers, body = _get(dist_host, "/anything", extra_headers={"X-Forwarded-For": "203.0.113.5"})
+        assert (status, body) == (200, b"ok")
+
+        lines = raw_header_server.last_header_lines
+        names_lower = [line.split(":", 1)[0].lower() for line in lines if line]
+        assert names_lower.count("x-origin-verify") == 1
+        xff_lines = [line for line in lines if line.lower().startswith("x-forwarded-for:")]
+        assert len(xff_lines) == 1
+        # CloudFront appends the viewer, then the load balancer appends CloudFront's address.
+        assert xff_lines[0].split(":", 1)[1].strip() == "203.0.113.5, 127.0.0.1, 127.0.0.1"
+    finally:
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+
+
+def test_registered_alb_origin_timeout_answers_504_and_closes_the_target_connection(cloudfront, elbv2, alb_origin):
+    # A target that reads the request and never answers.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    target_port = listener.getsockname()[1]
+    closed = threading.Event()
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(10)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            if conn.recv(4096) == b"":
+                closed.set()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    tg_arn = elbv2.create_target_group(
+        Name=f"cf-alb-{_uuid_mod.uuid4().hex[:8]}", Protocol="HTTP", Port=target_port,
+        VpcId="vpc-00000001", TargetType="ip",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    try:
+        elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": "127.0.0.1", "Port": target_port}])
+        elbv2.modify_listener(ListenerArn=alb_origin["listener_arn"],
+                              DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}])
+        dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [], read_timeout=1)
+
+        status, headers, _body = _get(dist_host, "/anything")
+        assert status == 504
+        assert headers.get("X-Cache") == "Error from cloudfront"
+        assert closed.wait(5)
+    finally:
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+        listener.close()
+        thread.join(timeout=10)
+
+
+def test_streamed_alb_body_without_its_final_frame_is_an_origin_failure():
+    async def truncated(send, _receive):
+        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+
+    with pytest.raises(cloudfront_dataplane.OriginUnreachable):
+        asyncio.run(cloudfront_dataplane._collect_streaming_body(StreamingResponse(truncated), 5))
+
+
+def test_streamed_alb_body_idle_past_the_read_timeout_is_an_origin_timeout():
+    async def stalled(send, _receive):
+        await send({"type": "http.response.body", "body": b"first", "more_body": True})
+        await asyncio.sleep(5)
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    with pytest.raises(cloudfront_dataplane.OriginTimeout):
+        asyncio.run(cloudfront_dataplane._collect_streaming_body(StreamingResponse(stalled), 0.2))

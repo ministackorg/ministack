@@ -572,7 +572,10 @@ def test_elbv2_dataplane_event_shape(elbv2, lam):
         assert body["httpMethod"] == "GET"
         assert body["path"] == "/check"
         assert body["queryStringParameters"].get("foo") == "bar"
-        assert "headers" in body
+        assert body["headers"]["x-forwarded-for"] == "127.0.0.1"
+        assert (body["headers"]["x-forwarded-proto"], body["headers"]["x-forwarded-port"]) == ("http", "80")
+        assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", body["headers"]["x-amzn-trace-id"])
+        assert body["multiValueHeaders"]["x-forwarded-for"] == ["127.0.0.1"]
         assert body["isBase64Encoded"] is False
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-evt-fn")
@@ -1058,6 +1061,108 @@ def test_elbv2_dataplane_preserves_repeated_target_headers(elbv2, chunked, cooki
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         sock.close()
         thread.join(timeout=5)
+
+
+def _start_request_capture_server():
+    """Serve one connection: keep its raw request-header lines, answer 200 "ok"."""
+    import socket as _socket
+    import threading
+
+    sock = _socket.socket()
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    header_lines = []
+
+    def _serve():
+        try:
+            conn, _ = sock.accept()
+            with conn:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                header_lines.extend(data.partition(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")[1:])
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    return sock, thread, header_lines
+
+
+def test_elbv2_dataplane_sends_forwarded_headers_once(elbv2):
+    """A request that already carries X-Forwarded-* reaches the target with one field per name."""
+    sock, thread, header_lines = _start_request_capture_server()
+    lb_name = f"dp-alb-xff-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(
+        elbv2, lb_name, "127.0.0.1", sock.getsockname()[1]
+    )
+    try:
+        request = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={
+            "X-Forwarded-For": "203.0.113.5", "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443",
+        })
+        with _req.urlopen(request, timeout=10) as resp:
+            assert resp.read() == b"ok"
+        thread.join(timeout=5)
+        fields = [(n.lower(), v.strip()) for n, _, v in (line.partition(":") for line in header_lines)]
+        names = [n for n, _ in fields]
+        for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-port"):
+            assert names.count(name) == 1, header_lines
+        values = dict(fields)
+        # The load balancer appends its client's address and states the listener's protocol and port.
+        assert values["x-forwarded-for"] == "203.0.113.5, 127.0.0.1"
+        assert (values["x-forwarded-proto"], values["x-forwarded-port"]) == ("http", "80")
+        assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", values["x-amzn-trace-id"])
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        sock.close()
+        thread.join(timeout=5)
+
+
+def test_elbv2_target_connection_closed_when_the_caller_stops_waiting():
+    """A caller that gives up before the target answers closes the target connection
+    instead of leaving it open for the idle timeout."""
+    import asyncio
+    import socket as _socket
+    import threading
+
+    from ministack.services import alb
+
+    sock = _socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+    closed = threading.Event()
+
+    def _serve():
+        conn, _ = sock.accept()
+        with conn:
+            conn.settimeout(30)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+            if conn.recv(4096) == b"":
+                closed.set()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    async def _give_up():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(alb._proxy_http_target(
+                {"Id": "127.0.0.1", "Port": port}, {"Port": port}, "GET", "/", {}, b"", {},
+            ), 0.5)
+        return await asyncio.to_thread(closed.wait, 5)
+
+    try:
+        assert asyncio.run(_give_up())
+    finally:
+        sock.close()
+        thread.join(timeout=35)
 
 
 @pytest.mark.serial
@@ -2718,3 +2823,33 @@ def test_elbv2_modify_rule_with_empty_conditions_or_actions_changes_nothing(elbv
             raw_elbv2.modify_rule(RuleArn=rule["RuleArn"], **params)
         _refused(exc, "You must provide either conditions, actions, or transforms")
     assert _described_rule(elbv2, rule["RuleArn"])["Transforms"] == [_url_rewrite()]
+
+
+def test_elbv2_target_headers_follow_xff_mode_and_trace_id_rules():
+    from ministack.services import alb
+
+    lb_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/xff-unit/1"
+    listener = {"Protocol": "HTTPS", "Port": 443}
+    try:
+        h = alb._target_headers(lb_arn, listener, {"X-Forwarded-For": "127.0.0.4, 127.0.0.8"}, "127.0.0.1")
+        assert h["x-forwarded-for"] == "127.0.0.4, 127.0.0.8, 127.0.0.1"
+        assert (h["x-forwarded-proto"], h["x-forwarded-port"]) == ("https", "443")
+        assert alb._target_headers(lb_arn, listener, {}, "127.0.0.1")["x-forwarded-for"] == "127.0.0.1"
+        assert alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"},
+                                   "2001:db8::1")["x-forwarded-for"] == "127.0.0.4, [2001:db8::1]"
+
+        trace = alb._target_headers(lb_arn, listener, {"x-amzn-trace-id": "Root=1-67891233-abcdef012345678912345678;CalledFrom=app"},
+                                    "127.0.0.1")["x-amzn-trace-id"].split(";")
+        assert re.fullmatch(r"Self=1-[0-9a-f]{8}-[0-9a-f]{24}", trace[0])
+        assert trace[1:] == ["Root=1-67891233-abcdef012345678912345678", "CalledFrom=app"]
+        trace = alb._target_headers(lb_arn, listener, {"x-amzn-trace-id": "Self=1-00000000-000000000000000000000000;Root=1-67891233-abcdef012345678912345678"},
+                                    "127.0.0.1")["x-amzn-trace-id"].split(";")
+        assert trace[0] != "Self=1-00000000-000000000000000000000000" and len(trace) == 2
+
+        alb._lb_attrs[lb_arn] = [{"Key": "routing.http.xff_header_processing.mode", "Value": "preserve"}]
+        assert alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"}, "127.0.0.1")["x-forwarded-for"] == "127.0.0.4"
+        assert "x-forwarded-for" not in alb._target_headers(lb_arn, listener, {}, "127.0.0.1")
+        alb._lb_attrs[lb_arn] = [{"Key": "routing.http.xff_header_processing.mode", "Value": "remove"}]
+        assert "x-forwarded-for" not in alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"}, "127.0.0.1")
+    finally:
+        alb._lb_attrs.pop(lb_arn, None)
