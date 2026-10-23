@@ -128,12 +128,12 @@ def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
         CacheSubnetGroupDescription="Test EC SG",
-        SubnetIds=["subnet-aaa"],
+        SubnetIds=["subnet-00000001"],
     )
     ec.modify_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
         CacheSubnetGroupDescription="Updated EC SG",
-        SubnetIds=["subnet-bbb"],
+        SubnetIds=["subnet-00000002"],
     )
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName="test-mod-ecsg")
     assert resp["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "Updated EC SG"
@@ -609,12 +609,12 @@ def test_elasticache_subnet_and_param_groups_are_region_scoped():
     east.create_cache_subnet_group(
         CacheSubnetGroupName=subnet_name,
         CacheSubnetGroupDescription="east subnet",
-        SubnetIds=["subnet-east"],
+        SubnetIds=["subnet-00000001"],
     )
     west.create_cache_subnet_group(
         CacheSubnetGroupName=subnet_name,
         CacheSubnetGroupDescription="west subnet",
-        SubnetIds=["subnet-west"],
+        SubnetIds=["subnet-00000001"],
     )
     east.create_cache_parameter_group(
         CacheParameterGroupName=param_name,
@@ -1093,7 +1093,7 @@ def test_delete_cache_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName=name,
         CacheSubnetGroupDescription="To be deleted",
-        SubnetIds=["subnet-aaa"],
+        SubnetIds=["subnet-00000001"],
     )
     # verify exists
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
@@ -1106,6 +1106,44 @@ def test_delete_cache_subnet_group(ec):
     with pytest.raises(ClientError) as exc:
         ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
     assert "CacheSubnetGroupNotFoundFault" in str(exc.value)
+
+
+def test_cache_subnet_group_keeps_subnets_and_tags(ec):
+    name = f"sg-keep-{_uid()}"
+    group = ec.create_cache_subnet_group(
+        CacheSubnetGroupName=name,
+        CacheSubnetGroupDescription="two subnets",
+        SubnetIds=["subnet-00000001", "subnet-00000002"],
+        Tags=[{"Key": "env", "Value": "dev"}],
+    )["CacheSubnetGroup"]
+    try:
+        described = ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)["CacheSubnetGroups"][0]
+        for g in (group, described):
+            assert g["VpcId"] == "vpc-00000001"
+            assert [(s["SubnetIdentifier"], s["SubnetAvailabilityZone"]["Name"]) for s in g["Subnets"]] == [
+                ("subnet-00000001", "us-east-1a"), ("subnet-00000002", "us-east-1b")]
+        assert ec.list_tags_for_resource(ResourceName=group["ARN"])["TagList"] == [{"Key": "env", "Value": "dev"}]
+
+        with pytest.raises(ClientError) as exc:
+            ec.create_cache_subnet_group(CacheSubnetGroupName=name, CacheSubnetGroupDescription="again",
+                                         SubnetIds=["subnet-00000001"])
+        assert exc.value.response["Error"]["Code"] == "CacheSubnetGroupAlreadyExists"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+        modified = ec.modify_cache_subnet_group(
+            CacheSubnetGroupName=name, SubnetIds=["subnet-00000003"])["CacheSubnetGroup"]
+        assert modified["VpcId"] == "vpc-00000001"
+        assert [s["SubnetIdentifier"] for s in modified["Subnets"]] == ["subnet-00000003"]
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_cache_subnet_group(CacheSubnetGroupName=name, SubnetIds=["subnet-doesnotexist"])
+        assert exc.value.response["Error"]["Code"] == "InvalidSubnet"
+    finally:
+        ec.delete_cache_subnet_group(CacheSubnetGroupName=name)
+
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_subnet_groups(CacheSubnetGroupName=name)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 # ---------------------------------------------------------------------------
@@ -1822,7 +1860,7 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
 
     spawned = []
 
-    def fake_spawn(name, engine, engine_version, labels):
+    def fake_spawn(name, engine, engine_version, labels, **_):
         spawned.append({"name": name, "engine": engine,
                          "engine_version": engine_version, "labels": labels})
         return ("ministack-elasticache", 6379, f"cid-{name}")
@@ -1865,7 +1903,7 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     set_request_account_id("000000000000")
     _ec.reset()
     monkeypatch.setattr(_ec, "_spawn_redis_container",
-                          lambda name, engine, engine_version, labels: ("rg-host", 6379, f"cid-{name}"))
+                          lambda name, engine, engine_version, labels, **_: ("rg-host", 6379, f"cid-{name}"))
 
     _ec.load_persisted_state({
         "replication_groups": {
@@ -1893,7 +1931,7 @@ def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
     _ec.reset()
     spawned = []
 
-    def fake_spawn(name, engine, engine_version, labels):
+    def fake_spawn(name, engine, engine_version, labels, **_):
         spawned.append({"name": name, "labels": labels})
         return (f"{labels['region']}-host", 6379, f"cid-{name}")
 
@@ -2297,3 +2335,85 @@ def test_serverless_ca_persists_across_restart(monkeypatch):
     monkeypatch.setattr(ec, "_serverless_ca", None)
     ec.load_persisted_state(state)
     assert ec.serverless_ca_cert_pem() == pem
+
+
+def test_replication_group_auth_token_needs_transit_encryption(ec):
+    rg_id = f"auth-{_uid()}"
+    for kwargs, code, message in (
+        ({"TransitEncryptionEnabled": False}, "InvalidParameterValue",
+         "The AUTH token is only supported when encryption-in-transit is enabled"),
+        ({"TransitEncryptionEnabled": True, "TransitEncryptionMode": "preferred"}, "InvalidParameterCombination",
+         "Transit encryption preferred is not supported with access control enabled clusters."),
+    ):
+        with pytest.raises(ClientError) as exc:
+            ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="t", Engine="redis",
+                                        NumCacheClusters=1, AuthToken="a-very-long-auth-token-123", **kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+
+    plain = ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="t",
+                                        Engine="redis", NumCacheClusters=1)["ReplicationGroup"]
+    try:
+        assert plain["TransitEncryptionEnabled"] is False and "TransitEncryptionMode" not in plain
+        member = ec.describe_cache_clusters(CacheClusterId=plain["MemberClusters"][0])["CacheClusters"][0]
+        assert (member["AuthTokenEnabled"], member["TransitEncryptionEnabled"], member["AtRestEncryptionEnabled"]) == (
+            False, False, False)
+        with pytest.raises(ClientError) as exc:
+            ec.modify_replication_group(ReplicationGroupId=rg_id, AuthToken="a-very-long-auth-token-123",
+                                        AuthTokenUpdateStrategy="ROTATE")
+        assert exc.value.response["Error"]["Message"] == (
+            "The AUTH token modification is only supported when encryption-in-transit is enabled")
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def _redis_session(endpoint, ca_file, *commands):
+    import socket
+    import ssl
+    ctx = ssl.create_default_context(cafile=ca_file)
+    deadline = time.time() + 30
+    while True:
+        try:
+            with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=5) as raw:
+                with ctx.wrap_socket(raw, server_hostname=endpoint["Address"]) as conn:
+                    replies = []
+                    for parts in commands:
+                        conn.sendall(f"*{len(parts)}\r\n".encode()
+                                     + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                        replies.append(conn.recv(65536))
+                    return replies
+        except (OSError, ssl.SSLError):
+            if time.time() > deadline:
+                raise
+            time.sleep(0.3)
+
+
+@pytest.mark.data_plane
+def test_replication_group_serves_tls_and_requires_auth_token(ec, tmp_path):
+    rg_id = f"tls-{_uid()}"
+    first, second = "first-auth-token-0123", "second-auth-token-4567"
+    rg = ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="t", Engine="redis",
+                                     NumCacheClusters=1, TransitEncryptionEnabled=True,
+                                     AtRestEncryptionEnabled=True, AuthToken=first)["ReplicationGroup"]
+    try:
+        assert (rg["TransitEncryptionEnabled"], rg["TransitEncryptionMode"], rg["AuthTokenEnabled"]) == (
+            True, "required", True)
+        member = ec.describe_cache_clusters(CacheClusterId=rg["MemberClusters"][0])["CacheClusters"][0]
+        assert (member["TransitEncryptionEnabled"], member["TransitEncryptionMode"],
+                member["AuthTokenEnabled"], member["AtRestEncryptionEnabled"]) == (True, "required", True, True)
+
+        endpoint = rg["NodeGroups"][0]["PrimaryEndpoint"]
+        ca_file = _serverless_ca_file(tmp_path)
+        assert _redis_session(endpoint, ca_file, ["PING"])[0].startswith(b"-NOAUTH")
+        assert _redis_session(endpoint, ca_file, ["AUTH", first], ["PING"]) == [b"+OK\r\n", b"+PONG\r\n"]
+
+        ec.modify_replication_group(ReplicationGroupId=rg_id, AuthToken=second,
+                                    AuthTokenUpdateStrategy="ROTATE", ApplyImmediately=True)
+        for token in (first, second):
+            assert _redis_session(endpoint, ca_file, ["AUTH", token])[0] == b"+OK\r\n"
+        ec.modify_replication_group(ReplicationGroupId=rg_id, AuthToken=second,
+                                    AuthTokenUpdateStrategy="SET", ApplyImmediately=True)
+        assert _redis_session(endpoint, ca_file, ["AUTH", first])[0].startswith(b"-WRONGPASS")
+        assert _redis_session(endpoint, ca_file, ["AUTH", second])[0] == b"+OK\r\n"
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)

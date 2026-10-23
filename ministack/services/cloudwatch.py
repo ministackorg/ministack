@@ -526,8 +526,7 @@ async def handle_request(method, path, headers, body, query_params):
                 logger.error("JSON decode error: %s", e)
                 cbor_data = {}
         else:
-            # Blank values kept: "Tags.member.2.Value=" is an empty value on
-            # AWS, while an absent member is null.
+            # "Tags.member.2.Value=" is an empty value on AWS, an absent one is null.
             for k, v in parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True).items():
                 params[k] = v
 
@@ -1079,15 +1078,12 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     if refused:
         return refused
 
-    # AWS describes DatapointsToAlarm only when the request sets it (absent
-    # and null alike); keep it off the record otherwise.
+    # AWS describes DatapointsToAlarm only when the request sets it.
     if alarm["DatapointsToAlarm"] is None:
         del alarm["DatapointsToAlarm"]
 
     _alarms[name] = alarm
-    # PutMetricAlarm applies Tags on creation only; on an existing alarm they
-    # are ignored on every protocol (TagResource and UntagResource change them).
-    # A key sent twice keeps its last value.
+    # Tags apply on create only; a key sent twice keeps its last value.
     if is_new and tags:
         _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
 
@@ -1115,9 +1111,7 @@ _QUERY_TAG_MEMBER = re.compile(r"Tags\.member\.([1-9][0-9]*)\.(Key|Value)")
 
 
 def _alarm_request_tags(params, cbor_data, is_cbor, is_json=False):
-    """An alarm request's Tags as sent, or None when absent. Query members are
-    read in index order, and one sent without Key or Value keeps that member
-    missing (AWS reports it as null)."""
+    """An alarm request's Tags, Query members in index order, or None when absent."""
     if is_cbor or is_json:
         return cbor_data.get("Tags")
     members = {}
@@ -1129,9 +1123,7 @@ def _alarm_request_tags(params, cbor_data, is_cbor, is_json=False):
 
 
 def _string_member_type_error(value):
-    """AWS's SerializationException text for a JSON/CBOR value sent where a
-    String is expected ("" where AWS sends no message), or None for a string
-    or null."""
+    """AWS's message for a non-string JSON/CBOR Key or Value, or None."""
     if value is None or isinstance(value, str):
         return None
     if isinstance(value, bool):
@@ -1146,8 +1138,7 @@ def _string_member_type_error(value):
 
 
 def _tags_serialization_error(tags):
-    """The first wrong JSON type in Tags, in document order, as (code, message,
-    status), or None."""
+    """The first wrong JSON type in Tags as (code, message, status), or None."""
     if tags is None:
         return None
     if isinstance(tags, dict):
@@ -1197,9 +1188,7 @@ _MAX_LISTED_VALIDATION_ERRORS = 10
 
 
 def _java_hashmap_order(keys):
-    """Distinct keys in the iteration order of a java.util.HashMap they were
-    put into: String.hashCode over UTF-16 units, spread (h ^ h >>> 16), default
-    capacity 16 doubled past a 0.75 load, insertion order within a bucket."""
+    """Keys in java.util.HashMap iteration order, as AWS walks them."""
     unique = list(dict.fromkeys(keys))
     capacity = 16
     while len(unique) > capacity * 0.75:
@@ -1216,11 +1205,7 @@ def _java_hashmap_order(keys):
 
 
 def _tagset_error(tags):
-    """The tag-set check AWS runs on create after the member constraints, on
-    the tags de-duplicated by key (a later value replaces an earlier one): a
-    character error anywhere, then the first too-long value, then the first
-    too-long key, in the tag map's iteration order. Length counts UTF-16
-    units; a tag whose key is too long is not checked further."""
+    """The create-only tag-set check on the de-duplicated tags: characters, then length."""
     def too_long(text, limit):
         return len(text.encode("utf-16-le")) // 2 > limit
 
@@ -1244,8 +1229,7 @@ def _tagset_error(tags):
 
 
 def _composite_system_tag_error(tags):
-    """PutCompositeAlarm's check of aws: keys, after the tag-set check, in the
-    same tag-map order (the first aws: key in that order is named)."""
+    """PutCompositeAlarm's aws: key check, in the same tag-map order."""
     for key in _java_hashmap_order(tag["Key"] for tag in tags or []):
         if key.startswith("aws:"):
             if ":" not in key[4:]:
@@ -1257,9 +1241,7 @@ def _composite_system_tag_error(tags):
 
 
 def _alarm_tags_refusal(tags, datapoints, is_new, is_cbor, is_json, composite=False):
-    """The error AWS answers for an alarm's Tags (and PutMetricAlarm's
-    DatapointsToAlarm), in AWS's order, or None. A refused call stores
-    nothing. The two calls differ only in how they refuse an aws: key."""
+    """The refusal for an alarm's Tags and DatapointsToAlarm, in AWS's order, or None."""
     def refuse(code, message, status):
         return _error(code, "" if is_cbor and code == "MalformedInput" else message, status,
                       use_json=is_json, use_cbor=is_cbor)
@@ -1268,8 +1250,7 @@ def _alarm_tags_refusal(tags, datapoints, is_new, is_cbor, is_json, composite=Fa
         wrong_type = _tags_serialization_error(tags)
         if wrong_type:
             return refuse(*wrong_type)
-    # The aws: prefix is refused only when the call creates the alarm (an
-    # update ignores its Tags), and before the member constraints.
+    # An update ignores its Tags, so only a create refuses an aws: key.
     if is_new and not composite and any(isinstance(t.get("Key"), str) and t["Key"].lower().startswith("aws:")
                                         for t in tags or []):
         return refuse("AccessDenied", 'The provided tag keys must not start with any case of "aws:"', 403)
@@ -1278,7 +1259,6 @@ def _alarm_tags_refusal(tags, datapoints, is_new, is_cbor, is_json, composite=Fa
         errors.append(f"Value '{datapoints}' at 'datapointsToAlarm' failed to satisfy constraint: "
                       "Member must have value greater than or equal to 1")
     if errors:
-        # AWS lists at most ten, and counts only those.
         errors = errors[:_MAX_LISTED_VALIDATION_ERRORS]
         count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected"
         return refuse("ValidationError", f"{count}: {'; '.join(errors)}", 400)
@@ -1561,8 +1541,7 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
             insuff_actions.append(_p(params, f"InsufficientDataActions.member.{ii}"))
             ii += 1
 
-    # Tags are checked before the rule, and stored only when the call creates
-    # the alarm (an update ignores them), as with PutMetricAlarm.
+    # Tags are checked before the rule and stored on create only.
     is_new = name not in _composite_alarms
     tags = _alarm_request_tags(params, cbor_data, is_cbor, is_json)
     refused = _alarm_tags_refusal(tags, None, is_new, is_cbor, is_json, composite=True)

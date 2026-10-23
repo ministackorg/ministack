@@ -1378,7 +1378,6 @@ def _extract_deps(resource_def: dict, all_resource_names: set) -> set:
 
 def _topological_sort(resources: dict, conditions: dict) -> list:
     """Kahn's algorithm for topological sort of resources."""
-    all_names = set(resources.keys())
     # Filter out resources whose condition evaluates to false
     active = set()
     for name, defn in resources.items():

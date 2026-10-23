@@ -232,7 +232,6 @@ def _invoke_agent(agent_id: str, alias_id: str, session_id: str, body) -> tuple:
     if err:
         return err
     prompt = body_obj.get("inputText", "")
-    end_session = bool(body_obj.get("endSession"))
     reply = _mock_reply(agent_id, prompt)
     # Stream: chunk(s) -> (optional end-of-session). No trace events are
     # emitted, even with enableTrace: no orchestration happens here (no model

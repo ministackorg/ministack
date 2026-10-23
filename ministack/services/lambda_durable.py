@@ -773,7 +773,6 @@ def _apply_update(rec: dict, upd: dict) -> None:
         # ChainedInvokeStarted event is on the log before a fast child can
         # append its ChainedInvokeSucceeded (history order matters to
         # replaying SDKs).
-        ci_opts = upd.get("ChainedInvokeOptions") or {}
     elif op_type == "EXECUTION":
         details = existing.setdefault("ExecutionDetails", {})
         if rec.get("InputPayload"):

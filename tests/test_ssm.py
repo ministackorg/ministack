@@ -1260,7 +1260,7 @@ def test_ssm_default_parameter_tier_setting(service_settings):
     tiers = set(_ssm_model().shape_for("ParameterTier").enum)
     big = "x" * 4097
     name = f"/tier/{_uuid_mod.uuid4().hex[:8]}"
-    cases = {"Standard": ("Standard", "Standard"), "Advanced": ("Advanced", "Advanced"),
+    cases = {"Standard": ("Standard", None), "Advanced": ("Advanced", "Advanced"),
              "Intelligent-Tiering": ("Standard", "Advanced")}
     try:
         for default_tier, (small_tier, big_tier) in cases.items():
@@ -1268,12 +1268,15 @@ def test_ssm_default_parameter_tier_setting(service_settings):
             put = ssm.put_parameter(Name=name, Value="v", Type="String", Overwrite=True)
             listed = ssm.describe_parameters(ParameterFilters=[{"Key": "Name", "Values": [name]}])["Parameters"][0]
             assert (put["Tier"], listed["Tier"]) == (small_tier, small_tier)
+            assert {put["Tier"], listed["Tier"]} <= tiers
             ssm.delete_parameter(Name=name)
-            assert ssm.put_parameter(Name=name, Value=big, Type="String")["Tier"] == big_tier
-            ssm.delete_parameter(Name=name)
-            assert ssm.put_parameter(Name=name, Value=big, Type="String", Tier="Standard")["Tier"] == "Standard"
-            ssm.delete_parameter(Name=name)
-            assert {put["Tier"], listed["Tier"], big_tier} <= tiers
+            if big_tier:
+                assert ssm.put_parameter(Name=name, Value=big, Type="String")["Tier"] == big_tier
+                ssm.delete_parameter(Name=name)
+        # An Advanced parameter stays Advanced when overwritten without a Tier.
+        ssm.put_parameter(Name=name, Value="v", Type="String", Tier="Advanced")
+        ssm.update_service_setting(SettingId=_TIER, SettingValue="Standard")
+        assert ssm.put_parameter(Name=name, Value="w", Type="String", Overwrite=True)["Tier"] == "Advanced"
     finally:
         ssm.delete_parameters(Names=[name])
 

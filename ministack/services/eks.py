@@ -687,8 +687,6 @@ def _create_cluster(body, creator_arn=None):
 
     # Spawn k3s container
     endpoint = ""
-    ca_data = ""
-    container_id = None
     port = _next_port()
 
     # Build cluster record immediately (status CREATING) and return fast.

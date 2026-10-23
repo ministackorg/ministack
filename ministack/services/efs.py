@@ -541,7 +541,6 @@ def _create_access_point(body):
 
     ap_id = _ap_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:access-point/{ap_id}"
-    now = _now_iso()
     tags = body.get("Tags", [])
 
     record = {

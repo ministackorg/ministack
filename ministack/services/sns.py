@@ -676,7 +676,6 @@ def _confirm_subscription(params):
     topic, err = _get_topic(_p(params, "TopicArn"))
     if err is not None:
         return err
-    topic_arn = topic["arn"]
 
     if not token:
         return _error("InvalidParameterException", "Token is required", 400)

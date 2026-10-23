@@ -3334,10 +3334,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 if body:
                     if isinstance(body, (dict, list)):
                         body = json.dumps(body)
-                    if isinstance(body, bytes):
-                        await send({"type": "websocket.send", "bytes": body})
-                    else:
-                        await send({"type": "websocket.send", "text": str(body)})
+                    await send({"type": "websocket.send", "text": str(body)})
         finally:
             close_event.set()
             closed_by_delete.cancel()

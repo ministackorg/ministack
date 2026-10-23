@@ -2945,7 +2945,6 @@ def _execute_command(data):
 
 def _list_account_settings(data):
     name = data.get("name", "")
-    effective = data.get("effectiveSettings", False)
     settings = []
     all_names = [
         "serviceLongArnFormat", "taskLongArnFormat",

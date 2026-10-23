@@ -840,8 +840,7 @@ _FUNCTION_TAG_LIMIT = 50
 
 
 def _last_child(el, tag):
-    """The last direct child with this local name (AWS keeps the last of a
-    repeated member)."""
+    """The last direct child with this local name; AWS keeps the last of a repeated member."""
     found = None
     for child in el:
         if _local_tag_name(child) == tag:
@@ -850,17 +849,12 @@ def _last_child(el, tag):
 
 
 def _function_request_tags(el):
-    """CreateFunctionRequest's Tags/Items in order as (Key, Value), None for a
-    missing element, and AWS's parse error for a malformed tag or None. AWS
-    reads every child of the last Items as a tag, whatever its name, keeps the
-    last of a repeated Key or Value, and ignores tags placed directly under
-    Tags."""
+    """CreateFunction's Tags/Items as (Key, Value) pairs, plus AWS's parse error or None."""
     tags_el = _find(el, "Tags")
     items_el = _last_child(tags_el, "Items") if tags_el is not None else None
     tags = []
     for tag_el in items_el if items_el is not None else []:
-        # Text in a tag without child elements is malformed, even whitespace;
-        # next to children it is ignored.
+        # Text in a tag without children is malformed, even whitespace.
         if not len(tag_el) and tag_el.text is not None:
             return [], "Unexpected complex element termination"
         if any(len(child) for child in tag_el if _local_tag_name(child) in ("Key", "Value")):
@@ -872,8 +866,7 @@ def _function_request_tags(el):
 
 
 def _function_tag_constraint_errors(tags):
-    """AWS's member constraints on CreateFunction tags: per tag Value, then
-    Key; per member length, then pattern. Value may be absent."""
+    """CreateFunction tag constraint messages: Value before Key, length before pattern."""
     errors = []
     for i, (key, value) in enumerate(tags, 1):
         for field, text, limit in (("value", value, 256), ("key", key, 128)):
@@ -892,8 +885,7 @@ def _function_tag_constraint_errors(tags):
 
 
 def _function_code_and_runtime_errors(el):
-    """The functionCode, functionConfig and runtime constraint messages, in
-    that order, which AWS lists before the tag messages."""
+    """The functionCode, functionConfig and runtime constraint messages, in AWS's order."""
     errors = []
     code_el = _find(el, "FunctionCode")
     if code_el is None:
@@ -926,8 +918,7 @@ def _function_name_errors(el):
 
 
 def _function_tagging_error(tags):
-    """AWS's InvalidTagging checks, after the constraints: a repeated key, then
-    an aws: key, then more than 50 tags."""
+    """InvalidTagging: a repeated key, then an aws: key, then more than 50 tags."""
     seen = set()
     for key, _ in tags:
         if key in seen:
@@ -948,8 +939,6 @@ def _cf_create_function(headers, body):
     el = _parse_body(body)
     if el is None:
         return _error("MalformedXML", "The XML document is malformed.", 400)
-    # Parse errors first (a malformed tag before invalid base64, wherever
-    # each sits in the document), then the member constraints.
     tags, tags_parse_error = _function_request_tags(el)
     if tags_parse_error:
         return _error("MalformedInput", tags_parse_error, 400)
@@ -959,8 +948,6 @@ def _cf_create_function(headers, body):
         if err is not None:
             return err
     name = _text(el, "Name")
-    # AWS checks the members before it looks the name up: the code, the
-    # config and runtime, the name and the tags, in one MalformedXML.
     errors = _function_code_and_runtime_errors(el) + _function_name_errors(el) + _function_tag_constraint_errors(tags)
     if errors:
         errors = errors[:_MAX_LISTED_VALIDATION_ERRORS]
@@ -999,8 +986,6 @@ def _cf_create_function(headers, body):
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
-    # The validated Tags/Items, as AWS reads them; ListTagsForResource lists
-    # them on the ARN, and a missing Value is an empty one.
     _tags[fn["arn"]] = [{"Key": key, "Value": value or ""} for key, value in tags]
     _functions[name] = fn
     logger.info("CreateFunction name=%s", name)
