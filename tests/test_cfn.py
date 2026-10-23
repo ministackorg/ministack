@@ -913,6 +913,40 @@ def test_cfn_s3_bucket_cors_public_access_block_and_website(cfn, s3):
     _wait_stack(cfn, "cfn-s3-configs")
 
 
+
+@pytest.mark.auth_contract
+def test_cfn_s3_bucket_without_public_access_block_contract(auth_enabled, cfn, s3):
+    """Under AUTH=true a template bucket without PublicAccessBlockConfiguration, or whose update removes it, has all
+    four settings on; without AUTH it has none."""
+    bucket = "cfn-s3-pab-default-bucket"
+    all_on = dict.fromkeys(("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True)
+
+    def template(props):
+        return json.dumps({"AWSTemplateFormatVersion": "2010-09-09", "Resources": {
+            "Bucket": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": bucket, **props}}}})
+
+    def settings():
+        try:
+            return s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"]
+        except ClientError as exc:
+            return exc.response["Error"]["Code"]
+
+    cfn.create_stack(StackName="cfn-s3-pab-default", TemplateBody=template({}))
+    assert _wait_stack(cfn, "cfn-s3-pab-default")["StackStatus"] == "CREATE_COMPLETE"
+    try:
+        expected = all_on if auth_enabled else "NoSuchPublicAccessBlockConfiguration"
+        assert settings() == expected
+        cfn.update_stack(StackName="cfn-s3-pab-default", TemplateBody=template({"PublicAccessBlockConfiguration": {
+            "BlockPublicAcls": False, "IgnorePublicAcls": True}}))
+        assert _wait_stack(cfn, "cfn-s3-pab-default")["StackStatus"] == "UPDATE_COMPLETE"
+        assert settings()["IgnorePublicAcls"] is True
+        cfn.update_stack(StackName="cfn-s3-pab-default", TemplateBody=template({}))
+        assert _wait_stack(cfn, "cfn-s3-pab-default")["StackStatus"] == "UPDATE_COMPLETE"
+        assert settings() == expected
+    finally:
+        cfn.delete_stack(StackName="cfn-s3-pab-default")
+        _wait_stack(cfn, "cfn-s3-pab-default")
+
 def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
     """AWS::IoT::ThingType, AWS::IoT::Policy, and
     AWS::Cognito::IdentityPoolRoleAttachment provision onto their real services

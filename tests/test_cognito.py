@@ -3764,6 +3764,26 @@ def _start_fake_oidc_idp(claims):
             self.end_headers()
             self.wfile.write(payload)
 
+        def do_GET(self):
+            # Discovery document advertising endpoints off the issuer's root,
+            # as Google's does.
+            if self.path != "/.well-known/openid-configuration":
+                self.send_response(404)
+                self.end_headers()
+                return
+            issuer = f"http://127.0.0.1:{self.server.server_address[1]}"
+            payload = json.dumps({
+                "issuer": issuer,
+                "authorization_endpoint": f"{issuer}/o/oauth2/v2/auth",
+                "token_endpoint": f"{issuer}/oauth2/v4/token",
+                "jwks_uri": f"{issuer}/oauth2/v3/certs",
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
         def log_message(self, *args, **kwargs):
             pass
 
@@ -3781,7 +3801,8 @@ def _start_fake_oidc_idp(claims):
     return token_url, recorded, stop
 
 
-def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mapping=None):
+def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mapping=None,
+                     provider_details=None):
     pid = cognito_idp.create_user_pool(
         PoolName="OIDCFedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
@@ -3797,7 +3818,7 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mappi
         UserPoolId=pid,
         ProviderName="TestOIDC",
         ProviderType="OIDC",
-        ProviderDetails={
+        ProviderDetails=provider_details or {
             "oidc_issuer": "https://idp.example.com",
             "authorize_url": "https://idp.example.com/authorize",
             "token_url": token_url,
@@ -3808,6 +3829,69 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mappi
         AttributeMapping=attribute_mapping or {"email": "email", "name": "name"},
     )
     return pid, client["ClientId"]
+
+
+def _oidc_federation_redirect(client_id):
+    """The response to an /oauth2/authorize request federated to TestOIDC."""
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={client_id}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestOIDC&state=appstate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+    except urllib.error.HTTPError as e:
+        return e
+    assert False, "Expected an HTTP error status"
+
+
+def test_cognito_oidc_endpoints_from_issuer_discovery(cognito_idp):
+    """With only oidc_issuer, the IdP redirect and the token exchange use the
+    endpoints of the issuer's discovery document, not paths guessed from it."""
+    token_url, recorded, stop = _start_fake_oidc_idp({"sub": "user-9002"})
+    issuer = token_url.rsplit("/", 1)[0]
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, provider_details={
+            "oidc_issuer": issuer,
+            "client_id": "oidc-client-id",
+            "client_secret": "oidc-client-secret",
+            "authorize_scopes": "openid email profile",
+        })
+        redirect = _oidc_federation_redirect(cid)
+        assert redirect.code == 302
+        location = redirect.headers.get("Location", "")
+        assert location.startswith(f"{issuer}/o/oauth2/v2/auth?")
+        relay_state = _parse_qs(urlparse(location).query)["state"][0]
+
+        try:
+            _no_redirect_opener.open(
+                f"{ENDPOINT}/oauth2/idpresponse?code=idp-issued-code&state={relay_state}")
+            assert False, "Expected 302 back to the app"
+        except urllib.error.HTTPError as e:
+            assert e.code == 302
+        assert recorded.get("path") == "/oauth2/v4/token"
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_user-9002")
+    finally:
+        stop()
+
+
+def test_cognito_oidc_discovery_issuer_mismatch(cognito_idp):
+    """A discovery document naming another issuer is refused (OpenID Connect
+    Discovery 1.0 §4.3), so no redirect reaches the endpoints it advertises."""
+    token_url, _recorded, stop = _start_fake_oidc_idp({"sub": "ignored"})
+    port = urlparse(token_url).port
+    try:
+        _pid, cid = _setup_oidc_pool(cognito_idp, token_url, provider_details={
+            "oidc_issuer": f"http://localhost:{port}",
+            "client_id": "oidc-client-id",
+            "authorize_scopes": "openid email profile",
+        })
+        redirect = _oidc_federation_redirect(cid)
+        assert redirect.code == 400
+        assert "InvalidParameterException" in json.loads(redirect.read()).get("__type", "")
+    finally:
+        stop()
 
 
 def test_cognito_oauth2_authorize_oidc_redirect(cognito_idp):

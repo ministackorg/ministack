@@ -2306,6 +2306,39 @@ def _oidc_callback_url(pool: dict) -> str:
     return f"{base}/oauth2/idpresponse"
 
 
+# ProviderDetails key -> OpenID Provider metadata key for the same endpoint.
+_OIDC_DISCOVERED_ENDPOINTS = {"authorize_url": "authorization_endpoint", "token_url": "token_endpoint"}
+
+
+def _oidc_endpoint(details: dict, key: str) -> str:
+    """An external OIDC IdP endpoint: the ProviderDetails value, else the one its issuer's discovery document advertises; "" if neither.
+
+    AWS takes `authorize_url` / `token_url` only for an IdP whose endpoints it
+    can't discover from `oidc_issuer`, so an issuer such as Google's, whose
+    endpoints are not `{issuer}/authorize` and `{issuer}/token`, works with
+    `oidc_issuer` alone. The document must name the configured issuer
+    (OpenID Connect Discovery 1.0, section 4.3).
+    """
+    import urllib.request
+
+    if details.get(key):
+        return details[key]
+    issuer = details.get("oidc_issuer", "")
+    if not issuer:
+        return ""
+    try:
+        with urllib.request.urlopen(f"{issuer.rstrip('/')}/.well-known/openid-configuration", timeout=10) as resp:
+            metadata = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("Cognito: OIDC discovery for %s failed: %s", issuer, exc)
+        return ""
+    if not isinstance(metadata, dict) or metadata.get("issuer") != issuer:
+        logger.warning("Cognito: OIDC discovery document of %s names another issuer", issuer)
+        return ""
+    url = metadata.get(_OIDC_DISCOVERED_ENDPOINTS[key])
+    return url if isinstance(url, str) else ""
+
+
 def _saml_sso_url_from_metadata(metadata_xml: str) -> str:
     """The IdP's HTTP-Redirect SingleSignOnService Location, the binding Cognito sends AuthnRequests on; "" if none."""
     if not metadata_xml:
@@ -6628,11 +6661,10 @@ def _oauth2_authorize_federation(query_params):
         })
     elif provider_type == "OIDC":
         # OIDC authorize redirect
-        oidc_issuer = details.get("oidc_issuer", "")
-        authorize_url = details.get("authorize_url", f"{oidc_issuer}/authorize" if oidc_issuer else "")
+        authorize_url = _oidc_endpoint(details, "authorize_url")
         if not authorize_url:
             return error_response_json("InvalidParameterException",
-                                       "OIDC provider has no oidc_issuer or authorize_url.", 400)
+                                       "OIDC provider has no authorize_url and none was discovered from its oidc_issuer.", 400)
         oidc_client_id = details.get("client_id", "")
         redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
             "response_type": response_type or "code",
@@ -6950,11 +6982,10 @@ def _oauth2_idp_response(method, body, query_params):
                                    f"OIDC provider {provider_name} not found.", 400)
 
     details = provider.get("ProviderDetails", {})
-    oidc_issuer = details.get("oidc_issuer", "")
-    token_url = details.get("token_url") or (f"{oidc_issuer}/token" if oidc_issuer else "")
+    token_url = _oidc_endpoint(details, "token_url")
     if not token_url:
         return error_response_json("InvalidParameterException",
-                                   "OIDC provider has no token_url or oidc_issuer.", 400)
+                                   "OIDC provider has no token_url and none was discovered from its oidc_issuer.", 400)
 
     oidc_client_id = details.get("client_id", "")
     oidc_client_secret = details.get("client_secret", "")

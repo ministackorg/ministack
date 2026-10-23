@@ -2885,6 +2885,11 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
             extra={"BucketName": name},
         )
 
+    if not enforced and _public_acl(headers) and _new_bucket_public_access_block():
+        # The Block Public Access settings of the new bucket refuse it.
+        return _error("InvalidBucketAclWithBlockPublicAccessError",
+                      "Bucket cannot have public ACLs set with BlockPublicAccess enabled", 400)
+
     constraint = None
     tags = {}
     if body:
@@ -2909,7 +2914,7 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
     # No explicit LocationConstraint: the bucket lands in the region the
     # request was signed for, like real AWS.
     region = _constraint_region(constraint) or get_region()
-    _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    _buckets[name] = {"created": now_iso(), "objects": {}, "region": region, **_new_bucket_public_access_block()}
     if constraint == "EU":
         # GetBucketLocation answers EU for a bucket created with EU (observed on AWS 2026-10-20).
         _buckets[name]["location_constraint"] = constraint
@@ -3739,6 +3744,24 @@ def _delete_bucket_ownership_controls(name: str):
     _buckets[name]["_ownership_controls_deleted"] = True
     return 204, {}, b""
 
+
+# Under AUTH=true a new bucket blocks all public access until PutPublicAccessBlock or DeletePublicAccessBlock
+# changes it.
+_NEW_BUCKET_PUBLIC_ACCESS_BLOCK = (
+    XML_DECL.decode() + "\n"
+    f'<PublicAccessBlockConfiguration xmlns="{S3_NS}">'
+    "<BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls>"
+    "<BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets>"
+    "</PublicAccessBlockConfiguration>"
+)
+
+
+
+def _new_bucket_public_access_block() -> dict:
+    """The Block Public Access record of a new bucket: all four settings on under AUTH=true, none otherwise."""
+    from ministack.app import AUTH
+
+    return {"_public_access_block": _NEW_BUCKET_PUBLIC_ACCESS_BLOCK} if AUTH else {}
 
 def _put_public_access_block(name: str, body: bytes):
     if name not in _buckets:
@@ -7380,13 +7403,18 @@ _CANNED_ACL_GROUP_GRANTS = {
 }
 
 
-def _public_acl_refused(bucket_name: str, headers: dict, acl_xml: str | bytes | None = None) -> tuple | None:
-    """AccessDenied for a request that sets a public ACL on a bucket whose BlockPublicAcls is on."""
+def _public_acl(headers: dict, acl_xml: str | bytes | None = None) -> bool:
+    """Whether the request's canned ACL, grant headers or ACL body grant AllUsers or AuthenticatedUsers."""
     public = (_ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED)
     uris = [uri for uri, _ in _CANNED_ACL_GROUP_GRANTS.get(headers.get("x-amz-acl", ""), [])]
     uris += [uri for uri, _ in _acl_grants(acl_xml)]
     grants = " ".join(v for k, v in headers.items() if k.lower().startswith("x-amz-grant-"))
-    if not any(uri in public for uri in uris) and not any(group in grants for group in public):
+    return any(uri in public for uri in uris) or any(group in grants for group in public)
+
+
+def _public_acl_refused(bucket_name: str, headers: dict, acl_xml: str | bytes | None = None) -> tuple | None:
+    """AccessDenied for a request that sets a public ACL on a bucket whose BlockPublicAcls is on."""
+    if not _public_acl(headers, acl_xml):
         return None
     if bucket_name not in _buckets or not _public_access_blocked(get_account_id(), bucket_name, "BlockPublicAcls"):
         return None
