@@ -8909,7 +8909,7 @@ class _InFlightMessage:
         self.retransmit_count = 0
 
 
-_RETRANSMIT_INTERVAL_SECONDS = int(os.environ.get("IOT_RETRANSMIT_SECONDS", "10"))
+_RETRANSMIT_INTERVAL_SECONDS = int(os.environ.get("IOT_RETRANSMIT_SECONDS", "30"))
 
 
 # MQTT 5 Retain Handling (§3.8.3.1), the one subscription option that is spent
@@ -11031,9 +11031,10 @@ class _WSSession:
             if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
                 msg.retransmit_count += 1
                 msg.sent_at = now
+                # AWS IoT does not support the DUP flag: a resend goes out with DUP 0.
                 await self.send_bytes(
                     _make_publish(
-                        msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
+                        msg.topic, msg.payload, qos=1, packet_id=pid,
                         retain=msg.retain,
                         properties=self._publish_properties(msg.properties),
                     )

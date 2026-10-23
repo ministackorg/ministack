@@ -4874,7 +4874,6 @@ import asyncio
 import struct
 
 from ministack.services.iot import (
-    _RETRANSMIT_INTERVAL_SECONDS,
     PKT_CONNACK,
     PKT_CONNECT,
     PKT_DISCONNECT,
@@ -6129,7 +6128,7 @@ def test_unacknowledged_qos1_message_is_resent_when_the_session_resumes(monkeypa
         await session2.handle_packet(PKT_CONNECT, 0, connect)
         assert _parse_connack(sent2) == (True, 0)
         assert _extract_publish_frames(sent2) == [
-            ("data/unacked", b"m1", 1, 1, True),
+            ("data/unacked", b"m1", 1, 1, False),
             ("data/unacked", b"m2", 1, 2, False),
         ]
         for pid in (1, 2):
@@ -6175,7 +6174,7 @@ def test_unacknowledged_qos1_message_waits_for_its_retransmit_interval_after_a_r
         assert _extract_publish_frames(sent2) == []
         await asyncio.sleep(0.5)
         # The payload follows an empty property block.
-        assert _extract_publish_frames(sent2) == [("data/unacked5", b"\x00m1", 1, 1, True)]
+        assert _extract_publish_frames(sent2) == [("data/unacked5", b"\x00m1", 1, 1, False)]
         await session2.handle_packet(PKT_DISCONNECT, 0, b"")
         await session2.cleanup()
         assert list(_persistent_sessions[key].in_flight) == [1]
@@ -7154,8 +7153,8 @@ def test_cleanup_clears_in_flight():
     reset()
 
 
-def test_retransmit_sends_dup_flag():
-    """Retransmission sends PUBLISH with DUP flag set."""
+def test_retransmit_resends_after_30_seconds_with_dup_clear():
+    """An unacknowledged QoS 1 message goes out again after 30 s with the same packet id and DUP 0."""
     reset()
 
     async def _run():
@@ -7176,35 +7175,18 @@ def test_retransmit_sends_dup_flag():
         assert len(publishes) == 1
         assert publishes[0][4] is False  # dup flag
 
-        # Manually trigger retransmission by manipulating sent_at
         pid = list(session._in_flight.keys())[0]
         msg = session._in_flight[pid]
-        # Set sent_at far in the past to trigger retransmit
-        msg.sent_at = 0
-
+        now = asyncio.get_event_loop().time()
         sent.clear()
+        msg.sent_at = now - 29
+        await session._retransmit_due()
+        assert _extract_publish_frames(sent) == []
 
-        # Run one iteration of retransmit logic manually
-        import asyncio as _asyncio
-        now = _asyncio.get_event_loop().time()
-        for p, m in list(session._in_flight.items()):
-            if now - m.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
-                m.retransmit_count += 1
-                m.sent_at = now
-                from ministack.services.iot import _make_publish
-                await session.send_bytes(
-                    _make_publish(m.topic, m.payload, qos=1, packet_id=p, dup=True)
-                )
-
-        # Verify retransmitted publish has DUP=True
-        publishes = _extract_publish_frames(sent)
-        assert len(publishes) == 1
-        topic, payload, qos, packet_id, dup = publishes[0]
-        assert topic == "test/dup"
-        assert payload == b"dup-payload"
-        assert qos == 1
-        assert packet_id == pid
-        assert dup is True
+        msg.sent_at = now - 30
+        await session._retransmit_due()
+        assert _extract_publish_frames(sent) == [("test/dup", b"dup-payload", 1, pid, False)]
+        assert msg.retransmit_count == 1
 
         await session.cleanup()
 
