@@ -11901,6 +11901,10 @@ def _rds_db_instance_fields(props):
         "DBInstanceClass": props.get("DBInstanceClass", "db.t3.micro"),
         "EngineVersion": engine_version,
         "AllocatedStorage": int(props.get("AllocatedStorage") or 20),
+        # Set only when it turns storage autoscaling on (above AllocatedStorage).
+        "MaxAllocatedStorage": (int(props["MaxAllocatedStorage"]) if props.get("MaxAllocatedStorage")
+                                and int(props["MaxAllocatedStorage"]) != int(props.get("AllocatedStorage") or 20)
+                                else None),
         "StorageType": props.get("StorageType", "gp2"),
         "PreferredBackupWindow": props.get("PreferredBackupWindow", "03:00-04:00"),
         "BackupRetentionPeriod": int(props.get("BackupRetentionPeriod", 1)),
