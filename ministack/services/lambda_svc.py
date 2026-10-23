@@ -46,6 +46,7 @@ import urllib.error
 import urllib.request
 import weakref
 import zipfile
+import zlib
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any
@@ -78,6 +79,7 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
+    get_request_client_ip,
     json_response,
     new_uuid,
 )
@@ -8007,7 +8009,7 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
             "ResourceConflictException", f"Function URL config already exists for {func_name}", 409
         )
     cfg = {
-        "FunctionUrl": f"https://{new_uuid()}.lambda-url.{get_region()}.on.aws/",
+        "FunctionUrl": f"https://{_new_function_url_id()}.lambda-url.{get_region()}.on.aws/",
         "FunctionArn": _func_arn(func_name),
         "AuthType": data.get("AuthType", "NONE"),
         "InvokeMode": data.get("InvokeMode", "BUFFERED"),
@@ -8077,6 +8079,15 @@ _STREAM_PRELUDE_SEPARATOR = b"\x00" * 8
 # Content types a Function URL delivers to the handler as a UTF-8 string rather
 # than base64. Function URLs use payload format 2.0, same rule as HTTP API v2.
 _FUNCTION_URL_TEXT_TYPES = ("application/json", "application/xml", "application/javascript")
+
+
+def _new_function_url_id() -> str:
+    # AWS's URL ids are 32 lowercase letters and digits.
+    return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(32))
+
+
+def _function_url_trace_root() -> str:
+    return "Root=1-%08x-%s" % (int(time.time()), secrets.token_hex(12))
 
 
 def _function_url_id(function_url: str) -> str:
@@ -8167,6 +8178,9 @@ def _build_function_url_event(
     headers: dict,
     body: bytes,
     query_params: dict,
+    source_ip: str = "127.0.0.1",
+    anonymous: bool = False,
+    trace_root: str = "",
 ) -> dict:
     """Build the payload-format-2.0 event a Function URL delivers.
 
@@ -8186,14 +8200,28 @@ def _build_function_url_event(
         req_body, is_base64 = None, False
 
     domain_name = f"{url_id}.lambda-url.{region}.on.aws"
+    # The fields the Function URL front end sets: X-Forwarded-For keeps only the
+    # first address it was sent, or names the caller.
+    event_headers = {k.lower(): v for k, v in headers.items()}
+    first_hop = (event_headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    event_headers.update({
+        "host": domain_name,
+        "x-amzn-tls-cipher-suite": "TLS_AES_128_GCM_SHA256",
+        "x-amzn-tls-version": "TLSv1.3",
+        "x-amzn-trace-id": trace_root or _function_url_trace_root(),
+        "x-forwarded-for": first_hop or source_ip,
+        "x-forwarded-port": "443",
+        "x-forwarded-proto": "https",
+    })
     event = {
         "version": "2.0",
         "routeKey": "$default",
         "rawPath": path,
         "rawQueryString": raw_qs,
-        "headers": dict(headers),
+        "headers": event_headers,
         "requestContext": {
-            "accountId": account_id,
+            # A URL with AuthType NONE reports the caller's account as "anonymous".
+            "accountId": "anonymous" if anonymous else account_id,
             "apiId": url_id,
             "domainName": domain_name,
             "domainPrefix": url_id,
@@ -8201,7 +8229,7 @@ def _build_function_url_event(
                 "method": method,
                 "path": path,
                 "protocol": "HTTP/1.1",
-                "sourceIp": "127.0.0.1",
+                "sourceIp": source_ip,
                 "userAgent": headers.get("user-agent", ""),
             },
             "requestId": new_uuid(),
@@ -8223,7 +8251,7 @@ def _build_function_url_event(
 
 async def handle_function_url_request(
     url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict,
-    resolved: tuple | None = None,
+    resolved: tuple | None = None, source_ip: str | None = None,
 ) -> tuple:
     """Serve a Lambda Function URL data-plane request.
 
@@ -8241,24 +8269,35 @@ async def handle_function_url_request(
     if method == "OPTIONS" and cfg.get("Cors"):
         return 200, cors_headers, b""
 
+    request_id = new_uuid()
     if cfg.get("AuthType") == "AWS_IAM" and not _function_url_is_signed(headers, query_params):
-        return 403, {"Content-Type": "application/json", **cors_headers}, json.dumps({"Message": "Forbidden"}).encode()
+        return 403, {"Content-Type": "application/json", "x-amzn-RequestId": request_id,
+                     "x-amzn-ErrorType": "AccessDeniedException", **cors_headers}, b'{"Message":"Forbidden"}'
 
     function_ref = f"{func_name}:{qualifier}" if qualifier else func_name
     func_data, func_config, _ = _get_func_record_for_ref_in_scope(function_ref, account_id=account_id, region=region)
     if func_data is None or func_config is None:
         return error_response_json("ResourceNotFoundException", f"Function not found: {func_name}", 404)
 
-    event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
+    trace_root = _function_url_trace_root()
+    event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params,
+                                      source_ip=source_ip or get_request_client_ip(),
+                                      anonymous=cfg.get("AuthType") == "NONE", trace_root=trace_root)
+    event["requestContext"]["requestId"] = request_id
     exec_record = _execution_record_for_config(func_data, func_config)
     result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
                                  thread_name="ministack-lambda-url")
 
+    lineage = "%08x" % zlib.crc32(func_config.get("FunctionArn", func_name).encode())
+    invoke_headers = {"x-amzn-RequestId": request_id,
+                      "X-Amzn-Trace-Id": f"{trace_root};Parent={secrets.token_hex(8)};Sampled=0;Lineage=1:{lineage}:0"}
     if cfg.get("InvokeMode") == "RESPONSE_STREAM" and not result.get("error") and not result.get("throttle"):
-        return _function_url_stream_response(result, cors_headers)
-
-    proxy_response, _ = lambda_execute_result_to_api_proxy_response(result)
-    return _function_url_proxy_response(proxy_response, cors_headers)
+        status, resp_headers, data = _function_url_stream_response(result, cors_headers)
+    else:
+        proxy_response, _ = lambda_execute_result_to_api_proxy_response(result)
+        status, resp_headers, data = _function_url_proxy_response(proxy_response, cors_headers)
+    _apply_headers_case_insensitively(resp_headers, invoke_headers)
+    return status, resp_headers, data
 
 
 def _apply_headers_case_insensitively(base: dict, overrides: dict) -> None:

@@ -58,8 +58,8 @@ Supports:
 Data plane (handle_viewer_request): serves viewer requests to <label>.cloudfront.net /
 <label>.cloudfront.<MINISTACK_HOST>. Not modelled: caching, WAF, logging, geo restrictions,
 signed URLs and cookies, Lambda@Edge, CORS preflight, synthetic CloudFront-Viewer-* headers,
-origins at AWS hostnames (502) other than a load balancer registered in this MiniStack, which is
-served in-process through its listener.
+origins at AWS hostnames (502) other than a load balancer or Function URL in this MiniStack, which is
+served in-process.
 """
 
 import asyncio
@@ -6088,6 +6088,49 @@ async def _fetch_from_alb_origin(lb: dict, origin: dict, method: str, uri: str, 
     return status, http.client.responses.get(status, ""), pairs, data
 
 
+def _registered_function_url(origin: dict):
+    """The Function URL host an origin's AWS-owned DomainName names, when that URL exists in this MiniStack."""
+    host = _normalize_origin_host(origin["domain_name"])
+    if not (_is_aws_owned_host(host) and ".lambda-url." in host):
+        return None
+    from ministack import app
+    from ministack.services import lambda_svc
+
+    parsed = app._parse_lambda_url(host, "/")
+    return host if parsed and lambda_svc.resolve_function_url(parsed[0]) is not None else None
+
+
+async def _fetch_from_function_url_origin(host: str, origin: dict, method: str, uri: str, query_string: str,
+                                          headers: dict, body: bytes, viewer_is_https: bool, client_ip: str,
+                                          viewer_xff: str) -> tuple:
+    """(status, reason, headers, body) from a Function URL, served as a request to its host would be."""
+    from ministack import app
+
+    _host, _port, use_https = _origin_connect_target(origin, viewer_is_https)
+    # A Function URL only answers HTTPS.
+    if not use_https:
+        raise OriginUnreachable(f"{host} does not answer HTTP")
+    url_headers = {k.lower(): v for k, v in _origin_request_headers(origin, headers, client_ip, viewer_xff).items()}
+    # A Function URL refuses a Host other than its own, as when a policy forwards the viewer's.
+    if url_headers.get("host", "").split(":", 1)[0].lower() != host:
+        return 403, "Forbidden", [("Content-Type", "application/json"), ("x-amzn-RequestId", new_uuid()),
+                                  ("x-amzn-ErrorType", "AccessDeniedException")], b'{"Message":null}'
+    read_timeout = origin.get("read_timeout", 30)
+    try:
+        status, response_headers, data = await asyncio.wait_for(
+            app._handle_lambda_url_request(host, uri, method, url_headers, body or b"",
+                                           parse_qs(query_string, keep_blank_values=True), source_ip="127.0.0.1"),
+            read_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise OriginTimeout(f"no response from {host} within {read_timeout}s") from e
+    except Exception as e:
+        raise OriginUnreachable(str(e)) from e
+    pairs = [(name, value) for name, values in response_headers.items()
+             for value in (values if isinstance(values, list) else [values])]
+    return status, http.client.responses.get(status, ""), pairs, data
+
+
 async def _collect_streaming_body(stream: StreamingResponse, read_timeout: float) -> bytes:
     """Buffer a relayed body; ``read_timeout`` bounds each chunk, and a missing final frame is a failure."""
     frames: asyncio.Queue = asyncio.Queue()
@@ -6136,6 +6179,13 @@ async def _fetch_from_origin(origin: dict, method: str, uri: str, query_string: 
     if lb is not None:
         status, reason, header_pairs, data = await _fetch_from_alb_origin(
             lb, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
+            viewer_is_https, client_ip, viewer_xff,
+        )
+        return status, reason, _multidict_from_pairs(header_pairs), data
+    url_host = _registered_function_url(origin)
+    if url_host is not None:
+        status, reason, header_pairs, data = await _fetch_from_function_url_origin(
+            url_host, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
             viewer_is_https, client_ip, viewer_xff,
         )
         return status, reason, _multidict_from_pairs(header_pairs), data

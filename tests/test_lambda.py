@@ -15654,3 +15654,31 @@ def test_slow_code_update_does_not_block_independent_resources(functions, monkey
 def test_missing_resource_keeps_not_found_response(functions, operation):
     assert _update(operation, "stale", name="missing")[0] == 404
     assert _lambda_mod._update_alias("revision-test", "missing", {"RevisionId": "stale"})[0] == 404
+
+
+def test_lambda_function_url_event_and_response_follow_aws(lam):
+    """Captured on AWS: the URL id, the front end's request fields, accountId and the response ids."""
+    name = f"fu-aws-{_uuid_mod.uuid4().hex[:10]}"
+    code = ("import json\n"
+            "def handler(event, context):\n"
+            "    return {'statusCode': 200, 'body': json.dumps(event)}\n")
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": _make_zip(code)})
+    try:
+        url = lam.create_function_url_config(FunctionName=name, AuthType="NONE")["FunctionUrl"]
+        url_id = _function_url_id(url)
+        assert re.fullmatch(r"https://[a-z0-9]{32}\.lambda-url\.us-east-1\.on\.aws/", url)
+        req = _function_url_request(url_id, path="/echo", headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.1"})
+        with _urlreq.urlopen(req) as resp:
+            event = json.loads(resp.read())
+            request_id, trace = resp.headers["x-amzn-RequestId"], resp.headers["X-Amzn-Trace-Id"]
+        headers = event["headers"]
+        assert headers["host"] == f"{url_id}.lambda-url.us-east-1.on.aws"
+        assert (headers["x-forwarded-for"], headers["x-forwarded-port"], headers["x-forwarded-proto"]) == (
+            "203.0.113.9", "443", "https")
+        assert event["requestContext"]["accountId"] == "anonymous"
+        assert event["requestContext"]["requestId"] == request_id
+        assert trace.startswith(headers["x-amzn-trace-id"] + ";Parent=")
+        assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=0;Lineage=1:[0-9a-f]{8}:0", trace)
+    finally:
+        lam.delete_function(FunctionName=name)

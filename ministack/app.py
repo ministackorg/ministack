@@ -55,7 +55,7 @@ _CLOUDFRONT_HOST_RE = re.compile(
 # FunctionUrl carries AWS's own `.on.aws` suffix, so we match any suffix rather
 # than only _MINISTACK_HOST — pointing a proxy or an /etc/hosts entry at the
 # AWS-shaped hostname is the whole point of addressing a function this way.
-_LAMBDA_URL_RE = re.compile(r"^([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.lambda-url\.[a-z0-9-]+\.")
+_LAMBDA_URL_RE = re.compile(r"^([a-z0-9]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.lambda-url\.[a-z0-9-]+\.")
 # OpenSearch Serverless collection endpoint: {collectionId}.{region}.aoss.<anything>[:port].
 _AOSS_COLLECTION_HOST_RE = re.compile(r"^[a-z0-9]{3,40}\.[a-z0-9-]+\.aoss\.", re.IGNORECASE)
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
@@ -2136,7 +2136,8 @@ def _function_url_auth_target(url_id: str) -> tuple[str, dict, tuple | None]:
     return function_arn, {"lambda:FunctionUrlAuthType": cfg.get("AuthType", "AWS_IAM")}, resolved
 
 
-async def _handle_lambda_url_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_lambda_url_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
+                                     source_ip: str | None = None):
     """Handle Lambda Function URL data plane requests (Host-based + path-based)."""
     parsed = _parse_lambda_url(host, path)
     if parsed is None:
@@ -2154,7 +2155,7 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
     try:
         # The handler reuses the lookup above; None makes it resolve again.
         return await _get_module("lambda_svc").handle_function_url_request(
-            url_id, method, function_path, headers, body, query_params, resolved=resolved,
+            url_id, method, function_path, headers, body, query_params, resolved=resolved, source_ip=source_ip,
         )
     except Exception as e:
         logger.exception("Error in Lambda Function URL dispatch: %s", e)

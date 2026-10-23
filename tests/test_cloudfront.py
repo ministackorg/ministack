@@ -6269,3 +6269,85 @@ def test_streamed_alb_body_idle_past_the_read_timeout_is_an_origin_timeout():
 
     with pytest.raises(cloudfront_svc.OriginTimeout):
         asyncio.run(cloudfront_svc._collect_streaming_body(StreamingResponse(stalled), 0.2))
+
+
+def _function_url_dist(cloudfront, url_host: str, protocol_policy: str = "https-only",
+                       origin_request_policy: str = _ALL_VIEWER_EXCEPT_HOST) -> str:
+    origin = {
+        "Id": "url-origin", "DomainName": url_host,
+        "CustomHeaders": {"Quantity": 1, "Items": [{"HeaderName": "X-Origin-Verify", "HeaderValue": "origin-token"}]},
+        "CustomOriginConfig": {
+            "HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": protocol_policy,
+            "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+            "OriginReadTimeout": 30, "OriginKeepaliveTimeout": 5,
+        },
+    }
+    dist_config = {
+        "CallerReference": f"cf-dp-url-{_uuid_mod.uuid4().hex[:10]}",
+        "Comment": "data plane Function URL origin test",
+        "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [origin]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "url-origin", "ViewerProtocolPolicy": "allow-all",
+            "CachePolicyId": _CACHING_DISABLED, "OriginRequestPolicyId": origin_request_policy,
+        },
+    }
+    return cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]["DomainName"]
+
+
+@pytest.fixture
+def function_url_origin(lam):
+    name = f"cf-dp-url-{_uuid_mod.uuid4().hex[:10]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/test-role",
+                        Handler="index.handler", Code={"ZipFile": _zip_lambda(_ORIGIN_LAMBDA_CODE)})
+    urls = {}
+    for alias, auth in (("open", "NONE"), ("iam", "AWS_IAM")):
+        version = lam.publish_version(FunctionName=name)["Version"]
+        lam.create_alias(FunctionName=name, Name=alias, FunctionVersion=version)
+        url = lam.create_function_url_config(FunctionName=name, Qualifier=alias, AuthType=auth)["FunctionUrl"]
+        urls[alias] = url.split("://", 1)[1].rstrip("/")
+    yield urls
+    lam.delete_function(FunctionName=name)
+
+
+def test_function_url_origin_is_served_with_the_origin_custom_headers(cloudfront, function_url_origin):
+    dist_host = _function_url_dist(cloudfront, function_url_origin["open"])
+    status, _headers, body = _get(dist_host, "/hello?a=1")
+    assert status == 200, body
+    payload = json.loads(body)
+    assert payload["path"] == "/hello"
+    assert payload["query"] == {"a": "1"}
+    assert payload["headers"]["x-origin-verify"] == "origin-token"
+    headers = payload["headers"]
+    assert headers["host"] == function_url_origin["open"]
+    assert "(CloudFront)" in headers["via"]
+    # Captured on AWS: the Function URL keeps the first X-Forwarded-For address and sets the rest.
+    assert (headers["x-forwarded-for"], headers["x-forwarded-port"], headers["x-forwarded-proto"]) == (
+        "127.0.0.1", "443", "https")
+    assert (headers["x-amzn-tls-version"], headers["x-amzn-tls-cipher-suite"]) == ("TLSv1.3", "TLS_AES_128_GCM_SHA256")
+    assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", headers["x-amzn-trace-id"])
+    status, _headers, body = _get(dist_host, "/hello", extra_headers={"X-Forwarded-For": "203.0.113.9"})
+    assert json.loads(body)["headers"]["x-forwarded-for"] == "203.0.113.9"
+
+
+def test_function_url_origin_refuses_the_viewer_host(cloudfront, function_url_origin):
+    dist_host = _function_url_dist(cloudfront, function_url_origin["open"], origin_request_policy=_ALL_VIEWER)
+    status, headers, body = _get(dist_host, "/hello")
+    assert (status, body) == (403, b'{"Message":null}')
+    assert {k.lower(): v for k, v in headers.items()}.get("x-amzn-errortype") == "AccessDeniedException"
+
+
+def test_function_url_origin_with_aws_iam_auth_answers_forbidden_without_signing(cloudfront, function_url_origin):
+    status, headers, body = _get(_function_url_dist(cloudfront, function_url_origin["iam"]), "/hello")
+    assert (status, body) == (403, b'{"Message":"Forbidden"}')
+    assert {k.lower(): v for k, v in headers.items()}.get("x-amzn-errortype") == "AccessDeniedException"
+
+
+def test_function_url_origin_over_http_is_unreachable(cloudfront, function_url_origin):
+    status, _headers, _body = _get(_function_url_dist(cloudfront, function_url_origin["open"], "http-only"), "/hello")
+    assert status == 502
+
+
+def test_unregistered_function_url_hostname_is_still_refused(cloudfront):
+    host = f"{_uuid_mod.uuid4()}.lambda-url.us-east-1.on.aws"
+    assert _get(_function_url_dist(cloudfront, host), "/hello")[0] == 502
