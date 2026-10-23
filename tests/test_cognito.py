@@ -5624,6 +5624,39 @@ def test_oauth2_token_client_credentials_refuses_scopes_it_cannot_grant(requeste
     assert 'access_token' not in response
 
 
+@pytest.mark.parametrize('flows,secret,requested,error', [
+    (['code'], True, None, 'invalid_grant'),
+    (['code'], True, 'api/read', 'invalid_grant'),
+    (['code'], True, 'openid', 'invalid_grant'),
+    (['code'], True, 'email', 'invalid_grant'),
+    (['code'], True, 'api/read bogus/x', 'invalid_grant'),
+    (['code'], True, 'bogus', 'invalid_scope'),
+    (['implicit'], True, 'api/read', 'invalid_grant'),
+    (['code'], False, None, 'invalid_grant'),
+    ([], True, None, 'invalid_scope'),
+])
+def test_oauth2_token_client_credentials_needs_the_flow(flows, secret, requested, error):
+    """A client without client_credentials in AllowedOAuthFlows gets no token; unknown scopes fail first."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _client_credentials_client(cognito_idp)
+    oauth = {'AllowedOAuthFlows': flows, 'AllowedOAuthScopes': ['openid', 'api/read'],
+             'AllowedOAuthFlowsUserPoolClient': True, 'CallbackURLs': ['https://example.com/cb']}
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='web', GenerateSecret=secret, **(oauth if flows else {}),
+    )['UserPoolClient']
+    form = {'grant_type': 'client_credentials', 'client_id': client['ClientId']}
+    if secret:
+        form['client_secret'] = client['ClientSecret']
+    if requested is not None:
+        form['scope'] = requested
+    try:
+        status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', form)
+        assert status == 400, body
+        assert json.loads(body) == {'error': error}
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
 @pytest.mark.parametrize('basic', [False, True])
 @pytest.mark.parametrize('requested,error', [
     ('api/admin', 'invalid_grant'),
@@ -6685,6 +6718,39 @@ def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     assert _decode_jwt_claims(resp2["access_token"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
 
 
+@pytest.mark.parametrize("version,fires", [("V2_0", False), ("V3_0", True)])
+def test_cognito_pretoken_client_credentials_fires_only_v3(cognito_idp, lam, version, fires):
+    """A client_credentials grant invokes the pre token generation trigger only with LambdaVersion V3_0."""
+    handler = (
+        "def handler(event, ctx):\n"
+        "    event['response']['claimsAndScopeOverrideDetails'] = {'accessTokenGeneration': {\n"
+        "        'claimsToAddOrOverride': {'seen_trigger_source': event['triggerSource']}}}\n"
+        "    return event\n"
+    )
+    fn_name = f"ministack-pretoken-client-credentials-{version}"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    pool_id, client = _client_credentials_client(cognito_idp)
+    cognito_idp.update_user_pool(
+        UserPoolId=pool_id,
+        LambdaConfig={"PreTokenGenerationConfig": {"LambdaArn": fn_arn, "LambdaVersion": version}},
+    )
+
+    status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+        "grant_type": "client_credentials", "client_id": client["ClientId"],
+        "client_secret": client["ClientSecret"], "scope": "api/read",
+    })
+
+    assert status == 200, body
+    claims = _decode_jwt_claims(json.loads(body)["access_token"])
+    assert claims.get("seen_trigger_source") == ("TokenGeneration_ClientCredentials" if fires else None)
+
+
 def test_cognito_pretoken_v2_event_carries_the_granted_scopes(cognito_idp, lam):
     """request.scopes holds the access token's scopes."""
     handler = (
@@ -6767,7 +6833,6 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
         }},
     )
     client_id = client["ClientId"]
-    client_secret = client["ClientSecret"]
 
     # InitiateAuth(USER_PASSWORD_AUTH) — real AWS never forwards ClientMetadata
     # here, so the trigger must see none, even though the caller passed one.
@@ -6853,10 +6918,20 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
 
     # M2M client_credentials — carries client metadata via the separate
     # aws_client_metadata POST field, not a ClientMetadata request parameter.
+    # Only a V3_0 trigger runs for this grant.
+    cognito_idp.update_user_pool(
+        UserPoolId=pool_id,
+        LambdaConfig={"PreTokenGenerationConfig": {"LambdaArn": fn_arn, "LambdaVersion": "V3_0"}},
+    )
+    cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier="api", Name="api",
+                                       Scopes=[{"ScopeName": "read", "ScopeDescription": "read"}])
+    machine = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="m2m", GenerateSecret=True, AllowedOAuthFlows=["client_credentials"],
+        AllowedOAuthScopes=["api/read"], AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]
     status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
         "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
+        "client_id": machine["ClientId"],
+        "client_secret": machine["ClientSecret"],
         "aws_client_metadata": json.dumps({"orgId": "org-m2m"}),
     })
     assert status == 200
