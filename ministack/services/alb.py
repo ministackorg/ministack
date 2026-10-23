@@ -2212,8 +2212,7 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
                                       for k, v in (query_params or {}).items()}, doseq=True)
     target_path = path + (f"?{raw_query_string}" if raw_query_string else "")
 
-    hop_by_hop = {"content-length", "connection", "transfer-encoding",
-                  "accept-encoding"}
+    hop_by_hop = {"content-length", "connection", "transfer-encoding"}
     fwd = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)

@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **ALB — `Accept-Encoding` reaches HTTP targets** — the data plane dropped the client's `Accept-Encoding`, so a target never compressed its response. It is now forwarded, and the target's encoded response is passed through unchanged. Contributed by @skialpine.
 - **API Gateway — an HTTP API's `rawQueryString` is the query string as the client sent it** — a bare key gained an `=` (`?flag` reached the function as `flag=`). Both the Lambda proxy event and the REQUEST authorizer event now carry the request's own query string. Contributed by @skialpine.
 - **ALB — an OPTIONS request reaches the target** — the gateway answered every preflight to a load balancer address with its own wildcard CORS response. The request is now forwarded to the target like any other method. Contributed by @skialpine.
 - **ALB — the query string reaches HTTP targets unchanged** — it was rebuilt from the first value of each key, so `?page=1&page=2` arrived as `?page=1`. The request's own query string is now forwarded, including from a CloudFront distribution whose origin is the load balancer. Contributed by @skialpine.

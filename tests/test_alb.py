@@ -2967,3 +2967,42 @@ def test_elbv2_dataplane_forwards_options_to_the_target(elbv2):
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _stop_server(server)
+
+
+def test_elbv2_dataplane_passes_accept_encoding_and_a_gzip_response_through(elbv2):
+    """The target receives the client's Accept-Encoding, and its gzip response reaches the client
+    still encoded."""
+    import gzip
+    import http.client
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            gzipped = "gzip" in (self.headers.get("Accept-Encoding") or "")
+            body = gzip.compress(b"compressed hello") if gzipped else b"plain hello"
+            self.send_response(200)
+            if gzipped:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-gzip"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    parsed = urlparse(_endpoint)
+    try:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
+        conn.request("GET", f"/_alb/{lb_name}/", headers={"Accept-Encoding": "gzip"})
+        resp = conn.getresponse()
+        assert resp.getheader("Content-Encoding") == "gzip"
+        assert gzip.decompress(resp.read()) == b"compressed hello"
+        conn.close()
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
