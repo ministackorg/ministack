@@ -45,6 +45,11 @@ Behaviour that follows the live service (measured 2026-08-26 unless noted):
     `signingParameters`, and `signatureExpiresAt` = createdAt plus the
     profile's `signatureValidityPeriod` (default 135 months, per the
     PutSigningProfile reference).
+  * PutSigningProfile on the Lambda and Notation platforms refuses any
+    `signingMaterial`. Under AUTH=true, on the IoT and FreeRTOS platforms it
+    refuses a profile without `signingMaterial` and a certificate ARN that
+    is malformed, in another region or account, unknown to ACM or not
+    issued; without AUTH those are accepted.
 
 Deliberate divergences from AWS, each pinned by a test:
 
@@ -97,6 +102,7 @@ from datetime import datetime, timedelta, timezone
 
 import ministack.services.acm as acm_svc
 import ministack.services.s3 as s3_svc
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     REST_JSON_CONTENT_TYPE,
     AccountRegionScopedDict,
@@ -178,6 +184,10 @@ _LAMBDA_PLATFORM_ID = "AWSLambda-SHA384-ECDSA"
 _IOT_PLATFORM_ID = "AWSIoTDeviceManagement-SHA256-ECDSA"
 # Platforms that sign with the profile's ACM certificate on AWS.
 _ACM_SIGNED_PLATFORMS = (_IOT_PLATFORM_ID, "AmazonFreeRTOS-Default", "AmazonFreeRTOS-TI-CC3220SF")
+# Platforms that sign with Signer's own keys and take no signingMaterial.
+_SIGNER_KEY_PLATFORMS = (_LAMBDA_PLATFORM_ID, "Notation-OCI-SHA384-ECDSA")
+_CERTIFICATE_RESOURCE_RE = re.compile(
+    r"certificate/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _now():
@@ -282,7 +292,7 @@ def _validate_overrides(overrides):
 
 
 def _validate_signing_material(material):
-    """certificateArn is required; StartSigningJob resolves it, so an ARN ACM does not hold is accepted."""
+    """certificateArn is required; the certificate itself is checked only under AUTH=true."""
     if material is None:
         return None
     if not isinstance(material, dict):
@@ -291,6 +301,45 @@ def _validate_signing_material(material):
     if not isinstance(material.get("certificateArn"), str) or not material["certificateArn"]:
         return _error(400, "ValidationException",
                       "signingMaterial.certificateArn is required.")
+    return None
+
+
+def _signing_material_problem(platform_id, material, auth):
+    """The refusal of signingMaterial the platform cannot use, checked before the profile name; the ARN checks need AUTH."""
+    if platform_id in _SIGNER_KEY_PLATFORMS:
+        if material is None:
+            return None
+        return _coded_error(400, "ValidationException", "InvalidProfileParameters",
+                            f"Signing material should not be present when using {platform_id} platform.")
+    if not auth or platform_id not in _ACM_SIGNED_PLATFORMS:
+        return None
+    if material is None:
+        return _coded_error(400, "ValidationException", "ValidationException",
+                            "signing material cannot be null.")
+    arn = material["certificateArn"]
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    if (spec is None or spec.service != "acm" or spec.region != get_region()
+            or not _ACCOUNT_ID_RE.fullmatch(spec.account_id)
+            or not _CERTIFICATE_RESOURCE_RE.fullmatch(spec.resource)):
+        return _coded_error(400, "ValidationException", "ValidationException",
+                            f"{arn} is not a valid ACM certificate ARN")
+    if spec.account_id != get_account_id():
+        return _coded_error(400, "ValidationException", "ValidationException",
+                            f"{arn} is not owned by {get_account_id()}")
+    return None
+
+
+def _certificate_problem(arn):
+    """The refusal of a certificate ACM does not hold or has not issued, checked after the profile name."""
+    cert = acm_svc._get_local_certificate(arn)
+    if cert is None:
+        return _coded_error(404, "ResourceNotFoundException", "CertificateNotFound",
+                            f"Could not find an issued certificate {arn}")
+    if cert.get("Status") != "ISSUED":
+        return _coded_error(400, "ValidationException", "ValidationException", "Certificate is not Issued")
     return None
 
 
@@ -812,10 +861,19 @@ def _put_signing_profile(name, body):
                     _validate_tags(body.get("tags"))):
         if problem is not None:
             return problem
+    from ministack.app import AUTH
+    platform_id, material = body["platformId"], body.get("signingMaterial")
+    problem = _signing_material_problem(platform_id, material, AUTH)
+    if problem is not None:
+        return problem
     if name in _profiles:
         # A profile name is taken for good, Active or Canceled.
         return _coded_error(400, "ValidationException", "ProfileAlreadyExists",
                             f"Profile with name {name} already exists")
+    if AUTH and platform_id in _ACM_SIGNED_PLATFORMS:
+        problem = _certificate_problem(material["certificateArn"])
+        if problem is not None:
+            return problem
     profile = _register_profile(name, body)
     return json_response({
         "arn": profile["arn"],
@@ -1014,7 +1072,7 @@ def _cancel_signing_profile(name):
     if profile.get("status") == "Active" and profile.get("policy"):
         profile["policy"] = dict(profile["policy"], revisionId=str(uuid.uuid4()))
     profile["status"] = "Canceled"
-    return json_response({})
+    return 204, {"Content-Type": REST_JSON_CONTENT_TYPE}, b""
 
 
 # ---------------------------------------------------------------------------

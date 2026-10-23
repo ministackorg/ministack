@@ -46,9 +46,9 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status=400):
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     t = "Sender" if status < 500 else "Receiver"
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="{CFN_NS}">'
         f'<Error><Type>{t}</Type><Code>{code}</Code>'
         f'<Message>{_esc(message)}</Message></Error>'
@@ -334,3 +334,10 @@ def _page(items, params, action, page_size=PAGE_SIZE):
     if start + page_size < len(items):
         next_token_xml = f"<NextToken>{action}:{start + page_size}</NextToken>"
     return page, next_token_xml, None
+
+
+def _sdk_error(message, service, status, request_id=None):
+    """A service error as a resource handler words it in the
+    StatusReason: the service's own message, then its SDK's suffix."""
+    return (f"{message} (Service: {service}, Status Code: {status}, "
+            f"Request ID: {request_id or new_uuid()}) (SDK Attempt Count: 1)")

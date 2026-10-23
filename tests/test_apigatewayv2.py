@@ -15,6 +15,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 from conftest import (
@@ -23,6 +24,7 @@ from conftest import (
     LoopProbe,
     concurrent_burst,
     make_probe_lambda,
+    second_access_key,
 )
 
 from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
@@ -90,17 +92,19 @@ def _start_echo_server():
 def _make_signed_token(claims: dict) -> str:
     from ministack.services import cognito as _cognito
 
-    if _cognito._RSA_PRIVATE_KEY is None:
+    pool_id = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    key, jwk = _cognito._pool_signing_key(pool_id, "id" if claims.get("token_use") == "id" else "access")
+    if key is None:
         pytest.skip("cryptography-backed Cognito signing key unavailable")
 
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    header = {"alg": "RS256", "kid": "ministack-key-1"}
+    header = {"alg": "RS256", "kid": jwk["kid"]}
     h = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
     p = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
     signed = f"{h}.{p}".encode()
-    sig = _cognito._RSA_PRIVATE_KEY.sign(signed, padding.PKCS1v15(), hashes.SHA256())
+    sig = key.sign(signed, padding.PKCS1v15(), hashes.SHA256())
     s = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
     return f"{h}.{p}.{s}"
 
@@ -2896,31 +2900,57 @@ def test_ws_get_connection_returns_metadata(apigw, lam):
         ws.close()
 
 
-def test_ws_delete_connection_closes_socket(apigw, lam):
-    """@connections DeleteConnection terminates the WS session."""
+def test_ws_delete_connection_closes_socket(apigw, lam, sqs):
+    """DeleteConnection sends the client a close frame, forgets the connection and runs $disconnect."""
+    import urllib.error
     import urllib.request
 
-    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="delc")
-    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod",
-                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
+    qname = _v2_auth_counter_queue(sqs)
+    disconnect = (_V2_AUTH_MARK_PRELUDE + (
+        f"def handler(event, context):\n    _mark('{qname}')\n    return {{'statusCode': 200}}\n").encode()).decode()
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="delc", disconnect_code=disconnect)
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    warmed = _v2_auth_count(sqs, qname)  # _make_fn's warm-up call
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod", headers={"Host": host})
     try:
         ws.send(json.dumps({"action": "x"}))
-        reply = ws.recv()
-        conn_id = json.loads(reply)["connectionId"]
+        conn_id = json.loads(ws.recv())["connectionId"]
+        url = f"http://{host}/prod/@connections/{conn_id}"
+        r = urllib.request.urlopen(urllib.request.Request(url, method="DELETE", headers={"Host": host}), timeout=30)
+        assert r.status == 204
 
-        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/@connections/{conn_id}"
-        req = urllib.request.Request(
-            url, method="DELETE",
-            headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
-        )
-        r = urllib.request.urlopen(req, timeout=30)
-        assert r.status in (200, 204)
-
-        # Give the server a moment to close, then subsequent recv returns None.
-        time.sleep(0.5)
-        assert ws.recv(timeout=1.5) is None
+        ws._sock.settimeout(5)
+        assert ws._recv_frame()[0] == 0x8
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(urllib.request.Request(url, method="GET", headers={"Host": host}), timeout=30)
+        assert exc_info.value.code == 410
+        assert exc_info.value.headers["x-amzn-ErrorType"] == "GoneException"
+        deadline = time.time() + 30
+        while _v2_auth_count(sqs, qname) < warmed + 1 and time.time() < deadline:
+            time.sleep(0.5)
+        assert _v2_auth_count(sqs, qname) == warmed + 1
     finally:
         ws.close()
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_ws_route_and_stage_keep_their_optional_fields(apigw):
+    api_id = apigw.create_api(Name="ws-fields", ProtocolType="WEBSOCKET")["ApiId"]
+    route = apigw.create_route(ApiId=api_id, RouteKey="send", RouteResponseSelectionExpression="$default",
+                               ModelSelectionExpression="$request.body.type")
+    got = apigw.get_route(ApiId=api_id, RouteId=route["RouteId"])
+    for answer in (route, got):
+        assert answer["RouteResponseSelectionExpression"] == "$default"
+        assert answer["ModelSelectionExpression"] == "$request.body.type"
+    updated = apigw.update_route(ApiId=api_id, RouteId=route["RouteId"], RouteResponseSelectionExpression="")
+    assert "RouteResponseSelectionExpression" not in updated
+
+    logs = {"DestinationArn": "arn:aws:logs:us-east-1:000000000000:log-group:ws", "Format": "$context.requestId"}
+    stage = apigw.create_stage(ApiId=api_id, StageName="prod", AccessLogSettings=logs)
+    assert stage["AccessLogSettings"] == logs
+    assert apigw.get_stage(ApiId=api_id, StageName="prod")["AccessLogSettings"] == logs
+    changed = {**logs, "Format": "$context.requestId $context.status"}
+    assert apigw.update_stage(ApiId=api_id, StageName="prod", AccessLogSettings=changed)["AccessLogSettings"] == changed
 
 
 def test_ws_post_to_unknown_connection_returns_410(apigw, lam):
@@ -3260,6 +3290,94 @@ def test_ws_connect_aws_iam_needs_a_signed_request(apigw, lam):
     assert _ws_handshake(api_id, "/prod", signed)[0] == 101
     presigned = "/prod?X-Amz-Credential=test%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request&X-Amz-Signature=0"
     assert _ws_handshake(api_id, presigned)[0] == 101
+
+
+_WS_IAM_POLICY = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["execute-api:Invoke", "sts:GetSessionToken"], "Resource": "*"}]}
+
+
+def _signed_ws_connect(host, key, secret, *, session=False, token=None, token_after=False, header=False,
+                       expires=3600, skew=0, drop=""):
+    """Path and headers of a GET /prod handshake signed by botocore for execute-api."""
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import quote
+
+    import botocore.auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    if session or token == "session":
+        credentials = boto3.client("sts", endpoint_url=ENDPOINT, aws_access_key_id=key, aws_secret_access_key=secret,
+                                   region_name="us-east-1").get_session_token()["Credentials"]
+        token = credentials["SessionToken"] if token == "session" else token
+        if session:
+            key, secret = credentials["AccessKeyId"], credentials["SecretAccessKey"]
+    request = AWSRequest(method="GET", url=f"http://{host}/prod")
+    signing = Credentials(key, secret, None if token_after else token)
+    signer = botocore.auth.SigV4Auth(signing, "execute-api", "us-east-1") if header else (
+        botocore.auth.SigV4QueryAuth(signing, "execute-api", "us-east-1", expires=expires))
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=skew)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        signer.add_auth(request)
+    query = "&".join(p for p in urlparse(request.url).query.split("&") if not drop or not p.startswith(drop + "="))
+    if token_after and token:
+        query += "&X-Amz-Security-Token=" + quote(token, safe="")
+    return f"/prod?{query}" if query else "/prod", {k: v for k, v in request.headers.items() if k.lower() != "host"}
+
+
+_MISMATCH = (
+    "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key "
+    "and signing method. Consult the service documentation for details.\n\nThe Canonical String for this request "
+    "should have been\n'GET\n/prod\n"
+)
+_INVALID_TOKEN = "The security token included in the request is invalid"
+_WS_CONNECT_CASES = {  # case: (signing arguments, AWS's 403 message under AUTH=true, or None for 101)
+    "signed": ({}, None),
+    "wrong-secret": ({"secret": "wrong"}, _MISMATCH),
+    "signed-2-min-ago-expires-60": ({"skew": -120, "expires": 60}, None),
+    "signed-6-min-ago-expires-86400": ({"skew": -360, "expires": 86400}, "Signature expired: "),
+    "signed-16-min-ahead": ({"skew": 960}, "Signature not yet current: "),
+    "no-signature": ({"drop": "X-Amz-Signature"}, "AWS query-string parameters must include 'X-Amz-Signature'. "
+                                                  "Re-examine the query-string parameters."),
+    "no-date": ({"drop": "X-Amz-Date"}, "AWS query-string parameters must include 'X-Amz-Date'. "
+                                        "Re-examine the query-string parameters."),
+    "header-signed": ({"header": True}, None),
+    "header-wrong-secret": ({"header": True, "secret": "wrong"}, _MISMATCH),
+    "unknown-key": ({"key": "AKIAUNKNOWNKEY000001"}, _INVALID_TOKEN + "."),
+    "session-token-signed": ({"session": True, "token": "session"}, None),
+    "session-token-appended": ({"session": True, "token": "session", "token_after": True}, _MISMATCH),
+    "session-no-token": ({"session": True}, _INVALID_TOKEN + "."),
+    "session-other-token": ({"session": True, "token": "other"}, _INVALID_TOKEN),
+    "user-key-with-token": ({"token": "session"}, _INVALID_TOKEN),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case", list(_WS_CONNECT_CASES))
+def test_ws_connect_aws_iam_handshake_signature_contract(auth_enabled, iam_user, apigw, case):
+    """Under AUTH=true an AWS_IAM $connect verifies the handshake's signature before its policy."""
+    api_id = apigw.create_api(Name=f"ws-iam-sig-{uuid.uuid4().hex[:6]}", ProtocolType="WEBSOCKET",
+                              RouteSelectionExpression="$request.body.action")["ApiId"]
+    try:
+        integration = apigw.create_integration(ApiId=api_id, IntegrationType="MOCK")["IntegrationId"]
+        apigw.create_route(ApiId=api_id, RouteKey="$connect", AuthorizationType="AWS_IAM",
+                           Target=f"integrations/{integration}")
+        apigw.create_stage(ApiId=api_id, StageName="prod")
+        args, message = _WS_CONNECT_CASES[case]
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        with second_access_key(iam_user(policy=_WS_IAM_POLICY)) as (key, secret):
+            args = {"key": key, "secret": secret, **args}
+            path, headers = _signed_ws_connect(host, args.pop("key"), args.pop("secret"), **args)
+            status, body = _ws_handshake(api_id, path, headers)
+    finally:
+        apigw.delete_api(ApiId=api_id)
+    if auth_enabled and message:
+        assert status == 403
+        assert body["message"].startswith(message) if message.endswith((" ", "\n")) else body["message"] == message
+        assert body["connectionId"] and body["requestId"]
+    else:
+        assert status == 101
 
 
 @pytest.mark.parametrize("resource, message", [

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -148,6 +149,229 @@ def test_appsync_signed_root_graphql_request_uses_current_region_fallback():
         assert "errors" not in response
     finally:
         west.delete_graphql_api(apiId=api["apiId"])
+
+
+def _graphql_host_post(host, headers=None, sign=False):
+    """POST { __typename } (no schema, so data is {}) with this Host header; return (status, body)."""
+    headers = {"Host": host, **(headers or {})}
+    if sign:
+        headers["Authorization"] = (
+            "AWS4-HMAC-SHA256 Credential=test/20261012/us-west-2/appsync/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=fake"
+        )
+    try:
+        return 200, _appsync_graphql_post(f"{_ENDPOINT}/graphql", "{ __typename }", headers=headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+_UNAUTHORIZED = {"errors": [{
+    "errorType": "UnauthorizedException", "message": "You are not authorized to make this call."}]}
+
+
+@pytest.mark.parametrize("host_shape", ["region", "uris", "no_region"])
+def test_appsync_graphql_host_reaches_the_api_it_names(host_shape):
+    west = _client("us-west-2")
+    key_api = west.create_graphql_api(name="host-key", authenticationType="API_KEY")["graphqlApi"]
+    iam_api = west.create_graphql_api(name="host-iam", authenticationType="AWS_IAM")["graphqlApi"]
+    key = west.create_api_key(apiId=key_api["apiId"])["apiKey"]["id"]
+
+    def host(api):
+        if host_shape == "uris":
+            return urlparse(api["uris"]["GRAPHQL"]).netloc
+        region = ".us-west-2" if host_shape == "region" else ""
+        return f"{api['apiId']}.appsync-api{region}.{_ENDPOINT_NETLOC}"
+
+    try:
+        assert _graphql_host_post(host(key_api), {"x-api-key": key}) == (200, {"data": {}})
+        assert _graphql_host_post(host(key_api)) == (401, _UNAUTHORIZED)
+        assert _graphql_host_post(host(iam_api), sign=True) == (200, {"data": {}})
+        assert _graphql_host_post(host(iam_api)) == (401, _UNAUTHORIZED)
+        assert _graphql_host_post(host(iam_api), {"x-api-key": key}) == (401, _UNAUTHORIZED)
+        assert _graphql_host_post(host(iam_api), {"x-api-key": key}, sign=True) == (200, {"data": {}})
+    finally:
+        west.delete_graphql_api(apiId=key_api["apiId"])
+        west.delete_graphql_api(apiId=iam_api["apiId"])
+
+
+@pytest.fixture
+def graphql_auth_apis(appsync):
+    """An API_KEY and an AWS_IAM API serving Query.hello and Query.other, and the API_KEY API's key."""
+    apis = {}
+    try:
+        for mode in ("API_KEY", "AWS_IAM"):
+            apis[mode] = api = appsync.create_graphql_api(
+                name=f"gql-auth-{mode}", authenticationType=mode)["graphqlApi"]
+            appsync.start_schema_creation(
+                apiId=api["apiId"], definition=b"type Msg { v: String }\n"
+                b"type Query { hello(v: String): Msg other(v: String): Msg }")
+            appsync.create_data_source(apiId=api["apiId"], name="none", type="NONE")
+            for field in ("hello", "other"):
+                appsync.create_resolver(apiId=api["apiId"], typeName="Query", fieldName=field, dataSourceName="none")
+        yield apis, appsync.create_api_key(apiId=apis["API_KEY"]["apiId"])["apiKey"]["id"]
+    finally:
+        for api in apis.values():
+            appsync.delete_graphql_api(apiId=api["apiId"])
+
+
+def _graphql_signed(api_id, route, query='{ hello(v: "hi") { v } }', credentials=None, x_api_key=None):
+    """POST a query to /v1/apis/{apiId}/graphql or the API's own host, SigV4-signed with *credentials* unless None."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    headers = {"Content-Type": "application/json", **({"x-api-key": x_api_key} if x_api_key else {})}
+    if route == "host":
+        url, headers["Host"] = f"{_ENDPOINT}/graphql", f"{api_id}.appsync-api.us-east-1.{_ENDPOINT_NETLOC}"
+    else:
+        url = f"{_ENDPOINT}/v1/apis/{api_id}/graphql"
+    request = AWSRequest(method="POST", url=url, data=json.dumps({"query": query}).encode(), headers=headers)
+    if credentials:
+        SigV4Auth(credentials, "appsync", "us-east-1").add_auth(request)
+    req = urllib.request.Request(url, data=request.body, headers=dict(request.headers), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+@contextlib.contextmanager
+def _contract_signing_credentials(user):
+    """A second access key of an ``iam_user`` for raw SigV4 calls, deleted before the fixture's cleanup."""
+    from botocore.credentials import Credentials
+    from conftest import make_client
+
+    admin = make_client("iam")
+    key = admin.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield Credentials(key["AccessKeyId"], key["SecretAccessKey"])
+    finally:
+        admin.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def _other_secret(credentials):
+    """The same access key id with a wrong secret."""
+    from botocore.credentials import Credentials
+
+    return Credentials(credentials.access_key, "wrong-secret")
+
+
+_HELLO = (200, {"data": {"hello": {"v": "hi"}}})
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("route", ["v1", "host"])
+def test_appsync_graphql_api_key_api_ignores_the_signature(auth_enabled, iam_user, graphql_auth_apis, route):
+    apis, api_key = graphql_auth_apis
+    api_id = apis["API_KEY"]["apiId"]
+    with _contract_signing_credentials(iam_user()) as credentials:
+        assert _graphql_signed(api_id, route, x_api_key=api_key) == _HELLO
+        for signer in (credentials, _other_secret(credentials)):
+            assert _graphql_signed(api_id, route, credentials=signer, x_api_key=api_key) == _HELLO
+        assert _graphql_signed(api_id, route, credentials=credentials) == (401, _UNAUTHORIZED)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("route", ["v1", "host"])
+def test_appsync_graphql_aws_iam_api_authorizes_each_top_level_field(
+        auth_enabled, iam_user, graphql_auth_apis, route):
+    from botocore.credentials import Credentials
+
+    api = graphql_auth_apis[0]["AWS_IAM"]
+    hello = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": "appsync:GraphQL", "Resource": f"{api['arn']}/types/Query/fields/hello"}]})
+    every = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": "appsync:GraphQL", "Resource": f"{api['arn']}/*"}]})
+    with _contract_signing_credentials(hello) as hello_key, _contract_signing_credentials(every) as every_key, \
+            _contract_signing_credentials(iam_user()) as bare_key:
+        assert _graphql_signed(api["apiId"], route, credentials=hello_key) == _HELLO
+        root = Credentials("test", "test")
+        assert _graphql_signed(api["apiId"], route, '{ other(v: "hi") { v } }', credentials=root)[0] == 200
+        assert _graphql_signed(api["apiId"], route, "{ __typename }", credentials=every_key) == (
+            200, {"data": {"__typename": "Query"}})
+        both = _graphql_signed(
+            api["apiId"], route, '{ hello(v: "hi") { v } other(v: "hi") { v } }', credentials=hello_key)
+        refused = [_graphql_signed(api["apiId"], route, credentials=bare_key),
+                   _graphql_signed(api["apiId"], route, '{ other(v: "hi") { v } }', credentials=hello_key),
+                   _graphql_signed(api["apiId"], route, "{ __typename }", credentials=hello_key)]
+    if auth_enabled:
+        denied = (401, {"errors": [{"errorType": "UnauthorizedException", "message": "Permission denied"}]})
+        assert refused == [denied] * 3
+        assert (both[0], both[1]["data"]) == (200, {"hello": {"v": "hi"}, "other": None})
+        assert [(e["errorType"], e["message"], e["path"]) for e in both[1]["errors"]] == [
+            ("Unauthorized", "Not Authorized to access other on type Query", ["other"])]
+    else:
+        assert [status for status, _body in refused] == [200] * 3
+        assert both == (200, {"data": {"hello": {"v": "hi"}, "other": {"v": "hi"}}})
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("route", ["v1", "host"])
+def test_appsync_graphql_aws_iam_api_authentication_failures(auth_enabled, iam_user, graphql_auth_apis, route):
+    from botocore.credentials import Credentials
+
+    api_id = graphql_auth_apis[0]["AWS_IAM"]["apiId"]
+    with _contract_signing_credentials(iam_user()) as credentials:
+        wrong = _graphql_signed(api_id, route, credentials=_other_secret(credentials))
+    unknown = _graphql_signed(api_id, route, credentials=Credentials("AKIAUNKNOWNKEY000001", "secret"))
+    if auth_enabled:
+        assert (wrong[0], wrong[1]["errors"][0]["errorType"]) == (400, "BadRequestException")
+        assert wrong[1]["errors"][0]["message"].startswith("The request signature we calculated does not match")
+        assert unknown == (403, {"errors": [{"errorType": "UnrecognizedClientException",
+                                             "message": "The security token included in the request is invalid."}]})
+    else:
+        assert wrong == unknown == _HELLO
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("route", ["v1", "host"])
+def test_appsync_graphql_aws_iam_api_without_schema_authorizes_the_caller(auth_enabled, iam_user, appsync, route):
+    from botocore.credentials import Credentials
+
+    api_id = appsync.create_graphql_api(name="gql-no-schema", authenticationType="AWS_IAM")["graphqlApi"]["apiId"]
+    try:
+        assert _graphql_signed(api_id, route, "{ hello }", credentials=Credentials("test", "test"))[0] == 200
+        with _contract_signing_credentials(iam_user()) as credentials:
+            assert _graphql_signed(api_id, route, "{ hello }", credentials=credentials)[0] == (
+                401 if auth_enabled else 200)
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_on_an_event_api_host_is_not_found():
+    west = _client("us-west-2")
+    mode = [{"authType": "API_KEY"}]
+    api = west.create_api(name="host-events", eventConfig={
+        "authProviders": mode, "connectionAuthModes": mode,
+        "defaultPublishAuthModes": mode, "defaultSubscribeAuthModes": mode,
+    })["api"]
+    key = west.create_api_key(apiId=api["apiId"])["apiKey"]["id"]
+    try:
+        assert _graphql_host_post(f"{api['apiId']}.appsync-api.us-west-2.{_ENDPOINT_NETLOC}", {"x-api-key": key}) == (
+            404, {"errors": [{"errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}]})
+    finally:
+        west.delete_api(apiId=api["apiId"])
+
+
+def test_appsync_graphql_on_an_event_api_host_names_its_error_type():
+    west = _client("us-west-2")
+    mode = [{"authType": "API_KEY"}]
+    api = west.create_api(name="host-events-type", eventConfig={
+        "authProviders": mode, "connectionAuthModes": mode,
+        "defaultPublishAuthModes": mode, "defaultSubscribeAuthModes": mode,
+    })["api"]
+    key = west.create_api_key(apiId=api["apiId"])["apiKey"]["id"]
+    req = urllib.request.Request(f"{_ENDPOINT}/graphql", data=b'{"query": "{ __typename }"}', method="POST", headers={
+        "Host": f"{api['apiId']}.appsync-api.us-west-2.{_ENDPOINT_NETLOC}",
+        "Content-Type": "application/json", "x-api-key": key})
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 404
+        assert exc.value.headers["x-amzn-ErrorType"] == "ResourceNotFoundException"
+        assert exc.value.headers["Content-Type"] == "application/json"
+    finally:
+        west.delete_api(apiId=api["apiId"])
 
 
 def test_appsync_graphql_honors_dynamodb_data_source_region():
@@ -592,6 +816,50 @@ def test_appsync_graphql_empty_query():
         assert False, "Should have failed"
     except urllib.error.HTTPError as e:
         assert e.code == 400
+
+
+def _graphql_raw(api_id, body, headers=None):
+    """POST raw bytes to an API's GraphQL endpoint; return status, headers and decoded body."""
+    req = urllib.request.Request(
+        f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=body, method="POST",
+        headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.headers, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, json.loads(e.read())
+
+
+@pytest.mark.parametrize("body, message", [
+    (b"{not json", "Invalid JSON payload in GraphQLAuth POST request."),
+    (b'[{"query": "{ hello }"}]', "Invalid JSON payload in GraphQLAuth POST request."),
+    (b'{"variables": {}}', "Invalid request, `query` can't be null."),
+    (b'{"query": ""}', "Invalid request, `query` can't be empty."),
+    (b'{"query": "{ hello "}', "Unable to parse GraphQL query."),
+])
+def test_appsync_graphql_malformed_request_refused(appsync, body, message):
+    api_id = appsync.create_graphql_api(name="gql-malformed", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    appsync.start_schema_creation(apiId=api_id, definition=b"type Query { hello: String }")
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    try:
+        status, headers, doc = _graphql_raw(api_id, body, {"x-api-key": key})
+        assert status == 400
+        assert headers["x-amzn-ErrorType"] == "MalformedHttpRequestException"
+        assert headers["Content-Type"] == "application/json"
+        assert doc == {"errors": [{"errorType": "MalformedHttpRequestException", "message": message}]}
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+def test_appsync_graphql_refusal_names_its_error_type(appsync):
+    api_id = appsync.create_graphql_api(name="gql-unauth", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    try:
+        status, headers, doc = _graphql_raw(api_id, b'{"query": "{ hello }"}')
+        assert status == 401
+        assert headers["x-amzn-ErrorType"] == "UnauthorizedException"
+        assert doc["errors"][0]["errorType"] == "UnauthorizedException"
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1116,6 +1384,35 @@ def test_appsync_update_data_source_and_resolver():
     )
     got = appsync.get_resolver(apiId=api["apiId"], typeName="Query", fieldName="hello")["resolver"]
     assert got["kind"] == "PIPELINE"
+
+
+def test_appsync_data_source_and_resolver_read_back_only_the_members_set():
+    """Unset members are absent; EventBridge config, DynamoDB defaults and maxBatchSize read back."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="members-api", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    appsync.start_schema_creation(apiId=api_id, definition=SDL.encode())
+    role = "arn:aws:iam::000000000000:role/appsync"
+    bus = {"eventBusArn": "arn:aws:events:us-east-1:000000000000:event-bus/default"}
+    appsync.create_data_source(apiId=api_id, name="none", type="NONE")
+    appsync.create_data_source(apiId=api_id, name="bus", type="AMAZON_EVENTBRIDGE",
+                               serviceRoleArn=role, eventBridgeConfig=bus)
+    appsync.create_data_source(apiId=api_id, name="ddb", type="AMAZON_DYNAMODB", serviceRoleArn=role,
+                               dynamodbConfig={"tableName": "items", "awsRegion": "us-east-1"})
+    sources = {d["name"]: d for d in appsync.list_data_sources(apiId=api_id)["dataSources"]}
+    assert "description" not in sources["none"] and "serviceRoleArn" not in sources["none"]
+    assert sources["bus"]["eventBridgeConfig"] == bus
+    assert sources["ddb"]["dynamodbConfig"] == {"tableName": "items", "awsRegion": "us-east-1",
+                                                "useCallerCredentials": False, "versioned": False}
+
+    appsync.create_resolver(apiId=api_id, typeName="Query", fieldName="hello", dataSourceName="none",
+                            runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+                            code="export function request(ctx) { return {}; }\n"
+                                 "export function response(ctx) { return 'hi'; }\n")
+    got = appsync.get_resolver(apiId=api_id, typeName="Query", fieldName="hello")["resolver"]
+    assert "requestMappingTemplate" not in got and "responseMappingTemplate" not in got
+    assert got["kind"] == "UNIT" and got["maxBatchSize"] == 0
 
 
 def test_appsync_update_api_key():
@@ -2492,3 +2789,38 @@ def test_appsync_cfn_schema_lands_in_the_schema_store():
     assert _appsync._schemas.get(api_id) is None
 
     _appsync._delete_graphql_api(api_id)
+
+
+@pytest.mark.auth_contract
+def test_appsync_aws_iam_api_refuses_an_unverifiable_signature_contract(auth_enabled, appsync):
+    """A SigV4 header the server cannot verify is no AWS_IAM credential."""
+    api_id = appsync.create_graphql_api(name="iam-unverifiable", authenticationType="AWS_IAM")["graphqlApi"]["apiId"]
+    try:
+        appsync.start_schema_creation(apiId=api_id, definition=b"type Query { hello: String }")
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=b'{"query": "{ hello }"}',
+                                     method="POST", headers={"Content-Type": "application/json",
+                                                             "Authorization": "AWS4-HMAC-SHA256 garbage"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status in ((401, 403) if auth_enabled else (200,))
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)
+
+
+@pytest.mark.parametrize("payload", [{"query": 123}, {"query": "{ hello }", "variables": "x"}], ids=["query", "variables"])
+def test_appsync_graphql_refuses_malformed_request_members(appsync, payload):
+    api_id = appsync.create_graphql_api(name="gql-members", authenticationType="API_KEY")["graphqlApi"]["apiId"]
+    appsync.start_schema_creation(apiId=api_id, definition=b"type Query { hello: String }")
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    try:
+        req = urllib.request.Request(f"{_ENDPOINT}/v1/apis/{api_id}/graphql", data=json.dumps(payload).encode(),
+                                     method="POST", headers={"Content-Type": "application/json", "x-api-key": key})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["errors"][0]["errorType"] == "MalformedHttpRequestException"
+    finally:
+        appsync.delete_graphql_api(apiId=api_id)

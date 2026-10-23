@@ -285,6 +285,20 @@ def _publish_http(
     return resp.status, json.loads(data) if data else None
 
 
+def _event_host_request(api_id, method, path, body: bytes):
+    """Send ``body`` to ``path`` on the API's appsync-api host; return status, headers and decoded body."""
+    conn = http.client.HTTPConnection("127.0.0.1", _PORT, timeout=5)
+    conn.request(method, path, body=body, headers={
+        "Host": f"{api_id}.appsync-api.us-east-1.amazonaws.com",
+        "Content-Type": "application/json",
+        "x-api-key": "da2-local-test-key",
+    })
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, resp.headers, json.loads(data) if data else None
+
+
 def _open_subscriber(api_id, *, auth_header: dict | None = None):
     """Open a realtime WebSocket with the spec-shaped subprotocol list.
 
@@ -550,15 +564,50 @@ def test_publish_returns_identifiers(api):
     assert {item["index"] for item in body["successful"]} == {0, 1}
 
 
+def test_publish_answers_application_json(api):
+    payload = json.dumps({"channel": "/default/room1", "events": [json.dumps("x")]}).encode()
+    status, headers, body = _event_host_request(api, "POST", "/event", payload)
+    assert status == 200
+    assert headers["Content-Type"] == "application/json"
+    assert len(body["successful"]) == 1
+
+
 def test_publish_unknown_namespace_rejected(api):
     status, body = _publish_http(api, "/does-not-exist/room", [json.dumps("x")])
     assert status == 401
-    assert body["__type"].endswith("UnauthorizedException") or body["__type"] == "UnauthorizedException"
+    assert body == {"errors": [{"errorType": "UnauthorizedException"}]}
+
+
+@pytest.mark.parametrize("payload, status, error_type, message", [
+    (b"{not json", 400, "SerializationException", "Unable to parse request body"),
+    (b'{"channel": "default/a", "events": "x"}', 400, "SerializationException", "Expected list or null"),
+    (b'{"events": ["1"]}', 400, "BadRequestException", "Missing channel"),
+    (b'{"channel": "default/a"}', 400, "BadRequestException", "Missing events"),
+    (json.dumps({"channel": "default/a", "events": ["1"] * 6}).encode(), 400, "BadRequestException",
+     "Input exceeded 5 event limit"),
+    (b'{"channel": "default/a b", "events": ["1"]}', 400, "BadRequestException", "Invalid Channel Format"),
+    (b'{"channel": "default/*", "events": ["1"]}', 400, "BadRequestException", "Invalid Channel Format"),
+])
+def test_publish_refusal_uses_the_errors_envelope(api, payload, status, error_type, message):
+    got_status, headers, body = _event_host_request(api, "POST", "/event", payload)
+    assert got_status == status
+    assert headers["x-amzn-ErrorType"] == error_type
+    assert headers["Content-Type"] == "application/json"
+    assert body == {"errors": [{"errorType": error_type, "message": message}]}
 
 
 def test_publish_unknown_api_404():
     status, body = _publish_http("deadbeefdeadbeefdeadbeefde", "/default/x", [json.dumps("x")])
     assert status == 404
+    assert body == {"errors": [{"errorType": "ResourceNotFoundException", "message": "Unable to find the Api."}]}
+
+
+@pytest.mark.parametrize("method, path", [("GET", "/event"), ("POST", "/other")])
+def test_event_api_host_unknown_operation(api, method, path):
+    status, headers, body = _event_host_request(api, method, path, b"{}")
+    assert status == 404
+    assert headers["x-amzn-ErrorType"] == "UnknownOperationException"
+    assert body == {"errors": [{"errorType": "UnknownOperationException", "message": "Unknown Operation Request."}]}
 
 
 def test_detect_service_post_event_appsync_api_vhost_returns_appsync_events():
@@ -788,9 +837,9 @@ def test_websocket_subscribe_receives_published_event(api):
         data = _drain_until(ws, lambda f: f.get("type") == "data")
         assert data is not None
         assert data["id"] == "sub-1"
-        # Per spec, the `event` field is an ARRAY of JSON-encoded strings.
-        assert isinstance(data["event"], list)
-        assert json.loads(data["event"][0]) == {"text": "hi"}
+        # AWS delivers one JSON-encoded string per data frame.
+        assert isinstance(data["event"], str)
+        assert json.loads(data["event"]) == {"text": "hi"}
     finally:
         ws.close()
 
@@ -805,7 +854,7 @@ def test_websocket_single_level_wildcard(api):
         first = _drain_until(ws, lambda f: f.get("type") == "data")
         assert first is not None
         assert first["id"] == "sub-1"
-        assert json.loads(first["event"][0]) == "a"
+        assert json.loads(first["event"]) == "a"
 
         # "/default/room1/child" is a two-segment suffix — should NOT match /default/*
         _publish_http(api, "/default/room1/child", [json.dumps("nope")])
@@ -824,7 +873,7 @@ def test_websocket_unsubscribe_stops_delivery(api):
         _publish_http(api, "/default/room1", [json.dumps("first")])
         first = _drain_until(ws, lambda f: f.get("type") == "data")
         assert first is not None
-        assert json.loads(first["event"][0]) == "first"
+        assert json.loads(first["event"]) == "first"
 
         ws.send_json({"type": "unsubscribe", "id": "sub-x"})
         unsub_ack = _drain_until(ws, lambda f: f.get("type") == "unsubscribe_success")
@@ -1006,7 +1055,7 @@ def test_websocket_discovers_resource_region_and_pins_frame_context(monkeypatch)
             assert data == {
                 "type": "data",
                 "id": "sub-regional",
-                "event": [event],
+                "event": event,
             }
 
             await incoming.put({"type": "websocket.disconnect"})
@@ -1210,7 +1259,7 @@ def test_fanout_publish_isolates_connections_by_api_id():
         assert await first_outbox.get() == {
             "type": "data",
             "id": "sub-first",
-            "event": [event],
+            "event": event,
         }
         assert second_outbox.empty()
 
@@ -1249,7 +1298,7 @@ def test_websocket_publish_frame_acks_and_fans_out(api):
         data = _drain_until(listener, lambda f: f.get("type") == "data")
         assert data is not None
         assert data["id"] == "sub-listener"
-        assert json.loads(data["event"][0]) == "over-ws"
+        assert json.loads(data["event"]) == "over-ws"
     finally:
         publisher.close()
         listener.close()
@@ -1355,14 +1404,14 @@ def test_publish_rejects_invalid_channel_path(api):
     # Too many segments (>5).
     status, body = _publish_http(api, "/default/a/b/c/d/e/f", [json.dumps("x")])
     assert status == 400
-    assert "BadRequestException" in body["__type"]
+    assert body["errors"][0]["errorType"] == "BadRequestException"
 
 
 def test_publish_rejects_segment_with_bad_chars(api):
     # Underscores are not allowed by the spec segment regex.
     status, body = _publish_http(api, "/default/bad_seg", [json.dumps("x")])
     assert status == 400
-    assert "BadRequestException" in body["__type"]
+    assert body["errors"][0]["errorType"] == "BadRequestException"
 
 
 def test_subscribe_rejects_invalid_channel_path(api):
@@ -1547,3 +1596,39 @@ def test_appsync_events_service_hosts_are_not_s3_virtual_hosts():
             )
         )
         assert result is None
+
+
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+def test_publish_batch_delivers_individual_event_strings(api, transport):
+    listener = _open_subscriber(api)
+    publisher = _open_subscriber(api) if transport == "websocket" else None
+    events = ['{ "message": "hello" }', '[1, 2]', '"text"']
+    try:
+        assert _subscribe(listener, "sub-batch", "/default/batch") == {
+            "type": "subscribe_success", "id": "sub-batch",
+        }
+        if publisher is None:
+            status, ack = _publish_http(api, "/default/batch", events)
+            assert status == 200
+        else:
+            publisher.send_json({
+                "type": "publish", "id": "pub-batch",
+                "channel": "/default/batch", "events": events,
+            })
+            ack = _drain_until(publisher, lambda f: f.get("type") == "publish_success")
+        assert ack is not None
+        assert len(ack["successful"]) == len(events)
+        assert ack["failed"] == []
+        received = []
+        for _ in events:
+            frame = _drain_until(listener, lambda f: f.get("type") == "data")
+            assert frame is not None
+            assert frame["id"] == "sub-batch"
+            assert isinstance(frame["event"], str)
+            received.append(frame["event"])
+        assert sorted(received) == sorted(events)
+        assert _drain_until(listener, lambda f: f.get("type") == "data", timeout=0.2) is None
+    finally:
+        listener.close()
+        if publisher is not None:
+            publisher.close()

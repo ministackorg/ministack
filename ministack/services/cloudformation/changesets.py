@@ -43,6 +43,7 @@ from .helpers import (
     _page,
     _request_problems,
     _resolve_template,
+    _sdk_error,
     _xml,
     enum_problems,
     stack_name_problems,
@@ -98,13 +99,6 @@ def _extract_resources_to_import(params):
 # AWS's answer when a ResourceIdentifier names nothing, for the types that do
 # not answer with a message of their own.
 _IMPORT_NOT_FOUND = "Resource of type '{type}' with identifier '{value}' was not found."
-
-
-def _sdk_error(message, service, status, request_id=None):
-    """A service error as the import's resource handler words it in the
-    StatusReason: the service's own message, then its SDK's suffix."""
-    return (f"{message} (Service: {service}, Status Code: {status}, "
-            f"Request ID: {request_id or new_uuid()}) (SDK Attempt Count: 1)")
 
 
 def _queue_import_problem(url):
@@ -808,6 +802,7 @@ def _create_change_set(params):
         "_resources_to_import": resources_to_import,
         "_import_existing": {e["LogicalResourceId"]: e["ResourceIdentifier"] for e in existing},
         "ImportExistingResources": import_existing,
+        "_disable_validation": _p(params, "DisableValidation", "false").lower() == "true",
     }
     _change_sets[cs_id] = change_set
 
@@ -1022,6 +1017,7 @@ def _execute_change_set(params):
     status_prefix = "UPDATE" if is_update else "CREATE"
     if not is_update:
         stack["DisableRollback"] = disable_rollback
+    stack["_disable_validation"] = cs.get("_disable_validation", False)
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body

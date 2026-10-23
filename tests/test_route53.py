@@ -1,7 +1,11 @@
+import os
 import time
+import uuid
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 def test_route53_create_and_get_hosted_zone(r53):
@@ -686,3 +690,246 @@ def test_unicode_route53_zone_comment(r53):
     zone_id = resp["HostedZone"]["Id"].split("/")[-1]
     get = r53.get_hosted_zone(Id=zone_id)
     assert get["HostedZone"]["Config"]["Comment"] == "zona en español — Ünïcödé"
+
+
+
+# ─── private hosted zones ─────────────────────────────────────────────────────
+
+_VPC_A = {"VPCRegion": "us-east-1", "VPCId": "vpc-0123456789abcdef0"}
+_VPC_B = {"VPCRegion": "us-west-2", "VPCId": "vpc-0fedcba9876543210"}
+
+
+def _assert_error(exc, code, status):
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == status
+
+
+@pytest.fixture
+def private_zone(r53):
+    """Factory for private zones, deleted after the test even when it fails."""
+    created = []
+
+    def create(name=None, vpc=_VPC_A, caller_ref=None):
+        resp = r53.create_hosted_zone(
+            Name=name or f"pz-{uuid.uuid4().hex[:8]}.example.internal",
+            CallerReference=caller_ref or str(uuid.uuid4()), VPC=vpc)
+        created.append(resp["HostedZone"]["Id"].split("/")[-1])
+        return resp
+
+    yield create
+    for zone_id in created:
+        try:
+            r53.delete_hosted_zone(Id=zone_id)
+        except ClientError:
+            pass
+
+
+def test_route53_private_zone_create_returns_vpc(r53, private_zone):
+    created = private_zone()
+    assert created["ResponseMetadata"]["HTTPStatusCode"] == 201
+    assert created["HostedZone"]["Config"]["PrivateZone"] is True
+    assert created["VPC"] == _VPC_A
+    assert "DelegationSet" not in created
+
+    got = r53.get_hosted_zone(Id=created["HostedZone"]["Id"].split("/")[-1])
+    assert got["HostedZone"]["Config"]["PrivateZone"] is True
+    assert got["VPCs"] == [_VPC_A]
+    assert "DelegationSet" not in got
+
+
+def test_route53_private_zone_caller_reference_replay(r53, private_zone):
+    ref = str(uuid.uuid4())
+    first = private_zone(caller_ref=ref)
+    replay = r53.create_hosted_zone(
+        Name=first["HostedZone"]["Name"], CallerReference=ref, VPC=_VPC_A)
+    assert replay["ResponseMetadata"]["HTTPStatusCode"] == 201
+    assert replay["HostedZone"]["Id"] == first["HostedZone"]["Id"]
+    assert replay["VPC"] == _VPC_A
+    assert "DelegationSet" not in replay
+    change_id = replay["ChangeInfo"]["Id"].split("/")[-1]
+    assert r53.get_change(Id=change_id)["ChangeInfo"]["Id"] == replay["ChangeInfo"]["Id"]
+
+
+def test_route53_public_zone_has_no_vpcs(r53):
+    created = r53.create_hosted_zone(Name="public-assoc.example.com", CallerReference=str(uuid.uuid4()))
+    zone_id = created["HostedZone"]["Id"].split("/")[-1]
+    try:
+        assert "DelegationSet" in created and "VPC" not in created
+        got = r53.get_hosted_zone(Id=zone_id)
+        assert got["HostedZone"]["Config"]["PrivateZone"] is False
+        assert "VPCs" not in got and "DelegationSet" in got
+        with pytest.raises(ClientError) as exc:
+            r53.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_A)
+        _assert_error(exc, "PublicZoneVPCAssociation", 400)
+        with pytest.raises(ClientError) as exc:
+            r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_A)
+        _assert_error(exc, "VPCAssociationNotFound", 404)
+    finally:
+        r53.delete_hosted_zone(Id=zone_id)
+
+
+def test_route53_private_zone_associate_and_disassociate(r53, private_zone):
+    zone_id = private_zone()["HostedZone"]["Id"].split("/")[-1]
+    resp = r53.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B, Comment="second")
+    assert resp["ChangeInfo"]["Comment"] == "second"
+    assert r53.get_change(Id=resp["ChangeInfo"]["Id"].split("/")[-1])["ChangeInfo"]["Status"] in (
+        "PENDING", "INSYNC")
+    assert r53.get_hosted_zone(Id=zone_id)["VPCs"] == [_VPC_A, _VPC_B]
+
+    with pytest.raises(ClientError) as exc:
+        r53.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B)
+    _assert_error(exc, "ConflictingDomainExists", 400)
+
+    r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B)
+    assert r53.get_hosted_zone(Id=zone_id)["VPCs"] == [_VPC_A]
+    with pytest.raises(ClientError) as exc:
+        r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B)
+    _assert_error(exc, "VPCAssociationNotFound", 404)
+    with pytest.raises(ClientError) as exc:
+        r53.disassociate_vpc_from_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_A)
+    _assert_error(exc, "LastVPCAssociation", 400)
+    # The same VPC id in another region is a different VPC.
+    with pytest.raises(ClientError) as exc:
+        r53.disassociate_vpc_from_hosted_zone(
+            HostedZoneId=zone_id, VPC={"VPCRegion": "eu-west-1", "VPCId": _VPC_A["VPCId"]})
+    _assert_error(exc, "VPCAssociationNotFound", 404)
+
+
+def test_route53_private_zone_same_name_conflicts_on_shared_vpc(r53, private_zone):
+    name = f"dup-{uuid.uuid4().hex[:8]}.example.internal"
+    private_zone(name=name)
+    with pytest.raises(ClientError) as exc:
+        r53.create_hosted_zone(Name=name, CallerReference=str(uuid.uuid4()), VPC=_VPC_A)
+    _assert_error(exc, "ConflictingDomainExists", 400)
+
+    other_id = private_zone(name=name, vpc=_VPC_B)["HostedZone"]["Id"].split("/")[-1]
+    with pytest.raises(ClientError) as exc:
+        r53.associate_vpc_with_hosted_zone(HostedZoneId=other_id, VPC=_VPC_A)
+    _assert_error(exc, "ConflictingDomainExists", 400)
+
+
+@pytest.mark.parametrize("operation", ["associate_vpc_with_hosted_zone", "disassociate_vpc_from_hosted_zone"])
+def test_route53_vpc_association_unknown_zone(r53, operation):
+    with pytest.raises(ClientError) as exc:
+        getattr(r53, operation)(HostedZoneId="ZNOSUCHZONE0001", VPC=_VPC_A)
+    _assert_error(exc, "NoSuchHostedZone", 404)
+
+
+@pytest.mark.parametrize("vpc,code", [
+    ({"VPCRegion": "us-east-1", "VPCId": "not-a-vpc"}, "InvalidVPCId"),
+    ({"VPCRegion": "us-east-1"}, "InvalidVPCId"),
+    ({"VPCId": "vpc-0123456789abcdef0"}, "InvalidInput"),
+])
+def test_route53_private_zone_rejects_incomplete_vpc(r53, private_zone, vpc, code):
+    with pytest.raises(ClientError) as exc:
+        r53.create_hosted_zone(Name="bad-vpc.example.internal", CallerReference=str(uuid.uuid4()), VPC=vpc)
+    _assert_error(exc, code, 400)
+    zone_id = private_zone()["HostedZone"]["Id"].split("/")[-1]
+    with pytest.raises(ClientError) as exc:
+        r53.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=vpc)
+    _assert_error(exc, code, 400)
+
+
+def test_route53_private_zone_flag_without_vpc_is_accepted(r53):
+    """MiniStack keeps accepting PrivateZone=true with no VPC (Cloud Map relies on it)."""
+    created = r53.create_hosted_zone(
+        Name="flag-only.example.internal", CallerReference=str(uuid.uuid4()),
+        HostedZoneConfig={"PrivateZone": True})
+    zone_id = created["HostedZone"]["Id"].split("/")[-1]
+    try:
+        assert created["HostedZone"]["Config"]["PrivateZone"] is True
+        assert r53.get_hosted_zone(Id=zone_id)["VPCs"] == []
+    finally:
+        r53.delete_hosted_zone(Id=zone_id)
+
+
+def test_route53_private_zone_delete(r53):
+    zone_id = r53.create_hosted_zone(
+        Name="delete-private.example.internal", CallerReference=str(uuid.uuid4()),
+        VPC=_VPC_A)["HostedZone"]["Id"].split("/")[-1]
+    r53.delete_hosted_zone(Id=zone_id)
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id=zone_id)
+    _assert_error(exc, "NoSuchHostedZone", 404)
+    assert zone_id not in [
+        s["HostedZoneId"] for s in r53.list_hosted_zones_by_vpc(**_VPC_A)["HostedZoneSummaries"]]
+
+
+def test_route53_list_hosted_zones_by_vpc_paginates(r53, private_zone):
+    vpc = {"VPCRegion": "eu-central-1", "VPCId": f"vpc-{uuid.uuid4().hex[:17]}"}
+    ids = sorted(private_zone(vpc=vpc)["HostedZone"]["Id"].split("/")[-1] for _ in range(3))
+    first = r53.list_hosted_zones_by_vpc(VPCId=vpc["VPCId"], VPCRegion=vpc["VPCRegion"], MaxItems="2")
+    assert [s["HostedZoneId"] for s in first["HostedZoneSummaries"]] == ids[:2]
+    assert first["MaxItems"] == "2"
+    assert first["HostedZoneSummaries"][0]["Owner"]["OwningAccount"]
+    second = r53.list_hosted_zones_by_vpc(
+        VPCId=vpc["VPCId"], VPCRegion=vpc["VPCRegion"], MaxItems="2", NextToken=first["NextToken"])
+    assert [s["HostedZoneId"] for s in second["HostedZoneSummaries"]] == ids[2:]
+    assert "NextToken" not in second
+
+
+def test_route53_list_hosted_zones_by_vpc_filters_and_validates(r53, private_zone):
+    vpc = {"VPCRegion": "ap-south-1", "VPCId": f"vpc-{uuid.uuid4().hex[:17]}"}
+    zone_id = private_zone(vpc=vpc)["HostedZone"]["Id"].split("/")[-1]
+    match = r53.list_hosted_zones_by_vpc(VPCId=vpc["VPCId"], VPCRegion=vpc["VPCRegion"])
+    assert [s["HostedZoneId"] for s in match["HostedZoneSummaries"]] == [zone_id]
+    # Same VPC id, other region: no match.
+    other = r53.list_hosted_zones_by_vpc(VPCId=vpc["VPCId"], VPCRegion="us-east-2")
+    assert other["HostedZoneSummaries"] == []
+    assert "NextToken" not in other
+    with pytest.raises(ClientError) as exc:
+        r53.list_hosted_zones_by_vpc(VPCId=vpc["VPCId"], VPCRegion=vpc["VPCRegion"], NextToken="bogus")
+    _assert_error(exc, "InvalidPaginationToken", 400)
+
+
+def test_route53_list_hosted_zones_by_vpc_requires_region():
+    # botocore enforces VPCRegion client-side; turn that off to reach the server.
+    client = make_client("route53", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        client.list_hosted_zones_by_vpc(VPCId=_VPC_A["VPCId"])
+    _assert_error(exc, "InvalidInput", 400)
+
+
+def test_route53_private_zones_are_account_scoped(r53, private_zone):
+    vpc = {"VPCRegion": "us-east-1", "VPCId": f"vpc-{uuid.uuid4().hex[:17]}"}
+    zone_id = private_zone(vpc=vpc)["HostedZone"]["Id"].split("/")[-1]
+    other = boto3.client(
+        "route53", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name="us-east-1", aws_access_key_id="222233334444", aws_secret_access_key="test")
+    assert other.list_hosted_zones_by_vpc(**vpc)["HostedZoneSummaries"] == []
+    with pytest.raises(ClientError) as exc:
+        other.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B)
+    _assert_error(exc, "NoSuchHostedZone", 404)
+    assert r53.get_hosted_zone(Id=zone_id)["VPCs"] == [vpc]
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "other-zone"])
+def test_route53_associate_vpc_permission_contract(auth_enabled, iam_user, private_zone, permission):
+    zone_id = private_zone()["HostedZone"]["Id"].split("/")[-1]
+    statements = []
+    if permission != "none":
+        resource_zone = "ZOTHERZONE0001" if permission == "other-zone" else zone_id
+        statements.append({"Effect": "Allow", "Action": "route53:AssociateVPCWithHostedZone",
+                           "Resource": f"arn:aws:route53:::hostedzone/{resource_zone}"})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client("route53")
+    if auth_enabled and permission != "allow":
+        with pytest.raises(ClientError) as exc:
+            client.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B)
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        resp = client.associate_vpc_with_hosted_zone(HostedZoneId=zone_id, VPC=_VPC_B)
+        assert resp["ChangeInfo"]["Status"] in ("PENDING", "INSYNC")
+
+
+@pytest.mark.auth_contract
+def test_route53_list_hosted_zones_by_vpc_permission_contract(auth_enabled, iam_user):
+    client = iam_user().client("route53")
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_hosted_zones_by_vpc(**_VPC_A)
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    else:
+        assert "HostedZoneSummaries" in client.list_hosted_zones_by_vpc(**_VPC_A)

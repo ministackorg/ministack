@@ -63,6 +63,10 @@ class SchemaUnavailable(Exception):
     """The API has no usable schema, so nothing can be validated or executed."""
 
 
+class QuerySyntaxError(Exception):
+    """The request's query is not a parseable GraphQL document."""
+
+
 def build_api_schema(api_id: str, sdl: str) -> GraphQLSchema:
     """Build (and cache) the executable schema for an API."""
     key = (len(sdl), hash(sdl))
@@ -121,7 +125,7 @@ def execute(api_id, sdl, query, variables, operation_name, field_resolver, conte
     try:
         document = parse(query)
     except GraphQLError as exc:
-        return None, _as_appsync_errors([exc])
+        raise QuerySyntaxError(exc.message) from exc
 
     # Validation is the step the regex could never do: an unknown field or a
     # mistyped variable is refused here instead of resolving to null.

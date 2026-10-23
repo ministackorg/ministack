@@ -1,4 +1,6 @@
+import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -9,10 +11,26 @@ import uuid
 import uuid as _uuid_mod
 from datetime import datetime
 from urllib.parse import urlparse
+from xml.etree import ElementTree
 
+import boto3
 import pytest
+import requests
+from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import make_client, patch_endpoint_dns, sqs_policy_allow_s3
+from conftest import (
+    inprocess_iam_user,
+    make_client,
+    patch_endpoint_dns,
+    routed_request,
+    second_access_key,
+    sqs_policy_allow_s3,
+)
+
+from ministack.core.responses import AccountScopedDict, request_scope
+from ministack.services import iam as _iam_mod
+from ministack.services import s3 as _s3_mod
+from ministack.services import sts as _sts_mod
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -829,28 +847,119 @@ def test_s3_get_bucket_location_us_east_1_is_none(s3):
     loc = s3.get_bucket_location(Bucket=bkt)
     assert loc["LocationConstraint"] is None
 
-def test_s3_get_bucket_location_defaults_to_signing_region(s3):
-    """A bucket created WITHOUT CreateBucketConfiguration lands in the region
-    the request was signed for — GetBucketLocation must echo that region."""
-    import boto3
-    from botocore.config import Config
+def _create_bucket_error(client, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        client.create_bucket(**kwargs)
+    return exc.value.response
 
-    west_s3 = boto3.client(
-        "s3",
-        endpoint_url=ENDPOINT,
-        aws_access_key_id="test",
-        aws_secret_access_key="test",
-        region_name="eu-west-1",
-        config=Config(
-            region_name="eu-west-1",
-            retries={"mode": "standard"},
-            max_pool_connections=50,
-        ),
-    )
+
+def test_s3_location_constraint_required_outside_us_east_1(s3):
+    """A regional endpoint other than us-east-1 refuses CreateBucket without a
+    LocationConstraint naming its own region (observed on AWS 2026-10-12)."""
+    euw1 = _regional_client("s3", "eu-west-1")
     bkt = f"intg-s3-loc-signing-{_uuid_mod.uuid4().hex[:8]}"
-    west_s3.create_bucket(Bucket=bkt)
-    loc = west_s3.get_bucket_location(Bucket=bkt)
-    assert loc["LocationConstraint"] == "eu-west-1"
+    resp = _create_bucket_error(euw1, Bucket=bkt)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+    assert resp["Error"]["Message"] == ("The unspecified location constraint is incompatible for the "
+                                        "region specific endpoint this request was sent to.")
+
+    resp = _create_bucket_error(euw1, Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+    assert resp["Error"]["Message"] == ("The us-west-2 location constraint is incompatible for the "
+                                        "region specific endpoint this request was sent to.")
+    with pytest.raises(ClientError):
+        s3.head_bucket(Bucket=bkt)
+
+    euw1.create_bucket(Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    try:
+        assert euw1.get_bucket_location(Bucket=bkt)["LocationConstraint"] == "eu-west-1"
+        # The constraint check precedes BucketAlreadyOwnedByYou.
+        resp = _create_bucket_error(euw1, Bucket=bkt)
+        assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+        resp = _create_bucket_error(euw1, Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+        assert resp["Error"]["Code"] == "BucketAlreadyOwnedByYou"
+        assert resp["Error"]["BucketName"] == bkt
+    finally:
+        euw1.delete_bucket(Bucket=bkt)
+
+
+def test_s3_location_constraint_eu_is_eu_west_1(s3):
+    """EU is the legacy LocationConstraint for eu-west-1: eu-west-1 accepts it
+    and GetBucketLocation answers EU, other regional endpoints refuse it
+    (observed on AWS 2026-10-20)."""
+    euw1 = _regional_client("s3", "eu-west-1")
+    bkt = f"intg-s3-loc-eu-{_uuid_mod.uuid4().hex[:8]}"
+    euw1.create_bucket(Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "EU"})
+    try:
+        assert euw1.get_bucket_location(Bucket=bkt)["LocationConstraint"] == "EU"
+        euw1.put_object(Bucket=bkt, Key="k", Body=b"x")
+        assert euw1.get_object(Bucket=bkt, Key="k")["Body"].read() == b"x"
+    finally:
+        euw1.delete_object(Bucket=bkt, Key="k")
+        euw1.delete_bucket(Bucket=bkt)
+
+    euc1 = _regional_client("s3", "eu-central-1")
+    resp = _create_bucket_error(euc1, Bucket=f"intg-s3-loc-eu-c1-{_uuid_mod.uuid4().hex[:8]}",
+                                CreateBucketConfiguration={"LocationConstraint": "EU"})
+    assert resp["Error"]["Code"] == "IllegalLocationConstraintException"
+    assert resp["Error"]["Message"] == ("The EU location constraint is incompatible for the "
+                                        "region specific endpoint this request was sent to.")
+
+
+def test_s3_location_constraint_us_east_1_is_invalid(s3):
+    bkt = f"intg-s3-loc-use1-{_uuid_mod.uuid4().hex[:8]}"
+    for client in (s3, _regional_client("s3", "eu-west-1")):
+        resp = _create_bucket_error(client, Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "us-east-1"})
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert resp["Error"]["Code"] == "InvalidLocationConstraint"
+        assert resp["Error"]["Message"] == "The specified location-constraint is not valid"
+        assert resp["Error"]["LocationConstraint"] == "us-east-1"
+
+
+def test_s3_location_constraint_internal_callers_unchanged():
+    """Internal callers (Glue warehouse, Transcribe) pass no endpoint region and
+    keep landing the bucket in the request region without a constraint."""
+    import contextvars
+
+    from ministack.core.responses import set_request_region
+    from ministack.services import s3 as s3_svc
+
+    name = f"intg-s3-loc-internal-{_uuid_mod.uuid4().hex[:8]}"
+
+    def create_in_eu_west_1():
+        set_request_region("eu-west-1")
+        try:
+            assert s3_svc._create_bucket(name, b"", {})[0] == 200
+            assert s3_svc.bucket_region(name) == "eu-west-1"
+        finally:
+            s3_svc._buckets.pop(name, None)
+
+    contextvars.copy_context().run(create_in_eu_west_1)
+
+
+def test_s3_location_constraint_bucket_already_exists_names_bucket(s3):
+    import boto3
+
+    other = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1",
+                         aws_access_key_id="111122223333", aws_secret_access_key="test")
+    bkt = f"intg-s3-loc-taken-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    try:
+        resp = _create_bucket_error(other, Bucket=bkt)
+        assert resp["Error"]["Code"] == "BucketAlreadyExists"
+        assert resp["Error"]["BucketName"] == bkt
+    finally:
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_location_constraint_us_east_1_endpoint_accepts_any_region(s3):
+    bkt = f"intg-s3-loc-any-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, CreateBucketConfiguration={"LocationConstraint": "ap-southeast-2"})
+    try:
+        assert s3.get_bucket_location(Bucket=bkt)["LocationConstraint"] == "ap-southeast-2"
+    finally:
+        _regional_client("s3", "ap-southeast-2").delete_bucket(Bucket=bkt)
 
 def test_s3_create_bucket_without_tags_has_no_tag_set(s3):
     """A CreateBucket with no tags must not create an empty tag set — a
@@ -1077,6 +1186,49 @@ def test_s3_control_list_tags_via_s3_control_host(s3):
     assert "env" in body
     assert "test" in body
 
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("bucket,operation,action,reason", [
+    ("other", "list_tags_for_resource", "ListTagsForResource", None),
+    ("other", "tag_resource", "TagResource", None),
+    ("other", "untag_resource", "UntagResource", None),
+    ("allowed", "untag_resource", "UntagResource", "with an explicit deny in an identity-based policy"),
+], ids=["list", "tag", "untag", "explicit-deny"])
+def test_s3_control_tagging_authorization_contract(auth_enabled, iam_user, s3, bucket, operation, action, reason):
+    """S3 Control tagging calls are authorized as s3:<operation> on the bucket."""
+    name = f"s3c-auth-{_uuid_mod.uuid4().hex[:8]}"
+    for suffix in ("allowed", "other"):
+        s3.create_bucket(Bucket=f"{name}-{suffix}")
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["s3:ListTagsForResource", "s3:TagResource"],
+             "Resource": f"arn:aws:s3:::{name}-allowed"},
+            {"Effect": "Deny", "Action": "s3:UntagResource", "Resource": f"arn:aws:s3:::{name}-allowed"},
+        ]})
+        control = user.client("s3control", config=Config(inject_host_prefix=False))
+        allowed = f"arn:aws:s3:::{name}-allowed"
+        control.tag_resource(AccountId="000000000000", ResourceArn=allowed, Tags=[{"Key": "k", "Value": "v"}])
+        assert control.list_tags_for_resource(AccountId="000000000000", ResourceArn=allowed)["Tags"] == [
+            {"Key": "k", "Value": "v"}]
+        arn = f"arn:aws:s3:::{name}-{bucket}"
+        params = {"tag_resource": {"Tags": [{"Key": "k", "Value": "v"}]}, "untag_resource": {"TagKeys": ["k"]}}
+        call = getattr(control, operation)
+        if not auth_enabled:
+            call(AccountId="000000000000", ResourceArn=arn, **params.get(operation, {}))
+            return
+        with pytest.raises(ClientError) as exc:
+            call(AccountId="000000000000", ResourceArn=arn, **params.get(operation, {}))
+        reason = reason or f"because no identity-based policy allows the s3:{action} action"
+        response = exc.value.response
+        assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (403, "AccessDenied")
+        assert response["Error"]["Message"] == (
+            f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" {reason}')
+        assert response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == "application/xml"
+    finally:
+        for suffix in ("allowed", "other"):
+            s3.delete_bucket(Bucket=f"{name}-{suffix}")
+
+
 class TestS3VhostGetPutObject:
     """
     Ensure vhost style and path style requests work correctly.
@@ -1165,6 +1317,50 @@ def test_s3_bucket_policy(s3):
     stored = json.loads(resp["Policy"])
     assert stored["Version"] == "2012-10-17"
     assert len(stored["Statement"]) == 1
+
+
+def _policy_bucket(effect, principal):
+    """A bucket with one object and a bucket policy statement on s3:GetObject."""
+    bucket = f"rp-{uuid.uuid4().hex[:10]}"
+    assert _lock_call("PUT", f"/{bucket}")[0] == 200
+    assert _lock_call("PUT", f"/{bucket}/k", body=b"x")[0] == 200
+    policy = {"Version": "2012-10-17", "Statement": [{
+        "Effect": effect, "Principal": {"AWS": principal}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*"}]}
+    assert _lock_call("PUT", f"/{bucket}", body=json.dumps(policy).encode(), query={"policy": [""]})[0] == 204
+    return bucket
+
+
+_ALLOW_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+
+
+def test_bucket_policy_naming_the_user_allows_without_identity_policy(auth):
+    key, user = inprocess_iam_user()
+    bucket = _policy_bucket("Allow", user)
+    assert routed_request(key, "s3", "GET", f"/{bucket}/k")[0] == 200
+
+
+def test_bucket_policy_naming_the_account_needs_an_identity_policy(auth):
+    bucket = _policy_bucket("Allow", "arn:aws:iam::000000000000:root")
+    key, _user = inprocess_iam_user()
+    status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/k")
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    key, _user = inprocess_iam_user(_ALLOW_S3)
+    assert routed_request(key, "s3", "GET", f"/{bucket}/k")[0] == 200
+
+
+def test_bucket_policy_deny_beats_an_identity_allow(auth):
+    import xml.etree.ElementTree as ET
+
+    key, user = inprocess_iam_user(_ALLOW_S3)
+    bucket = _policy_bucket("Deny", user)
+    status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/k")
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    assert ET.fromstring(body).findtext("Message") == (
+        f'User: {user} is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::{bucket}/k" '
+        "with an explicit deny in a resource-based policy")
+    assert routed_request(key, "s3", "PUT", f"/{bucket}/k2", b"y")[0] == 200
+
 
 def test_s3_object_tagging(s3):
     bkt = "intg-s3-objtags"
@@ -1272,6 +1468,135 @@ def test_s3_public_access_block(s3):
         s3.get_public_access_block(Bucket=bkt)
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
 
+
+def test_s3_block_public_policy_refuses_a_public_bucket_policy(s3):
+    bkt = f"intg-s3-bpp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    def policy(**extra):
+        return json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bkt}/*", **extra}]})
+
+    try:
+        s3.put_bucket_policy(Bucket=bkt, Policy=policy())
+        s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={
+            "BlockPublicAcls": False, "IgnorePublicAcls": False,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": False})
+        # The policy set before the setting stays.
+        assert json.loads(s3.get_bucket_policy(Bucket=bkt)["Policy"]) == json.loads(policy())
+        for public in (policy(), policy(Condition={"StringLike": {"aws:SourceVpc": "vpc-*"}})):
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_policy(Bucket=bkt, Policy=public)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        s3.put_bucket_policy(Bucket=bkt, Policy=policy(
+            Condition={"StringEquals": {"aws:SourceVpc": "vpc-91237329"}}))
+    finally:
+        s3.delete_public_access_block(Bucket=bkt)
+        s3.delete_bucket_policy(Bucket=bkt)
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_block_public_acls_refuses_setting_a_public_acl(s3):
+    """BlockPublicAcls refuses every call that sets a public ACL; private grants and IgnorePublicAcls alone pass."""
+    import requests
+
+    bkt = f"bpa-acl-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(s3, bkt)
+    s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    all_users = "http://acs.amazonaws.com/groups/global/AllUsers"
+    public_policy = {"Owner": {"ID": owner_id}, "Grants": [
+        {"Grantee": {"Type": "Group", "URI": all_users}, "Permission": "READ"}]}
+    s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={"BlockPublicAcls": True})
+    try:
+        for call, kwargs in (
+            (s3.put_object, {"Key": "n", "Body": b"n", "ACL": "public-read"}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "ACL": "authenticated-read"}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "GrantRead": f'uri="{all_users}"'}),
+            (s3.put_object_acl, {"Key": "k", "ACL": "public-read"}),
+            (s3.put_object_acl, {"Key": "k", "GrantRead": f'uri="{all_users}"'}),
+            (s3.put_object_acl, {"Key": "k", "AccessControlPolicy": public_policy}),
+            (s3.copy_object, {"Key": "c", "CopySource": {"Bucket": bkt, "Key": "k"}, "ACL": "public-read"}),
+            (s3.create_multipart_upload, {"Key": "m", "ACL": "public-read"}),
+            (s3.put_bucket_acl, {"ACL": "authenticated-read"}),
+            (s3.put_bucket_acl, {"AccessControlPolicy": public_policy}),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=bkt, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied", kwargs
+            assert "BlockPublicAcls" in exc.value.response["Error"]["Message"]
+        post = s3.generate_presigned_post(
+            Bucket=bkt, Key="p", Fields={"acl": "public-read"}, Conditions=[{"acl": "public-read"}])
+        assert requests.post(post["url"], data=post["fields"], files={"file": ("p", b"x")}).status_code == 403
+        assert s3.list_objects_v2(Bucket=bkt)["KeyCount"] == 1
+
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", ACL="bucket-owner-full-control")
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", GrantRead=f'id="{owner_id}"')
+        s3.put_object_acl(Bucket=bkt, Key="k", ACL="private")
+        s3.put_bucket_acl(Bucket=bkt, ACL="log-delivery-write")
+        assert not any("URI" in g["Grantee"] and g["Grantee"]["URI"].endswith("/global/AllUsers")
+                       for g in s3.get_object_acl(Bucket=bkt, Key="k")["Grants"])
+
+        s3.put_public_access_block(Bucket=bkt, PublicAccessBlockConfiguration={"IgnorePublicAcls": True})
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", ACL="public-read")
+    finally:
+        _purge_foreign(s3, bkt)
+
+
+def test_s3_bucket_owner_enforced_refuses_acls(s3):
+    """With ACLs disabled every ACL write is refused; object writes and CreateBucket keep an owner-only ACL."""
+    import requests
+
+    bkt = f"boe-acl-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="k", Body=b"x")
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    owner, source = f'id="{owner_id}"', {"Bucket": bkt, "Key": "k"}
+    owner_policy = {"Owner": {"ID": owner_id}, "Grants": [
+        {"Grantee": {"Type": "CanonicalUser", "ID": owner_id}, "Permission": "FULL_CONTROL"}]}
+    try:
+        for kwargs in ({"ACL": "public-read"}, {"ACL": "log-delivery-write"}, {"GrantRead": owner}):
+            with pytest.raises(ClientError) as exc:
+                s3.create_bucket(Bucket=f"{bkt}-x", **kwargs)
+            assert exc.value.response["Error"]["Code"] == "InvalidBucketAclWithObjectOwnership", kwargs
+        for kwargs in ({"ACL": "private"}, {"GrantFullControl": owner}):
+            s3.create_bucket(Bucket=f"{bkt}-x", **kwargs)
+            s3.delete_bucket(Bucket=f"{bkt}-x")
+
+        for call, kwargs in (
+            (s3.put_bucket_acl, {"ACL": "private"}),
+            (s3.put_bucket_acl, {"ACL": "log-delivery-write"}),
+            (s3.put_bucket_acl, {"AccessControlPolicy": owner_policy}),
+            (s3.put_object_acl, {"Key": "k", "ACL": "bucket-owner-full-control"}),
+            (s3.put_object_acl, {"Key": "k", "AccessControlPolicy": owner_policy}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "ACL": "public-read"}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "ACL": "aws-exec-read"}),
+            (s3.put_object, {"Key": "n", "Body": b"n", "GrantRead": owner}),
+            (s3.copy_object, {"Key": "c", "CopySource": source, "ACL": "public-read"}),
+            (s3.create_multipart_upload, {"Key": "m", "GrantRead": owner}),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=bkt, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "AccessControlListNotSupported", kwargs
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        post = s3.generate_presigned_post(
+            Bucket=bkt, Key="p", Fields={"acl": "public-read"}, Conditions=[{"acl": "public-read"}])
+        assert requests.post(post["url"], data=post["fields"], files={"file": ("p", b"x")}).status_code == 400
+        assert s3.list_objects_v2(Bucket=bkt)["KeyCount"] == 1
+
+        for acl in ("private", "bucket-owner-read", "bucket-owner-full-control"):
+            s3.put_object(Bucket=bkt, Key="n", Body=b"n", ACL=acl)
+        s3.put_object(Bucket=bkt, Key="n", Body=b"n", GrantFullControl=owner)
+        s3.copy_object(Bucket=bkt, Key="c", CopySource=source, ACL="private")
+        upload = s3.create_multipart_upload(Bucket=bkt, Key="m", ACL="bucket-owner-full-control")
+        s3.abort_multipart_upload(Bucket=bkt, Key="m", UploadId=upload["UploadId"])
+        assert [g["Permission"] for g in s3.get_bucket_acl(Bucket=bkt)["Grants"]] == ["FULL_CONTROL"]
+        assert [g["Permission"] for g in s3.get_object_acl(Bucket=bkt, Key="k")["Grants"]] == ["FULL_CONTROL"]
+    finally:
+        _purge_foreign(s3, bkt)
+
 def test_s3_ownership_controls(s3):
     bkt = "intg-s3-ownership"
     s3.create_bucket(Bucket=bkt)
@@ -1368,45 +1693,32 @@ def test_s3_object_legal_hold(s3):
     assert resp["LegalHold"]["Status"] == "OFF"
 
 def test_s3_object_lock_prevents_delete(s3):
-    bkt = "intg-s3-lock-del"
-    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    s3.put_object(Bucket=bkt, Key="locked.txt", Body=b"immutable")
-
-    s3.put_object_legal_hold(
-        Bucket=bkt,
-        Key="locked.txt",
-        LegalHold={"Status": "ON"},
-    )
-    with pytest.raises(ClientError) as exc:
-        s3.delete_object(Bucket=bkt, Key="locked.txt")
-    assert exc.value.response["Error"]["Code"] == "AccessDenied"
-
-    # Remove legal hold, add governance retention
-    s3.put_object_legal_hold(
-        Bucket=bkt,
-        Key="locked.txt",
-        LegalHold={"Status": "OFF"},
-    )
+    """A delete naming a locked version is refused; a plain delete adds a delete marker (Object Lock docs)."""
     from datetime import datetime, timedelta, timezone
 
-    retain_until = datetime.now(timezone.utc) + timedelta(days=1)
-    s3.put_object_retention(
-        Bucket=bkt,
-        Key="locked.txt",
-        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until},
-    )
+    bkt = "intg-s3-lock-del"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    version = s3.put_object(Bucket=bkt, Key="locked.txt", Body=b"immutable")["VersionId"]
+    s3.put_object_legal_hold(Bucket=bkt, Key="locked.txt", LegalHold={"Status": "ON"})
     with pytest.raises(ClientError) as exc:
-        s3.delete_object(Bucket=bkt, Key="locked.txt")
+        s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version)
     assert exc.value.response["Error"]["Code"] == "AccessDenied"
 
-    # Bypass governance retention
-    s3.delete_object(
-        Bucket=bkt,
-        Key="locked.txt",
-        BypassGovernanceRetention=True,
-    )
+    marker = s3.delete_object(Bucket=bkt, Key="locked.txt")
+    assert marker["DeleteMarker"] is True
+    assert s3.get_object(Bucket=bkt, Key="locked.txt", VersionId=version)["Body"].read() == b"immutable"
+    assert s3.get_object_legal_hold(Bucket=bkt, Key="locked.txt", VersionId=version)["LegalHold"]["Status"] == "ON"
+
+    s3.put_object_legal_hold(Bucket=bkt, Key="locked.txt", VersionId=version, LegalHold={"Status": "OFF"})
+    retain_until = datetime.now(timezone.utc) + timedelta(days=1)
+    s3.put_object_retention(Bucket=bkt, Key="locked.txt", VersionId=version,
+                            Retention={"Mode": "GOVERNANCE", "RetainUntilDate": retain_until})
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    s3.delete_object(Bucket=bkt, Key="locked.txt", VersionId=version, BypassGovernanceRetention=True)
     with pytest.raises(ClientError):
-        s3.head_object(Bucket=bkt, Key="locked.txt")
+        s3.get_object(Bucket=bkt, Key="locked.txt", VersionId=version)
 
 def test_s3_bucket_replication(s3):
     src = "intg-s3-repl-src"
@@ -1524,17 +1836,20 @@ def test_s3_default_retention_applied(s3):
 def test_s3_batch_delete_enforces_lock(s3):
     bkt = "intg-s3-batch-lock"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
-    s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")
-    s3.put_object(Bucket=bkt, Key="b.txt", Body=b"b")
+    a_version = s3.put_object(Bucket=bkt, Key="a.txt", Body=b"a")["VersionId"]
+    b_version = s3.put_object(Bucket=bkt, Key="b.txt", Body=b"b")["VersionId"]
     s3.put_object_legal_hold(Bucket=bkt, Key="a.txt", LegalHold={"Status": "ON"})
     resp = s3.delete_objects(
         Bucket=bkt,
-        Delete={"Objects": [{"Key": "a.txt"}, {"Key": "b.txt"}]},
+        Delete={"Objects": [{"Key": "a.txt", "VersionId": a_version}, {"Key": "b.txt", "VersionId": b_version}]},
     )
     deleted_keys = [d["Key"] for d in resp.get("Deleted", [])]
     error_keys = [e["Key"] for e in resp.get("Errors", [])]
     assert "b.txt" in deleted_keys
     assert "a.txt" in error_keys
+    # Without a VersionId the locked key just gets a delete marker.
+    resp = s3.delete_objects(Bucket=bkt, Delete={"Objects": [{"Key": "a.txt"}]})
+    assert resp["Deleted"][0]["DeleteMarker"] is True
 
 def test_s3_copy_preserves_tags_and_lock(s3):
     src = "intg-s3-copy-tag-src"
@@ -3020,7 +3335,7 @@ def test_s3_bucket_acl_canned(s3):
     owner-only."""
     import uuid as _u
     bucket = f"acl-bkt-canned-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket, ACL="public-read")
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter", ACL="public-read")
     grants = s3.get_bucket_acl(Bucket=bucket)["Grants"]
     assert len(grants) == 2
     group = [g for g in grants if g["Grantee"]["Type"] == "Group"]
@@ -3052,7 +3367,7 @@ def test_s3_put_bucket_acl_xml_body(s3):
     """A well-formed AccessControlPolicy XML body is accepted and round-trips."""
     import uuid as _u
     bucket = f"acl-bkt-xml-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter")
     s3.put_bucket_acl(
         Bucket=bucket,
         AccessControlPolicy={
@@ -3081,6 +3396,62 @@ def test_s3_put_bucket_acl_xml_body(s3):
     perms = sorted(g["Permission"] for g in acl["Grants"])
     assert perms == ["FULL_CONTROL", "READ"]
     s3.delete_bucket(Bucket=bucket)
+
+def _grant_pairs(acl):
+    """``(ID or URI, permission)`` for each grant of a GetBucketAcl/GetObjectAcl response, in order."""
+    return [(g["Grantee"].get("ID") or g["Grantee"].get("URI"), g["Permission"]) for g in acl["Grants"]]
+
+
+def test_s3_bucket_acl_grant_headers(s3):
+    """x-amz-grant-* headers on CreateBucket and PutBucketAcl set exactly the grants they name."""
+    bucket = f"acl-bkt-grant-{uuid.uuid4().hex[:8]}"
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    other_id = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"
+    log_delivery = "http://acs.amazonaws.com/groups/s3/LogDelivery"
+    owner, other, logs = f'id="{owner_id}"', f'id="{other_id}"', f'uri="{log_delivery}"'
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="BucketOwnerPreferred", GrantFullControl=owner, GrantRead=other)
+    try:
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == [(other_id, "READ"), (owner_id, "FULL_CONTROL")]
+
+        s3.put_bucket_acl(Bucket=bucket, GrantFullControl=owner, GrantRead=f"{other}, {logs}", GrantWrite=logs,
+                          GrantReadACP=other, GrantWriteACP=logs)
+        expected = [(other_id, "READ"), (log_delivery, "READ"), (log_delivery, "WRITE"),
+                    (owner_id, "FULL_CONTROL"), (other_id, "READ_ACP"), (log_delivery, "WRITE_ACP")]
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == expected
+
+        policy = {"Owner": {"ID": owner_id}, "Grants": [
+            {"Grantee": {"Type": "CanonicalUser", "ID": owner_id}, "Permission": "FULL_CONTROL"}]}
+        for kwargs, code in (
+            ({"GrantRead": other, "ACL": "private"}, "InvalidRequest"),
+            ({"GrantRead": other, "AccessControlPolicy": policy}, "UnexpectedContent"),
+            ({"GrantRead": "bogus"}, "InvalidArgument"),
+            ({"GrantRead": 'id="abc"'}, "InvalidArgument"),
+            ({"GrantRead": 'uri="http://acs.amazonaws.com/groups/global/Nobody"'}, "InvalidArgument"),
+            ({"GrantRead": 'emailAddress="nobody@example.com"'}, "UnsupportedArgument"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_acl(Bucket=bucket, **kwargs)
+            assert exc.value.response["Error"]["Code"] == code, kwargs
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == expected
+
+        s3.put_bucket_acl(Bucket=bucket, GrantRead=f"ID={owner_id}")
+        assert _grant_pairs(s3.get_bucket_acl(Bucket=bucket)) == [(owner_id, "READ")]
+        with pytest.raises(ClientError) as exc:
+            s3.create_bucket(Bucket=f"{bucket}-x", ObjectOwnership="ObjectWriter", GrantRead="bogus")
+        assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+        # BucketOwnerEnforced, the default, disables ACLs: grant headers on an ACL write are refused.
+        s3.create_bucket(Bucket=f"{bucket}-e")
+        s3.put_object(Bucket=f"{bucket}-e", Key="k", Body=b"x")
+        for call, kwargs in ((s3.put_bucket_acl, {}), (s3.put_object_acl, {"Key": "k"})):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=f"{bucket}-e", GrantRead=other, **kwargs)
+            assert exc.value.response["Error"]["Code"] == "AccessControlListNotSupported"
+    finally:
+        s3.delete_bucket(Bucket=bucket)
+        s3.delete_object(Bucket=f"{bucket}-e", Key="k")
+        s3.delete_bucket(Bucket=f"{bucket}-e")
+
 
 def test_s3_range_suffix(s3):
     """Range: bytes=-N returns last N bytes."""
@@ -3785,7 +4156,7 @@ def test_s3_noncurrent_versions_keep_bytes_tags_and_acls_across_restart(s3_persi
     after a noncurrent version is purged under a delete marker."""
     s3mod = s3_persist
     bucket = "qa-s3-persist-history"
-    s3mod._create_bucket(bucket, b"")
+    s3mod._create_bucket(bucket, b"", {"x-amz-object-ownership": "ObjectWriter"})
     s3mod._bucket_versioning[bucket] = "Enabled"
     vids = [s3mod._put_object(bucket, "k", body, {"x-amz-tagging": f"n={body.decode()}"})[1]["x-amz-version-id"]
             for body in (b"one", b"two", b"three")]
@@ -4223,6 +4594,50 @@ def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_t
                 assert error is None
     finally:
         iam_svc._access_keys.pop_scoped(owner, None, key, None)
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("expires,skew,change,status,code", [
+    (604800, 0, None, None, None),
+    (604801, 0, None, 400, "AuthorizationQueryParametersError"),
+    (3600, 840, None, None, None),
+    (3600, 960, None, 403, "Request is not yet valid"),
+    (3600, 0, ("X-Amz-Expires", "abc"), 400, "X-Amz-Expires should be a number"),
+    (3600, 0, ("X-Amz-Date", "2026"), 400, "X-Amz-Date must be in the ISO8601 Long Format"),
+])
+def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, skew, change, status, code):
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import parse_qs, urlsplit
+
+    import boto3
+    import botocore.auth
+    from botocore.config import Config
+
+    from ministack import app as app_mod
+    from ministack.services import s3 as s3_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    client = boto3.client(
+        "s3", endpoint_url="http://localhost:4566", region_name="us-east-1",
+        aws_access_key_id="test", aws_secret_access_key="test", config=Config(signature_version="s3v4"),
+    )
+    signed_at = botocore.auth.get_current_datetime() + dt.timedelta(seconds=skew)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=signed_at):
+        url = urlsplit(client.generate_presigned_url(
+            "get_object", Params={"Bucket": "test-bucket", "Key": "object"}, ExpiresIn=expires))
+    query = parse_qs(url.query)
+    if change:
+        query[change[0]] = [change[1]]
+
+    error = s3_svc._verify_presigned_sigv4("GET", url.path, {"host": url.netloc}, query)
+
+    if auth_enabled and status:
+        assert error[0] == status and code in error[2].decode()
+    elif change:
+        assert b"SignatureDoesNotMatch" in error[2]
+    else:
+        assert error is None
 
 
 def test_presigned_mrap_resolves_alias_in_iam_owner_account(monkeypatch):
@@ -4986,7 +5401,7 @@ def test_s3_put_object_acl_canned(s3):
     """Canned ACL via x-amz-acl header is stored and round-trips via Get."""
     import uuid as _u
     bucket = f"acl-canned-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter")
     s3.put_object(Bucket=bucket, Key="k", Body=b"x")
     s3.put_object_acl(Bucket=bucket, Key="k", ACL="public-read")
     acl = s3.get_object_acl(Bucket=bucket, Key="k")
@@ -5032,7 +5447,7 @@ def test_s3_put_object_acl_xml_body(s3):
     """A well-formed AccessControlPolicy XML body is accepted and round-trips."""
     import uuid as _u
     bucket = f"acl-xml-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter")
     s3.put_object(Bucket=bucket, Key="k", Body=b"x")
     s3.put_object_acl(
         Bucket=bucket, Key="k",
@@ -5071,7 +5486,7 @@ def test_s3_object_acl_per_version(s3):
     default ACL while the addressed version keeps what was set."""
     import uuid as _u
     bucket = f"acl-ver-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter")
     s3.put_bucket_versioning(
         Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     v1 = s3.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
@@ -5101,7 +5516,7 @@ def test_s3_put_object_canned_acl_versioned(s3):
     """x-amz-acl on PutObject sticks to the version that PUT created."""
     import uuid as _u
     bucket = f"acl-put-ver-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter")
     s3.put_bucket_versioning(
         Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     v1 = s3.put_object(
@@ -5118,6 +5533,234 @@ def test_s3_put_object_canned_acl_versioned(s3):
     s3.delete_bucket(Bucket=bucket)
 
 
+def _grant_object_acl(client, bucket, key, grants, **kwargs):
+    """Replace an object's ACL with the owner's FULL_CONTROL plus ``(canonical ID, permission)`` grants."""
+    owner_id = client.list_buckets()["Owner"]["ID"]
+    client.put_object_acl(Bucket=bucket, Key=key, **kwargs, AccessControlPolicy={
+        "Owner": {"ID": owner_id},
+        "Grants": [{"Grantee": {"Type": "CanonicalUser", "ID": grantee}, "Permission": permission}
+                   for grantee, permission in [(owner_id, "FULL_CONTROL"), *grants]],
+    })
+
+
+def _acl_enabled_bucket(client, bucket):
+    """A bucket with ACLs enabled (BucketOwnerPreferred), so object ACLs take effect."""
+    client.create_bucket(Bucket=bucket)
+    client.put_bucket_ownership_controls(
+        Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]})
+
+
+def _denied(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"] in ("AccessDenied", "403")
+
+
+def test_s3_object_acl_grant_opens_reads_to_another_account(s3):
+    """Another account's READ grant opens GetObject and HeadObject only; BucketOwnerEnforced drops it."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"acl-xacct-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one")
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+
+        _grant_object_acl(owner, bucket, "k", [(reader.list_buckets()["Owner"]["ID"], "READ")])
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+        assert reader.head_object(Bucket=bucket, Key="k")["ContentLength"] == 3
+        assert _denied(reader.get_object_acl, Bucket=bucket, Key="k")
+        assert _denied(reader.get_object_tagging, Bucket=bucket, Key="k")
+        assert _denied(reader.put_object, Bucket=bucket, Key="k", Body=b"two")
+
+        owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={
+            "BlockPublicAcls": True, "IgnorePublicAcls": True,
+            "BlockPublicPolicy": True, "RestrictPublicBuckets": True})
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_bucket_ownership_controls(
+            Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="k")
+        owner.delete_bucket(Bucket=bucket)
+
+
+def test_s3_bucket_owner_enforced_needs_an_owner_only_bucket_acl(s3):
+    """BucketOwnerEnforced is refused while the bucket ACL grants others; object ACLs read as the owner's meanwhile."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"boe-switch-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    enforced = {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one", ACL="public-read")
+        owner.put_bucket_acl(Bucket=bucket, ACL="public-read")
+        with pytest.raises(ClientError) as exc:
+            owner.put_bucket_ownership_controls(Bucket=bucket, OwnershipControls=enforced)
+        assert exc.value.response["Error"]["Code"] == "InvalidBucketAclWithObjectOwnership"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert reader.list_objects_v2(Bucket=bucket)["KeyCount"] == 1
+
+        owner.put_bucket_acl(Bucket=bucket, ACL="private")
+        owner.put_bucket_ownership_controls(Bucket=bucket, OwnershipControls=enforced)
+        assert [g["Permission"] for g in owner.get_object_acl(Bucket=bucket, Key="k")["Grants"]] == ["FULL_CONTROL"]
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+
+        owner.put_bucket_ownership_controls(
+            Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "ObjectWriter"}]})
+        assert len(owner.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 2
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+    finally:
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_object_acl_grant_to_another_account_follows_the_version(s3):
+    """The grant stays on the version current when it was set; READ_ACP opens that version's ACL."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    reader_id = reader.list_buckets()["Owner"]["ID"]
+    bucket = f"acl-xacct-ver-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        v1 = owner.put_object(Bucket=bucket, Key="k", Body=b"one")["VersionId"]
+        _grant_object_acl(owner, bucket, "k", [(reader_id, "READ")])
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_object(Bucket=bucket, Key="k", Body=b"two")
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+        assert reader.get_object(Bucket=bucket, Key="k", VersionId=v1)["Body"].read() == b"one"
+        assert _denied(reader.get_object_acl, Bucket=bucket, Key="k", VersionId=v1)
+
+        _grant_object_acl(owner, bucket, "k", [(reader_id, "READ_ACP")], VersionId=v1)
+        grants = reader.get_object_acl(Bucket=bucket, Key="k", VersionId=v1)["Grants"]
+        assert {(g["Grantee"]["ID"], g["Permission"]) for g in grants} >= {(reader_id, "READ_ACP")}
+    finally:
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_object_grant_headers_set_the_object_acl(s3):
+    """x-amz-grant-* headers on PutObject and PutObjectAcl set the object ACL, which then answers reads."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    owner_id, reader_id = owner.list_buckets()["Owner"]["ID"], reader.list_buckets()["Owner"]["ID"]
+    bucket = f"acl-grant-hdr-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one", GrantRead=f'id="{reader_id}"')
+        assert _grant_pairs(owner.get_object_acl(Bucket=bucket, Key="k")) == [(reader_id, "READ")]
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_object_acl(Bucket=bucket, Key="k", GrantFullControl=f'id="{owner_id}"',
+                             GrantReadACP=f'id="{reader_id}"')
+        assert _grant_pairs(owner.get_object_acl(Bucket=bucket, Key="k")) == [
+            (owner_id, "FULL_CONTROL"), (reader_id, "READ_ACP")]
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+        assert _grant_pairs(reader.get_object_acl(Bucket=bucket, Key="k"))[1] == (reader_id, "READ_ACP")
+
+        policy = {"Owner": {"ID": owner_id}, "Grants": [
+            {"Grantee": {"Type": "CanonicalUser", "ID": owner_id}, "Permission": "FULL_CONTROL"}]}
+        grant = f'id="{reader_id}"'
+        for call, kwargs, code in (
+            (owner.put_object, {"Key": "n", "Body": b"x", "GrantRead": grant, "ACL": "private"}, "InvalidRequest"),
+            (owner.put_object, {"Key": "n", "Body": b"x", "GrantRead": "bogus"}, "InvalidArgument"),
+            (owner.put_object_acl, {"Key": "k", "GrantRead": grant, "ACL": "private"}, "InvalidRequest"),
+            (owner.put_object_acl, {"Key": "k", "GrantRead": grant, "AccessControlPolicy": policy},
+             "UnexpectedContent"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(Bucket=bucket, **kwargs)
+            assert exc.value.response["Error"]["Code"] == code, kwargs
+        assert owner.list_objects_v2(Bucket=bucket)["KeyCount"] == 1
+        assert len(owner.get_object_acl(Bucket=bucket, Key="k")["Grants"]) == 2
+    finally:
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_public_read_object_acl_opens_reads_to_another_account(s3):
+    """A public-read object ACL answers another account's read until IgnorePublicAcls is set."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"acl-xacct-pub-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"one", ACL="public-read")
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"one"
+
+        owner.put_public_access_block(
+            Bucket=bucket, PublicAccessBlockConfiguration={"IgnorePublicAcls": True})
+        assert _denied(reader.get_object, Bucket=bucket, Key="k")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="k")
+        owner.delete_bucket(Bucket=bucket)
+
+
+def test_s3_block_public_access_settings_each_cover_their_own_grants(s3):
+    """Only IgnorePublicAcls drops a public ACL and only RestrictPublicBuckets a public policy."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"bpa-each-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    settings = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+    try:
+        owner.put_object(Bucket=bucket, Key="acl", Body=b"acl", ACL="public-read")
+        owner.put_object(Bucket=bucket, Key="pol/k", Body=b"pol")
+        owner.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bucket}/pol/*"}]}))
+        for setting in settings:
+            owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={setting: True})
+            for key, ignored_by in (("acl", "IgnorePublicAcls"), ("pol/k", "RestrictPublicBuckets")):
+                if setting == ignored_by:
+                    assert _denied(reader.get_object, Bucket=bucket, Key=key), (setting, key)
+                else:
+                    assert reader.get_object(Bucket=bucket, Key=key)["Body"].read(), (setting, key)
+    finally:
+        owner.delete_bucket_policy(Bucket=bucket)
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_restrict_public_buckets_keeps_a_policy_that_is_not_public(s3):
+    """RestrictPublicBuckets drops only a public policy; a policy naming another account still grants it."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"bpa-named-{uuid.uuid4().hex[:8]}"
+    owner.create_bucket(Bucket=bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"k")
+        owner.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={"RestrictPublicBuckets": True})
+        owner.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::222222222222:root"}, "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:::{bucket}/*"}]}))
+        assert reader.get_object(Bucket=bucket, Key="k")["Body"].read() == b"k"
+    finally:
+        owner.delete_bucket_policy(Bucket=bucket)
+        _purge_foreign(owner, bucket)
+
+
+def test_s3_public_bucket_acl_grants_only_what_the_bucket_permissions_cover(s3):
+    """Bucket READ lists and WRITE adds and removes objects; neither opens objects, configuration or the ACL."""
+    owner, reader = _s3_account("111111111111"), _s3_account("222222222222")
+    bucket = f"bacl-pub-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(owner, bucket)
+    try:
+        owner.put_object(Bucket=bucket, Key="k", Body=b"k")
+        owner.put_bucket_acl(Bucket=bucket, ACL="public-read")
+        assert [o["Key"] for o in reader.list_objects_v2(Bucket=bucket)["Contents"]] == ["k"]
+        reader.list_object_versions(Bucket=bucket)
+        reader.list_multipart_uploads(Bucket=bucket)
+        for call in (reader.get_object, reader.head_object, reader.get_object_acl):
+            assert _denied(call, Bucket=bucket, Key="k"), call
+        for call in (reader.get_bucket_acl, reader.get_bucket_versioning, reader.get_bucket_tagging):
+            assert _denied(call, Bucket=bucket), call
+
+        owner.put_bucket_acl(Bucket=bucket, ACL="public-read-write")
+        reader.put_object(Bucket=bucket, Key="w", Body=b"w")
+        reader.delete_object(Bucket=bucket, Key="w")
+        assert _denied(reader.put_object_acl, Bucket=bucket, Key="k", ACL="public-read")
+        assert _denied(reader.put_bucket_tagging, Bucket=bucket, Tagging={"TagSet": [{"Key": "a", "Value": "b"}]})
+        assert _denied(reader.put_bucket_acl, Bucket=bucket, ACL="private")
+        assert _denied(reader.delete_bucket, Bucket=bucket)
+        grants = owner.get_bucket_acl(Bucket=bucket)["Grants"]
+        assert sorted(g["Permission"] for g in grants if "URI" in g["Grantee"]) == ["READ", "WRITE"]
+    finally:
+        _purge_foreign(owner, bucket)
+
+
 def test_s3_post_object_acl_field(s3):
     """The POST form names its canned-ACL field `acl`; it applies to the
     uploaded object like x-amz-acl does on PutObject."""
@@ -5125,7 +5768,7 @@ def test_s3_post_object_acl_field(s3):
 
     import requests
     bucket = f"acl-post-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket, ObjectOwnership="ObjectWriter")
     post = s3.generate_presigned_post(
         Bucket=bucket, Key="k",
         Fields={"acl": "public-read"},
@@ -6295,7 +6938,7 @@ def test_s3_canned_acl_expands_to_group_grants(s3):
     implies: public-read -> AllUsers READ; authenticated-read -> AuthenticatedUsers
     READ; plus the owner's FULL_CONTROL. Invalid canned values are rejected. (#1322)"""
     bkt = f"acl-{_uuid_mod.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bkt)
+    s3.create_bucket(Bucket=bkt, ObjectOwnership="ObjectWriter")
 
     def grants(key):
         acl = s3.get_object_acl(Bucket=bkt, Key=key)
@@ -6559,7 +7202,7 @@ def test_s3_list_object_versions_rolls_up_prefixes(s3):
 def test_s3_copy_object_applies_canned_acl(s3):
     """x-amz-acl on a copy permissions the destination, as it does on a put."""
     bkt = "s3-copy-acl"
-    s3.create_bucket(Bucket=bkt)
+    s3.create_bucket(Bucket=bkt, ObjectOwnership="ObjectWriter")
     s3.put_object(Bucket=bkt, Key="src.txt", Body=b"body")
 
     s3.copy_object(Bucket=bkt, Key="dst.txt", ACL="public-read",
@@ -6579,6 +7222,26 @@ def test_s3_copy_object_applies_canned_acl(s3):
         s3.copy_object(Bucket=bkt, Key="bad.txt", ACL="nonsense",
                        CopySource={"Bucket": bkt, "Key": "src.txt"})
     assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+
+
+def test_s3_copy_object_applies_grant_headers(s3):
+    """x-amz-grant-* headers on a copy set the destination's ACL; together with x-amz-acl the copy is refused."""
+    bkt = f"s3-copy-grant-{uuid.uuid4().hex[:8]}"
+    _acl_enabled_bucket(s3, bkt)
+    owner_id = s3.list_buckets()["Owner"]["ID"]
+    other_id = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"
+    s3.put_object(Bucket=bkt, Key="src.txt", Body=b"body")
+    source = {"Bucket": bkt, "Key": "src.txt"}
+
+    s3.copy_object(Bucket=bkt, Key="dst.txt", CopySource=source, GrantRead=f'id="{other_id}"',
+                   GrantFullControl=f'id="{owner_id}"')
+    assert _grant_pairs(s3.get_object_acl(Bucket=bkt, Key="dst.txt")) == [
+        (other_id, "READ"), (owner_id, "FULL_CONTROL")]
+
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bkt, Key="both.txt", CopySource=source, GrantRead=f'id="{other_id}"', ACL="private")
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert [o["Key"] for o in s3.list_objects_v2(Bucket=bkt)["Contents"]] == ["dst.txt", "src.txt"]
 
 
 def test_s3_upload_part_copy_honours_source_preconditions(s3):
@@ -6855,11 +7518,13 @@ def _mrap_get(alias, key, region=None):
 
 def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
     """The MRAP hostname resolved nowhere — it is not a bucket name and matched
-    no virtual-host rule. It now lands on the existing vhost path, and the
-    member whose *stored* bucket region matches the request region is served
-    rather than whichever is listed first. The buckets are created through the
-    S3 API (one per region, like a real MRAP's members) and only the access
-    point comes from the stack."""
+    no virtual-host rule. It now lands on the existing vhost path. AWS routes
+    by network proximity, not by the signing region (observed 2026-10-12:
+    us-east-1 and eu-west-1 clients in one location were served by the same
+    member), so MiniStack serves the member homed in its own MINISTACK_REGION
+    (us-east-1 for the test server) whatever region the request names. The
+    buckets are created through the S3 API (one per region, like a real MRAP's
+    members) and only the access point comes from the stack."""
     us_bucket, eu_bucket = "mrap-serve-us-app", "mrap-serve-eu-app"
     s3.create_bucket(Bucket=us_bucket)  # the client's own region, us-east-1
     s3.create_bucket(Bucket=eu_bucket, CreateBucketConfiguration={
@@ -6868,8 +7533,8 @@ def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {"Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
                                "Properties": {"Name": "serve-mrap-app",
-                                              "Regions": [{"Bucket": us_bucket},
-                                                          {"Bucket": eu_bucket}]}}},
+                                              "Regions": [{"Bucket": eu_bucket},
+                                                          {"Bucket": us_bucket}]}}},
         "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
     })
     cfn.create_stack(StackName="cfn-s3-mrap-serve", TemplateBody=template)
@@ -6881,15 +7546,10 @@ def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
         s3.put_object(Bucket=us_bucket, Key="who.txt", Body=b"US BUCKET")
         s3.put_object(Bucket=eu_bucket, Key="who.txt", Body=b"EU BUCKET")
 
-        # us-east-1 is listed first, so serving the eu-west-1 member proves the
+        # eu-west-1 is listed first, so serving the us-east-1 member proves the
         # member is chosen by its stored region rather than taken off the front.
-        assert _mrap_get(alias, "who.txt", region="eu-west-1") == (200, "EU BUCKET")
-        assert _mrap_get(alias, "who.txt", region="us-east-1") == (200, "US BUCKET")
-
-        # A request whose credential scope names a region with no member falls
-        # back to the first member rather than failing (SigV4A carries no
-        # region at all and lands the same way).
-        assert _mrap_get(alias, "who.txt", region="ap-south-1") == (200, "US BUCKET")
+        for region in ("eu-west-1", "us-east-1", "ap-south-1", None):
+            assert _mrap_get(alias, "who.txt", region=region) == (200, "US BUCKET")
     finally:
         cfn.delete_stack(StackName="cfn-s3-mrap-serve")
         _wait_stack(cfn, "cfn-s3-mrap-serve")
@@ -7392,14 +8052,20 @@ RETENTION = "Access Denied because object protected by object lock retention."
 LEGAL_HOLD = "Access Denied because object protected by object lock legal hold."
 
 
+_ROOT_AUTHORIZATION = (
+    "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake"
+)
+
+
 def _lock_call(method, path, headers=None, body=b"", query=None):
     import asyncio
 
     from ministack.core.responses import request_scope
     from ministack.services import s3 as s3mod
 
+    headers = {"authorization": _ROOT_AUTHORIZATION, **(headers or {})}
     with request_scope("000000000000", "us-east-1"):
-        return asyncio.run(s3mod.handle_request(method, path, headers or {}, body, query or {}))
+        return asyncio.run(s3mod.handle_request(method, path, headers, body, query or {}))
 
 
 def _locked_in_process(**lock_headers):
@@ -7704,6 +8370,593 @@ def test_s3_replication_filter_round_trips_tag_and_and(s3):
     assert [r["Filter"] for r in got] == [r["Filter"] for r in rules]
 
 
+# Replication rule options (#2311). Capture keys refer to the AWS captures: "run1 C.." to
+# s3-replication-destination.json, "repeats ..." to repeats.json (keys s3:...), "U..", "M:..." to 2311-uncertainties.json, "r2 R.." to 2311-uncertainties-2.json
+# "r3 P.." to 2311-uncertainties-3.json, "r4 P.." to 2311-uncertainties-4.json, "r5 U7w.." to
+# 2311-uncertainties-5.json and "r7 .." to 2311-uncertainties-7.json.
+_REPL_KEY = "arn:aws:kms:us-east-1:000000000000:key/replica"  # AWS accepts it (U6:tests-fake-key)
+_REPL_MALFORMED = ("MalformedXML", "The XML you provided was not well-formed or did not validate "
+                                   "against our published schema", None)
+_REPL_RTC15 = {"Status": "Enabled", "Time": {"Minutes": 15}}
+_REPL_MET15 = {"Status": "Enabled", "EventThreshold": {"Minutes": 15}}
+_REPL_SSE_ON = {"SseKmsEncryptedObjects": {"Status": "Enabled"}}
+
+
+def _repl_rule(dst, dest=None, rid="r", **kw):
+    """A minimal rule AWS accepts (Filter, Priority, DeleteMarkerReplication), plus *kw*."""
+    rule = {"ID": rid, "Priority": 1, "Filter": {"Prefix": ""}, "Status": "Enabled",
+            "DeleteMarkerReplication": {"Status": "Disabled"}, "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}}
+    rule.update(kw)
+    rule["Destination"] = {**rule["Destination"], **(dest or {})}
+    return rule
+
+
+def _repl_v1_rule(dst, dest=None, rid="r", **kw):
+    """A rule in the older Prefix schema: no Filter, Priority or DeleteMarkerReplication."""
+    rule = {"ID": rid, "Prefix": "logs/", "Status": "Enabled", "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}}
+    rule.update(kw)
+    rule["Destination"] = {**rule["Destination"], **(dest or {})}
+    return rule
+
+
+def _repl_options_rule(dst):
+    """The reproduction rule of the issue, accepted and returned unchanged (repeats s3:C9:roundtrip-wire-order)."""
+    return _repl_rule(dst, rid="options", Filter={"Prefix": "kms/"}, DeleteMarkerReplication={"Status": "Enabled"},
+                      SourceSelectionCriteria={"SseKmsEncryptedObjects": {"Status": "Enabled"},
+                                               "ReplicaModifications": {"Status": "Enabled"}},
+                      dest={"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY},
+                            "ReplicationTime": _REPL_RTC15, "Metrics": _REPL_MET15})
+
+
+def _repl_key(key):
+    """The reproduction rule with *key* as its ReplicaKmsKeyID, the request AWS was sent for every key-form capture."""
+    return {"key": key}
+
+
+def _repl_case_rule(dst, extra):
+    extra = dict(extra)
+    if "key" in extra:
+        rule = _repl_options_rule(dst)
+        rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"] = extra["key"]
+        return rule
+    return (_repl_v1_rule if extra.pop("v1", False) else _repl_rule)(dst, **extra)
+
+
+@pytest.fixture
+def repl_pair(s3):
+    src, dst = _bucket(s3, versioned=True), _bucket(s3, versioned=True)
+    yield src, dst
+    s3.delete_bucket_replication(Bucket=src)
+    s3.delete_bucket(Bucket=src)
+    s3.delete_bucket(Bucket=dst)
+
+
+def test_s3_replication_round_trips_rule_and_destination_options(s3, repl_pair):
+    """Each rule comes back exactly as put, options included, and nothing is defaulted in
+    (repeats s3:C1:roundtrip-three-rule, U7:three-rule-round-trip). A second put replaces the
+    whole configuration (repeats s3:C4:second-put-replaces, U7:second-put-replaces)."""
+    src, dst = repl_pair
+    full = _repl_options_rule(dst)
+    plain = _repl_rule(dst, rid="plain", Priority=2, Filter={"Prefix": "plain/"})
+    metrics = _repl_rule(dst, rid="metrics", Priority=3, Filter={"Prefix": "m/"}, dest={"Metrics": {"Status": "Disabled"}})
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [full, plain, metrics]})
+    got = s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]
+    assert got["Rules"] == [full, plain, metrics]
+    assert got["Rules"][0]["Destination"]["ReplicationTime"]["Time"]["Minutes"] == 15
+
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+        "Role": _REPL_ROLE, "Rules": [{**plain, "ID": "options"}]})
+    assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [{**plain, "ID": "options"}]
+
+
+@pytest.mark.parametrize("extra", [
+    pytest.param({"dest": {"Metrics": {"Status": "Enabled"}}}, id="U7:metrics-enabled-bare-no-rtc"),
+    pytest.param({"dest": {"Metrics": {"Status": "Disabled"}}}, id="U7:metrics-disabled-bare-no-rtc"),
+    pytest.param({"SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Disabled"}}},
+                 id="U7:replicamods-disabled-only"),
+    pytest.param({"dest": {"ReplicationTime": {"Status": "Disabled", "Time": {"Minutes": 15}},
+                           "Metrics": {"Status": "Enabled"}}}, id="U3:rtc-disabled+metrics-enabled"),
+    pytest.param({"dest": {"ReplicationTime": {"Status": "Disabled", "Time": {"Minutes": 15}},
+                           "Metrics": {"Status": "Disabled", "EventThreshold": {"Minutes": 15}}}},
+                 id="U3:rtc-disabled+metrics-disabled-et15"),
+    pytest.param({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Disabled"}},
+                  "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, id="M:ssekms-disabled+enc"),
+    pytest.param({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON,
+                  "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, id="U7:v1-ssekms+enc"),
+    pytest.param({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"EncryptionConfiguration": {
+        "ReplicaKmsKeyID": "arn:aws:kms:us-east-1:000000000000:alias/replica"}}}, id="U6:alias-arn-nonexistent"),
+    *[pytest.param(_repl_key(key), id=f"r2 R3:{name}") for name, key in (
+        ("kms-key-empty-id", "arn:aws:kms:us-east-1:000000000000:key/"),
+        ("kms-alias-empty", "arn:aws:kms:us-east-1:000000000000:alias/"),
+        ("kms-no-account", "arn:aws:kms:us-east-1::key/5f0e8a54-1f6c-4d2a-9d55-2b8e3c1f0a11"),
+        ("kms-account-abc", "arn:aws:kms:us-east-1:abc:key/5f0e8a54-1f6c-4d2a-9d55-2b8e3c1f0a11"))],
+    *[pytest.param(_repl_key(key), id=f"r3 P2:{name}") for name, key in (
+        ("resource-with-colon", "arn:aws:kms:us-east-1:000000000000:key/abc:def"),
+        ("resource-with-slashes", "arn:aws:kms:us-east-1:000000000000:key/a/b"))],
+    pytest.param(_repl_key("arn:aws:kms:us-east-1:000000000000:key/abc\ndef"), id="r7 K:key-newline-in-resource"),
+])
+def test_s3_replication_accepts_option_combinations(s3, repl_pair, extra):
+    """Each of these single-rule configurations was accepted by AWS and came back unchanged
+    (capture key in the parameter id)."""
+    src, dst = repl_pair
+    rule = _repl_case_rule(dst, extra)
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+    assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [rule]
+
+
+def _repl_time(status, minutes):
+    return {"Status": status, "Time": {"Minutes": minutes}}
+
+
+def _repl_metrics(status, minutes=None):
+    return {"Status": status, **({"EventThreshold": {"Minutes": minutes}} if minutes is not None else {})}
+
+
+_REPL_TIME_MINUTES = ("InvalidArgument", "Invalid time minute value", "ReplicationTime")
+_REPL_EVENT_MINUTES = ("InvalidArgument", "Invalid event threshold minute value", "ReplicationMetrics")
+_REPL_BOTH_OR_NEITHER = ("InvalidRequest", "Replication destination must contain both ReplicationTime and "
+                                           "Metrics or neither.", None)
+_REPL_NO_THRESHOLD = ("InvalidArgument", "Metrics cannot contain an event threshold when ReplicationTime is "
+                                         "not specified or Disabled", "Metrics")
+_REPL_NEEDS_THRESHOLD = ("InvalidArgument", "ReplicationMetrics must contain an event threshold", "ReplicationMetrics")
+_REPL_SAME_STATUS = ("InvalidArgument", "ReplicationTime and ReplicationMetrics should have the same status",
+                     "ReplicationTime")
+_REPL_NEEDS_KEY = ("InvalidRequest", "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present.", None)
+_REPL_NEEDS_SSE = ("InvalidRequest", "SseKmsEncryptedObjects must be specified if EncryptionConfiguration is present.",
+                   None)
+_REPL_BAD_KEY = ("InvalidArgument", "Invalid ReplicaKmsKeyID ARN.", "ReplicaKmsKeyID")
+_REPL_KEY_REGION = ("InvalidRequest", "KMS key must be in the same region as the destination bucket.", None)
+_REPL_DEST_VERSIONING = ("InvalidRequest", "Destination bucket must have versioning enabled.", None)
+_REPL_V1 = "{} cannot be used for this version of the replication configuration schema.{}Please refer to the S3 " \
+           "Developer Guide for more information."
+
+
+def _repl_dest(**dest):
+    return {"dest": dest}
+
+
+_REPL_REFUSALS = [
+    # schema errors
+    ({"dest": {"Metrics": {"Status": "On"}}}, _REPL_MALFORMED, "U7:metrics-status-On"),
+    (_repl_dest(ReplicationTime=_repl_time("enabled", 15), Metrics=_REPL_MET15), _REPL_MALFORMED,
+     "U7:rtc-status-lowercase"),
+    ({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "On"}},
+      "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, _REPL_MALFORMED, "M:ssekms-status-on"),
+    ({"SourceSelectionCriteria": {"ReplicaModifications": {"Status": "On"}}}, _REPL_MALFORMED, "M:replicamods-status-on"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 2147483648), Metrics=_REPL_MET15), _REPL_MALFORMED,
+     "U4:rtc-minutes-2147483648"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", -2147483649), Metrics=_REPL_MET15), _REPL_MALFORMED,
+     "r2 R1:rtc-minutes-below-int"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Enabled", 2147483648)), _REPL_MALFORMED,
+     "U4:et-minutes-2147483648"),
+    (_repl_dest(ReplicationTime=_repl_time("On", 15)), _REPL_MALFORMED, "U2:rtc-status-on-no-metrics"),
+    # minutes
+    *[(_repl_dest(ReplicationTime=_repl_time("Enabled", n), Metrics=_REPL_MET15), _REPL_TIME_MINUTES, key)
+      for n, key in {-2147483648: 'r2 R1:rtc-minutes-min-int', -1: 'U7:rtc-minutes-minus1', 0: 'U7:rtc-minutes-0', 1: 'U4:rtc-minutes-1', 5: 'U4:rtc-minutes-5', 10: 'run1 C26:rtc-minutes-10', 14: 'U7:rtc-minutes-14', 16: 'repeats C26:rtc-minutes-16', 30: 'repeats C26:rtc-minutes-30', 45: 'U4:rtc-minutes-45', 60: 'repeats C26:rtc-minutes-60', 120: 'U4:rtc-minutes-120', 1440: 'U4:rtc-minutes-1440', 2147483647: 'U4:rtc-minutes-2147483647'}.items()],
+    *[(_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Enabled", n)), _REPL_EVENT_MINUTES, key)
+      for n, key in {-1: 'U4:et-minutes--1', 0: 'U7:et-minutes-0', 5: 'U4:et-minutes-5', 10: 'run1 C26:et-minutes-10', 14: 'repeats C26:metrics-minutes-14', 16: 'repeats C26:metrics-minutes-16', 30: 'U7:et-minutes-30', 45: 'U4:et-minutes-45', 60: 'repeats C26:metrics-minutes-60'}.items()],
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 10), Metrics=_repl_metrics("Enabled", 10)), _REPL_TIME_MINUTES,
+     "U2:et-10+rtc-10"),
+    # ReplicationTime and Metrics together
+    (_repl_dest(ReplicationTime=_REPL_RTC15), _REPL_BOTH_OR_NEITHER, "U7:rtc-without-metrics"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15)), _REPL_BOTH_OR_NEITHER, "U3:rtc-disabled-no-metrics"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 10)), _REPL_TIME_MINUTES, "U2:rtc-10-no-metrics"),
+    (_repl_dest(Metrics=_REPL_MET15), _REPL_NO_THRESHOLD, "U7:et15-no-rtc"),
+    (_repl_dest(Metrics=_repl_metrics("Disabled", 15)), _REPL_NO_THRESHOLD, "U3:metrics-disabled-et15-no-rtc"),
+    (_repl_dest(Metrics=_repl_metrics("Enabled", 10)), _REPL_NO_THRESHOLD, "U2:et-10+no-rtc"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_REPL_MET15), _REPL_NO_THRESHOLD,
+     "U3:rtc-disabled+metrics-enabled-et15"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_repl_metrics("Enabled", 10)), _REPL_NO_THRESHOLD,
+     "r2 R1:rtcD15+metE10"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 10), Metrics=_REPL_MET15), _REPL_TIME_MINUTES,
+     "r2 R1:rtcD10+metE15"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_repl_metrics("Disabled", 10)),
+     _REPL_EVENT_MINUTES, "r2 R1:rtcD15+metD10"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Disabled", 10)), _REPL_EVENT_MINUTES,
+     "U3:rtc-enabled+metrics-disabled-et10"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 15), Metrics=_repl_metrics("Disabled")), _REPL_NEEDS_THRESHOLD,
+     "U3:rtc-disabled+metrics-disabled"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Enabled")), _REPL_NEEDS_THRESHOLD,
+     "U3:rtc-enabled+metrics-enabled-bare"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Disabled")), _REPL_NEEDS_THRESHOLD,
+     "U3:rtc-enabled+metrics-disabled"),
+    (_repl_dest(ReplicationTime=_repl_time("Disabled", 10), Metrics=_repl_metrics("Disabled")), _REPL_TIME_MINUTES,
+     "U3:rtc-disabled-10+metrics-disabled"),
+    (_repl_dest(ReplicationTime=_repl_time("Enabled", 10), Metrics=_repl_metrics("Enabled")), _REPL_TIME_MINUTES,
+     "r2 R1:rtcE10+metE-bare"),
+    (_repl_dest(ReplicationTime=_REPL_RTC15, Metrics=_repl_metrics("Disabled", 15)), _REPL_SAME_STATUS,
+     "U3:rtc-enabled+metrics-disabled-et15"),
+    # SourceSelectionCriteria and EncryptionConfiguration
+    ({"SourceSelectionCriteria": _REPL_SSE_ON}, _REPL_NEEDS_KEY, "U7:ssekms-enabled-no-enc"),
+    ({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Disabled"}}}, _REPL_NEEDS_KEY,
+     "U7:ssekms-disabled-no-enc"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": _REPL_KEY}), _REPL_NEEDS_SSE, "U7:enc-no-ssc"),
+    ({"SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}},
+      "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}}}, _REPL_NEEDS_SSE, "M:replicamods-only+enc"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": "not-a-key"}), _REPL_NEEDS_SSE, "r2 R3:garbage-key-no-ssc"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"ReplicationTime": _repl_time("Enabled", 10),
+                                                         "Metrics": _REPL_MET15}}, _REPL_NEEDS_KEY,
+     "U2:ssekms-no-enc+rtc-10"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"ReplicationTime": _REPL_RTC15}}, _REPL_NEEDS_KEY,
+     "r2 R2:ssekms-no-enc+rtc-no-metrics"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"Metrics": _REPL_MET15}}, _REPL_NEEDS_KEY,
+     "U2:et15-no-rtc+ssekms-no-enc"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": _REPL_KEY}, ReplicationTime=_REPL_RTC15), _REPL_NEEDS_SSE,
+     "U2:enc-no-ssc+rtc-no-metrics"),
+    (_repl_dest(EncryptionConfiguration={"ReplicaKmsKeyID": _REPL_KEY}, ReplicationTime=_repl_time("Enabled", 10),
+                Metrics=_REPL_MET15), _REPL_NEEDS_SSE, "U2:enc-no-ssc+rtc-10"),
+    # the replica key
+    (_repl_key(""), ("InvalidArgument", "ReplicaKmsKeyID cannot be empty.", "ReplicaKmsKeyID"), "U6:empty-element"),
+    *[(_repl_key(key), _REPL_BAD_KEY, f"U6/r2 R3/r3 P2:{name}") for name, key in (
+        ("bare-random-uuid", "5f0e8a54-1f6c-4d2a-9d55-2b8e3c1f0a11"),
+        ("alias-name-nonexistent", "alias/replica"),
+        ("garbage", "not-a-key"),
+        ("s3-arn", "arn:aws:s3:::some-bucket"),
+        ("kms-other-resource", "arn:aws:kms:us-east-1:000000000000:grant/abc"),
+        ("kms-five-parts", "arn:aws:kms:us-east-1:000000000000"),
+        ("kms-padded", f" {_REPL_KEY} "),
+        ("key-no-arn-prefix", "aws:kms:us-east-1:000000000000:key/replica"),
+        ("key-no-slash", "arn:aws:kms:us-east-1:000000000000:key"),
+        ("service-uppercase", "arn:aws:KMS:us-east-1:000000000000:key/replica"),
+        ("arn-uppercase", "ARN:aws:kms:us-east-1:000000000000:key/replica"),
+        ("partition-empty", "arn::kms:us-east-1:000000000000:key/replica"),
+        ("whitespace-only", " "))],
+    *[(_repl_key(key), _REPL_BAD_KEY, f"r7 K:{name}") for name, key in (
+        ("key-resource-upper", "arn:aws:kms:us-east-1:000000000000:KEY/replica"),
+        ("alias-resource-capital", "arn:aws:kms:us-east-1:000000000000:Alias/x"))],
+    (_repl_key("arn:aws-cn:kms:us-east-1:000000000000:key/replica"),
+     ("InvalidRequest", "KMS key ARN partition must match the destination bucket ARN partition.", None),
+     "r2 R3:kms-partition-cn"),
+    (_repl_key("arn:aws-cn:kms:us-west-2:000000000000:key/replica"),
+     ("InvalidRequest", "KMS key ARN partition must match the destination bucket ARN partition.", None),
+     "r3 P2:partition-cn-and-west"),
+    ({"SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Disabled"}}, "dest": {
+        "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:us-west-2:000000000000:key/replica"}}},
+     _REPL_KEY_REGION, "r3 P2:ssekms-disabled+west-key"),
+    *[(_repl_key(key), _REPL_KEY_REGION, f"U6/r2 R3:{name}") for name, key in (
+        ("other-region-key-arn", "arn:aws:kms:us-west-2:000000000000:key/replica"),
+        ("kms-no-region", "arn:aws:kms::000000000000:key/replica"),
+        ("kms-bogus-region", "arn:aws:kms:mars-1:000000000000:key/replica"),
+        ("kms-other-region-alias", "arn:aws:kms:us-west-2:000000000000:alias/x"))],
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": "not-a-key"},
+                                                         "ReplicationTime": _repl_time("Enabled", 10),
+                                                         "Metrics": _REPL_MET15}}, _REPL_BAD_KEY,
+     "r2 R3:garbage-key+rtc10"),
+    ({"SourceSelectionCriteria": _REPL_SSE_ON, "dest": {
+        "EncryptionConfiguration": {"ReplicaKmsKeyID": "arn:aws:kms:us-west-2:000000000000:key/replica"},
+        "ReplicationTime": _REPL_RTC15}}, _REPL_KEY_REGION, "r2 R3:west-key+rtc-no-metrics"),
+    # the older Prefix schema, checked after the rule checks above
+    ({"v1": True, "dest": {"ReplicationTime": _REPL_RTC15, "Metrics": _REPL_MET15}},
+     ("InvalidRequest", _REPL_V1.format("ReplicationTime", ""), None), "M:v1-rtc+metrics"),
+    ({"v1": True, "dest": {"ReplicationTime": _repl_time("Disabled", 15), "Metrics": _repl_metrics("Enabled")}},
+     ("InvalidRequest", _REPL_V1.format("ReplicationTime", ""), None), "r2 R4:v1-rtc-disabled+metrics-enabled"),
+    ({"v1": True, "dest": {"Metrics": _repl_metrics("Enabled")}},
+     ("InvalidRequest", _REPL_V1.format("Metrics", ""), None), "M:v1-metrics-enabled"),
+    ({"v1": True, "dest": {"Metrics": _repl_metrics("Disabled")}},
+     ("InvalidRequest", _REPL_V1.format("Metrics", ""), None), "r2 R4:v1-metrics-disabled"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}}},
+     ("InvalidRequest", _REPL_V1.format("ReplicaModifications", " "), None), "M:v1-replicamods"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Disabled"}}},
+     ("InvalidRequest", _REPL_V1.format("ReplicaModifications", " "), None), "r2 R4:v1-replicamods-disabled"),
+    ({"v1": True, "SourceSelectionCriteria": {"SseKmsEncryptedObjects": {"Status": "Enabled"},
+                                              "ReplicaModifications": {"Status": "Enabled"}},
+      "dest": {"EncryptionConfiguration": {"ReplicaKmsKeyID": _REPL_KEY}, "ReplicationTime": _REPL_RTC15,
+               "Metrics": _REPL_MET15}},
+     ("InvalidRequest", _REPL_V1.format("ReplicaModifications", " "), None), "M:v1-full-order"),
+    ({"v1": True, "dest": {"ReplicationTime": _REPL_RTC15}}, _REPL_BOTH_OR_NEITHER, "M:v1-rtc-no-metrics"),
+    ({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON}, _REPL_NEEDS_KEY, "M:v1-ssekms-no-enc"),
+    ({"v1": True, "dest": {"ReplicationTime": _repl_time("Enabled", 10), "Metrics": _REPL_MET15}},
+     _REPL_TIME_MINUTES, "r2 R4:v1-rtc10+metrics"),
+    ({"v1": True, "dest": {"Metrics": _REPL_MET15}}, _REPL_NO_THRESHOLD, "r2 R4:v1-metrics-et15-no-rtc"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}},
+      "dest": {"ReplicationTime": _REPL_RTC15}}, _REPL_BOTH_OR_NEITHER, "r2 R4:v1-replicamods+rtc-no-metrics"),
+    ({"v1": True, "SourceSelectionCriteria": {"ReplicaModifications": {"Status": "Enabled"}, **_REPL_SSE_ON}},
+     _REPL_NEEDS_KEY, "r2 R4:v1-replicamods+ssekms-no-enc"),
+    ({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"ReplicationTime": _REPL_RTC15,
+                                                                    "Metrics": _REPL_MET15}},
+     _REPL_NEEDS_KEY, "r2 R4:v1-rtc+metrics+ssekms-no-enc"),
+    ({"v1": True, "SourceSelectionCriteria": _REPL_SSE_ON, "dest": {"EncryptionConfiguration": {
+        "ReplicaKmsKeyID": "not-a-key"}}}, _REPL_BAD_KEY, "r2 R3:v1-garbage-key"),
+]
+
+
+@pytest.mark.parametrize("extra,expected", [pytest.param(e, x, id=k) for e, x, k in _REPL_REFUSALS])
+def test_s3_replication_refuses_options_like_aws(s3, repl_pair, extra, expected):
+    """One single-rule put per AWS capture (key in the parameter id): the same code, message,
+    status and ArgumentName, and nothing is stored."""
+    src, dst = repl_pair
+    rule = _repl_case_rule(dst, extra)
+    with pytest.raises(ClientError) as exc:
+        s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+    code, message, argument = expected
+    err = exc.value.response["Error"]
+    assert (err["Code"], err["Message"], _status(exc)) == (code, message, 400)
+    assert err.get("ArgumentName") == argument
+    if argument == "ReplicaKmsKeyID" and rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"]:
+        assert err["ArgumentValue"] == rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"]
+    with pytest.raises(ClientError) as exc:
+        s3.get_bucket_replication(Bucket=src)
+    assert _code(exc) == "ReplicationConfigurationNotFoundError"
+
+
+def test_s3_replication_checks_options_document_first_then_rule_by_rule(s3, repl_pair):
+    """Schema errors anywhere in the document come first (U2:two-rules-crossfield-then-schema,
+    U2:unversioned-dest+metrics-on). Then each rule in turn gets the destination versioning
+    check and its option checks (r2 R5:rule1-crossfield+rule2-unversioned,
+    R5:rule1-unversioned+rule2-crossfield, R5:rule1-minutes+rule2-unversioned,
+    U2:unversioned-dest+rtc-no-metrics, U2:two-rules-minutes-then-crossfield,
+    U2:two-rules-crossfield-then-minutes, U2:two-rules-second-bad). The Prefix-schema checks
+    run after every rule (r2 R5:rule1-v1-rtc+rule2-unversioned)."""
+    src, dst = repl_pair
+    unv = _bucket(s3)
+    try:
+        cases = [
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _REPL_RTC15}),
+              _repl_rule(dst, rid="b", Priority=2, dest={"Metrics": {"Status": "On"}})], _REPL_MALFORMED),
+            ([_repl_rule(unv, dest={"Metrics": {"Status": "On"}})], _REPL_MALFORMED),
+            ([_repl_rule(unv, dest={"ReplicationTime": _REPL_RTC15})], _REPL_DEST_VERSIONING),
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _REPL_RTC15}),
+              _repl_rule(unv, rid="b", Priority=2)], _REPL_BOTH_OR_NEITHER),
+            ([_repl_rule(unv, rid="a"),
+              _repl_rule(dst, rid="b", Priority=2, dest={"ReplicationTime": _REPL_RTC15})], _REPL_DEST_VERSIONING),
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _repl_time("Enabled", 10), "Metrics": _REPL_MET15}),
+              _repl_rule(unv, rid="b", Priority=2)], _REPL_TIME_MINUTES),
+            ([_repl_rule(dst, rid="a", dest={"ReplicationTime": _repl_time("Enabled", 10), "Metrics": _REPL_MET15}),
+              _repl_rule(dst, rid="b", Priority=2, SourceSelectionCriteria=_REPL_SSE_ON)], _REPL_TIME_MINUTES),
+            ([_repl_rule(dst, rid="a", SourceSelectionCriteria=_REPL_SSE_ON),
+              _repl_rule(dst, rid="b", Priority=2, dest={"ReplicationTime": _repl_time("Enabled", 10),
+                                                         "Metrics": _REPL_MET15})], _REPL_NEEDS_KEY),
+            ([_repl_rule(dst, rid="a"), _repl_rule(dst, rid="b", Priority=2, dest={"ReplicationTime": _REPL_RTC15})],
+             _REPL_BOTH_OR_NEITHER),
+            ([_repl_v1_rule(dst, rid="a", Prefix="a/", dest={"ReplicationTime": _REPL_RTC15, "Metrics": _REPL_MET15}),
+              _repl_v1_rule(unv, rid="b", Prefix="b/")], _REPL_DEST_VERSIONING),
+        ]
+        for rules, (code, message, argument) in cases:
+            with pytest.raises(ClientError) as exc:
+                s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": rules})
+            err = exc.value.response["Error"]
+            assert (err["Code"], err["Message"], err.get("ArgumentName")) == (code, message, argument), rules
+            with pytest.raises(ClientError) as exc:
+                s3.get_bucket_replication(Bucket=src)
+            assert _code(exc) == "ReplicationConfigurationNotFoundError"
+    finally:
+        s3.delete_bucket(Bucket=unv)
+
+
+def test_s3_replication_refused_put_keeps_the_stored_configuration(s3, repl_pair):
+    """A refused put leaves the configuration already stored (U2:existing-then-refused,
+    U2:existing-then-malformed)."""
+    src, dst = repl_pair
+    full = _repl_options_rule(dst)
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [full]})
+    for dest, code in (({"ReplicationTime": _REPL_RTC15}, "InvalidRequest"), ({"Metrics": {"Status": "On"}}, "MalformedXML")):
+        with pytest.raises(ClientError) as exc:
+            s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={
+                "Role": _REPL_ROLE, "Rules": [_repl_rule(dst, dest=dest)]})
+        assert _code(exc) == code
+        assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [full]
+
+
+def test_s3_replication_key_region_follows_the_destination_bucket(s3, repl_pair):
+    """The replica key must be in the destination bucket's region: for a us-west-2 destination
+    a us-east-1 key is refused and a us-west-2 key accepted (r5 U7w:west-dest+east-key,
+    U7w:west-dest+west-key)."""
+    src, _ = repl_pair
+    dst = _bucket(s3, versioned=True, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    try:
+        rule = _repl_rule(dst, SourceSelectionCriteria=_REPL_SSE_ON, dest={"EncryptionConfiguration": {
+            "ReplicaKmsKeyID": _REPL_KEY}})
+        with pytest.raises(ClientError) as exc:
+            s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+        assert exc.value.response["Error"]["Message"] == _REPL_KEY_REGION[1]
+        rule["Destination"]["EncryptionConfiguration"]["ReplicaKmsKeyID"] = _REPL_KEY.replace("us-east-1", "us-west-2")
+        s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+        assert s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"] == [rule]
+    finally:
+        s3.delete_bucket(Bucket=dst)
+
+
+@pytest.fixture
+def replication_state(monkeypatch):
+    """A versioned bucket in fresh in-process S3 state, under account 000000000000."""
+    fresh = {"_buckets": AccountScopedDict(), "_bucket_versioning": AccountScopedDict(),
+             "_bucket_replication": AccountScopedDict()}
+    for attr, store in fresh.items():
+        monkeypatch.setattr(_s3_mod, attr, store)
+    monkeypatch.setitem(_s3_mod._PERSISTED_BUCKET_DICTS, "bucket_versioning", fresh["_bucket_versioning"])
+    monkeypatch.setitem(_s3_mod._PERSISTED_BUCKET_DICTS, "bucket_replication", fresh["_bucket_replication"])
+    with request_scope("000000000000", "us-east-1"):
+        _s3_mod._buckets["repl-options-src"] = {"objects": {}}
+        _s3_mod._bucket_versioning["repl-options-src"] = "Enabled"
+        yield "repl-options-src"
+
+
+# The accepted reproduction rule as botocore serialises it (repeats s3:C9:raw-accepted-rule).
+_REPL_OPTIONS_XML = (
+    '<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    "<Role>arn:aws:iam::000000000000:role/repl</Role>"
+    "<Rule><ID>options</ID><Priority>1</Priority><Filter><Prefix>kms/</Prefix></Filter><Status>Enabled</Status>"
+    "<SourceSelectionCriteria><SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>"
+    "<ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria>"
+    "<Destination><Bucket>arn:aws:s3:::repl-options-dst</Bucket>"
+    f"<EncryptionConfiguration><ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID></EncryptionConfiguration>"
+    "<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time></ReplicationTime>"
+    "<Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>"
+    "</Destination><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule>"
+    "</ReplicationConfiguration>")
+
+
+def _replication_tree(body):
+    def tree(el):
+        name = el.tag.split("}")[-1]
+        return {name: [tree(c) for c in el]} if len(el) else name
+    return tree(ElementTree.fromstring(body))
+
+
+def test_s3_replication_options_wire_form_and_persistence(replication_state):
+    """GetBucketReplication emits the options where AWS does: SourceSelectionCriteria after the
+    rule's existing members, and EncryptionConfiguration, Metrics, ReplicationTime last in the
+    destination (repeats s3:C9:roundtrip-wire-order, M:full-dest-order), with Minutes as 15. The
+    stored options survive a get_state/load round trip in the account that put them
+    (MiniStack-only)."""
+    bucket = replication_state
+    assert _s3_mod._put_bucket_replication(bucket, _REPL_OPTIONS_XML.encode())[0] == 200
+    state = _s3_mod.get_state()["bucket_replication"]
+    _s3_mod._bucket_replication.clear()
+    _s3_mod.load_persisted_state({"bucket_replication": state})
+
+    status, _headers, body = _s3_mod._get_bucket_replication(bucket)
+    assert status == 200
+    (rule,) = [c for c in _replication_tree(body)["ReplicationConfiguration"] if isinstance(c, dict)]
+    members = [next(iter(c)) if isinstance(c, dict) else c for c in rule["Rule"]]
+    assert members[-2:] == ["SourceSelectionCriteria", "Destination"]
+    assert rule["Rule"][-2] == {"SourceSelectionCriteria": [{"SseKmsEncryptedObjects": ["Status"]},
+                                                           {"ReplicaModifications": ["Status"]}]}
+    assert rule["Rule"][-1]["Destination"][-3:] == [
+        {"EncryptionConfiguration": ["ReplicaKmsKeyID"]},
+        {"Metrics": ["Status", {"EventThreshold": ["Minutes"]}]},
+        {"ReplicationTime": ["Status", {"Time": ["Minutes"]}]}]
+    root = ElementTree.fromstring(body)
+    assert [el.text for el in root.iter(f"{{{_s3_mod.S3_NS}}}Minutes")] == ["15", "15"]
+    with request_scope("111111111111", "us-east-1"):
+        assert _s3_mod._bucket_replication.get(bucket) is None
+
+
+def _repl_raw_error(bucket, body):
+    status, _headers, out = _s3_mod._put_bucket_replication(bucket, body.encode())
+    root = ElementTree.fromstring(out)
+    return status, {el.tag: el.text for el in root}
+
+
+_BOGUS = "<Bogus>x</Bogus>"
+
+
+@pytest.mark.parametrize("old,new,expected", [
+    pytest.param("<Metrics><Status>Enabled</Status>", "<Metrics>", _REPL_MALFORMED, id="U7:metrics-no-status"),
+    pytest.param("<SseKmsEncryptedObjects><Status>Enabled</Status>", "<SseKmsEncryptedObjects>", _REPL_MALFORMED,
+                 id="U7:ssekms-no-status"),
+    pytest.param("<ReplicaModifications><Status>Enabled</Status>", "<ReplicaModifications>", _REPL_MALFORMED,
+                 id="U7:replicamods-no-status"),
+    pytest.param("<Time><Minutes>15</Minutes></Time>", "", _REPL_MALFORMED, id="U7:rtc-no-time"),
+    pytest.param("<Time><Minutes>15</Minutes></Time>", "<Time></Time>", _REPL_MALFORMED, id="M:time-empty+metrics"),
+    pytest.param("<EventThreshold><Minutes>15</Minutes></EventThreshold>", "<EventThreshold></EventThreshold>",
+                 _REPL_MALFORMED, id="M:et-empty+rtc"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes>fifteen</Minutes>", _REPL_MALFORMED,
+                 id="U7:minutes-fifteen"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes>15.0</Minutes>", _REPL_MALFORMED,
+                 id="U4:rtc-minutes-15.0"),
+    pytest.param("<ReplicationTime><Status>Enabled</Status>", "<ReplicationTime><Status> Enabled </Status>",
+                 _REPL_MALFORMED, id="M:status-padded"),
+    pytest.param("<ReplicationTime><Status>Enabled</Status>", "<ReplicationTime><Status></Status>", _REPL_MALFORMED,
+                 id="M:rtc-empty-status"),
+    pytest.param("<ReplicationTime><Status>Enabled</Status><Time><Minutes>15</Minutes></Time></ReplicationTime>",
+                 "<ReplicationTime></ReplicationTime>", _REPL_MALFORMED, id="M:rtc-empty"),
+    pytest.param("<Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>",
+                 "<Metrics></Metrics>", _REPL_MALFORMED, id="M:metrics-empty+rtc"),
+    *[pytest.param(f"</{el}>", f"{_BOGUS}</{el}>", _REPL_MALFORMED, id=f"U5:bogus-in-{el}")
+      for el in ("SourceSelectionCriteria", "SseKmsEncryptedObjects", "ReplicaModifications", "EncryptionConfiguration",
+                 "ReplicationTime", "Time", "Metrics", "EventThreshold")],
+    pytest.param("<Metrics><Status>Enabled</Status>", "<Metrics><Status>Enabled</Status><Status>Enabled</Status>",
+                 _REPL_MALFORMED, id="r3 P1:dup-metrics-status"),
+    pytest.param("<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>",
+                 "<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>" * 2, _REPL_MALFORMED,
+                 id="r3 P1:dup-ssekms"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes>15</Minutes><Minutes>15</Minutes>", _REPL_MALFORMED,
+                 id="r3 P1:dup-time-minutes"),
+    pytest.param("</EncryptionConfiguration>", f"</EncryptionConfiguration><EncryptionConfiguration><ReplicaKmsKeyID>"
+                 f"{_REPL_KEY}</ReplicaKmsKeyID></EncryptionConfiguration>", _REPL_MALFORMED,
+                 id="r3 P1:dup-encryption-configuration"),
+    pytest.param("</ReplicationTime>", "</ReplicationTime><ReplicationTime><Status>Enabled</Status><Time><Minutes>15"
+                 "</Minutes></Time></ReplicationTime>", _REPL_MALFORMED, id="r3 P1:dup-replication-time"),
+    pytest.param("</SourceSelectionCriteria>", "</SourceSelectionCriteria><SourceSelectionCriteria>"
+                 "<ReplicaModifications><Status>Enabled</Status></ReplicaModifications></SourceSelectionCriteria>",
+                 _REPL_MALFORMED, id="r3 P1:dup-ssc"),
+    *[pytest.param(old, new, _REPL_MALFORMED, id=f"r7 D:{name}") for name, old, new in (
+        ("dup-metrics", "</Metrics>", "</Metrics><Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes>"
+                                      "</EventThreshold></Metrics>"),
+        ("dup-replicamods", "</ReplicaModifications>",
+         "</ReplicaModifications><ReplicaModifications><Status>Enabled</Status></ReplicaModifications>"),
+        ("dup-replica-kms-key-id", "</ReplicaKmsKeyID>", f"</ReplicaKmsKeyID><ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID>"),
+        ("dup-event-threshold", "</EventThreshold>", "</EventThreshold><EventThreshold><Minutes>15</Minutes></EventThreshold>"),
+        ("dup-time", "</Time>", "</Time><Time><Minutes>15</Minutes></Time>"),
+        ("dup-rtc-status", "<ReplicationTime><Status>Enabled</Status>",
+         "<ReplicationTime><Status>Enabled</Status><Status>Enabled</Status>"),
+        ("dup-ssekms-status", "<SseKmsEncryptedObjects><Status>Enabled</Status>",
+         "<SseKmsEncryptedObjects><Status>Enabled</Status><Status>Enabled</Status>"),
+        ("dup-et-minutes", "<EventThreshold><Minutes>15</Minutes>", "<EventThreshold><Minutes>15</Minutes><Minutes>15</Minutes>"))],
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes></Minutes>", _REPL_TIME_MINUTES,
+                 id="U4:rtc-minutes-empty"),
+    pytest.param("<EventThreshold><Minutes>15</Minutes>", "<EventThreshold><Minutes></Minutes>", _REPL_EVENT_MINUTES,
+                 id="r2 R1:rtcE15+metE-empty-minutes"),
+    pytest.param("<Time><Minutes>15</Minutes>", "<Time><Minutes> </Minutes>", _REPL_TIME_MINUTES,
+                 id="r4 P7:rtc-minutes-whitespace-only"),
+    pytest.param("<EventThreshold><Minutes>15</Minutes>", "<EventThreshold><Minutes> </Minutes>", _REPL_EVENT_MINUTES,
+                 id="r4 P7:et-minutes-whitespace-only"),
+    pytest.param(f"<ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID>", "", (
+        "InvalidRequest", "ReplicaKmsKeyID tag must be specified in EncryptionConfiguration.", None),
+        id="U7:empty-enc+ssekms"),
+    pytest.param(f"<ReplicaKmsKeyID>{_REPL_KEY}</ReplicaKmsKeyID>" + "</EncryptionConfiguration><ReplicationTime>"
+                 "<Status>Enabled</Status><Time><Minutes>15</Minutes>",
+                 "</EncryptionConfiguration><ReplicationTime><Status>Enabled</Status><Time><Minutes>10</Minutes>", (
+                     "InvalidRequest", "ReplicaKmsKeyID tag must be specified in EncryptionConfiguration.", None),
+                 id="r2 R2:empty-enc+ssekms+rtc10"),
+    pytest.param("<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>"
+                 "<ReplicaModifications><Status>Enabled</Status></ReplicaModifications>", "", (
+                     "InvalidRequest", "SourceSelectionCriteria cannot be empty.", None), id="U2:empty-ssc+enc"),
+])
+def test_s3_replication_raw_option_bodies_like_aws(replication_state, old, new, expected):
+    """Raw-XML variants of the accepted rule that botocore cannot send (capture key in the
+    parameter id): the same code, message and ArgumentName, and nothing is stored."""
+    assert old in _REPL_OPTIONS_XML
+    status, err = _repl_raw_error(replication_state, _REPL_OPTIONS_XML.replace(old, new, 1))
+    code, message, argument = expected
+    assert (status, err["Code"], err["Message"], err.get("ArgumentName")) == (400, code, message, argument)
+    assert _s3_mod._bucket_replication.get(replication_state) is None
+
+
+def test_s3_replication_raw_empty_selection_and_encryption(replication_state):
+    """Empty SourceSelectionCriteria and EncryptionConfiguration elements on a minimal rule
+    (U7:empty-ssc, U7:empty-enc-no-ssc, r2 R2:empty-ssc+rtc10)."""
+    def body(rule_extra="", dest_extra=""):
+        return ('<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                "<Role>arn:aws:iam::000000000000:role/repl</Role><Rule><ID>r</ID><Priority>1</Priority>"
+                f"<Filter><Prefix></Prefix></Filter><Status>Enabled</Status>{rule_extra}"
+                f"<Destination><Bucket>arn:aws:s3:::repl-options-dst</Bucket>{dest_extra}</Destination>"
+                "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication></Rule>"
+                "</ReplicationConfiguration>")
+    empty_ssc = ("InvalidRequest", "SourceSelectionCriteria cannot be empty.")
+    for raw, expected in (
+        (body("<SourceSelectionCriteria></SourceSelectionCriteria>"), empty_ssc),
+        (body("<SourceSelectionCriteria></SourceSelectionCriteria>",
+              "<ReplicationTime><Status>Enabled</Status><Time><Minutes>10</Minutes></Time></ReplicationTime>"
+              "<Metrics><Status>Enabled</Status><EventThreshold><Minutes>15</Minutes></EventThreshold></Metrics>"),
+         empty_ssc),
+        (body(dest_extra="<EncryptionConfiguration></EncryptionConfiguration>"), _REPL_NEEDS_SSE[:2]),
+    ):
+        status, err = _repl_raw_error(replication_state, raw)
+        assert (status, err["Code"], err["Message"]) == (400, *expected)
+        assert _s3_mod._bucket_replication.get(replication_state) is None
+
+
+@pytest.mark.parametrize("minutes", ["015", "+15", " 15 ", "\t15\n"])
+def test_s3_replication_reads_minutes_as_an_integer(replication_state, minutes):
+    """xs:int forms of 15 are accepted and returned as 15 (U4:rtc-minutes-015, U4:rtc-minutes-+15,
+    U4:rtc-minutes-padded-15, U4:et-minutes-015, r3 P1:minutes-tab-newline)."""
+    body = _REPL_OPTIONS_XML.replace("<Minutes>15</Minutes>", f"<Minutes>{minutes}</Minutes>")
+    assert _s3_mod._put_bucket_replication(replication_state, body.encode())[0] == 200
+    dest = _s3_mod._bucket_replication[replication_state]["Rules"][0]["Destination"]
+    assert dest["ReplicationTime"]["Time"] == dest["Metrics"]["EventThreshold"] == {"Minutes": 15}
+
+
+def test_s3_replication_empty_key_argument_value(replication_state):
+    """An empty ReplicaKmsKeyID answers InvalidArgument with an empty ArgumentValue (U6:empty-element)."""
+    body = _REPL_OPTIONS_XML.replace(_REPL_KEY, "", 1)
+    status, err = _repl_raw_error(replication_state, body)
+    assert (status, err["Code"], err["Message"], err["ArgumentName"]) == (
+        400, "InvalidArgument", "ReplicaKmsKeyID cannot be empty.", "ReplicaKmsKeyID")
+    assert err["ArgumentValue"] in (None, "")
+
+
 def test_s3_replication_config_round_trips_cross_account_fields(s3):
     """GetBucketReplication answers the cross-account fields the PUT stored."""
     src_client, dst_client, src, dst = _cross_account_pair("cfg")
@@ -7965,7 +9218,7 @@ def test_delete_objects_in_an_unversioned_bucket(s3, sqs, notified):
 def test_s3_create_owned_bucket_again(s3):
     east = f"owned-east-{_uuid_mod.uuid4().hex[:8]}"
     west = f"owned-west-{_uuid_mod.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=east, ACL="public-read")
+    s3.create_bucket(Bucket=east, ObjectOwnership="ObjectWriter", ACL="public-read")
     s3.create_bucket(Bucket=west, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
     try:
         s3.create_bucket(Bucket=east)
@@ -7974,8 +9227,1663 @@ def test_s3_create_owned_bucket_again(s3):
         with pytest.raises(ClientError) as exc:
             s3.create_bucket(Bucket=west, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
         assert exc.value.response["Error"]["Code"] == "BucketAlreadyOwnedByYou"
-        assert exc.value.response["Error"]["Message"] == "The bucket you tried to create already exists, and you own it."
+        assert exc.value.response["Error"]["Message"] == (
+            "Your previous request to create the named bucket succeeded and you already own it.")
+        assert exc.value.response["Error"]["BucketName"] == west
         assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
     finally:
         s3.delete_bucket(Bucket=east)
         s3.delete_bucket(Bucket=west)
+
+
+# Under AUTH=true a request without credentials is anonymous. S3 answers it only
+# through the bucket owner's public grants (AllUsers ACL grants or a bucket policy
+# for Principal "*", unless Public Access Block shuts them off); otherwise 403
+# AccessDenied. Source: the S3 User Guide on anonymous requests and Block Public
+# Access; not measured against AWS here.
+
+def _anonymous_bucket(monkeypatch, auth=True, **bucket_headers):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    bucket = f"anon-{uuid.uuid4().hex[:10]}"
+    assert _lock_call("PUT", f"/{bucket}", bucket_headers)[0] == 200
+    assert _lock_call("PUT", f"/{bucket}/k", {}, b"secret")[0] == 200
+    return bucket
+
+
+def _anonymous_call(method, path, headers=None, body=b"", internal=False):
+    import asyncio
+
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3mod
+
+    with request_scope("000000000000", "us-east-1"):
+        return asyncio.run(s3mod.handle_request(method, path, headers or {}, body, {}, internal=internal))
+
+
+def _public_read_policy(bucket):
+    return json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*",
+    }]}).encode()
+
+
+def test_anonymous_request_to_a_private_bucket_is_denied_under_auth(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    for method, path, body in [("GET", f"/{bucket}/k", b""), ("HEAD", f"/{bucket}/k", b""),
+                               ("GET", f"/{bucket}/missing", b""), ("GET", f"/{bucket}", b""),
+                               ("PUT", f"/{bucket}/new", b"x"), ("DELETE", f"/{bucket}/k", b"")]:
+        status, _, resp = _anonymous_call(method, path, body=body)
+        assert status == 403, (method, path)
+        if method != "HEAD":
+            assert b"<Code>AccessDenied</Code>" in resp
+    # The owner still reads it, and the object is still there.
+    status, _, resp = _lock_call("GET", f"/{bucket}/k")
+    assert (status, resp) == (200, b"secret")
+
+
+def test_s3_create_bucket_object_ownership_header(s3):
+    name = f"own-hdr-{uuid.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=name, ObjectOwnership="ObjectWriter")
+    try:
+        rules = s3.get_bucket_ownership_controls(Bucket=name)["OwnershipControls"]["Rules"]
+        assert rules == [{"ObjectOwnership": "ObjectWriter"}]
+    finally:
+        s3.delete_bucket(Bucket=name)
+
+
+def test_anonymous_request_reads_a_public_object_under_auth(monkeypatch):
+    # Object ACLs only count on a bucket with ACLs enabled (not BucketOwnerEnforced).
+    bucket = _anonymous_bucket(monkeypatch, **{"x-amz-object-ownership": "BucketOwnerPreferred"})
+    assert _lock_call("PUT", f"/{bucket}/pub", {"x-amz-acl": "public-read"}, b"open")[0] == 200
+    status, _, resp = _anonymous_call("GET", f"/{bucket}/pub")
+    assert (status, resp) == (200, b"open")
+    assert _anonymous_call("GET", f"/{bucket}/k")[0] == 403
+
+
+def test_anonymous_request_follows_a_public_bucket_policy_and_public_access_block(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    import asyncio
+
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3mod
+
+    with request_scope("000000000000", "us-east-1"):
+        status, _, _ = asyncio.run(s3mod.handle_request(
+            "PUT", f"/{bucket}", {"authorization": _ROOT_AUTHORIZATION}, _public_read_policy(bucket),
+            {"policy": [""]}))
+    assert status == 204
+    status, _, resp = _anonymous_call("GET", f"/{bucket}/k")
+    assert (status, resp) == (200, b"secret")
+    # The policy allows only s3:GetObject.
+    assert _anonymous_call("PUT", f"/{bucket}/k", body=b"overwrite")[0] == 403
+
+    block = (b"<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets>"
+             b"</PublicAccessBlockConfiguration>")
+    with request_scope("000000000000", "us-east-1"):
+        status, _, _ = asyncio.run(s3mod.handle_request(
+            "PUT", f"/{bucket}", {"authorization": _ROOT_AUTHORIZATION}, block, {"publicAccessBlock": [""]}))
+    assert status == 200
+    assert _anonymous_call("GET", f"/{bucket}/k")[0] == 403
+
+
+def test_s3_bucket_owner_enforced_ignores_a_stored_bucket_acl():
+    """A public bucket ACL stored before ACLs were disabled, as older persisted state can hold, grants nothing."""
+    from ministack.core.responses import request_scope
+    from ministack.services import s3 as s3mod
+
+    bucket = f"boe-stored-{uuid.uuid4().hex[:8]}"
+    headers = {"x-amz-object-ownership": "ObjectWriter", "x-amz-acl": "public-read"}
+    assert _lock_call("PUT", f"/{bucket}", headers)[0] == 200
+    with request_scope("000000000000", "us-east-1"):
+        assert s3mod._foreign_bucket_allows("000000000000", bucket, "", "GET", {}, "")
+        s3mod._buckets[bucket].pop("_ownership_controls")
+        assert not s3mod._foreign_bucket_allows("000000000000", bucket, "", "GET", {}, "")
+
+
+def test_anonymous_request_is_served_without_auth(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch, auth=False)
+    status, _, resp = _anonymous_call("GET", f"/{bucket}/k")
+    assert (status, resp) == (200, b"secret")
+
+
+def test_internal_call_without_credentials_is_not_anonymous(monkeypatch):
+    bucket = _anonymous_bucket(monkeypatch)
+    assert _anonymous_call("PUT", f"/{bucket}/delivered", body=b"x", internal=True)[0] == 200
+# ---------------------------------------------------------------------------
+# Bucket home region (#2158)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("headers,query,expected", [
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=AKID/20261012/eu-west-1/s3/aws4_request, "
+                       "SignedHeaders=host, Signature=abc"}, {}, "eu-west-1"),
+    ({}, {"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/us-west-2/s3/aws4_request"]}, "us-west-2"),
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=AKID/20261012/eu-west-1/sqs/aws4_request, "
+                       "SignedHeaders=host, Signature=abc"}, {}, None),
+    ({"authorization": "AWS4-ECDSA-P256-SHA256 Credential=AKID/20261012/s3/aws4_request, "
+                       "SignedHeaders=host, Signature=abc", "x-amz-region-set": "eu-west-1"}, {}, None),
+    ({"authorization": "AWS AKID:sig"}, {}, None),
+    ({}, {}, None),
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=broken"}, {}, None),
+])
+def test_s3_signed_region(headers, query, expected):
+    from ministack.services import s3 as s3_svc
+
+    assert s3_svc._signed_region(headers, query) == expected
+
+
+def test_s3_error_extra_elements_and_headers():
+    from xml.etree.ElementTree import fromstring
+
+    from ministack.services import s3 as s3_svc
+
+    status, headers, body = s3_svc._error("Plain", "msg", 400, "/b")
+    assert status == 400 and headers == {"Content-Type": "application/xml"}
+    assert [c.tag for c in fromstring(body)] == ["Code", "Message", "Resource", "RequestId"]
+
+    status, headers, body = s3_svc._error(
+        "PermanentRedirect", "moved", 301, "/b",
+        extra={"Endpoint": "b.s3-eu-west-1.amazonaws.com", "Bucket": "b"},
+        headers={"x-amz-bucket-region": "eu-west-1"},
+    )
+    root = fromstring(body)
+    assert status == 301
+    assert headers == {"Content-Type": "application/xml", "x-amz-bucket-region": "eu-west-1"}
+    assert [c.tag for c in root] == ["Code", "Message", "Resource", "Endpoint", "Bucket", "RequestId"]
+    assert root.findtext("Endpoint") == "b.s3-eu-west-1.amazonaws.com"
+
+
+def test_s3_list_buckets_region_filter(s3):
+    tag = _uuid_mod.uuid4().hex[:8]
+    east = [f"lbr-{tag}-e{i}" for i in range(2)]
+    west = [f"lbr-{tag}-w{i}" for i in range(3)]
+    for name in east:
+        s3.create_bucket(Bucket=name)
+    for name in west:
+        s3.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    euw1 = _regional_client("s3", "eu-west-1")
+    prefix = f"lbr-{tag}-"
+    try:
+        listed = euw1.list_buckets(Prefix=prefix, BucketRegion="eu-west-1")["Buckets"]
+        assert [b["Name"] for b in listed] == west
+        assert {b["BucketRegion"] for b in listed} == {"eu-west-1"}
+
+        listed = s3.list_buckets(Prefix=prefix, BucketRegion="us-east-1")["Buckets"]
+        assert [b["Name"] for b in listed] == east
+
+        # Pagination stays within the filter.
+        names, token = [], None
+        while True:
+            kwargs = {"Prefix": prefix, "BucketRegion": "eu-west-1", "MaxBuckets": 1}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = euw1.list_buckets(**kwargs)
+            names += [b["Name"] for b in page["Buckets"]]
+            token = page.get("ContinuationToken")
+            if not token:
+                break
+        assert names == west
+
+        # No filter lists every region.
+        listed = euw1.list_buckets(Prefix=prefix)["Buckets"]
+        assert [b["Name"] for b in listed] == sorted(east + west)
+    finally:
+        for name in east:
+            s3.delete_bucket(Bucket=name)
+        for name in west:
+            euw1.delete_bucket(Bucket=name)
+
+
+def test_s3_list_buckets_region_filter_must_match_endpoint(s3):
+    with pytest.raises(ClientError) as exc:
+        s3.list_buckets(BucketRegion="eu-west-1")
+    err = exc.value.response["Error"]
+    assert err["Code"] == "InvalidArgument"
+    assert err["Message"] == ("Requests with bucket-region specified must be made to the "
+                              "corresponding regional endpoint")
+    assert err["ArgumentName"] == "bucket-region"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def _raw_signed(method, path, region, host=None, presign=False, body=b""):
+    """Send a SigV4-signed S3 request without any client-side redirect
+    handling. ``host`` overrides the Host header (signed as sent)."""
+    import http.client
+
+    from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    parsed = urlparse(ENDPOINT)
+    netloc = host or parsed.netloc
+    req = AWSRequest(method=method, url=f"http://{netloc}{path}", data=body)
+    creds = Credentials("test", "test")
+    if presign:
+        S3SigV4QueryAuth(creds, "s3", region, expires=300).add_auth(req)
+    else:
+        req.headers["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
+        S3SigV4Auth(creds, "s3", region).add_auth(req)
+    target = urlparse(req.url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    headers = {k: v for k, v in req.headers.items()}
+    headers["Host"] = netloc
+    conn.request(method, target.path + (f"?{target.query}" if target.query else ""), body=body or None,
+                 headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, data
+
+
+def _xml_error(body):
+    from xml.etree.ElementTree import fromstring
+
+    root = fromstring(body)
+    return {child.tag: child.text for child in root}
+
+
+@pytest.fixture
+def euw1_bucket(s3):
+    name = f"home-euw1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    euw1 = _regional_client("s3", "eu-west-1")
+    euw1.put_object(Bucket=name, Key="k.txt", Body=b"hello")
+    yield name
+    for obj in euw1.list_objects_v2(Bucket=name).get("Contents", []):
+        euw1.delete_object(Bucket=name, Key=obj["Key"])
+    euw1.delete_bucket(Bucket=name)
+
+
+_REDIRECT_MSG = ("The bucket you are attempting to access must be addressed using the specified "
+                 "endpoint. Please send all future requests to this endpoint.")
+
+
+def test_s3_wrong_region_get_is_permanent_redirect(euw1_bucket):
+    for presign in (False, True):
+        status, headers, body = _raw_signed("GET", f"/{euw1_bucket}/k.txt", "us-west-2", presign=presign)
+        assert status == 301, body
+        assert headers["x-amz-bucket-region"] == "eu-west-1"
+        err = _xml_error(body)
+        assert err["Code"] == "PermanentRedirect"
+        assert err["Message"] == _REDIRECT_MSG
+        assert err["Endpoint"] == f"{euw1_bucket}.s3-eu-west-1.amazonaws.com"
+        assert err["Bucket"] == euw1_bucket
+
+    # A us-east-1 client on the global host is pointed at the global endpoint.
+    status, headers, body = _raw_signed("PUT", f"/{euw1_bucket}/new.txt", "us-east-1", body=b"x")
+    assert status == 301
+    assert _xml_error(body)["Endpoint"] == f"{euw1_bucket}.s3.amazonaws.com"
+    assert headers["x-amz-bucket-region"] == "eu-west-1"
+
+
+def test_s3_wrong_region_head_is_bodiless_redirect(euw1_bucket):
+    for path in (f"/{euw1_bucket}", f"/{euw1_bucket}/k.txt"):
+        status, headers, body = _raw_signed("HEAD", path, "us-east-1")
+        assert (status, body) == (301, b"")
+        assert headers["x-amz-bucket-region"] == "eu-west-1"
+
+
+def test_s3_wrong_region_at_home_endpoint_is_authorization_error(euw1_bucket):
+    host = f"s3.eu-west-1.{urlparse(ENDPOINT).netloc}"
+    status, headers, body = _raw_signed("GET", f"/{euw1_bucket}/k.txt", "us-east-1", host=host)
+    assert status == 400
+    err = _xml_error(body)
+    assert err["Code"] == "AuthorizationHeaderMalformed"
+    assert err["Message"] == ("The authorization header is malformed; the region 'us-east-1' is wrong; "
+                              "expecting 'eu-west-1'")
+    assert err["Region"] == "eu-west-1"
+    assert "x-amz-bucket-region" not in headers
+
+    vhost = f"{euw1_bucket}.s3.eu-west-1.{urlparse(ENDPOINT).netloc}"
+    status, headers, body = _raw_signed("GET", "/k.txt", "us-east-1", host=vhost, presign=True)
+    assert status == 400
+    err = _xml_error(body)
+    assert err["Code"] == "AuthorizationQueryParametersError"
+    assert err["Message"] == ("Error parsing the X-Amz-Credential parameter; the region 'us-east-1' is "
+                              "wrong; expecting 'eu-west-1'")
+    assert err["Region"] == "eu-west-1"
+
+    status, headers, body = _raw_signed("HEAD", f"/{euw1_bucket}", "us-east-1", host=host)
+    assert (status, body) == (400, b"")
+    assert headers["x-amz-bucket-region"] == "eu-west-1"
+    status, headers, body = _raw_signed("HEAD", f"/{euw1_bucket}/k.txt", "us-east-1", host=host)
+    assert (status, body) == (400, b"")
+    assert "x-amz-bucket-region" not in headers
+
+
+def test_s3_wrong_region_exemptions_and_match(euw1_bucket):
+    status, _, body = _raw_signed("GET", f"/{euw1_bucket}?location", "us-east-1")
+    assert status == 200 and b"eu-west-1" in body
+    status, _, body = _raw_signed("GET", "/", "ap-south-1")
+    assert status == 200 and euw1_bucket.encode() in body
+    status, _, body = _raw_signed("GET", f"/{euw1_bucket}/k.txt", "eu-west-1")
+    assert (status, body) == (200, b"hello")
+    status, _, _ = _raw_signed("GET", f"/no-such-{euw1_bucket}/k.txt", "us-west-2")
+    assert status == 404
+
+
+def test_s3_unsigned_region_request_is_not_redirected(euw1_bucket):
+    """Anonymous requests carry no signing region, so a public-read object in
+    eu-west-1 answers 200 wherever the request lands."""
+    import urllib.request
+
+    euw1 = _regional_client("s3", "eu-west-1")
+    euw1.put_bucket_ownership_controls(
+        Bucket=euw1_bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "ObjectWriter"}]})
+    euw1.put_object(Bucket=euw1_bucket, Key="public.txt", Body=b"open", ACL="public-read")
+    with urllib.request.urlopen(f"{ENDPOINT}/{euw1_bucket}/public.txt") as resp:
+        assert (resp.status, resp.read()) == (200, b"open")
+
+
+def test_s3_cross_region_boto3_follows_redirect(s3):
+    """boto3 configured for us-east-1 reaches a us-west-2 bucket through the
+    PermanentRedirect + x-amz-bucket-region it gets back."""
+    name = f"redir-usw2-{_uuid_mod.uuid4().hex[:8]}"
+    usw2 = _regional_client("s3", "us-west-2")
+    usw2.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    try:
+        s3.put_object(Bucket=name, Key="a.txt", Body=b"redirected")
+        assert s3.get_object(Bucket=name, Key="a.txt")["Body"].read() == b"redirected"
+        assert [o["Key"] for o in s3.list_objects_v2(Bucket=name)["Contents"]] == ["a.txt"]
+        assert s3.head_bucket(Bucket=name)["ResponseMetadata"]["HTTPHeaders"]["x-amz-bucket-region"] == "us-west-2"
+        assert s3.head_object(Bucket=name, Key="a.txt")["ContentLength"] == 10
+        s3.delete_object(Bucket=name, Key="a.txt")
+        assert usw2.list_objects_v2(Bucket=name)["KeyCount"] == 0
+    finally:
+        usw2.delete_bucket(Bucket=name)
+
+
+def test_s3_cross_region_copy_and_upload_part_copy(s3):
+    tag = _uuid_mod.uuid4().hex[:8]
+    src, dst = f"copy-src-usw2-{tag}", f"copy-dst-euw1-{tag}"
+    usw2, euw1 = _regional_client("s3", "us-west-2"), _regional_client("s3", "eu-west-1")
+    usw2.create_bucket(Bucket=src, CreateBucketConfiguration={"LocationConstraint": "us-west-2"})
+    euw1.create_bucket(Bucket=dst, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    part = b"p" * (5 * 1024 * 1024)
+    try:
+        usw2.put_object(Bucket=src, Key="obj", Body=b"copy me")
+        usw2.put_object(Bucket=src, Key="big", Body=part)
+        euw1.copy_object(Bucket=dst, Key="copied", CopySource={"Bucket": src, "Key": "obj"})
+        assert euw1.get_object(Bucket=dst, Key="copied")["Body"].read() == b"copy me"
+
+        upload = euw1.create_multipart_upload(Bucket=dst, Key="multi")
+        etag = euw1.upload_part_copy(Bucket=dst, Key="multi", UploadId=upload["UploadId"], PartNumber=1,
+                                     CopySource={"Bucket": src, "Key": "big"})["CopyPartResult"]["ETag"]
+        euw1.complete_multipart_upload(Bucket=dst, Key="multi", UploadId=upload["UploadId"],
+                                       MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": etag}]})
+        assert euw1.head_object(Bucket=dst, Key="multi")["ContentLength"] == len(part)
+    finally:
+        for client, bucket in ((usw2, src), (euw1, dst)):
+            for obj in client.list_objects_v2(Bucket=bucket).get("Contents", []):
+                client.delete_object(Bucket=bucket, Key=obj["Key"])
+            client.delete_bucket(Bucket=bucket)
+
+
+# ---------------------------------------------------------------------------
+# Cross-Region Replication (#2158)
+# ---------------------------------------------------------------------------
+
+_REPL_ROLE = "arn:aws:iam::000000000000:role/repl"
+
+
+def _versioned_bucket(region, slug):
+    client = _regional_client("s3", region)
+    name = f"crr-{slug}-{_uuid_mod.uuid4().hex[:8]}"
+    kwargs = {} if region == "us-east-1" else {"CreateBucketConfiguration": {"LocationConstraint": region}}
+    client.create_bucket(Bucket=name, **kwargs)
+    client.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
+    return client, name
+
+
+def _replicate(client, src, dst, **rule):
+    rule = {"ID": "r1", "Status": "Enabled", "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}, **rule}
+    client.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": [rule]})
+
+
+def _purge(client, bucket):
+    lv = client.list_object_versions(Bucket=bucket)
+    for v in lv.get("Versions", []) + lv.get("DeleteMarkers", []):
+        client.delete_object(Bucket=bucket, Key=v["Key"], VersionId=v["VersionId"])
+    client.delete_bucket(Bucket=bucket)
+
+
+@pytest.fixture
+def crr_pair():
+    """A us-east-1 source and an eu-west-1 destination, both versioned."""
+    use1, src = _versioned_bucket("us-east-1", "src")
+    euw1, dst = _versioned_bucket("eu-west-1", "dst")
+    yield use1, src, euw1, dst
+    _purge(use1, src)
+    _purge(euw1, dst)
+
+
+def test_s3_replication_cross_region_replica_readable_in_destination(crr_pair):
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Filter={"Prefix": ""}, DeleteMarkerReplication={"Status": "Disabled"})
+    use1.put_object(Bucket=src, Key="a.txt", Body=b"across regions")
+    assert use1.head_object(Bucket=src, Key="a.txt")["ReplicationStatus"] == "COMPLETED"
+    replica = euw1.get_object(Bucket=dst, Key="a.txt")
+    assert replica["ReplicationStatus"] == "REPLICA"
+    assert replica["Body"].read() == b"across regions"
+
+
+def _delete_markers(client, bucket, key):
+    return [m for m in client.list_object_versions(Bucket=bucket).get("DeleteMarkers", []) if m["Key"] == key]
+
+
+def test_s3_delete_marker_replication_enabled_v2_rule(crr_pair):
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Filter={"Prefix": ""}, DeleteMarkerReplication={"Status": "Enabled"})
+    use1.put_object(Bucket=src, Key="gone.txt", Body=b"x")
+    use1.put_object(Bucket=src, Key="batch.txt", Body=b"y")
+    use1.delete_object(Bucket=src, Key="gone.txt")
+    use1.delete_objects(Bucket=src, Delete={"Objects": [{"Key": "batch.txt"}]})
+    for key in ("gone.txt", "batch.txt"):
+        assert len(_delete_markers(euw1, dst, key)) == 1
+        with pytest.raises(ClientError) as exc:
+            euw1.get_object(Bucket=dst, Key=key)
+        assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_s3_delete_marker_replication_v1_rule(crr_pair):
+    """A rule without Filter is V1, which replicates delete markers from user deletes."""
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Prefix="")
+    use1.put_object(Bucket=src, Key="v1.txt", Body=b"x")
+    use1.delete_object(Bucket=src, Key="v1.txt")
+    assert len(_delete_markers(euw1, dst, "v1.txt")) == 1
+
+
+def test_s3_delete_marker_replication_version_id_delete_stays_local(crr_pair):
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Filter={"Prefix": ""}, DeleteMarkerReplication={"Status": "Enabled"})
+    vid = use1.put_object(Bucket=src, Key="v.txt", Body=b"x")["VersionId"]
+    use1.delete_object(Bucket=src, Key="v.txt", VersionId=vid)
+    assert euw1.get_object(Bucket=dst, Key="v.txt")["Body"].read() == b"x"
+    assert _delete_markers(euw1, dst, "v.txt") == []
+
+
+@pytest.mark.parametrize("rule", [
+    {"Filter": {"Prefix": ""}, "DeleteMarkerReplication": {"Status": "Disabled"}},
+    {"Filter": {"Tag": {"Key": "keep", "Value": "yes"}}, "DeleteMarkerReplication": {"Status": "Enabled"}},
+], ids=["disabled", "tag-filter"])
+def test_s3_delete_marker_replication_not_replicated(crr_pair, rule):
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, **rule)
+    use1.put_object(Bucket=src, Key="k.txt", Body=b"x", Tagging="keep=yes")
+    assert euw1.get_object(Bucket=dst, Key="k.txt")["Body"].read() == b"x"
+    use1.delete_object(Bucket=src, Key="k.txt")
+    assert _delete_markers(euw1, dst, "k.txt") == []
+    assert euw1.get_object(Bucket=dst, Key="k.txt")["Body"].read() == b"x"
+
+
+def _replicated_keys(client, bucket):
+    return sorted(o["Key"] for o in client.list_objects_v2(Bucket=bucket).get("Contents", []))
+
+
+def test_s3_replication_tag_filter_single_tag(crr_pair):
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Filter={"Tag": {"Key": "replicate", "Value": "yes"}},
+               DeleteMarkerReplication={"Status": "Disabled"})
+    use1.put_object(Bucket=src, Key="tagged", Body=b"1", Tagging="replicate=yes&other=1")
+    use1.put_object(Bucket=src, Key="wrong-value", Body=b"2", Tagging="replicate=no")
+    use1.put_object(Bucket=src, Key="untagged", Body=b"3")
+    use1.copy_object(Bucket=src, Key="copy-replaced", CopySource={"Bucket": src, "Key": "untagged"},
+                     TaggingDirective="REPLACE", Tagging="replicate=yes")
+    use1.copy_object(Bucket=src, Key="copy-kept", CopySource={"Bucket": src, "Key": "tagged"})
+    assert _replicated_keys(euw1, dst) == ["copy-kept", "copy-replaced", "tagged"]
+    assert "ReplicationStatus" not in use1.head_object(Bucket=src, Key="untagged")
+
+
+def test_s3_replication_tag_filter_and(crr_pair):
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst,
+               Filter={"And": {"Prefix": "logs/", "Tags": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]}},
+               DeleteMarkerReplication={"Status": "Disabled"})
+    use1.put_object(Bucket=src, Key="logs/both", Body=b"x", Tagging="a=1&b=2")
+    use1.put_object(Bucket=src, Key="logs/one", Body=b"x", Tagging="a=1")
+    use1.put_object(Bucket=src, Key="data/both", Body=b"x", Tagging="a=1&b=2")
+    assert _replicated_keys(euw1, dst) == ["logs/both"]
+
+
+def test_s3_two_way_replication_has_no_loop():
+    use1, a = _versioned_bucket("us-east-1", "a")
+    euw1, b = _versioned_bucket("eu-west-1", "b")
+    try:
+        _replicate(use1, a, b, Filter={"Prefix": ""}, DeleteMarkerReplication={"Status": "Disabled"})
+        _replicate(euw1, b, a, Filter={"Prefix": ""}, DeleteMarkerReplication={"Status": "Disabled"})
+        use1.put_object(Bucket=a, Key="from-a", Body=b"a")
+        euw1.put_object(Bucket=b, Key="from-b", Body=b"b")
+        for client, bucket in ((use1, a), (euw1, b)):
+            versions = client.list_object_versions(Bucket=bucket)["Versions"]
+            assert sorted(v["Key"] for v in versions) == ["from-a", "from-b"]
+        assert euw1.head_object(Bucket=b, Key="from-a")["ReplicationStatus"] == "REPLICA"
+        assert use1.head_object(Bucket=a, Key="from-b")["ReplicationStatus"] == "REPLICA"
+        assert use1.head_object(Bucket=a, Key="from-a")["ReplicationStatus"] == "COMPLETED"
+    finally:
+        _purge(use1, a)
+        _purge(euw1, b)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Region Access Points through S3 Control (#2158)
+# ---------------------------------------------------------------------------
+
+_ACCOUNT = "000000000000"
+
+
+@pytest.fixture
+def s3control_dns():
+    """boto3 prefixes S3 Control hosts with the account id."""
+    with patch_endpoint_dns():
+        yield
+
+
+@pytest.fixture
+def mrap_members():
+    """One bucket in us-east-1 and one in eu-west-1, each holding who.txt."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    use1, use1_bucket = _versioned_bucket("us-east-1", f"mrap-{tag}-use1")
+    euw1, euw1_bucket = _versioned_bucket("eu-west-1", f"mrap-{tag}-euw1")
+    use1.put_object(Bucket=use1_bucket, Key="who.txt", Body=b"use1")
+    euw1.put_object(Bucket=euw1_bucket, Key="who.txt", Body=b"euw1")
+    yield use1, use1_bucket, euw1, euw1_bucket
+    for client, bucket in ((use1, use1_bucket), (euw1, euw1_bucket)):
+        try:
+            _purge(client, bucket)
+        except ClientError:
+            pass
+
+
+def _mrap_name():
+    return f"mrap-{_uuid_mod.uuid4().hex[:10]}"
+
+
+def test_s3_mrap_routes_default_for_records_persisted_before_routes():
+    from ministack.services import s3 as s3_svc
+
+    legacy = {"Name": "old", "Alias": "a.mrap", "Regions": ["b1", "b2"], "CreatedAt": "2026-01-01T00:00:00Z"}
+    assert s3_svc.mrap_routes(legacy) == {"b1": 100, "b2": 100}
+    assert s3_svc.mrap_routes({**legacy, "Routes": {"b1": 0}}) == {"b1": 0, "b2": 100}
+
+
+def _mrap_create(ctl, name, buckets):
+    token = ctl.create_multi_region_access_point(
+        AccountId=_ACCOUNT, ClientToken=_uuid_mod.uuid4().hex,
+        Details={"Name": name, "Regions": [{"Bucket": b} for b in buckets]})["RequestTokenARN"]
+    return ctl.describe_multi_region_access_point_operation(
+        AccountId=_ACCOUNT, RequestTokenARN=token)["AsyncOperation"]
+
+
+def _mrap_delete(ctl, name):
+    token = ctl.delete_multi_region_access_point(
+        AccountId=_ACCOUNT, ClientToken=_uuid_mod.uuid4().hex, Details={"Name": name})["RequestTokenARN"]
+    return ctl.describe_multi_region_access_point_operation(
+        AccountId=_ACCOUNT, RequestTokenARN=token)["AsyncOperation"]
+
+
+def test_s3_mrap_control_async_create_describe_delete(s3control_dns, mrap_members):
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    name = _mrap_name()
+    op = _mrap_create(ctl, name, [use1_bucket, euw1_bucket])
+    assert re.fullmatch(rf"arn:aws:s3:us-west-2:{_ACCOUNT}:async-request/mrap/create/.+", op["RequestTokenARN"])
+    assert op["Operation"] == "CreateMultiRegionAccessPoint"
+    assert op["RequestStatus"] == "SUCCEEDED"
+    assert op["RequestParameters"]["CreateMultiRegionAccessPointRequest"]["Name"] == name
+    regions = op["ResponseDetails"]["MultiRegionAccessPointDetails"]["Regions"]
+    assert sorted(r["Name"] for r in regions) == ["eu-west-1", "us-east-1"]
+
+    again = _mrap_create(ctl, name, [use1_bucket, euw1_bucket])
+    assert again["RequestStatus"] == "FAILED"
+    assert again["ResponseDetails"]["ErrorDetails"]["Code"] == "MultiRegionAccessPointAlreadyOwnedByYou"
+    assert again["ResponseDetails"]["ErrorDetails"]["Message"] == (
+        "You must provide a unique name for each Multi-Region Access Point in your account. "
+        "A MRAP with this name already exists.")
+
+    deleted = _mrap_delete(ctl, name)
+    assert (deleted["Operation"], deleted["RequestStatus"]) == ("DeleteMultiRegionAccessPoint", "SUCCEEDED")
+    with pytest.raises(ClientError) as exc:
+        ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)
+    assert exc.value.response["Error"]["Code"] == "NoSuchMultiRegionAccessPoint"
+
+
+def test_s3_mrap_control_async_validation_failures(s3control_dns, mrap_members):
+    use1, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    name = _mrap_name()
+    op = _mrap_create(ctl, name, [use1_bucket, f"missing-{use1_bucket}"])
+    assert op["RequestStatus"] == "FAILED"
+    err = op["ResponseDetails"]["ErrorDetails"]
+    assert (err["Code"], err["Message"], err["Resource"]) == (
+        "NoSuchBucket", "The specified bucket does not exist.", name)
+    assert op["ResponseDetails"]["MultiRegionAccessPointDetails"]["Regions"] == []
+
+    second_use1 = f"{use1_bucket}-2"
+    use1.create_bucket(Bucket=second_use1)
+    try:
+        op = _mrap_create(ctl, name, [use1_bucket, second_use1])
+        assert op["ResponseDetails"]["ErrorDetails"]["Code"] == "MultiRegionAccessPointSameBucketRegion"
+        assert op["ResponseDetails"]["ErrorDetails"]["Message"] == (
+            "The buckets specified must be part of different Regions.")
+    finally:
+        use1.delete_bucket(Bucket=second_use1)
+    with pytest.raises(ClientError):
+        ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)
+
+
+def test_s3_mrap_control_read_get_list_policy(s3control_dns, mrap_members):
+    use1, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    names = [_mrap_name(), _mrap_name()]
+    for name in names:
+        assert _mrap_create(ctl, name, [use1_bucket, euw1_bucket])["RequestStatus"] == "SUCCEEDED"
+    try:
+        ap = ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=names[0])["AccessPoint"]
+        assert ap["Name"] == names[0]
+        assert re.fullmatch(r"[a-z][a-z0-9]{12}\.mrap", ap["Alias"])
+        assert ap["Status"] == "READY"
+        assert {(r["Bucket"], r["Region"], r["BucketAccountId"]) for r in ap["Regions"]} == {
+            (use1_bucket, "us-east-1", _ACCOUNT), (euw1_bucket, "eu-west-1", _ACCOUNT)}
+
+        listed, token = [], None
+        while True:
+            kwargs = {"AccountId": _ACCOUNT, "MaxResults": 1, **({"NextToken": token} if token else {})}
+            page = ctl.list_multi_region_access_points(**kwargs)
+            listed += [a["Name"] for a in page["AccessPoints"]]
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(listed)
+
+        policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{_ACCOUNT}:root"},
+            "Action": "s3:GetObject", "Resource": f"arn:aws:s3::{_ACCOUNT}:accesspoint/{ap['Alias']}/object/*"}]})
+        token = ctl.put_multi_region_access_point_policy(
+            AccountId=_ACCOUNT, ClientToken="p", Details={"Name": names[0], "Policy": policy})["RequestTokenARN"]
+        op = ctl.describe_multi_region_access_point_operation(AccountId=_ACCOUNT, RequestTokenARN=token)
+        assert op["AsyncOperation"]["RequestStatus"] == "SUCCEEDED"
+        doc = ctl.get_multi_region_access_point_policy(AccountId=_ACCOUNT, Name=names[0])["Policy"]
+        assert doc["Established"]["Policy"] == policy
+        assert doc["Proposed"]["Policy"] == policy
+
+        with pytest.raises(ClientError) as exc:
+            use1.delete_bucket(Bucket=use1_bucket)
+        assert exc.value.response["Error"]["Code"] == "BucketHasAccessPointsAttached"
+        assert exc.value.response["Error"]["Message"] == "Bucket has access points attached and cannot be deleted."
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        for name in names:
+            _mrap_delete(ctl, name)
+
+    with pytest.raises(ClientError) as exc:
+        ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=names[0])
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert err["Message"] == "The specified Multi-Region Access Point does not exist."
+    assert (err["MultiRegionAccessPointName"], err["AccountId"]) == (names[0], _ACCOUNT)
+
+
+def _mrap_control_raw(method, path, key=("test", "test")):
+    """A SigV4-signed S3 Control request for us-west-2, the path sent as given: status and body."""
+    import http.client
+
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    req = AWSRequest(method=method, url=f"{ENDPOINT}{path}", headers={"x-amz-account-id": _ACCOUNT})
+    req.headers["x-amz-content-sha256"] = hashlib.sha256(b"").hexdigest()
+    S3SigV4Auth(Credentials(*key), "s3", "us-west-2").add_auth(req)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, path, headers=dict(req.headers.items()))
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+_MRAP_ARN_PATH = f"arn%3Aaws%3As3%3A%3A{_ACCOUNT}%3Aaccesspoint/nope.mrap"
+
+
+@pytest.mark.parametrize("method,path,status,fields", [
+    ("POST", "", 405, {"Method": "POST", "ResourceType": "MULTI_REGION_ACCESS_POINTS"}),
+    ("DELETE", "/m1", 405, {"Method": "DELETE", "ResourceType": "MULTI_REGION_ACCESS_POINT"}),
+    ("POST", "/m1/policy", 405, {"Method": "POST", "ResourceType": "GET_MULTI_REGION_ACCESS_POINT_POLICY"}),
+    ("POST", f"/{_MRAP_ARN_PATH}/routes", 405, {"Method": "POST", "ResourceType": "MULTI_REGION_ACCESS_POINT_ROUTES"}),
+    ("GET", "/", 400, {"URI": "mrap/instances/"}),
+    ("GET", "/m1/", 400, {}),
+    ("GET", "//m1", 400, {}),
+    ("GET", "/m1/policy/", 400, {}),
+    ("GET", "/m1/x", 400, {"URI": "mrap/instances/m1/x"}),
+    ("GET", "/m1/policy/x", 400, {}),
+    ("GET", f"/{_MRAP_ARN_PATH}", 400, {}),
+    ("GET", f"/{_MRAP_ARN_PATH}/routes/", 400, {}),
+    ("GET", "/routes", 404, {"MultiRegionAccessPointName": "routes"}),
+    ("GET", "/m1/policystatus", 404, {}),
+])
+def test_s3_mrap_control_unserved_requests(method, path, status, fields):
+    """Unserved methods answer 405, unparsed paths 400 InvalidURI; "routes" alone names an MRAP."""
+    got, data = _mrap_control_raw(method, "/v20180820/mrap/instances" + path)
+    code = {405: "MethodNotAllowed", 400: "InvalidURI", 404: "NoSuchMultiRegionAccessPoint"}[status]
+    assert (got, re.search(rb"<Code>(\w+)</Code>", data).group(1).decode()) == (status, code)
+    for tag, value in fields.items():
+        assert f"<{tag}>{value}</{tag}>".encode() in data
+
+
+@pytest.mark.auth_contract
+def test_s3_mrap_named_policy_needs_the_get_action(auth_enabled, iam_user, s3control_dns, mrap_members):
+    """/v20180820/mrap/instances/policy names an MRAP called "policy"."""
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    assert _mrap_create(ctl, "policy", [use1_bucket, euw1_bucket])["RequestStatus"] == "SUCCEEDED"
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "s3:GetMultiRegionAccessPointPolicy", "Resource": "*"}]}).client(
+            "s3control", region="us-west-2")
+        assert "Policy" in user.get_multi_region_access_point_policy(AccountId=_ACCOUNT, Name="policy")
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                user.get_multi_region_access_point(AccountId=_ACCOUNT, Name="policy")
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        else:
+            assert user.get_multi_region_access_point(AccountId=_ACCOUNT, Name="policy")["AccessPoint"]["Name"] == (
+                "policy")
+    finally:
+        _mrap_delete(ctl, "policy")
+
+
+def test_s3_mrap_control_read_routes(s3control_dns, mrap_members):
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    ctl, routes_ctl = _regional_client("s3control", "us-west-2"), _regional_client("s3control", "eu-west-1")
+    name = _mrap_name()
+    _mrap_create(ctl, name, [use1_bucket, euw1_bucket])
+    try:
+        alias = ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)["AccessPoint"]["Alias"]
+        arn = f"arn:aws:s3::{_ACCOUNT}:accesspoint/{alias}"
+        routes = routes_ctl.get_multi_region_access_point_routes(AccountId=_ACCOUNT, Mrap=arn)
+        assert routes["Mrap"] == arn
+        assert {(r["Bucket"], r["Region"], r["TrafficDialPercentage"]) for r in routes["Routes"]} == {
+            (use1_bucket, "us-east-1", 100), (euw1_bucket, "eu-west-1", 100)}
+
+        def submit_error(updates, mrap=arn):
+            with pytest.raises(ClientError) as exc:
+                routes_ctl.submit_multi_region_access_point_routes(AccountId=_ACCOUNT, Mrap=mrap, RouteUpdates=updates)
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+            return exc.value.response["Error"]
+
+        assert submit_error([{"Bucket": use1_bucket, "TrafficDialPercentage": 50}]) == {
+            "Code": "InvalidRequest", "Message": "Request invalid"}
+        assert submit_error([{"Bucket": f"x-{use1_bucket}", "TrafficDialPercentage": 0}])["Message"] == (
+            "The provided Region or bucket is not part of the Multi-Region Access Point.")
+        assert submit_error([{"Bucket": use1_bucket, "TrafficDialPercentage": 0},
+                             {"Bucket": euw1_bucket, "TrafficDialPercentage": 0}])["Message"] == (
+            "At least one Region or bucket in the Multi-Region Access Point must be configured to receive "
+            "traffic. Set at least one Region or bucket to Active, and then try again.")
+        assert submit_error([{"Bucket": use1_bucket, "TrafficDialPercentage": 0}], mrap=name)["Message"] == (
+            "Request invalid")
+
+        routes_ctl.submit_multi_region_access_point_routes(
+            AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": use1_bucket, "TrafficDialPercentage": 0}])
+        dials = {r["Bucket"]: r["TrafficDialPercentage"]
+                 for r in routes_ctl.get_multi_region_access_point_routes(AccountId=_ACCOUNT, Mrap=arn)["Routes"]}
+        assert dials == {use1_bucket: 0, euw1_bucket: 100}
+    finally:
+        _mrap_delete(ctl, name)
+
+
+def test_s3_mrap_control_region_rules(s3control_dns, mrap_members):
+    """Management operations are served only from us-west-2 and route
+    operations from five regions; anything else is redirected (observed)."""
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    with pytest.raises(ClientError) as exc:
+        _mrap_create(_regional_client("s3control", "us-east-1"), _mrap_name(), [use1_bucket, euw1_bucket])
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 301
+    assert err["Code"] == "PermanentRedirect"
+    assert err["Message"] == ("This API operation is only available in the following Regions: us-west-2. "
+                              "Make sure to send all future requests to a supported Region.")
+    assert err["Endpoint"] == "https://s3-control.us-west-2.amazonaws.com/v20180820/async-requests/mrap/create"
+
+    ctl = _regional_client("s3control", "us-west-2")
+    name = _mrap_name()
+    _mrap_create(ctl, name, [use1_bucket, euw1_bucket])
+    try:
+        alias = ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)["AccessPoint"]["Alias"]
+        arn = f"arn:aws:s3::{_ACCOUNT}:accesspoint/{alias}"
+        with pytest.raises(ClientError) as exc:
+            _regional_client("s3control", "eu-central-1").submit_multi_region_access_point_routes(
+                AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": use1_bucket, "TrafficDialPercentage": 0}])
+        assert exc.value.response["Error"]["Message"] == (
+            "This API operation is only available in the following Regions: us-west-2, ap-southeast-2, "
+            "ap-northeast-1, eu-west-1 and us-east-1. Make sure to send all future requests to a supported Region.")
+        for region in ("us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1", "ap-southeast-2"):
+            _regional_client("s3control", region).get_multi_region_access_point_routes(AccountId=_ACCOUNT, Mrap=arn)
+    finally:
+        _mrap_delete(ctl, name)
+
+
+def test_s3_mrap_control_account_check_only_under_auth(monkeypatch):
+    """x-amz-account-id must name the caller's account; that is an authorization check, so AUTH=true only."""
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.services import s3 as s3_svc
+
+    headers = {"x-amz-account-id": "111122223333"}
+    status, _, body = s3_svc.s3control_account_error(headers)
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    status, _, _ = asyncio.run(app_mod._handle_s3_control_request(
+        "/v20180820/mrap/instances", "GET", b"", {}, "rid", headers))
+    assert status == 200
+
+
+def _mrap_request(alias, method, key, body=b""):
+    import http.client
+
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, f"/{key}", body=body or None,
+                 headers={"Host": f"{alias}.accesspoint.s3-global.amazonaws.com"})
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+def test_s3_mrap_end_to_end_routing_failover_and_replication(s3control_dns, mrap_members):
+    use1, use1_bucket, euw1, euw1_bucket = mrap_members
+    _replicate(use1, use1_bucket, euw1_bucket, Filter={"Prefix": "data/"},
+               DeleteMarkerReplication={"Status": "Disabled"})
+    _replicate(euw1, euw1_bucket, use1_bucket, Filter={"Prefix": "data/"},
+               DeleteMarkerReplication={"Status": "Disabled"})
+    ctl, routes_ctl = _regional_client("s3control", "us-west-2"), _regional_client("s3control", "eu-west-1")
+    name = _mrap_name()
+    # Listed eu-west-1 first: the us-east-1 member wins on region, not position.
+    _mrap_create(ctl, name, [euw1_bucket, use1_bucket])
+    alias = ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)["AccessPoint"]["Alias"]
+    arn = f"arn:aws:s3::{_ACCOUNT}:accesspoint/{alias}"
+    try:
+        for region in ("us-east-1", "eu-west-1", None):
+            assert _mrap_get(alias, "who.txt", region=region) == (200, "use1")
+
+        routes_ctl.submit_multi_region_access_point_routes(
+            AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": use1_bucket, "TrafficDialPercentage": 0}])
+        assert _mrap_get(alias, "who.txt") == (200, "euw1")
+        with pytest.raises(ClientError):
+            routes_ctl.submit_multi_region_access_point_routes(
+                AccountId=_ACCOUNT, Mrap=arn, RouteUpdates=[{"Bucket": euw1_bucket, "TrafficDialPercentage": 0}])
+        assert _mrap_get(alias, "who.txt") == (200, "euw1")
+
+        assert _mrap_request(alias, "PUT", "data/new.txt", b"through mrap")[0] == 200
+        assert euw1.get_object(Bucket=euw1_bucket, Key="data/new.txt")["ReplicationStatus"] == "COMPLETED"
+        assert use1.get_object(Bucket=use1_bucket, Key="data/new.txt")["Body"].read() == b"through mrap"
+    finally:
+        _mrap_delete(ctl, name)
+    assert _mrap_request(alias, "GET", "who.txt")[0] in (403, 404)
+
+
+def _mrap_signed_request(credentials, alias, method, target, body=b""):
+    """A SigV4-signed request through the MRAP hostname: status and body."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    host = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    request = AWSRequest(method, f"{ENDPOINT.rstrip('/')}{target}", data=body,
+                         headers={"host": host, "x-amz-content-sha256": hashlib.sha256(body).hexdigest()})
+    S3SigV4Auth(Credentials(*credentials), "s3", "us-east-1").add_auth(request)
+    response = requests.request(method, request.url, data=body, headers=dict(request.headers.items()), timeout=30)
+    return response.status_code, response.content
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("grant,denied_on", [
+    ("none", "bucket"), ("mrap", "bucket"), ("bucket", "mrap"), ("both", None), ("mrap-policy", None),
+])
+def test_s3_mrap_requests_are_authorized_on_the_bucket_and_the_mrap(
+        auth_enabled, iam_user, s3control_dns, mrap_members, grant, denied_on):
+    """Through an MRAP, S3 checks the member bucket first and then the MRAP; an MRAP policy can allow the latter."""
+    _, use1_bucket, _, _ = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    name = _mrap_name()
+    _mrap_create(ctl, name, [use1_bucket])
+    alias = ctl.get_multi_region_access_point(AccountId=_ACCOUNT, Name=name)["AccessPoint"]["Alias"]
+    mrap_arn = f"arn:aws:s3::{_ACCOUNT}:accesspoint/{alias}"
+    bucket_arn = f"arn:aws:s3:::{use1_bucket}"
+
+    def allow(prefix):
+        return [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"{prefix}/*"},
+                {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": prefix}]
+
+    identity = {"none": [], "mrap": allow(mrap_arn), "bucket": allow(bucket_arn), "both": allow(mrap_arn)
+                + allow(bucket_arn), "mrap-policy": allow(bucket_arn)}[grant]
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": identity} if identity else None)
+        if grant == "mrap-policy":
+            statements = [{**s, "Principal": {"AWS": user.arn}} for s in allow(mrap_arn)]
+            ctl.put_multi_region_access_point_policy(
+                AccountId=_ACCOUNT, ClientToken=_uuid_mod.uuid4().hex,
+                Details={"Name": name, "Policy": json.dumps({"Version": "2012-10-17", "Statement": statements})})
+        with second_access_key(user) as credentials:
+            for action, method, target, body, resource in [
+                ("GetObject", "GET", "/who.txt", b"", "/who.txt"),
+                ("PutObject", "PUT", "/mrap-put.txt", b"x", "/mrap-put.txt"),
+                ("ListBucket", "GET", "/?list-type=2", b"", ""),
+            ]:
+                status, data = _mrap_signed_request(credentials, alias, method, target, body)
+                if not auth_enabled or denied_on is None:
+                    assert status == 200, data
+                    continue
+                arn = (bucket_arn if denied_on == "bucket" else mrap_arn + ("/object" if resource else "")) + resource
+                assert status == 403 and ElementTree.fromstring(data).findtext("Code") == "AccessDenied"
+                assert ElementTree.fromstring(data).findtext("Message") == (
+                    f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" '
+                    f"because no identity-based policy allows the s3:{action} action")
+    finally:
+        _mrap_delete(ctl, name)
+
+
+# IAM contracts, run by CI with AUTH=false and AUTH=true.
+@pytest.fixture
+def auth_s3_objects(s3):
+    """Two private buckets with one source object; isolate and clean every test."""
+    with contextlib.ExitStack() as cleanup:
+        source = f"auth-source-{uuid.uuid4().hex}"
+        destination = f"auth-dest-{uuid.uuid4().hex}"
+        for bucket in (source, destination):
+            s3.create_bucket(Bucket=bucket)
+            cleanup.callback(s3.delete_bucket, Bucket=bucket)
+        s3.put_object(Bucket=source, Key="source", Body=b"auth-contract")
+        cleanup.callback(s3.delete_object, Bucket=source, Key="source")
+        # Register before the test so even an unexpected successful write is removed.
+        cleanup.callback(s3.delete_object, Bucket=destination, Key="copied")
+        yield source, destination
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny", "other-resource"])
+def test_s3_read_permission_contract(auth_enabled, iam_user, auth_s3_objects, permission):
+    source, _ = auth_s3_objects
+    statements = []
+    if permission != "none":
+        resource = f"arn:aws:s3:::{source}/" + ("other" if permission == "other-resource" else "source")
+        statements.append({"Effect": "Allow", "Action": "s3:GetObject", "Resource": resource})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{source}/source"})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client("s3")
+    if auth_enabled and permission != "allow":
+        with pytest.raises(ClientError) as exc:
+            client.get_object(Bucket=source, Key="source")
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        response = client.get_object(Bucket=source, Key="source")
+        with response["Body"] as body:
+            assert body.read() == b"auth-contract"
+
+
+@pytest.fixture
+def auth_condition_bucket(s3):
+    """A bucket whose policy denies a user an object action under a condition; emptied and removed after."""
+    bucket = f"auth-cond-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=bucket)
+
+    def deny(user_arn, action, condition):
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Deny", "Principal": {"AWS": user_arn}, "Action": action,
+            "Resource": f"arn:aws:s3:::{bucket}/*", "Condition": condition}]}))
+        return bucket
+
+    yield deny
+    for upload in s3.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
+        s3.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+    for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+        s3.delete_object(Bucket=bucket, Key=item["Key"])
+    s3.delete_bucket(Bucket=bucket)
+
+
+_ALLOW_ALL_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+
+
+def _assert_s3_condition(auth_enabled, allowed, call):
+    """Under AUTH a refused call answers 403 AccessDenied; anything else succeeds."""
+    if auth_enabled and not allowed:
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] in ("AccessDenied", "403")
+    else:
+        assert call()["ResponseMetadata"]["HTTPStatusCode"] in (200, 204)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("condition", [
+    {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}},
+    {"Null": {"s3:x-amz-server-side-encryption": "true"}},
+], ids=["string-not-equals", "null"])
+def test_s3_encryption_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket, condition):
+    """A bucket policy on s3:x-amz-server-side-encryption sees the header of a PutObject and a CopyObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", condition)
+    s3.put_object(Bucket=bucket, Key="source", Body=b"x")
+    client = user.client("s3")
+    for sse in (None, "AES256"):
+        extra = {"ServerSideEncryption": sse} if sse else {}
+        _assert_s3_condition(auth_enabled, sse is not None,
+                             lambda: client.put_object(Bucket=bucket, Key=f"put-{sse}", Body=b"x", **extra))
+        _assert_s3_condition(auth_enabled, sse is not None, lambda: client.copy_object(
+            Bucket=bucket, Key=f"copy-{sse}", CopySource={"Bucket": bucket, "Key": "source"}, **extra))
+
+
+@pytest.mark.auth_contract
+def test_s3_multipart_encryption_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A part and the completion carry the encryption header their CreateMultipartUpload sent."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"Null": {"s3:x-amz-server-side-encryption": "true"}})
+    client = user.client("s3")
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key="sealed", ServerSideEncryption="AES256")["UploadId"]
+    etag = client.upload_part(Bucket=bucket, Key="sealed", UploadId=upload_id, PartNumber=1, Body=b"x")["ETag"]
+    client.complete_multipart_upload(Bucket=bucket, Key="sealed", UploadId=upload_id,
+                                     MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})
+    plain = s3.create_multipart_upload(Bucket=bucket, Key="plain")["UploadId"]
+    _assert_s3_condition(auth_enabled, False, lambda: client.upload_part(
+        Bucket=bucket, Key="plain", UploadId=plain, PartNumber=1, Body=b"x"))
+
+
+@pytest.mark.auth_contract
+def test_s3_canned_acl_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """A bucket policy on s3:x-amz-acl sees the canned ACL of a PutObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject",
+                                   {"StringNotEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}})
+    client = user.client("s3")
+    for acl in (None, "bucket-owner-full-control", "private"):
+        extra = {"ACL": acl} if acl else {}
+        _assert_s3_condition(auth_enabled, acl == "bucket-owner-full-control",
+                             lambda: client.put_object(Bucket=bucket, Key=f"acl-{acl}", Body=b"x", **extra))
+
+
+@pytest.mark.auth_contract
+def test_s3_grant_header_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A bucket policy on s3:x-amz-grant-read sees the grant header of a PutObject."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"Null": {"s3:x-amz-grant-read": "false"}})
+    s3.put_bucket_ownership_controls(Bucket=bucket, OwnershipControls={"Rules": [{"ObjectOwnership": "ObjectWriter"}]})
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(Bucket=bucket, Key="plain", Body=b"x"))
+    grant = 'id="c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"'
+    _assert_s3_condition(auth_enabled, False,
+                         lambda: client.put_object(Bucket=bucket, Key="granted", Body=b"x", GrantRead=grant))
+
+
+@pytest.mark.auth_contract
+def test_s3_existing_object_tag_condition_contract(auth_enabled, iam_user, s3, auth_condition_bucket):
+    """A bucket policy on s3:ExistingObjectTag sees the tags of the object a GetObject or HeadObject reads."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:GetObject", {"StringEquals": {"s3:ExistingObjectTag/class": "secret"}})
+    for name, tagging in (("secret", "class=secret"), ("public", "class=public"), ("untagged", "")):
+        s3.put_object(Bucket=bucket, Key=name, Body=b"x", **({"Tagging": tagging} if tagging else {}))
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, False, lambda: client.get_object(Bucket=bucket, Key="secret"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.head_object(Bucket=bucket, Key="secret"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.get_object(Bucket=bucket, Key="public"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.get_object(Bucket=bucket, Key="untagged"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("addressing_style", ["path", "virtual"])
+@pytest.mark.parametrize("allow_source_read", [False, True], ids=["no-source-read", "source-read"])
+def test_s3_copy_permission_contract(
+    auth_enabled, iam_user, s3, auth_s3_objects, addressing_style, allow_source_read,
+):
+    source, destination = auth_s3_objects
+    statements = [{"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{destination}/*"}]
+    if allow_source_read:
+        statements.append({"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{source}/*"})
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": statements}).client(
+        "s3", config=Config(signature_version="s3v4", s3={"addressing_style": addressing_style}),
+    )
+    request = {"Bucket": destination, "Key": "copied", "CopySource": {"Bucket": source, "Key": "source"}}
+    with patch_endpoint_dns():
+        if auth_enabled and not allow_source_read:
+            with pytest.raises(ClientError) as exc:
+                client.copy_object(**request)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+            # A rejected request must not leave the destination object behind.
+            assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
+        else:
+            response = client.copy_object(**request)
+            assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+            result = s3.get_object(Bucket=destination, Key="copied")
+            with result["Body"] as body:
+                assert body.read() == b"auth-contract"
+
+
+@pytest.fixture
+def auth_s3_post_bucket(s3):
+    """A versioned bucket supporting lock fields, with complete version cleanup."""
+    bucket = f"auth-post-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=bucket, ObjectLockEnabledForBucket=True)
+    try:
+        yield bucket
+    finally:
+        versions = s3.list_object_versions(Bucket=bucket)
+        for version in versions.get("Versions", []):
+            s3.put_object_legal_hold(Bucket=bucket, Key=version["Key"], LegalHold={"Status": "OFF"})
+            s3.delete_object(Bucket=bucket, Key=version["Key"], VersionId=version["VersionId"])
+        for marker in versions.get("DeleteMarkers", []):
+            s3.delete_object(Bucket=bucket, Key=marker["Key"], VersionId=marker["VersionId"])
+        s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission,field,value,extra_action", [
+    ("none", None, None, None),
+    ("allow", None, None, None),
+    ("explicit-deny", None, None, None),
+    ("other-resource", None, None, None),
+] + [
+    (permission, field, value, action)
+    for permission in ("missing-extra", "allow")
+    for field, value, action in (
+        ("acl", "private", "s3:PutObjectAcl"),
+        ("x-amz-tagging", "purpose=test", "s3:PutObjectTagging"),
+        ("x-amz-object-lock-legal-hold", "ON", "s3:PutObjectLegalHold"),
+        ("x-amz-object-lock-mode", "GOVERNANCE", "s3:PutObjectRetention"),
+    )
+])
+def test_s3_post_permission_contract(
+    auth_enabled, iam_user, s3, auth_s3_post_bucket, permission, field, value, extra_action,
+):
+    """Multipart credentials identify the signer, including optional write actions."""
+    from xml.etree import ElementTree
+
+    import requests
+
+    destination = auth_s3_post_bucket
+    resource = f"arn:aws:s3:::{destination}/copied"
+    statements = []
+    if permission != "none":
+        actions = ["s3:PutObject"]
+        if extra_action and permission == "allow":
+            actions.append(extra_action)
+        statements.append({"Effect": "Allow", "Action": actions,
+                           "Resource": resource + "-other" if permission == "other-resource" else resource})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": "s3:PutObject", "Resource": resource})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client(
+        "s3", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    fields = {field: value} if field else {}
+    form = client.generate_presigned_post(
+        Bucket=destination, Key="copied", Fields=fields,
+        Conditions=[{field: value}] if field else [],
+    )
+    response = requests.post(form["url"], data=form["fields"],
+                             files={"file": ("contract.txt", b"post-auth-contract")}, timeout=10)
+    if auth_enabled and permission != "allow":
+        assert response.status_code == 403, response.text
+        assert ElementTree.fromstring(response.content).findtext("Code") == "AccessDenied"
+        assert s3.list_objects_v2(Bucket=destination).get("Contents", []) == []
+    else:
+        assert response.status_code == 204, response.text
+        with s3.get_object(Bucket=destination, Key="copied")["Body"] as body:
+            assert body.read() == b"post-auth-contract"
+
+
+@pytest.fixture
+def post_form(monkeypatch):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    monkeypatch.setattr(_s3_mod, "_buckets", AccountScopedDict())
+    monkeypatch.setattr(_s3_mod, "S3_PERSIST", False)
+    with request_scope("000000000000", "us-east-1"):
+        bucket = "post-policy-" + uuid.uuid4().hex[:12]
+        key, _arn = inprocess_iam_user({"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]})
+        _s3_mod._create_bucket(bucket, b"", {})
+
+        class Form:
+            def generate(self, *, fields=None, conditions=None, key_name="uploads/data.txt", expires=300,
+                         secret=None, token=None, access_key=None, signature_version="s3v4"):
+                client = boto3.client(
+                    "s3", endpoint_url="http://localhost", region_name="us-east-1",
+                    aws_access_key_id=access_key or key[0], aws_secret_access_key=secret or key[1],
+                    aws_session_token=token, config=Config(signature_version=signature_version),
+                )
+                return client.generate_presigned_post(
+                    Bucket=bucket, Key=key_name, Fields=fields or {},
+                    Conditions=conditions or [], ExpiresIn=expires,
+                )["fields"]
+
+            def submit(self, fields, *, data=b"contents", filename="data.txt", routed=False):
+                req = requests.Request(
+                    "POST", "http://localhost/" + bucket,
+                    data=fields, files={"file": (filename, data)},
+                ).prepare()
+                headers = {name.lower(): value for name, value in req.headers.items()}
+                if routed:
+                    return routed_request(None, "s3", "POST", "/" + bucket,
+                                          body=req.body, headers=headers)
+                return asyncio.run(_s3_mod.handle_request("POST", "/" + bucket, headers, req.body, {}))
+
+            def assert_rejected(self, fields, code, **kwargs):
+                response = self.submit(fields, **kwargs)
+                assert response[0] in (400, 403)
+                assert ElementTree.fromstring(response[2]).findtext("Code") == code
+                assert _s3_mod._buckets[bucket]["objects"] == {}
+
+        form = Form()
+        form.bucket, form.key = bucket, key
+        yield form
+        _iam_mod._access_keys.pop(key[0], None)
+        name = _arn.rsplit("/", 1)[-1]
+        _iam_mod._users.pop(name, None)
+        _iam_mod._user_inline_policies.pop(name, None)
+
+
+@pytest.mark.parametrize("signature_version", ["s3v4", "s3"])
+def test_signed_post_stores_bytes_and_metadata(post_form, signature_version):
+    fields = post_form.generate(fields={"x-amz-meta-author": "alice", "success_action_status": "201"},
+                                conditions=[{"x-amz-meta-author": "alice"}, {"success_action_status": "201"}],
+                                signature_version=signature_version)
+    assert post_form.submit(fields)[0] == 201
+    obj = _s3_mod._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
+    assert obj["body"] == b"contents"
+    assert obj["metadata"] == {"x-amz-meta-author": "alice"}
+
+
+@pytest.mark.parametrize("name,value", [("key", "uploads/other.txt"), ("Content-Type", "text/plain"),
+                                        ("x-amz-meta-author", "bob"), ("success_action_status", "204")])
+def test_post_exact_conditions_reject_mismatched_fields(post_form, name, value):
+    fields = {"Content-Type": "application/json", "x-amz-meta-author": "alice", "success_action_status": "201"}
+    form = post_form.generate(fields=fields, conditions=[{k: v} for k, v in fields.items()])
+    form[name] = value
+    post_form.assert_rejected(form, "AccessDenied")
+
+
+@pytest.fixture
+def post_auth(monkeypatch):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+
+
+@pytest.mark.parametrize("signature_version", ["s3v4", "s3"])
+@pytest.mark.parametrize("auth_enabled", [False, True])
+def test_post_signature_verified_under_auth_only(post_form, monkeypatch, auth_enabled, signature_version):
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    form = post_form.generate(secret=uuid.uuid4().hex, signature_version=signature_version)
+    if auth_enabled:
+        post_form.assert_rejected(form, "SignatureDoesNotMatch", routed=True)
+    else:
+        assert post_form.submit(form, routed=True)[0] == 204
+
+
+@pytest.mark.parametrize("missing", ["x-amz-signature", "x-amz-date", "x-amz-credential", "policy"])
+def test_incomplete_sigv4_form_rejected(post_form, missing):
+    form = post_form.generate()
+    del form[missing]
+    post_form.assert_rejected(form, "InvalidArgument")
+
+
+def test_expired_post_policy_rejected(post_form):
+    post_form.assert_rejected(post_form.generate(expires=-60), "AccessDenied")
+
+
+@pytest.mark.parametrize("content_type,accepted", [("image/png,image/jpeg", True), ("image/png,text/plain", False)])
+def test_post_content_type_prefix_applies_to_each_list_item(post_form, content_type, accepted):
+    form = post_form.generate(fields={"Content-Type": content_type},
+                              conditions=[["starts-with", "$Content-Type", "image/"]])
+    if accepted:
+        assert post_form.submit(form)[0] == 204
+    else:
+        post_form.assert_rejected(form, "AccessDenied")
+
+
+def test_post_variables_expanded_before_matching(post_form):
+    form = post_form.generate(key_name="uploads/${filename}", fields={"x-amz-meta-name": "${filename}"},
+                              conditions=[["eq", "$x-amz-meta-name", "data.txt"]])
+    assert post_form.submit(form)[0] == 204
+    obj = _s3_mod._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
+    assert obj["metadata"]["x-amz-meta-name"] == "data.txt"
+
+
+def test_post_variables_expanded_once(post_form):
+    form = post_form.generate(key_name="uploads/${filename}")
+    assert post_form.submit(form, filename="${filename}.txt")[0] == 204
+    assert list(_s3_mod._buckets[post_form.bucket]["objects"]) == ["uploads/${filename}.txt"]
+
+
+@pytest.mark.parametrize("extra", ["x-amz-meta-extra", "acl"])
+def test_post_uncovered_form_fields_rejected(post_form, extra):
+    form = post_form.generate(fields={extra: "private"})
+    post_form.assert_rejected(form, "AccessDenied")
+
+
+def test_post_missing_condition_field_rejected(post_form):
+    form = post_form.generate(conditions=[["starts-with", "$x-amz-meta-required", ""]])
+    post_form.assert_rejected(form, "AccessDenied")
+
+
+def test_post_ignore_fields_exempt_from_conditions(post_form):
+    assert post_form.submit(post_form.generate(fields={"x-ignore-client": "local"}))[0] == 204
+
+
+@pytest.mark.parametrize("data,code", [(b"a", "EntityTooSmall"), (b"1234", "EntityTooLarge"), (b"12", None), (b"123", None)])
+def test_post_size_range_inclusive(post_form, data, code):
+    form = post_form.generate(conditions=[["content-length-range", 2, 3]])
+    if code:
+        post_form.assert_rejected(form, code, data=data)
+    else:
+        assert post_form.submit(form, data=data)[0] == 204
+
+
+@pytest.mark.parametrize("low,code", [("2", None), ("x", "AccessDenied")])
+def test_post_size_range_string_bounds(post_form, low, code):
+    form = post_form.generate(conditions=[["content-length-range", low, "3"]])
+    if code:
+        post_form.assert_rejected(form, code, data=b"12")
+    else:
+        assert post_form.submit(form, data=b"12")[0] == 204
+
+
+def test_post_modified_policy_fails_signature(post_form, post_auth):
+    form = post_form.generate()
+    form["policy"] = form["policy"][:-2]
+    post_form.assert_rejected(form, "SignatureDoesNotMatch")
+
+
+def test_post_invalid_condition_rejected(post_form):
+    post_form.assert_rejected(post_form.generate(conditions=[["unknown", "$key", ""]]), "InvalidPolicyDocument")
+
+
+def test_post_policy_refusals_use_aws_messages(post_form):
+    def message(form):
+        return ElementTree.fromstring(post_form.submit(form)[2]).findtext("Message")
+    form = post_form.generate(fields={"x-amz-meta-author": "alice"}, conditions=[{"x-amz-meta-author": "alice"}])
+    form["x-amz-meta-author"] = "bob"
+    assert message(form) == 'Invalid according to Policy: Policy Condition failed: ["eq", "$x-amz-meta-author", "alice"]'
+    assert message(post_form.generate(expires=-60)) == "Invalid according to Policy: Policy expired."
+    assert message(post_form.generate(fields={"x-amz-meta-extra": "x"})) == (
+        "Invalid according to Policy: Extra input fields: x-amz-meta-extra")
+
+
+def test_post_bucket_condition_uses_destination(post_form):
+    post_form.assert_rejected(post_form.generate(conditions=[{"bucket": "different-bucket"}]), "AccessDenied")
+
+
+def test_post_inactive_registered_key_rejected(post_form, post_auth):
+    form = post_form.generate()
+    _iam_mod._access_keys[post_form.key[0]]["Status"] = "Inactive"
+    post_form.assert_rejected(form, "InvalidAccessKeyId")
+
+
+def test_post_unexpected_session_token_rejected(post_form, post_auth):
+    post_form.assert_rejected(post_form.generate(token=uuid.uuid4().hex), "InvalidToken")
+
+
+def test_post_registered_key_resolves_nondefault_account(post_form):
+    with request_scope("123456789012", "us-east-1"):
+        key, arn = inprocess_iam_user()
+        try:
+            bucket = "tenant-post-" + uuid.uuid4().hex[:12]
+            _s3_mod._create_bucket(bucket, b"", {})
+            client = boto3.client("s3", endpoint_url="http://localhost", region_name="us-east-1",
+                                  aws_access_key_id=key[0], aws_secret_access_key=key[1],
+                                  config=Config(signature_version="s3v4"))
+            form = client.generate_presigned_post(Bucket=bucket, Key="uploads/data.txt")["fields"]
+            # submit() captures the fixture bucket, so route this request explicitly.
+            req = requests.Request("POST", "http://localhost/" + bucket, data=form,
+                                   files={"file": ("data.txt", b"tenant")}).prepare()
+            result = asyncio.run(_s3_mod.handle_request("POST", "/" + bucket,
+                {k.lower(): v for k, v in req.headers.items()}, req.body, {}))
+            assert result[0] == 204
+            assert _s3_mod._buckets[bucket]["objects"]["uploads/data.txt"]["body"] == b"tenant"
+        finally:
+            _iam_mod._access_keys.pop(key[0], None)
+            _iam_mod._users.pop(arn.rsplit("/", 1)[-1], None)
+
+
+@pytest.mark.parametrize("signature", ["", "not-hex", "é" * 64])
+def test_post_malformed_signature_is_a_client_error(post_form, post_auth, signature):
+    form = post_form.generate()
+    form["x-amz-signature"] = signature
+    post_form.assert_rejected(form, "InvalidArgument" if not signature else "SignatureDoesNotMatch")
+
+
+@pytest.mark.parametrize("token_state", ["valid", "missing", "incorrect", "expired"])
+def test_post_uses_sts_issued_credentials(post_form, post_auth, token_state):
+    response = routed_request(post_form.key, "sts", "POST", "/",
+        body=b"Action=GetSessionToken&DurationSeconds=900",
+        headers={"content-type": "application/x-www-form-urlencoded"})
+    assert response[0] == 200
+    root = ElementTree.fromstring(response[2])
+    credentials = {name: root.findtext(".//{*}" + name) for name in ("AccessKeyId", "SecretAccessKey", "SessionToken")}
+    access_key = credentials["AccessKeyId"]
+    try:
+        token = credentials["SessionToken"]
+        if token_state == "missing":
+            token = None
+        elif token_state == "incorrect":
+            token = uuid.uuid4().hex
+        elif token_state == "expired":
+            _sts_mod._sessions[access_key]["Expiration"] = time.time() - 60
+        form = post_form.generate(access_key=access_key, secret=credentials["SecretAccessKey"], token=token)
+        if token_state == "valid":
+            assert post_form.submit(form)[0] == 204
+        else:
+            post_form.assert_rejected(form, "ExpiredToken" if token_state == "expired" else "InvalidToken")
+    finally:
+        _sts_mod._sessions.pop(access_key, None)
+
+
+def test_post_configured_root_credentials(post_form, monkeypatch):
+    key, secret = "local-root-" + uuid.uuid4().hex, uuid.uuid4().hex
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", key)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    assert post_form.submit(post_form.generate(access_key=key, secret=secret))[0] == 204
+
+
+def test_rejected_post_preserves_existing_object_and_disk(post_form, post_auth, monkeypatch, tmp_path):
+    monkeypatch.setattr(_s3_mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(_s3_mod, "S3_PERSIST", True)
+    events = []
+    monkeypatch.setattr(_s3_mod, "_fire_s3_event_async", lambda *a, **kw: events.append(kw))
+    assert post_form.submit(post_form.generate(), data=b"original")[0] == 204
+    files = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert files
+    invalid = post_form.generate(secret=uuid.uuid4().hex)
+    assert post_form.submit(invalid, data=b"replacement")[0] == 403
+    assert {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
+    assert len(events) == 1
+    obj = _s3_mod._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
+    assert _s3_mod._read_body(post_form.bucket, "uploads/data.txt", obj) == b"original"
+    _s3_mod._buckets.clear()
+    _s3_mod._load_persisted_data()
+    obj = _s3_mod._buckets[post_form.bucket]["objects"]["uploads/data.txt"]
+    assert _s3_mod._read_body(post_form.bucket, "uploads/data.txt", obj) == b"original"
+
+
+def test_post_after_persisted_reload(post_form, monkeypatch, tmp_path):
+    monkeypatch.setattr(_s3_mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(_s3_mod, "S3_PERSIST", True)
+    assert post_form.submit(post_form.generate(), data=b"first")[0] == 204
+    _s3_mod._buckets.clear()
+    _s3_mod._load_persisted_data()
+    assert post_form.submit(post_form.generate(), data=b"second")[0] == 204
+
+
+def test_s3_object_lock_headers_need_an_object_lock_bucket(s3):
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-nolock-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bkt, Key="k", Body=b"x", ObjectLockMode="COMPLIANCE",
+                          ObjectLockRetainUntilDate=datetime.now(timezone.utc) + timedelta(days=1))
+        err = exc.value.response
+        assert (err["Error"]["Code"], err["Error"]["Message"], err["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "InvalidRequest", "Bucket is missing ObjectLockConfiguration", 400)
+        assert s3.list_objects_v2(Bucket=bkt).get("KeyCount") == 0
+    finally:
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_object_lock_applies_to_its_version_only(s3):
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-lock-ver-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    locked = s3.put_object(Bucket=bkt, Key="k", Body=b"v1", ObjectLockMode="COMPLIANCE",
+                           ObjectLockRetainUntilDate=datetime.now(timezone.utc) + timedelta(days=1))["VersionId"]
+    free = s3.put_object(Bucket=bkt, Key="k", Body=b"v2")["VersionId"]
+    assert "ObjectLockMode" not in s3.head_object(Bucket=bkt, Key="k")
+    assert s3.head_object(Bucket=bkt, Key="k", VersionId=locked)["ObjectLockMode"] == "COMPLIANCE"
+    s3.delete_object(Bucket=bkt, Key="k", VersionId=free)
+    with pytest.raises(ClientError) as exc:
+        s3.delete_object(Bucket=bkt, Key="k", VersionId=locked)
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def test_s3_copy_and_multipart_refuse_object_lock_headers_without_object_lock(s3):
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-nolock-cp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="src", Body=b"x")
+    until = datetime.now(timezone.utc) + timedelta(days=1)
+    calls = (
+        lambda: s3.copy_object(Bucket=bkt, Key="dst", CopySource={"Bucket": bkt, "Key": "src"},
+                               ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=until),
+        lambda: s3.copy_object(Bucket=bkt, Key="dst", CopySource={"Bucket": bkt, "Key": "src"},
+                               ObjectLockLegalHoldStatus="OFF"),
+        lambda: s3.create_multipart_upload(Bucket=bkt, Key="mpu", ObjectLockMode="COMPLIANCE",
+                                           ObjectLockRetainUntilDate=until),
+        lambda: s3.create_multipart_upload(Bucket=bkt, Key="mpu", ObjectLockLegalHoldStatus="ON"),
+    )
+    try:
+        for call in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            err = exc.value.response
+            assert (err["Error"]["Code"], err["Error"]["Message"], err["ResponseMetadata"]["HTTPStatusCode"]) == (
+                "InvalidRequest", "Bucket is missing ObjectLockConfiguration", 400)
+        assert [o["Key"] for o in s3.list_objects_v2(Bucket=bkt)["Contents"]] == ["src"]
+        assert "Uploads" not in s3.list_multipart_uploads(Bucket=bkt)
+    finally:
+        for v in s3.list_object_versions(Bucket=bkt).get("Versions", []):
+            s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
+        s3.delete_bucket(Bucket=bkt)
+
+
+
+def test_s3_bucket_config_enum_and_day_validation(s3):
+    bucket = f"cfgval-{uuid.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=bucket)
+    malformed = "The XML you provided was not well-formed or did not validate against our published schema"
+
+    def err(fn):
+        with pytest.raises(ClientError) as exc:
+            fn()
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    for status in ("Disabled", "banana", "enabled"):
+        assert err(lambda: s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": status})) == (
+            "MalformedXML", malformed)
+    assert err(lambda: s3.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled", "MFADelete": "banana"}))[0] == "MalformedXML"
+    assert "Status" not in s3.get_bucket_versioning(Bucket=bucket)
+
+    def rule(**kw):
+        return {"Rules": [{"ID": "r", "Status": "Enabled", "Filter": {"Prefix": ""}, **kw}]}
+
+    for days in (0, -1):
+        assert err(lambda: s3.put_bucket_lifecycle_configuration(
+            Bucket=bucket, LifecycleConfiguration=rule(Expiration={"Days": days}))) == (
+            "InvalidArgument", "'Days' for Expiration action must be a positive integer")
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration=rule(NoncurrentVersionExpiration={"NoncurrentDays": 0}))) == (
+        "InvalidArgument", "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer")
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": [
+        {"ID": "r", "Status": "banana", "Filter": {"Prefix": ""}, "Expiration": {"Days": 1}}]}))[0] == "MalformedXML"
+    assert err(lambda: s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration=rule(Transitions=[{"Days": 30, "StorageClass": "banana"}])))[0] == "MalformedXML"
+    assert err(lambda: s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "banana"}}]}))[0] == "MalformedXML"
+
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended"})
+    s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration=rule(
+        Expiration={"Days": 1}, Transitions=[{"Days": 30, "StorageClass": "GLACIER_IR"}]))
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms:dsse"}}]})
+    s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_anonymous_copy_source_and_policy_action_contract(auth_enabled, s3):
+    """A public PutObject policy lets anonymous callers write, not read another bucket through a copy or delete."""
+    secret, upload = f"anon-src-{uuid.uuid4().hex[:8]}", f"anon-dst-{uuid.uuid4().hex[:8]}"
+    for bucket in (secret, upload):
+        s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=secret, Key="c", Body=b"secret")
+    s3.put_object(Bucket=upload, Key="kept", Body=b"kept")
+    s3.put_bucket_policy(Bucket=upload, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]}))
+    try:
+        assert requests.put(f"{ENDPOINT}/{upload}/plain", data=b"x").status_code == 200
+        copy = requests.put(f"{ENDPOINT}/{upload}/loot", headers={"x-amz-copy-source": f"/{secret}/c"})
+        delete = requests.delete(f"{ENDPOINT}/{upload}/kept")
+        if auth_enabled:
+            assert (copy.status_code, delete.status_code) == (403, 403)
+        else:
+            assert (copy.status_code, delete.status_code) == (200, 204)
+    finally:
+        s3.delete_bucket_policy(Bucket=upload)
+        for bucket in (secret, upload):
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_copy_source_in_the_query_string_is_authorized_contract(auth_enabled, iam_user, s3):
+    """x-amz-copy-source hoisted into the query string is checked like the header."""
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import second_access_key
+
+    secret, upload = f"hoist-src-{uuid.uuid4().hex[:8]}", f"hoist-dst-{uuid.uuid4().hex[:8]}"
+    for bucket in (secret, upload):
+        s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=secret, Key="c", Body=b"secret")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{upload}/*"}]})
+    try:
+        with second_access_key(user) as (key, secret_key):
+            url = f"{ENDPOINT}/{upload}/b?x-amz-copy-source=%2F{secret}%2Fc"
+            request = AWSRequest(method="PUT", url=url, data=b"")
+            S3SigV4Auth(Credentials(key, secret_key), "s3", "us-east-1").add_auth(request)
+            status = requests.put(url, data=b"", headers=dict(request.headers)).status_code
+        assert status == (403 if auth_enabled else 200)
+    finally:
+        for bucket in (secret, upload):
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)

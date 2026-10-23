@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import io
 import json
 import os
@@ -5,17 +7,18 @@ import re
 import time
 import uuid
 import uuid as _uuid_mod
+import xml.etree.ElementTree as ET
 import zipfile
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import REGION, sqs_policy_allow_s3, sqs_policy_allow_sns
+from conftest import REGION, inprocess_iam_user, routed_request, sqs_policy_allow_s3, sqs_policy_allow_sns
 
 from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
-from ministack.core.responses import request_scope
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, request_scope
 from ministack.services import s3 as s3_svc
 from ministack.services import sns as sns_svc
 from ministack.services import sqs as sqs_svc
@@ -84,6 +87,29 @@ def test_sqs_list_queues(sqs):
     assert len(urls) >= 2
     assert any("intg-sqs-list-alpha" in u for u in urls)
     assert any("intg-sqs-list-beta" in u for u in urls)
+
+
+@pytest.mark.auth_contract
+def test_sqs_list_queues_header_without_credential_contract(auth_enabled, iam_user):
+    """Under AUTH=true a header signature without Credential answers IncompleteSignature."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}]}).client("sqs")
+    client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+
+    def strip_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", strip_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "IncompleteSignature", 400)
+        assert response["Error"]["Message"].startswith("Authorization header requires 'Credential' parameter.")
+    else:
+        client.list_queues(QueueNamePrefix="intg-sqs-nocred-")
 
 def test_sqs_list_queues_paginates_with_max_results(sqs):
     prefix = f"intg-sqs-page-{_uuid_mod.uuid4().hex[:8]}-"
@@ -311,6 +337,44 @@ def test_sqs_message_attributes(sqs):
     assert attrs["color"]["StringValue"] == "blue"
     assert attrs["count"]["StringValue"] == "42"
 
+def test_sqs_receive_md5_of_filtered_message_attributes(sqs):
+    """MD5OfMessageAttributes on ReceiveMessage must be the digest of the
+    attributes actually returned, not of every attribute sent. SDKs that
+    validate it recompute it from the attributes in the response."""
+    url = sqs.create_queue(QueueName="intg-sqs-md5-filtered")["QueueUrl"]
+    sqs.send_message(
+        QueueUrl=url,
+        MessageBody="md5-filtered",
+        MessageAttributes={
+            "item.color": {"DataType": "String", "StringValue": "red"},
+            "size": {"DataType": "String", "StringValue": "large"},
+        },
+    )
+    # Digests of the SQS binary encoding of the returned attributes.
+    md5_color = "577bde534466fcc0f833e000d746308b"
+    md5_size = "293ff4145d6b9021065be848a611037b"
+    md5_all = "9906f4cd4d08bdd5cf9f22829f9e07f7"
+
+    def receive(**kwargs):
+        resp = sqs.receive_message(QueueUrl=url, VisibilityTimeout=0, **kwargs)
+        return resp["Messages"][0]
+
+    for names, returned, md5 in (
+        (["item.color"], ["item.color"], md5_color),
+        (["item.*"], ["item.color"], md5_color),
+        (["size"], ["size"], md5_size),
+        (["All"], ["item.color", "size"], md5_all),
+    ):
+        msg = receive(MessageAttributeNames=names)
+        assert sorted(msg["MessageAttributes"]) == returned, names
+        assert msg["MD5OfMessageAttributes"] == md5, names
+
+    for kwargs in ({}, {"MessageAttributeNames": ["missing"]}):
+        msg = receive(**kwargs)
+        assert "MessageAttributes" not in msg
+        assert "MD5OfMessageAttributes" not in msg
+    sqs.delete_queue(QueueUrl=url)
+
 def test_sqs_batch_send(sqs):
     url = sqs.create_queue(QueueName="intg-sqs-batchsend")["QueueUrl"]
     resp = sqs.send_message_batch(
@@ -443,6 +507,43 @@ def test_sqs_fifo_deduplication(sqs):
         MessageDeduplicationId="dedup-001",
     )
     assert r1["MessageId"] == r2["MessageId"]
+
+def test_sqs_fifo_dedup_hit_returns_md5_of_current_request(sqs):
+    """A dedup hit keeps the first message, but its response must carry the
+    MD5s of the request just sent, as AWS does. SDKs that verify the digests
+    (.NET, Java) reject a response that repeats the first message's."""
+    url = sqs.create_queue(
+        QueueName="intg-sqs-dedup-md5.fifo",
+        Attributes={"FifoQueue": "true", "ContentBasedDeduplication": "false"},
+    )["QueueUrl"]
+
+    def send(body, sent_at):
+        return sqs.send_message(
+            QueueUrl=url,
+            MessageBody=body,
+            MessageGroupId="g1",
+            MessageDeduplicationId="dedup-md5",
+            MessageAttributes={
+                "DateSent": {"DataType": "String", "StringValue": sent_at},
+            },
+        )
+
+    r1 = send("body-one", "2026-10-15T00:00:01Z")
+    r2 = send("body-one", "2026-10-15T00:00:02Z")  # same body, new attribute
+    r3 = send("body-two", "2026-10-15T00:00:03Z")  # new body and attribute
+
+    assert r1["MessageId"] == r2["MessageId"] == r3["MessageId"]
+    # Digests of the SQS binary encoding of each request's attributes.
+    assert r1["MD5OfMessageAttributes"] == "e9721848ab1db43af2ce7e25fce5d807"
+    assert r2["MD5OfMessageAttributes"] == "4079b5e9650ac7c7fd23793b2f8450d7"
+    assert r3["MD5OfMessageAttributes"] == "2a0cd9230604b4d3fcc365096e11817f"
+    assert r1["MD5OfMessageBody"] == r2["MD5OfMessageBody"] == "58bc92401b7ad098acdab54fad72e79a"
+    assert r3["MD5OfMessageBody"] == "6423099901cb7ed39e2a7a6517162e8d"
+
+    attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])
+    assert attrs["Attributes"]["ApproximateNumberOfMessages"] == "1"
+    sqs.delete_queue(QueueUrl=url)
+
 
 def test_sqs_fifo_dedup_survives_consumption(sqs):
     """A FIFO dedup id is honored for its full 5-minute window even after the
@@ -1634,14 +1735,17 @@ def test_unicode_sqs_message(sqs):
 
 ACCT_A = "111111111111"
 ACCT_B = "222222222222"
+HOME = get_account_id()
 
 
 def _reset_messaging_state():
     from ministack.core.iam_evaluator import _request_caller_arn
+    from ministack.services import iam as iam_svc
 
     sqs_svc.reset()
     sns_svc.reset()
     s3_svc.reset()
+    iam_svc.reset()
     _request_caller_arn.set("")
 
 
@@ -2201,6 +2305,117 @@ class TestSnsFanoutPolicies:
 
 
 # ---------------------------------------------------------------------------
+# Identity policy and resource policy together, through the router
+# ---------------------------------------------------------------------------
+
+def _routed_send(key, url, body="m"):
+    return routed_request(key, "sqs", "POST", "/", json.dumps({"QueueUrl": url, "MessageBody": body}).encode(), {
+        "content-type": "application/x-amz-json-1.0", "x-amz-target": "AmazonSQS.SendMessage"})
+
+
+def _routed_publish(key, arn):
+    from urllib.parse import urlencode
+
+    return routed_request(key, "sns", "POST", "/", urlencode({
+        "Action": "Publish", "TopicArn": arn, "Message": "m"}).encode(),
+        {"content-type": "application/x-www-form-urlencoded"})
+
+
+def _grant(effect, principal, action, resource):
+    return {"Version": "2012-10-17", "Statement": [{
+        "Effect": effect, "Principal": {"AWS": principal}, "Action": action, "Resource": resource}]}
+
+
+_ALLOW_MESSAGING = {"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Action": ["sqs:*", "sns:*"], "Resource": "*"}]}
+
+
+class TestIdentityAndResourcePolicy:
+    """Same-account cases run in the default account, where IAM users live."""
+
+    def test_queue_policy_naming_the_user_allows_without_identity_policy(self, auth):
+        key, user = inprocess_iam_user()
+        name = _uniq("rp-q")
+        url = _make_queue(HOME, name, _grant("Allow", user, "sqs:SendMessage", _qarn(HOME, name)))
+        assert _routed_send(key, url, "granted")[0] == 200
+        assert _queue_bodies(_qarn(HOME, name)) == ["granted"]
+
+    def test_queue_policy_naming_the_account_needs_an_identity_policy(self, auth):
+        key, _user = inprocess_iam_user()
+        name = _uniq("rp-q")
+        url = _make_queue(HOME, name, _grant("Allow", f"arn:aws:iam::{HOME}:root",
+                                             "sqs:SendMessage", _qarn(HOME, name)))
+        status, headers, _body = _routed_send(key, url)
+        assert status == 403
+        assert headers["x-amzn-query-error"] == "AccessDenied;Sender"
+        key, _user = inprocess_iam_user(_ALLOW_MESSAGING)
+        assert _routed_send(key, url)[0] == 200
+
+    def test_queue_policy_deny_beats_an_identity_allow(self, auth):
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
+        name = _uniq("rp-q")
+        url = _make_queue(HOME, name, _grant("Deny", user, "sqs:SendMessage", _qarn(HOME, name)))
+        status, headers, body = _routed_send(key, url)
+        assert status == 403
+        assert headers["x-amzn-query-error"] == "AccessDenied;Sender"
+        assert json.loads(body)["message"] == (
+            f"User: {user} is not authorized to perform: sqs:sendmessage on resource: {_qarn(HOME, name)} "
+            "with an explicit deny in a resource-based policy")
+        assert _queue_bodies(_qarn(HOME, name)) == []
+
+    def test_topic_policy_naming_the_user_allows_without_identity_policy(self, auth):
+        key, user = inprocess_iam_user()
+        arn = _make_topic(HOME, _uniq("rp-t"))
+        _set_topic_policy(HOME, arn, _grant("Allow", user, "sns:Publish", arn))
+        assert _resp_code(_routed_publish(key, arn)) == (200, "")
+
+    def test_topic_policy_naming_the_account_needs_an_identity_policy(self, auth):
+        key, _user = inprocess_iam_user()
+        arn = _make_topic(HOME, _uniq("rp-t"))
+        _set_topic_policy(HOME, arn, _grant("Allow", HOME, "sns:Publish", arn))
+        assert _resp_code(_routed_publish(key, arn)) == (403, "AuthorizationError")
+        key, _user = inprocess_iam_user(_ALLOW_MESSAGING)
+        assert _resp_code(_routed_publish(key, arn)) == (200, "")
+
+    def test_topic_policy_deny_beats_an_identity_allow(self, auth):
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
+        arn = _make_topic(HOME, _uniq("rp-t"))
+        _set_topic_policy(HOME, arn, _grant("Deny", user, "sns:Publish", arn))
+        assert _resp_detail(_routed_publish(key, arn)) == (403, "AuthorizationError", (
+            f"User: {user} is not authorized to perform: SNS:Publish on resource: {arn} "
+            "with an explicit deny in a resource-based policy"))
+
+    def test_default_topic_policy_grants_nothing_to_a_user(self, auth):
+        key, _user = inprocess_iam_user()
+        arn = _make_topic(HOME, _uniq("rp-t"))
+        assert _resp_code(_routed_publish(key, arn)) == (403, "AuthorizationError")
+
+    def test_cross_account_needs_both_policies(self, auth):
+        name = _uniq("rp-q")
+        key, user = inprocess_iam_user()
+        url = _make_queue(ACCT_A, name, _grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))
+        assert _routed_send(key, url)[0] == 403
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes, {"QueueUrl": url, "Attributes": {
+            "Policy": json.dumps(_grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))}}, url)
+        assert _routed_send(key, url)[0] == 200
+
+    def test_cross_account_ignores_a_same_named_queue_of_the_caller(self, auth):
+        name = _uniq("rp-q")
+        key, user = inprocess_iam_user()
+        home = _make_queue(HOME, name, _grant("Allow", user, "sqs:SendMessage", _qarn(HOME, name)))
+        url = _make_queue(ACCT_A, name, _grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))
+        assert _routed_send(key, url)[0] == 403
+        key, user = inprocess_iam_user(_ALLOW_MESSAGING)
+        _as(HOME, sqs_svc._act_set_queue_attributes, {"QueueUrl": home, "Attributes": {
+            "Policy": json.dumps(_grant("Deny", user, "sqs:SendMessage", _qarn(HOME, name)))}}, home)
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes, {"QueueUrl": url, "Attributes": {
+            "Policy": json.dumps(_grant("Allow", user, "sqs:SendMessage", _qarn(ACCT_A, name)))}}, url)
+        assert _routed_send(key, url, "foreign")[0] == 200
+        assert _queue_bodies(_qarn(ACCT_A, name)) == ["foreign"]
+
+
+# ---------------------------------------------------------------------------
 # AUTH=false stays permissive
 # ---------------------------------------------------------------------------
 
@@ -2395,3 +2610,89 @@ def test_sqs_dlq_move_enqueue_time_and_source_arn(monkeypatch, fifo):
     remaining = sum(counts(dlq))
     # Standard keeps the original enqueue time (expired); FIFO reset it on the move (still there).
     assert remaining == (1 if fifo else 0)
+
+
+@pytest.fixture
+def queue(monkeypatch):
+    monkeypatch.setattr(sqs_svc, "_queues", AccountRegionScopedDict())
+    monkeypatch.setattr(sqs_svc, "_queue_name_to_url", AccountRegionScopedDict())
+    url = sqs_svc._act_create_queue({"QueueName": "policy-removal"}, "")["QueueUrl"]
+    dlq = sqs_svc._act_create_queue({"QueueName": "policy-removal-dlq"}, "")["QueueUrl"]
+    arn = sqs_svc._act_get_queue_attributes({"QueueUrl": dlq}, "")["Attributes"]["QueueArn"]
+    policies = {
+        "Policy": json.dumps({"Version": "2012-10-17", "Statement": []}),
+        "RedrivePolicy": json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": "3"}),
+        "RedriveAllowPolicy": json.dumps({"redrivePermission": "denyAll"}),
+    }
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": policies}, "")
+    return url, policies
+
+
+def _request(protocol, action, url, attributes=None, names=None):
+    if protocol == "json":
+        data = {"QueueUrl": url}
+        if attributes is not None:
+            data["Attributes"] = attributes
+        if names is not None:
+            data["AttributeNames"] = names
+        headers = {"x-amz-target": f"AmazonSQS.{action}"}
+        body = json.dumps(data).encode()
+    else:
+        data = {"Action": action, "QueueUrl": url}
+        for i, (key, value) in enumerate((attributes or {}).items(), 1):
+            data[f"Attribute.{i}.Name"] = key
+            data[f"Attribute.{i}.Value"] = value
+        for i, name in enumerate(names or [], 1):
+            data[f"AttributeName.{i}"] = name
+        headers = {"content-type": "application/x-www-form-urlencoded"}
+        body = urlencode(data).encode()
+    return asyncio.run(sqs_svc.handle_request("POST", "/", headers, body, {}))
+
+
+def _read(protocol, url, names):
+    status, _, body = _request(protocol, "GetQueueAttributes", url, names=names)
+    assert status == 200
+    if protocol == "json":
+        return json.loads(body)["Attributes"]
+    ns = "{http://queue.amazonaws.com/doc/2012-11-05/}"
+    return {entry.findtext(f"{ns}Name"): entry.findtext(f"{ns}Value")
+            for entry in ET.fromstring(body).iter(f"{ns}Attribute")}
+
+
+@pytest.mark.parametrize("protocol", ["json", "query"])
+@pytest.mark.parametrize("attribute", ["Policy", "RedrivePolicy", "RedriveAllowPolicy"])
+def test_empty_policy_removes_attribute_from_all_and_specific_reads(queue, protocol, attribute):
+    url, policies = queue
+    assert _read(protocol, url, [attribute]) == {attribute: policies[attribute]}
+    for _ in range(2):
+        status, _, body = _request(protocol, "SetQueueAttributes", url, {attribute: ""})
+        assert status == 200, body
+        assert _read(protocol, url, [attribute]) == {}
+        remaining = _read(protocol, url, ["All"])
+        assert attribute not in remaining
+        for other in policies.keys() - {attribute}:
+            assert remaining[other] == policies[other]
+        assert remaining["VisibilityTimeout"] == "30"
+
+
+@pytest.mark.parametrize("invalid", [{"RedrivePolicy": "not-json"},
+                                   {"RedrivePolicy": '"double-encoded"'},
+                                   {"VisibilityTimeout": "-1"}])
+def test_invalid_update_preserves_all_attributes(queue, invalid):
+    url, _ = queue
+    before = copy.deepcopy(sqs_svc._queues[url])
+    status, _, body = _request("json", "SetQueueAttributes", url, {"Policy": "", **invalid})
+    assert status == 400
+    assert json.loads(body)["__type"] == "InvalidAttributeValue"
+    assert sqs_svc._queues[url] == before
+
+
+def test_removed_policies_remain_absent_after_persistence_round_trip(queue):
+    url, policies = queue
+    assert _request("json", "SetQueueAttributes", url, dict.fromkeys(policies, ""))[0] == 200
+    state = sqs_svc.get_state()
+    sqs_svc._queues.clear()
+    sqs_svc._queue_name_to_url.clear()
+    sqs_svc.load_persisted_state(state)
+    assert policies.keys().isdisjoint(_read("json", url, ["All"]))
+    assert _read("json", url, ["QueueArn"])["QueueArn"].endswith(":policy-removal")

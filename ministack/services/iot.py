@@ -20,11 +20,13 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``$aws/events/certificates/registered/{caCertificateId}``
   - Provisioning templates: ``CreateProvisioningTemplate``,
     ``DescribeProvisioningTemplate``, ``ListProvisioningTemplates``,
-    ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate`` —
-    storage + CRUD only: the fleet-provisioning MQTT workflow
-    (``$aws/provisioning-templates/...``) is not implemented, and
-    ``provisioningRoleArn`` is presence-checked but not resolved
-    (MiniStack does not validate IAM role ARNs elsewhere either)
+    ``UpdateProvisioningTemplate``, ``DeleteProvisioningTemplate``,
+    ``CreateProvisioningClaim``, and fleet provisioning over MQTT
+    (``$aws/certificates/create/json`` and
+    ``$aws/provisioning-templates/{name}/provision/json``, after the
+    template's pre-provisioning hook allows it); with ``AUTH=true``
+    RegisterThing needs a ``provisioningRoleArn`` that IoT may assume and
+    that allows its writes
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc., plus the deprecated principal-policy family
     (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
@@ -37,8 +39,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateEventConfigurations``
   - Jobs (control plane): ``CreateJob``, ``UpdateJob``, ``DescribeJob``,
     ``ListJobs``, ``GetJobDocument``, ``CancelJob``, ``DeleteJob``,
-    ``ListJobExecutionsForThing``, ``DescribeJobExecution``,
-    ``CancelJobExecution`` — execution state shared with the
+    ``ListJobExecutionsForThing``, ``ListJobExecutionsForJob``,
+    ``DescribeJobExecution``, ``CancelJobExecution``,
+    ``DeleteJobExecution`` — execution state shared with the
     ``iot-jobs-data`` device data plane (``iot_jobs_data.py``)
   - Job templates: ``CreateJobTemplate``, ``DescribeJobTemplate``,
     ``ListJobTemplates``, ``DeleteJobTemplate``; ``CreateJob`` with a
@@ -49,6 +52,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateDomainConfiguration``, ``DeleteDomainConfiguration``, including
     the ``iot:Data-ATS`` / ``iot:CredentialProvider`` configurations IoT owns
     (control plane only: the broker does not serve a configured domain)
+  - Tags: ``TagResource``, ``UntagResource``, ``ListTagsForResource`` on the
+    taggable types above, which also take ``tags`` when created
 
 This is the control plane — pure HTTP/JSON, no MQTT broker
 dependency. The data plane (``iot_data.py``) is
@@ -69,12 +74,16 @@ import base64
 import contextlib
 import contextvars
 import copy
+import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import secrets
 import ssl
+import string
 import struct
 import time
 import unicodedata
@@ -82,8 +91,11 @@ import uuid
 import weakref
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
+from urllib.parse import parse_qs, parse_qsl
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
+from ministack.core.iam_evaluator import AuthError, EvalContext, ResolvedCredential, evaluate, parse_policy_document
 from ministack.core.responses import (
     AccountRegionScopedDict,
     _request_account_id,
@@ -95,7 +107,9 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
+from ministack.core.router import extract_access_key_id
 from ministack.core.x509_utils import (
+    certificate_common_name,
     certificate_is_signed_by,
     generate_ca,
     get_certificate_id,
@@ -135,10 +149,16 @@ _ca_certificates: AccountRegionScopedDict = AccountRegionScopedDict()
 _registration_codes: AccountRegionScopedDict = AccountRegionScopedDict()
 # Provisioning templates (CreateProvisioningTemplate & friends): templateName -> record
 _provisioning_templates: AccountRegionScopedDict = AccountRegionScopedDict()
+# Claim certificates (CreateProvisioningClaim): certificateId -> record, until they expire
+_provisioning_claims: AccountRegionScopedDict = AccountRegionScopedDict()
+# Ownership tokens of certificates created over MQTT: token -> record, until they expire
+_ownership_tokens: AccountRegionScopedDict = AccountRegionScopedDict()
 _jobs: AccountRegionScopedDict = AccountRegionScopedDict()  # jobId -> Job dict
 # (thingName, jobId) -> JobExecution dict — tuple keys, same pattern as _shadows
 _job_executions: AccountRegionScopedDict = AccountRegionScopedDict()
 _job_templates: AccountRegionScopedDict = AccountRegionScopedDict()  # jobTemplateId -> record
+# Tags of the taggable resources: resource ARN -> {key: value}
+_tags: AccountRegionScopedDict = AccountRegionScopedDict()
 
 # Local CA state — lazily generated on first use, persisted across restarts.
 import threading
@@ -198,17 +218,22 @@ _retained: dict[str, "_RetainedMessage"] = {}
 
 
 class _RetainedMessage:
-    __slots__ = ("payload", "properties", "qos", "topic", "ts")
+    __slots__ = ("expires_at", "payload", "properties", "qos", "topic", "ts")
 
-    def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b""):
+    def __init__(self, topic: str, payload: bytes, qos: int, properties: bytes = b"",
+                 ts: float | None = None):
         self.topic = topic
         self.payload = payload
         self.qos = qos
         # Encoded MQTT 5 property block forwarded to v5 subscribers, empty for
-        # a message published by a 3.1.1 client. Runtime only: properties are
-        # not part of the persisted retained-message state.
+        # a message published by a 3.1.1 client.
         self.properties = properties
-        self.ts = time.time()
+        self.ts = time.time() if ts is None else ts
+        self.expires_at = _message_expires_at(properties, self.ts)
+
+    def expired(self, now: float) -> bool:
+        """Whether the message's MQTT 5 expiry interval has run out."""
+        return self.expires_at is not None and now >= self.expires_at
 
 
 def _broker_get_state() -> dict:
@@ -221,6 +246,8 @@ def _broker_get_state() -> dict:
             "topic": msg.topic,
             "payload": base64.b64encode(msg.payload).decode("ascii"),
             "qos": msg.qos,
+            "properties": base64.b64encode(msg.properties).decode("ascii"),
+            "ts": msg.ts,
         })
     return {"region_scoped": True, "retained": retained_list}
 
@@ -239,7 +266,8 @@ def _broker_restore_state(data: dict | None) -> None:
                 )
         payload = base64.b64decode(entry["payload"])
         qos = entry.get("qos", 0)
-        _retained[topic] = _RetainedMessage(topic, payload, qos)
+        properties = base64.b64decode(entry.get("properties", ""))
+        _retained[topic] = _RetainedMessage(topic, payload, qos, properties, entry.get("ts"))
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +290,12 @@ def get_state() -> dict:
         "ca_certificates": copy.deepcopy(_ca_certificates),
         "registration_codes": copy.deepcopy(_registration_codes),
         "provisioning_templates": copy.deepcopy(_provisioning_templates),
+        "provisioning_claims": copy.deepcopy(_provisioning_claims),
+        "ownership_tokens": copy.deepcopy(_ownership_tokens),
         "jobs": copy.deepcopy(_jobs),
         "job_executions": copy.deepcopy(_job_executions),
         "job_templates": copy.deepcopy(_job_templates),
+        "tags": copy.deepcopy(_tags),
         "ca": {"ca_cert_pem": _ca_cert_pem, "ca_key_pem": _ca_key_pem}
         if _ca_cert_pem and _ca_key_pem
         else {},
@@ -300,9 +331,29 @@ def _restore_state(data: dict | None) -> None:
     _ca_certificates.update(data.get("ca_certificates", {}))
     _registration_codes.update(data.get("registration_codes", {}))
     _provisioning_templates.update(data.get("provisioning_templates", {}))
+    # Older state kept a template's body on the record, as its only version.
+    for record in _provisioning_templates.all_values():
+        if "versions" not in record:
+            body = record.pop("templateBody")
+            record["versions"] = {"1": _provisioning_template_version(1, body, record["creationDate"])}
+            record["lastVersionId"] = 1
+    _provisioning_claims.update(data.get("provisioning_claims", {}))
+    _ownership_tokens.update(data.get("ownership_tokens", {}))
     _jobs.update(data.get("jobs", {}))
     _job_executions.update(data.get("job_executions", {}))
     _job_templates.update(data.get("job_templates", {}))
+    _tags.update(data.get("tags", {}))
+    # Older state kept these tags on the records.
+    for store, arn_key in ((_thing_groups, "thingGroupArn"), (_jobs, "jobArn"),
+                           (_job_templates, "jobTemplateArn")):
+        for (account, region, _), record in store.all_items():
+            legacy = record.pop("tags", None)
+            if legacy and not _tags.contains_scoped(account, region, record[arn_key]):
+                _tags.set_scoped(account, region, record[arn_key],
+                                 {t["Key"]: t.get("Value", "") for t in legacy})
+    for (account_id, region, _), job in _jobs.all_items():
+        if job.get("rolloutQueue"):
+            _jobs_rollout_start(account_id, region, job)
     ca_data = data.get("ca")
     if ca_data:
         cert = ca_data.get("ca_cert_pem")
@@ -343,9 +394,14 @@ def reset() -> None:
     _ca_certificates.clear()
     _registration_codes.clear()
     _provisioning_templates.clear()
+    _provisioning_claims.clear()
+    _ownership_tokens.clear()
     _jobs.clear()
     _job_executions.clear()
     _job_templates.clear()
+    _tags.clear()
+    # Retained messages are part of the state get_state() saves.
+    _retained.clear()
     with _CA_LOCK:
         _ca_cert_pem = None
         _ca_key_pem = None
@@ -454,10 +510,41 @@ def _parse_body(body: bytes) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _error_not_found(resource: str, name: str) -> tuple:
-    return error_response_json(
-        "ResourceNotFoundException", f"{resource} {name!r} not found", 404
-    )
+# AWS's ResourceNotFoundException wording per resource, or per operation where it differs.
+_NOT_FOUND_MESSAGES = {
+    "Thing": "Thing {name} not found.",
+    "DescribeThing": "Thing {account}:{name} not found.",
+    "ListThingGroupsForThing": "thing does not exist",
+    "ListThingPrincipals": "Failed to list principals for thing{name} because the thing does not exist in your account",
+    "AttachThingPrincipal": "Failed to attach the principal {principal} to thing {name} because the thing does not "
+    "exist in your account",
+    "DetachThingPrincipal": "Failed to detach the principal {principal} from thing {name} because the thing does not "
+    "exist in your account",
+    "AttachThingPrincipal:principal": "Can't attach the principal {principal} to thing {name} because the principal "
+    "does not exist in your account",
+    "DetachThingPrincipal:principal": "Can't detach the principal {principal} from thing {name} because the principal "
+    "does not exist in your account",
+    "ListPrincipalThings": "Can't list things for the principal {name} because the principal does not exist in your "
+    "account",
+    "ThingType": "Thing Type {account}:{name} not found.",
+    "ThingGroup": "ThingGroup {account}:{name} not found.",
+    "UpdateThingGroup": "Group {name} does not exist",
+    "ThingGroupMember": "Cannot find requested thing group for accountId: {account} and thing group name: {name}",
+    "Certificate": "CertificateId {name} does not exist",
+    "CACertificate": "Requested CA Certificate does not exist.",
+    "Policy": "Policy not found",
+    "GetPolicy": "Policy default version not found",
+    "PolicyVersion": "Policy version does not exist (name={policy}, versionId={name})",
+    "Job": "Job {name} cannot be found.",
+    "JobExecution": "Job execution for thing {thing} cannot be found within job {name}.",
+    "JobExecution:job": "Job execution cannot be found as the Job {name} does not exist.",
+}
+
+
+def _error_not_found(resource: str, name: str, **fields) -> tuple:
+    template = _NOT_FOUND_MESSAGES.get(resource, "{resource} {name!r} not found")
+    message = template.format(resource=resource, name=name, account=get_account_id(), **fields)
+    return error_response_json("ResourceNotFoundException", message, 404)
 
 
 def _qp_bool(qp: dict, name: str, default: bool = False) -> bool:
@@ -526,7 +613,8 @@ async def _route_request(
     # must come BEFORE the generic /things/{name} branch.
     if path.startswith("/things/") and path.endswith("/thing-groups") and method == "GET":
         return _list_thing_groups_for_thing(path)
-    # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] — like
+    # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] and
+    # /things/{name}/jobs/{jobId}/executionNumber/{n} — like
     # /principals, must come BEFORE the generic /things/{name} branch. The
     # `jobs` segment only counts when a thing name precedes it: `/things/jobs`
     # is thing CRUD for a thing that happens to be named `jobs`.
@@ -562,7 +650,7 @@ async def _route_request(
     if path == "/provisioning-templates" and method == "GET":
         return _list_provisioning_templates(qp)
     if path.startswith("/provisioning-templates/"):
-        return _handle_provisioning_template(method, path, body)
+        return _handle_provisioning_template(method, path, body, qp)
 
     # Certificates
     if path == "/keys-and-certificate" and method == "POST":
@@ -646,7 +734,14 @@ async def _route_request(
     if path == "/rules" and method == "GET":
         return _list_topic_rules(qp)
     if path.startswith("/rules/"):
-        return _handle_topic_rule(method, path, body)
+        return _handle_topic_rule(method, path, body, hdr)
+
+    if path == "/tags" and method == "POST":
+        return _tag_resource(_parse_body(body))
+    if path == "/untag" and method == "POST":
+        return _untag_resource(_parse_body(body))
+    if path == "/tags" and method == "GET":
+        return _list_tags_for_resource(qp)
 
     return error_response_json(
         "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
@@ -970,7 +1065,8 @@ def _create_domain_configuration(name: str, payload: dict) -> tuple:
     the configuration is AWS_MANAGED and gets a generated ``-ats`` host; with
     one it is CUSTOMER_MANAGED on the caller's ``domainName``."""
     err = (_domain_config_name_error(name, _DOMAIN_CONFIG_NAME_RE)
-           or _domain_config_model_error(payload))
+           or _domain_config_model_error(payload)
+           or _tags_error(payload.get("tags"), required=False))
     if err:
         return err
     service_type = payload.get("serviceType") or "DATA"
@@ -1049,6 +1145,7 @@ def _create_domain_configuration(name: str, payload: dict) -> tuple:
         if payload.get(member):
             record[member] = payload[member]
     _domain_configurations[name] = record
+    _set_created_tags(record["domainConfigurationArn"], payload.get("tags"))
     return json_response({
         "domainConfigurationName": name,
         "domainConfigurationArn": record["domainConfigurationArn"],
@@ -1195,6 +1292,7 @@ def _delete_domain_configuration(name: str) -> tuple:
             "AWS Managed Domain Configuration must be disabled for at least 7 days "
             "before it can be deleted")
     del _domain_configurations[name]
+    _tags.pop(record["domainConfigurationArn"], None)
     return json_response({})
 
 
@@ -1246,7 +1344,7 @@ def _handle_thing(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if method == "PATCH":
         return _update_thing(name, _parse_body(body))
     if method == "DELETE":
-        return _delete_thing(name)
+        return _delete_thing(name, qp.get("expectedVersion"))
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
     )
@@ -1302,7 +1400,7 @@ def _create_thing(name: str, payload: dict) -> tuple:
 def _describe_thing(name: str) -> tuple:
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
+        return _error_not_found("DescribeThing", name)
     body = {
         "thingName": thing["thingName"],
         "thingId": thing["thingId"],
@@ -1372,16 +1470,23 @@ def _update_thing(name: str, payload: dict) -> tuple:
     return json_response({})
 
 
-def _delete_thing(name: str) -> tuple:
+def _delete_thing(name: str, expected_version=None) -> tuple:
+    """DeleteThing; an unknown name answers 200 like a completed delete."""
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
-    # Detach all attached certificates
-    thing_arn = thing["thingArn"]
-    for cert_id, cert in list(_certificates.items()):
-        if thing_arn in cert.get("attachedThings", []):
-            cert["attachedThings"].remove(thing_arn)
-            _certificates[cert_id] = cert
+        return json_response({})
+    if expected_version not in (None, "") and str(expected_version) != str(thing.get("version", 1)):
+        return error_response_json(
+            "VersionConflictException",
+            f"The version for thing {name} does not match the expected version.",
+            409,
+        )
+    if any(p.rsplit("/", 1)[-1] in _certificates for p in thing.get("principals", [])):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Cannot delete. Thing {name} is still attached to one or more principals",
+            400,
+        )
     _thing_events("DELETED", thing, thing.get("thingTypeName"))
     # Remove from groups
     for gname in list(thing.get("thingGroupNames", [])):
@@ -1396,6 +1501,9 @@ def _delete_thing(name: str) -> tuple:
     orphaned_jobs = [key[1] for key in _job_executions.keys() if key[0] == name]
     for job_id in orphaned_jobs:
         del _job_executions[(name, job_id)]
+    for job in _jobs.values():
+        if name in (job.get("executionsDeletedFor") or ()):
+            job["executionsDeletedFor"].remove(name)
     del _things[name]
     for job_id in orphaned_jobs:
         _jobs_maybe_complete(job_id)
@@ -1459,6 +1567,9 @@ def _thing_type_props_identity(props: dict) -> tuple:
 
 
 def _create_thing_type(name: str, payload: dict) -> tuple:
+    err = _tags_error(payload.get("tags"), required=False, missing_value=_TAG_WITHOUT_VALUE)
+    if err:
+        return err
     props = payload.get("thingTypeProperties") or {}
     existing = _thing_types.get(name)
     if existing is not None:
@@ -1493,6 +1604,7 @@ def _create_thing_type(name: str, payload: dict) -> tuple:
         },
     }
     _thing_types[name] = record
+    _set_created_tags(record["thingTypeArn"], payload.get("tags"))
     _thing_type_event("CREATED", record)
     logger.info("IoT Thing Type created: %s", name)
     return json_response({
@@ -1528,14 +1640,21 @@ def _deprecate_thing_type(name: str, payload: dict) -> tuple:
 def _delete_thing_type(name: str) -> tuple:
     t = _thing_types.get(name)
     if t is None:
-        return _error_not_found("ThingType", name)
+        return json_response({})
     if not t["thingTypeMetadata"].get("deprecated"):
         return error_response_json(
             "InvalidRequestException",
             "ThingType must be deprecated for at least 5 minutes before deletion",
             400,
         )
+    if any(thing.get("thingTypeName") == name for thing in _things.values()):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Can not delete thing type {name} with things associated with it",
+            400,
+        )
     del _thing_types[name]
+    _tags.pop(t["thingTypeArn"], None)
     _thing_type_event("DELETED", t)
     return json_response({})
 
@@ -1572,10 +1691,6 @@ def _handle_thing_group(method: str, path: str, body: bytes, qp: dict) -> tuple:
     )
 
 
-def _thing_group_tag_pairs(tags: list | None) -> list:
-    return sorted((t.get("Key"), t.get("Value")) for t in tags or [])
-
-
 def _create_existing_thing_group(group: dict, payload: dict) -> tuple:
     """CreateThingGroup on a name that exists. AWS answers 200 with the
     existing group when the request describes it exactly: description,
@@ -1597,7 +1712,8 @@ def _create_existing_thing_group(group: dict, payload: dict) -> tuple:
         or (payload.get("parentGroupName") or None) != stored_parent
     ):
         message = f"Thing Group {group['thingGroupName']} already exists in current account"
-    elif _thing_group_tag_pairs(payload.get("tags")) != _thing_group_tag_pairs(group.get("tags")):
+    elif ({t.get("Key"): t.get("Value") for t in payload.get("tags") or []}
+          != (_tags.get(group["thingGroupArn"]) or {})):
         message = f"Resource {group['thingGroupArn']} already exists in current account"
     else:
         return json_response({
@@ -1620,11 +1736,16 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
             f"ThingGroup {name!r} already exists",
             409,
         )
+    err = _tags_error(payload.get("tags"), required=False, missing_value=_TAG_WITHOUT_VALUE)
+    if err:
+        return err
     props = payload.get("thingGroupProperties") or {}
     attr_payload = props.get("attributePayload") or {}
     parent = payload.get("parentGroupName")
     if parent and parent not in _thing_groups:
-        return _error_not_found("ThingGroup", parent)
+        return error_response_json(
+            "InvalidRequestException", f"Cannot create group using non-existing group as parent : {parent}", 400
+        )
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),
@@ -1636,8 +1757,6 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         "version": 1,
         "things": [],
         "creationDate": _now_epoch(),
-        # Kept for a repeated CreateThingGroup to compare; not echoed.
-        "tags": list(payload.get("tags") or []),
     }
     if parent:
         # DescribeThingGroup reports the parent under thingGroupMetadata, as
@@ -1647,6 +1766,7 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
             "creationDate": record["creationDate"],
         }
     _thing_groups[name] = record
+    _set_created_tags(record["thingGroupArn"], payload.get("tags"))
     _thing_group_event("CREATED", record)
     if parent:
         _hierarchy_event("ADDED", _thing_groups[parent], record)
@@ -1678,7 +1798,7 @@ def _list_things_in_thing_group(path: str) -> tuple:
     middle = path[len("/thing-groups/"):-len("/things")]
     g = _thing_groups.get(middle)
     if g is None:
-        return _error_not_found("ThingGroup", middle)
+        return _error_not_found("ThingGroupMember", middle)
     return json_response({"things": list(g.get("things", []))})
 
 
@@ -1700,7 +1820,7 @@ def _list_thing_groups_for_thing(path: str) -> tuple:
         )
     thing = _things.get(middle)
     if thing is None:
-        return _error_not_found("Thing", middle)
+        return _error_not_found("ListThingGroupsForThing", middle)
     return json_response({
         "thingGroups": [
             {"groupName": g, "groupArn": _thing_group_arn(g)}
@@ -1715,7 +1835,7 @@ def _list_thing_groups_for_thing(path: str) -> tuple:
 def _update_thing_group(name: str, payload: dict) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
-        return _error_not_found("ThingGroup", name)
+        return _error_not_found("UpdateThingGroup", name)
     props = payload.get("thingGroupProperties") or {}
     if props:
         g["thingGroupProperties"].update({
@@ -1735,7 +1855,7 @@ def _update_thing_group(name: str, payload: dict) -> tuple:
 def _delete_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
-        return _error_not_found("ThingGroup", name)
+        return json_response({})
     if any((c.get("thingGroupMetadata") or {}).get("parentGroupName") == name for c in _thing_groups.values()):
         return error_response_json(
             "InvalidRequestException",
@@ -1753,21 +1873,60 @@ def _delete_thing_group(name: str) -> tuple:
     if parent:
         _hierarchy_event("REMOVED", parent, g)
     del _thing_groups[name]
+    _tags.pop(g["thingGroupArn"], None)
     return json_response({})
+
+
+_MEMBERSHIP_ARN_ERRORS = {
+    "thingGroup": ("thinggroup", "Invalid ThingGroupArn",
+                   "ThingGroupName from thingGroupArn does not match specified thingGroupName in request"),
+    "thing": ("thing", "Invalid ThingArn", "ThingName in thingArn does not match specified thingName in request"),
+}
+
+
+def _membership_name(payload: dict, field: str) -> tuple[str, tuple | None]:
+    """The thing group or thing (``field``) a membership call names by name or ARN, or the call's refusal."""
+    rtype, invalid, mismatch = _MEMBERSHIP_ARN_ERRORS[field]
+    name, arn = payload.get(f"{field}Name"), payload.get(f"{field}Arn")
+    if not arn:
+        if name:
+            return name, None
+        message = f"Both {field}Arn and {field}Name are empty. Need to specify at least one of them"
+        return "", error_response_json("InvalidRequestException", message, 400)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return "", error_response_json("InvalidRequestException", "Invalid arn in request", 400)
+    if spec.account_id != get_account_id():
+        return "", error_response_json(
+            "InvalidRequestException", "ResourceArn doesn't belong in requester's account", 400)
+    # The ARN's region is not checked: the call acts on the resource of its own region.
+    if spec.service != "iot" or not spec.resource.startswith(f"{rtype}/"):
+        return "", error_response_json("InvalidRequestException", invalid, 400)
+    arn_name = spec.resource[len(rtype) + 1:]
+    if name and name != arn_name:
+        return "", error_response_json("InvalidRequestException", mismatch, 400)
+    return arn_name, None
+
+
+def _membership_names(payload: dict) -> tuple[str, str, tuple | None]:
+    """The thing group and the thing a membership call names, or its refusal (the group's first)."""
+    gname, error = _membership_name(payload, "thingGroup")
+    if error:
+        return "", "", error
+    tname, error = _membership_name(payload, "thing")
+    return gname, tname, error
 
 
 async def _add_thing_to_group(payload: dict) -> tuple:
     """Async because a CONTINUOUS job the thing joins publishes
     jobs/notify(-next) through the broker."""
-    gname = payload.get("thingGroupName")
-    tname = payload.get("thingName")
-    if not gname or not tname:
-        return error_response_json(
-            "InvalidRequestException", "thingGroupName and thingName are required", 400
-        )
+    gname, tname, error = _membership_names(payload)
+    if error:
+        return error
     group = _thing_groups.get(gname)
     if group is None:
-        return _error_not_found("ThingGroup", gname)
+        return _error_not_found("ThingGroupMember", gname)
     thing = _things.get(tname)
     if thing is None:
         return _error_not_found("Thing", tname)
@@ -1788,23 +1947,26 @@ async def _add_thing_to_group(payload: dict) -> tuple:
 async def _remove_thing_from_group(payload: dict) -> tuple:
     """Async because a QUEUED CONTINUOUS execution the removal retires
     publishes jobs/notify(-next) through the broker."""
-    gname = payload.get("thingGroupName")
-    tname = payload.get("thingName")
-    group = _thing_groups.get(gname) if gname else None
-    thing = _things.get(tname) if tname else None
-    if group is None:
-        return _error_not_found("ThingGroup", gname or "")
+    gname, tname, error = _membership_names(payload)
+    if error:
+        return error
+    group = _thing_groups.get(gname)
+    thing = _things.get(tname)
     if thing is None:
-        return _error_not_found("Thing", tname or "")
+        return _error_not_found("Thing", tname)
+    if group is None:
+        # A group that does not exist answers 200.
+        return json_response({})
     prev_next = jobs_first_pending_job_id(tname)
-    if tname in group.get("things", []):
+    left = tname in group.get("things", [])
+    if left:
         group["things"].remove(tname)
         _thing_groups[gname] = group
         _membership_event("REMOVED", group, thing)
     if gname in thing.get("thingGroupNames", []):
         thing["thingGroupNames"].remove(gname)
         _things[tname] = thing
-    if _jobs_thing_left_group(tname):
+    if _jobs_thing_left_group(tname, _thing_group_arn(gname) if left else None):
         await jobs_notify_thing(get_account_id(), get_region(), tname, prev_next)
     return json_response({})
 
@@ -1812,10 +1974,11 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 # ---------------------------------------------------------------------------
 # Provisioning templates
 #
-# Storage + CRUD only: the fleet-provisioning MQTT workflow
-# ($aws/provisioning-templates/{name}/provision/*) is not implemented, and
-# provisioningRoleArn is presence-checked but never resolved — MiniStack does
-# not validate IAM role ARNs elsewhere either. Template versions are not
+# CRUD, CreateProvisioningClaim and the fleet provisioning MQTT API (JSON
+# topics) that applies a template to a certificate created over MQTT, once the
+# template's pre-provisioning hook allows it; with AUTH=true RegisterThing
+# answers AccessDenied unless provisioningRoleArn names a role IoT may assume
+# that allows every write it makes. Template versions are not
 # modeled: a template always carries defaultVersionId 1. Wire shapes and
 # error messages mirror a live probe of the real service (2026-08-26).
 # ---------------------------------------------------------------------------
@@ -1835,9 +1998,25 @@ def _validate_provisioning_template_name(name: str | None) -> tuple | None:
     return None
 
 
+def _provisioning_template_resource_error(resource, certificates: int) -> str | None:
+    """Why the service refuses one resource of a template body, or None."""
+    props = resource.get("Properties")
+    if props is None:
+        return "Properties of a resource cannot be null."
+    if resource.get("Type") != "AWS::IoT::Certificate":
+        return None
+    if certificates:
+        return "Only one certificate resource can be defined"
+    if not isinstance(props, dict) or props.get("CertificateId") != {"Ref": "AWS::IoT::Certificate::Id"}:
+        return "CertificateId must contain a reference to AWS::IoT::Certificate::Id"
+    status = props.get("Status")
+    if not isinstance(status, str) or status.lower() not in ("active", "inactive"):
+        return 'A certificate resource must specify a Status of either "Active" or "Inactive"'
+    return None
+
+
 def _validate_provisioning_template_body(body) -> tuple | None:
-    """The live service refuses a body without an AWS::IoT::Certificate
-    resource; its message is quoted verbatim below."""
+    """Refuse a body the live service refuses, with its messages verbatim."""
     doc = body
     if not isinstance(doc, dict):
         try:
@@ -1847,15 +2026,22 @@ def _validate_provisioning_template_body(body) -> tuple | None:
     if not isinstance(doc, dict):
         return error_response_json(
             "InvalidRequestException",
-            "The template body is invalid: Template body is not valid JSON.",
+            "The template body is invalid",
             400,
         )
     resources = doc.get("Resources")
     values = resources.values() if isinstance(resources, dict) else ()
-    if not any(
-        isinstance(r, dict) and r.get("Type") == "AWS::IoT::Certificate"
-        for r in values
-    ):
+    certificates = 0
+    for resource in values:
+        if not isinstance(resource, dict):
+            continue
+        reason = _provisioning_template_resource_error(resource, certificates)
+        if reason:
+            return error_response_json(
+                "InvalidRequestException", f"The template body is invalid: {reason}", 400
+            )
+        certificates += resource.get("Type") == "AWS::IoT::Certificate"
+    if not certificates:
         return error_response_json(
             "InvalidRequestException",
             "The template body is invalid: Template must have certificate resource.",
@@ -1864,22 +2050,106 @@ def _validate_provisioning_template_body(body) -> tuple | None:
     return None
 
 
+_PROVISIONING_HOOK_PAYLOAD_VERSION = "2020-04-01"
+_LAMBDA_FUNCTION_ARN_RE = re.compile(
+    r"^arn:aws[a-z-]*:lambda:[a-z0-9-]+:\d{12}:function:[A-Za-z0-9_-]+(:[A-Za-z0-9$_-]+)?$"
+)
+
+
+def _validate_provisioning_hook(hook, template_type: str, template_arn: str) -> tuple | None:
+    """The live service's checks of a ``preProvisioningHook``, the function's policy last."""
+    hook = hook if isinstance(hook, dict) else {}
+    version, target = hook.get("payloadVersion"), hook.get("targetArn")
+    if version is not None and not re.fullmatch(r"[0-9-]+", str(version)):
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'preProvisioningHook.payloadVersion' failed "
+            "to satisfy constraint: Member must satisfy regular expression pattern: ^[0-9-]+$",
+            400,
+        )
+    if template_type == "JITP":
+        return error_response_json(
+            "InvalidRequestException",
+            "Provisioning hook is not supported for template type: JITP",
+            400,
+        )
+    if not isinstance(target, str) or not _LAMBDA_FUNCTION_ARN_RE.match(target):
+        return error_response_json("InvalidRequestException", "Invalid arguments in the call", 400)
+    if version not in (None, _PROVISIONING_HOOK_PAYLOAD_VERSION):
+        return error_response_json(
+            "InvalidRequestException",
+            "The hook version cannot be supported by AWS Iot, the supported versions are: "
+            f"[{_PROVISIONING_HOOK_PAYLOAD_VERSION}]",
+            400,
+        )
+    if _provisioning_hook_function(target, template_arn) is None:
+        return error_response_json(
+            "InvalidRequestException", f"Access denied during lambda validation: {target}", 400
+        )
+    return None
+
+
+def _provisioning_hook(hook: dict) -> dict:
+    """A validated hook as the live service stores it, with its default payloadVersion."""
+    return {
+        "payloadVersion": hook.get("payloadVersion") or _PROVISIONING_HOOK_PAYLOAD_VERSION,
+        "targetArn": hook["targetArn"],
+    }
+
+
+def _provisioning_hook_function(target_arn: str, template_arn: str) -> dict | None:
+    """The hook function's execution record, if its policy lets iot.amazonaws.com invoke it for the template."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+    from ministack.services import lambda_svc
+
+    base, _config, _name = lambda_svc._get_base_func_record_for_ref(target_arn)
+    func, config, _name = lambda_svc._get_func_record_for_ref(target_arn)
+    if base is None or func is None or config is None:
+        return None
+    ctx = EvalContext(
+        principal_arn="*",
+        principal_type="Service",
+        principal_account="",
+        action="lambda:InvokeFunction",
+        resource_arn=target_arn,
+        region=get_region(),
+        service_context={"aws:sourcearn": template_arn, "aws:sourceaccount": get_account_id()},
+    )
+    if evaluate_resource_policy(base.get("policy"), ctx, service="iot.amazonaws.com").decision != "Allow":
+        return None
+    return lambda_svc._execution_record_for_config(func, config)
+
+
 def _provisioning_template_not_found(name: str) -> tuple:
     return error_response_json(
         "ResourceNotFoundException", f"Unable to find template named {name}", 404
     )
 
 
-def _handle_provisioning_template(method: str, path: str, body: bytes) -> tuple:
+def _handle_provisioning_template(method: str, path: str, body: bytes, qp: dict) -> tuple:
     suffix = path[len("/provisioning-templates/"):]
-    if "/" in suffix:
+    name, _, sub = suffix.partition("/")
+    version = sub[len("versions/"):] if sub.startswith("versions/") else None
+    routes = {("POST", "provisioning-claim"), ("POST", "versions"), ("GET", "versions")}
+    if sub and (method, sub) not in routes and not (
+        version and "/" not in version and method in ("GET", "DELETE")
+    ):
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
         )
-    name = suffix
     err = _validate_provisioning_template_name(name)
     if err:
         return err
+    if sub == "provisioning-claim":
+        return _create_provisioning_claim(name)
+    if sub == "versions" and method == "POST":
+        return _create_provisioning_template_version(name, _parse_body(body), qp)
+    if sub == "versions":
+        return _list_provisioning_template_versions(name)
+    if version is not None and method == "GET":
+        return _describe_provisioning_template_version(name, version)
+    if version is not None:
+        return _delete_provisioning_template_version(name, version)
     if method == "GET":
         return _describe_provisioning_template(name)
     if method == "PATCH":
@@ -1901,9 +2171,17 @@ def _create_provisioning_template(payload: dict) -> tuple:
             return error_response_json(
                 "InvalidRequestException", f"{field} is required", 400
             )
-    err = _validate_provisioning_template_body(payload["templateBody"])
+    err = (_validate_provisioning_template_body(payload["templateBody"])
+           or _tags_error(payload.get("tags"), required=False))
     if err:
         return err
+    hook = payload.get("preProvisioningHook")
+    if hook:
+        err = _validate_provisioning_hook(
+            hook, payload.get("type", "FLEET_PROVISIONING"), _provisioning_template_arn(name)
+        )
+        if err:
+            return err
     if name in _provisioning_templates:
         return error_response_json(
             "ResourceAlreadyExistsException",
@@ -1914,21 +2192,23 @@ def _create_provisioning_template(payload: dict) -> tuple:
     record = {
         "templateName": name,
         "templateArn": _provisioning_template_arn(name),
-        "templateBody": payload["templateBody"],
         "enabled": bool(payload.get("enabled", False)),
         "provisioningRoleArn": payload["provisioningRoleArn"],
         "type": payload.get("type", "FLEET_PROVISIONING"),
         "defaultVersionId": 1,
         "creationDate": now,
         "lastModifiedDate": now,
+        "versions": {"1": _provisioning_template_version(1, payload["templateBody"], now)},
+        "lastVersionId": 1,
     }
     # The live service omits description from Describe when it was never set —
     # absent, not empty — so an unset one is not stored at all.
     if payload.get("description"):
         record["description"] = payload["description"]
-    if payload.get("preProvisioningHook"):
-        record["preProvisioningHook"] = payload["preProvisioningHook"]
+    if hook:
+        record["preProvisioningHook"] = _provisioning_hook(hook)
     _provisioning_templates[name] = record
+    _set_created_tags(record["templateArn"], payload.get("tags"))
     logger.info("IoT provisioning template created: %s", name)
     return json_response({
         "templateArn": record["templateArn"],
@@ -1937,11 +2217,21 @@ def _create_provisioning_template(payload: dict) -> tuple:
     })
 
 
+def _provisioning_template_version(version_id: int, body, created: float) -> dict:
+    return {"versionId": version_id, "creationDate": created, "templateBody": body}
+
+
+def _provisioning_template_body(t: dict):
+    """The body of the template's default version."""
+    return t["versions"][str(t["defaultVersionId"])]["templateBody"]
+
+
 def _describe_provisioning_template(name: str) -> tuple:
     t = _provisioning_templates.get(name)
     if t is None:
         return _provisioning_template_not_found(name)
-    return json_response(t)
+    out = {k: v for k, v in t.items() if k not in ("versions", "lastVersionId")}
+    return json_response({**out, "templateBody": _provisioning_template_body(t)})
 
 
 def _list_provisioning_templates(qp: dict) -> tuple:
@@ -1967,12 +2257,17 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
     if t is None:
         return _provisioning_template_not_found(name)
     version = payload.get("defaultVersionId")
-    if version is not None and version != t["defaultVersionId"]:
+    if version is not None and str(version) not in t["versions"]:
         return error_response_json(
             "InvalidRequestException",
-            f"ProvisioningTemplate {name!r} has no version {version}",
+            f"Unable to set version {version} as the default, version does not exist",
             400,
         )
+    hook = None if payload.get("removePreProvisioningHook") else payload.get("preProvisioningHook")
+    if hook:
+        err = _validate_provisioning_hook(hook, t["type"], t["templateArn"])
+        if err:
+            return err
     if "description" in payload:
         # Same absent-not-empty rule as create: clearing removes the key.
         if payload["description"]:
@@ -1984,21 +2279,636 @@ def _update_provisioning_template(name: str, payload: dict) -> tuple:
             t[field] = payload[field]
     if payload.get("removePreProvisioningHook"):
         t.pop("preProvisioningHook", None)
-    elif payload.get("preProvisioningHook"):
-        t["preProvisioningHook"] = payload["preProvisioningHook"]
+    elif hook:
+        t["preProvisioningHook"] = _provisioning_hook(hook)
+    if version is not None:
+        t["defaultVersionId"] = int(version)
     t["lastModifiedDate"] = _now_epoch()
     _provisioning_templates[name] = t
     # The live service answers 200 with an empty body — not an empty JSON
-    # object — and does not bump defaultVersionId.
+    # object.
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
 
 
 def _delete_provisioning_template(name: str) -> tuple:
     if _provisioning_templates.get(name) is None:
-        return _provisioning_template_not_found(name)
-    del _provisioning_templates[name]
+        return error_response_json("ResourceNotFoundException", "Unable to delete template, template not found", 404)
+    _tags.pop(_provisioning_templates.pop(name)["templateArn"], None)
     logger.info("IoT provisioning template deleted: %s", name)
     return json_response({})
+
+
+_PROVISIONING_TEMPLATE_VERSIONS_MAX = 5
+
+
+def _create_provisioning_template_version(name: str, payload: dict, qp: dict) -> tuple:
+    """``CreateProvisioningTemplateVersion``: version ids count up and are never reused."""
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    body = payload.get("templateBody")
+    if not body:
+        return error_response_json("InvalidRequestException", "templateBody is required", 400)
+    err = _validate_provisioning_template_body(body)
+    if err:
+        return err
+    if len(t["versions"]) >= _PROVISIONING_TEMPLATE_VERSIONS_MAX:
+        return error_response_json(
+            "VersionsLimitExceededException",
+            f"Can't create a template version for the template {name}, "
+            "the maximum number of template versions has been reached",
+            409,
+        )
+    version_id = t["lastVersionId"] + 1
+    now = _now_epoch()
+    t["versions"][str(version_id)] = _provisioning_template_version(version_id, body, now)
+    t["lastVersionId"] = version_id
+    is_default = str(qp.get("setAsDefault", "")).lower() == "true"
+    if is_default:
+        t["defaultVersionId"] = version_id
+    t["lastModifiedDate"] = now
+    _provisioning_templates[name] = t
+    return json_response({
+        "templateArn": t["templateArn"],
+        "templateName": name,
+        "versionId": version_id,
+        "isDefaultVersion": is_default,
+    })
+
+
+def _list_provisioning_template_versions(name: str) -> tuple:
+    """``ListProvisioningTemplateVersions``: all versions in one page, whatever maxResults asks for."""
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return error_response_json("ResourceNotFoundException", f"Template named {name} not found", 404)
+    return json_response({"versions": [
+        {
+            "versionId": v["versionId"],
+            "creationDate": v["creationDate"],
+            "isDefaultVersion": v["versionId"] == t["defaultVersionId"],
+        }
+        for v in t["versions"].values()
+    ]})
+
+
+def _describe_provisioning_template_version(name: str, version_id: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return error_response_json("ResourceNotFoundException", f"Unable to find a template named {name}", 404)
+    v = t["versions"].get(version_id)
+    if v is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Unable to find a template version with ID {version_id} for template {name}",
+            404,
+        )
+    return json_response({**v, "isDefaultVersion": v["versionId"] == t["defaultVersionId"]})
+
+
+def _delete_provisioning_template_version(name: str, version_id: str) -> tuple:
+    t = _provisioning_templates.get(name)
+    if t is None:
+        return _provisioning_template_not_found(name)
+    v = t["versions"].get(version_id)
+    if v is None:
+        return error_response_json(
+            "ResourceNotFoundException", f"Unable to find template version {version_id}", 404
+        )
+    if v["versionId"] == t["defaultVersionId"]:
+        return error_response_json(
+            "InvalidRequestException",
+            f"Unable to delete template version {version_id}, it is the default version",
+            400,
+        )
+    del t["versions"][version_id]
+    t["lastModifiedDate"] = _now_epoch()
+    _provisioning_templates[name] = t
+    return json_response({})
+
+
+# A claim certificate expires five minutes after it is issued, at the end of its
+# X.509 validity; an ownership token expires after an hour.
+_PROVISIONING_CLAIM_SECONDS = 300
+_OWNERSHIP_TOKEN_SECONDS = 3600
+
+
+def _drop_expired(store: AccountRegionScopedDict) -> None:
+    """Forget the claims or ownership tokens past their expiration, in every scope."""
+    now = time.time()
+    for key, record in list(store._data.items()):
+        if record["expiration"] <= now:
+            store._data.pop(key, None)
+
+
+def _create_provisioning_claim(name: str) -> tuple:
+    """``CreateProvisioningClaim``: a claim certificate kept out of the certificate registry."""
+    if _provisioning_templates.get(name) is None:
+        return _provisioning_template_not_found(name)
+    try:
+        ca_cert_pem, ca_key_pem = _ensure_ca()
+        cert_pem, private_pem, public_pem = sign_leaf_certificate(
+            ca_cert_pem=ca_cert_pem,
+            ca_key_pem=ca_key_pem,
+            common_name="AWS IoT Certificate",
+            days_valid=_PROVISIONING_CLAIM_SECONDS / 86400,
+        )
+    except RuntimeError as e:
+        return error_response_json("InternalFailureException", str(e), 503)
+    from cryptography import x509
+
+    leaf = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    not_after = getattr(leaf, "not_valid_after_utc", None) or leaf.not_valid_after.replace(
+        tzinfo=timezone.utc
+    )
+    cert_id = get_certificate_id(cert_pem)
+    _drop_expired(_provisioning_claims)
+    _provisioning_claims[cert_id] = {
+        "certificateId": cert_id,
+        "templateName": name,
+        "expiration": not_after.timestamp(),
+    }
+    return json_response({
+        "certificateId": cert_id,
+        "certificatePem": cert_pem,
+        "keyPair": {"PublicKey": public_pem, "PrivateKey": private_pem},
+        "expiration": not_after.timestamp(),
+    })
+
+
+# The fleet provisioning MQTT API (JSON payloads). A request is answered on the
+# connection that published it, and nowhere else.
+_FLEET_CREATE_TOPIC = "$aws/certificates/create/json"
+_FLEET_TEMPLATES_PREFIX = "$aws/provisioning-templates/"
+_FLEET_PROVISION_SUFFIX = "/provision/json"
+_CERTIFICATE_ID_PARAMETER = "AWS::IoT::Certificate::Id"
+
+
+def _parse_fleet_provisioning_topic(topic: str) -> tuple[str, str | None] | None:
+    """``("create", None)`` for CreateKeysAndCertificate, ``("provision", template)`` for RegisterThing."""
+    if topic == _FLEET_CREATE_TOPIC:
+        return "create", None
+    if topic.startswith(_FLEET_TEMPLATES_PREFIX) and topic.endswith(_FLEET_PROVISION_SUFFIX):
+        name = topic[len(_FLEET_TEMPLATES_PREFIX):-len(_FLEET_PROVISION_SUFFIX)]
+        if name and "/" not in name:
+            return "provision", name
+    return None
+
+
+def _fleet_rejected(code: str, message: str, status: int = 400) -> tuple[str, dict]:
+    return "rejected", {"statusCode": status, "errorCode": code, "errorMessage": message}
+
+
+class _ProvisioningRejected(Exception):
+    """A RegisterThing request the template cannot be applied to."""
+
+    def __init__(self, code: str, message: str, status: int = 400):
+        super().__init__(message)
+        self.reply = _fleet_rejected(code, message, status)
+
+
+def _provisioning_failed(message: str) -> _ProvisioningRejected:
+    """A registry refusal, worded the way AWS relays it on ``/rejected``."""
+    return _ProvisioningRejected(
+        "ProvisioningFailed",
+        f"{message} (Service: AWSIot; Status Code: 400; Error Code: "
+        f"ResourceRegistrationFailureException; Request ID: {new_uuid()}; Proxy: null)",
+    )
+
+
+async def _fleet_provisioning_reply(
+    account_id: str, region: str, operation: str, template_name: str | None, payload: bytes,
+    connection: dict,
+) -> tuple[str, dict]:
+    """The reply suffix (``accepted`` or ``rejected``) and document for one request."""
+    if operation == "create":
+        return await _fleet_create_keys_and_certificate(account_id, region)
+    try:
+        return await _fleet_register_thing(account_id, region, template_name, payload, connection)
+    except _ProvisioningRejected as e:
+        return e.reply
+
+
+async def _fleet_create_keys_and_certificate(account_id: str, region: str) -> tuple[str, dict]:
+    """``CreateKeysAndCertificate`` over MQTT: a PENDING_ACTIVATION certificate and its ownership token."""
+
+    def _issue() -> tuple[str, str, str]:
+        ca_cert_pem, ca_key_pem = _ensure_ca()
+        return sign_leaf_certificate(ca_cert_pem, ca_key_pem, "AWS IoT Certificate")
+
+    try:
+        # RSA key generation, kept off the broker's loop.
+        cert_pem, private_pem, _public_pem = await asyncio.to_thread(_issue)
+    except RuntimeError as e:
+        return _fleet_rejected("InternalFailure", str(e), 500)
+    cert_id = get_certificate_id(cert_pem)
+    token = secrets.token_urlsafe(48)
+    with request_scope(account_id, region):
+        _certificates[cert_id] = _certificate_record(cert_id, cert_pem, "PENDING_ACTIVATION")
+        _drop_expired(_ownership_tokens)
+        _ownership_tokens[token] = {
+            "certificateId": cert_id,
+            "expiration": time.time() + _OWNERSHIP_TOKEN_SECONDS,
+        }
+    return "accepted", {
+        "certificateId": cert_id,
+        "certificatePem": cert_pem,
+        "privateKey": private_pem,
+        "certificateOwnershipToken": token,
+    }
+
+
+async def _fleet_register_thing(
+    account_id: str, region: str, template_name: str, payload: bytes, connection: dict
+) -> tuple[str, dict]:
+    """``RegisterThing``: apply the template to the certificate the ownership token stands for."""
+    try:
+        request = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        request = None
+    if not isinstance(request, dict):
+        return _fleet_rejected("InvalidPayload", "Message cannot be parsed")
+    with request_scope(account_id, region):
+        template = _provisioning_templates.get(template_name)
+        if template is None:
+            return _fleet_rejected(
+                "InvalidTemplate", f"Template with name {template_name} does not exist."
+            )
+        if not template.get("enabled"):
+            return _fleet_rejected("InvalidTemplate", f"Template {template_name} is not enabled.")
+        token = request.get("certificateOwnershipToken")
+        if token is None or token == "":
+            return _fleet_rejected(
+                "InvalidCertificateOwnershipToken", "Certificate ownership token cannot be empty."
+            )
+        record = _ownership_tokens.get(token) if isinstance(token, str) else None
+        cert = (
+            _certificates.get(record["certificateId"])
+            if record is not None and record["expiration"] > time.time()
+            else None
+        )
+        if cert is None:
+            return _fleet_rejected(
+                "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
+            )
+        parameters = request.get("parameters")
+        parameters = parameters if isinstance(parameters, dict) else {}
+        if template.get("preProvisioningHook"):
+            parameters = await _run_provisioning_hook(template, {
+                **connection,
+                "certificateId": cert["certificateId"],
+                "certificatePem": cert["certificatePem"],
+                "templateArn": template["templateArn"],
+                "parameters": parameters,
+            })
+            cert = _certificates.get(cert["certificateId"])
+            if cert is None:
+                return _fleet_rejected(
+                    "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
+                )
+        plan = _provisioning_plan(template, parameters, cert["certificateId"])
+        thing_name = await _apply_provisioning_plan(plan, cert, template.get("provisioningRoleArn") or "")
+    reply = {"deviceConfiguration": plan["deviceConfiguration"]}
+    if thing_name is not None:
+        reply["thingName"] = thing_name
+    return "accepted", reply
+
+
+# A hook that has not answered six seconds after it was invoked fails the request.
+_PROVISIONING_HOOK_SECONDS = 6
+_HOOK_INVALID_RESULT = ("InvalidResult", "Provisioning hook result is in an invalid format.")
+
+
+async def _run_provisioning_hook(template: dict, event: dict) -> dict:
+    """Invoke the template's pre-provisioning hook: the parameters with its overrides, or a rejection."""
+    from ministack.services import lambda_svc
+
+    exec_record = _provisioning_hook_function(
+        template["preProvisioningHook"]["targetArn"], template["templateArn"]
+    )
+    if exec_record is None:
+        raise _ProvisioningRejected("InvocationError", "Access denied while invoking Lambda function")
+    invocation = run_reentrant(
+        lambda_svc._execute_function_with_config_scope, exec_record, event,
+        thread_name="ministack-iot-provisioning-hook",
+    )
+    try:
+        # Past the limit the function keeps running; only its answer is dropped.
+        result = await asyncio.wait_for(asyncio.shield(invocation), _PROVISIONING_HOOK_SECONDS)
+    except Exception:
+        result = None
+    if not isinstance(result, dict) or result.get("throttle"):
+        raise _ProvisioningRejected(
+            "InvocationError", "A failure occurred while invoking the provisioning hook."
+        )
+    if result.get("error"):
+        raise _ProvisioningRejected(
+            "InvocationError", "The provisioning hook was not executed successfully."
+        )
+    return {**event["parameters"], **_provisioning_hook_overrides(result)}
+
+
+def _provisioning_hook_overrides(result: dict) -> dict:
+    """The ``parameterOverrides`` of an answer that allows provisioning, or a rejection."""
+    answer = result.get("body")
+    if isinstance(answer, bytes) or (isinstance(answer, str) and result.get("raw_payload")):
+        try:
+            answer = json.loads(answer)
+        except ValueError:
+            raise _ProvisioningRejected(*_HOOK_INVALID_RESULT) from None
+    if answer is None:
+        raise _ProvisioningRejected("InvalidResult", "The provisioning hook did not return a response.")
+    answer = answer if isinstance(answer, dict) else {}
+    allow, overrides = answer.get("allowProvisioning"), answer.get("parameterOverrides")
+    # Read the way a Java boolean field reads JSON: "true", "TRUE" and 1 allow.
+    if isinstance(allow, str):
+        allow = {"true": True, "false": False}.get(allow.lower())
+    elif not isinstance(allow, (bool, int, float)):
+        allow = None
+    if allow is None or not isinstance(overrides, (dict, type(None))) or any(
+        isinstance(value, (dict, list)) for value in (overrides or {}).values()
+    ):
+        raise _ProvisioningRejected(*_HOOK_INVALID_RESULT)
+    if not allow:
+        raise _ProvisioningRejected("AccessDenied", "Access Denied", 403)
+    # Numbers and booleans become strings; null leaves the parameter unresolved.
+    return {
+        name: value if value is None or isinstance(value, str) else json.dumps(value)
+        for name, value in (overrides or {}).items()
+    }
+
+
+def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
+    """The template's resources with ``Ref`` and the intrinsic functions resolved against the parameters."""
+    body = _provisioning_template_body(template)
+    body = json.loads(body) if isinstance(body, str) else body
+    declared = body.get("Parameters")
+    values = {
+        name: spec["Default"]
+        for name, spec in (declared.items() if isinstance(declared, dict) else ())
+        if isinstance(spec, dict) and "Default" in spec
+    }
+    values.update(parameters)
+    values[_CERTIFICATE_ID_PARAMETER] = cert_id
+    mappings = body.get("Mappings") if isinstance(body.get("Mappings"), dict) else {}
+
+    def invalid(function):
+        return _ProvisioningRejected(
+            "InvalidTemplate", f"Template {template['templateName']} has an invalid {function}."
+        )
+
+    def reference(name):
+        if values.get(name) is None:
+            raise _ProvisioningRejected("InvalidParameters", f"Cannot resolve reference value: {name}")
+        return values[name]
+
+    def substitute(text, variables):
+        def one(match):
+            name = match.group(1)
+            if name.startswith("!"):
+                return "${" + name[1:] + "}"
+            return str(variables[name]) if name in variables else str(reference(name))
+
+        return re.sub(r"\$\{([^}]*)\}", one, text)
+
+    def resolve(value):
+        if isinstance(value, list):
+            return [resolve(v) for v in value]
+        if not isinstance(value, dict):
+            return value
+        if len(value) == 1:
+            function, argument = next(iter(value.items()))
+            if function == "Ref":
+                return reference(argument)
+            if not function.startswith("Fn::"):
+                return {function: resolve(argument)}
+            argument = resolve(argument)
+            if function == "Fn::Join":
+                if not (isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list)):
+                    raise invalid(function)
+                return str(argument[0]).join(str(v) for v in argument[1])
+            if function == "Fn::Select":
+                if not (isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list)):
+                    raise invalid(function)
+                try:
+                    index = int(argument[0])
+                except (TypeError, ValueError):
+                    raise invalid(function) from None
+                if not 0 <= index < len(argument[1]) or argument[1][index] is None:
+                    raise invalid(function)
+                return argument[1][index]
+            if function == "Fn::Split":
+                if not (isinstance(argument, list) and len(argument) == 2
+                        and isinstance(argument[0], str) and isinstance(argument[1], str) and argument[0]):
+                    raise invalid(function)
+                return argument[1].split(argument[0])
+            if function == "Fn::FindInMap":
+                if not (isinstance(argument, list) and len(argument) == 3):
+                    raise invalid(function)
+                found = mappings.get(argument[0])
+                found = found.get(argument[1]) if isinstance(found, dict) else None
+                found = found.get(argument[2]) if isinstance(found, dict) else None
+                if found is None:
+                    raise invalid(function)
+                return found
+            if function == "Fn::Sub":
+                if isinstance(argument, str):
+                    return substitute(argument, {})
+                if (isinstance(argument, list) and len(argument) == 2
+                        and isinstance(argument[0], str) and isinstance(argument[1], dict)):
+                    return substitute(argument[0], argument[1])
+                raise invalid(function)
+            raise invalid(function)
+        return {k: resolve(v) for k, v in value.items()}
+
+    plan = {"thing": None, "status": "ACTIVE", "policies": []}
+    resources = body.get("Resources")
+    for resource in resources.values() if isinstance(resources, dict) else ():
+        if not isinstance(resource, dict):
+            continue
+        properties = resolve(resource.get("Properties") or {})
+        kind = resource.get("Type")
+        if kind == "AWS::IoT::Thing":
+            plan["thing"] = (properties, resource.get("OverrideSettings") or {})
+        elif kind == "AWS::IoT::Certificate":
+            plan["status"] = str(properties.get("Status") or "ACTIVE").upper()
+        elif kind == "AWS::IoT::Policy":
+            document = properties.get("PolicyDocument")
+            if document is None:
+                plan["policies"].append((properties.get("PolicyName"), None))
+                continue
+            if "PolicyName" in properties:
+                raise invalid("AWS::IoT::Policy")
+            document = document if isinstance(document, str) else json.dumps(document)
+            try:
+                json.loads(document)
+            except ValueError:
+                raise invalid("AWS::IoT::Policy") from None
+            # The developer guide: PolicyName "Defaults to a hash of the policy document".
+            plan["policies"].append((hashlib.sha256(document.encode("utf-8")).hexdigest(), document))
+    plan["deviceConfiguration"] = resolve(body.get("DeviceConfiguration") or {})
+    return plan
+
+
+def _java_map(attributes: dict) -> str:
+    return "{" + ", ".join(f"{k}={v}" for k, v in sorted(attributes.items())) + "}"
+
+
+async def _apply_provisioning_plan(plan: dict, cert: dict, role_arn: str) -> str | None:
+    """Create or update the thing, then activate and attach the certificate; a rejection changes nothing."""
+    account = get_account_id()
+    for policy, document in plan["policies"]:
+        if document is None and _policies.get(policy) is None:
+            raise _provisioning_failed(
+                "Register thing workflow execution terminates due to: Policy default version not found"
+            )
+    cert_arn = cert["certificateArn"]
+    requests = [("iot:UpdateCertificate", cert_arn)]
+    for policy, document in plan["policies"]:
+        if document is not None and _policies.get(policy) is None:
+            requests.append(("iot:CreatePolicy", _policy_arn(policy)))
+        requests.append(("iot:AttachPolicy", cert_arn))
+    name = update = None
+    join = leave = []
+    if plan["thing"] is not None:
+        properties, overrides = plan["thing"]
+        name = properties.get("ThingName")
+        if not isinstance(name, str) or not _NAME_RE.match(name):
+            raise _provisioning_failed("Invalid thingName: must match [a-zA-Z0-9:_-]{1,128}")
+        attributes = properties.get("AttributePayload")
+        type_name = properties.get("ThingTypeName")
+        groups = properties.get("ThingGroups")
+        if type_name and type_name not in _thing_types:
+            raise _provisioning_failed(
+                "Register thing workflow execution terminates due to: "
+                f"Thing Type {account}:{type_name} not found."
+            )
+        for group in groups or ():
+            if group not in _thing_groups:
+                raise _provisioning_failed(
+                    "Register thing workflow execution terminates due to: "
+                    f"ThingGroup {account}:{group} not found."
+                )
+        thing = _things.get(name)
+        if thing is None:
+            join = list(groups or ())
+            requests.append(("iot:CreateThing", _thing_arn(name)))
+        else:
+            update, join, leave = _provisioning_thing_changes(
+                thing, attributes, type_name, groups, overrides
+            )
+            if update:
+                requests.append(("iot:UpdateThing", _thing_arn(name)))
+        requests += [("iot:AddThingToThingGroup", _thing_group_arn(g)) for g in join]
+        requests += [("iot:RemoveThingFromThingGroup", _thing_group_arn(g)) for g in leave]
+        requests.append(("iot:AttachThingPrincipal", _thing_arn(name)))
+    if not _provisioning_role_allows(role_arn, requests):
+        raise _ProvisioningRejected("AccessDenied", "Access Denied", 403)
+    if name is not None:
+        if _things.get(name) is None:
+            _create_thing(name, {
+                "attributePayload": {"attributes": attributes or {}},
+                "thingTypeName": type_name or None,
+            })
+        elif update:
+            _update_thing(name, update)
+        for group in join:
+            await _add_thing_to_group({"thingGroupName": group, "thingName": name})
+        for group in leave:
+            await _remove_thing_from_group({"thingGroupName": group, "thingName": name})
+        thing = _things[name]
+        if cert_arn not in thing.setdefault("principals", []):
+            thing["principals"].append(cert_arn)
+            _things[name] = thing
+        if thing["thingArn"] not in cert.setdefault("attachedThings", []):
+            cert["attachedThings"].append(thing["thingArn"])
+    cert["status"] = plan["status"]
+    _certificates[cert["certificateId"]] = cert
+    for policy, document in plan["policies"]:
+        if document is not None and _policies.get(policy) is None:
+            _create_policy(policy, {"policyDocument": document})
+        _change_policy_target(policy, cert_arn, attach=True)
+    return name
+
+
+def _provisioning_role_allows(role_arn: str, requests: list[tuple[str, str]]) -> bool:
+    """Under AUTH=true, whether the template's provisioning role is one IoT may assume and allows every write."""
+    from ministack import app
+
+    if not app.AUTH:
+        return True
+    if not _iot_role_usable(role_arn):
+        return False
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _permissions_boundary,
+        evaluate,
+    )
+    from ministack.services import iam as _iam
+
+    account = get_account_id()
+    role_name = role_arn.rsplit("/", 1)[-1]
+    policies = _gather_role_policies(role_name, account)
+    limits = _permissions_boundary(_iam._roles, role_name, account)
+    principal = f"arn:aws:sts::{account}:assumed-role/{role_name}/IoTProvisioning"
+    for action, resource in requests:
+        ctx = EvalContext(
+            principal_arn=principal,
+            principal_type="AssumedRole",
+            principal_account=account,
+            action=action,
+            resource_arn=resource,
+            region=get_region(),
+        )
+        if evaluate(ctx, policies, *limits).decision != "Allow":
+            return False
+    return True
+
+
+def _provisioning_thing_changes(
+    thing: dict, attributes, type_name, groups, overrides: dict
+) -> tuple[dict, list, list]:
+    """The UpdateThing payload and the groups to join and leave for a thing that exists."""
+    update: dict = {}
+    join: list = []
+    leave: list = []
+    if attributes is not None:
+        current = thing.get("attributes") or {}
+        setting = overrides.get("AttributePayload")
+        if setting == "MERGE":
+            attributes = {**current, **attributes}
+        if setting in ("REPLACE", "MERGE"):
+            update["attributePayload"] = {"attributes": attributes}
+        elif setting != "DO_NOTHING" and attributes != current:
+            raise _provisioning_failed(
+                f"Existing AttributePayload: {_java_map(current)} conflicts with "
+                f"AttributePayload: {_java_map(attributes)} in Template."
+            )
+    if type_name is not None:
+        current = thing.get("thingTypeName")
+        setting = overrides.get("ThingTypeName")
+        if setting == "REPLACE":
+            update["thingTypeName"] = type_name
+        elif setting != "DO_NOTHING" and type_name != current:
+            raise _provisioning_failed(
+                f"Existing ThingType: {current or 'null'} conflicts with "
+                f"ThingType: {type_name} in Template."
+            )
+    if groups is not None:
+        current = list(thing.get("thingGroupNames") or [])
+        setting = overrides.get("ThingGroups")
+        if setting in ("REPLACE", "MERGE"):
+            join = [g for g in groups if g not in current]
+            leave = [g for g in current if g not in groups] if setting == "REPLACE" else []
+        elif setting != "DO_NOTHING" and set(groups) != set(current):
+            existing = ", ".join(
+                f"{{GroupName: {g},GroupArn: {_thing_group_arn(g)}}}" for g in current
+            )
+            raise _provisioning_failed(
+                f"Existing ThingGroups: [{existing}] conflict with "
+                f"ThingGroups: [{', '.join(groups)}] in Template."
+            )
+    return update, join, leave
 
 
 # ---------------------------------------------------------------------------
@@ -2009,12 +2919,14 @@ def _delete_provisioning_template(name: str) -> tuple:
 def _certificate_record(
     cert_id: str, cert_pem: str, status: str, ca_id: str | None = None
 ) -> dict:
-    """The registry record of a device certificate, owned by the current scope."""
+    """The registry record of a device certificate, owned by the current scope; it takes its CA's mode."""
+    ca = _ca_certificates.get(ca_id) if ca_id else None
     return {
         "certificateId": cert_id,
         "certificateArn": _cert_arn(cert_id),
         "certificatePem": cert_pem,  # verbatim
         "status": status,
+        "certificateMode": (ca or {}).get("certificateMode", "DEFAULT"),
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
         "caCertificateId": ca_id,
@@ -2127,14 +3039,36 @@ def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
 
 
 def _registered_issuer_id(cert_pem: str) -> str | None:
-    """The id of the ACTIVE CA registered in this account/region that signed
-    ``cert_pem``, or None. Several CAs may share a subject, so the signature
-    decides, not the issuer name."""
+    """The id of the registered CA that signed ``cert_pem``, an ACTIVE one first, or None."""
+    issuer_id = None
     for ca in _ca_certificates.values():
-        if ca.get("status") == "ACTIVE" and certificate_is_signed_by(
-            cert_pem, ca.get("certificatePem") or ""
-        ):
-            return ca["certificateId"]
+        if certificate_is_signed_by(cert_pem, ca.get("certificatePem") or ""):
+            if ca.get("status") == "ACTIVE":
+                return ca["certificateId"]
+            issuer_id = issuer_id or ca["certificateId"]
+    return issuer_id
+
+
+def _not_issued_by_error(cert_pem: str, ca_pem: str) -> tuple | None:
+    """400 when ``ca_pem`` did not issue ``cert_pem``, checking the issuer name before the signature."""
+    from cryptography import x509
+
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    ca = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
+    if cert.issuer != ca.subject:
+        return error_response_json(
+            "CertificateValidationException",
+            "The issuer of the certificate did not match the subject of the "
+            "provided CA certificate.",
+            400,
+        )
+    if not certificate_is_signed_by(cert_pem, ca_pem):
+        return error_response_json(
+            "CertificateValidationException",
+            "The signature of the certificate failed verification against the "
+            "provided CA certificate.",
+            400,
+        )
     return None
 
 
@@ -2151,12 +3085,12 @@ async def _register_certificate(
     CA reference and takes its status from the plain ``status`` body field
     only — it has no deprecated ``setAsActive``.
 
-    ``caCertificatePem`` must name a CA registered via
+    ``caCertificatePem`` must name an ACTIVE CA registered via
     ``RegisterCACertificate`` in this account/region that really signed the
-    leaf; anything else is a ``CertificateValidationException``. Without it,
-    ``RegisterCertificate`` links the certificate to the registered ACTIVE CA
-    that signed it, as AWS does, so DescribeCertificate names that CA and
-    ListCertificatesByCA lists the certificate. Registering
+    leaf; anything else is refused. Without it, ``RegisterCertificate`` links
+    the certificate to the registered CA that signed it, as AWS does, so
+    DescribeCertificate names that CA and ListCertificatesByCA lists the
+    certificate, and refuses it while that CA is not ACTIVE. Registering
     publishes no JITR event, whatever the CA's ``autoRegistrationStatus``: AWS
     sends that event only from a device connect (see ``_mtls_auto_register``),
     and refuses a registration with status PENDING_ACTIVATION.
@@ -2194,33 +3128,25 @@ async def _register_certificate(
     # fleet, so the claim is verified the way AWS does before anything is
     # stored — the CA has to be registered in this account/region, and it has to
     # be the certificate that actually signed the leaf.
-    ca = None
     if ca_id is not None:
-        ca = _ca_certificates.get(ca_id)
-        if ca is None:
+        if ca_id not in _ca_certificates:
             return error_response_json(
-                "CertificateValidationException",
-                (
-                    f"The CA certificate {ca_id} is not registered in this "
-                    "account and region. Register it with RegisterCACertificate, "
-                    "or use RegisterCertificateWithoutCA."
-                ),
-                400,
+                "CertificateStateException",
+                "No CA certificate exists for the given certificate",
+                406,
             )
-        if not certificate_is_signed_by(cert_pem, ca_pem):
-            return error_response_json(
-                "CertificateValidationException",
-                (
-                    f"The certificate was not signed by CA {ca_id}. "
-                    "caCertificatePem must be the CA certificate that issued "
-                    "certificatePem."
-                ),
-                400,
-            )
+        refused = _not_issued_by_error(cert_pem, ca_pem)
+        if refused is not None:
+            return refused
+    elif not without_ca:
+        ca_id = _registered_issuer_id(cert_pem)
+    # A CA that is not ACTIVE refuses the leaf, ahead of the duplicate check.
+    if ca_id is not None and _ca_certificates[ca_id]["status"] != "ACTIVE":
+        return error_response_json(
+            "CertificateStateException", "The CA certificate is not active", 406
+        )
     if cert_id in _certificates:
         return _certificate_already_exists(cert_id)
-    if ca_id is None and not without_ca:
-        ca_id = _registered_issuer_id(cert_pem)
     record = _certificate_record(
         cert_id, cert_pem, status or ("ACTIVE" if set_active else "INACTIVE"), ca_id
     )
@@ -2412,9 +3338,27 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
         if record["status"] == "ACTIVE":
             return error_response_json(
                 "CertificateStateException",
-                "Certificate is ACTIVE; deactivate before deletion",
+                f"Certificate must be deactivated (not ACTIVE) before deletion. Id: {cert_id}",
                 406,
             )
+        # Attached things refuse even forceDelete; attached policies only
+        # refuse without it, and forceDelete detaches them.
+        arn = record["certificateArn"]
+        if any(_thing_name_from_arn(t) in _things for t in record.get("attachedThings", [])):
+            return error_response_json(
+                "DeleteConflictException",
+                f"Things must be detached before deletion (arn: {arn})",
+                409,
+            )
+        policies = _policies_attached_to(arn)
+        if policies and not _qp_bool(qp, "forceDelete"):
+            return error_response_json(
+                "DeleteConflictException",
+                f"Certificate policies must be detached before deletion (arn: {arn})",
+                409,
+            )
+        for policy in policies:
+            _change_policy_target(policy["policyName"], arn, attach=False)
         del _certificates[cert_id]
         return json_response({})
     return error_response_json(
@@ -2476,27 +3420,15 @@ def _verification_certificate_error(
         )
     try:
         cert = x509.load_pem_x509_certificate(verification_pem.encode("utf-8"))
-        ca = x509.load_pem_x509_certificate(ca_pem.encode("utf-8"))
     except Exception:
         return error_response_json(
             "InvalidRequestException",
             "Contents of the Verification Certificate are not correct",
             400,
         )
-    if cert.issuer != ca.subject:
-        return error_response_json(
-            "CertificateValidationException",
-            "The issuer of the certificate did not match the subject of the "
-            "provided CA certificate.",
-            400,
-        )
-    if not certificate_is_signed_by(verification_pem, ca_pem):
-        return error_response_json(
-            "CertificateValidationException",
-            "The signature of the certificate failed verification against the "
-            "provided CA certificate.",
-            400,
-        )
+    refused = _not_issued_by_error(verification_pem, ca_pem)
+    if refused is not None:
+        return refused
     common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     if [a.value for a in common_names] != [_registration_code()]:
         return error_response_json(
@@ -2545,7 +3477,7 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
         )
     refused = _verification_certificate_error(
         ca_pem, payload.get("verificationCertificate"), certificate_mode
-    )
+    ) or _tags_error(payload.get("tags"), required=False)
     if refused is not None:
         return refused
     if ca_id in _ca_certificates:
@@ -2565,6 +3497,7 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     if registration_config is not None:
         record["registrationConfig"] = registration_config
     _ca_certificates[ca_id] = record
+    _set_created_tags(record["certificateArn"], payload.get("tags"))
     return json_response({
         "certificateArn": record["certificateArn"],
         "certificateId": ca_id,
@@ -2671,6 +3604,7 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
                 406,
             )
         del _ca_certificates[ca_id]
+        _tags.pop(record["certificateArn"], None)
         return json_response({})
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
@@ -2691,8 +3625,9 @@ def _handle_thing_principals(method: str, path: str, headers: dict, body: bytes,
         )
     name = middle
     thing = _things.get(name)
+    operation = {"PUT": "AttachThingPrincipal", "DELETE": "DetachThingPrincipal"}.get(method, "ListThingPrincipals")
     if thing is None:
-        return _error_not_found("Thing", name)
+        return _error_not_found(operation, name, principal=headers.get("x-amzn-principal") or qp.get("principal"))
 
     if method == "GET":
         return json_response({"principals": list(thing.get("principals", []))})
@@ -2706,7 +3641,7 @@ def _handle_thing_principals(method: str, path: str, headers: dict, body: bytes,
     cert_id = principal.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if cert is None:
-        return _error_not_found("Principal", principal)
+        return _error_not_found(f"{operation}:principal", name, principal=principal)
 
     if method == "PUT":
         if principal not in thing.setdefault("principals", []):
@@ -2739,7 +3674,7 @@ def _list_principal_things(headers: dict, qp: dict) -> tuple:
     cert_id = principal.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if cert is None:
-        return _error_not_found("Principal", principal)
+        return _error_not_found("ListPrincipalThings", principal)
     things = []
     for arn in cert.get("attachedThings", []):
         tname = _thing_name_from_arn(arn)
@@ -2769,6 +3704,8 @@ def _handle_policy(method: str, path: str, body: bytes, qp: dict) -> tuple:
             return _get_policy_version(name, version_id)
         if method == "DELETE":
             return _delete_policy_version(name, version_id)
+        if method == "PATCH":
+            return _set_default_policy_version(name, version_id)
 
     # /policies/{name}/version
     if len(parts) == 2 and parts[1] == "version":
@@ -2802,6 +3739,9 @@ def _create_policy(name: str, payload: dict) -> tuple:
         return error_response_json(
             "InvalidRequestException", "policyDocument is required", 400
         )
+    err = _tags_error(payload.get("tags"), required=False)
+    if err:
+        return err
     try:
         json.loads(doc)
     except (TypeError, json.JSONDecodeError):
@@ -2824,6 +3764,7 @@ def _create_policy(name: str, payload: dict) -> tuple:
         "targets": [],
     }
     _policies[name] = record
+    _set_created_tags(record["policyArn"], payload.get("tags"))
     return json_response({
         "policyName": name,
         "policyArn": record["policyArn"],
@@ -2835,7 +3776,7 @@ def _create_policy(name: str, payload: dict) -> tuple:
 def _get_policy(name: str) -> tuple:
     p = _policies.get(name)
     if p is None:
-        return _error_not_found("Policy", name)
+        return _error_not_found("GetPolicy", name)
     default_id = p["defaultVersionId"]
     return json_response({
         "policyName": name,
@@ -2858,13 +3799,21 @@ def _delete_policy(name: str) -> tuple:
     p = _policies.get(name)
     if p is None:
         return _error_not_found("Policy", name)
+    if len(p["versions"]) > 1:
+        return error_response_json(
+            "DeleteConflictException",
+            f"The policy cannot be deleted as multiple versions of the policy exist (name={name}). "
+            "Use DeletePolicyVersion action to delete all non-default versions of the policy and retry.",
+            409,
+        )
     if p.get("targets"):
         return error_response_json(
             "DeleteConflictException",
-            "Policy is attached; detach it before deletion",
+            f"The policy cannot be deleted as the policy is attached to one or more principals (name={name})",
             409,
         )
     del _policies[name]
+    _tags.pop(p["policyArn"], None)
     return json_response({})
 
 
@@ -2914,7 +3863,7 @@ def _get_policy_version(name: str, version_id: str) -> tuple:
         return _error_not_found("Policy", name)
     v = p["versions"].get(version_id)
     if v is None:
-        return _error_not_found("PolicyVersion", version_id)
+        return _error_not_found("PolicyVersion", version_id, policy=name)
     return json_response({
         "policyArn": p["policyArn"],
         "policyDocument": v["document"],
@@ -2935,7 +3884,7 @@ def _list_policy_versions(name: str) -> tuple:
                 "isDefaultVersion": v["isDefaultVersion"],
                 "createDate": v.get("createDate"),
             }
-            for vid, v in p["versions"].items()
+            for vid, v in sorted(p["versions"].items(), key=lambda item: int(item[0]), reverse=True)
         ]
     })
 
@@ -2945,16 +3894,41 @@ def _delete_policy_version(name: str, version_id: str) -> tuple:
     if p is None:
         return _error_not_found("Policy", name)
     if version_id not in p["versions"]:
-        return _error_not_found("PolicyVersion", version_id)
+        return _error_not_found("PolicyVersion", version_id, policy=name)
     if p["defaultVersionId"] == version_id:
         return error_response_json(
-            "InvalidRequestException",
-            "Cannot delete the default policy version",
-            400,
+            "DeleteConflictException",
+            f"Cannot delete a default policy version (name={name}, versionId={version_id})",
+            409,
         )
     del p["versions"][version_id]
     _policies[name] = p
     return json_response({})
+
+
+def _set_default_policy_version(name: str, version_id: str) -> tuple:
+    """SetDefaultPolicyVersion: 200 with an empty body, also for the current default."""
+    if not version_id.isdigit():
+        return error_response_json(
+            "InvalidRequestException",
+            "1 validation error detected: Value at 'policyVersionId' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: [0-9]+",
+            400,
+        )
+    p = _policies.get(name)
+    if p is None:
+        return error_response_json("ResourceNotFoundException", "Policy not found", 404)
+    if version_id not in p["versions"]:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Policy version does not exist (name={name}, versionId={version_id})",
+            404,
+        )
+    for vid, v in p["versions"].items():
+        v["isDefaultVersion"] = vid == version_id
+    p["defaultVersionId"] = version_id
+    _policies[name] = p
+    return 200, {}, b""
 
 
 # AttachPolicy / DetachPolicy via /target-policies/{policyName}
@@ -2976,17 +3950,21 @@ def _handle_target_policy(method: str, path: str, body: bytes, qp: dict) -> tupl
         return error_response_json(
             "InvalidRequestException", f"Unsupported method: {method}", 400
         )
+    # DetachPolicy of an unknown policy succeeds; DetachPrincipalPolicy refuses it.
+    if method != "PUT" and name not in _policies:
+        return json_response({})
     return _change_policy_target(
         name, _parse_body(body).get("target"), attach=method == "PUT"
     )
 
 
-def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tuple:
+def _change_policy_target(name: str, target: str | None, *, attach: bool, principal: bool = False) -> tuple:
     """``AttachPolicy`` / ``DetachPolicy`` over the policy and certificate stores.
 
     The data core behind both the modern ``/target-policies/{policyName}``
     route and the deprecated ``/principal-policies/{policyName}`` one, so
-    neither has to synthesize a request for the other.
+    neither has to synthesize a request for the other. ``principal`` selects
+    the deprecated call's refusals.
     """
     p = _policies.get(name)
     if p is None:
@@ -2995,6 +3973,10 @@ def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tup
         return error_response_json(
             "InvalidRequestException", "target is required", 400
         )
+    if attach:
+        err = _policy_target_error(target, principal=principal)
+        if err:
+            return err
     cert_id = target.rsplit("/", 1)[-1]
     cert = _certificates.get(cert_id)
     if attach:
@@ -3012,6 +3994,51 @@ def _change_policy_target(name: str, target: str | None, *, attach: bool) -> tup
             cert["attachedPolicies"].remove(name)
             _certificates[cert_id] = cert
     return json_response({})
+
+
+# A Cognito identity id, the one target that is not an ARN.
+_COGNITO_IDENTITY_ID_RE = re.compile(r"[\w-]+:[0-9a-f-]+")
+
+
+def _policy_target_error(target: str, *, principal: bool) -> tuple | None:
+    """AttachPolicy's refusal of ``target`` (AttachPrincipalPolicy's with ``principal``), or ``None``."""
+    if _COGNITO_IDENTITY_ID_RE.fullmatch(target):
+        return None
+    try:
+        spec = parse_arn(target)
+    except ArnParseError:
+        spec = None
+    if spec is None:
+        if principal and target.startswith("arn:"):
+            return error_response_json("InvalidRequestException", "ARN not in proper syntax.", 400)
+        message = "Invalid principal type" if principal else "Invalid Target"
+        return error_response_json("InvalidRequestException", message, 400)
+    kind, _, resource_id = spec.resource.partition("/")
+    if spec.service != "iot" or kind not in (("cert",) if principal else ("cert", "thinggroup")):
+        message = "The given ARN does not represent a cert" if principal else f"Invalid Target: {target}"
+        return error_response_json("InvalidRequestException", message, 400)
+    if spec.account_id != get_account_id():
+        return error_response_json(
+            "AccessDeniedException",
+            "Cross account not allowed. Please check the account of the resource specified.",
+            403,
+        )
+    if spec.region != get_region() and not principal:
+        return error_response_json("InvalidRequestException", "Invalid Target", 400)
+    if kind == "thinggroup":
+        if resource_id in _thing_groups:
+            return None
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Cannot find requested thing group for accountId: {get_account_id()} and thing group name: "
+            f"{resource_id}",
+            404,
+        )
+    if resource_id in _certificates:
+        return None
+    return error_response_json(
+        "ResourceNotFoundException", "The certificate given in the principal does not exist.", 404
+    )
 
 
 def _policy_targets(name: str) -> list | None:
@@ -3072,7 +4099,7 @@ def _handle_principal_policy(method: str, path: str, headers: dict, qp: dict) ->
         return error_response_json(
             "InvalidRequestException", "x-amzn-iot-principal header is required", 400
         )
-    return _change_policy_target(name, principal, attach=method == "PUT")
+    return _change_policy_target(name, principal, attach=method == "PUT", principal=True)
 
 
 def _list_principal_policies(headers: dict, qp: dict) -> tuple:
@@ -4019,10 +5046,12 @@ _IMPLEMENTED_SQL_FUNCS = frozenset({
     "encode",
     "isundefined",
     "newuuid",
+    "principal",
     "regexp_matches",
     "replace",
     "timestamp",
     "topic",
+    "traceid",
 })
 _warned_sql_funcs: set[str] = set()
 
@@ -4087,9 +5116,10 @@ def _eval_select_function(
     if name == "clientid" and not args:
         # Documented as the client id "or n/a if the message wasn't sent over MQTT".
         return client_id if client_id else "n/a"
-    # principal() and traceid() land here too: this publish path carries no
-    # certificate identity or trace id to report, so they warn like any other
-    # function the evaluator does not implement.
+    if name == "principal" and not args:
+        return _rule_message_identity.get()[0] or _MISSING
+    if name == "traceid" and not args:
+        return _rule_message_identity.get()[1] or _MISSING
     _warn_unimplemented_sql_function(name)
     return _MISSING
 
@@ -4639,6 +5669,10 @@ class RuleRoleError(ValueError):
     `put_topic_rule`."""
 
 
+class RuleRepublishError(ValueError):
+    """A republish action inside the rule's own topic filter, raised by `put_topic_rule`."""
+
+
 def _validate_rule_sql(sql: str) -> str | None:
     """Return an error message when the rule SQL cannot be parsed, else None."""
     sql = sql or ""
@@ -4693,6 +5727,27 @@ def _unimplemented_sql_functions(sql: str) -> list[str]:
     return sorted(names - _IMPLEMENTED_SQL_FUNCS - _SQL_KEYWORDS)
 
 
+def _republish_inside_filter(sql: str, actions) -> str | None:
+    """The refusal when an action republishes (templates unexpanded) into the rule's FROM filter, else None."""
+    filter_ = _rule_topic_filter(sql)
+    if not filter_:
+        return None
+    for action in actions or []:
+        republish = action.get("republish") if isinstance(action, dict) else None
+        target = republish.get("topic") if isinstance(republish, dict) else None
+        if not isinstance(target, str):
+            continue
+        # `$$` is the documented escape for a topic that starts with `$`.
+        if target.startswith("$$"):
+            target = target[1:]
+        # As in MQTT, a filter that starts with a wildcard does not match a `$` topic.
+        if target.startswith("$") and filter_[:1] in ("#", "+"):
+            continue
+        if _topic_matches(filter_, target):
+            return f"Republish topic cannot be within topic space of rule's topic pattern '{filter_}'"
+    return None
+
+
 def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None) -> dict:
     """Store a topic rule from an API-shape (camelCase) ``TopicRulePayload``.
 
@@ -4704,11 +5759,16 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
     AWS) but warns, so the resulting misfire is visible. Raises `RuleRoleError`
     (under AUTH=true) for an action role IAM cannot resolve, through the same
     two doors — real IoT probes the role at create time and fails the call.
+    Raises `RuleRepublishError` for a republish action inside the rule's own
+    topic filter (the errorAction is not checked).
     """
     sql = payload.get("sql", "")
     error = _validate_rule_sql(sql)
     if error:
         raise RuleSqlError(error)
+    refusal = _republish_inside_filter(sql, payload.get("actions"))
+    if refusal:
+        raise RuleRepublishError(refusal)
     for func in _unimplemented_sql_functions(sql):
         logger.warning(
             "Topic rule %s calls %s(), which MiniStack does not implement: it "
@@ -4743,12 +5803,16 @@ def put_topic_rule(name: str, payload: dict, *, created_at: float | None = None)
 
 def delete_topic_rule(name: str) -> None:
     _topic_rules.pop(name, None)
+    _tags.pop(_topic_rule_arn(name), None)
 
 
-def _handle_topic_rule(method: str, path: str, body: bytes) -> tuple:
+def _handle_topic_rule(method: str, path: str, body: bytes, headers: dict) -> tuple:
     name = path[len("/rules/"):]
+    if method == "POST" and name.endswith(("/enable", "/disable")):
+        name, _, verb = name.rpartition("/")
+        return _set_topic_rule_disabled(name, verb == "disable")
     if method == "POST":
-        return _create_topic_rule(name, _parse_body(body))
+        return _create_topic_rule(name, _parse_body(body), headers.get("x-amz-tagging"))
     if method == "GET":
         return _get_topic_rule(name)
     if method == "PATCH":
@@ -4760,13 +5824,10 @@ def _handle_topic_rule(method: str, path: str, body: bytes) -> tuple:
     )
 
 
-def _create_topic_rule(name: str, payload: dict) -> tuple:
-    if not _RULE_NAME_RE.match(name or ""):
-        return error_response_json(
-            "InvalidRequestException",
-            "Invalid ruleName: must match [a-zA-Z0-9_]{1,128}",
-            400,
-        )
+def _create_topic_rule(name: str, payload: dict, tagging: str | None = None) -> tuple:
+    """CreateTopicRule; its tags arrive as the ``x-amz-tagging`` header, ``k1=v1&k2=v2``."""
+    if not _RULE_NAME_RE.fullmatch(name or ""):
+        return _error_rule_name(name or "")
     if name in _topic_rules:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Rule {name!r} already exists", 409
@@ -4774,35 +5835,86 @@ def _create_topic_rule(name: str, payload: dict) -> tuple:
     if not payload.get("sql"):
         return error_response_json("SqlParseException", "sql is required", 400)
     try:
-        put_topic_rule(name, payload)
-    except RuleSqlError as exc:
-        return error_response_json("SqlParseException", str(exc), 400)
-    except RuleRoleError as exc:
-        return error_response_json("InvalidRequestException", str(exc), 400)
-    return json_response({})
-
-
-def _replace_topic_rule(name: str, payload: dict) -> tuple:
-    if name not in _topic_rules:
-        return _error_not_found("Rule", name)
+        pairs = parse_qsl(tagging or "", keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return error_response_json(
+            "InvalidRequestException",
+            "Invalid tag parameters, please make sure the tags are in correct format with tagKeys "
+            "not exceeding 128 characters and tagValues not exceeding 256 characters", 400)
+    tags = [{"Key": k, "Value": v} for k, v in pairs]
+    err = _tags_error(tags, required=False)
+    if err:
+        return err
     try:
         put_topic_rule(name, payload)
     except RuleSqlError as exc:
         return error_response_json("SqlParseException", str(exc), 400)
-    except RuleRoleError as exc:
+    except (RuleRoleError, RuleRepublishError) as exc:
+        return error_response_json("InvalidRequestException", str(exc), 400)
+    _set_created_tags(_topic_rule_arn(name), tags)
+    return json_response({})
+
+
+def _error_rule_denied(name: str) -> tuple:
+    return error_response_json(
+        "UnauthorizedException", f"Access to topic rule '{name}' was denied", 401
+    )
+
+
+def _error_rule_name(name: str) -> tuple:
+    """The 400 for a rule name outside the pattern, longer than 128, or both."""
+    failed = []
+    if not re.fullmatch(r"[a-zA-Z0-9_]+", name):
+        failed.append("satisfy regular expression pattern: ^[a-zA-Z0-9_]+$")
+    if len(name) > 128:
+        failed.append("have length less than or equal to 128")
+    detail = "; ".join(
+        f"Value '{name}' at 'ruleName' failed to satisfy constraint: Member must {c}" for c in failed
+    )
+    count = "1 validation error" if len(failed) == 1 else f"{len(failed)} validation errors"
+    return error_response_json("InvalidRequestException", f"{count} detected: {detail}", 400)
+
+
+def _replace_topic_rule(name: str, payload: dict) -> tuple:
+    if not _RULE_NAME_RE.fullmatch(name):
+        return _error_rule_name(name)
+    if name not in _topic_rules:
+        return _error_rule_denied(name)
+    try:
+        put_topic_rule(name, payload)
+    except RuleSqlError as exc:
+        return error_response_json("SqlParseException", str(exc), 400)
+    except (RuleRoleError, RuleRepublishError) as exc:
         return error_response_json("InvalidRequestException", str(exc), 400)
     return json_response({})
 
 
 def _get_topic_rule(name: str) -> tuple:
+    if not _RULE_NAME_RE.fullmatch(name):
+        return _error_rule_name(name)
     rule = _topic_rules.get(name)
     if rule is None:
-        return _error_not_found("Rule", name)
+        return _error_rule_denied(name)
     return json_response({"ruleArn": _topic_rule_arn(name), "rule": rule})
 
 
+def _set_topic_rule_disabled(name: str, disabled: bool) -> tuple:
+    """EnableTopicRule and DisableTopicRule: 200 with an empty body, also when nothing changes."""
+    if not _RULE_NAME_RE.fullmatch(name):
+        return _error_rule_name(name)
+    rule = _topic_rules.get(name)
+    if rule is None:
+        return _error_rule_denied(name)
+    rule["ruleDisabled"] = disabled
+    return 200, {}, b""
+
+
 def _delete_topic_rule(name: str) -> tuple:
-    _topic_rules.pop(name, None)
+    if not _RULE_NAME_RE.fullmatch(name):
+        return _error_rule_name(name)
+    if name not in _topic_rules:
+        return _error_rule_denied(name)
+    delete_topic_rule(name)
     return json_response({})
 
 
@@ -4820,6 +5932,178 @@ def _list_topic_rules(qp: dict) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Tags (TagResource / UntagResource / ListTagsForResource)
+# ---------------------------------------------------------------------------
+
+_TAG_KEY_PATTERN = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$"
+_TAGS_PER_RESOURCE = 50
+_TOO_MANY_TAGS = "Too many tags provided in the request. Please check the input."
+_INVALID_TAG_REQUEST = "Invalid request exception. Please check the input."
+# What CreateThingType/CreateThingGroup and CreateJob/CreateJobTemplate answer for a tag without a value.
+_TAG_WITHOUT_VALUE = "All tags in request should have keys and values."
+_INVALID_JOB_TAG = "Invalid tag parameter exception. Please check the input."
+
+# ARN resource type -> (the store keyed by what follows the type, the message of
+# TagResource and UntagResource for a resource that does not exist)
+_TAGGABLE_RESOURCES = {
+    "thinggroup": (_thing_groups, "Thing Group {name} does not exist."),
+    "thingtype": (_thing_types, "Thing Type {name} does not exist."),
+    "policy": (_policies, "This resource is not found"),
+    "rule": (_topic_rules, "Rule {name} not found. accountId: {account}, resourceArn: {arn}"),
+    "job": (_jobs, "Job {name} cannot be found."),
+    "jobtemplate": (_job_templates, "Job Template {name} cannot be found."),
+    "cacert": (_ca_certificates, "CA Certificate {name} not found"),
+    "provisioningtemplate": (_provisioning_templates, "Unable to get template id, template not found"),
+    "domainconfiguration": (_domain_configurations, None),
+}
+# Resource types IoT has but does not tag.
+_UNTAGGABLE_RESOURCE_TYPES = ("thing", "cert")
+
+
+def _tag_request_error(message: str) -> tuple:
+    return error_response_json("InvalidRequestException", message, 400)
+
+
+def _tag_key_error(key) -> str | None:
+    """The model constraint a tag key fails, or None."""
+    if not isinstance(key, str):
+        return "Member must not be null"
+    if not key:
+        return "Member must have length greater than or equal to 1"
+    if len(key) > 128:
+        return "Member must have length less than or equal to 128"
+    if not all(unicodedata.category(c)[0] in "LNZ" or c in "_.:/=+-@" for c in key):
+        return f"Member must satisfy regular expression pattern: {_TAG_KEY_PATTERN}"
+    return None
+
+
+def _tags_error(tags, required: bool = True,
+                missing_value: str = _INVALID_TAG_REQUEST) -> tuple | None:
+    """The refusal of the tag list of a TagResource (or, not required, a Create) call."""
+    if not tags:
+        if not required:
+            return None
+        if tags is None:
+            return _job_template_validation_error(None, "tags", "Member must not be null")
+        return _tag_request_error("The validated collection is empty")
+    if not isinstance(tags, list) or not all(isinstance(t, dict) for t in tags):
+        return _tag_request_error(_INVALID_TAG_REQUEST)
+    clauses = []
+    for index, tag in enumerate(tags, 1):
+        constraint = _tag_key_error(tag.get("Key"))
+        if constraint:
+            clauses.append(_job_validation_clause(
+                tag.get("Key"), f"tags.{index}.member.key", constraint))
+        value = tag.get("Value")
+        if isinstance(value, str) and len(value) > 256:
+            clauses.append(_job_validation_clause(
+                value, f"tags.{index}.member.value",
+                "Member must have length less than or equal to 256"))
+    if clauses:
+        return _job_validation_error(clauses)
+    for tag in tags:
+        if not isinstance(tag.get("Value"), str):
+            return _tag_request_error(missing_value)
+        if tag["Key"].lower().startswith("aws:"):
+            return _tag_request_error(f'Tags cannot begin with "aws:", offending tag: {tag["Key"]}')
+    if len({tag["Key"] for tag in tags}) > _TAGS_PER_RESOURCE:
+        return _tag_request_error(_TOO_MANY_TAGS)
+    return None
+
+
+def _set_created_tags(arn: str, tags: list | None) -> None:
+    """Store the tags a Create call carried; none drops what a deleted namesake left."""
+    if tags:
+        _tags[arn] = {tag["Key"]: tag["Value"] for tag in tags}
+    else:
+        _tags.pop(arn, None)
+
+
+def _tag_target_error(arn, must_exist: bool) -> tuple | None:
+    """The refusal of a tagging call on ``arn``, or None; ListTagsForResource passes must_exist=False."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    rtype, _, rest = spec.resource.partition("/") if spec else ("", "", "")
+    if not rest or spec.service != "iot" or (
+            rtype not in _TAGGABLE_RESOURCES and rtype not in _UNTAGGABLE_RESOURCE_TYPES):
+        return _tag_request_error("Invalid arn in request")
+    if spec.account_id != get_account_id():
+        return _tag_request_error("ResourceArn doesn't belong in requester's account")
+    if rtype in _UNTAGGABLE_RESOURCE_TYPES:
+        return _tag_request_error(f"Invalid resource type in ARN: {rtype}")
+    if not must_exist:
+        return None
+    if spec.region != get_region():
+        return _tag_request_error(_INVALID_TAG_REQUEST)
+    store, message = _TAGGABLE_RESOURCES[rtype]
+    # A domain configuration ARN ends in a generated id after the name.
+    name = rest.partition("/")[0] if rtype == "domainconfiguration" else rest
+    record = store.get(name)
+    if record is not None and record.get("domainConfigurationArn", arn) == arn:
+        return None
+    if message is None:
+        return _domain_config_not_found(name)
+    return error_response_json(
+        "ResourceNotFoundException",
+        message.format(name=name, account=spec.account_id, arn=arn), 404)
+
+
+def _tag_resource(payload: dict) -> tuple:
+    """``POST /tags``: add or overwrite tags; the last of a repeated key wins."""
+    arn, tags = payload.get("resourceArn"), payload.get("tags")
+    err = _tags_error(tags) or _tag_target_error(arn, must_exist=True)
+    if err:
+        return err
+    merged = {**(_tags.get(arn) or {}), **{tag["Key"]: tag["Value"] for tag in tags}}
+    if len(merged) > _TAGS_PER_RESOURCE:
+        return _tag_request_error(_TOO_MANY_TAGS)
+    _tags[arn] = merged
+    return json_response({})
+
+
+def _untag_resource(payload: dict) -> tuple:
+    """``POST /untag``: a key the resource does not carry is no error."""
+    keys = payload.get("tagKeys")
+    if keys is None:
+        return _job_template_validation_error(None, "tagKeys", "Member must not be null")
+    if not keys:
+        return _tag_request_error("The validated collection is empty")
+    if not isinstance(keys, list):
+        return _tag_request_error(_INVALID_TAG_REQUEST)
+    if any(_tag_key_error(key) for key in keys):
+        return _job_template_validation_error(
+            "[" + ", ".join(map(str, keys)) + "]", "tagKeys",
+            "Member must satisfy constraint: [Member must have length less than or equal "
+            "to 128, Member must have length greater than or equal to 1, Member must "
+            f"satisfy regular expression pattern: {_TAG_KEY_PATTERN}]")
+    reserved = next((key for key in keys if key.lower().startswith("aws:")), None)
+    if reserved is not None:
+        return _tag_request_error(f'Tags cannot begin with "aws:", offending tag: {reserved}')
+    arn = payload.get("resourceArn")
+    err = _tag_target_error(arn, must_exist=True)
+    if err:
+        return err
+    stored = _tags.get(arn) or {}
+    for key in keys:
+        stored.pop(key, None)
+    return json_response({})
+
+
+def _list_tags_for_resource(qp: dict) -> tuple:
+    """``GET /tags``: every tag in one page, whatever nextToken says."""
+    arn = qp.get("resourceArn")
+    err = _tag_target_error(arn, must_exist=False)
+    if err:
+        return err
+    return json_response({
+        "nextToken": None,
+        "tags": [{"Key": k, "Value": v} for k, v in (_tags.get(arn) or {}).items()],
+    })
+
+
+# ---------------------------------------------------------------------------
 # IoT Jobs (control plane; execution state shared with iot_jobs_data.py)
 # ---------------------------------------------------------------------------
 #
@@ -4833,7 +6117,7 @@ def _list_topic_rules(qp: dict) -> tuple:
 #   QUEUED → IN_PROGRESS → {SUCCEEDED, FAILED, REJECTED, CANCELED}
 #
 # `versionNumber` gives optimistic concurrency: every transition bumps it, and
-# a stale `expectedVersion` is rejected with a 409. `executionNumber` is NOT a
+# a stale `expectedVersion` is rejected. `executionNumber` is NOT a
 # concurrency token here. It counts a thing's executions of one job: 1 for the
 # first, one more each time the thing joins a CONTINUOUS job's target group
 # again after its last execution finished (AWS also increments it when a job
@@ -4844,6 +6128,9 @@ def _list_topic_rules(qp: dict) -> tuple:
 # A thing leaving every target of a CONTINUOUS job moves its QUEUED execution
 # to REMOVED (see `_jobs_thing_left_group`). Deleting a thing DELETES its
 # executions (see `_delete_thing`) rather than marking them REMOVED.
+# DeleteJobExecution removes one execution; a CONTINUOUS job's thing that
+# lost all of them is listed under the job's `executionsDeletedFor`, so that
+# reads do not queue a new one until the thing joins a target group again.
 
 # Job ids are stricter than thing names, and identically so in both service
 # models (`iot` and `iot-jobs-data` declare JobId as [a-zA-Z0-9_-], max 64).
@@ -4903,6 +6190,12 @@ def _job_arn(job_id: str) -> str:
     return f"arn:aws:iot:{get_region()}:{get_account_id()}:job/{job_id}"
 
 
+def _job_target_not_found(arn: str) -> str:
+    """AWS's message for a job target thing or thing group that does not exist."""
+    kind, _, name = arn.rpartition(":")[2].partition("/")
+    return f"{'Thing Group' if kind == 'thinggroup' else 'Thing'} {name} cannot be found."
+
+
 def _job_target_resolve(arn: str) -> list[str] | None:
     """Thing names one job target ARN resolves to, under the caller's scope.
 
@@ -4951,7 +6244,8 @@ def _jobs_materialize_executions(job_id: str) -> None:
     SNAPSHOT jobs resolve group membership exactly once (at creation) — the
     `snapshotted` flag latches that. CONTINUOUS jobs re-resolve lazily on
     every read, which is exactly when new membership matters and avoids
-    watching group mutations.
+    watching group mutations. Things in the job's `rolloutQueue` wait for
+    their rollout batch.
     """
     job = _jobs.get(job_id)
     if not job or job.get("status") == "CANCELED":
@@ -4959,9 +6253,11 @@ def _jobs_materialize_executions(job_id: str) -> None:
     if job.get("targetSelection") == "SNAPSHOT" and job.get("snapshotted"):
         return
     now = _jobs_now_ms()
+    deleted = job.get("executionsDeletedFor") or ()
+    waiting = set(job.get("rolloutQueue") or ())
     for thing in _job_target_things(job.get("targets")):
         key = (thing, job_id)
-        if key in _job_executions:
+        if key in _job_executions or thing in deleted or thing in waiting:
             continue
         _jobs_queue_execution(thing, job_id, now)
     if job.get("targetSelection") == "SNAPSHOT":
@@ -4979,7 +6275,6 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
         "jobId": job_id,
         "thingName": thing,
         "status": "QUEUED",
-        "statusDetails": {},
         "queuedAt": now,
         "startedAt": None,
         "lastUpdatedAt": now,
@@ -4993,6 +6288,100 @@ def _jobs_queue_execution(thing: str, job_id: str, now: int) -> None:
             *previous.get("history", []),
         ]
     _job_executions[(thing, job_id)] = execution
+    deleted = (_jobs.get(job_id) or {}).get("executionsDeletedFor")
+    if deleted and thing in deleted:
+        deleted.remove(thing)
+
+
+# A job with jobExecutionsRolloutConfig creates its executions in batches, one
+# batch per this interval; the things still waiting are in its `rolloutQueue`.
+_JOB_ROLLOUT_INTERVAL_MS = 60_000
+# The running rollout tasks, kept here because the event loop holds only weak references.
+_rollout_tasks: set[asyncio.Task] = set()
+
+
+def _jobs_rollout_batch_size(job: dict, waiting: int) -> int:
+    """How many of `waiting` things a job notifies in its next batch."""
+    config = job.get("jobExecutionsRolloutConfig")
+    config = config if isinstance(config, dict) else {}
+    maximum = config.get("maximumPerMinute")
+    size = maximum if isinstance(maximum, int) and maximum > 0 else waiting
+    rate = config.get("exponentialRate")
+    rate = rate if isinstance(rate, dict) else {}
+    criteria = rate.get("rateIncreaseCriteria")
+    criteria = criteria if isinstance(criteria, dict) else {}
+    if criteria.get("numberOfSucceededThings") is not None:
+        step = criteria["numberOfSucceededThings"]
+        done = _jobs_status_counts(job["jobId"])["SUCCEEDED"]
+    else:
+        step = criteria.get("numberOfNotifiedThings")
+        done = sum(1 for e in _job_executions.values() if e["jobId"] == job["jobId"])
+    base, factor = rate.get("baseRatePerMinute"), rate.get("incrementFactor")
+    if not (
+        isinstance(base, int) and base > 0 and isinstance(step, int) and step > 0
+        and isinstance(factor, (int, float)) and factor > 1
+    ):
+        return size
+    # The rate grows by incrementFactor for every full step of notified (or
+    # succeeded) things, and maximumPerMinute caps it.
+    per_minute = base
+    for _ in range(done // step):
+        if per_minute >= size:
+            break
+        per_minute *= factor
+    return min(size, int(per_minute))
+
+
+def _jobs_rollout_release(job: dict) -> list[tuple[str, str | None]]:
+    """Queue the next batch of a job's waiting things; returns (thing, previous queue front) pairs."""
+    job_id, waiting = job["jobId"], job["rolloutQueue"]
+    batch = waiting[:_jobs_rollout_batch_size(job, len(waiting))]
+    job["rolloutQueue"] = waiting[len(batch):]
+    now = _jobs_now_ms()
+    job["rolloutBatchAt"] = now
+    # A thing deleted meanwhile is skipped, and so is one a CONTINUOUS job no longer targets.
+    targeted = (
+        set(_job_target_things(job.get("targets")))
+        if job.get("targetSelection") == "CONTINUOUS" else _things
+    )
+    released = []
+    for thing in batch:
+        if thing in targeted and (thing, job_id) not in _job_executions:
+            released.append((thing, jobs_first_pending_job_id(thing)))
+            _jobs_queue_execution(thing, job_id, now)
+    _jobs_maybe_complete(job_id)
+    return released
+
+
+async def _jobs_rollout(account_id: str, region: str, job: dict) -> None:
+    """Release a job's waiting things batch by batch until none is left or the job stops."""
+    while True:
+        with request_scope(account_id, region):
+            if (
+                _jobs.get(job["jobId"]) is not job
+                or job["status"] != "IN_PROGRESS"
+                or not job.get("rolloutQueue")
+            ):
+                return
+            wait = job["rolloutBatchAt"] + _JOB_ROLLOUT_INTERVAL_MS - _jobs_now_ms()
+        if wait > 0:
+            await asyncio.sleep(wait / 1000)
+            continue
+        async with publishing_events():
+            with request_scope(account_id, region):
+                released = _jobs_rollout_release(job)
+            for thing, prev_next in released:
+                await jobs_notify_thing(account_id, region, thing, prev_next)
+
+
+def _jobs_rollout_start(account_id: str, region: str, job: dict) -> None:
+    """Run a job's rollout on the running event loop, if there is one."""
+    try:
+        task = asyncio.get_running_loop().create_task(_jobs_rollout(account_id, region, job))
+    except RuntimeError:
+        return
+    _rollout_tasks.add(task)
+    task.add_done_callback(_rollout_tasks.discard)
 
 
 def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
@@ -5022,10 +6411,11 @@ def _jobs_thing_joined_group(thing: str, group_arn: str) -> bool:
     return queued
 
 
-def _jobs_thing_left_group(thing: str) -> bool:
+def _jobs_thing_left_group(thing: str, group_arn: str | None) -> bool:
     """Retire a thing's QUEUED CONTINUOUS executions after it left a group.
 
-    Call after the membership change. For every CONTINUOUS job the thing no
+    Call after the membership change, with the ARN of the group the thing
+    left (None when it was not a member). For every CONTINUOUS job the thing no
     longer resolves into, a QUEUED execution becomes REMOVED with its
     `versionNumber` unchanged. IN_PROGRESS, SUCCEEDED and FAILED executions
     keep their status (measured eu-central-1 2026-10-05). Returns whether a
@@ -5035,6 +6425,17 @@ def _jobs_thing_left_group(thing: str) -> bool:
     removed = False
     for job_id, job in _jobs.items():
         execution = _job_executions.get((thing, job_id))
+        if (
+            execution is None
+            and thing in (job.get("executionsDeletedFor") or ())
+            and group_arn in (job.get("targets") or [])
+            and job.get("status") != "CANCELED"
+            and thing not in _job_target_things(job.get("targets"))
+        ):
+            # All its executions were deleted: it gets a REMOVED one, without an event.
+            _jobs_queue_execution(thing, job_id, now)
+            _job_executions[(thing, job_id)]["status"] = "REMOVED"
+            continue
         if (
             execution is None
             or execution["status"] != "QUEUED"
@@ -5190,6 +6591,8 @@ def _jobs_apply_timeout(execution: dict) -> dict:
     execution["versionNumber"] += 1
     _job_execution_event(execution)
     _jobs_maybe_complete(execution["jobId"])
+    # A read sends no jobs/notify, so the things an abort cancels here are not notified.
+    _jobs_abort(execution["jobId"])
     return execution
 
 
@@ -5206,6 +6609,7 @@ def _jobs_maybe_complete(job_id: str) -> None:
         not job
         or job.get("targetSelection") == "CONTINUOUS"
         or job.get("status") != "IN_PROGRESS"
+        or job.get("rolloutQueue")
     ):
         return
     executions = [e for e in _job_executions.values() if e["jobId"] == job_id]
@@ -5217,17 +6621,54 @@ def _jobs_maybe_complete(job_id: str) -> None:
         _job_event(job, "completed")
 
 
+# The execution statuses each abortConfig failureType counts.
+_JOB_ABORT_FAILURE_STATUSES = {
+    "FAILED": ("FAILED",), "REJECTED": ("REJECTED",), "TIMED_OUT": ("TIMED_OUT",),
+    "ALL": ("FAILED", "REJECTED", "TIMED_OUT"),
+}
+
+
+def _jobs_abort(job_id: str) -> dict:
+    """Cancel an IN_PROGRESS job once a criterion of its abortConfig is met; returns _jobs_cancel's mapping."""
+    job = _jobs.get(job_id)
+    criteria = ((job or {}).get("abortConfig") or {}).get("criteriaList") or []
+    if not criteria or job.get("status") != "IN_PROGRESS":
+        return {}
+    counts = _jobs_status_counts(job_id)
+    # Every terminal execution counts as completed, CANCELED and REMOVED ones included.
+    completed = sum(counts[status] for status in _JOB_EXECUTION_TERMINAL)
+    for criterion in criteria:
+        failure_type = criterion.get("failureType")
+        threshold = criterion.get("thresholdPercentage")
+        minimum = criterion.get("minNumberOfExecutedThings")
+        if (
+            criterion.get("action") != "CANCEL"
+            or failure_type not in _JOB_ABORT_FAILURE_STATUSES
+            or not isinstance(threshold, (int, float))
+            or not isinstance(minimum, int)
+        ):
+            continue
+        failed = sum(counts[status] for status in _JOB_ABORT_FAILURE_STATUSES[failure_type])
+        if completed >= max(minimum, 1) and failed * 100 >= threshold * completed:
+            comment = (
+                f"Abort criteria for failure type {failure_type} with threshold {threshold:.2f}% met. "
+                f"Total completed executions: {completed}, total {failure_type} executions: {failed}"
+            )
+            return _jobs_cancel(job_id, {"comment": comment, "reasonCode": "ABORT_CANCEL"}, False)
+    return {}
+
+
 def _jobs_check_expected_version(
-    execution: dict, expected, conflict_code: str
+    execution: dict, expected, conflict_code: str, status: int = 409
 ) -> tuple | None:
     """Optimistic-concurrency gate, shared by the two update paths.
 
     The rejection message carries the current version so a device can resync
-    without a separate describe. `conflict_code` differs by plane and is NOT
-    cosmetic: the `iot` model declares VersionConflictException for
-    CancelJobExecution, while the `iot-jobs-data` model declares only
-    InvalidStateTransitionException for UpdateJobExecution — returning the
-    unmodeled code there makes a device's
+    without a separate describe. `conflict_code` and `status` differ by plane
+    and are NOT cosmetic: the `iot` model declares VersionConflictException
+    for CancelJobExecution, while UpdateJobExecution in the `iot-jobs-data`
+    model answers 400 InvalidRequestException — returning the unmodeled code
+    there makes a device's
     `except client.exceptions.VersionConflictException` raise AttributeError
     instead of catching, because botocore only synthesizes exception classes
     for the errors its model lists.
@@ -5245,20 +6686,26 @@ def _jobs_check_expected_version(
             conflict_code,
             f"Expected version {expected} but found version "
             f"{execution['versionNumber']}",
-            409,
+            status,
         )
     return None
 
 
-def _jobs_reject_if_terminal(execution: dict, verb: str) -> tuple | None:
+def _jobs_reject_if_terminal(execution: dict, message: str) -> tuple | None:
     """Terminal executions are frozen — no update, no cancel."""
     if execution["status"] not in _JOB_EXECUTION_TERMINAL:
         return None
+    return error_response_json("InvalidStateTransitionException", message, 409)
+
+
+def jobs_reject_terminal_describe(execution: dict) -> tuple | None:
+    """The device plane describes only QUEUED and IN_PROGRESS executions."""
+    if execution["status"] not in _JOB_EXECUTION_TERMINAL:
+        return None
     return error_response_json(
-        "InvalidStateTransitionException",
-        f"Job execution is in terminal status {execution['status']} and "
-        f"cannot be {verb}",
-        409,
+        "TerminalStateException",
+        "Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED",
+        410,
     )
 
 
@@ -5273,6 +6720,8 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
         return await _cancel_job(suffix[:-len("/cancel")], _parse_body(body), qp)
     if suffix.endswith("/job-document") and method == "GET":
         return _get_job_document(suffix[:-len("/job-document")])
+    if suffix.endswith("/things") and method == "GET":
+        return _list_job_executions_for_job(suffix[:-len("/things")], qp)
     if "/" in suffix:
         return error_response_json(
             "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
@@ -5291,6 +6740,127 @@ async def _handle_job(method: str, path: str, body: bytes, qp: dict) -> tuple:
     )
 
 
+# An S3 host: path style without a bucket label, virtual-hosted with one.
+_JOB_DOCUMENT_S3_HOST_RE = re.compile(r"(?:(?P<bucket>.+)\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com")
+_JOB_DOCUMENT_MAX_BYTES = 32768
+_JOB_DOCUMENT_MAX_DEPTH = 1000
+
+
+def _job_document_s3_location(source: str) -> tuple[str, str]:
+    """The bucket and key an s3:// or S3 object URL names, empty where it names none."""
+    from urllib.parse import unquote, urlsplit
+
+    bucket = key = ""
+    if isinstance(source, str) and source.startswith("s3://"):
+        bucket, _, key = source[len("s3://"):].partition("/")
+    elif isinstance(source, str) and source.startswith(("https://", "http://")):
+        with contextlib.suppress(ValueError):
+            parts = urlsplit(source)
+            match = _JOB_DOCUMENT_S3_HOST_RE.fullmatch(parts.hostname or "")
+            if match and match.group("bucket"):
+                bucket, key = match.group("bucket"), unquote(parts.path[1:])
+            elif match:
+                bucket, _, key = parts.path[1:].partition("/")
+                key = unquote(key)
+    return bucket, key
+
+
+def _job_document_is_json(document: str) -> bool:
+    """Whether a job document is JSON (NaN and Infinity are not) nested no deeper than AWS accepts."""
+    from ministack.services.apigateway_v1 import _json_depth
+    from ministack.services.eventbridge import _reject_json_constant
+
+    try:
+        value = json.loads(document, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return False
+    return _json_depth(value) <= _JOB_DOCUMENT_MAX_DEPTH
+
+
+def _job_inline_document_error(document) -> tuple | None:
+    """The refusal of a request's document that is not JSON AWS accepts, or None."""
+    if isinstance(document, str) and document and not _job_document_is_json(document):
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document located at request input is an invalid JSON document.", 400,
+        )
+    return None
+
+
+def _job_document_from_source(source: str) -> tuple[str | None, tuple | None]:
+    """The job document a documentSource names in this account's S3, or an error."""
+    from ministack.services import s3 as _s3
+
+    bucket, key = _job_document_s3_location(source)
+    if not bucket:
+        return None, error_response_json(
+            "InvalidRequestException", f"Job document source {source} is invalid.", 400
+        )
+    if not key:
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Provided S3 url is not valid: {source}. Error: Key cannot be null", 400,
+        )
+    bucket_record = _s3._ensure_bucket(bucket)
+    if bucket_record is None:
+        return None, error_response_json(
+            "InvalidRequestException", f"Bucket specified by url: {source} is not found.", 400
+        )
+    obj = bucket_record["objects"].get(key)
+    if obj is None:
+        return None, error_response_json(
+            "InvalidRequestException", f"Job document located at {source} is not found.", 400
+        )
+    if obj["size"] > _JOB_DOCUMENT_MAX_BYTES:
+        return None, error_response_json(
+            "LimitExceededException",
+            f"Job document from {source} exceeds size limit {_JOB_DOCUMENT_MAX_BYTES} bytes.",
+            410,
+        )
+    try:
+        document = _s3._get_object_data(bucket, key).decode("utf-8")
+    except ValueError:
+        document = ""
+    if not _job_document_is_json(document):
+        return None, error_response_json(
+            "InvalidRequestException",
+            f"Job document located at {source} is an invalid JSON document.",
+            400,
+        )
+    return document, None
+
+
+# ${aws:iot:s3-presigned-url:<url>}; the -v2 form takes the URL encoded.
+_JOB_PRESIGN_RE = re.compile(r"\$\{aws:iot:s3-presigned-url(?P<v2>-v2)?:(?P<url>[^}]*)\}")
+
+
+def _job_presign_error(document: str | None, config: dict | None, job_id: str) -> tuple | None:
+    """AWS's refusal of presigned-URL placeholders without a role or an S3 object URL."""
+    placeholders = list(_JOB_PRESIGN_RE.finditer(document or ""))
+    if not placeholders:
+        return None
+    if not (isinstance(config, dict) and config.get("roleArn")):
+        message = (
+            "presignedUrlConfig role ARN is required to generate an S3 presigned url in job document."
+            if all(m.group("v2") for m in placeholders)
+            else f"Role must be provided for pre-sign S3 urls in job document of job {job_id}."
+        )
+        return error_response_json("InvalidRequestException", message, 400)
+    for m in placeholders:
+        url = m.group("url")
+        bucket, key = _job_document_s3_location(url)
+        if not bucket or (m.group("v2") and re.search(r'[\s"<>\\^`{|}]', url)):
+            return error_response_json(
+                "InvalidRequestException", f"Given S3 url {url} is invalid.", 400
+            )
+        if not key:
+            return error_response_json(
+                "InvalidRequestException",
+                f"Provided S3 url is not valid: {url}. Error: Key cannot be null", 400,
+            )
+    return None
+
+
 async def _create_job(job_id: str, payload: dict) -> tuple:
     if not job_id or not _JOB_ID_RE.match(job_id):
         return error_response_json(
@@ -5298,14 +6868,33 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             "Invalid jobId: must match [a-zA-Z0-9_-]{1,64}",
             400,
         )
+    abort = payload.get("abortConfig")
+    if violations := _job_update_violations(job_id, {"abortConfig": abort}):
+        return _job_validation_error(violations)
+    timeout_cfg = payload.get("timeoutConfig") or {}
+    if timeout_cfg:
+        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
+        if err:
+            return err
+    if err := _job_abort_criteria_error(abort):
+        return err
     if job_id in _jobs:
         return error_response_json(
             "ResourceAlreadyExistsException", f"Job {job_id} already exists", 409
+        )
+    if payload.get("document") and payload.get("documentSource"):
+        return error_response_json(
+            "InvalidRequestException",
+            "Job document and job document source cannot be specified at the same time.",
+            400,
         )
     if payload.get("jobTemplateArn") is not None:
         payload, err = _job_payload_from_template(payload)
         if err:
             return err
+    err = _tags_error(payload.get("tags"), required=False, missing_value=_INVALID_JOB_TAG)
+    if err:
+        return err
     # Absent means SNAPSHOT (the AWS default); present means it has to be one
     # of the two modeled values — including the empty string, which would
     # otherwise default its way to a SNAPSHOT job the caller never asked for.
@@ -5333,11 +6922,6 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
                 "follow the format YYYY-MM-DDThh:mm.",
                 400,
             )
-    timeout_cfg = payload.get("timeoutConfig") or {}
-    if timeout_cfg:
-        err = _job_timeout_error(timeout_cfg.get("inProgressTimeoutInMinutes"))
-        if err:
-            return err
     targets = payload.get("targets")
     if not targets:
         return error_response_json(
@@ -5357,7 +6941,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         resolved = _job_target_resolve(arn)
         if resolved is None:
             return error_response_json(
-                "ResourceNotFoundException", f"Job target {arn} not found", 404
+                "ResourceNotFoundException", _job_target_not_found(arn), 404
             )
         target_things.update(resolved)
     document = payload.get("document")
@@ -5366,6 +6950,8 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             "InvalidRequestException",
             "document exceeds the maximum length of 32768", 400,
         )
+    if err := _job_inline_document_error(document):
+        return err
     source = payload.get("documentSource")
     if isinstance(source, str) and not 1 <= len(source) <= 1350:
         return error_response_json(
@@ -5379,13 +6965,13 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
             400,
         )
     if not document and payload.get("documentSource"):
-        # DELIBERATE DIVERGENCE: AWS fetches the document from the S3 URL and
-        # serves its CONTENT to devices. MiniStack does not fetch it — it
-        # stands in a placeholder naming the source, so a `documentSource` job
-        # still creates, describes, and runs its whole execution lifecycle.
-        # A device that parses the document therefore sees the URL, not the
-        # payload; pass `document` when the content matters.
-        document = json.dumps({"documentSource": payload["documentSource"]})
+        # The object is read once, here: a later overwrite changes no job.
+        document, err = _job_document_from_source(payload["documentSource"])
+        if err:
+            return err
+    err = _job_presign_error(document, payload.get("presignedUrlConfig"), job_id)
+    if err:
+        return err
     # Captured BEFORE the job record exists: jobs_first_pending_job_id
     # materializes, and once the new job is in the store it would already
     # count as the front of the queue.
@@ -5406,7 +6992,7 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "presignedUrlConfig": payload.get("presignedUrlConfig") or {},
         "jobExecutionsRolloutConfig": payload.get("jobExecutionsRolloutConfig")
         or {},
-        # Stored so DescribeJob echoes them. timeoutConfig is acted on; nothing aborts.
+        # Stored so DescribeJob echoes them. abortConfig and timeoutConfig are acted on.
         "abortConfig": payload.get("abortConfig"),
         "timeoutConfig": payload.get("timeoutConfig"),
         "jobExecutionsRetryConfig": payload.get("jobExecutionsRetryConfig"),
@@ -5415,9 +7001,15 @@ async def _create_job(job_id: str, payload: dict) -> tuple:
         "documentParameters": payload.get("documentParameters"),
         "schedulingConfig": payload.get("schedulingConfig"),
         "destinationPackageVersions": payload.get("destinationPackageVersions"),
-        "tags": payload.get("tags"),
         "snapshotted": False,
     }
+    _set_created_tags(_job_arn(job_id), payload.get("tags"))
+    things = _job_target_things(targets)
+    batch = _jobs_rollout_batch_size(_jobs[job_id], len(things))
+    if batch < len(things):
+        # The other things wait for later batches of the rollout.
+        _jobs[job_id].update(rolloutQueue=things[batch:], rolloutBatchAt=now)
+        _jobs_rollout_start(get_account_id(), get_region(), _jobs[job_id])
     _jobs_materialize_executions(job_id)
     # New QUEUED executions joined each target's pending set — notify, as AWS
     # does (notify-next only reaches the things whose queue front changed).
@@ -5445,10 +7037,12 @@ _JOB_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/.+$")
 
 
 def _job_update_violations(job_id: str, payload: dict) -> list[str]:
-    """Model constraint failures of an UpdateJob request."""
+    """Model constraint failures of an UpdateJob request; CreateJob and CreateJobTemplate check abortConfig with it."""
     found: list[str] = []
 
-    def bound(value, member, low=None, high=None, double=False):
+    def bound(value, member, low=None, high=None, double=False, required=False):
+        if value is None and required:
+            found.append(_job_validation_clause(None, member, "Member must not be null"))
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return
         shown = float(value) if double else value
@@ -5459,7 +7053,9 @@ def _job_update_violations(job_id: str, payload: dict) -> list[str]:
             found.append(_job_validation_clause(
                 shown, member, f"Member must have value less than or equal to {high}"))
 
-    def enum(value, member, allowed):
+    def enum(value, member, allowed, required=False):
+        if value is None and required:
+            found.append(_job_validation_clause(None, member, "Member must not be null"))
         if value is not None and value not in allowed:
             found.append(_job_validation_clause(
                 value, member, f"Member must satisfy enum value set: {allowed}"))
@@ -5521,15 +7117,43 @@ def _job_update_violations(job_id: str, payload: dict) -> list[str]:
         at = f"jobExecutionsRetryConfig.criteriaList.{i}.member"
         bound(c.get("numberOfRetries"), f"{at}.numberOfRetries", low=0, high=10)
         enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED]")
-    for i, c in enumerate(criteria_list(payload.get("abortConfig"),
-                                        "abortConfig.criteriaList"), 1):
+    abort = payload.get("abortConfig")
+    if isinstance(abort, dict) and abort.get("criteriaList") is None:
+        found.append(_job_validation_clause(
+            None, "abortConfig.criteriaList", "Member must not be null"))
+    for i, c in enumerate(criteria_list(abort, "abortConfig.criteriaList"), 1):
         at = f"abortConfig.criteriaList.{i}.member"
-        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1)
-        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]")
-        enum(c.get("action"), f"{at}.action", "[CANCEL]")
+        bound(c.get("minNumberOfExecutedThings"), f"{at}.minNumberOfExecutedThings", low=1,
+              required=True)
+        enum(c.get("failureType"), f"{at}.failureType", "[ALL, TIMED_OUT, FAILED, REJECTED]",
+             required=True)
+        enum(c.get("action"), f"{at}.action", "[CANCEL]", required=True)
         bound(c.get("thresholdPercentage"), f"{at}.thresholdPercentage", high=100,
-              double=True)
+              double=True, required=True)
     return found
+
+
+def _job_abort_criteria_error(abort) -> tuple | None:
+    """The abortConfig checks that follow the model constraints, criterion by criterion."""
+    criteria = abort.get("criteriaList") if isinstance(abort, dict) else None
+    seen = set()
+    for c in criteria if isinstance(criteria, list) else []:
+        if not isinstance(c, dict):
+            continue
+        threshold = c.get("thresholdPercentage")
+        numeric = isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
+        message = None
+        if c.get("failureType") in seen:
+            message = "Multiple AbortCriteria cannot have the same failure type"
+        elif numeric and threshold <= 0:
+            message = (f"ThresholdPercentage value {float(threshold)} for AbortCriteria "
+                       "must have value greater than 0")
+        elif numeric and round(threshold, 2) != threshold:
+            message = "Abort thresholdPercentage must have two or less decimal digits"
+        if message:
+            return error_response_json("InvalidRequestException", message, 400)
+        seen.add(c.get("failureType"))
+    return None
 
 
 def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
@@ -5547,6 +7171,8 @@ def _job_update_request_error(job_id: str, payload: dict) -> tuple | None:
             (payload["timeoutConfig"] or {}).get("inProgressTimeoutInMinutes"))
         if err:
             return err
+    if err := _job_abort_criteria_error(payload.get("abortConfig")):
+        return err
     rollout = payload.get("jobExecutionsRolloutConfig")
     if isinstance(rollout, dict):
         maximum, rate = rollout.get("maximumPerMinute"), rollout.get("exponentialRate")
@@ -5667,6 +7293,9 @@ def _describe_job(job_id: str) -> tuple:
     if job is None:
         return _error_not_found("Job", job_id)
     _jobs_materialize_executions(job_id)
+    for latest in _job_executions.values():
+        if latest["jobId"] == job_id:
+            _jobs_apply_timeout(latest)
     # Every execution counts, a rejoined thing's earlier ones included
     # (measured eu-central-1 2026-10-05).
     counts = _jobs_status_counts(job_id)
@@ -5708,10 +7337,10 @@ def _describe_job(job_id: str) -> tuple:
     job_doc["schedulingConfig"] = job.get("schedulingConfig") or {}
     # isConcurrent is false in every steady state (captured eu-north-1
     # 2026-09-19 with a QUEUED, an IN_PROGRESS and a SUCCEEDED execution). It is
-    # true only inside the rollout/cancel window the reference describes, which
-    # this emulator does not model. processingTargets is null throughout the same
+    # true while a rollout still has things to notify; the cancel window the
+    # reference also describes is not modeled. processingTargets is null throughout the same
     # capture, so it stays omitted rather than echoing the target ARNs.
-    job_doc["isConcurrent"] = False
+    job_doc["isConcurrent"] = job["status"] == "IN_PROGRESS" and bool(job.get("rolloutQueue"))
     response = {"job": job_doc}
     if job.get("documentSource") is not None:
         response["documentSource"] = job["documentSource"]
@@ -5742,6 +7371,7 @@ async def _delete_job(job_id: str, qp: dict) -> tuple:
     job["lastUpdatedAt"] = _jobs_now_ms()
     _job_event(job, "deletion_in_progress")
     del _jobs[job_id]
+    _tags.pop(job["jobArn"], None)
     for key in [k for k in _job_executions.keys() if k[1] == job_id]:
         _job_execution_event(_job_executions[key], "DELETED")
         del _job_executions[key]
@@ -5789,7 +7419,7 @@ _JOB_TEMPLATE_CONFIG_MEMBERS = (
     "presignedUrlConfig", "jobExecutionsRolloutConfig", "abortConfig",
     "timeoutConfig", "jobExecutionsRetryConfig",
 )
-_JOB_TEMPLATE_PAGE_MAX = 250
+_JOB_PAGE_MAX = 250
 
 
 def _job_template_arn(template_id: str) -> str:
@@ -5876,17 +7506,23 @@ def _handle_job_template(method: str, path: str, body: bytes) -> tuple:
 
 
 def _create_job_template(template_id: str, payload: dict) -> tuple:
+    abort = payload.get("abortConfig")
+    violations = _job_update_violations(template_id, {"abortConfig": abort})
     if payload.get("description") is None:
-        return _job_template_validation_error(
-            None, "description", "Member must not be null"
-        )
+        violations.insert(0, _job_validation_clause(None, "description", "Member must not be null"))
+    if violations:
+        return _job_validation_error(violations)
     document = payload.get("document")
     if isinstance(document, str) and len(document) > 32768:
         return _job_template_validation_error(
             document, "document", "Member must have length less than or equal to 32768"
         )
+    if err := _job_inline_document_error(document):
+        return err
     minutes = (payload.get("timeoutConfig") or {}).get("inProgressTimeoutInMinutes")
     if minutes is not None and (err := _job_timeout_error(minutes)):
+        return err
+    if err := _job_abort_criteria_error(abort):
         return err
     source = payload.get("documentSource")
     if document and source:
@@ -5895,6 +7531,8 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
             "Job document and job document source cannot be specified at the same time.",
             400,
         )
+    if err := _tags_error(payload.get("tags"), required=False, missing_value=_INVALID_JOB_TAG):
+        return err
     if not document and not source and not payload.get("jobArn"):
         return error_response_json(
             "InvalidRequestException",
@@ -5927,15 +7565,20 @@ def _create_job_template(template_id: str, payload: dict) -> tuple:
         record["document"] = document
         record["documentSource"] = source
     if source and not document:
-        # Same stand-in as CreateJob's: the S3 object is not fetched.
-        record["document"] = json.dumps({"documentSource": source})
+        record["document"], err = _job_document_from_source(source)
+        if err:
+            return err
     for member in _JOB_TEMPLATE_CONFIG_MEMBERS + (
-        "maintenanceWindows", "destinationPackageVersions", "tags",
+        "maintenanceWindows", "destinationPackageVersions",
     ):
         if payload.get(member) is not None:
             record[member] = copy.deepcopy(payload[member])
     _job_config_floats(record)
+    err = _job_presign_error(record.get("document"), record.get("presignedUrlConfig"), template_id)
+    if err:
+        return err
     _job_templates[template_id] = record
+    _set_created_tags(record["jobTemplateArn"], payload.get("tags"))
     return json_response({
         "jobTemplateArn": record["jobTemplateArn"], "jobTemplateId": template_id,
     })
@@ -5975,50 +7618,58 @@ def _describe_job_template(template_id: str) -> tuple:
     })
 
 
-def _list_job_templates(qp: dict) -> tuple:
-    """``GET /job-templates``, newest first, paged by ``maxResults`` /
-    ``nextToken``; the token carries an offset into that order."""
+def _jobs_page(items: list, qp: dict, kind: str) -> tuple[list, str | None, tuple | None]:
+    """The ``maxResults`` / ``nextToken`` page of ``items`` as (page, token, error); a token is an offset."""
     raw = qp.get("maxResults")
     try:
-        limit = _JOB_TEMPLATE_PAGE_MAX if raw in (None, "") else int(raw)
+        limit = _JOB_PAGE_MAX if raw in (None, "") else int(raw)
     except (TypeError, ValueError):
         limit = 0
-    if not 1 <= limit <= _JOB_TEMPLATE_PAGE_MAX:
+    if not 1 <= limit <= _JOB_PAGE_MAX:
         bound = ("greater than or equal to 1" if limit < 1
-                 else f"less than or equal to {_JOB_TEMPLATE_PAGE_MAX}")
-        return _job_template_validation_error(
+                 else f"less than or equal to {_JOB_PAGE_MAX}")
+        return [], None, _job_validation_error([_job_validation_clause(
             raw, "maxResults", f"Member must have value {bound}"
-        )
+        )])
     start = 0
     token = qp.get("nextToken")
     if token:
         try:
             raw_token = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
             prefix, _, offset = raw_token.partition(":")
-            start = int(offset) if prefix == "jobtemplates" else -1
+            start = int(offset) if prefix == kind else -1
         except ValueError:  # binascii.Error and UnicodeDecodeError included
             start = -1
         if start < 0:
-            return error_response_json(
+            return [], None, error_response_json(
                 "InvalidRequestException", "Next token is invalid.", 400
             )
+    if start + limit >= len(items):
+        return items[start:], None, None
+    token = base64.urlsafe_b64encode(f"{kind}:{start + limit}".encode()).decode().rstrip("=")
+    return items[start:start + limit], token, None
+
+
+def _list_job_templates(qp: dict) -> tuple:
+    """``GET /job-templates``, newest first, paged by ``maxResults`` /
+    ``nextToken``; the token carries an offset into that order."""
     ordered = sorted(_job_templates.values(), key=lambda t: t["createdAt"], reverse=True)
-    page = ordered[start:start + limit]
+    page, token, error = _jobs_page(ordered, qp, "jobtemplates")
+    if error:
+        return error
     response = {"jobTemplates": [
         {k: t[k] for k in ("jobTemplateArn", "jobTemplateId", "description", "createdAt")}
         for t in page
     ]}
-    if start + limit < len(ordered):
-        response["nextToken"] = base64.urlsafe_b64encode(
-            f"jobtemplates:{start + limit}".encode()
-        ).decode().rstrip("=")
+    if token:
+        response["nextToken"] = token
     return json_response(response)
 
 
 def _delete_job_template(template_id: str) -> tuple:
     if _job_templates.get(template_id) is None:
         return _job_template_not_found(template_id)
-    del _job_templates[template_id]
+    _tags.pop(_job_templates.pop(template_id)["jobTemplateArn"], None)
     # AWS answers 200 with an empty body.
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, b""
 
@@ -6075,21 +7726,12 @@ def _job_payload_from_template(payload: dict) -> tuple[dict | None, tuple | None
     return merged, None
 
 
-async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
-    job = _jobs.get(job_id)
-    if job is None:
-        return _error_not_found("Job", job_id)
-    if job["status"] != "IN_PROGRESS":
-        return error_response_json(
-            "InvalidRequestException",
-            f"Job {job_id} is in status {job['status']} and cannot be canceled",
-            400,
-        )
-    force = _qp_bool(qp, "force")
+def _jobs_cancel(job_id: str, payload: dict, force: bool) -> dict:
+    """CancelJob's state change; maps each thing whose execution it canceled to its earlier queue front."""
+    job = _jobs[job_id]
     now = _jobs_now_ms()
     job["status"] = "CANCELED"
-    if force:
-        job["forceCanceled"] = True
+    job["forceCanceled"] = force
     job["lastUpdatedAt"] = now
     job["completedAt"] = now
     if payload.get("comment") is not None:
@@ -6120,9 +7762,23 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
             _job_execution_event(execution, force_canceled=force)
             canceled_things.add(execution["thingName"])
     _job_event(job, "canceled")
+    return {thing_name: prev_next[thing_name] for thing_name in canceled_things}
+
+
+async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
+    job = _jobs.get(job_id)
+    if job is None:
+        return _error_not_found("Job", job_id)
+    if job["status"] != "IN_PROGRESS":
+        return error_response_json(
+            "InvalidRequestException",
+            f"Job {job_id} is in status {job['status']} and cannot be canceled",
+            400,
+        )
+    canceled = _jobs_cancel(job_id, payload, _qp_bool(qp, "force"))
     account_id, region = get_account_id(), get_region()
-    for thing_name in sorted(canceled_things):
-        await jobs_notify_thing(account_id, region, thing_name, prev_next[thing_name])
+    for thing_name in sorted(canceled):
+        await jobs_notify_thing(account_id, region, thing_name, canceled[thing_name])
     response = {"jobArn": job["jobArn"], "jobId": job_id}
     if job.get("description") is not None:
         response["description"] = job["description"]
@@ -6132,7 +7788,8 @@ async def _cancel_job(job_id: str, payload: dict, qp: dict) -> tuple:
 async def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> tuple:
     """Dispatch /things/{name}/jobs[...] control-plane routes.
 
-    Async because CancelJobExecution publishes jobs/notify(-next)."""
+    Async because CancelJobExecution and DeleteJobExecution publish
+    jobs/notify(-next)."""
     rest = path[len("/things/"):]
     thing, _, sub = rest.partition("/")
     err = _validate_name(thing, "thingName")
@@ -6155,6 +7812,9 @@ async def _handle_thing_jobs(method: str, path: str, body: bytes, qp: dict) -> t
         )
     if "/" not in tail and method == "GET":
         return _describe_job_execution(thing, tail, qp)
+    job_id, _, number = tail.partition("/executionNumber/")
+    if number and "/" not in job_id and method == "DELETE":
+        return await _delete_job_execution(thing, job_id, number, qp)
     return error_response_json(
         "InvalidRequestException", f"Unsupported IoT path: {method} {path}", 400
     )
@@ -6169,37 +7829,88 @@ def _list_job_executions_for_thing(thing: str, qp: dict) -> tuple:
     # the jobId beside it (JobExecutionSummaryForThing).
     summaries = []
     # A rejoined thing's executions of one job come newest first, as on AWS.
-    executions = [
-        execution
-        for latest in _job_executions.values()
-        for execution in _jobs_with_history(latest)
-    ]
+    # Time out only this thing's executions, all of them before any is read, so the page agrees with itself.
+    latest_executions = [e for e in list(_job_executions.values()) if e["thingName"] == thing]
+    for latest in latest_executions:
+        _jobs_apply_timeout(latest)
+    executions = [execution for latest in latest_executions for execution in _jobs_with_history(latest)]
     for execution in executions:
-        if execution["thingName"] != thing:
-            continue
         if wanted_status and execution["status"] != wanted_status:
             continue
         if wanted_job and execution["jobId"] != wanted_job:
             continue
-        summary = {
-            "status": execution["status"],
-            "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
-            "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
-            "executionNumber": execution["executionNumber"],
-            "retryAttempt": execution.get("retryAttempt", 0),
-        }
-        if execution.get("startedAt") is not None:
-            summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
-        summaries.append(
-            {"jobId": execution["jobId"], "jobExecutionSummary": summary}
-        )
+        summaries.append({
+            "jobId": execution["jobId"],
+            "jobExecutionSummary": _job_execution_summary(execution),
+        })
     return json_response({"executionSummaries": summaries})
+
+
+def _job_execution_summary(execution: dict) -> dict:
+    """Control-plane JobExecutionSummary, as both execution lists nest it."""
+    summary = {
+        "status": execution["status"],
+        "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
+        "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
+        "executionNumber": execution["executionNumber"],
+        "retryAttempt": execution.get("retryAttempt", 0),
+    }
+    if execution.get("startedAt") is not None:
+        summary["startedAt"] = _jobs_ms_to_s(execution["startedAt"])
+    return summary
+
+
+def _list_job_executions_for_job(job_id: str, qp: dict) -> tuple:
+    """``GET /jobs/{jobId}/things``, most recently updated first, paged like ``ListJobTemplates``."""
+    clauses = []
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", job_id):
+        clauses.append(_job_validation_clause(
+            job_id, "jobId", "Member must satisfy regular expression pattern: [a-zA-Z0-9_-]+"
+        ))
+    status = qp.get("status")
+    if status is not None and status not in _JOB_EXECUTION_STATUSES:
+        clauses.append(_job_validation_clause(
+            status, "status", "Member must satisfy enum value set: [REMOVED, SUCCEEDED, "
+            "TIMED_OUT, IN_PROGRESS, QUEUED, CANCELED, FAILED, REJECTED]"
+        ))
+    if clauses:
+        return _job_validation_error(clauses)
+    _, _, error = _jobs_page([], qp, "jobexecutions")
+    if error:
+        return error
+    if job_id not in _jobs:
+        return error_response_json(
+            "ResourceNotFoundException", f"Job {job_id} cannot be found.", 404
+        )
+    _jobs_materialize_executions(job_id)
+    latest_executions = [e for e in list(_job_executions.values()) if e["jobId"] == job_id]
+    for latest in latest_executions:
+        _jobs_apply_timeout(latest)
+    executions = [
+        execution
+        for latest in latest_executions
+        for execution in _jobs_with_history(latest)
+        if status is None or execution["status"] == status
+    ]
+    executions.sort(key=lambda e: e["lastUpdatedAt"], reverse=True)
+    page, token, error = _jobs_page(executions, qp, "jobexecutions")
+    if error:
+        return error
+    response = {"executionSummaries": [
+        {"thingArn": _thing_arn(e["thingName"]), "jobExecutionSummary": _job_execution_summary(e)}
+        for e in page
+    ]}
+    if token:
+        response["nextToken"] = token
+    return json_response(response)
 
 
 def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
     """Without `executionNumber` the newest execution, with it that one."""
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
+    if execution is not None:
+        _jobs_apply_timeout(execution)
     number = qp.get("executionNumber")
     if execution is not None and number is not None:
         try:
@@ -6213,13 +7924,15 @@ def _describe_job_execution(thing: str, job_id: str, qp: dict) -> tuple:
             None,
         )
     if execution is None:
-        return _error_not_found("Job execution", f"{thing}/{job_id}")
+        return _error_not_found("JobExecution" if job_id in _jobs else "JobExecution:job", job_id, thing=thing)
     view = {
         "jobId": execution["jobId"],
         "status": execution["status"],
         # Control-plane JobExecution nests the map under `detailsMap`
         # (JobExecutionStatusDetails); the data plane returns it flat.
-        "statusDetails": {"detailsMap": execution.get("statusDetails") or {}},
+        "statusDetails": (
+            {"detailsMap": execution["statusDetails"]} if execution.get("statusDetails") is not None else {}
+        ),
         "thingArn": _thing_arn(thing),
         "queuedAt": _jobs_ms_to_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_s(execution["lastUpdatedAt"]),
@@ -6237,13 +7950,15 @@ async def _cancel_job_execution(
     _jobs_materialize_executions(job_id)
     execution = _job_executions.get((thing, job_id))
     if execution is None:
-        return _error_not_found("Job execution", f"{thing}/{job_id}")
+        return _error_not_found("JobExecution" if job_id in _jobs else "JobExecution:job", job_id, thing=thing)
     error = _jobs_check_expected_version(
         execution, payload.get("expectedVersion"), "VersionConflictException"
     )
     if error:
         return error
-    error = _jobs_reject_if_terminal(execution, "canceled")
+    error = _jobs_reject_if_terminal(
+        execution, f"Job execution for thing {thing} within job {job_id} cannot be canceled."
+    )
     if error:
         return error
     force = _qp_bool(qp, "force")
@@ -6255,14 +7970,75 @@ async def _cancel_job_execution(
         )
     prev_next = jobs_first_pending_job_id(thing)
     execution["status"] = "CANCELED"
-    if payload.get("statusDetails"):
+    if isinstance(payload.get("statusDetails"), dict):
         execution["statusDetails"] = dict(payload["statusDetails"])
     execution["lastUpdatedAt"] = _jobs_now_ms()
     execution["versionNumber"] += 1
     _job_execution_event(execution, force_canceled=force)
     _jobs_maybe_complete(job_id)
     await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    await jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return json_response({})
+
+
+async def _delete_job_execution(thing: str, job_id: str, number: str, qp: dict) -> tuple:
+    """Delete one of a thing's executions of a job; an IN_PROGRESS one only with force."""
+    try:
+        number = int(number)
+    except ValueError:
+        return error_response_json(
+            "SerializationException", f"'{number}' can not be converted to Long", 400
+        )
+    if number < 1:
+        return error_response_json(
+            "InvalidRequestException", "Execution number is invalid.", 400
+        )
+    job = _jobs.get(job_id)
+    if job is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Job execution cannot be found as the Job {job_id} does not exist.",
+            404,
+        )
+    _jobs_materialize_executions(job_id)
+    latest = _job_executions.get((thing, job_id))
+    executions = _jobs_with_history(_jobs_apply_timeout(latest)) if latest else []
+    execution = next((e for e in executions if e["executionNumber"] == number), None)
+    if execution is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Job execution for thing {thing} cannot be found within job {job_id}.",
+            404,
+        )
+    if execution["status"] == "IN_PROGRESS" and not _qp_bool(qp, "force"):
+        return error_response_json(
+            "InvalidStateTransitionException",
+            f"Job execution for thing {thing} within job {job_id} in status "
+            "IN_PROGRESS cannot be deleted without force flag.",
+            409,
+        )
+    pending = execution["status"] in ("QUEUED", "IN_PROGRESS")
+    prev_next = jobs_first_pending_job_id(thing) if pending else None
+    # The next newest execution, if any, becomes the thing's current one.
+    rest = [
+        {k: v for k, v in e.items() if k != "history"}
+        for e in executions
+        if e is not execution
+    ]
+    if rest:
+        if len(rest) > 1:
+            rest[0]["history"] = rest[1:]
+        _job_executions[(thing, job_id)] = rest[0]
+    else:
+        del _job_executions[(thing, job_id)]
+        if job.get("targetSelection") == "CONTINUOUS":
+            job.setdefault("executionsDeletedFor", []).append(thing)
+    _job_execution_event(execution, "DELETED")
+    _jobs_maybe_complete(job_id)
+    if pending:
+        await jobs_notify_thing(get_account_id(), get_region(), thing, prev_next)
+    await jobs_abort_if_met(get_account_id(), get_region(), job_id)
+    return 200, {}, b""
 
 
 # ---------------------------------------------------------------------------
@@ -6329,7 +8105,7 @@ def jobs_start_next_execution(
         execution["startedAt"] = now
         execution["lastUpdatedAt"] = now
         execution["versionNumber"] += 1
-        if status_details:
+        if isinstance(status_details, dict):
             execution["statusDetails"] = dict(status_details)
     return dict(execution)
 
@@ -6354,22 +8130,272 @@ def jobs_describe_execution(thing_name: str, job_id: str) -> dict | None:
     return dict(_jobs_apply_timeout(execution))
 
 
+# Control characters as AWS escapes them in the document it sends a device; a lone
+# surrogate stays escaped too, since UTF-8 cannot carry it.
+_JOBS_DEVICE_ESCAPES = {
+    **{code: f"\\u{code:04X}" for code in (*range(0x20), *range(0xD800, 0xE000))},
+    0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\",
+}
+
+
+def _jobs_device_float(value: float) -> str:
+    """A float spelled as Java's Double.toString, with a non-finite value as a string."""
+    if not math.isfinite(value):
+        return f'"{json.dumps(value)}"'
+    if value == 0 or 1e-3 <= abs(value) < 1e7:
+        return repr(value)
+    from decimal import Decimal
+
+    sign, digits, exponent = Decimal(repr(value)).normalize().as_tuple()
+    text = "".join(map(str, digits))
+    return f"{'-' * sign}{text[0]}.{text[1:] or '0'}E{len(text) - 1 + exponent}"
+
+
+def _jobs_device_json(value) -> str:
+    """Compact JSON of a job document as AWS sends it to a device: object members that are null are left out."""
+    parts: list[str] = []
+    # Values still to write, last first; a tuple holds punctuation (json.loads makes none).
+    pending = [value]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, tuple):
+            parts.append(value[0])
+        elif isinstance(value, dict):
+            members = [(key, member) for key, member in value.items() if member is not None]
+            parts.append("{")
+            pending.append(("}",))
+            for index in range(len(members) - 1, -1, -1):
+                key, member = members[index]
+                pending.append(member)
+                pending.append(("," * bool(index) + '"' + key.translate(_JOBS_DEVICE_ESCAPES) + '":',))
+        elif isinstance(value, list):
+            parts.append("[")
+            pending.append(("]",))
+            for index in range(len(value) - 1, -1, -1):
+                pending.append(value[index])
+                if index:
+                    pending.append((",",))
+        elif isinstance(value, str):
+            parts.append('"' + value.translate(_JOBS_DEVICE_ESCAPES) + '"')
+        elif isinstance(value, float):
+            parts.append(_jobs_device_float(value))
+        else:
+            parts.append(json.dumps(value))
+    return "".join(parts)
+
+
+# The host a device reached MiniStack on: its presigned URLs name it.
+jobs_device_host: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_iot_jobs_device_host", default=""
+)
+_JOB_PRESIGN_HOST_RE = re.compile(r"[A-Za-z0-9.\-\[\]:_]+")
+# The labels of an IoT endpoint host up to its region; S3 is not routed under them.
+_JOB_PRESIGN_IOT_LABELS_RE = re.compile(r"(?:[^.:]+\.)*?iot\.[a-z0-9-]+\.(?=[^:])")
+# A role session signs an hour of URLs, each valid for its full expiresInSec.
+_JOB_PRESIGN_SESSION_REUSE_SECONDS = 3600
+# (account, role ARN) -> the access key of that role's current session.
+_jobs_presign_sessions: dict[tuple[str, str], str] = {}
+
+
+def _iot_role_usable(role_arn: str) -> bool:
+    """Under AUTH=true, whether the role exists in the caller's account and its trust policy lets IoT assume it."""
+    from ministack import app
+
+    if not app.AUTH:
+        return True
+    from ministack.core.iam_evaluator import _action_matches, _service_principal_matches
+    from ministack.services import iam as _iam
+
+    parts = role_arn.split(":", 5)
+    if len(parts) != 6 or parts[4] != get_account_id() or not parts[5].startswith("role/"):
+        return False
+    role = _iam._roles.get(parts[5].rsplit("/", 1)[-1])
+    try:
+        statements = json.loads((role or {}).get("AssumeRolePolicyDocument") or "{}").get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    allowed = False
+    for stmt in statements if isinstance(statements, list) else [statements]:
+        if not isinstance(stmt, dict) or not _service_principal_matches(stmt.get("Principal"), "iot.amazonaws.com"):
+            continue
+        actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
+        if not _action_matches("sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
+                               [not_actions] if isinstance(not_actions, str) else not_actions):
+            continue
+        if stmt.get("Effect") == "Deny":
+            return False
+        allowed = allowed or stmt.get("Effect") == "Allow"
+    return allowed
+
+
+def _jobs_presign_session(role_arn: str, expires: int) -> tuple[str, dict]:
+    """A session of the presign role, registered with STS, that outlives a URL signed now."""
+    from ministack.services import iam as _iam
+    from ministack.services import sts as _sts
+
+    cache_key = (get_account_id(), role_arn)
+    access_key = _jobs_presign_sessions.get(cache_key, "")
+    session = _sts._sessions.get(access_key)
+    if session is None or session["Expiration"] < time.time() + expires:
+        partition = role_arn.split(":")[1] if _JOB_ROLE_ARN_RE.match(role_arn) else "aws"
+        account = get_account_id()  # the job's account, whatever account the role ARN names
+        name = uuid.uuid4().hex
+        access_key = _iam._gen_session_access_key()
+        session = {
+            "Arn": f"arn:{partition}:sts::{account}:assumed-role/{role_arn.rsplit('/', 1)[-1]}/{name}",
+            "UserId": f"AROA{uuid.uuid4().hex[:17].upper()}:{name}",
+            "SecretAccessKey": _iam._gen_secret(),
+            "SessionToken": _iam._gen_session_token(),
+            "Expiration": time.time() + expires + _JOB_PRESIGN_SESSION_REUSE_SECONDS,
+            "AccountId": account,
+            "PrincipalType": "AssumedRole",
+        }
+        _sts.register_session(access_key, session)
+        _jobs_presign_sessions[cache_key] = access_key
+    return access_key, session
+
+
+def _jobs_presigned_document(job: dict) -> str:
+    """The job document with each placeholder replaced by a presigned GET URL of MiniStack's S3."""
+    document = job.get("document") or "{}"
+    config = job.get("presignedUrlConfig")
+    if "${aws:iot:s3-presigned-url" not in document or not (
+        isinstance(config, dict) and config.get("roleArn")
+    ) or not _iot_role_usable(config["roleArn"]):
+        return document
+    from ministack.core.sigv4 import (
+        build_canonical_query_string,
+        build_canonical_request,
+        build_string_to_sign,
+        calculate_signature,
+        uri_encode,
+    )
+    from ministack.core.tls import use_ssl_enabled
+
+    expires = config.get("expiresInSec")
+    expires = int(expires) if isinstance(expires, (int, float)) and expires > 0 else 3600
+    access_key, session = _jobs_presign_session(config["roleArn"], expires)
+    host = jobs_device_host.get()
+    if not _JOB_PRESIGN_HOST_RE.fullmatch(host):
+        host = f"{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+    elif labels := _JOB_PRESIGN_IOT_LABELS_RE.match(host):
+        host = host[labels.end():]
+    base = f"{'https' if use_ssl_enabled() else 'http'}://{host}"
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    region = get_region()
+    query = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key}/{amz_date[:8]}/{region}/s3/aws4_request",
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": str(expires),
+        "X-Amz-Security-Token": session["SessionToken"],
+        "X-Amz-SignedHeaders": "host",
+    }
+    canonical_query = build_canonical_query_string(query)
+
+    def presign(match: re.Match) -> str:
+        bucket, key = _job_document_s3_location(match.group("url"))
+        if not (bucket and key):
+            return match.group(0)
+        path = f"/{bucket}/{key}"
+        string_to_sign = build_string_to_sign(
+            amz_date, amz_date[:8], region, "s3",
+            build_canonical_request("GET", path, {"host": host}, query, "host"),
+        )
+        signature = calculate_signature(
+            session["SecretAccessKey"], amz_date[:8], region, "s3", string_to_sign
+        )
+        return (f"{base}{uri_encode(path, encode_slash=False)}?{canonical_query}"
+                f"&X-Amz-Signature={signature}")
+
+    return _JOB_PRESIGN_RE.sub(presign, document)
+
+
 def jobs_job_document(job_id: str) -> str:
-    """The document a device should run for a job — ``{}`` if there is none."""
+    """The document a device should run for a job, re-serialized as AWS sends it — ``{}`` if there is none."""
     job = _jobs.get(job_id)
-    return (job or {}).get("document") or "{}"
+    document = _jobs_presigned_document(job) if job else "{}"
+    try:
+        return _jobs_device_json(json.loads(document))
+    except (ValueError, RecursionError):
+        return document
 
 
-def _jobs_job_document_object(job_id: str):
-    """The job document as a JSON object — the shape AWS serves over MQTT
-    (over HTTP the same document stays a string; see jobs-mqtt-api vs the
-    REST JobExecution shape). A stored document that is not valid JSON
-    passes through as the raw string rather than being invented into one."""
+class _JobsDocumentText(str):
+    """A job document in its device spelling, written into a Jobs MQTT message as it is."""
+
+
+_JOBS_NON_BMP_RE = re.compile("[\\U00010000-\\U0010FFFF]")
+
+
+def _jobs_utf16_escape(match: re.Match) -> str:
+    """A character outside the BMP as the escapes of its UTF-16 surrogate pair."""
+    code = ord(match.group()) - 0x10000
+    return f"\\u{0xD800 + (code >> 10):04X}\\u{0xDC00 + (code & 0x3FF):04X}"
+
+
+def _jobs_job_document_object(job_id: str, escape_non_bmp: bool = False):
+    """The job document a Jobs MQTT message carries; a stored text that is not JSON goes out as a string."""
     document = jobs_job_document(job_id)
     try:
-        return json.loads(document)
-    except ValueError:
+        json.loads(document)
+    except (ValueError, RecursionError):
         return document
+    if escape_non_bmp:
+        document = _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, document)
+    return _JobsDocumentText(document)
+
+
+_JOBS_MQTT_EXECUTION_MEMBERS = (
+    "jobId", "status", "statusDetails", "queuedAt", "startedAt", "lastUpdatedAt",
+    "versionNumber", "executionNumber", "approximateSecondsBeforeTimedOut", "jobDocument",
+)
+
+
+def _jobs_mqtt_execution(execution: dict, document) -> dict:
+    """A JobExecution as Jobs MQTT messages carry it: AWS's member order, no thingName."""
+    view = jobs_execution_view(execution, document)
+    return {key: view[key] for key in _JOBS_MQTT_EXECUTION_MEMBERS if key in view}
+
+
+def _jobs_mqtt_head(client_token, timestamp: int) -> dict:
+    """The members a Jobs MQTT response starts with: the request's clientToken, if any, then timestamp."""
+    head = {} if client_token is None else {"clientToken": client_token}
+    head["timestamp"] = timestamp
+    return head
+
+
+def jobs_execution_state(execution: dict) -> dict:
+    """The executionState of an update or a Jobs MQTT rejection: statusDetails only when set."""
+    state = {"status": execution["status"]}
+    if execution.get("statusDetails") is not None:
+        state["statusDetails"] = execution["statusDetails"]
+    state["versionNumber"] = execution["versionNumber"]
+    return state
+
+
+def _jobs_mqtt_json(value) -> str:
+    """Compact JSON of a Jobs MQTT message: characters outside the BMP escaped, a job document's text kept as it is."""
+    if isinstance(value, _JobsDocumentText):
+        return value
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{_jobs_mqtt_json(key)}:{_jobs_mqtt_json(member)}" for key, member in value.items()
+        ) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(map(_jobs_mqtt_json, value)) + "]"
+    if isinstance(value, str):
+        return _JOBS_NON_BMP_RE.sub(_jobs_utf16_escape, _jobs_device_json(value))
+    return _jobs_device_json(value)
+
+
+def _jobs_status_details_error(status_details):
+    """InvalidRequestException unless statusDetails is a map of non-empty strings, as the DetailsMap shape is."""
+    if status_details is None or (isinstance(status_details, dict) and all(
+            isinstance(k, str) and k and isinstance(v, str) and v for k, v in status_details.items())):
+        return None
+    return error_response_json(
+        "InvalidRequestException", "statusDetails must be a map of non-empty string keys to non-empty strings", 400)
 
 
 def jobs_update_execution(
@@ -6380,42 +8406,23 @@ def jobs_update_execution(
     expected_version=None,
     status_details: dict | None = None,
     step_timeout_minutes=None,
+    execution_number=None,
 ) -> tuple:
     """Apply a device-reported status to an execution.
 
     Returns ``(execution copy, None)``, or ``(None, error)`` for every
-    rejection: unknown execution (404), stale or non-numeric
-    `expectedVersion`, an already-terminal execution, an unknown status, the
-    illegal walk back to QUEUED, and the service-side statuses a device may
-    not set. A successful update may complete the job.
+    rejection, in this order: an unknown status or one a device may not set
+    (QUEUED and the service-side statuses), unknown execution or
+    `execution_number` (404), stale or non-numeric `expectedVersion`, and an
+    already-terminal execution. A successful update may complete the job.
     """
-    _jobs_materialize_executions(job_id)
-    execution = _job_executions.get((thing_name, job_id))
-    if execution is None:
-        return None, error_response_json(
-            "ResourceNotFoundException",
-            f"No job execution found for thing {thing_name} and job {job_id}",
-            404,
-        )
-    error = _jobs_check_expected_version(
-        execution, expected_version, "InvalidStateTransitionException"
-    )
-    if error:
-        return None, error
-    error = _jobs_reject_if_terminal(execution, "updated")
-    if error:
+    if error := _jobs_status_details_error(status_details):
         return None, error
     if not status or status not in _JOB_EXECUTION_STATUSES:
         return None, error_response_json(
             "InvalidRequestException",
             f"Invalid job execution status: {status!r}",
             400,
-        )
-    if status == "QUEUED":
-        return None, error_response_json(
-            "InvalidStateTransitionException",
-            "A device cannot move a job execution back to QUEUED",
-            409,
         )
     if status not in _DEVICE_SETTABLE_STATUSES:
         # InvalidStateTransitionException, not InvalidRequestException
@@ -6425,11 +8432,33 @@ def jobs_update_execution(
             f"The status of job execution cannot be changed to be {status}",
             409,
         )
+    _jobs_materialize_executions(job_id)
+    execution = _job_executions.get((thing_name, job_id))
+    if execution_number is not None and execution and execution_number != execution["executionNumber"]:
+        execution = None
+    if execution is None:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"Job {job_id} not found for {thing_name}",
+            404,
+        )
+    error = _jobs_check_expected_version(
+        execution, expected_version, "InvalidRequestException", 400
+    )
+    if error:
+        return None, error
+    error = _jobs_reject_if_terminal(
+        execution,
+        f"Job {job_id} for {thing_name} has already finished with status {execution['status']}",
+    )
+    if error:
+        return None, error
     now = _jobs_now_ms()
     execution["status"] = status
-    if status_details:
+    if status_details is not None:
         execution["statusDetails"] = dict(status_details)
-    if status == "IN_PROGRESS" and execution.get("startedAt") is None:
+    # The first report starts the execution, unless the device rejects the job.
+    if status != "REJECTED" and execution.get("startedAt") is None:
         execution["startedAt"] = now
     if status == "IN_PROGRESS" and step_timeout_minutes is not None:
         # The device's own step timeout, reset every time it re-reports
@@ -6444,23 +8473,32 @@ def jobs_update_execution(
     return dict(execution), None
 
 
+async def jobs_abort_if_met(account_id: str, region: str, job_id: str) -> None:
+    """Apply the job's abortConfig after an execution finished, notifying the things whose execution it canceled."""
+    with request_scope(account_id, region):
+        canceled = _jobs_abort(job_id)
+    for thing_name in sorted(canceled):
+        await jobs_notify_thing(account_id, region, thing_name, canceled[thing_name])
+
+
 def jobs_execution_view(execution: dict, document: str | dict | None) -> dict:
     """Device-plane JobExecution — whole-second ``long`` timestamps (the API
     reference words every stamp as "the time, in seconds since the epoch"),
     flat statusDetails map. Shared by the iot-jobs-data HTTP plane (which
     passes ``document`` as the string AWS serves there) and the
-    jobs-over-MQTT bridge (which passes the parsed object) so both speak one
+    jobs-over-MQTT bridge (which passes the document as JSON) so both speak one
     shape."""
     view = {
         "jobId": execution["jobId"],
         "thingName": execution["thingName"],
         "status": execution["status"],
-        "statusDetails": execution.get("statusDetails") or {},
         "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
         "executionNumber": execution["executionNumber"],
         "versionNumber": execution["versionNumber"],
     }
+    if execution.get("statusDetails") is not None:
+        view["statusDetails"] = dict(execution["statusDetails"])
     if execution.get("startedAt") is not None:
         view["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
     remaining = _jobs_seconds_before_timeout(execution)
@@ -6478,11 +8516,11 @@ def jobs_execution_summary(execution: dict) -> dict:
         "jobId": execution["jobId"],
         "queuedAt": _jobs_ms_to_long_s(execution["queuedAt"]),
         "lastUpdatedAt": _jobs_ms_to_long_s(execution["lastUpdatedAt"]),
-        "versionNumber": execution["versionNumber"],
-        "executionNumber": execution["executionNumber"],
     }
     if execution.get("startedAt") is not None:
         entry["startedAt"] = _jobs_ms_to_long_s(execution["startedAt"])
+    entry["executionNumber"] = execution["executionNumber"]
+    entry["versionNumber"] = execution["versionNumber"]
     return entry
 
 
@@ -6520,16 +8558,10 @@ async def jobs_notify_thing(
         pending = jobs_pending_for_thing(thing_name)
         nxt = jobs_start_next_execution(thing_name, peek=True)
         next_view = (
-            jobs_execution_view(nxt, _jobs_job_document_object(nxt["jobId"]))
+            _jobs_mqtt_execution(nxt, _jobs_job_document_object(nxt["jobId"]))
             if nxt is not None
             else None
         )
-    if next_view is not None:
-        # AWS sends no thingName and no empty statusDetails here (measured
-        # eu-central-1 2026-10-05).
-        del next_view["thingName"]
-        if not next_view["statusDetails"]:
-            del next_view["statusDetails"]
     ts = int(time.time())
     jobs_by_status: dict = {}
     for execution in pending:
@@ -6539,7 +8571,7 @@ async def jobs_notify_thing(
     base = f"$aws/things/{thing_name}/jobs"
     await broker_publish(
         account_id, region, f"{base}/notify",
-        json.dumps({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
+        _jobs_mqtt_json({"timestamp": ts, "jobs": jobs_by_status}).encode("utf-8"), qos=1,
     )
     next_job_id = nxt["jobId"] if nxt is not None else None
     if next_job_id == prev_next_job_id:
@@ -6549,7 +8581,7 @@ async def jobs_notify_thing(
         notify_next["execution"] = next_view
     await broker_publish(
         account_id, region, f"{base}/notify-next",
-        json.dumps(notify_next).encode("utf-8"), qos=1,
+        _jobs_mqtt_json(notify_next).encode("utf-8"), qos=1,
     )
 
 
@@ -6632,6 +8664,21 @@ def _metadata_for_delta(delta: dict, desired_meta: dict) -> dict:
 
 def _shadow_error(status: int, message: str) -> tuple:
     return status, {"message": message}
+
+
+def _shadow_number(text: str):
+    """A JSON number with a fraction or exponent; one beyond a double's range is stored as AWS stores it."""
+    value = float(text)
+    if math.isfinite(value):
+        return value
+    return "Infinity" if value > 0 else "-Infinity"
+
+
+def parse_shadow_request(payload):
+    """A shadow request payload as AWS reads it; ValueError when it is not JSON (NaN and Infinity are not)."""
+    from ministack.services.eventbridge import _reject_json_constant
+
+    return json.loads(payload, parse_constant=_reject_json_constant, parse_float=_shadow_number)
 
 
 def update_thing_shadow(thing_name: str, shadow_name: str, request: dict) -> tuple:
@@ -6753,10 +8800,10 @@ def delete_thing_shadow(thing_name: str, shadow_name: str) -> tuple:
 # property blocks on every packet that carries one, all four fields of the
 # subscription-options byte (QoS, No Local, Retain As Published, Retain
 # Handling), v5 reason codes on CONNACK/SUBACK/PUBACK/UNSUBACK/DISCONNECT, an
-# assigned client identifier, and pass-through of the PUBLISH properties a
-# subscriber may echo back. Out of scope, and advertised as unavailable in
-# CONNACK where the protocol has a flag for it: shared subscriptions, topic
-# aliases, message expiry, flow control (receive maximum), subscription
+# assigned client identifier, message expiry, and pass-through of the
+# PUBLISH properties a subscriber may echo back. Out of scope, and advertised
+# as unavailable in CONNACK where the protocol has a flag for it: shared
+# subscriptions, topic aliases, flow control (receive maximum), subscription
 # identifiers, and request/response semantics beyond forwarding the
 # properties untouched. Properties this broker does not model are parsed and
 # ignored, never echoed back.
@@ -6797,7 +8844,7 @@ _MAX_QUEUED_MESSAGES = 1000
 class _PersistentSessionState:
     __slots__ = (
         "subscriptions", "queued_messages", "created_at", "expiry_interval",
-        "session_identifier",
+        "session_identifier", "in_flight", "next_packet_id",
     )
 
     def __init__(
@@ -6808,7 +8855,8 @@ class _PersistentSessionState:
         session_identifier: str | None = None,
     ):
         self.subscriptions: list[str] = subscriptions
-        self.queued_messages: list[tuple[str, bytes, int]] = []
+        # (topic, payload, qos, PUBLISH properties, time the broker received it)
+        self.queued_messages: list[tuple[str, bytes, int, bytes, float]] = []
         self.created_at: float = created_at
         # Seconds this session outlives its connection, as the client asked
         # for it in the MQTT 5 Session Expiry Interval. None means the client
@@ -6817,6 +8865,10 @@ class _PersistentSessionState:
         self.expiry_interval: int | None = expiry_interval
         # Reported as ``sessionIdentifier`` by every connection that resumes it.
         self.session_identifier: str = session_identifier or str(uuid.uuid4())
+        # QoS 1 messages sent but not acknowledged when the connection ended,
+        # and the packet identifier counter, both handed to the next resume.
+        self.in_flight: dict[int, "_InFlightMessage"] = {}
+        self.next_packet_id: int = 1
 
 
 def _is_session_expired(session_state: _PersistentSessionState) -> bool:
@@ -6953,6 +9005,9 @@ def _subscription_matches(filter_: str, topic: str) -> bool:
     """Whether a subscription's or rule's filter matches; ``$aws/events`` skips filters that start with a wildcard."""
     if topic.startswith("$aws/events/") and filter_[:1] in ("#", "+"):
         return False
+    # AWS IoT delivers nothing to `a/#` from the level above it, `a`.
+    if filter_.endswith("/#") and topic.count("/") < filter_.count("/"):
+        return False
     return _topic_matches(filter_, topic)
 
 
@@ -6973,11 +9028,8 @@ def _validate_publish_topic(topic: str) -> bool:
     return True
 
 
-# The reserved topic space a client may publish into. AWS closes the connection
-# of an MQTT client that publishes to any other topic starting with ``$``
-# (measured for ``$aws/events/...``, ``$aws/jobs/...`` and ``$foo/...``; a
-# publish under ``$aws/rules/`` and ``$aws/things/`` is acknowledged). The HTTPS
-# Publish in iot_data.py applies the same list and answers 400.
+# The reserved topic families an HTTPS Publish may write into; iot_data.py
+# answers 400 for any other topic starting with ``$``.
 RESERVED_PUBLISH_PREFIXES = (
     "$aws/rules/",
     "$aws/things/",
@@ -6987,9 +9039,128 @@ RESERVED_PUBLISH_PREFIXES = (
     "$aws/commands/",
 )
 
+# Over MQTT a client may publish anywhere under $aws/rules/ and $aws/things/
+# except to the replies and notifications AWS IoT itself writes there, and
+# elsewhere in the reserved space only to the request topics below.
+_RESERVED_REPLY_TOPIC_RE = re.compile(
+    r"\$aws/things/[^/]+/(jobs/((get|start-next|[^/]+/(get|update))/(accepted|rejected)|notify|notify-next)"
+    r"|defender/metrics/[^/]+/(accepted|rejected)|streams/[^/]+/(data|description|rejected)/[^/]+)"
+)
+_RESERVED_REQUEST_TOPIC_RE = re.compile(
+    r"\$aws/(certificates/create(-from-csr)?/[^/]+|provisioning-templates/[^/]+/provision/[^/]+"
+    r"|device_location/[^/]+/get_position_estimate|commands/[^/]+/[^/]+/executions/[^/]+/response/(json|cbor))"
+)
+
+# The reserved filters a client may subscribe to; a variable segment may be a "+".
+_RESERVED_FILTER_RE = re.compile(
+    r"\$aws/(things/.+|events/.+|sitewise/asset-models/[^/]+/assets/[^/]+/properties/[^/]+"
+    r"|certificates/create(-from-csr)?/[^/]+/(accepted|rejected)"
+    r"|provisioning-templates/[^/]+/provision/[^/]+/(accepted|rejected)"
+    r"|device_location/[^/]+/get_position_estimate/(accepted|rejected)"
+    r"|commands/[^/]+/[^/]+/executions/[^/]+/(request(/(json|cbor))?|response/(accepted|rejected)/(json|cbor)))"
+)
+
 
 def _reserved_topic_publish_allowed(topic: str) -> bool:
-    return not topic.startswith("$") or topic.startswith(RESERVED_PUBLISH_PREFIXES)
+    if not topic.startswith("$"):
+        return True
+    if topic.startswith(("$aws/rules/", "$aws/things/")):
+        return _RESERVED_REPLY_TOPIC_RE.fullmatch(topic) is None
+    return _RESERVED_REQUEST_TOPIC_RE.fullmatch(topic) is not None
+
+
+def _reserved_filter_subscribe_allowed(topic_filter: str) -> bool:
+    if topic_filter.startswith("$share/"):
+        # A shared subscription ($share/{ShareName}/{TopicFilter}) is held to the rule for its filter.
+        topic_filter = topic_filter.split("/", 2)[2] if topic_filter.count("/") >= 2 else ""
+    return not topic_filter.startswith("$") or _RESERVED_FILTER_RE.fullmatch(topic_filter) is not None
+
+
+_POLICY_VARIABLE_RE = re.compile(r"\$\{(iot:[A-Za-z.]+)\}")
+
+
+def _mqtt_policy_context(account_id: str, region: str, certificate_id: str, client_id: str) -> dict:
+    """The policy variables of a certificate session, keyed in lower case."""
+    with request_scope(account_id, region):
+        record = _certificates.get(certificate_id) or {}
+        attached = client_id in _things and _thing_arn(client_id) in record.get("attachedThings", [])
+    context = {"iot:clientid": client_id, "iot:connection.thing.isattached": str(attached).lower()}
+    if attached:
+        context["iot:connection.thing.thingname"] = client_id
+    common_name = certificate_common_name(record["certificatePem"]) if record.get("certificatePem") else None
+    if common_name is not None:
+        context["iot:certificate.subject.commonname"] = common_name
+    return context
+
+
+@functools.lru_cache(maxsize=1024)
+def _parsed_iot_policy(document: str, context: tuple) -> list:
+    """The statements of an IoT policy document with the policy variables in ``context`` substituted."""
+    values = dict(context)
+
+    def substitute(match: re.Match) -> str:
+        value = values.get(match.group(1).lower())
+        return match.group(0) if value is None else json.dumps(value)[1:-1]
+
+    return parse_policy_document(_POLICY_VARIABLE_RE.sub(substitute, document))
+
+
+@functools.lru_cache(maxsize=256)
+def _provisioning_claim_policy(template_name: str) -> str:
+    """The policy of a claim certificate: its template's fleet provisioning topics and nothing else."""
+    topics = [
+        "$aws/certificates/create/*",
+        "$aws/certificates/create-from-csr/*",
+        f"$aws/provisioning-templates/{template_name}/provision/*",
+    ]
+    return json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Connect", "Resource": "*"},
+        {"Effect": "Allow", "Action": ["iot:Publish", "iot:Receive"],
+         "Resource": [f"arn:aws:iot:*:*:topic/{topic}" for topic in topics]},
+        {"Effect": "Allow", "Action": "iot:Subscribe",
+         "Resource": [f"arn:aws:iot:*:*:topicfilter/{topic}" for topic in topics]},
+    ]})
+
+
+def _mqtt_policy_allows(
+    account_id: str,
+    region: str,
+    certificate_id: str,
+    context: dict,
+    action: str,
+    resource: str,
+    provisioning_template: str | None = None,
+) -> bool:
+    """Whether the policies attached to the certificate, or a claim's own policy, allow ``action`` on ``resource``."""
+    if provisioning_template is not None:
+        documents = [_provisioning_claim_policy(provisioning_template)]
+    else:
+        with request_scope(account_id, region):
+            record = _certificates.get(certificate_id) or {}
+            policies = [_policies.get(name) for name in record.get("attachedPolicies", [])]
+        documents = [p["versions"][p["defaultVersionId"]]["document"] for p in policies if p]
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:iot:{region}:{account_id}:cert/{certificate_id}",
+        principal_type="Certificate",
+        principal_account=account_id,
+        action=action,
+        resource_arn=f"arn:aws:iot:{region}:{account_id}:{resource}",
+        region=region,
+        service_context=context,
+    )
+    variables = tuple(sorted(context.items()))
+    return evaluate(ctx, [_parsed_iot_policy(doc, variables) for doc in documents]).decision == "Allow"
+
+
+def _mqtt_iam_allows(
+    account_id: str, region: str, credential: tuple[str, str], action: str, resource: str
+) -> bool:
+    """Whether the IAM policies of the key that signed a WebSocket session allow ``action`` on ``resource``."""
+    from ministack.core.iam_evaluator import enforce
+
+    access_key_id, key_account = credential
+    with request_scope(key_account, region):
+        return enforce(access_key_id, action, "iot", region, f"arn:aws:iot:{region}:{account_id}:{resource}") is None
 
 
 # ---------------------------------------------------------------------------
@@ -7105,14 +9276,34 @@ def _dispatch_rule_to_lambda(
     ).start()
 
 
-# Depth guard for republish chains: rule A republishing onto a topic that rule
-# A (or a cycle of rules) matches again would recurse without bound. Real AWS
-# does not loop-protect either — such a rule is user error — but the emulator
-# must at least not crash, so the chain is cut and logged past this depth.
+# Depth guard for republish chains: put_topic_rule refuses an action that
+# republishes into the rule's own filter, but an errorAction that does, a
+# cycle across rules or a rule restored from saved state would still recurse
+# without bound, so the chain is cut and logged past this depth.
 _MAX_REPUBLISH_DEPTH = 8
 _republish_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "_iot_republish_depth", default=0
 )
+
+_ROLE_SESSION_NAME_CHARS = string.ascii_letters + string.digits
+
+
+def _rule_role_principal(account_id: str, role_arn: str) -> str | None:
+    """principal() of a republished message: the rule role's session, as GetCallerIdentity names it."""
+    from ministack.services import iam as _iam
+
+    try:
+        arn = parse_arn(role_arn)
+    except ArnParseError:
+        return None
+    if arn.account_id != account_id or not arn.resource.startswith("role/"):
+        return None
+    role = _iam._roles.get_scoped(account_id, None, arn.resource.rsplit("/", 1)[-1])
+    if not role:
+        return None
+    # The rules engine names its role sessions with eight random letters and digits.
+    session = "".join(secrets.choice(_ROLE_SESSION_NAME_CHARS) for _ in range(8))
+    return f"{role['RoleId']}:{session}"
 
 
 async def _dispatch_rule_republish(
@@ -7127,8 +9318,7 @@ async def _dispatch_rule_republish(
     depth = _republish_depth.get()
     if depth >= _MAX_REPUBLISH_DEPTH:
         _broker_logger.warning(
-            "IoT rule %s: republish depth limit (%d) reached — dropping republish to %r "
-            "(a rule republishing onto its own topic filter loops forever on AWS too)",
+            "IoT rule %s: republish depth limit (%d) reached — dropping republish to %r",
             rule_name,
             _MAX_REPUBLISH_DEPTH,
             target_topic,
@@ -7146,6 +9336,7 @@ async def _dispatch_rule_republish(
             target_topic,
             json.dumps(event).encode("utf-8"),
             qos=qos,
+            principal=_rule_role_principal(account_id, spec.get("roleArn") or ""),
         )
     finally:
         _republish_depth.reset(token)
@@ -7315,8 +9506,8 @@ async def _dispatch_rule_error_action(
     error_event = {
         "ruleName": rule_name,
         "topic": topic,
-        # The emulator's publish path carries no CloudWatch trace id.
-        "cloudwatchTraceId": "",
+        # The id traceid() returns for the same message.
+        "cloudwatchTraceId": _rule_message_identity.get()[1],
         # "N/A", not "" — and not clientid()'s lowercase "n/a" (measured eu-north-1 2026-09-19).
         "clientId": client_id or "N/A",
         "sourceIp": _publish_source_ip.get(),
@@ -7505,11 +9696,11 @@ def _jobs_rejected(
     enum (InvalidRequest, InvalidJson, ResourceNotFound, VersionMismatch,
     InvalidStateTransition, TerminalStateReached), never a numeric HTTP
     status."""
-    doc = {"code": code, "message": message, "timestamp": int(time.time())}
+    doc = _jobs_mqtt_head(client_token, int(time.time()))
     if execution_state is not None:
         doc["executionState"] = execution_state
-    if client_token is not None:
-        doc["clientToken"] = client_token
+    doc["code"] = code
+    doc["message"] = message
     return doc
 
 
@@ -7519,9 +9710,10 @@ def _jobs_error_tuple_to_rejected(
     """Map a jobs_* seam error (a ready HTTP response tuple) onto the MQTT
     rejected document.
 
-    The HTTP status folds onto the string ErrorCode enum; the three 409s all
-    share one HTTP ``__type`` (InvalidStateTransitionException), so the
-    specific code is read off the message sentence — every candidate
+    The HTTP status folds onto the string ErrorCode enum; the 409s share one
+    HTTP ``__type`` (InvalidStateTransitionException) and the version mismatch
+    shares the 400 with a bad request, so the specific code is read off the
+    message sentence — every candidate
     sentence is authored in this module (_jobs_check_expected_version,
     _jobs_reject_if_terminal, jobs_update_execution), so the match cannot
     drift silently. ``execution`` is the execution's current state, when it
@@ -7535,20 +9727,19 @@ def _jobs_error_tuple_to_rejected(
         message = ""
     if status == 404:
         code = "ResourceNotFound"
-    elif status == 400:
+    elif status == 400 and not message.startswith("Expected version"):
         code = "InvalidRequest"
+    elif status == 410:
+        code = "TerminalStateReached"
     elif message.startswith("Expected version"):
         code = "VersionMismatch"
-    elif "terminal status" in message:
-        code = "TerminalStateReached"
     else:
         code = "InvalidStateTransition"
     execution_state = None
-    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None:
-        execution_state = {
-            "status": execution["status"],
-            "versionNumber": execution["versionNumber"],
-        }
+    # A refused status carries no executionState.
+    refused_status = message.startswith("The status of job execution cannot be changed")
+    if code in ("VersionMismatch", "InvalidStateTransition") and execution is not None and not refused_status:
+        execution_state = jobs_execution_state(execution)
     return _jobs_rejected(code, message, client_token, execution_state)
 
 
@@ -7565,12 +9756,10 @@ async def _handle_jobs_publish(
     ``accepted`` / ``rejected`` responses back through the broker.
 
     Payload members (`statusDetails`, `expectedVersion`,
-    `includeJobExecutionState`, `includeJobDocument`, `clientToken`) follow
-    the device SDK contract and mirror the HTTP plane's handling; the request
-    members `stepTimeoutInMinutes` and `executionNumber` are accepted but
-    ignored — MiniStack has no execution timeouts, and `executionNumber` is
-    write-once so there is never more than one execution to address. Every
-    ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
+    `includeJobExecutionState`, `includeJobDocument`, `clientToken`,
+    `executionNumber`) follow the device SDK contract and mirror the HTTP
+    plane's handling; the request member `stepTimeoutInMinutes` is accepted
+    but ignored. Every ``timestamp`` and execution stamp is epoch seconds; ``jobDocument`` is
     served as a JSON object here (over HTTP it stays a string, as on AWS)."""
     base = f"{SHADOW_TOPIC_PREFIX}{thing}/jobs"
     suffix_base = f"{job_id}/{verb}" if job_id is not None else verb
@@ -7579,7 +9768,7 @@ async def _handle_jobs_publish(
         await broker_publish(
             account_id, region,
             f"{base}/{suffix_base}/{kind}",
-            json.dumps(doc).encode("utf-8"), qos=1,
+            _jobs_mqtt_json(doc).encode("utf-8"), qos=1,
         )
 
     try:
@@ -7607,21 +9796,20 @@ async def _handle_jobs_publish(
     if verb == "get" and job_id is None:
         with request_scope(account_id, region):
             pending = jobs_pending_for_thing(thing)
-        doc = {
-            "timestamp": ts,
-            "inProgressJobs": [
-                jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
-            ],
-            "queuedJobs": [
-                jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
-            ],
-        }
-        if client_token is not None:
-            doc["clientToken"] = client_token
+        doc = _jobs_mqtt_head(client_token, ts)
+        doc["inProgressJobs"] = [
+            jobs_execution_summary(e) for e in pending if e["status"] == "IN_PROGRESS"
+        ]
+        doc["queuedJobs"] = [
+            jobs_execution_summary(e) for e in pending if e["status"] == "QUEUED"
+        ]
         await _respond("accepted", doc)
         return
 
     if verb == "start-next":
+        if error := _jobs_status_details_error(request.get("statusDetails")):
+            await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
+            return
         with request_scope(account_id, region):
             execution = jobs_start_next_execution(
                 thing, status_details=request.get("statusDetails"), peek=False
@@ -7631,11 +9819,9 @@ async def _handle_jobs_publish(
                 if execution is not None
                 else None
             )
-        doc = {"timestamp": ts}
+        doc = _jobs_mqtt_head(client_token, ts)
         if execution is not None:
-            doc["execution"] = jobs_execution_view(execution, document)
-        if client_token is not None:
-            doc["clientToken"] = client_token
+            doc["execution"] = _jobs_mqtt_execution(execution, document)
         await _respond("accepted", doc)
         # No notify / notify-next here: QUEUED -> IN_PROGRESS keeps the
         # execution both pending and at the front of the queue, and AWS stays
@@ -7651,6 +9837,9 @@ async def _handle_jobs_publish(
                 execution = jobs_start_next_execution(thing, peek=True)
             else:
                 execution = jobs_describe_execution(thing, job_id)
+                number = request.get("executionNumber")
+                if number is not None and execution and number != execution["executionNumber"]:
+                    execution = None
             include_document = request.get("includeJobDocument", True)
             document = (
                 _jobs_job_document_object(execution["jobId"])
@@ -7662,17 +9851,19 @@ async def _handle_jobs_publish(
                 "rejected",
                 _jobs_rejected(
                     "ResourceNotFound",
-                    f"No job execution found for thing {thing} and job {job_id}",
+                    f"Job {job_id} not found for {thing}",
                     client_token,
                 ),
             )
             return
+        error = jobs_reject_terminal_describe(execution) if execution is not None else None
+        if error:
+            await _respond("rejected", _jobs_error_tuple_to_rejected(error, client_token))
+            return
         # An idle thing's "$next" mirrors the HTTP plane's empty structure.
-        doc = {"timestamp": ts}
+        doc = _jobs_mqtt_head(client_token, ts)
         if execution is not None:
-            doc["execution"] = jobs_execution_view(execution, document)
-        if client_token is not None:
-            doc["clientToken"] = client_token
+            doc["execution"] = _jobs_mqtt_execution(execution, document)
         await _respond("accepted", doc)
         return
 
@@ -7684,6 +9875,7 @@ async def _handle_jobs_publish(
             status=request.get("status"),
             expected_version=request.get("expectedVersion"),
             status_details=request.get("statusDetails"),
+            execution_number=request.get("executionNumber"),
         )
         current = jobs_describe_execution(thing, job_id) if error else None
     if error:
@@ -7691,24 +9883,19 @@ async def _handle_jobs_publish(
             "rejected", _jobs_error_tuple_to_rejected(error, client_token, current)
         )
         return
-    doc = {"timestamp": ts}
+    doc = _jobs_mqtt_head(client_token, ts)
     if request.get("includeJobExecutionState"):
-        doc["executionState"] = {
-            "status": execution["status"],
-            "statusDetails": execution.get("statusDetails") or {},
-            "versionNumber": execution["versionNumber"],
-        }
+        doc["executionState"] = jobs_execution_state(execution)
     if request.get("includeJobDocument"):
         with request_scope(account_id, region):
-            doc["jobDocument"] = _jobs_job_document_object(job_id)
-    if client_token is not None:
-        doc["clientToken"] = client_token
+            doc["jobDocument"] = _jobs_job_document_object(job_id, escape_non_bmp=True)
     await _respond("accepted", doc)
     if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
         # A terminal report removed the execution from the pending set. AWS
         # publishes update/accepted first, then notify + notify-next
         # (live-captured order) — which the _respond above just preserved.
         await jobs_notify_thing(account_id, region, thing, prev_next)
+        await jobs_abort_if_met(account_id, region, job_id)
 
 
 def _shadow_rejected(status: int, message: str, client_token: str | None = None) -> dict:
@@ -7822,11 +10009,11 @@ async def _handle_shadow_publish(
         )
 
     try:
-        request = json.loads(payload) if payload else {}
+        request = parse_shadow_request(payload) if payload else {}
     except (ValueError, UnicodeDecodeError):
         # All three request verbs reject malformed JSON, as on AWS — a `get`
         # or `delete` payload is optional but must parse when present.
-        await _respond(f"{verb}/rejected", _shadow_rejected(400, "invalid json"))
+        await _respond(f"{verb}/rejected", _shadow_rejected(400, "Payload contains invalid json"))
         return
     if not isinstance(request, dict):
         request = {}
@@ -7896,51 +10083,53 @@ async def broker_publish(
     retain: bool = False,
     properties: bytes = b"",
     client_id: str | None = None,
-) -> int:
+    principal: str | None = None,
+) -> None:
     """Deliver a message to every matching subscriber.
 
     ``properties`` is an encoded MQTT 5 property block forwarded verbatim to
-    v5 subscribers (empty for a 3.1.1 publisher or an HTTP publish). Returns
-    how many recipients the message reached — subscribers delivered to plus
-    offline persistent sessions it was queued for — which is what an MQTT 5
-    PUBACK reports as Success versus No matching subscribers.
+    v5 subscribers (empty for a 3.1.1 publisher or an HTTP publish).
 
     ``client_id`` names the publishing MQTT client, which is what a No Local
     subscription is defined against (§3.8.3.1): that subscriber does not want
     its own messages back. A publish with no client identity — iot_data's HTTP
     Publish, a rule, an in-process caller — matches no subscriber's identity
     and so is delivered to all of them.
+
+    ``principal`` is who published the message, what the rule SQL
+    ``principal()`` returns; rules also see a fresh trace id per message.
     """
-    delivered = 0
     # Basic Ingest: a publish to `$aws/rules/<ruleName>` is delivered straight
     # to that rule's actions and bypasses pub/sub delivery entirely.
     if topic.startswith(_BASIC_INGEST_PREFIX):
         remainder = topic[len(_BASIC_INGEST_PREFIX):].split("/", 1)
         rule_name = remainder[0]
-        await _run_rule_actions(
-            account_id,
-            region,
-            _topic_rules.get_scoped(account_id, region, rule_name),
-            payload,
-            # Under Basic Ingest `topic()` reports the topic after the
-            # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
-            remainder[1] if len(remainder) > 1 else "",
-            client_id,
-        )
-        return delivered
+        with _rule_message_scope(principal):
+            await _run_rule_actions(
+                account_id,
+                region,
+                _topic_rules.get_scoped(account_id, region, rule_name),
+                payload,
+                # Under Basic Ingest `topic()` reports the topic after the
+                # `$aws/rules/<ruleName>/` prefix, as it does on AWS.
+                remainder[1] if len(remainder) > 1 else "",
+                client_id,
+            )
+        return
 
     scoped = _scoped_topic(account_id, region, topic)
+    received_at = time.time()
 
     if retain:
         if not payload:
             _retained.pop(scoped, None)
         else:
-            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties)
+            _retained[scoped] = _RetainedMessage(scoped, payload, qos, properties, received_at)
 
     async with _broker_lock:
         subs = [s for sset in _subscriptions.values() for s in sset]
 
-    token = _delivery_properties.set(properties)
+    token = _delivery_properties.set(_aged_properties(properties, received_at, received_at) or b"")
     try:
         for sub in subs:
             if sub.account_id != account_id or sub.region != region:
@@ -7963,7 +10152,6 @@ async def broker_publish(
                         payload,
                         effective_qos,
                     )
-                    delivered += 1
                 except Exception:
                     _broker_logger.exception("IoT broker: subscriber %s delivery failed", sub.subscription_id)
                 finally:
@@ -7982,13 +10170,13 @@ async def broker_publish(
                 continue
             for filt in ps.subscriptions:
                 if _subscription_matches(filt, topic):
-                    ps.queued_messages.append((topic, payload, qos))
+                    ps.queued_messages.append((topic, payload, qos, properties, received_at))
                     if len(ps.queued_messages) > _MAX_QUEUED_MESSAGES:
                         ps.queued_messages = ps.queued_messages[-_MAX_QUEUED_MESSAGES:]
-                    delivered += 1
                     break
 
-    await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
+    with _rule_message_scope(principal):
+        await _evaluate_topic_rules(account_id, region, topic, payload, client_id)
 
     # Shadow-over-MQTT bridge — AFTER delivery and rule evaluation, so rules
     # matching `$aws/things/+/shadow/update` fire on the request, and the
@@ -8021,8 +10209,6 @@ async def broker_publish(
             _broker_logger.warning(
                 "IoT jobs bridge failed for %r", topic, exc_info=True
             )
-
-    return delivered
 
 
 async def broker_subscribe(
@@ -8076,7 +10262,10 @@ async def broker_subscribe(
             retained_to_send = []
 
     for r in retained_to_send:
-        token = _delivery_properties.set(r.properties)
+        properties = _aged_properties(r.properties, r.ts)
+        if properties is None:
+            continue
+        token = _delivery_properties.set(properties)
         # §3.3.1.3: a message sent because a subscription was established
         # carries RETAIN 1 whatever the subscription's Retain As Published
         # says — that flag is how the client tells this apart from live
@@ -8103,6 +10292,27 @@ async def broker_unsubscribe(subscription_id: str) -> None:
                     subs.discard(s)
             if not subs:
                 _subscriptions.pop(filter_, None)
+
+
+def broker_get_retained(account_id: str, region: str, topic: str) -> "_RetainedMessage | None":
+    """The retained message stored for ``topic``, or None; an expired one is dropped here."""
+    scoped = _scoped_topic(account_id, region, topic)
+    msg = _retained.get(scoped)
+    if msg is not None and msg.expired(time.time()):
+        _retained.pop(scoped, None)
+        return None
+    return msg
+
+
+def broker_list_retained(account_id: str, region: str) -> list[tuple[str, "_RetainedMessage"]]:
+    """``(topic, message)`` for every retained message here, most recently stored first."""
+    prefix = f"{account_id}/{region}/"
+    now = time.time()
+    for key in [k for k, m in _retained.items() if k.startswith(prefix) and m.expired(now)]:
+        del _retained[key]
+    found = [(k[len(prefix):], m) for k, m in _retained.items() if k.startswith(prefix)]
+    found.sort(key=lambda item: item[1].ts, reverse=True)
+    return found
 
 
 def broker_reset() -> None:
@@ -8240,11 +10450,11 @@ CONNACK_311_NOT_AUTHORIZED = 0x05
 # MQTT 5 reason codes, only the ones this broker produces (§2.4). Success and
 # Normal disconnection share the value 0x00.
 RC5_SUCCESS = 0x00
-RC5_NO_MATCHING_SUBSCRIBERS = 0x10
 RC5_NO_SUBSCRIPTION_EXISTED = 0x11
 RC5_MALFORMED_PACKET = 0x81
 RC5_NOT_AUTHORIZED = 0x87
 RC5_SESSION_TAKEN_OVER = 0x8E
+RC5_TOPIC_FILTER_INVALID = 0x8F
 RC5_TOPIC_NAME_INVALID = 0x90
 
 # Layout of the MQTT 5 SUBSCRIBE options byte (§3.8.3.1). MQTT 3.1.1 sends a
@@ -8320,7 +10530,8 @@ _PROPERTY_TYPES: dict[int, str] = {
     PROP_SHARED_SUBSCRIPTION_AVAILABLE: "byte",
 }
 
-# PUBLISH properties handed on to subscribers unchanged. §3.3.2.3 requires a
+# PUBLISH properties handed on to subscribers unchanged, except the expiry
+# interval, which loses the time the message waited. §3.3.2.3 requires a
 # server to forward these, and a request/response client depends on getting
 # its own response topic and correlation data back. Everything else a
 # publisher sends (topic alias, subscription identifier, anything this broker
@@ -8333,6 +10544,9 @@ _FORWARDED_PUBLISH_PROPERTIES = frozenset({
     PROP_CORRELATION_DATA,
     PROP_USER_PROPERTY,
 })
+
+# AWS IoT Core counts a Message Expiry Interval of 0 as 1 and caps it at seven days.
+_MESSAGE_EXPIRY_MAX = 604800
 
 # MQTT 5 PUBLISH properties ride a contextvar rather than the subscriber
 # callback signature. ``deliver(topic, payload, qos)`` is the broker's
@@ -8359,6 +10573,32 @@ _publish_source_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
 _delivery_retain: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_iot_delivery_retain", default=False
 )
+
+
+# The principal and trace id of the message the rules engine is evaluating, for
+# principal(), traceid() and the errorAction document. Scoped to one message's
+# rule evaluation, so a republished message carries its own.
+_rule_message_identity: contextvars.ContextVar[tuple[str | None, str]] = contextvars.ContextVar(
+    "_iot_rule_message_identity", default=(None, "")
+)
+
+
+@contextlib.contextmanager
+def _rule_message_scope(principal: str | None):
+    """Scope a message's principal and a fresh trace id over its rule evaluation."""
+    token = _rule_message_identity.set((principal, new_uuid()))
+    try:
+        yield
+    finally:
+        _rule_message_identity.reset(token)
+
+
+def _caller_principal(access_key: str) -> str:
+    """principal() of an IAM-signed publish: the caller's user id as GetCallerIdentity reports it."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+
+    identity = resolve_caller_identity(access_key)
+    return identity["userId"] if identity else get_account_id()
 
 
 def _encode_remaining_length(n: int) -> bytes:
@@ -8521,6 +10761,40 @@ def _forwardable_publish_properties(props: list[tuple[int, object]]) -> bytes:
     return _encode_properties(kept)
 
 
+def _expiry_interval(props: list[tuple[int, object]]) -> int | None:
+    """The Message Expiry Interval among decoded PUBLISH properties, as AWS IoT Core bounds it."""
+    interval = _property_value(props, PROP_MESSAGE_EXPIRY_INTERVAL, None)
+    if interval is None:
+        return None
+    return min(max(int(interval), 1), _MESSAGE_EXPIRY_MAX)  # type: ignore[arg-type]
+
+
+def _message_expires_at(properties: bytes, received_at: float) -> float | None:
+    """When a message with this PUBLISH property block expires, or None if it never does."""
+    if not properties:
+        return None
+    interval = _expiry_interval(_decode_properties(properties, 0)[0])
+    return None if interval is None else received_at + interval
+
+
+def _aged_properties(properties: bytes, received_at: float, now: float | None = None) -> bytes | None:
+    """``properties`` with the expiry interval lowered to the whole seconds left, None once expired."""
+    if not properties:
+        return properties
+    props, _ = _decode_properties(properties, 0)
+    interval = _expiry_interval(props)
+    if interval is None:
+        return properties
+    left = received_at + interval - (time.time() if now is None else now)
+    if left <= 0:
+        return None
+    # A started second counts as spent: 60 goes out as 59, and 999 ms left as 0.
+    seconds = math.ceil(left) - 1
+    return _encode_properties(
+        [(i, seconds if i == PROP_MESSAGE_EXPIRY_INTERVAL else v) for i, v in props]
+    )
+
+
 def _make_connack(
     return_code: int = 0,
     session_present: bool = False,
@@ -8609,7 +10883,9 @@ class _WSSession:
         self._send = send_coro
         self.account_id = account_id
         self.region = region
-        # Lifecycle-event principal: the client certificate id, else the account.
+        self._cleaned_up = False
+        # The client certificate id or the IAM caller's user id, else the account:
+        # lifecycle events' principalIdentifier and the rule SQL principal().
         self._principal = principal or account_id
         self._session_identifier = ""
         self._presence_version = 0
@@ -8639,14 +10915,25 @@ class _WSSession:
         # Set when the broker itself ends the session, overriding whatever the
         # socket then looks like from the client's side.
         self._forced_disconnect_reason: str | None = None
+        # The client certificate of an mTLS session; its policies are evaluated
+        # under AUTH=true.
+        self.certificate_id: str | None = None
+        # The template of a provisioning claim certificate, which has a policy of its own.
+        self.provisioning_template: str | None = None
+        # The access key and account of an IAM principal that signed a WebSocket
+        # session; its IAM policies are evaluated under AUTH=true.
+        self.iam_credential: tuple[str, str] | None = None
+        self._policy_context: dict = {}
 
     def disconnect_reason(self) -> str:
         """Why this session ended, in AWS's disconnect-reason vocabulary.
 
-        Only the three the broker can actually tell apart are ever reported: a
+        Only the reasons the broker can actually tell apart are ever reported: a
         DISCONNECT packet (``CLIENT_INITIATED_DISCONNECT``), a takeover by a
         second connection using the same client id (``DUPLICATE_CLIENTID``),
-        and everything else — a transport that went away (``CONNECTION_LOST``).
+        a packet the session's policies refuse (``CLIENT_ERROR`` on 3.1.1,
+        ``AUTH_ERROR`` on MQTT 5), and everything else — a transport that went
+        away (``CONNECTION_LOST``).
         AWS's remaining reasons name machinery this broker does not have
         (throttling, credential expiry, keep-alive enforcement), so reporting
         one would be a guess dressed up as a fact.
@@ -8666,7 +10953,7 @@ class _WSSession:
         lifecycle events, so none is published for them."""
         if "#" in self._client_id or "+" in self._client_id:
             return
-        group ="presence" if event_type.endswith("connected") else "subscriptions"
+        group = "subscriptions" if event_type.endswith("subscribed") else "presence"
         await _publish_event(
             self.account_id,
             self.region,
@@ -8689,9 +10976,38 @@ class _WSSession:
             versionNumber=self._presence_version,
         )
 
+    async def _answer_fleet_provisioning(
+        self, topic: str, operation: str, template_name: str | None, payload: bytes
+    ) -> None:
+        """Answer a fleet provisioning request on this connection only, if it subscribed to the reply."""
+        # What a pre-provisioning hook learns about the requester.
+        connection = {"clientId": self._client_id}
+        if self._principal != self.account_id:
+            connection["claimCertificateId"] = self._principal
+        try:
+            async with publishing_events():
+                kind, doc = await _fleet_provisioning_reply(
+                    self.account_id, self.region, operation, template_name, payload, connection
+                )
+        except Exception:
+            _broker_logger.warning("IoT fleet provisioning failed for %r", topic, exc_info=True)
+            return
+        reply_topic = f"{topic}/{kind}"
+        granted = [
+            self._sub_granted_qos.get(sid, 0)
+            for sid, topic_filter in self._sub_filters.items()
+            if _subscription_matches(topic_filter, reply_topic)
+        ]
+        if granted:
+            await self.deliver_to_client(reply_topic, json.dumps(doc).encode("utf-8"), max(granted))
+
     def _alloc_packet_id(self) -> int:
-        pid = self._next_pid
-        self._next_pid = (self._next_pid % 65535) + 1
+        # Skip identifiers still in flight: one id never names two messages at once.
+        for _ in range(65535):
+            pid = self._next_pid
+            self._next_pid = (self._next_pid % 65535) + 1
+            if pid not in self._in_flight:
+                return pid
         return pid
 
     def _ensure_retransmit_timer(self) -> None:
@@ -8701,21 +11017,27 @@ class _WSSession:
     async def _retransmit_loop(self) -> None:
         try:
             while self._in_flight:
-                await asyncio.sleep(_RETRANSMIT_INTERVAL_SECONDS)
+                oldest = min(msg.sent_at for msg in self._in_flight.values())
                 now = asyncio.get_event_loop().time()
-                for pid, msg in list(self._in_flight.items()):
-                    if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
-                        msg.retransmit_count += 1
-                        msg.sent_at = now
-                        await self.send_bytes(
-                            _make_publish(
-                                msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
-                                retain=msg.retain,
-                                properties=self._publish_properties(msg.properties),
-                            )
-                        )
+                await asyncio.sleep(max(oldest + _RETRANSMIT_INTERVAL_SECONDS - now, 0))
+                await self._retransmit_due()
         except asyncio.CancelledError:
             pass
+
+    async def _retransmit_due(self) -> None:
+        """Resend every in-flight QoS 1 message that has waited a retransmit interval for its PUBACK."""
+        now = asyncio.get_event_loop().time()
+        for pid, msg in list(self._in_flight.items()):
+            if now - msg.sent_at >= _RETRANSMIT_INTERVAL_SECONDS:
+                msg.retransmit_count += 1
+                msg.sent_at = now
+                await self.send_bytes(
+                    _make_publish(
+                        msg.topic, msg.payload, qos=1, packet_id=pid, dup=True,
+                        retain=msg.retain,
+                        properties=self._publish_properties(msg.properties),
+                    )
+                )
 
     async def send_bytes(self, b: bytes) -> None:
         async with self._send_lock:
@@ -8733,6 +11055,8 @@ class _WSSession:
         return properties or b"\x00"
 
     async def deliver_to_client(self, topic: str, payload: bytes, qos: int) -> None:
+        if not self._policy_allows("iot:Receive", f"topic/{topic}"):
+            return
         properties = _delivery_properties.get()
         retain = _delivery_retain.get()
         if qos == 0:
@@ -8812,6 +11136,66 @@ class _WSSession:
                     return_code=CONNACK_311_ACCEPTED, session_present=session_present
                 )
             )
+
+    def _evaluates_policies(self) -> bool:
+        """Whether this session is held to its certificate's IoT policies or its signer's IAM policies (AUTH=true)."""
+        from ministack import app
+
+        return app.AUTH and (self.certificate_id is not None or self.iam_credential is not None)
+
+    def _policy_allows(self, action: str, resource: str) -> bool:
+        """Whether this session may do ``action`` on ``resource``."""
+        if self._evaluates_policies() and self.iam_credential is not None:
+            return _mqtt_iam_allows(self.account_id, self.region, self.iam_credential, action, resource)
+        return not self._evaluates_policies() or _mqtt_policy_allows(
+            self.account_id,
+            self.region,
+            self.certificate_id,
+            self._policy_context,
+            action,
+            resource,
+            self.provisioning_template,
+        )
+
+    def _publish_allowed(self, topic: str, retain: bool) -> bool:
+        """iot:Publish on the topic, and iot:RetainPublish too for a retained message."""
+        from ministack import app
+
+        if app.AUTH and self.certificate_id is None and _parse_fleet_provisioning_topic(topic):
+            # Fleet provisioning writes the registry: under AUTH=true it needs an authenticated device.
+            return False
+        resource = f"topic/{topic}"
+        return self._policy_allows("iot:Publish", resource) and (
+            not retain or self._policy_allows("iot:RetainPublish", resource)
+        )
+
+    async def _refuse_connect(self, denied: str) -> bool:
+        """Refuse a CONNECT: CONNACK 0x87 on MQTT 5, a plain close on 3.1.1, and a connect_failed event."""
+        _broker_logger.warning(
+            "IoT broker: CONNECT from %r refused, the attached policies do not allow %s", self._client_id, denied
+        )
+        self._session_identifier = str(uuid.uuid4())
+        await self._publish_lifecycle(
+            "connect_failed", connectFailureReason="AUTHORIZATION_FAILED", ipAddress=_publish_source_ip.get()
+        )
+        self._client_id = ""
+        self._will_topic = None
+        if self.protocol_version == MQTT_5:
+            await self.send_bytes(_make_connack(return_code=RC5_NOT_AUTHORIZED, protocol_version=MQTT_5))
+        return False
+
+    async def _close_unauthorized(self) -> bool:
+        """End the session over a refused packet: DISCONNECT 0x87 on MQTT 5, a plain close on 3.1.1."""
+        # Nothing more reaches the client, its own will included; the filters stay for a stored session.
+        for sid in self._sub_ids:
+            await broker_unsubscribe(sid)
+        self._sub_ids.clear()
+        if self.protocol_version == MQTT_5:
+            self._forced_disconnect_reason = "AUTH_ERROR"
+            await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
+        else:
+            self._forced_disconnect_reason = "CLIENT_ERROR"
+        return False
 
     async def _reject_malformed_packet(self, pkt_type: int, exc: Exception) -> None:
         """Answer a packet this broker could not parse, then let the caller close.
@@ -8960,6 +11344,15 @@ class _WSSession:
                 self._will_retain = False
                 self._will_properties = b""
 
+            if self._evaluates_policies() and self.certificate_id is not None:
+                self._policy_context = _mqtt_policy_context(
+                    self.account_id, self.region, self.certificate_id, client_id
+                )
+            if not self._policy_allows("iot:Connect", f"client/{client_id}"):
+                return await self._refuse_connect(f"iot:Connect on client/{client_id}")
+            if self._will_topic is not None and not self._publish_allowed(self._will_topic, self._will_retain):
+                return await self._refuse_connect(f"the will on topic/{self._will_topic}")
+
             self._graceful_disconnect = False
             self._forced_disconnect_reason = None
             self._session_identifier = str(uuid.uuid4())
@@ -8984,6 +11377,13 @@ class _WSSession:
                 if existing_ps is not None and not _is_session_expired(existing_ps):
                     session_present = True
                     self._session_identifier = existing_ps.session_identifier
+                    # Unacknowledged messages keep their packet identifiers: restore them before
+                    # a resubscription replays a retained message, so no new id collides with them.
+                    self._next_pid = existing_ps.next_packet_id
+                    # The resuming connection receives them only where its own policies allow it.
+                    self._in_flight.update({pid: msg for pid, msg in existing_ps.in_flight.items()
+                                            if self._policy_allows("iot:Receive", f"topic/{msg.topic}")})
+                    existing_ps.in_flight = {}
                     for topic_filter in existing_ps.subscriptions:
                         # A stored session keeps its topic filters, not the
                         # subscription options they were made with: those live
@@ -9003,10 +11403,21 @@ class _WSSession:
                     await self._send_connack(
                         session_present=True, assigned_client_id=assigned_client_id
                     )
+                    # They go out again once their retransmit interval has passed.
+                    await self._retransmit_due()
                     queued = existing_ps.queued_messages[:]
                     existing_ps.queued_messages.clear()
-                    for q_topic, q_payload, q_qos in queued:
-                        await self.deliver_to_client(q_topic, q_payload, q_qos)
+                    for q_topic, q_payload, q_qos, q_properties, q_received_at in queued:
+                        properties = _aged_properties(q_properties, q_received_at)
+                        if properties is None:
+                            continue
+                        token = _delivery_properties.set(properties)
+                        try:
+                            await self.deliver_to_client(q_topic, q_payload, q_qos)
+                        finally:
+                            _delivery_properties.reset(token)
+                    if self._in_flight:
+                        self._ensure_retransmit_timer()
                     await self._publish_connected()
                     return True
                 else:
@@ -9043,14 +11454,33 @@ class _WSSession:
                     await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
             if not _reserved_topic_publish_allowed(topic):
-                # AWS closes the connection without a PUBACK (measured over
-                # MQTT 3.1.1; the MQTT 5 reason code is not measured).
-                _broker_logger.warning("IoT broker: PUBLISH to a reserved topic closes the connection: %r", topic)
+                # Before the policy check: MQTT 5 answers a QoS 1 PUBLISH with
+                # PUBACK 0x90 and keeps the connection, 3.1.1 closes it.
+                _broker_logger.warning("IoT broker: PUBLISH to the reserved topic %r refused", topic)
                 if self.protocol_version == MQTT_5:
-                    await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
+                    if qos == 1 and packet_id is not None:
+                        await self.send_bytes(_make_puback(packet_id, reason_code=RC5_TOPIC_NAME_INVALID))
+                        return True
+                    await self.send_bytes(_make_disconnect(RC5_TOPIC_NAME_INVALID))
                 return False
+            if self.provisioning_template is not None and _mtls_claim_scope(self.certificate_id) is None:
+                # AWS acknowledges a PUBLISH on an expired claim's connection, then closes it.
+                _broker_logger.warning("IoT broker: the provisioning claim of %r has expired", self._client_id)
+                if qos == 1 and packet_id is not None:
+                    await self.send_bytes(_make_puback(packet_id))
+                return await self._close_unauthorized()
+            if not self._publish_allowed(topic, retain):
+                # MQTT 5 answers a refused QoS 1 PUBLISH with PUBACK 0x87 and
+                # keeps the connection.
+                _broker_logger.warning(
+                    "IoT broker: PUBLISH from %r to %r refused by the attached policies", self._client_id, topic
+                )
+                if self.protocol_version == MQTT_5 and qos == 1 and packet_id is not None:
+                    await self.send_bytes(_make_puback(packet_id, reason_code=RC5_NOT_AUTHORIZED))
+                    return True
+                return await self._close_unauthorized()
             payload = body[off:]
-            delivered = await broker_publish(
+            await broker_publish(
                 self.account_id,
                 self.region,
                 topic,
@@ -9059,13 +11489,17 @@ class _WSSession:
                 retain=retain,
                 properties=properties,
                 client_id=self._client_id or None,
+                principal=self._principal,
             )
             if qos == 1 and packet_id is not None:
+                # Success also when nobody subscribes, as AWS IoT answers.
                 if self.protocol_version == MQTT_5:
-                    reason = RC5_SUCCESS if delivered else RC5_NO_MATCHING_SUBSCRIBERS
-                    await self.send_bytes(_make_puback(packet_id, reason_code=reason))
+                    await self.send_bytes(_make_puback(packet_id, reason_code=RC5_SUCCESS))
                 else:
                     await self.send_bytes(_make_puback(packet_id))
+            fleet = _parse_fleet_provisioning_topic(topic)
+            if fleet is not None:
+                await self._answer_fleet_provisioning(topic, *fleet, payload)
             return True
 
         if pkt_type == PKT_SUBSCRIBE:
@@ -9079,7 +11513,6 @@ class _WSSession:
             topics = []
             while off < len(body):
                 topic, off = _read_string(body, off)
-                topics.append(topic)
                 # MQTT 5 replaces 3.1.1's bare QoS byte with a subscription
                 # options byte: the low two bits are the QoS, the rest are No
                 # Local, Retain As Published and Retain Handling. In 3.1.1 the
@@ -9089,6 +11522,23 @@ class _WSSession:
                     raise ValueError("SUBSCRIBE topic filter without options byte")
                 subscription_options = body[off]
                 off += 1
+                if not _reserved_filter_subscribe_allowed(topic):
+                    # Before the policy check: 3.1.1 closes, MQTT 5 refuses this filter alone.
+                    _broker_logger.warning("IoT broker: SUBSCRIBE to the reserved filter %r refused", topic)
+                    if self.protocol_version != MQTT_5:
+                        return False
+                    granted.append(RC5_TOPIC_FILTER_INVALID)
+                    continue
+                if not self._policy_allows("iot:Subscribe", f"topicfilter/{topic}"):
+                    # As on AWS: 3.1.1 closes, MQTT 5 refuses this filter alone.
+                    _broker_logger.warning(
+                        "IoT broker: SUBSCRIBE from %r to %r refused by the attached policies", self._client_id, topic
+                    )
+                    if self.protocol_version != MQTT_5:
+                        return await self._close_unauthorized()
+                    granted.append(RC5_NOT_AUTHORIZED)
+                    continue
+                topics.append(topic)
                 granted_qos = min(subscription_options & SUB_OPT_QOS_MASK, 1)
                 # A granted QoS doubles as an MQTT 5 SUBACK reason code: 0x00
                 # and 0x01 mean the same thing in both versions.
@@ -9114,7 +11564,9 @@ class _WSSession:
             await self.send_bytes(
                 _make_suback(packet_id, granted, protocol_version=self.protocol_version)
             )
-            await self._publish_lifecycle("subscribed", topics=topics)
+            # The event lists the granted filters; one with none granted raises no event.
+            if topics or not granted:
+                await self._publish_lifecycle("subscribed", topics=topics)
             return True
 
         if pkt_type == PKT_PUBACK:
@@ -9198,6 +11650,11 @@ class _WSSession:
         return True
 
     async def cleanup(self) -> None:
+        # A takeover cleans the old connection up, and its own transport loop does again on exit:
+        # the second run must not overwrite the stored session with the evicted connection's state.
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
         if self._retransmit_task is not None and not self._retransmit_task.done():
             self._retransmit_task.cancel()
             try:
@@ -9205,7 +11662,6 @@ class _WSSession:
             except asyncio.CancelledError:
                 pass
             self._retransmit_task = None
-        self._in_flight.clear()
         if not self._graceful_disconnect and self._will_topic is not None:
             await broker_publish(
                 self.account_id,
@@ -9229,6 +11685,7 @@ class _WSSession:
                 _persistent_sessions.pop(
                     (self.account_id, self.region, self._client_id), None
                 )
+        self._in_flight.clear()
         for sid in self._sub_ids:
             await broker_unsubscribe(sid)
         self._sub_ids.clear()
@@ -9255,12 +11712,15 @@ class _WSSession:
             existing.created_at = time.time()
             existing.expiry_interval = self._session_expiry_interval
         else:
-            _persistent_sessions[session_key] = _PersistentSessionState(
+            existing = _persistent_sessions[session_key] = _PersistentSessionState(
                 subscriptions=unprefixed_filters,
                 created_at=time.time(),
                 expiry_interval=self._session_expiry_interval,
                 session_identifier=self._session_identifier,
             )
+        pending = list(self._in_flight.items())[-_MAX_QUEUED_MESSAGES:]
+        existing.in_flight = dict(pending)
+        existing.next_packet_id = self._next_pid
 
 
 async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bool:
@@ -9285,6 +11745,25 @@ async def _feed_session(session: _WSSession, data: bytes, max_buffer: int) -> bo
             return False
 
 
+def _ws_handshake_check(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Under AUTH=true, the upgrade's verified IAM credential or the ``AuthError`` refusing it; else None."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import authenticate_handshake
+
+    return authenticate_handshake(scope) if AUTH else None
+
+
+async def _refuse_ws_handshake(scope: dict, send) -> None:
+    """Answer a refused upgrade with 403 and a trace id, the device gateway's answer to any credential failure."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": "Forbidden", "traceId": str(uuid.uuid4())}, separators=(",", ":")).encode()
+    await send({"type": "websocket.http.response.start", "status": 403,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
+
+
 async def handle_websocket(
     scope: dict, receive, send, account_id: str, region: str
 ) -> None:
@@ -9302,6 +11781,13 @@ async def handle_websocket(
             sub_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
         except UnicodeDecodeError:
             sub_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+    checked = _ws_handshake_check(scope)
+    if isinstance(checked, AuthError):
+        await _refuse_ws_handshake(scope, send)
+        return
+    if checked is not None:
+        # The session belongs to the signing key's account, not the one guessed from the key id.
+        account_id = checked.account_id
     requested = sub_headers.get("sec-websocket-protocol", "")
     chosen = None
     for proto in [p.strip() for p in requested.split(",") if p.strip()]:
@@ -9309,13 +11795,21 @@ async def handle_websocket(
             chosen = proto
             break
 
+    jobs_device_host.set(sub_headers.get("host", ""))
+
     accept: dict = {"type": "websocket.accept"}
     if chosen:
         accept["subprotocol"] = chosen
     await send(accept)
 
     ctx_token = _request_account_id.set(account_id)
-    session = _WSSession(send, account_id, region)
+    query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+    # A verified signer names the session; an unverified credential only guesses one.
+    principal = _caller_principal(checked.access_key_id if checked is not None
+                                  else extract_access_key_id(sub_headers, query))
+    session = _WSSession(send, account_id, region, principal)
+    if checked is not None:
+        session.iam_credential = (checked.access_key_id, checked.account_id)
     max_buffer = _max_frame_buffer_bytes()
 
     try:
@@ -9380,8 +11874,12 @@ async def handle_websocket(
 # * a certificate registered ACTIVE in exactly one account: that account and
 #   region serve the session, which is what gives a device fleet per-tenant
 #   isolation without any credential handling.
+# * a claim certificate from CreateProvisioningClaim, until it expires: the
+#   account and region of its template serve the session, and under AUTH=true
+#   it may use only that template's fleet provisioning topics.
 # * a certificate that is unknown, not ACTIVE, or ACTIVE in several accounts:
-#   refused with a "not authorized" MQTT CONNACK. This reads the X.509
+#   refused with a "not authorized" MQTT CONNACK, or under AUTH=true closed
+#   without one, as on AWS. This reads the X.509
 #   identity lifecycle that the registry already keeps and that the control plane already
 #   enforces (deleting an ACTIVE certificate is CertificateStateException
 #   406), so it is not policy evaluation and not a credential check; a
@@ -9389,6 +11887,11 @@ async def handle_websocket(
 #   mean anything and what real AWS IoT does. The ambiguous case cannot be
 #   attributed at all: two registrations see byte-identical bytes, so any
 #   tie-break would award the session to whoever registered the copy.
+# * with ``AUTH=true``, a session under a certificate is also held to the IoT
+#   policies attached to it, as on AWS: ``iot:Connect`` on the client id at
+#   CONNECT, ``iot:Publish`` (and ``iot:RetainPublish``) for a PUBLISH and the
+#   will, ``iot:Subscribe`` per topic filter and ``iot:Receive`` per delivered
+#   message. Without it no policy is evaluated.
 # * just-in-time registration, as on AWS: a certificate that is unknown, or
 #   still PENDING_ACTIVATION, and signed by a registered CA that is ACTIVE
 #   with auto-registration enabled is created PENDING_ACTIVATION in that CA's
@@ -9414,6 +11917,11 @@ _mtls_lock = asyncio.Lock()
 # Every live connection's writer, so that stopping the listener can close them
 # deliberately and in bounded time (see ``mtls_stop``).
 _mtls_sessions: set[asyncio.StreamWriter] = set()
+# Built on the first connection, not at boot, and dropped when the listener stops.
+_mtls_ssl_context: ssl.SSLContext | None = None
+_mtls_context_lock = asyncio.Lock()
+# TLS upgrades in flight, held so the loop keeps a reference to each task.
+_mtls_upgrades: set[asyncio.Task] = set()
 # Digests of the trust anchors already loaded into the live TLS context;
 # emptied whenever a context is built, since a fresh one starts with none.
 _mtls_loaded_anchors: set[str] = set()
@@ -9676,17 +12184,10 @@ async def _mtls_start_locked() -> None:
     if port is None:
         return
     try:
-        # Building the context can mint the server certificate — and, on first
-        # boot, the CA — which is RSA keygen, so keep it off the event loop.
-        ctx = await asyncio.to_thread(_mtls_build_ssl_context)
-    except Exception as e:
-        _mtls_logger.warning(
-            "IoT mTLS: could not build the TLS context (%s); listener unavailable", e
-        )
-        return
-    try:
-        _mtls_server = await asyncio.start_server(
-            _mtls_handle_conn, host="0.0.0.0", port=port, ssl=ctx
+        # Bound without TLS: the context imports `cryptography` and mints the
+        # server certificate (and the CA), which waits for the first device.
+        _mtls_server = await asyncio.get_running_loop().create_server(
+            _MtlsAcceptor, host="0.0.0.0", port=port
         )
     except OSError as e:
         _mtls_logger.warning(
@@ -9701,7 +12202,8 @@ async def _mtls_start_locked() -> None:
 
 
 async def _mtls_stop_locked() -> None:
-    global _mtls_server
+    global _mtls_server, _mtls_ssl_context
+    _mtls_ssl_context = None
     if _mtls_server is None and not _mtls_sessions:
         return
     if _mtls_server is not None:
@@ -9780,29 +12282,40 @@ def _mtls_refusal_reason(cert_id: str) -> str:
     return "not registered"
 
 
-def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str] | None:
-    """Map a peer certificate (or none) to (account_id, region), or None.
+def _mtls_resolve_identity(der: bytes | None) -> tuple[str, str, str | None] | None:
+    """Map a peer certificate (or none) to (account_id, region, claim template), or None.
 
     None means "this connection is refused". Presenting no certificate is not
     refused: that caller claims nothing and is served under the default
     account, the same way ``_ws_resolve_iot_account_id`` treats an unsigned
     WebSocket upgrade. A certificate that IS presented is read against the
     registry, which is the identity lifecycle this service already keeps:
-    ACTIVE in exactly one account selects it, and unknown, not ACTIVE, or
-    ACTIVE in several accounts is refused by the caller with a "not
-    authorized" CONNACK.
+    ACTIVE in exactly one account selects it, as does an unexpired
+    provisioning claim, and unknown, not ACTIVE, or ACTIVE in several
+    accounts is refused by the caller (``_mtls_refuse``). The claim template
+    is set for a provisioning claim only.
     """
     if not der:
         return (
             os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000"),
             os.environ.get("MINISTACK_REGION", "us-east-1"),
+            None,
         )
     # Same derivation as x509_utils.get_certificate_id, without a PEM round-trip.
     cert_id = hashlib.sha256(der).hexdigest()
     active = _mtls_active_registrations(cert_id)
     if len(active) == 1:
         account_id, region, _record = active[0]
-        return account_id, region
+        return account_id, region, None
+    return _mtls_claim_scope(cert_id)
+
+
+def _mtls_claim_scope(cert_id: str) -> tuple[str, str, str] | None:
+    """(account_id, region, templateName) of the unexpired provisioning claim with this certificate id, or None."""
+    now = time.time()
+    for (account_id, region, key), record in list(_provisioning_claims._data.items()):
+        if key == cert_id and record["expiration"] > now:
+            return account_id, region, record["templateName"]
     return None
 
 
@@ -9953,18 +12466,20 @@ async def _mtls_refuse(
 ) -> None:
     """Answer an unusable client certificate with a "not authorized" CONNACK
     (0x05, or reason code 0x87 for an MQTT 5 client) when the client sent a
-    CONNECT, then close.
+    CONNECT, then close; with AUTH=true, close without one.
 
     AWS closes the socket without a CONNACK unless just-in-time registration
-    applies. Diverging here is deliberate: an emulator's job is
+    applies. Diverging here without AUTH is deliberate: an emulator's job is
     diagnosability, "not authorized" is reported cleanly by every device SDK,
     and a TLS-layer rejection could not tell the user "unknown" from
     "deactivated".
     """
+    from ministack import app
+
     _mtls_logger.warning(
         "IoT mTLS: refusing client certificate %s (%s)", cert_id, _mtls_refusal_reason(cert_id)
     )
-    if protocol_level is None:
+    if protocol_level is None or app.AUTH:
         return
     # The CONNACK has to match the client's protocol level: a v5 client
     # handed the two-byte 3.1.1 form dies in its decoder instead of reporting
@@ -9986,6 +12501,55 @@ async def _mtls_close(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
     except (OSError, ssl.SSLError):
         pass
+
+
+async def _mtls_context() -> ssl.SSLContext | None:
+    """The listener's TLS context, built once on first use; None refuses the connection and a later one retries."""
+    global _mtls_ssl_context
+    async with _mtls_context_lock:
+        if _mtls_ssl_context is None:
+            try:
+                # RSA keygen on first use, so keep it off the event loop.
+                _mtls_ssl_context = await asyncio.to_thread(_mtls_build_ssl_context)
+            except Exception as e:
+                _mtls_logger.warning(
+                    "IoT mTLS: could not build the TLS context (%s); connection refused", e
+                )
+                return None
+        return _mtls_ssl_context
+
+
+class _MtlsAcceptor(asyncio.Protocol):
+    """Accepts plaintext, upgrades it to TLS, then serves the stream session.
+
+    Reading is paused before anything arrives, so the ClientHello stays in the
+    kernel buffer until ``loop.start_tls`` takes over the transport.
+    """
+
+    def connection_made(self, transport):
+        transport.pause_reading()
+        task = asyncio.get_running_loop().create_task(self._upgrade(transport))
+        _mtls_upgrades.add(task)
+        task.add_done_callback(_mtls_upgrades.discard)
+
+    async def _upgrade(self, transport):
+        loop = asyncio.get_running_loop()
+        ctx = await _mtls_context()
+        if ctx is None or transport.is_closing():
+            transport.abort()
+            return
+        reader = asyncio.StreamReader(loop=loop)
+        protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+        try:
+            tls_transport = await loop.start_tls(transport, protocol, ctx, server_side=True)
+        except Exception as e:
+            _mtls_logger.debug("IoT mTLS: TLS handshake failed: %s", e)
+            transport.abort()
+            return
+        # start_tls does not call connection_made on the new protocol.
+        protocol.connection_made(tls_transport)
+        writer = asyncio.StreamWriter(tls_transport, protocol, reader, loop)
+        await _mtls_handle_conn(reader, writer)
 
 
 async def _mtls_handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -10017,7 +12581,7 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
         finally:
             await _mtls_close(writer)
         return
-    account_id, region = owner
+    account_id, region, provisioning_template = owner
 
     async def _tcp_send(message: dict) -> None:
         """Adapter for the two ASGI messages a session ever sends."""
@@ -10030,9 +12594,14 @@ async def _mtls_serve_conn(reader: asyncio.StreamReader, writer: asyncio.StreamW
 
     account_token = _request_account_id.set(account_id)
     region_token = _request_region.set(region)
-    session = _WSSession(
-        _tcp_send, account_id, region, hashlib.sha256(der).hexdigest() if der else None
-    )
+    # The name the device dialled (its SNI), or the address, on the gateway port.
+    local = str((writer.get_extra_info("sockname") or ("",))[0])
+    dialled = _mtls_server_names.get(ssl_object) if ssl_object is not None else None
+    jobs_device_host.set(f"{dialled or (f'[{local}]' if ':' in local else local)}:{_GATEWAY_PORT}")
+    certificate_id = hashlib.sha256(der).hexdigest() if der else None
+    session = _WSSession(_tcp_send, account_id, region, certificate_id)
+    session.certificate_id = certificate_id
+    session.provisioning_template = provisioning_template
     max_buffer = _max_frame_buffer_bytes()
     _mtls_logger.info(
         "IoT mTLS: connection from %s serving %s/%s (%s)",

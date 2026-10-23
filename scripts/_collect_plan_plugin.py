@@ -24,6 +24,9 @@ def pytest_collection_finish(session):
     out = rootpath / COLLECT_PLAN_FILENAME
     counts: dict[str, dict[str, int]] = {}
     for item in session.items:
+        # Auth contracts belong to the separate two-mode matrix, not these shards.
+        if item.get_closest_marker("auth_contract"):
+            continue
         try:
             path = item.path.relative_to(rootpath).as_posix()
         except ValueError:

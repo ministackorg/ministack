@@ -358,6 +358,7 @@ def _create_stack(params):
         "Outputs": [],
         "DisableRollback": disable_rollback,
         "EnableTerminationProtection": termination_protection,
+        "_disable_validation": _p(params, "DisableValidation", "false").lower() == "true",
         "_stack_policy": stack_policy or "",
         "_region": get_region(),
         "_resources": {},
@@ -370,7 +371,7 @@ def _create_stack(params):
     _stack_events[stack_id] = []
 
     _add_event(stack_id, stack_name, stack_name,
-               "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS",
+               "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS", "User Initiated",
                physical_id=stack_id)
 
     deploy = _deploy_stack_async(stack_name, stack_id, template,
@@ -598,6 +599,50 @@ def _describe_stack_events(params):
     return _xml(200, "DescribeStackEventsResponse",
                 f"<DescribeStackEventsResult><StackEvents>{members}</StackEvents>"
                 f"{next_token_xml}</DescribeStackEventsResult>")
+
+
+# --- DescribeEvents ---
+
+_OPERATION_EVENT_FIELDS = (
+    "EventId", "StackId", "OperationId", "OperationType", "OperationStatus", "EventType",
+    "LogicalResourceId", "PhysicalResourceId", "ResourceType", "Timestamp", "ResourceStatus",
+    "ResourceStatusReason", "DetailedStatus", "ValidationFailureMode", "ValidationName",
+    "ValidationStatus", "ValidationStatusReason", "ValidationPath",
+)
+
+
+def _describe_events(params):
+    """The operation events of a stack. MiniStack records them for a create
+    that fails pre-deployment validation, the case the stack event tells the
+    caller to call DescribeEvents for; change-set events are not recorded."""
+    stack_name = _p(params, "StackName")
+    if stack_name:
+        stack = _resolve_stack(stack_name)
+        if not stack:
+            return _error("ValidationError", f"Stack [{stack_name}] does not exist")
+        events = list(stack.get("_operation_events") or [])
+    elif _p(params, "ChangeSetName"):
+        events = []
+    else:
+        # Every member is optional; an OperationId alone names its stack's events.
+        from ministack.services.cloudformation import _stacks
+        events = [e for s in _stacks.values() for e in s.get("_operation_events") or []]
+    operation_id = _p(params, "OperationId")
+    if operation_id:
+        events = [e for e in events if e.get("OperationId") == operation_id]
+    if _p(params, "Filters.FailedEvents").lower() == "true":
+        events = [e for e in events if e.get("OperationStatus") == "FAILED"]
+    events, next_token_xml, err = _page(events, params, "DescribeEvents")
+    if err:
+        return err
+    members = "".join(
+        "<member>" + "".join(f"<{f}>{_esc(str(e[f]))}</{f}>" for f in _OPERATION_EVENT_FIELDS if e.get(f))
+        + "</member>"
+        for e in events
+    )
+    return _xml(200, "DescribeEventsResponse",
+                f"<DescribeEventsResult><OperationEvents>{members}</OperationEvents>"
+                f"{next_token_xml}</DescribeEventsResult>")
 
 
 # --- DescribeStackResource ---
@@ -1075,6 +1120,7 @@ def _update_stack(params):
 
     stack["StackStatus"] = "UPDATE_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
+    stack["_disable_validation"] = _p(params, "DisableValidation", "false").lower() == "true"
     stack["_template_body"] = template_body
     # The capabilities a stack reports are the ones its last operation
     # acknowledged, so an update replaces them rather than adding to them.
@@ -1089,7 +1135,7 @@ def _update_stack(params):
         stack["_conditions"] = _evaluate_conditions(template, param_values)
 
         _add_event(stack_id, stack_name, stack_name,
-                   "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS",
+                   "AWS::CloudFormation::Stack", "UPDATE_IN_PROGRESS", "User Initiated",
                    physical_id=stack_id)
 
         _create_stack_task_in_region(
@@ -1709,6 +1755,7 @@ _ACTION_HANDLERS = {
     "DeleteStack": _delete_stack,
     "UpdateStack": _update_stack,
     "DescribeStackEvents": _describe_stack_events,
+    "DescribeEvents": _describe_events,
     "DescribeStackResource": _describe_stack_resource,
     "DescribeStackResources": _describe_stack_resources,
     "ListStackResources": _list_stack_resources,

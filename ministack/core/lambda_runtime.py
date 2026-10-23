@@ -26,6 +26,12 @@ from ministack.core.responses import _12_DIGIT_RE
 
 logger = logging.getLogger("lambda_runtime")
 
+# S3 Object Lambda handlers call WriteGetObjectResponse, whose modeled host
+# prefix (`<route>.<host>`) doesn't resolve against MiniStack's endpoint.
+# botocore reads this variable and skips the prefix; MiniStack routes the call
+# by its x-amz-request-route header instead. A function's own value wins.
+HOST_PREFIX_ENV = "AWS_DISABLE_HOST_PREFIX_INJECTION"
+
 _RESERVED_RUNTIME_ENV_VARS = {
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
@@ -364,6 +370,38 @@ fs.write = function(fd, ...args) {
 // a Lambda Layer with the actual SDK takes precedence; fall back to a stub
 // that routes through AWS_ENDPOINT_URL (Ministack).
 (function _installAwsSdkV3Stubs() {
+  // SigV4-sign a stub request with the function's credentials, as the real SDK does.
+  function _signedHeaders(service, method, ep, requestPath, body, headers) {
+    const crypto = require("crypto");
+    const accessKey = process.env.AWS_ACCESS_KEY_ID;
+    const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
+    if (!accessKey || !secretKey) return headers;
+    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+    const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const scope = amzDate.slice(0, 8) + "/" + region + "/" + service + "/aws4_request";
+    const signed = Object.assign({}, headers, { host: ep.host, "x-amz-date": amzDate });
+    if (process.env.AWS_SESSION_TOKEN) signed["x-amz-security-token"] = process.env.AWS_SESSION_TOKEN;
+    const values = {};
+    for (const name of Object.keys(signed)) values[name.toLowerCase()] = String(signed[name]).trim();
+    const names = Object.keys(values).sort();
+    const encode = (v) => encodeURIComponent(v)
+      .replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+    const [rawPath, rawQuery] = requestPath.split("?");
+    const query = new URLSearchParams(rawQuery || "");
+    const canonicalQuery = [...query.entries()].map(([k, v]) => encode(k) + "=" + encode(v)).sort().join("&");
+    const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
+    const hmac = (key, data) => crypto.createHmac("sha256", key).update(data).digest();
+    const canonical = [method, rawPath.split("/").map(encode).join("/"), canonicalQuery,
+      names.map((n) => n + ":" + values[n] + "\n").join(""), names.join(";"), hash(body || "")].join("\n");
+    let key = hmac("AWS4" + secretKey, amzDate.slice(0, 8));
+    for (const part of [region, service, "aws4_request"]) key = hmac(key, part);
+    const signature = crypto.createHmac("sha256", key)
+      .update(["AWS4-HMAC-SHA256", amzDate, scope, hash(canonical)].join("\n")).digest("hex");
+    signed["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope
+      + ", SignedHeaders=" + names.join(";") + ", Signature=" + signature;
+    return signed;
+  }
+
   // ── Lambda stub (REST-based, not JSON-RPC) ─────────────────────────────
   function _lambdaInvoke(params) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
@@ -381,14 +419,15 @@ fs.write = function(fd, ...args) {
     if (process.env.__DEPTH_ENV__) {
       headers["__DEPTH_HEADER__"] = process.env.__DEPTH_ENV__;
     }
+    const requestPath = "/2015-03-31/functions/" + fn + "/invocations" + qs;
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
-          path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
-          headers: headers,
+          path: requestPath,
+          headers: _signedHeaders("lambda", "POST", ep, requestPath, body, headers),
         },
         (res) => {
           const chunks = [];
@@ -525,7 +564,7 @@ fs.write = function(fd, ...args) {
         headers["Content-Type"] = "application/json";
         headers["Content-Length"] = Buffer.byteLength(encodedBody);
       }
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
@@ -651,21 +690,21 @@ fs.write = function(fd, ...args) {
     "@aws-sdk/client-translate":                   "AWSShineFrontendService_20170701",
   };
 
-  function _jsonRpcRequest(targetPrefix, opName, params) {
+  function _jsonRpcRequest(targetPrefix, opName, params, service) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
     const body = JSON.stringify(params || {});
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
           path: "/",
-          headers: {
+          headers: _signedHeaders(service, "POST", ep, "/", body, {
             "Content-Type": "application/x-amz-json-1.1",
             "X-Amz-Target": targetPrefix + "." + opName,
             "Content-Length": Buffer.byteLength(body),
-          },
+          }),
         },
         (res) => {
           const chunks = [];
@@ -694,12 +733,21 @@ fs.write = function(fd, ...args) {
     });
   }
 
-  function _makeGenericJsonServiceModule(targetPrefix) {
+  // Signing names that differ from the package name.
+  const _SIGNING_NAMES = {
+    "sfn": "states", "cloudwatch-logs": "logs", "secrets-manager": "secretsmanager", "eventbridge": "events",
+    "dynamodb-streams": "dynamodb", "cognito-identity-provider": "cognito-idp", "emr": "elasticmapreduce",
+    "resource-groups-tagging-api": "tagging",
+  };
+
+  function _makeGenericJsonServiceModule(targetPrefix, id) {
+    const pkg = id.replace(/^@aws-sdk\/client-/, "");
+    const service = _SIGNING_NAMES[pkg] || pkg;
     // Command class factory: new PutParameterCommand(params) → has _run()
     function _cmdClass(opName) {
       return class {
         constructor(params) { this._params = params; }
-        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params); }
+        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params, service); }
       };
     }
 
@@ -716,7 +764,7 @@ fs.write = function(fd, ...args) {
           get(_, prop) {
             if (typeof prop !== "string") return undefined;
             const opName = prop[0].toUpperCase() + prop.slice(1);
-            return (params) => _jsonRpcRequest(targetPrefix, opName, params);
+            return (params) => _jsonRpcRequest(targetPrefix, opName, params, service);
           },
         });
       },
@@ -766,7 +814,7 @@ fs.write = function(fd, ...args) {
         requireError = err;
       }
       const prefix = _JSON_RPC_TARGETS[id];
-      if (prefix) return _makeGenericJsonServiceModule(prefix);
+      if (prefix) return _makeGenericJsonServiceModule(prefix, id);
       if (
         requireError.code !== "MODULE_NOT_FOUND"
         || !requireError.message.includes("'" + id + "'")
@@ -813,20 +861,31 @@ function patchAwsSdk() {
     };
   } catch (_) {}
 
-  // Patch https.request for bundled SDK
+  // Patch https.request for bundled SDK. Under USE_SSL the gateway serves only
+  // HTTPS, so requests to it keep TLS and only their port is rewritten.
+  const msTls = parsed.protocol === "https:";
   const origHttpsReq = https.request;
-  https.request = function(options, callback) {
-    if (typeof options === "string") options = url.parse(options);
-    else if (options instanceof url.URL) options = url.parse(options.toString());
-    else options = Object.assign({}, options);
+  https.request = function(input, options, callback) {
+    // Node takes (url[, options][, callback]) and (options[, callback]).
+    const original = Array.prototype.slice.call(arguments);
+    if (typeof options === "function") { callback = options; options = undefined; }
+    if (typeof input === "string") input = url.parse(input);
+    else if (input instanceof url.URL) input = url.parse(input.toString());
+    options = Object.assign({}, input, options);
 
     const host = options.hostname || options.host || "";
     if (host.endsWith(".amazonaws.com") || host.endsWith(".amazonaws.com.cn")) {
-      options.protocol = "http:";
       options.hostname = msHost;
       options.host = msHost + ":" + msPort;
       options.port = msPort;
       options.path = options.path || "/";
+      if (msTls) {
+        // Verify the gateway's name, not the AWS host the Host header carries.
+        options.protocol = "https:";
+        options.servername = require("net").isIP(msHost) ? "" : msHost;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       if (options.agent instanceof https.Agent) {
         options.agent = new http.Agent({ keepAlive: true });
       } else if (options.agent === undefined) {
@@ -839,13 +898,18 @@ function patchAwsSdk() {
     // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
     // cfn-response.js calls https.request unconditionally for the ResponseURL
     // PUT, and also drops the port when constructing options.  Intercept here
-    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
+    // so the PUT reaches Ministack on msPort, not port 443 (over TLS under USE_SSL).
     const advertised = (process.env.MINISTACK_HOST || "").split(":")[0];
     if (host === "127.0.0.1" || host === "localhost" || host === msHost
         || (advertised && host === advertised)) {
-      options.protocol = "http:";
       // The https default port means the gateway port here, as in the container shim.
       options.port = options.port && String(options.port) !== "443" ? options.port : msPort;
+      if (msTls) {
+        options.protocol = "https:";
+        options.hostname = host;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       options.host = host + ":" + options.port;
       options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
@@ -866,10 +930,10 @@ function patchAwsSdk() {
       return http.request(options, callback);
     }
 
-    return origHttpsReq.call(https, options, callback);
+    return origHttpsReq.apply(https, original);
   };
-  https.get = function(options, callback) {
-    var req = https.request(options, callback);
+  https.get = function() {
+    var req = https.request.apply(https, arguments);
     req.end();
     return req;
   };
@@ -1192,6 +1256,7 @@ class Worker:
                 spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
+        spawn_env.setdefault(HOST_PREFIX_ENV, "true")
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))

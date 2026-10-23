@@ -788,6 +788,12 @@ def test_ssm_put_parameter_name_error_wins_over_other_checks(ssm):
     assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
 
 
+def test_ssm_public_latest_ami_parameter_names_a_stub_image(ssm, ec2):
+    param = ssm.get_parameter(Name="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64")["Parameter"]
+    assert param["ARN"].split(":")[4] == ""
+    assert ec2.describe_images(ImageIds=[param["Value"]])["Images"][0]["Name"].startswith("al2023-ami-")
+
+
 def test_ssm_put_parameter_rejects_tags_with_overwrite(ssm):
     tags = [{"Key": "k", "Value": "v"}]
     new_name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"

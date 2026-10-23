@@ -3020,6 +3020,10 @@ def _create_archive(data):
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    # Unlike event buses, an empty identifier is not stored: an archive with no
+    # customer managed key has no KmsKeyIdentifier in DescribeArchive.
+    if data.get("KmsKeyIdentifier"):
+        _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
 
 
@@ -3057,6 +3061,12 @@ def _update_archive(data):
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
+    if "KmsKeyIdentifier" in data:
+        # An empty identifier clears the stored key.
+        if data["KmsKeyIdentifier"]:
+            archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+        else:
+            archive.pop("KmsKeyIdentifier", None)
 
     archive["LastUpdatedTime"] = _now_ts()
     return json_response({
@@ -3064,6 +3074,10 @@ def _update_archive(data):
         "State": archive.get("State", "ENABLED"),
         "CreationTime": archive["CreationTime"],
     })
+
+
+_ARCHIVE_SUMMARY_KEYS = ("ArchiveName", "EventSourceArn", "State", "StateReason",
+                         "RetentionDays", "SizeBytes", "EventCount", "CreationTime")
 
 
 def _list_archives(data):
@@ -3078,7 +3092,7 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append(archive)
+        results.append({k: archive[k] for k in _ARCHIVE_SUMMARY_KEYS if k in archive})
     return json_response({"Archives": results})
 
 

@@ -277,12 +277,7 @@ def _log_sink(build):
 
     def emit(line):
         ts = int(time.time() * 1000)
-        events = stream["events"]
-        events.append({"timestamp": ts, "message": line, "ingestionTime": ts})
-        if stream["firstEventTimestamp"] is None:
-            stream["firstEventTimestamp"] = ts
-        stream["lastEventTimestamp"] = ts
-        stream["lastIngestionTime"] = ts
+        _cwl._append_log_events(stream, [{"timestamp": ts, "message": line, "ingestionTime": ts}])
 
     return emit
 

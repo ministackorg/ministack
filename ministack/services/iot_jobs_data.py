@@ -71,6 +71,7 @@ async def handle_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict
 ) -> tuple:
     """Route a device-plane request, then publish the job events it raised."""
+    _iot_module.jobs_device_host.set(headers.get("host", ""))
     async with _iot_module.publishing_events():
         return await _route_request(method, path, body, query_params)
 
@@ -158,6 +159,8 @@ def _start_next(thing: str, payload: dict, *, peek: bool) -> tuple:
     No jobs/notify(-next) publish: QUEUED -> IN_PROGRESS keeps the execution
     both pending and at the front of the queue, and AWS stays silent
     (live-captured)."""
+    if error := _iot_module._jobs_status_details_error(payload.get("statusDetails")):
+        return error
     execution = _iot_module.jobs_start_next_execution(
         thing, status_details=payload.get("statusDetails"), peek=peek
     )
@@ -179,7 +182,7 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
     if execution is None:
         return error_response_json(
             "ResourceNotFoundException",
-            f"No job execution found for thing {thing} and job {job_id}",
+            f"Job {job_id} not found for {thing}",
             404,
         )
     execution_number = qp.get("executionNumber")
@@ -195,10 +198,12 @@ def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
         if execution_number != execution["executionNumber"]:
             return error_response_json(
                 "ResourceNotFoundException",
-                f"No job execution {execution_number} found for thing {thing} "
-                f"and job {job_id}",
+                f"Job {job_id} not found for {thing}",
                 404,
             )
+    error = _iot_module.jobs_reject_terminal_describe(execution)
+    if error:
+        return error
     include_document = str(qp.get("includeJobDocument", "true")).lower() != "false"
     document = _iot_module.jobs_job_document(job_id) if include_document else None
     return json_response({"execution": _execution_view(execution, document)})
@@ -216,13 +221,6 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
                 "InvalidRequestException",
                 f"Invalid executionNumber: {execution_number!r}", 400,
             )
-        current = _iot_module.jobs_describe_execution(thing, job_id)
-        if current is not None and execution_number != current["executionNumber"]:
-            return error_response_json(
-                "ResourceNotFoundException",
-                f"No job execution {execution_number} found for thing {thing} "
-                f"and job {job_id}", 404,
-            )
     prev_next = _iot_module.jobs_first_pending_job_id(thing)
     execution, error = _iot_module.jobs_update_execution(
         thing,
@@ -231,6 +229,7 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         expected_version=payload.get("expectedVersion"),
         status_details=payload.get("statusDetails"),
         step_timeout_minutes=payload.get("stepTimeoutInMinutes"),
+        execution_number=execution_number,
     )
     if error:
         return error
@@ -241,11 +240,7 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
 
     response: dict = {}
     if str(payload.get("includeJobExecutionState", "")).lower() in ("true", "1"):
-        response["executionState"] = {
-            "status": execution["status"],
-            "statusDetails": execution.get("statusDetails") or {},
-            "versionNumber": execution["versionNumber"],
-        }
+        response["executionState"] = _iot_module.jobs_execution_state(execution)
     if str(payload.get("includeJobDocument", "")).lower() in ("true", "1"):
         response["jobDocument"] = _iot_module.jobs_job_document(job_id)
     if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
@@ -253,4 +248,5 @@ async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
         await _iot_module.jobs_notify_thing(
             get_account_id(), get_region(), thing, prev_next
         )
+        await _iot_module.jobs_abort_if_met(get_account_id(), get_region(), job_id)
     return json_response(response)

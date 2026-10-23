@@ -46,6 +46,9 @@ _DEFAULT_EVENT_SELECTORS = [
     {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
 ]
 
+# Logging state kept on the trail record for GetTrailStatus; not part of the Trail shape.
+_TRAIL_STATE_KEYS = frozenset({"IsLogging", "_StartedAt", "_StoppedAt"})
+
 _SCRUB_KEYS = frozenset(
     {
         "secretaccesskey",
@@ -462,7 +465,8 @@ def _create_trail(body: dict):
         "HasCustomEventSelectors": False,
         "HasInsightSelectors": False,
         "IsOrganizationTrail": body.get("IsOrganizationTrail", False),
-        "IsLogging": True,
+        "RecursiveLogging": body.get("RecursiveLogging", True),
+        "IsLogging": False,
     }
     # CreateTrail must persist KmsKeyId so DescribeTrails/GetTrail echo it; otherwise a
     # CMK set at create is dropped and Terraform's aws_cloudtrail needs a second apply to
@@ -481,6 +485,7 @@ def _create_trail(body: dict):
         "TrailARN": arn,
         "LogFileValidationEnabled": trail["LogFileValidationEnabled"],
         "IsOrganizationTrail": trail["IsOrganizationTrail"],
+        "RecursiveLogging": trail["RecursiveLogging"],
     }
     if kms:
         resp["KmsKeyId"] = kms
@@ -499,6 +504,11 @@ def _delete_trail(body: dict):
     return _ok({})
 
 
+def _trail_view(trail: dict) -> dict:
+    """The trail record as the Trail shape: no logging state and no unset members."""
+    return {k: v for k, v in trail.items() if k not in _TRAIL_STATE_KEYS and v != ""}
+
+
 def _get_trail(body: dict):
     raw = body.get("Name", "").strip()
     if not raw:
@@ -511,7 +521,7 @@ def _get_trail(body: dict):
         return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
-    return _ok({"Trail": trail})
+    return _ok({"Trail": _trail_view(trail)})
 
 
 def _describe_trails(body: dict):
@@ -540,7 +550,7 @@ def _describe_trails(body: dict):
             ):
                 resolved.append(trail)
         all_trails = resolved
-    return _ok({"trailList": all_trails})
+    return _ok({"trailList": [_trail_view(trail) for trail in all_trails]})
 
 
 def _get_trail_status(body: dict):
@@ -553,18 +563,26 @@ def _get_trail_status(body: dict):
         return _err("CloudTrailARNInvalidException", str(exc))
     if trail is None:
         return _err("TrailNotFoundException", f"Unknown trail: {name!r}", 404)
-    now = int(time.time())
-    is_logging = bool(trail.get("IsLogging", True))
-    return _ok(
-        {
-            "IsLogging": is_logging,
-            "LatestDeliveryTime": now if is_logging else trail.get("_StoppedAt", now),
-            "StartLoggingTime": trail.get("_StartedAt", now - 3600),
-            "StopLoggingTime": trail.get("_StoppedAt") if not is_logging else None,
-            "LatestDeliveryError": "",
-            "LatestNotificationError": "",
-        }
+    status = {
+        "IsLogging": bool(trail.get("IsLogging", True)),
+        "StartLoggingTime": trail.get("_StartedAt"),
+        "StopLoggingTime": trail.get("_StoppedAt"),
+    }
+    status = {k: v for k, v in status.items() if v is not None}
+    # The deprecated string members; nothing is delivered here, so the attempt times stay empty.
+    status.update(
+        LatestDeliveryAttemptSucceeded="",
+        LatestDeliveryAttemptTime="",
+        LatestNotificationAttemptSucceeded="",
+        LatestNotificationAttemptTime="",
+        TimeLoggingStarted=_iso_time(status.get("StartLoggingTime")),
+        TimeLoggingStopped=_iso_time(status.get("StopLoggingTime")),
     )
+    return _ok(status)
+
+
+def _iso_time(epoch) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch)) if epoch is not None else ""
 
 
 def _start_logging(body: dict):
@@ -576,7 +594,6 @@ def _start_logging(body: dict):
         return error
     trail["IsLogging"] = True
     trail["_StartedAt"] = int(time.time())
-    trail.pop("_StoppedAt", None)
     return _ok({})
 
 
@@ -587,8 +604,10 @@ def _stop_logging(body: dict):
     _name, _home_region, trail, error = _find_mutable_trail(raw)
     if error:
         return error
+    # Only a running trail records a stop; stopping a stopped trail keeps the last time.
+    if trail.get("IsLogging", True):
+        trail["_StoppedAt"] = int(time.time())
     trail["IsLogging"] = False
-    trail["_StoppedAt"] = int(time.time())
     return _ok({})
 
 
@@ -629,6 +648,7 @@ def _update_trail(body: dict):
         ("CloudWatchLogsLogGroupArn", "CloudWatchLogsLogGroupArn"),
         ("CloudWatchLogsRoleArn", "CloudWatchLogsRoleArn"),
         ("IsOrganizationTrail", "IsOrganizationTrail"),
+        ("RecursiveLogging", "RecursiveLogging"),
     ):
         if src in body:
             trail[dst] = body[src]
@@ -653,6 +673,7 @@ def _update_trail(body: dict):
         "CloudWatchLogsLogGroupArn": trail.get("CloudWatchLogsLogGroupArn", ""),
         "CloudWatchLogsRoleArn": trail.get("CloudWatchLogsRoleArn", ""),
         "IsOrganizationTrail": trail.get("IsOrganizationTrail", False),
+        "RecursiveLogging": trail.get("RecursiveLogging", True),
     }
     # Omit KmsKeyId when unset, matching CreateTrail and the DescribeTrails/GetTrail
     # read-back: AWS omits the field when there is no CMK, and an empty "" is not a

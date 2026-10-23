@@ -532,6 +532,14 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"budgets\."],
         "credential_scope": "budgets",
     },
+    # Managed Service for Apache Flink. The v1 API (KinesisAnalytics_20150814)
+    # shares the `kinesisanalytics` signing name and is not implemented, so
+    # requests route on the v2 target prefix.
+    "kinesisanalyticsv2": {
+        "target_prefixes": ["KinesisAnalytics_20180523"],
+        "host_patterns": [r"kinesisanalytics\."],
+        "credential_scope": "kinesisanalytics",
+    },
     "inspector2": {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
@@ -711,6 +719,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # win before credential-scope routing.
     if method == "POST" and path == "/event" and re.search(r"\.appsync-api\.", host):
         return "appsync-events"
+    # GraphQL requests use the same host family with the fixed "/graphql" path.
+    if method == "POST" and path == "/graphql" and re.search(r"\.appsync-api\.", host):
+        return "appsync"
 
     # 2. Check Authorization header for service name in credential scope
     if auth:
@@ -861,6 +872,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
                 "budgets": "budgets",
+                "kinesisanalytics": "kinesisanalyticsv2",
                 "inspector2": "inspector2",
                 "dsql": "dsql",
                 "s3tables": "s3tables",
@@ -961,6 +973,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateRoleDescription": "iam",
             "PutRolePermissionsBoundary": "iam",
             "DeleteRolePermissionsBoundary": "iam",
+            "PutUserPermissionsBoundary": "iam",
+            "DeleteUserPermissionsBoundary": "iam",
             "AttachUserPolicy": "iam",
             "DetachUserPolicy": "iam",
             "ListAttachedUserPolicies": "iam",
@@ -976,6 +990,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "GetCallerIdentity": "sts",
             "AssumeRole": "sts",
             "GetSessionToken": "sts",
+            "GetFederationToken": "sts",
             "AssumeRoleWithWebIdentity": "sts",
             "AssumeRoleWithSAML": "sts",
             # CloudWatch actions
@@ -1382,19 +1397,60 @@ def _credential_from_query(query_params) -> str:
     return cred or ""
 
 
+def _query_value(query_params, name: str) -> str:
+    if not query_params:
+        return ""
+    value = query_params.get(name) or query_params.get(name.lower())
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return value or ""
+
+
+def _single_region(region_set: str) -> str | None:
+    """A SigV4a ``X-Amz-Region-Set`` names one region only when it holds no
+    wildcard and no list."""
+    region_set = region_set.strip()
+    if not region_set or "*" in region_set or "," in region_set:
+        return None
+    return region_set
+
+
+def extract_signed_region(headers: dict, query_params=None) -> str | None:
+    """Region the request was signed for, or None when it carries none.
+
+    SigV4 scopes are ``AKID/date/region/service/aws4_request``. SigV4a scopes
+    drop the region (``AKID/date/service/aws4_request``) and sign an
+    ``X-Amz-Region-Set`` instead, which only counts when it names one region.
+    Unsigned, SigV2 and malformed requests have no signed region."""
+    auth = headers.get("authorization", "")
+    if auth.startswith("AWS4-HMAC-SHA256"):
+        match = re.search(r"Credential=[^/]+/\d{8}/([^/]+)/[^/]+/aws4_request", auth)
+        return match.group(1) if match else None
+    if auth.startswith("AWS4-ECDSA-P256-SHA256"):
+        return _single_region(headers.get("x-amz-region-set", ""))
+    algorithm = _query_value(query_params, "X-Amz-Algorithm")
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        return _single_region(_query_value(query_params, "X-Amz-Region-Set"))
+    # A bare X-Amz-Credential (no algorithm) still names its region, as
+    # IoT WebSocket and AppSync clients send it.
+    if algorithm in ("", "AWS4-HMAC-SHA256"):
+        parts = _credential_from_query(query_params).split("/")
+        if len(parts) == 5 and parts[2] and parts[4] == "aws4_request":
+            return parts[2]
+    return None
+
+
 def extract_region(headers: dict, query_params=None) -> str:
     """Extract AWS region from the request (Authorization header, then SigV4
-    presigned ``X-Amz-Credential`` query param)."""
-    auth = headers.get("authorization", "")
-    match = re.search(r"Credential=[^/]+/[^/]+/([^/]+)/", auth)
-    if match:
-        return match.group(1)
-    cred = _credential_from_query(query_params)
-    if cred:
-        parts = cred.split("/")
-        if len(parts) >= 3 and parts[2]:
-            return parts[2]
-    return os.environ.get("MINISTACK_REGION", "us-east-1")
+    presigned ``X-Amz-Credential`` query param), else the default region."""
+    return extract_signed_region(headers, query_params) or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _sigv4a_verified() -> bool:
+    """SigV4a header signatures name their key only where they are verified, under AUTH=true."""
+    from ministack.app import AUTH
+
+    return AUTH
 
 
 def extract_access_key_id(headers: dict, query_params=None) -> str:
@@ -1402,7 +1458,7 @@ def extract_access_key_id(headers: dict, query_params=None) -> str:
     query-string credentials of a presigned URL — SigV4 ``X-Amz-Credential`` or
     SigV2 ``AWSAccessKeyId``."""
     auth = headers.get("authorization", "")
-    if auth.startswith("AWS4-HMAC"):
+    if auth.startswith("AWS4-HMAC") or (auth.startswith("AWS4-ECDSA-P256-SHA256") and _sigv4a_verified()):
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)

@@ -427,6 +427,22 @@ def test_s3tables_iceberg_catalog_spans_control_plane_regions():
         west.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
+@pytest.mark.parametrize("headers, query, cross_region", [
+    ({"authorization": "AWS AKIAEXAMPLE:sig"}, {}, False),
+    ({}, {"x-amz-credential": ["AKIAEXAMPLE/20260101/us-west-2/s3tables/aws4_request"]}, False),
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-west-2/s3tables/aws4_request, "
+                       "SignedHeaders=host, Signature=abc"}, {}, False),
+    ({}, {}, True),
+], ids=["sigv2", "lowercase-query", "sigv4", "unsigned"])
+def test_s3tables_iceberg_auth_holds_a_named_key_to_its_region(monkeypatch, headers, query, cross_region):
+    """Under AUTH a call that names any key serves its own region, the one its checks resolve."""
+    import ministack.app as app
+    from ministack.services import s3tables
+
+    monkeypatch.setattr(app, "AUTH", True)
+    assert s3tables._iceberg_allows_cross_region(headers, query) is cross_region
+
+
 def test_s3tables_iceberg_catalog_prefers_signed_region_for_duplicate_names():
     east = _make_s3tables_client(region_name="us-east-1")
     west = _make_s3tables_client(region_name="us-west-2")
@@ -495,62 +511,54 @@ def test_iceberg_rest_error_uses_spec_envelope():
     assert body["error"]["message"]
 
 
-def test_s3tables_iceberg_catalog_no_prefix_url_format(s3tables):
-    """S3 Tables uses /iceberg/v1/namespaces/... (no catalog prefix in path,
-    warehouse in query param) — the format DuckDB sends with ENDPOINT_TYPE s3_tables
-    or an explicit ENDPOINT pointing at the catalog root."""
-    bucket_name = f"tb-noprefix-{_uuid_mod.uuid4().hex[:6]}"
-    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+def test_s3tables_iceberg_routes_without_prefix_are_unknown(s3tables):
+    """Every route but /v1/config takes the table bucket ARN prefix; real AWS
+    answers one without it 404 <UnknownOperationException/>."""
+    bucket_arn = s3tables.create_table_bucket(name=f"tb-noprefix-{_uuid_mod.uuid4().hex[:6]}")["arn"]
     ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
     table = f"t_{_uuid_mod.uuid4().hex[:6]}"
     try:
         s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
         s3tables.create_table(
-            tableBucketARN=bucket_arn,
-            namespace=ns,
-            name=table,
-            format="ICEBERG",
+            tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG",
             metadata={"iceberg": {"schema": {"fields": [{"name": "id", "type": "long"}]}}},
         )
-
-        # List namespaces — no prefix
-        resp = _iceberg_json("/iceberg/v1/namespaces")
-        ns_names = [
-            (n[0] if isinstance(n, list) else n)
-            for n in resp.get("namespaces", [])
-        ]
-        assert ns in ns_names
-
-        # List tables — no prefix
-        resp = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables")
-        assert {"namespace": [ns], "name": table} in resp.get("identifiers", [])
-
-        # Load table — no prefix
-        resp = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
-        assert resp.get("metadata-location", "").startswith(f"s3://{bucket_name}/{ns}/{table}/")
-        assert resp.get("metadata", {}).get("table-uuid")
+        for method, path in (
+            ("GET", "/iceberg/v1/namespaces"),
+            ("GET", f"/iceberg/v1/namespaces/{ns}/tables"),
+            ("GET", f"/iceberg/v1/namespaces/{ns}/tables/{table}"),
+            ("POST", f"/iceberg/v1/namespaces/{ns}/tables"),
+            ("POST", "/iceberg/v1/transactions/commit"),
+        ):
+            req = urllib.request.Request(f"{_ENDPOINT}{path}", method=method, data=b"{}" if method == "POST" else None)
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(req)
+            assert (exc.value.code, exc.value.read()) == (404, b"<UnknownOperationException/>")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata-location"].startswith(f"s3://{bucket_arn.rsplit('/', 1)[1]}/{ns}/{table}/")
     finally:
-        try:
-            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
-        except Exception:
-            pass
-        try:
-            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
-        except Exception:
-            pass
+        s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
 def test_s3tables_iceberg_config_returns_s3_defaults():
-    """GET /iceberg/v1/config must return S3 connection defaults so clients
-    don't need out-of-band credential / endpoint configuration."""
-    resp = _iceberg_json("/iceberg/v1/config")
-    defaults = resp.get("defaults", {})
-    assert "s3.endpoint" in defaults, "s3.endpoint missing from config defaults"
-    assert "s3.access-key-id" in defaults, "s3.access-key-id missing from config defaults"
-    assert "s3.secret-access-key" in defaults, "s3.secret-access-key missing from config defaults"
-    assert "s3.path-style-access" in defaults, "s3.path-style-access missing from config defaults"
-    assert "client.region" in defaults, "client.region missing from config defaults"
+    """GET /iceberg/v1/config hands back the url-encoded table bucket ARN as the
+    prefix in defaults, as AWS does, plus the S3 connection defaults."""
+    arn = "arn:aws:s3tables:us-east-1:000000000000:bucket/cfg-bucket"
+    resp = _iceberg_json(f"/iceberg/v1/config?warehouse={_arn_prefix(arn)}")
+    defaults = resp["defaults"]
+    assert defaults["prefix"] == _arn_prefix(arn)
+    assert resp["overrides"] == {}
+    for key in ("s3.endpoint", "s3.access-key-id", "s3.secret-access-key", "s3.path-style-access", "client.region"):
+        assert key in defaults
+
+
+@pytest.mark.parametrize("query", ["", "?warehouse=arn:aws:s3tables:us-east-1:000000000000:bucket"])
+def test_s3tables_iceberg_config_needs_a_table_bucket_arn(query):
+    status, body = _iceberg_call(f"/iceberg/v1/config{query}")
+    assert (status, body) == (400, {"error": {
+        "message": "The specified table bucket ARN is not valid.", "type": "bad_request", "code": 400}})
 
 
 def test_s3tables_iceberg_load_table_includes_region(s3tables):
@@ -564,7 +572,7 @@ def test_s3tables_iceberg_load_table_includes_region(s3tables):
         s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
         s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
 
-        resp = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        resp = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         config = resp.get("config", {})
         assert "s3.region" in config, "s3.region missing from LoadTable config"
         assert "client.region" in config, "client.region missing from LoadTable config"
@@ -593,7 +601,7 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
 
         snapshot_id = 1234567890
         resp = _iceberg_json(
-            "/iceberg/v1/transactions/commit",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/transactions/commit",
             method="POST",
             payload={
                 "table-changes": [
@@ -626,7 +634,7 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
         assert resp is not None
 
         # Verify the snapshot was recorded in the table metadata
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         metadata = loaded.get("metadata", {})
         snap_ids = [s.get("snapshot-id") for s in metadata.get("snapshots", [])]
         assert snapshot_id in snap_ids, f"snapshot {snapshot_id} not found after commit"
@@ -658,21 +666,21 @@ def test_s3tables_iceberg_upgrade_format_version(s3tables):
         s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
         s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
 
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         assert loaded["metadata"]["format-version"] == 2
 
         resp = _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}", method="POST",
             payload={"requirements": [],
                      "updates": [{"action": "upgrade-format-version", "format-version": 3}]},
         )
         assert resp["metadata"]["format-version"] == 3
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         assert loaded["metadata"]["format-version"] == 3
 
         # Re-asserting the version the table already has is a no-op commit.
         resp = _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}", method="POST",
             payload={"requirements": [],
                      "updates": [{"action": "upgrade-format-version", "format-version": 3}]},
         )
@@ -681,13 +689,13 @@ def test_s3tables_iceberg_upgrade_format_version(s3tables):
         # A downgrade is refused, and the table keeps its version.
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             _iceberg_json(
-                f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+                f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}", method="POST",
                 payload={"requirements": [],
                          "updates": [{"action": "upgrade-format-version", "format-version": 2}]},
             )
         assert exc_info.value.code == 400
         assert b"downgrade" in exc_info.value.read()
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         assert loaded["metadata"]["format-version"] == 3
     finally:
         try:
@@ -716,14 +724,14 @@ def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3t
         s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
 
         _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
             method="POST",
             payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
         )
         # Commit a snapshot so there's real state a resent create could destroy.
         snapshot_id = 42
         _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}",
             method="POST",
             payload={
                 "requirements": [],
@@ -746,7 +754,7 @@ def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3t
         # response was lost.
         try:
             _iceberg_json(
-                f"/iceberg/v1/namespaces/{ns}/tables",
+                f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
                 method="POST",
                 payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
             )
@@ -757,7 +765,7 @@ def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3t
             assert body["error"]["type"] == "AlreadyExistsException"
 
         # The original snapshot must still be there -- not wiped by the resend.
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         snap_ids = [s.get("snapshot-id") for s in loaded["metadata"]["snapshots"]]
         assert snapshot_id in snap_ids, "resent create-table must not wipe existing table state"
     finally:
@@ -786,7 +794,7 @@ def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
         s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
 
         _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}",
             method="POST",
             payload={
                 "requirements": [],
@@ -802,11 +810,11 @@ def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
                 ],
             },
         )
-        first = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        first = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         assert first["metadata"]["last-column-id"] == 1
 
         _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}",
             method="POST",
             payload={
                 "requirements": [],
@@ -825,7 +833,7 @@ def test_s3tables_iceberg_add_schema_advances_last_column_id(s3tables):
                 ],
             },
         )
-        second = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        second = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         metadata = second["metadata"]
         assert metadata["last-column-id"] == 2
 
@@ -858,7 +866,7 @@ def test_s3tables_iceberg_add_spec_uses_real_wire_action_name(s3tables):
         s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
 
         _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}",
             method="POST",
             payload={
                 "requirements": [],
@@ -874,7 +882,7 @@ def test_s3tables_iceberg_add_spec_uses_real_wire_action_name(s3tables):
                 ],
             },
         )
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         metadata = loaded["metadata"]
         spec_ids = [s["spec-id"] for s in metadata["partition-specs"]]
         assert 1 in spec_ids, "add-spec must append the new partition spec"
@@ -906,7 +914,7 @@ def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables)
         s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
 
         created = _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables",
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
             method="POST",
             payload={
                 "name": table,
@@ -965,9 +973,9 @@ def test_s3tables_iceberg_add_schema_is_idempotent_by_schema_id(s3tables):
         # Send the identical commit twice, simulating Spark re-declaring its
         # current schema on a second, unrelated write.
         for _ in range(2):
-            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+            _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
 
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         schema_ids = [s.get("schema-id") for s in loaded["metadata"]["schemas"]]
         assert schema_ids.count(0) == 1, "resent add-schema must not duplicate the schema-id entry"
     finally:
@@ -1008,9 +1016,9 @@ def test_s3tables_iceberg_add_spec_is_idempotent_by_spec_id(s3tables):
             ],
         }
         for _ in range(2):
-            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+            _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
 
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         spec_ids = [s.get("spec-id") for s in loaded["metadata"]["partition-specs"]]
         assert spec_ids.count(1) == 1, "resent add-spec must not duplicate the spec-id entry"
     finally:
@@ -1051,9 +1059,9 @@ def test_s3tables_iceberg_add_sort_order_is_idempotent_by_order_id(s3tables):
             ],
         }
         for _ in range(2):
-            _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
+            _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}", method="POST", payload=payload)
 
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         order_ids = [o.get("order-id") for o in loaded["metadata"]["sort-orders"]]
         assert order_ids.count(1) == 1, "resent add-sort-order must not duplicate the order-id entry"
     finally:
@@ -1093,7 +1101,7 @@ def test_s3tables_iceberg_load_table_serves_the_numerically_latest_metadata(s3ta
         s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
         s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
 
-        base = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")["metadata"]
+        base = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")["metadata"]
         for v in range(1, 12):
             doc = dict(base, **{"last-sequence-number": v})
             s3.put_object(
@@ -1102,7 +1110,7 @@ def test_s3tables_iceberg_load_table_serves_the_numerically_latest_metadata(s3ta
                 Body=json.dumps(doc).encode(),
             )
 
-        resp = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        resp = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
         assert resp["metadata-location"].endswith("/v11.metadata.json"), resp["metadata-location"]
         assert resp["metadata"]["last-sequence-number"] == 11
     finally:
@@ -1250,6 +1258,424 @@ def test_s3tables_iceberg_rest_sequence_numbers_and_requirements(s3tables):
             s3tables.delete_table_bucket(tableBucketARN=arn)
 
 
+def test_iceberg_route_splits_paths_as_the_router():
+    """The router and the IAM checks read one split: raw segments, the {prefix} decoded only afterwards."""
+    from ministack.services.s3tables import _iceberg_route, iceberg_lacks_prefix
+
+    bucket = "arn%3Aaws%3As3tables%3Aus-east-1%3A000000000000%3Abucket%2Fb"
+    assert _iceberg_route("GET", "/iceberg/v1/config") == ("config", [], [])
+    assert _iceberg_route("GET", f"/iceberg/v1/{bucket}/namespaces/ns") == ("namespaces", [bucket], ["ns"])
+    # a decoded ARN spans two segments; an encoded keyword is a segment like any other
+    assert _iceberg_route("GET", "/iceberg/v1/arn:aws:s3tables:us-east-1:000000000000:bucket/b/namespaces") == (
+        "namespaces", ["arn:aws:s3tables:us-east-1:000000000000:bucket", "b"], [])
+    assert _iceberg_route("GET", f"/iceberg/v1/%6Eamespaces/{bucket}/namespaces") == (
+        "namespaces", ["%6Eamespaces", bucket], [])
+    assert _iceberg_route("GET", f"/iceberg/v1/{bucket}/%6Eamespaces") is None
+    # tables/rename after a namespace is updateTable on a table named rename
+    assert _iceberg_route("POST", f"/iceberg/v1/{bucket}/tables/rename") == ("rename", [bucket], [])
+    assert _iceberg_route("POST", f"/iceberg/v1/{bucket}/namespaces/ns/tables/rename") == (
+        "namespaces", [bucket], ["ns", "tables", "rename"])
+    assert _iceberg_route("POST", f"/iceberg/v1/{bucket}/transactions/commit") == (
+        "transactions", [bucket], ["commit"])
+    for method, path in (("GET", "/iceberg/v1/namespaces"), ("GET", "/iceberg/v1/namespaces/ns/tables/t"),
+                         ("POST", "/iceberg/v1/tables/rename"), ("POST", "/iceberg/v1/transactions/commit")):
+        assert iceberg_lacks_prefix(method, path)
+    # a first segment before "namespaces" is the {prefix}, whatever it reads
+    for method, path in (("GET", "/iceberg/v1/config"), ("GET", f"/iceberg/v1/{bucket}/namespaces"),
+                         ("POST", f"/iceberg/v1/{bucket}/tables/rename"), ("GET", "/iceberg/v1/tables/namespaces"),
+                         ("GET", "/iceberg/v1/transactions/namespaces/ns"),
+                         ("POST", f"/iceberg/v1/{bucket}/transactions/commit")):
+        assert not iceberg_lacks_prefix(method, path)
+
+
+def test_iceberg_iam_checks_name_the_bucket_the_prefix_names():
+    """A bucket ARN or account:s3tablescatalog/bucket names a table bucket; any other {prefix} names none."""
+    from ministack.services.s3tables import iceberg_iam_checks, iceberg_prefix_error
+
+    bucket = "arn:aws:s3tables:us-east-1:000000000000:bucket/b"
+    for prefix in (_arn_prefix(bucket), "000000000000:s3tablescatalog/b"):
+        assert iceberg_iam_checks("GET", f"/iceberg/v1/{prefix}/namespaces", b"", {}) == [
+            ("s3tables:ListNamespaces", bucket)]
+        assert iceberg_prefix_error("GET", f"/iceberg/v1/{prefix}/namespaces") is None
+    no_arn = "The specified table bucket ARN is not valid."
+    for prefix, message in (("catalog", no_arn), ("%6Eamespaces/000000000000:s3tablescatalog/b", no_arn),
+                            (_arn_prefix(f"{bucket}/x"), "The specified bucket name isn't valid. Specify a different "
+                                                         "bucket name, and then try again.")):
+        assert iceberg_iam_checks("POST", f"/iceberg/v1/{prefix}/namespaces", b"{}", {}) is None
+        status, _, body = iceberg_prefix_error("POST", f"/iceberg/v1/{prefix}/namespaces")
+        assert (status, json.loads(body)) == (400, {"error": {"message": message, "type": "bad_request", "code": 400}})
+    # a rename body whose source is no object names no table
+    assert iceberg_iam_checks("POST", f"/iceberg/v1/{_arn_prefix(bucket)}/tables/rename", b'{"source": "t"}', {}) == [
+        ("s3tables:RenameTable", f"{bucket}/table/*")]
+
+
+@pytest.fixture
+def iceberg_auth_catalog(s3tables):
+    """A table bucket with namespace ns and tables t and u, removed with whatever a test left in it."""
+    name = f"irc-{_uuid_mod.uuid4().hex[:8]}"
+    bucket = s3tables.create_table_bucket(name=name)["arn"]
+    s3tables.create_namespace(tableBucketARN=bucket, namespace=["ns"])
+    tables = {t: s3tables.create_table(tableBucketARN=bucket, namespace="ns", name=t, format="ICEBERG")["tableARN"]
+              for t in ("t", "u")}
+    yield {"bucket": bucket, "name": name, "prefix": _arn_prefix(bucket), **tables}
+    for namespace in s3tables.list_namespaces(tableBucketARN=bucket)["namespaces"]:
+        ns = namespace["namespace"][0]
+        for table in s3tables.list_tables(tableBucketARN=bucket, namespace=ns)["tables"]:
+            s3tables.delete_table(tableBucketARN=bucket, namespace=ns, name=table["name"])
+        s3tables.delete_namespace(tableBucketARN=bucket, namespace=ns)
+    s3tables.delete_table_bucket(tableBucketARN=bucket)
+
+
+@contextlib.contextmanager
+def _iceberg_contract_signer(user):
+    """A second access key of an ``iam_user`` for signed Iceberg REST calls, deleted before the fixture's cleanup."""
+    from botocore.credentials import Credentials
+    from conftest import make_client
+
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield Credentials(key["AccessKeyId"], key["SecretAccessKey"])
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def _iceberg_signed(credentials, method, path, query=None, body=None, service="s3tables", region="us-east-1",
+                    presigned=False):
+    """One SigV4-signed Iceberg REST call over HTTP: status, body (parsed when JSON, None when empty) and headers."""
+    from botocore.auth import S3SigV4Auth, SigV4Auth, SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+
+    request = AWSRequest(method=method, url=f"{_ENDPOINT}/iceberg/v1/{path}", params=query or {},
+                         data=json.dumps(body).encode() if body is not None else None)
+    if presigned:
+        SigV4QueryAuth(credentials, service, region, expires=300).add_auth(request)
+    else:
+        (S3SigV4Auth if service == "s3" else SigV4Auth)(credentials, service, region).add_auth(request)
+    prepared = request.prepare()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                prepared.url, data=prepared.body, method=method, headers=dict(prepared.headers))) as response:
+            status, content, headers = response.status, response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        status, content, headers = error.code, error.read(), error.headers
+    headers = {k.lower(): v for k, v in headers.items()}
+    if content and "json" in headers.get("content-type", ""):
+        content = json.loads(content)
+    return status, content or None, headers
+
+
+def _iceberg_fill(value, names):
+    """A path, query or body template with {name} placeholders filled from ``names``."""
+    text = json.dumps(value)
+    for key, name in names.items():
+        text = text.replace("{" + key + "}", name)
+    return json.loads(text)
+
+
+def _iceberg_denial(user, action, resource, reason=None):
+    """The Iceberg error body of an s3tables identity-policy denial."""
+    reason = reason or f"because no identity-based policy allows the s3tables:{action} action"
+    return {"error": {"message": f"User: {user.arn} is not authorized to perform: s3tables:{action} "
+                                 f"on resource: {resource} {reason}", "type": "forbidden", "code": 403}}
+
+
+# Iceberg REST routes on the S3 Tables catalog: method, path, query, body, the actions AWS lists for each (on the
+# table bucket or table), and MiniStack's status once they are allowed.
+_UPDATE_TABLE_T = [("UpdateTableMetadataLocation", "{t}"), ("PutTableData", "{t}"), ("GetTableData", "{t}")]
+_S3TABLES_ICEBERG_ROUTES = {
+    "config": ("GET", "config", {"warehouse": "{bucket}"}, None, [("GetTableBucket", "{bucket}")], 200),
+    "list-namespaces": ("GET", "{prefix}/namespaces", None, None, [("ListNamespaces", "{bucket}")], 200),
+    "create-namespace": ("POST", "{prefix}/namespaces", None, {"namespace": ["{new}"]},
+                         [("CreateNamespace", "{bucket}")], 200),
+    "load-namespace": ("GET", "{prefix}/namespaces/ns", None, None, [("GetNamespace", "{bucket}")], 200),
+    "drop-namespace": ("DELETE", "{prefix}/namespaces/ns", None, None, [("DeleteNamespace", "{bucket}")], 404),
+    "list-tables": ("GET", "{prefix}/namespaces/ns/tables", None, None, [("ListTables", "{bucket}")], 200),
+    "create-table": ("POST", "{prefix}/namespaces/ns/tables", None, {"name": "{new}"},
+                     [("CreateTable", "{bucket}"), ("PutTableData", "{bucket}/table/*")], 200),
+    "load-table": ("GET", "{prefix}/namespaces/ns/tables/t", None, None,
+                   [("GetTableMetadataLocation", "{t}"), ("GetTableData", "{t}")], 200),
+    "update-table": ("POST", "{prefix}/namespaces/ns/tables/t", None, {"requirements": [], "updates": []},
+                     _UPDATE_TABLE_T, 200),
+    "drop-table": ("DELETE", "{prefix}/namespaces/ns/tables/t", None, None, [("DeleteTable", "{t}")], 404),
+    "table-exists": ("HEAD", "{prefix}/namespaces/ns/tables/t", None, None, [("GetTable", "{t}")], 200),
+    "rename-table": ("POST", "{prefix}/tables/rename", None, {"source": {"namespace": ["ns"], "name": "t"},
+                                                               "destination": {"namespace": ["ns"], "name": "{new}"}},
+                     [("RenameTable", "{t}")], 404),
+    "commit-transaction": ("POST", "{prefix}/transactions/commit", None, {"table-changes": [
+        {"identifier": {"namespace": ["ns"], "name": "t"}, "requirements": [], "updates": []}]}, _UPDATE_TABLE_T, 200),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service", ["s3tables", "glue", "s3", "sts"])
+@pytest.mark.parametrize("route", list(_S3TABLES_ICEBERG_ROUTES))
+def test_s3tables_iceberg_route_contract(auth_enabled, iam_user, iceberg_auth_catalog, route, service):
+    """Each Iceberg route on a table bucket needs exactly its s3tables actions, whatever service it is signed for."""
+    method, path, query, body, actions, served = _S3TABLES_ICEBERG_ROUTES[route]
+    actions = _iceberg_fill(actions, iceberg_auth_catalog)
+    allowed = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": f"s3tables:{action}", "Resource": resource} for action, resource in actions]})
+    nobody = iam_user()
+    with _iceberg_contract_signer(allowed) as signer, _iceberg_contract_signer(nobody) as refused_signer:
+        calls = [_iceberg_signed(credentials, method, *_iceberg_fill([path, query, body], {
+            **iceberg_auth_catalog, "new": f"by-{label}"}), service=service)
+            for label, credentials in (("allowed", signer), ("nobody", refused_signer))]
+    assert calls[0][0] == served
+    if not auth_enabled:
+        assert calls[1][0] == served
+        return
+    status, error, headers = calls[1]
+    assert (status, headers["content-type"], headers["x-amzn-errortype"]) == (
+        403, "application/json", "IrcForbiddenResponse")
+    assert error == (None if method == "HEAD" else _iceberg_denial(nobody, *actions[0]))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("method,path,body,action,resource,reason", [
+    ("GET", "config?warehouse={absent}", None, "GetTableBucket", "{absent}", None),
+    ("POST", "{prefix}/namespaces", {"namespace": ["ns2"]}, "CreateNamespace", "{bucket}",
+     "with an explicit deny in an identity-based policy"),
+    ("GET", "{prefix}/namespaces/ns/tables/u", None, "GetTableMetadataLocation", "{u}", None),
+    ("GET", "{prefix}/namespaces/ns/tables/absent", None, "GetTableMetadataLocation", "{bucket}/table/*", None),
+], ids=["config-absent-bucket", "explicit-deny", "other-table", "absent-table"])
+def test_s3tables_iceberg_authorization_contract(auth_enabled, iam_user, iceberg_auth_catalog,
+                                                 method, path, body, action, resource, reason):
+    """A denial names the bucket or table the call names, table/* for a table that does not exist, and a Deny."""
+    catalog = iceberg_auth_catalog
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Resource": catalog["bucket"],
+         "Action": ["s3tables:GetTableBucket", "s3tables:ListNamespaces", "s3tables:GetNamespace"]},
+        {"Effect": "Allow", "Action": "s3tables:GetTableMetadataLocation", "Resource": catalog["t"]},
+        {"Effect": "Deny", "Action": "s3tables:CreateNamespace", "Resource": catalog["bucket"]},
+    ]})
+    names = {**catalog, "absent": catalog["bucket"].rsplit("/", 1)[0] + "/absent"}
+    path, query = _iceberg_fill(path, names), None
+    if "?warehouse=" in path:
+        path, warehouse = path.split("?warehouse=")
+        query = {"warehouse": warehouse}
+    with _iceberg_contract_signer(user) as signer:
+        assert _iceberg_signed(signer, "GET", "config", {"warehouse": catalog["bucket"]})[0] == 200
+        assert _iceberg_signed(signer, "GET", f"{catalog['prefix']}/namespaces")[1] == {"namespaces": [["ns"]]}
+        status, error, headers = _iceberg_signed(signer, method, path, query, body)
+    if not auth_enabled:
+        assert status != 403
+        return
+    assert (status, headers["content-type"]) == (403, "application/json")
+    assert error == _iceberg_denial(user, action, _iceberg_fill(resource, names), reason)
+
+
+@pytest.mark.auth_contract
+def test_s3tables_iceberg_later_action_contract(auth_enabled, iam_user, iceberg_auth_catalog):
+    """loadTable's second action answers Access Denied."""
+    catalog = iceberg_auth_catalog
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:GetTableMetadataLocation", "Resource": catalog["t"]}]})
+    with _iceberg_contract_signer(user) as signer:
+        loaded = _iceberg_signed(signer, "GET", f"{catalog['prefix']}/namespaces/ns/tables/t")
+    if not auth_enabled:
+        assert loaded[0] == 200
+        return
+    assert loaded[:2] == (403, {"error": {"message": "Access Denied", "type": "forbidden", "code": 403}})
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service", ["s3tables", "glue"])
+def test_s3tables_iceberg_wrong_secret_contract(auth_enabled, iam_user, iceberg_auth_catalog, service):
+    """Iceberg REST calls check their signature, for S3 Tables and for the Glue catalog alike, in JSON."""
+    from botocore.credentials import Credentials
+
+    catalog = iceberg_auth_catalog
+    warehouse = catalog["bucket"] if service == "s3tables" else "000000000000"
+    action = "s3tables:GetTableBucket" if service == "s3tables" else "glue:GetCatalog"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": action, "Resource": "*"}]})
+    with _iceberg_contract_signer(user) as signer:
+        assert _iceberg_signed(signer, "GET", "config", {"warehouse": warehouse}, service=service)[0] == 200
+        status, _, headers = _iceberg_signed(Credentials(signer.access_key, "wrong-secret"), "GET", "config",
+                                             {"warehouse": warehouse}, service=service)
+    if not auth_enabled:
+        assert status == 200
+        return
+    assert (status, headers["x-amzn-errortype"], headers["content-type"]) == (
+        403, "InvalidSignatureException", "application/json")
+
+
+@pytest.mark.auth_contract
+def test_s3tables_iceberg_calls_naming_no_table_bucket_contract(auth_enabled, iam_user):
+    """An unprefixed route answers 404 whatever its signature; config without a table bucket answers 400."""
+    from botocore.credentials import Credentials
+
+    with _iceberg_contract_signer(iam_user()) as signer:
+        assert _iceberg_signed(signer, "GET", "config")[0] == 400
+        wrong = Credentials(signer.access_key, "wrong-secret")
+        assert _iceberg_signed(wrong, "GET", "namespaces")[0] == 404
+        assert _iceberg_signed(wrong, "HEAD", "namespaces/ns")[0] == 404
+        status, _, headers = _iceberg_signed(wrong, "GET", "config")
+        read_as_prefix = _iceberg_signed(wrong, "GET", "tables/namespaces", service="glue")
+    assert (status, headers.get("x-amzn-errortype")) == (
+        (403, "InvalidSignatureException") if auth_enabled else (400, None))
+    # "tables" before "namespaces" is the {prefix}, so that call is authenticated however it is signed
+    assert read_as_prefix[0] == (403 if auth_enabled else 200)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("method,prefix,message,served", [
+    ("GET", "somewhere", "The specified table bucket ARN is not valid.", [200, 200, 200]),
+    ("POST", "%256Eamespaces/000000000000:s3tablescatalog/{name}", "The specified table bucket ARN is not valid.",
+     [200, 409, 409]),
+    ("POST", "{bucket}/x", "The specified bucket name isn't valid. Specify a different bucket name, and then try "
+                           "again.", [404, 404, 404]),
+], ids=["list-namespaces", "encoded-namespaces-segment", "bucket-arn-and-more"])
+def test_s3tables_iceberg_prefix_naming_no_table_bucket_contract(auth_enabled, iam_user, iceberg_auth_catalog,
+                                                                 s3tables, method, prefix, message, served):
+    """A {prefix} that is no table bucket answers 400 after the credential check, before any policy, as on AWS."""
+    from botocore.credentials import Credentials
+
+    catalog = iceberg_auth_catalog
+    prefix = _iceberg_fill(prefix, catalog)
+    prefix = _arn_prefix(prefix) if prefix.startswith("arn:") else prefix
+    everything = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:*", "Resource": "*"}]})
+    body = {"namespace": ["created"]} if method == "POST" else None
+    with _iceberg_contract_signer(iam_user()) as nobody, _iceberg_contract_signer(everything) as signer:
+        calls = [_iceberg_signed(credentials, method, f"{prefix}/namespaces", body=body)
+                 for credentials in (nobody, signer, Credentials(signer.access_key, "wrong-secret"))]
+    if not auth_enabled:
+        assert [status for status, _, _ in calls] == served
+        return
+    for status, error, _ in calls[:2]:
+        assert (status, error) == (400, {"error": {"message": message, "type": "bad_request", "code": 400}})
+    assert (calls[2][0], calls[2][2]["x-amzn-errortype"]) == (403, "InvalidSignatureException")
+    assert [n["namespace"] for n in s3tables.list_namespaces(tableBucketARN=catalog["bucket"])["namespaces"]] == [
+        ["ns"]]
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("prefix", ["{prefix}/%6Eamespaces", "000000000000:s3tablescatalog/{name}/namespaces"],
+                         ids=["encoded-namespaces-keyword", "account-catalog-prefix"])
+def test_s3tables_iceberg_prefix_forms_served_are_authorized_contract(auth_enabled, iam_user, iceberg_auth_catalog,
+                                                                     prefix):
+    """A path MiniStack serves as listNamespaces is authorized as one, whichever form names the bucket."""
+    catalog = iceberg_auth_catalog
+    path = _iceberg_fill(prefix, catalog)
+    allowed = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:ListNamespaces", "Resource": catalog["bucket"]}]})
+    nobody = iam_user()
+    with _iceberg_contract_signer(allowed) as signer, _iceberg_contract_signer(nobody) as refused_signer:
+        listed = _iceberg_signed(signer, "GET", path)
+        refused = _iceberg_signed(refused_signer, "GET", path)
+    assert listed[:2] == (200, {"namespaces": [["ns"]]})
+    if not auth_enabled:
+        assert refused[:2] == listed[:2]
+        return
+    assert refused[:2] == (403, _iceberg_denial(nobody, "ListNamespaces", catalog["bucket"]))
+
+
+@pytest.mark.auth_contract
+def test_s3tables_iceberg_presigned_region_contract(auth_enabled, iam_user, iceberg_auth_catalog):
+    """Under AUTH a presigned call serves its credential region, whose bucket and table the checks read."""
+    catalog = iceberg_auth_catalog
+    west = _make_s3tables_client(region_name="us-west-2")
+    west_arn = west.create_table_bucket(name=catalog["name"])["arn"]
+    west.create_namespace(tableBucketARN=west_arn, namespace=["ns"])
+    secret = west.create_table(tableBucketARN=west_arn, namespace="ns", name="secret", format="ICEBERG")["tableARN"]
+    reads = ["s3tables:GetTableMetadataLocation", "s3tables:GetTableData"]
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:ListNamespaces", "Resource": catalog["bucket"]},
+        {"Effect": "Allow", "Action": reads, "Resource": "*"},
+        {"Effect": "Deny", "Action": reads, "Resource": secret}]})
+    by_name = f"000000000000:s3tablescatalog/{catalog['name']}/namespaces"
+    table = f"{_arn_prefix(west_arn)}/namespaces/ns/tables/secret"
+    try:
+        with _iceberg_contract_signer(user) as signer:
+            calls = {(region, kind): _iceberg_signed(signer, "GET", path, region=region, presigned=True)
+                     for region in ("us-east-1", "us-west-2") for kind, path in (("list", by_name), ("table", table))}
+    finally:
+        west.delete_table(tableBucketARN=west_arn, namespace="ns", name="secret")
+        west.delete_namespace(tableBucketARN=west_arn, namespace="ns")
+        west.delete_table_bucket(tableBucketARN=west_arn)
+    if not auth_enabled:
+        assert [status for status, _, _ in calls.values()] == [200, 200, 200, 200]
+        return
+    # signed for us-east-1, neither call reaches the us-west-2 bucket
+    assert calls["us-east-1", "list"][:2] == (200, {"namespaces": [["ns"]]})
+    assert calls["us-east-1", "table"][0] == 404
+    assert calls["us-west-2", "list"][:2] == (403, _iceberg_denial(user, "ListNamespaces", west_arn))
+    assert calls["us-west-2", "table"][:2] == (403, _iceberg_denial(
+        user, "GetTableMetadataLocation", secret, "with an explicit deny in an identity-based policy"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("warehouse", ["1:s3tablescatalog/{name}", "000000000000:s3tablescatalog/{name}/x"],
+                         ids=["short-account", "trailing-segment"])
+def test_s3tables_iceberg_config_catalog_warehouse_contract(auth_enabled, iam_user, iceberg_auth_catalog, warehouse):
+    """getConfig serves any account:s3tablescatalog/ warehouse; one naming no bucket needs GetTableBucket on *."""
+    warehouse = _iceberg_fill(warehouse, iceberg_auth_catalog)
+    nobody = iam_user()
+    allowed = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:GetTableBucket", "Resource": "*"}]})
+    with _iceberg_contract_signer(allowed) as signer, _iceberg_contract_signer(nobody) as refused_signer:
+        served = _iceberg_signed(signer, "GET", "config", {"warehouse": warehouse})
+        refused = _iceberg_signed(refused_signer, "GET", "config", {"warehouse": warehouse})
+    assert served[0] == 200
+    if not auth_enabled:
+        assert refused[0] == 200
+        return
+    assert refused[:2] == (403, _iceberg_denial(nobody, "GetTableBucket", "*"))
+
+
+@pytest.mark.auth_contract
+def test_s3tables_iceberg_table_named_rename_contract(auth_enabled, iam_user, iceberg_auth_catalog, s3tables):
+    """A commit to a table named rename is updateTable on that table, not renameTable."""
+    catalog = iceberg_auth_catalog
+    table = s3tables.create_table(tableBucketARN=catalog["bucket"], namespace="ns", name="rename",
+                                  format="ICEBERG")["tableARN"]
+    path = f"{catalog['prefix']}/namespaces/ns/tables/rename"
+    renamer = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3tables:RenameTable", "Resource": "*"}]})
+    updater = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": f"s3tables:{action}", "Resource": table} for action, _ in _UPDATE_TABLE_T]})
+    commit = {"requirements": [], "updates": []}
+    with _iceberg_contract_signer(renamer) as refused_signer, _iceberg_contract_signer(updater) as signer:
+        assert _iceberg_signed(signer, "POST", path, body=commit)[0] == 200
+        refused = _iceberg_signed(refused_signer, "POST", path, body=commit)
+    if not auth_enabled:
+        assert refused[0] == 200
+        return
+    assert refused[:2] == (403, _iceberg_denial(renamer, "UpdateTableMetadataLocation", table))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("body", ["t", "t-and-u", "no-changes", "no-object"])
+def test_s3tables_iceberg_transaction_commit_contract(auth_enabled, iam_user, iceberg_auth_catalog, body):
+    """transactions/commit needs updateTable's actions on each table it changes, on * when it names none."""
+    catalog = iceberg_auth_catalog
+    change = {"identifier": {"namespace": ["ns"], "name": "t"}, "requirements": [], "updates": []}
+    bodies = {"t": {"table-changes": [change]},
+              "t-and-u": {"table-changes": [change, {**change, "identifier": {"namespace": ["ns"], "name": "u"}}]},
+              "no-changes": {}, "no-object": "table-changes"}
+    allowed = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": f"s3tables:{action}", "Resource": catalog["t"]}
+        for action, _ in _UPDATE_TABLE_T]})
+    nobody = iam_user()
+    path = f"{catalog['prefix']}/transactions/commit"
+    with _iceberg_contract_signer(allowed) as signer, _iceberg_contract_signer(nobody) as refused_signer:
+        committed = _iceberg_signed(signer, "POST", path, body=bodies[body])
+        refused = _iceberg_signed(refused_signer, "POST", path, body=bodies[body])
+    if not auth_enabled:
+        assert (committed[0], refused[0]) == ((500, 500) if body == "no-object" else (200, 200))
+        return
+    first = "*" if body in ("no-changes", "no-object") else catalog["t"]
+    assert refused[:2] == (403, _iceberg_denial(nobody, "UpdateTableMetadataLocation", first))
+    if body == "t":
+        assert committed[0] == 200
+    elif body == "t-and-u":
+        assert committed[:2] == (403, {"error": {"message": "Access Denied", "type": "forbidden", "code": 403}})
+    else:
+        assert committed[:2] == (403, _iceberg_denial(allowed, "UpdateTableMetadataLocation", "*"))
+
+
 def test_s3tables_bucket_subresources_defaults_and_updates(s3tables):
     """Documented defaults until set: SSE-S3, STANDARD, unreferenced file removal 3/10 days."""
     arn = s3tables.create_table_bucket(name=f"sub-{_uuid_mod.uuid4().hex[:8]}",
@@ -1346,3 +1772,56 @@ def test_s3tables_table_subresources_and_rename(s3tables):
     with pytest.raises(ClientError) as exc:
         s3tables.get_table(tableBucketARN=arn, namespace="a", name="t")
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_s3tables_create_table_keeps_iceberg_types(s3tables):
+    bucket = s3tables.create_table_bucket(name=f"types-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    s3tables.create_namespace(tableBucketARN=bucket, namespace=["ns"])
+    primitives = ["decimal(19, 2)", "decimal(19,2)", "timestamp", "timestamptz", "time", "uuid", "fixed[16]", "binary",
+                  "STRING"]
+    stored = ["decimal(19, 2)", "decimal(19, 2)", "timestamp", "timestamptz", "time", "uuid", "fixed[16]", "binary",
+              "string"]
+    nested = {"type": "list", "element-id": 3, "element": "string", "element-required": False}
+    try:
+        s3tables.create_table(
+            tableBucketARN=bucket, namespace="ns", name="flat", format="ICEBERG",
+            metadata={"iceberg": {"schema": {"fields": [
+                {"name": f"c{i}", "type": t, "required": False} for i, t in enumerate(primitives)]}}},
+        )
+        s3tables.create_table(
+            tableBucketARN=bucket, namespace="ns", name="nested", format="ICEBERG",
+            metadata={"iceberg": {"schemaV2": {"type": "struct", "fields": [
+                {"id": 1, "name": "amount", "type": "decimal(9,2)", "required": True},
+                {"id": 2, "name": "tags", "type": nested, "required": False}]}}},
+        )
+        prefix = _arn_prefix(bucket)
+        flat = _iceberg_json(f"/iceberg/v1/{prefix}/namespaces/ns/tables/flat")["metadata"]
+        assert [f["type"] for f in flat["schemas"][0]["fields"]] == stored
+        fields = _iceberg_json(f"/iceberg/v1/{prefix}/namespaces/ns/tables/nested")["metadata"]["schemas"][0]["fields"]
+        assert [f["type"] for f in fields] == ["decimal(9, 2)", nested]
+    finally:
+        for name in ("flat", "nested"):
+            with contextlib.suppress(ClientError):
+                s3tables.delete_table(tableBucketARN=bucket, namespace="ns", name=name)
+        s3tables.delete_namespace(tableBucketARN=bucket, namespace="ns")
+        s3tables.delete_table_bucket(tableBucketARN=bucket)
+
+
+@pytest.mark.parametrize("kind", ["timestamp_ns", "varchar", "decimal(x,2)"])
+def test_s3tables_create_table_refuses_an_invalid_iceberg_type(s3tables, kind):
+    bucket = s3tables.create_table_bucket(name=f"badtype-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    s3tables.create_namespace(tableBucketARN=bucket, namespace=["ns"])
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3tables.create_table(
+                tableBucketARN=bucket, namespace="ns", name="t", format="ICEBERG",
+                metadata={"iceberg": {"schema": {"fields": [{"name": "c", "type": kind}]}}},
+            )
+        error = exc.value.response
+        assert error["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert (error["Error"]["Code"], error["Error"]["Message"]) == (
+            "BadRequestException", "The specified metadata is not valid")
+        assert s3tables.list_tables(tableBucketARN=bucket)["tables"] == []
+    finally:
+        s3tables.delete_namespace(tableBucketARN=bucket, namespace="ns")
+        s3tables.delete_table_bucket(tableBucketARN=bucket)

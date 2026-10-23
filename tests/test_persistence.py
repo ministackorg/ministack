@@ -639,6 +639,36 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_route53_private_zone_vpcs_round_trip():
+    vpc = {"VPCRegion": "us-west-2", "VPCId": "vpc-0123456789abcdef0"}
+    body = (
+        '<CreateHostedZoneRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">'
+        "<Name>persisted.example.internal</Name><CallerReference>persist-1</CallerReference>"
+        f"<VPC><VPCRegion>{vpc['VPCRegion']}</VPCRegion><VPCId>{vpc['VPCId']}</VPCId></VPC>"
+        "</CreateHostedZoneRequest>"
+    ).encode()
+    zone_ids = []
+
+    def populate(mod):
+        status, _, _ = mod._create_hosted_zone(body, {})
+        assert status == 201
+        zone_ids.extend(mod._zones.keys())
+        # A zone persisted before VPC associations existed has no "vpcs" key.
+        mod._zones["ZLEGACYPRIVATE1"] = {
+            "id": "ZLEGACYPRIVATE1", "name": "legacy.example.internal.",
+            "caller_reference": "legacy", "comment": "", "private": True,
+        }
+
+    def observe(mod):
+        assert mod._zones[zone_ids[0]]["vpcs"] == [vpc]
+        status, _, out = mod._list_hosted_zones_by_vpc({"vpcid": vpc["VPCId"], "vpcregion": vpc["VPCRegion"]})
+        assert status == 200 and zone_ids[0].encode() in out
+        status, _, out = mod._get_hosted_zone("ZLEGACYPRIVATE1")
+        assert status == 200 and b"<VPCs />" in out
+
+    _round_trip("route53", "route53", populate, observe)
+
+
 def test_s3_mrap_round_trip():
     """A multi-region access point outlives a restart. Its alias is baked into
     client configuration, so member buckets coming back without the alias
@@ -657,6 +687,61 @@ def test_s3_mrap_round_trip():
         assert mrap["Regions"] == ["app-us-east-1-release", "app-eu-west-1-release"]
 
     _round_trip("s3", "s3", populate, observe)
+
+
+def test_s3_access_points_round_trip_every_tenant():
+    """Access points are scoped by account and region; a restart keeps all of
+    them, not only the tenant that saved."""
+    record = {"Name": "ap", "Bucket": "data", "Alias": "ap-abc-s3alias", "NetworkOrigin": "Internet"}
+
+    def populate(mod):
+        mod._access_points.set_scoped("111111111111", "us-east-1", "ap", dict(record))
+        mod._access_points.set_scoped("222222222222", "eu-west-1", "ap", {**record, "Bucket": "other"})
+
+    def observe(mod):
+        assert mod._access_points.get_scoped("111111111111", "us-east-1", "ap")["Bucket"] == "data"
+        assert mod._access_points.get_scoped("222222222222", "eu-west-1", "ap")["Bucket"] == "other"
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_s3_object_lambda_access_points_round_trip_without_pending_requests():
+    """Object Lambda Access Points outlive a restart; requests waiting for a
+    WriteGetObjectResponse are in flight only and are never saved."""
+    def populate(mod):
+        mod._object_lambda_access_points.set_scoped("111111111111", "us-east-1", "olap", {
+            "Name": "olap", "Alias": {"Value": "olap-abc--ol-s3", "Status": "READY"}})
+        mod._olap_requests[("route", "token")] = {"done": False}
+
+    def observe(mod):
+        assert mod._object_lambda_access_points.get_scoped(
+            "111111111111", "us-east-1", "olap")["Alias"]["Value"] == "olap-abc--ol-s3"
+        assert "olap_requests" not in mod.get_state()
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_cloudfront_vpc_origins_round_trip_every_account():
+    """CloudFront VPC origins are account-scoped; a restart keeps every account's."""
+    def record(account, vo_id, version):
+        return {"Id": vo_id, "Arn": f"arn:aws:cloudfront::{account}:vpcorigin/{vo_id}", "AccountId": account,
+                "Status": "Deployed", "Version": version, "VpcOriginEndpointConfig": {"Name": "api"}}
+
+    def populate(mod):
+        mod._vpc_origins.set_scoped("111111111111", "us-east-1", "vo_a", record("111111111111", "vo_a", 4))
+        mod._vpc_origins.set_scoped("222222222222", "us-east-1", "vo_b", record("222222222222", "vo_b", 6))
+        # A deleted origin had reached version 8: its ETags must stay valid too (R1 U10/delete-C-after-gone).
+        for version in range(1, 9):
+            mod._vpc_origin_etag(version)
+
+    def observe(mod):
+        assert mod._vpc_origins.get_scoped("111111111111", "us-east-1", "vo_a")["AccountId"] == "111111111111"
+        assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["Version"] == 6
+        assert not mod._vpc_origins.contains_scoped("111111111111", "us-east-1", "vo_b")
+        # Every version's ETag issued before the restart is valid again for If-Match.
+        assert sorted(set(mod._vpc_origin_etags_issued.values())) == list(range(1, 9))
+
+    _round_trip("cloudfront", "cloudfront", populate, observe)
 
 
 def test_transcribe_round_trip():

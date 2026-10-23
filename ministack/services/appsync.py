@@ -118,6 +118,37 @@ def _select_api_region(api_id):
     return True
 
 
+# {apiId}.appsync-api[.{region}].{host}, the endpoint uris.GRAPHQL reports.
+_GRAPHQL_HOST_RE = re.compile(r"^([a-z0-9]+)\.appsync-api(?:\.([a-z0-9]+(?:-[a-z0-9]+)+-\d+))?(?:[.:]|$)")
+
+
+def _api_from_graphql_host(headers, query_params):
+    """Return the API named by the request host's first label and select its region, or None."""
+    m = _GRAPHQL_HOST_RE.match(str(headers.get("host") or "").lower())
+    if not m:
+        return None
+    api_id, host_region = m.groups()
+    if _has_sigv4_credentials(headers, query_params):
+        return api_id if api_id in _apis else None
+    if host_region is None:
+        return api_id if _select_api_region(api_id) else None
+    account_id = get_account_id()
+    for (stored_account, region, stored_api_id), _api in _apis.all_items():
+        if stored_account == account_id and region == host_region and stored_api_id == api_id:
+            set_request_region(region)
+            return api_id
+    return None
+
+
+def _graphql_host_names_event_api(headers):
+    """Whether the request host's first label is an AppSync Events API of this account."""
+    m = _GRAPHQL_HOST_RE.match(str(headers.get("host") or "").lower())
+    if not m:
+        return False
+    from ministack.services import appsync_events
+    return appsync_events._discover_api_scope(m.group(1), get_account_id()) is not None
+
+
 def _has_sigv4_credentials(headers, query_params):
     """Return whether the data request carries an explicit SigV4 region."""
     query_params = query_params or {}
@@ -324,8 +355,6 @@ def _create_data_source(api_id, body):
 
     name = body.get("name", "")
     ds_type = body.get("type", "NONE")
-    description = body.get("description", "")
-    service_role_arn = body.get("serviceRoleArn", "")
 
     arn = f"{_apis[api_id]['arn']}/datasources/{name}"
 
@@ -333,14 +362,17 @@ def _create_data_source(api_id, body):
         "dataSourceArn": arn,
         "name": name,
         "type": ds_type,
-        "description": description,
-        "serviceRoleArn": service_role_arn,
         "createdAt": _now(),
         "lastUpdatedAt": _now(),
     }
+    # Members the caller left out are absent from the data source.
+    for member in ("description", "serviceRoleArn", "metricsConfig"):
+        if body.get(member):
+            record[member] = body[member]
 
     if ds_type == "AMAZON_DYNAMODB":
-        record["dynamodbConfig"] = body.get("dynamodbConfig", {})
+        record["dynamodbConfig"] = {"useCallerCredentials": False, "versioned": False,
+                                    **body.get("dynamodbConfig", {})}
     elif ds_type == "AWS_LAMBDA":
         record["lambdaConfig"] = body.get("lambdaConfig", {})
     elif ds_type == "AMAZON_ELASTICSEARCH" or ds_type == "AMAZON_OPENSEARCH_SERVICE":
@@ -349,6 +381,8 @@ def _create_data_source(api_id, body):
         record["httpConfig"] = body.get("httpConfig", {})
     elif ds_type == "RELATIONAL_DATABASE":
         record["relationalDatabaseConfig"] = body.get("relationalDatabaseConfig", {})
+    elif ds_type == "AMAZON_EVENTBRIDGE":
+        record["eventBridgeConfig"] = body.get("eventBridgeConfig", {})
 
     _data_sources.setdefault(api_id, {})[name] = record
     return _json(200, {"dataSource": record})
@@ -410,12 +444,15 @@ def _create_resolver(api_id, type_name, body):
         "fieldName": field_name,
         "dataSourceName": data_source_name,
         "resolverArn": arn,
-        "requestMappingTemplate": request_template,
-        "responseMappingTemplate": response_template,
         "kind": kind,
+        "maxBatchSize": body.get("maxBatchSize", 0),
         "createdAt": _now(),
         "lastUpdatedAt": _now(),
     }
+    if request_template:
+        record["requestMappingTemplate"] = request_template
+    if response_template:
+        record["responseMappingTemplate"] = response_template
     if pipeline_config:
         record["pipelineConfig"] = pipeline_config
     if caching_config:
@@ -424,6 +461,9 @@ def _create_resolver(api_id, type_name, body):
         record["runtime"] = runtime
     if code:
         record["code"] = code
+    for optional in ("syncConfig", "metricsConfig"):
+        if body.get(optional) is not None:
+            record[optional] = body[optional]
 
     _resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = record
     return _json(200, {"resolver": record})
@@ -1022,18 +1062,26 @@ async def handle_request(method, path, headers, body, query_params):
 
     # GraphQL data plane: POST /graphql or POST /v1/apis/{apiId}/graphql
     if path == "/graphql" and method == "POST":
-        api_key = headers.get("x-api-key", "")
-        api_id = _resolve_api_by_key(
-            api_key,
-            allow_cross_region=not _has_sigv4_credentials(headers, query_params),
-        )
+        api_id = _api_from_graphql_host(headers, query_params)
+        if not api_id and _graphql_host_names_event_api(headers):
+            return _graphql_error(404, "ResourceNotFoundException", "Unable to find the Api.")
         if not api_id:
-            return error_response_json("UnauthorizedException", "Valid API key required", 401)
-        data = json.loads(body) if body else {}
+            api_id = _resolve_api_by_key(
+                headers.get("x-api-key", ""),
+                allow_cross_region=not _has_sigv4_credentials(headers, query_params),
+            )
+        if not api_id:
+            return _unauthorized_response()
+        authorize = _iam_field_authorizer(api_id, headers, query_params)
+        if isinstance(authorize, tuple):
+            return authorize
+        data = _graphql_request(body)
+        if data is None:
+            return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
         # Resolver execution blocks — an HTTP or Lambda data source may call
         # back into ministack, and a nested request cannot be served while
         # the event loop waits on it. Run it on a worker thread.
-        return await asyncio.to_thread(_execute_graphql, api_id, data, headers)
+        return await asyncio.to_thread(_execute_graphql, api_id, data, headers, authorize)
 
     if path.startswith("/v1/apis/") and path.endswith("/graphql") and method == "POST":
         parts = path.split("/")
@@ -1041,11 +1089,16 @@ async def handle_request(method, path, headers, body, query_params):
             api_id = parts[3]
             if not _has_sigv4_credentials(headers, query_params):
                 _select_api_region(api_id)
-            data = json.loads(body) if body else {}
+            authorize = _iam_field_authorizer(api_id, headers, query_params)
+            if isinstance(authorize, tuple):
+                return authorize
+            data = _graphql_request(body)
+            if data is None:
+                return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
             # Resolver execution blocks — an HTTP or Lambda data source may call
             # back into ministack, and a nested request cannot be served while
             # the event loop waits on it. Run it on a worker thread.
-            return await asyncio.to_thread(_execute_graphql, api_id, data, headers)
+            return await asyncio.to_thread(_execute_graphql, api_id, data, headers, authorize)
 
     m = _PATH_RE.match(path)
     if not m:
@@ -1431,15 +1484,31 @@ def _invoke_lambda_authorizer(
     return {}
 
 
-def _unauthorized_response():
+def _graphql_error(status, error_type, message):
+    """A GraphQL endpoint refusal: an `errors` envelope plus the `x-amzn-ErrorType` header."""
+    status, headers, body = _json(status, {"errors": [{"errorType": error_type, "message": message}]})
+    return status, {**headers, "x-amzn-errortype": error_type}, body
+
+
+def _graphql_request(body):
+    """The decoded GraphQL request body, or None when it is not a JSON object."""
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _malformed_graphql_request(message):
+    return _graphql_error(400, "MalformedHttpRequestException", message)
+
+
+def _unauthorized_response(message="You are not authorized to make this call."):
     """AppSync's wire-shape for an authorizer rejection: HTTP 401 with a
     GraphQL `errors` envelope carrying `UnauthorizedException`."""
-    return _json(401, {
-        "errors": [{
-            "errorType": "UnauthorizedException",
-            "message": "You are not authorized to make this call.",
-        }],
-    })
+    return _graphql_error(401, "UnauthorizedException", message)
 
 
 def _auth_modes(api):
@@ -1474,14 +1543,53 @@ def _request_is_authenticated(api_id, api, request_headers):
         if auth and not auth.startswith("AWS4-HMAC-SHA256"):
             return True
     if "AWS_IAM" in modes and auth.startswith("AWS4-HMAC-SHA256"):
-        return True
+        from ministack.app import AUTH
+        if not AUTH:
+            return True
+        from ministack.core.iam_evaluator import caller_verified
+        from ministack.core.router import extract_access_key_id
+        # Under AUTH a SigV4 header counts only once its signature checks out.
+        if caller_verified(extract_access_key_id(headers, {}), get_account_id()):
+            return True
     if "AWS_LAMBDA" in modes and api.get("lambdaAuthorizerConfig"):
         # The authorizer runs below and may still reject.
         return True
     return False
 
 
-def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_headers):
+def _iam_field_authorizer(api_id, headers, query_params):
+    """Under AUTH, authenticate a SigV4 request to an API that accepts AWS_IAM: its per-field check or a refusal."""
+    from ministack.app import AUTH
+
+    api = _apis.get(api_id)
+    if not AUTH or not api or "AWS_IAM" not in _auth_modes(api) or not _has_sigv4_credentials(headers, query_params):
+        return None
+    from ministack.core.iam_evaluator import AuthError, authenticate, enforce, resolve_principal
+    from ministack.core.router import extract_access_key_id
+
+    access_key, account_id, region = extract_access_key_id(headers, query_params), get_account_id(), get_region()
+    caller = authenticate(access_key, account_id)
+    if not isinstance(caller, AuthError):
+        caller = resolve_principal(access_key, account_id, caller)
+    if isinstance(caller, AuthError):
+        status, error_type = (400, "BadRequestException") if caller.code == "SignatureDoesNotMatch" else (
+            403, caller.code)
+        return _graphql_error(status, error_type, caller.message)
+    arn = _api_arn(api_id)
+
+    def authorize(type_name, field_name):
+        return enforce(access_key, "appsync:GraphQL", "appsync", region,
+                       resource_arn=f"{arn}/types/{type_name}/fields/{field_name}") is None
+
+    return authorize
+
+
+def _unauthorized_field(type_name, field_name):
+    """The error of a top-level field the IAM caller may not access."""
+    return _AppSyncResolverError(f"Not Authorized to access {field_name} on type {type_name}", "Unauthorized")
+
+
+def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_headers, authorize=None):
     """Execute against the API's schema with the real GraphQL algorithm."""
     from ministack.core import appsync_graphql
 
@@ -1498,11 +1606,16 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
             return _unauthorized_response()
 
     appended = []
+    checked = []  # whether the IAM caller may access each top-level field it asked for
 
     def field_resolver(source, info, **args):
         """Called for every field graphql-core resolves."""
         type_name = info.parent_type.name
         field_name = info.field_name
+        if authorize is not None and info.path.prev is None:
+            checked.append(authorize(type_name, field_name))
+            if not checked[-1]:
+                raise _unauthorized_field(type_name, field_name)
 
         resolver = (_resolvers.get(api_id) or {}).get(type_name, {}).get(field_name)
         if resolver is None:
@@ -1527,6 +1640,14 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
             api_id, sdl, query, variables, operation_name, field_resolver, None)
     except appsync_graphql.SchemaUnavailable as exc:
         return _json(200, {"data": None, "errors": [{"message": str(exc)}]})
+    except appsync_graphql.QuerySyntaxError:
+        return _malformed_graphql_request("Unable to parse GraphQL query.")
+    # An IAM caller allowed none of the top-level fields it asked for is refused as a whole;
+    # a request for nothing but __typename needs that field of the root type.
+    if authorize is not None and data is not None and not checked:
+        checked.append(authorize("Mutation" if query.lstrip().startswith("mutation") else "Query", "__typename"))
+    if authorize is not None and checked and not any(checked):
+        return _unauthorized_response("Permission denied")
 
     # util.appendError is non-fatal and rides alongside the data.
     for a in appended:
@@ -1538,17 +1659,22 @@ def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_
     return _json(200, body)
 
 
-def _execute_graphql(api_id, data, request_headers=None):
+def _execute_graphql(api_id, data, request_headers=None, authorize=None):
     """Execute a GraphQL query/mutation against the configured resolvers."""
     query = data.get("query", "")
     variables = data.get("variables", {})
     operation_name = data.get("operationName")
 
+    if data.get("query") is None:
+        return _malformed_graphql_request("Invalid request, `query` can't be null.")
+    if not isinstance(query, str) or (variables is not None and not isinstance(variables, dict)):
+        return _malformed_graphql_request("Invalid JSON payload in GraphQLAuth POST request.")
+    variables = variables or {}
     if not query.strip():
-        return _json(400, {"errors": [{"message": "Query is required"}]})
+        return _malformed_graphql_request("Invalid request, `query` can't be empty.")
 
     if api_id not in _apis:
-        return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
+        return _graphql_error(404, "ResourceNotFoundException", "Unable to find the Api.")
 
     # Applied before either execution path, so it does not depend on whether
     # the API has a schema. AWS refuses a request that satisfies none of the
@@ -1564,7 +1690,7 @@ def _execute_graphql(api_id, data, request_headers=None):
     sdl = (_schemas.get(api_id) or {}).get("definition")
     if sdl:
         return _execute_with_schema(
-            api_id, sdl, query, variables, operation_name, request_headers or {})
+            api_id, sdl, query, variables, operation_name, request_headers or {}, authorize)
 
     # Parse the top-level operation
     # Strip __typename fields — Amplify adds these everywhere
@@ -1605,7 +1731,16 @@ def _execute_graphql(api_id, data, request_headers=None):
 
     results = {}
     errors = []
+    allowed = []
     for field_name, args, sub_fields in fields:
+        if authorize is not None:
+            root_type = "Mutation" if is_mutation else "Query"
+            if not authorize(root_type, field_name):
+                e = _unauthorized_field(root_type, field_name)
+                errors.append({"message": str(e), "errorType": e.error_type, "path": [field_name]})
+                results[field_name] = None
+                continue
+            allowed.append(field_name)
         resolver = _find_resolver(api_id, "Mutation" if is_mutation else "Query", field_name)
         if resolver:
             # A mutation is never served from cache, and never populates it.
@@ -1660,6 +1795,10 @@ def _execute_graphql(api_id, data, request_headers=None):
             # No resolver — return mock empty result
             results[field_name] = None
 
+    # A request for nothing but __typename needs that field of the root type.
+    if authorize is not None and not allowed and (
+            fields or not authorize("Mutation" if is_mutation else "Query", "__typename")):
+        return _unauthorized_response("Permission denied")
     response = {"data": results}
     if errors:
         response["errors"] = errors

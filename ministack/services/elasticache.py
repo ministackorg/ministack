@@ -3052,9 +3052,10 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
-    body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<ErrorResponse xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
-    <Error><Code>{code}</Code><Message>{message}</Message></Error>
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
+    fault_type = "Sender" if 400 <= status < 500 else "Receiver"
+    body = f"""<ErrorResponse xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
+    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
     <RequestId>{new_uuid()}</RequestId>
 </ErrorResponse>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body

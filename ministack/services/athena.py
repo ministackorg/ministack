@@ -936,6 +936,11 @@ async def _run_duckdb(query, database, catalog=None):
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            # DuckDB 2.0's type_pushdown makes the CSV reader's TRY_CAST strict; 1.x has no such optimizer.
+            try:
+                conn.execute("SET disabled_optimizers = 'type_pushdown'")
+            except duckdb.Error:
+                pass
             if s3_table_buckets:
                 _attach_s3_table_buckets(conn, s3_table_buckets)
             if "read_avro(" in rewritten:

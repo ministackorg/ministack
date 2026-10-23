@@ -3,10 +3,13 @@
 import asyncio
 import json
 import os
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import pytest
+from botocore.exceptions import ClientError
 
 from ministack import app as app_module
 
@@ -61,6 +64,8 @@ def test_ministack_health_endpoints():
     assert resp_health.status == 200
     data_health = json.loads(resp_health.read())
     assert "services" in data_health
+    assert data_health["auth"] in {"enabled", "disabled"}
+    assert "auth_enabled" not in data_health
     assert "s3" in data_health["services"]
     assert data_health["edition"] == "light"
 
@@ -812,6 +817,34 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("service,labels", [
+    ("opensearch", {"com.ministack.service": "opensearch"}),
+    ("opensearchserverless", {"com.ministack.service": "opensearchserverless"}),
+    ("dsql", {}),
+    ("ecs", {}),
+    ("eks", {}),
+])
+def test_service_reset_spares_other_instances_containers(fake_docker, monkeypatch, service, labels):
+    """A reset clears this instance's containers; another MiniStack on the daemon keeps its own."""
+    import importlib
+
+    from ministack.core import container_reaper
+    from ministack.services import rds
+
+    mod = importlib.import_module(f"ministack.services.{service}")
+    for name, port in (("theirs", "4777"), ("ours", "4566")):
+        monkeypatch.setenv("GATEWAY_PORT", port)
+        fake_docker.containers.run(name=name, labels={**container_reaper.own_labels(service), **labels})
+    monkeypatch.setattr(rds if service == "dsql" else mod, "_get_docker", lambda: fake_docker)
+    if service == "dsql":
+        monkeypatch.setattr(mod, "_docker_available", lambda: True)
+
+    mod.reset()
+
+    assert fake_docker.live() == ["theirs"], f"{service} reset removed another instance's container"
+
+
+@pytest.mark.serial
 def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monkeypatch):
     """A full listing inspects every container, so one failed inspect used to cost the whole sweep."""
     from ministack.core import container_reaper
@@ -1061,7 +1094,9 @@ def test_drop_containers_logs_the_ids_it_could_not_remove(caplog):
 
 from ministack.core.responses import (  # noqa: E402
     expected_error_content_type,
+    expected_success_content_type,
     fix_error_content_type,
+    fix_success_content_type,
 )
 from ministack.core.router import detect_service  # noqa: E402
 
@@ -1122,8 +1157,7 @@ def test_fix_error_content_type_scopes():
     fix_error_content_type("kinesis", 400, headers)
     assert headers["Content-Type"] == "application/x-amz-json-1.1"
 
-    # success responses are never rewritten — an S3 object that happens to
-    # be JSON must keep its real content type.
+    # success responses are never rewritten by the error path
     headers = {"Content-Type": "application/json"}
     fix_error_content_type("s3", 200, headers)
     assert headers["Content-Type"] == "application/json"
@@ -1135,6 +1169,82 @@ def test_fix_error_content_type_scopes():
     headers = {"Content-Type": "application/xml"}
     fix_error_content_type("not-a-service", 400, headers)
     assert headers["Content-Type"] == "application/xml"
+
+
+@pytest.mark.parametrize("service,emitted,expected", [
+    # query successes answer text/xml; ec2 adds charset.
+    ("iam", "application/xml", "text/xml"),
+    ("sns", "application/xml", "text/xml"),
+    ("cloudformation", "application/xml", "text/xml"),
+    ("elasticloadbalancing", "application/xml", "text/xml"),
+    ("ec2", "application/xml", "text/xml;charset=UTF-8"),
+    # json successes follow the model's jsonVersion.
+    ("dynamodb", "application/json", "application/x-amz-json-1.0"),
+    ("dynamodb", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("kinesis", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("sqs", "application/json", "application/x-amz-json-1.0"),
+    # rest-json answers application/json.
+    ("lambda", "application/x-amz-json-1.0", "application/json"),
+    ("apigateway", "application/x-amz-json-1.0", "application/json"),
+    # sesv2's x-amz-json-1.1 override is error-path evidence only — its
+    # successes get the rest-json model value like any other service.
+    ("sesv2", "application/x-amz-json-1.0", "application/json"),
+    ("sesv2", "application/json", "application/json"),
+    # monitoring serves a query-compatible JSON mode AWS answers as
+    # x-amz-json-1.0 (success override); its XML query path still maps
+    # to the model's text/xml below.
+    ("monitoring", "application/json", "application/x-amz-json-1.0"),
+    ("monitoring", "application/xml", "text/xml"),
+    # rest-xml answers text/xml — except S3, which keeps application/xml.
+    ("route53", "application/xml", "text/xml"),
+    ("cloudfront", "application/xml", "text/xml"),
+    ("s3", "application/xml", "application/xml"),
+])
+def test_expected_success_content_type(service, emitted, expected):
+    assert expected_success_content_type(service, emitted) == expected
+
+
+@pytest.mark.parametrize("service,emitted", [
+    # An emitted text/xml is already wire-final: correct on API envelopes
+    # (route53/cloudfront/alb) and payload on e.g. a stored S3 object.
+    ("s3", "text/xml"),
+    ("route53", "text/xml"),
+    ("iam", "text/xml"),
+    ("ec2", "text/xml"),
+    # A stored S3 object's JSON or binary Content-Type is payload.
+    ("s3", "application/json"),
+    ("s3", "application/octet-stream"),
+    ("dynamodb", "application/octet-stream"),
+    ("iam", "text/plain"),
+    # Unknown service — nothing evidence-backed to enforce.
+    ("not-a-service", "application/xml"),
+    # An XML body from a json-protocol service has no modeled answer.
+    ("sqs", "application/xml"),
+])
+def test_expected_success_content_type_untouched(service, emitted):
+    assert expected_success_content_type(service, emitted) is None
+
+
+def test_fix_success_content_type_scopes():
+    headers = {"Content-Type": "application/xml"}
+    fix_success_content_type("iam", 200, headers)
+    assert headers["Content-Type"] == "text/xml"
+
+    # errors are never rewritten by the success path
+    headers = {"Content-Type": "application/xml"}
+    fix_success_content_type("iam", 400, headers)
+    assert headers["Content-Type"] == "application/xml"
+
+    # a stored S3 object's text/xml payload is not corrupted to the
+    # envelope value
+    headers = {"Content-Type": "text/xml"}
+    fix_success_content_type("s3", 200, headers)
+    assert headers["Content-Type"] == "text/xml"
+
+    # non-envelope payloads are untouched
+    headers = {"Content-Type": "application/octet-stream"}
+    fix_success_content_type("dynamodb", 200, headers)
+    assert headers["Content-Type"] == "application/octet-stream"
 
 
 @pytest.mark.parametrize("scope", ["glacier", "pinpoint", "route53resolver"])
@@ -1196,3 +1306,295 @@ def test_failed_docker_hub_pull_falls_back_to_a_mirror_and_keeps_the_name(monkey
     with pytest.raises(APIError, match="registry unavailable"):
         ImageCollection.pull(None, "public.ecr.aws/lambda/python:3.12")
     assert pulled == ["public.ecr.aws/lambda/python:3.12"]
+
+
+# Wire envelopes and success Content-Types, from real-AWS captures: query errors carry
+# <Type> and no <?xml?>; ec2 keeps its declaration and charset; rest-xml carries <Type>.
+
+
+def _wire_ct(resp):
+    return resp["ResponseMetadata"]["HTTPHeaders"]["content-type"]
+
+
+def _wire_status(err):
+    return err["ResponseMetadata"]["HTTPStatusCode"]
+
+
+def test_iam_query_error_envelope(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.get_user(UserName="wire-missing-user")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "NoSuchEntity"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_status(err) == 404
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_sns_query_error_envelope(sns):
+    with pytest.raises(ClientError) as exc:
+        sns.set_topic_attributes(
+            TopicArn="arn:aws:sns:us-east-1:000000000000:wire-missing",
+            AttributeName="DisplayName",
+            AttributeValue="x",
+        )
+    err = exc.value.response
+    assert err["Error"]["Code"] == "NotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_elbv2_query_error_envelope(elbv2):
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_load_balancers(Names=["wire-missing"])
+    err = exc.value.response
+    assert err["Error"]["Code"] == "LoadBalancerNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_autoscaling_query_error_envelope(autoscaling):
+    with pytest.raises(ClientError) as exc:
+        autoscaling.update_auto_scaling_group(
+            AutoScalingGroupName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "ValidationError"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_elasticache_query_error_envelope(ec):
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_clusters(CacheClusterId="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "CacheClusterNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_rds_query_error_envelope(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_instances(DBInstanceIdentifier="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "DBInstanceNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_status(err) == 404
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_docdb_query_error_envelope(docdb):
+    with pytest.raises(ClientError) as exc:
+        docdb.describe_db_instances(DBInstanceIdentifier="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_cloudwatch_query_error_envelope():
+    # boto3 1.42+ speaks smithy-rpc-v2-cbor to CloudWatch: the Query path needs a raw request.
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=b"Action=GetDashboard&Version=2010-08-01&DashboardName=wire-missing",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/monitoring/aws4_request, "
+                             "SignedHeaders=host, Signature=x",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req)
+    http_err = exc.value
+    body = http_err.read().decode()
+    assert http_err.headers["content-type"] == "text/xml"
+    assert not body.startswith("<?xml")
+    assert "<Type>Sender</Type>" in body
+    assert "ResourceNotFound" in body
+
+
+def test_ses_query_error_envelope(ses):
+    with pytest.raises(ClientError) as exc:
+        ses.describe_receipt_rule_set(RuleSetName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "RuleSetDoesNotExist"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_cfn_query_error_envelope(cfn):
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_stacks(StackName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "ValidationError"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_ec2_error_envelope_has_no_type_and_charset(ec2):
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-0123456789abcdef0"])
+    err = exc.value.response
+    assert err["Error"]["Code"] == "InvalidInstanceID.NotFound"
+    assert err["Error"].get("Type") is None
+    assert _wire_ct(err) == "text/xml;charset=UTF-8"
+
+
+def test_route53_restxml_error_envelope(r53):
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id="/hostedzone/ZWIREMISSING000")
+    err = exc.value.response
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_query_success_content_types(iam, sns, sts, ec, autoscaling,
+                                     elbv2, ses, rds, docdb, cfn):
+    calls = [
+        (iam.list_users, {}),
+        (sns.list_topics, {}),
+        (sts.get_caller_identity, {}),
+        (ec.describe_cache_clusters, {}),
+        (autoscaling.describe_auto_scaling_groups, {}),
+        (elbv2.describe_load_balancers, {}),
+        (ses.list_identities, {}),
+        (rds.describe_db_instances, {}),
+        (docdb.describe_db_instances, {}),
+        (cfn.list_stacks, {}),
+    ]
+    for call, kwargs in calls:
+        assert _wire_ct(call(**kwargs)) == "text/xml", call.__name__
+
+
+def test_cloudwatch_query_success_content_type():
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=b"Action=ListMetrics&Version=2010-08-01",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/monitoring/aws4_request, "
+                             "SignedHeaders=host, Signature=x",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        assert resp.headers["content-type"] == "text/xml"
+
+
+def test_json_success_content_types(ddb, sqs, kin):
+    assert _wire_ct(ddb.list_tables()) == "application/x-amz-json-1.0"
+    assert _wire_ct(sqs.list_queues()) == "application/x-amz-json-1.0"
+    assert _wire_ct(kin.list_streams()) == "application/x-amz-json-1.1"
+
+
+def test_restxml_success_content_types(s3, r53):
+    assert _wire_ct(s3.list_buckets()) == "application/xml"
+    assert _wire_ct(r53.list_hosted_zones()) == "text/xml"
+
+
+def test_restjson_success_content_type(lam):
+    assert _wire_ct(lam.list_functions()) == "application/json"
+
+
+def test_ec2_success_content_type(ec2):
+    assert _wire_ct(ec2.describe_regions()) == "text/xml;charset=UTF-8"
+
+
+def test_s3_object_payload_content_type_not_rewritten(s3):
+    # A stored object's Content-Type is payload, not an envelope.
+    bucket = "wire-ct-payload"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="doc.xml", Body=b"<a/>",
+                      ContentType="text/xml")
+        resp = s3.get_object(Bucket=bucket, Key="doc.xml")
+        assert _wire_ct(resp) == "text/xml"
+    finally:
+        s3.delete_object(Bucket=bucket, Key="doc.xml")
+        s3.delete_bucket(Bucket=bucket)
+@pytest.mark.auth_contract
+def test_ministack_auth_unset_is_permissive(tmp_path):
+    """Exercise a fresh HTTP server without AUTH, even in the strict CI job."""
+    import socket
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    from contextlib import closing
+    from pathlib import Path
+
+    import boto3
+    from botocore.config import Config
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}"
+    env = {**os.environ, "IOT_MTLS_ENABLED": "0", "PERSIST_STATE": "0", "S3_PERSIST": "0"}
+    env.pop("AUTH", None)
+    env.pop("LOCALSTACK_PERSISTENCE", None)
+    log_path = tmp_path / "auth-unset.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "hypercorn", "ministack.app:app", "--bind", f"127.0.0.1:{port}"],
+            cwd=Path(__file__).resolve().parents[1], env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    pytest.fail(f"Default-mode server exited: {log_path.read_text()}")
+                try:
+                    with urllib.request.urlopen(f"{endpoint}/_ministack/health", timeout=1) as response:
+                        health = json.load(response)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                pytest.fail(f"Default-mode server did not start: {log_path.read_text()}")
+            assert health["auth"] == "disabled"
+            with closing(boto3.client(
+                "s3", endpoint_url=endpoint, region_name="us-east-1",
+                aws_access_key_id="unregistered-auth-contract-key", aws_secret_access_key="dummy-secret",
+                config=Config(retries={"total_max_attempts": 1}, connect_timeout=5, read_timeout=5),
+            )) as client:
+                assert "Buckets" in client.list_buckets()
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def test_auth_contracts_are_excluded_from_existing_shards(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\nmarkers =\n    serial\n    data_plane\n    auth_contract\n"
+    )
+    (tmp_path / "test_lanes.py").write_text(
+        "import pytest\n"
+        "def test_parallel(): pass\n"
+        "@pytest.mark.serial\ndef test_serial(): pass\n"
+        "@pytest.mark.data_plane\ndef test_data_plane(): pass\n"
+        "@pytest.mark.auth_contract\n"
+        "@pytest.mark.parametrize('value', [1, 2])\ndef test_auth(value): pass\n"
+        "@pytest.mark.auth_contract\n@pytest.mark.serial\ndef test_auth_serial(): pass\n"
+        "@pytest.mark.auth_contract\n@pytest.mark.data_plane\ndef test_auth_data_plane(): pass\n"
+    )
+    (tmp_path / "test_auth_only.py").write_text(
+        "import pytest\n@pytest.mark.auth_contract\ndef test_only_auth(): pass\n"
+    )
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    env = {**os.environ, "PYTHONPATH": str(scripts)}
+    # Parent pytest flags must not change the nested collection's selection.
+    env.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "_collect_plan_plugin"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    counts = json.loads((tmp_path / ".pytest_collect_plan.json").read_text())
+    assert counts == {"test_lanes.py": {"parallel": 1, "serial": 1, "data_plane": 1}}

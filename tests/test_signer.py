@@ -66,11 +66,13 @@ def buckets(s3):
 
 
 @pytest.fixture()
-def profile(signer):
+def profile(signer, acm_client):
     """A signing profile on the IoT platform (the one whose signed-object
-    key is exactly prefix + jobId)."""
+    key is exactly prefix + jobId), with a requested certificate, which has no key here."""
     name = f"profile_{_uid()}"
-    signer.put_signing_profile(profileName=name, platformId=_IOT_PLATFORM)
+    cert_arn = acm_client.request_certificate(DomainName=f"{name}.example.invalid")["CertificateArn"]
+    signer.put_signing_profile(profileName=name, platformId=_IOT_PLATFORM,
+                               signingMaterial={"certificateArn": cert_arn})
     return name
 
 
@@ -200,13 +202,14 @@ def test_signer_iot_platform_rsa_certificate_fails_the_job(signer, s3, acm_clien
     assert job_id in [j["jobId"] for j in failed]
 
 
-def test_signer_iot_platform_without_an_imported_key_writes_the_receipt(signer, s3, buckets):
+def test_signer_iot_platform_without_an_imported_key_writes_the_receipt(signer, s3, acm_client, buckets):
     """Control: with no key in ACM for the certificate ARN the receipt is written as before."""
     src, dst = buckets
     s3.put_object(Bucket=src, Key="r.cfg", Body=b"r")
     name = f"receipt_{_uid()}"
+    cert_arn = acm_client.request_certificate(DomainName=f"{name}.example.invalid")["CertificateArn"]
     signer.put_signing_profile(profileName=name, platformId=_IOT_PLATFORM,
-                               signingMaterial={"certificateArn": _CERT_ARN})
+                               signingMaterial={"certificateArn": cert_arn})
 
     job_id = _start(signer, src, dst, key="r.cfg", profile=name)["jobId"]
 
@@ -636,13 +639,13 @@ def test_signer_describe_job_succeeded_with_signed_object(signer, s3, buckets, p
     assert job["requestedBy"]
 
 
-def test_signer_describe_job_carries_the_profile_material_and_expiry(signer, s3, buckets):
+def test_signer_describe_job_carries_the_profile_material_and_expiry(signer, s3, acm_client, buckets):
     """signingMaterial, overrides and signingParameters come from the
     profile; signatureExpiresAt is createdAt plus the profile's
     signatureValidityPeriod."""
     src, dst = buckets
     name = f"material_{_uid()}"
-    cert = "arn:aws:acm:us-east-1:000000000000:certificate/9ec626ca-0bbb-4be5-83a2-ee563f8386ca"
+    cert = acm_client.request_certificate(DomainName=f"{name}.example.invalid")["CertificateArn"]
     signer.put_signing_profile(
         profileName=name,
         platformId=_IOT_PLATFORM,
@@ -1166,6 +1169,14 @@ def test_signer_cancel_profile_keeps_the_name_and_freezes_permissions(signer):
                                   f"Signing Profile with name {ghost} does not exist.")
 
 
+def test_signer_cancel_profile_answers_204_with_an_empty_body(signer):
+    name, _put, _account = _permissions_profile(signer)
+    meta = signer.cancel_signing_profile(profileName=name)["ResponseMetadata"]
+    assert meta["HTTPStatusCode"] == 204
+    assert meta["HTTPHeaders"]["content-type"] == "application/json"
+    assert meta["HTTPHeaders"].get("content-length", "0") == "0"
+
+
 @pytest.mark.parametrize("name", ["fw-profile", "p" * 65])
 def test_signer_profile_name_outside_documented_pattern_is_refused(
     signer, s3, buckets, name
@@ -1205,7 +1216,7 @@ def test_signer_put_profile_accepts_a_partial_validity_period(signer):
         name = f"partial_{_uid()}"
         signer.put_signing_profile(
             profileName=name,
-            platformId=_IOT_PLATFORM,
+            platformId=_LAMBDA_PLATFORM,
             signatureValidityPeriod=period,
         )
         assert signer.get_signing_profile(profileName=name)["profileName"] == name
@@ -1223,7 +1234,7 @@ def test_signer_put_profile_rejects_an_unknown_override_enum(signer):
         with pytest.raises(ClientError) as exc:
             signer.put_signing_profile(
                 profileName=f"ovr_{_uid()}",
-                platformId=_IOT_PLATFORM,
+                platformId=_LAMBDA_PLATFORM,
                 overrides=overrides,
             )
         assert exc.value.response["Error"]["Code"] == "ValidationException"
@@ -1232,7 +1243,7 @@ def test_signer_put_profile_rejects_an_unknown_override_enum(signer):
     name = f"ovr_{_uid()}"
     signer.put_signing_profile(
         profileName=name,
-        platformId=_IOT_PLATFORM,
+        platformId=_LAMBDA_PLATFORM,
         overrides={
             "signingImageFormat": "JSONDetached",
             "signingConfiguration": {"encryptionAlgorithm": "ECDSA",
@@ -1258,6 +1269,130 @@ def test_signer_put_profile_requires_the_signing_material_certificate(signer):
     assert exc.value.response["Error"]["Code"] == "ValidationException"
 
 
+_SCOPE = ("000000000000", "eu-central-1")
+_SCOPED_CERT = "arn:aws:acm:eu-central-1:{account}:certificate/{id}"
+
+
+@pytest.fixture()
+def in_process(monkeypatch):
+    """PutSigningProfile and ACM ImportCertificate in this process under AUTH=true; yields (put, certificate)."""
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import acm as acm_module
+    from ministack.services import signer as signer_module
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    names, arns = [], []
+
+    def put(platform, arn=None, name=None):
+        name = name or f"auth_{_uid()}"
+        names.append(name)
+        body = {"platformId": platform}
+        if arn is not None:
+            body["signingMaterial"] = {"certificateArn": arn}
+        with request_scope(*_SCOPE):
+            status, _headers, payload = signer_module._put_signing_profile(name, body)
+        error = json.loads(payload) if status >= 400 else {}
+        return status, error.get("__type"), error.get("code"), error.get("message")
+
+    def certificate():
+        with request_scope(*_SCOPE):
+            _status, _headers, payload = acm_module._import_certificate({
+                "Certificate": "-----BEGIN CERTIFICATE-----\nBODY\n-----END CERTIFICATE-----\n",
+                "PrivateKey": _ec_private_key_pem(),
+            })
+        arns.append(json.loads(payload)["CertificateArn"])
+        return arns[-1]
+
+    yield put, certificate
+    for name in names:
+        signer_module._profiles.pop_scoped(*_SCOPE, name, None)
+    for arn in arns:
+        acm_module._certificates.pop_scoped(*_SCOPE, arn, None)
+
+
+_NO_MATERIAL = (400, "ValidationException", "ValidationException", "signing material cannot be null.")
+_NOT_VALID = (400, "ValidationException", "ValidationException", "{arn} is not a valid ACM certificate ARN")
+_NOT_FOUND = (404, "ResourceNotFoundException", "CertificateNotFound", "Could not find an issued certificate {arn}")
+
+
+@pytest.mark.parametrize("auth", [True, False], ids=["auth", "no-auth"])
+@pytest.mark.parametrize("platform, arn, refusal", [
+    pytest.param(_IOT_PLATFORM, None, _NO_MATERIAL, id="iot-no-material"),
+    pytest.param("AmazonFreeRTOS-TI-CC3220SF", None, _NO_MATERIAL, id="freertos-no-material"),
+    pytest.param(_IOT_PLATFORM, "not-an-arn", _NOT_VALID, id="not-an-arn"),
+    pytest.param(_IOT_PLATFORM, "arn:aws:s3:::bucket", _NOT_VALID, id="other-service"),
+    pytest.param(_IOT_PLATFORM, "arn:aws:acm:eu-central-1:000000000000:certificate/", _NOT_VALID, id="empty-id"),
+    pytest.param(_IOT_PLATFORM, _SCOPED_CERT.format(account="000000000000", id="not-a-uuid"), _NOT_VALID,
+                 id="id-not-a-uuid"),
+    pytest.param(_IOT_PLATFORM, _SCOPED_CERT.format(account="notanaccount", id=uuid.uuid4()), _NOT_VALID,
+                 id="account-not-digits"),
+    pytest.param(_IOT_PLATFORM, f"arn:aws:acm:us-east-1:000000000000:certificate/{uuid.uuid4()}", _NOT_VALID,
+                 id="other-region"),
+    pytest.param(_IOT_PLATFORM, _SCOPED_CERT.format(account="111122223333", id=uuid.uuid4()),
+                 (400, "ValidationException", "ValidationException", "{arn} is not owned by 000000000000"),
+                 id="other-account"),
+    pytest.param(_IOT_PLATFORM, _SCOPED_CERT.format(account="000000000000", id=uuid.uuid4()), _NOT_FOUND,
+                 id="unknown-certificate"),
+    pytest.param(_IOT_PLATFORM, _SCOPED_CERT.format(account="000000000000", id=str(uuid.uuid4()).upper()),
+                 _NOT_FOUND, id="unknown-certificate-uppercase-id"),
+    pytest.param("AmazonFreeRTOS-Default", _SCOPED_CERT.format(account="000000000000", id=uuid.uuid4()), _NOT_FOUND,
+                 id="freertos-unknown-certificate"),
+    pytest.param(_LAMBDA_PLATFORM, "not-an-arn",
+                 (400, "ValidationException", "InvalidProfileParameters",
+                  "Signing material should not be present when using AWSLambda-SHA384-ECDSA platform."),
+                 id="lambda-with-material"),
+    pytest.param("Notation-OCI-SHA384-ECDSA", _SCOPED_CERT.format(account="000000000000", id=uuid.uuid4()),
+                 (400, "ValidationException", "InvalidProfileParameters",
+                  "Signing material should not be present when using Notation-OCI-SHA384-ECDSA platform."),
+                 id="notation-with-material"),
+])
+def test_signer_put_profile_refuses_unusable_signing_material_under_auth(monkeypatch, in_process, auth, platform,
+                                                                         arn, refusal):
+    """Under AUTH=true PutSigningProfile refuses what AWS refuses; without AUTH only the Lambda and Notation refusal stays."""
+    from ministack import app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    put, _certificate = in_process
+    status, error_type, code, message = put(platform, arn)
+    if auth or refusal[2] == "InvalidProfileParameters":
+        assert (status, error_type, code, message) == (*refusal[:3], refusal[3].format(arn=arn))
+    else:
+        assert (status, error_type, code, message) == (200, None, None, None)
+
+
+def test_signer_put_profile_under_auth_needs_an_issued_certificate(in_process):
+    """An imported or requested certificate is issued here; one in any other status is refused."""
+    from ministack.core.responses import request_scope
+    from ministack.services import acm as acm_module
+
+    put, certificate = in_process
+    imported = certificate()
+    assert put(_IOT_PLATFORM, imported)[0] == 200
+    with request_scope(*_SCOPE):
+        _status, _headers, payload = acm_module._request_certificate({"DomainName": "signer-auth.example.invalid"})
+    requested = json.loads(payload)["CertificateArn"]
+    try:
+        assert put(_IOT_PLATFORM, requested)[0] == 200
+    finally:
+        acm_module._certificates.pop_scoped(*_SCOPE, requested, None)
+    acm_module._certificates.get_scoped(*_SCOPE, imported)["Status"] = "PENDING_VALIDATION"
+    assert put(_IOT_PLATFORM, imported) == (400, "ValidationException", "ValidationException",
+                                            "Certificate is not Issued")
+
+
+def test_signer_put_profile_under_auth_checks_the_arn_before_the_name_and_acm_after_it(in_process):
+    """On a taken name the material and ARN shape are refused first; an unknown certificate is not."""
+    put, certificate = in_process
+    name, arn = f"taken_{_uid()}", certificate()
+    assert put(_IOT_PLATFORM, arn, name=name)[0] == 200
+    assert put(_IOT_PLATFORM, None, name=name)[3] == "signing material cannot be null."
+    assert put(_IOT_PLATFORM, "not-an-arn", name=name)[3] == "not-an-arn is not a valid ACM certificate ARN"
+    assert put(_LAMBDA_PLATFORM, arn, name=name)[2] == "InvalidProfileParameters"
+    unknown = _SCOPED_CERT.format(account="000000000000", id=uuid.uuid4())
+    assert put(_IOT_PLATFORM, unknown, name=name)[2] == "ProfileAlreadyExists"
+
+
 def test_signer_put_profile_enforces_the_tag_constraints(signer):
     """Keys are 1..128 and match ^(?!aws:)[a-zA-Z+-=._:/]+$, values are at
     most 256 characters, and the map takes at most 200 entries."""
@@ -1270,12 +1405,12 @@ def test_signer_put_profile_enforces_the_tag_constraints(signer):
     ):
         with pytest.raises(ClientError) as exc:
             signer.put_signing_profile(
-                profileName=f"tag_{_uid()}", platformId=_IOT_PLATFORM, tags=tags)
+                profileName=f"tag_{_uid()}", platformId=_LAMBDA_PLATFORM, tags=tags)
         assert exc.value.response["Error"]["Code"] == "ValidationException", tags
 
     name = f"tag_{_uid()}"
     signer.put_signing_profile(
-        profileName=name, platformId=_IOT_PLATFORM, tags={"team.name": "iot"})
+        profileName=name, platformId=_LAMBDA_PLATFORM, tags={"team.name": "iot"})
     assert signer.get_signing_profile(profileName=name)["tags"] == {"team.name": "iot"}
 
 

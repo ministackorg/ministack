@@ -4829,7 +4829,7 @@ def test_rds_create_read_replica_source_not_found(rds):
 
 
 def test_rds_reboot_db_instance(rds):
-    """RebootDBInstance sets the instance status back to available."""
+    """RebootDBInstance returns rebooting, then converges to available."""
     rds.create_db_instance(
         DBInstanceIdentifier="reboot-test",
         DBInstanceClass="db.t3.micro",
@@ -4839,11 +4839,15 @@ def test_rds_reboot_db_instance(rds):
         AllocatedStorage=10,
     )
     try:
+        rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier="reboot-test", WaiterConfig={"Delay": 1, "MaxAttempts": 120})
         resp = rds.reboot_db_instance(DBInstanceIdentifier="reboot-test")
-        assert resp["DBInstance"]["DBInstanceStatus"] == "available"
+        assert resp["DBInstance"]["DBInstanceStatus"] == "rebooting"
+        rds.get_waiter("db_instance_available").wait(DBInstanceIdentifier="reboot-test", WaiterConfig={"Delay": 1, "MaxAttempts": 120})
 
         desc = rds.describe_db_instances(DBInstanceIdentifier="reboot-test")
         assert desc["DBInstances"][0]["DBInstanceStatus"] == "available"
+        events = rds.describe_events(SourceIdentifier="reboot-test", SourceType="db-instance")["Events"]
+        assert any(event["Message"] == "DB instance restarted." for event in events)
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="reboot-test", SkipFinalSnapshot=True)
 
@@ -4853,6 +4857,255 @@ def test_rds_reboot_db_instance_not_found(rds):
     with pytest.raises(ClientError) as exc:
         rds.reboot_db_instance(DBInstanceIdentifier="no-such-instance")
     assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+
+@pytest.fixture
+def reboot_instance(monkeypatch):
+    """An in-process instance record for the reboot worker; no server or Docker needed."""
+    monkeypatch.setattr(_imm_rds, "_single_instance_response", lambda *args: args[-1].copy())
+    value = {
+        "DBInstanceIdentifier": "reboot-test", "DBInstanceStatus": "available",
+        "Engine": "mysql", "MasterUsername": "root", "_MasterUserPassword": "test",
+        "_docker_container_id": "owned", "_HostPort": 13306,
+        "Endpoint": {"Address": "localhost", "Port": 13306},
+    }
+    _imm_rds._instances["reboot-test"] = value
+    yield value
+    _imm_rds._instances.pop("reboot-test", None)
+
+
+def test_rds_reboot_is_async_and_waits_for_sql(monkeypatch, reboot_instance):
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+
+    class Container:
+        status = "running"
+
+        def stop(self, timeout):
+            calls.append("stop")
+
+        def start(self):
+            calls.append("start")
+
+        def reload(self):
+            pass
+
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: Container())))
+
+    def ready(*args):
+        calls.append("ready")
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    original = _imm_rds._finish_instance_reboot
+
+    def finish(*args):
+        try:
+            original(*args)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(_imm_rds, "_finish_instance_reboot", finish)
+    try:
+        _imm_rds._reboot_db_instance({"DBInstanceIdentifier": "reboot-test"})
+        assert entered.wait(5)
+        assert reboot_instance["DBInstanceStatus"] == "rebooting"
+        assert calls == ["stop", "start", "ready"]
+    finally:
+        release.set()
+        assert done.wait(5)
+    assert reboot_instance["DBInstanceStatus"] == "available"
+
+
+def test_rds_reboot_refuses_an_instance_that_is_not_available(reboot_instance):
+    reboot_instance["DBInstanceStatus"] = "stopped"
+    status, _, body = _imm_rds._reboot_db_instance({"DBInstanceIdentifier": "reboot-test"})
+    assert status == 400
+    assert b"InvalidDBInstanceState" in body
+    assert b"DBInstance reboot-test is in stopped state but expected it to be one of available." in body
+
+
+@pytest.mark.data_plane
+def test_rds_reboot_preserves_mysql_data_and_breaks_sessions(monkeypatch, reboot_instance):
+    import docker
+    import pymysql
+
+    client = docker.from_env()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    container = client.containers.run(
+        "mysql:8.0", detach=True, ports={"3306/tcp": ("127.0.0.1", port)},
+        environment={"MYSQL_ROOT_PASSWORD": "test", "MYSQL_ROOT_HOST": "%"},
+    )
+    connection = None
+    try:
+        container.reload()
+        port = int(container.attrs["NetworkSettings"]["Ports"]["3306/tcp"][0]["HostPort"])
+        reboot_instance["_HostPort"] = port
+        reboot_instance["_docker_container_id"] = container.id
+
+        def connect():
+            return pymysql.connect(host="127.0.0.1", port=port, user="root", password="test", connect_timeout=2,
+                                   read_timeout=2, autocommit=True)
+
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            try:
+                connection = connect()
+                break
+            except pymysql.Error:
+                time.sleep(0.5)
+        assert connection is not None
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE DATABASE reboot_test")
+            cursor.execute("CREATE TABLE reboot_test.evidence (value INT)")
+            cursor.execute("INSERT INTO reboot_test.evidence VALUES (42)")
+        monkeypatch.setattr(_imm_rds, "_get_docker", lambda: client)
+        response = _imm_rds._reboot_db_instance({"DBInstanceIdentifier": "reboot-test"})
+        assert response["DBInstanceStatus"] == "rebooting"
+        deadline = time.monotonic() + 90
+        while reboot_instance["DBInstanceStatus"] == "rebooting" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert reboot_instance["DBInstanceStatus"] == "available"
+        with pytest.raises(pymysql.Error):
+            connection.ping(reconnect=False)
+        with connect() as recovered:
+            with recovered.cursor() as cursor:
+                cursor.execute("SELECT value FROM reboot_test.evidence")
+                assert cursor.fetchone() == (42,)
+    finally:
+        if connection:
+            connection.close()
+        container.remove(force=True, v=True)
+
+
+def test_rds_reboot_failed_restart_does_not_report_available(monkeypatch, reboot_instance):
+    def fail():
+        raise RuntimeError("Docker unavailable")
+
+    monkeypatch.setattr(_imm_rds, "_get_docker", fail)
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, None)
+    assert reboot_instance["DBInstanceStatus"] == "failed"
+
+
+def test_rds_reboot_does_not_resurrect_a_replaced_instance(monkeypatch, reboot_instance):
+    replacement = dict(reboot_instance)
+
+    def ready(*args):
+        _imm_rds._instances["reboot-test"] = replacement
+        return True
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None)
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, None)
+    assert _imm_rds._instances["reboot-test"] is replacement
+    assert reboot_instance["DBInstanceStatus"] == "rebooting"
+
+
+@pytest.fixture
+def clean_rds_events():
+    saved = dict(_imm_rds._events.items())
+    for key in list(_imm_rds._events):
+        del _imm_rds._events[key]
+    yield
+    for key in list(_imm_rds._events):
+        del _imm_rds._events[key]
+    _imm_rds._events.update(saved)
+
+
+def _describe_rds_events(**params):
+    """In-process DescribeEvents, parsed with botocore's Query parser."""
+    import botocore.session
+    from botocore.parsers import QueryParser
+
+    status, headers, body = _imm_rds._describe_events(params)
+    shape = botocore.session.get_session().get_service_model("rds").operation_model("DescribeEvents").output_shape
+    return status, QueryParser().parse({"status_code": status, "headers": headers, "body": body}, shape)
+
+
+def _record_rds_reboot_event(name="example"):
+    _imm_rds._record_reboot_event({"DBInstanceIdentifier": name,
+                                   "DBInstanceArn": f"arn:aws:rds:us-east-1:000000000000:db:{name}"})
+
+
+def test_rds_reboot_event_wire_shape_and_filters(clean_rds_events):
+    _record_rds_reboot_event("example")
+    _record_rds_reboot_event("other")
+    status, result = _describe_rds_events(SourceIdentifier="example", SourceType="db-instance")
+    assert status == 200
+    event, = result["Events"]
+    assert event["Message"] == "DB instance restarted."
+    assert event["EventCategories"] == ["availability"]
+    assert event["SourceArn"].endswith(":db:example")
+    assert abs(event["Date"].timestamp() - time.time()) < 2
+    assert _describe_rds_events(SourceType="db-cluster")[1]["Events"] == []
+    assert _describe_rds_events(SourceType="db-shard-group")[0] == 200
+    assert _describe_rds_events(**{"EventCategories.member.1": "failure"})[1]["Events"] == []
+    assert _describe_rds_events(StartTime="2100-01-01T00:00:00Z", EndTime="2100-01-02T00:00:00Z")[1]["Events"] == []
+
+
+def test_rds_events_pagination_has_no_duplicates(clean_rds_events):
+    for i in range(23):
+        _record_rds_reboot_event(str(i))
+    _, first = _describe_rds_events(MaxRecords="20")
+    _, second = _describe_rds_events(MaxRecords="20", Marker=first["Marker"])
+    assert len(first["Events"]) == 20
+    assert len(second["Events"]) == 3
+    assert "Marker" not in second
+    assert len({e["SourceIdentifier"] for e in first["Events"] + second["Events"]}) == 23
+
+
+@pytest.mark.parametrize("params", [{"SourceIdentifier": "x"}, {"MaxRecords": "19"}, {"MaxRecords": "101"},
+                                    {"Duration": "bad"}, {"Marker": "missing"}, {"StartTime": "bad"}])
+def test_rds_events_invalid_requests(clean_rds_events, params):
+    assert _describe_rds_events(**params)[0] == 400
+
+
+def test_rds_events_survive_persistence_and_are_region_scoped(clean_rds_events):
+    from ministack.core.responses import get_region, set_request_region
+
+    region = get_region()
+    _record_rds_reboot_event()
+    snapshot = _imm_rds.get_state()
+    try:
+        set_request_region("eu-north-1" if region != "eu-north-1" else "us-east-2")
+        assert _describe_rds_events()[1]["Events"] == []
+    finally:
+        set_request_region(region)
+    for key in list(_imm_rds._events):
+        del _imm_rds._events[key]
+    _imm_rds.load_persisted_state(snapshot)
+    assert len(_describe_rds_events()[1]["Events"]) == 1
+
+
+def test_rds_reboot_event_recorded_only_after_success(clean_rds_events, monkeypatch):
+    instance = {"DBInstanceIdentifier": "event-reboot", "DBInstanceStatus": "rebooting"}
+    _imm_rds._instances["event-reboot"] = instance
+    try:
+        monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+        _imm_rds._finish_instance_reboot(instance, None)
+        assert len(_describe_rds_events()[1]["Events"]) == 1
+        instance["DBInstanceStatus"] = "rebooting"
+        instance["_docker_container_id"] = "missing"
+
+        def fail(_):
+            raise RuntimeError("missing container")
+
+        monkeypatch.setattr(_imm_rds, "_get_docker",
+                            lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=fail)))
+        _imm_rds._finish_instance_reboot(instance, None)
+        assert len(_describe_rds_events()[1]["Events"]) == 1
+        assert instance["DBInstanceStatus"] == "failed"
+    finally:
+        _imm_rds._instances.pop("event-reboot", None)
 
 
 def test_rds_restore_from_snapshot(rds):

@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import re
 
 import pytest
 from botocore.exceptions import ClientError
@@ -116,6 +117,34 @@ def test_sts_assume_role(sts):
     assumed = resp["AssumedRoleUser"]
     assert "test-session" in assumed["Arn"]
     assert "AssumedRoleId" in assumed
+
+
+@pytest.mark.parametrize("auth, status", [(True, 400), (False, 200)])
+def test_sts_assume_role_refuses_session_tag_keys_differing_in_case_under_auth(monkeypatch, auth, status):
+    import asyncio
+
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    role = f"tag-case-{os.urandom(4).hex()}"
+    trust = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": "000000000000"},
+                            "Action": ["sts:AssumeRole", "sts:TagSession"]}]}
+    iam_svc._roles[role] = {"RoleName": role, "Arn": f"arn:aws:iam::000000000000:role/{role}", "Tags": [],
+                            "AssumeRolePolicyDocument": json.dumps(trust)}
+    body = (f"Action=AssumeRole&Version=2011-06-15&RoleSessionName=tags&RoleArn=arn:aws:iam::000000000000:role/{role}"
+            "&Tags.member.1.Key=team&Tags.member.1.Value=blue&Tags.member.2.Key=TEAM&Tags.member.2.Value=red").encode()
+    headers = {"content-type": "application/x-www-form-urlencoded",
+               "authorization": "AWS4-HMAC-SHA256 Credential=test/20260930/us-east-1/sts/aws4_request"}
+    try:
+        got, _headers, payload = asyncio.run(sts_mod.handle_request("POST", "/", headers, body, {}))
+    finally:
+        iam_svc._roles.pop(role, None)
+    assert got == status
+    if auth:
+        assert b"<Code>InvalidParameterValue</Code>" in payload
+        assert b"Tag keys are case insensitive" in payload
 
 
 def test_sts_assumed_role_arn_uses_sts_service(sts):
@@ -401,6 +430,148 @@ def test_sts_get_session_token_rejects_temporary_caller_when_auth_enabled(monkey
         sts_mod._sessions.pop(source_key, None)
 
 
+def test_sts_get_federation_token_names_the_federated_user(sts):
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}]})
+    resp = sts.get_federation_token(Name="fed", Policy=policy)
+    assert resp["FederatedUser"] == {
+        "FederatedUserId": "000000000000:fed",
+        "Arn": "arn:aws:sts::000000000000:federated-user/fed",
+    }
+    creds = resp["Credentials"]
+    import boto3
+    fed = boto3.client("sts", endpoint_url=sts.meta.endpoint_url, region_name="us-east-1",
+                       aws_access_key_id=creds["AccessKeyId"],
+                       aws_secret_access_key=creds["SecretAccessKey"],
+                       aws_session_token=creds["SessionToken"])
+    assert fed.get_caller_identity()["Arn"] == "arn:aws:sts::000000000000:federated-user/fed"
+
+
+_SESSION_POLICY_ERRORS = [
+    ({"Policy": '{"Statement":'}, "MalformedPolicyDocument"),
+    ({"Policy": json.dumps({"Statement": [{"Effect": "Maybe", "Action": "*", "Resource": "*"}]})},
+     "MalformedPolicyDocument"),
+    ({"Policy": json.dumps({"Statement": [{"Effect": "Allow", "Action": f"sqs:A{i}", "Resource": "<&>"}
+                                          for i in range(60)]})}, "ValidationError"),
+    ({"PolicyArns": [{"arn": "arn:aws:iam::000000000000:policy/no-such-session-policy"}]}, "ValidationError"),
+    ({"PolicyArns": [{"arn": "arn:aws:iam::aws:policy/NoSuchManagedSessionPolicy"}]}, "ValidationError"),
+]
+
+
+@pytest.mark.parametrize("params, code", _SESSION_POLICY_ERRORS)
+def test_sts_get_federation_token_validates_session_policies(sts, params, code):
+    with pytest.raises(ClientError) as exc:
+        sts.get_federation_token(Name="fed", **params)
+    assert exc.value.response["Error"]["Code"] == code
+
+
+@pytest.mark.parametrize("auth", [True, False])
+@pytest.mark.parametrize("params, code", _SESSION_POLICY_ERRORS)
+def test_sts_assume_role_validates_session_policies_under_auth(monkeypatch, auth, params, code):
+    import asyncio
+    from urllib.parse import urlencode
+
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", auth)
+    role = f"session-policy-{os.urandom(4).hex()}"
+    trust = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}
+    iam_svc._roles[role] = {"RoleName": role, "Arn": f"arn:aws:iam::000000000000:role/{role}", "Tags": [],
+                            "AssumeRolePolicyDocument": json.dumps(trust)}
+    query = {"Action": "AssumeRole", "Version": "2011-06-15", "RoleSessionName": "s1",
+             "RoleArn": f"arn:aws:iam::000000000000:role/{role}"}
+    if "Policy" in params:
+        query["Policy"] = params["Policy"]
+    for n, entry in enumerate(params.get("PolicyArns", []), 1):
+        query[f"PolicyArns.member.{n}.arn"] = entry["arn"]
+    headers = {"content-type": "application/x-www-form-urlencoded",
+               "authorization": "AWS4-HMAC-SHA256 Credential=test/20260930/us-east-1/sts/aws4_request"}
+    try:
+        status, _headers, payload = asyncio.run(sts_mod.handle_request(
+            "POST", "/", headers, urlencode(query).encode(), {}))
+    finally:
+        iam_svc._roles.pop(role, None)
+    if auth:
+        assert (status, f"<Code>{code}</Code>".encode() in payload) == (400, True)
+    else:
+        assert status == 200
+
+
+@pytest.mark.parametrize("name, value, constraint", [
+    (None, "null", "Member must not be null"),
+    ("f", "'f'", "Member must have length greater than or equal to 2"),
+    ("x" * 33, f"'{'x' * 33}'", "Member must have length less than or equal to 32"),
+    ("fed <&>", "'fed <&>'", "Member must satisfy regular expression pattern: [\\w+=,.@-]*"),
+])
+def test_sts_get_federation_token_validates_the_name(sts, name, value, constraint):
+    import boto3
+    from botocore.config import Config
+
+    unchecked = boto3.client("sts", endpoint_url=sts.meta.endpoint_url, region_name="us-east-1",
+                             aws_access_key_id="test", aws_secret_access_key="test",
+                             config=Config(parameter_validation=False))
+    with pytest.raises(ClientError) as exc:
+        unchecked.get_federation_token(**({} if name is None else {"Name": name}))
+    assert exc.value.response["Error"]["Message"] == (
+        f"1 validation error detected: Value {value} at 'name' failed to satisfy constraint: {constraint}")
+
+
+def test_sts_session_policy_arns_are_looked_up_in_the_role_account(sts):
+    import uuid
+
+    import boto3
+
+    role_account = "222233334444"
+    iam = boto3.client("iam", endpoint_url=sts.meta.endpoint_url, region_name="us-east-1",
+                       aws_access_key_id=role_account, aws_secret_access_key="test")
+    name = f"session-{uuid.uuid4().hex[:8]}"
+    arn = iam.create_policy(PolicyName=name, PolicyDocument=json.dumps(
+        {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]}),
+    )["Policy"]["Arn"]
+    iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}))
+    try:
+        resp = sts.assume_role(RoleArn=f"arn:aws:iam::{role_account}:role/{name}", RoleSessionName="s1",
+                               PolicyArns=[{"arn": arn}])
+        assert resp["AssumedRoleUser"]["Arn"] == f"arn:aws:sts::{role_account}:assumed-role/{name}/s1"
+    finally:
+        iam.delete_role(RoleName=name)
+        iam.delete_policy(PolicyArn=arn)
+
+
+def test_sts_get_federation_token_refuses_session_credentials(monkeypatch):
+    import asyncio
+    import time
+
+    import ministack.app as app_mod
+    from ministack.core.responses import get_account_id
+    from ministack.services import sts as sts_mod
+
+    account_id = get_account_id()
+    source_key = "test-federation-source-key"
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    sts_mod._sessions[source_key] = {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/role/session",
+        "UserId": "AROA123:session", "SecretAccessKey": "secret",
+        "SessionToken": "token", "Expiration": time.time() + 900,
+        "AccountId": account_id, "PrincipalType": "AssumedRole",
+    }
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={source_key}/20260930/us-east-1/sts/aws4_request",
+        "content-type": "application/x-www-form-urlencoded",
+        "x-amz-security-token": "token",
+    }
+    try:
+        status, _headers, payload = asyncio.run(sts_mod.handle_request(
+            "POST", "/", headers, b"Action=GetFederationToken&Version=2011-06-15&Name=fed", {}))
+    finally:
+        sts_mod._sessions.pop(source_key, None)
+    assert status == 403
+    assert b"Cannot call GetFederationToken with session credentials" in payload
+
+
 @pytest.mark.parametrize("auth_enabled", [False, True])
 @pytest.mark.parametrize("action", ["GetSessionToken", "AssumeRole"])
 @pytest.mark.parametrize("credential_kind", ["unknown", "inactive", "expired"])
@@ -504,19 +675,68 @@ def test_sts_policies_reach_only_get_access_key_info(monkeypatch, auth_enabled, 
 def test_sts_assume_role_with_web_identity(sts, iam):
     iam.create_role(
         RoleName="test-oidc-role",
-        AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[]}',
+        AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
+            "Principal": {"Federated": "arn:aws:iam::000000000000:oidc-provider/oidc.example.com"}}]}),
     )
     role_arn = "arn:aws:iam::000000000000:role/test-oidc-role"
     resp = sts.assume_role_with_web_identity(
         RoleArn=role_arn,
         RoleSessionName="ci-session",
-        WebIdentityToken="fake-oidc-token-value",
+        WebIdentityToken=_web_token({"iss": "https://oidc.example.com", "aud": "ci", "sub": "ci-user"}),
     )
     creds = resp["Credentials"]
     assert "AccessKeyId" in creds
     assert "SecretAccessKey" in creds
     assert "SessionToken" in creds
     assert "Expiration" in creds
+
+
+def _web_token(claims):
+    import base64
+
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{b64({'alg': 'RS256'})}.{b64(claims)}.sig"
+
+
+@pytest.mark.parametrize("role,status", [
+    ("trust-web", 200), ("trust-web-aud", 403), ("trust-web-aws", 403),
+])
+def test_sts_assume_role_with_web_identity_checks_trust(monkeypatch, role, status):
+    import asyncio
+    from urllib.parse import urlencode
+
+    from ministack import app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    account, host = "000000000000", "issuer.example.com/pool"
+    provider = f"arn:aws:iam::{account}:oidc-provider/{host}"
+
+    def federated(aud):
+        return [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity", "Principal": {"Federated": provider},
+                 "Condition": {"StringEquals": {f"{host}:aud": aud}}}]
+    trust = {"trust-web": federated("client-a"), "trust-web-aud": federated("client-b"),
+             "trust-web-aws": [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
+                                "Principal": {"AWS": account}}]}[role]
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam_svc._roles.set_scoped(account, None, role, {
+        "RoleName": role, "Arn": f"arn:aws:iam::{account}:role/{role}", "Tags": [],
+        "AssumeRolePolicyDocument": json.dumps({"Version": "2012-10-17", "Statement": trust})})
+    body = urlencode({"Action": "AssumeRoleWithWebIdentity", "RoleSessionName": "trust",
+                      "RoleArn": f"arn:aws:iam::{account}:role/{role}",
+                      "WebIdentityToken": _web_token({"iss": f"https://{host}", "aud": "client-a", "sub": "u-1"})})
+    try:
+        with request_scope(account, "us-east-1"):
+            got, _, payload = asyncio.run(sts_svc.handle_request(
+                "POST", "/", {"content-type": "application/x-www-form-urlencoded"}, body.encode(), {}))
+    finally:
+        iam_svc._roles.pop_scoped(account, None, role, None)
+    assert got == status
+    if status == 403:
+        assert b"Not authorized to perform sts:AssumeRoleWithWebIdentity" in payload
 
 
 def _gwit_post(data: bytes):
@@ -777,22 +997,18 @@ def test_sts_get_caller_identity_json_protocol_resolves_iam_user(iam):
     """JSON protocol renders the resolved IAM-user identity, not root."""
     import urllib.request
 
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
     with _iam_user_key(iam, "caller-identity-json-user") as (_, source):
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps({}).encode(),
-            method="POST",
-            headers={
-                "Content-Type": "application/x-amz-json-1.1",
-                "X-Amz-Target": "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
-                "Authorization": (
-                    "AWS4-HMAC-SHA256 "
-                    f"Credential={source['AccessKeyId']}/20240101/us-east-1/sts/aws4_request, "
-                    "SignedHeaders=host, Signature=fake"
-                ),
-            },
-        )
+        signed = AWSRequest(method="POST", url=endpoint, data=json.dumps({}).encode(), headers={
+            "Content-Type": "application/x-amz-json-1.1",
+            "X-Amz-Target": "AWSSecurityTokenServiceV20110615.GetCallerIdentity",
+        })
+        SigV4Auth(Credentials(source["AccessKeyId"], source["SecretAccessKey"]), "sts", "us-east-1").add_auth(signed)
+        req = urllib.request.Request(endpoint, data=signed.body, method="POST", headers=dict(signed.headers))
         with urllib.request.urlopen(req) as r:
             assert r.status == 200
             data = json.loads(r.read())
@@ -800,6 +1016,68 @@ def test_sts_get_caller_identity_json_protocol_resolves_iam_user(iam):
         assert data["Arn"] == "arn:aws:iam::000000000000:user/caller-identity-json-user"
         assert data["Account"] == "000000000000"
         assert data["UserId"]
+
+
+def _strip_credential(request, **_):
+    """Send the signed Authorization header without its Credential part."""
+    algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+    request.headers["Authorization"] = algorithm + b" " + fields.partition(b", ")[2]
+
+
+def _empty_credential_key(request, **_):
+    """Send the signed Authorization header with the access key cut out of its Credential."""
+    algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+    request.headers["Authorization"] = algorithm + b" Credential=/" + fields.split(b"/", 1)[1]
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("edit, code, status, message", [
+    (_strip_credential, "IncompleteSignature", 400,
+     "Authorization header requires 'Credential' parameter. (Hashed with SHA-256 and encoded with Base64) "),
+    (_empty_credential_key, "InvalidClientTokenId", 403, "The security token included in the request is invalid."),
+], ids=["no-credential", "empty-key"])
+def test_sts_header_signature_without_access_key_contract(auth_enabled, iam_user, edit, code, status, message):
+    """Under AUTH=true a header signature that names no access key is refused, not served as the root."""
+    user = iam_user()
+    client = user.client("sts")
+    assert client.get_caller_identity()["Arn"] == user.arn
+    client.meta.events.register_first("before-send", edit)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.get_caller_identity()
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (code, status)
+        assert response["Error"]["Message"].startswith(message)
+    else:
+        assert client.get_caller_identity()["Arn"].endswith(":root")
+
+
+@pytest.mark.auth_contract
+def test_sts_presigned_url_without_credential_contract(auth_enabled, iam_user):
+    """Under AUTH=true a presigned URL without X-Amz-Credential answers IncompleteSignature."""
+    import html
+    import urllib.error
+    import urllib.request
+
+    def post(url):
+        # botocore presigns a Query API call as a POST, as AWS checks it.
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, data=b"", method="POST"), timeout=10) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as err:
+            return err.code, err.read().decode()
+
+    url = iam_user().client("sts").generate_presigned_url("get_caller_identity", ExpiresIn=300)
+    assert post(url)[0] == 200
+    status, body = post(re.sub(r"X-Amz-Credential=[^&]*&", "", url))
+    if auth_enabled:
+        assert status == 400
+        assert "<Code>IncompleteSignature</Code>" in body
+        assert ("AWS query-string parameters must include 'X-Amz-Credential'. "
+                "Re-examine the query-string parameters.") in html.unescape(body)
+    else:
+        assert status == 200
+        assert ":root</Arn>" in body
 
 
 @pytest.mark.parametrize("auth_enabled", [False, True])

@@ -4564,7 +4564,7 @@ def test_ec2_describe_images_filters_apply_to_the_stubs(ec2):
         public = ec2.describe_images(
             Filters=[{"Name": "is-public", "Values": ["true"]}])["Images"]
         assert {i["ImageId"] for i in public} == {
-            "ami-0abcdef1234567890", "ami-0123456789abcdef0", "ami-0fedcba9876543210"}
+            "ami-0abcdef1234567890", "ami-0c2023a1b2c3d4e5f", "ami-0123456789abcdef0", "ami-0fedcba9876543210"}
 
         private = ec2.describe_images(
             Filters=[{"Name": "is-public", "Values": ["false"]}])["Images"]
