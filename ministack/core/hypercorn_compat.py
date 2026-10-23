@@ -9,37 +9,35 @@ when the client is waiting on ``Expect: 100-continue`` (e.g. S3
 ``upload_file``). Injecting the standard reason phrase makes the wire
 output ``HTTP/1.1 100 Continue\\r\\n``, which every SDK version accepts.
 
+Final responses get their standard phrase the same way: AWS endpoints answer
+``HTTP/1.1 200 OK``, and a CloudFront Function reads it as ``statusDescription``.
+
 Issue: https://github.com/ministackorg/ministack/issues/389
 Remove this module if h11 ever ships a default reason upstream.
 """
 
+from http import HTTPStatus
+
 import h11
 
-# RFC 9110 § 15.2 informational response reason phrases.
-_DEFAULT_REASONS = {
-    100: b"Continue",
-    101: b"Switching Protocols",
-    102: b"Processing",
-    103: b"Early Hints",
-}
 
-_original_post_init = h11.InformationalResponse.__post_init__
-
-
-def _patched_post_init(self) -> None:
-    _original_post_init(self)
-    if not self.reason:
-        default = _DEFAULT_REASONS.get(self.status_code)
-        if default is not None:
+def _with_default_reason(original_post_init):
+    def _patched_post_init(self) -> None:
+        original_post_init(self)
+        if not self.reason:
+            try:
+                default = HTTPStatus(self.status_code).phrase.encode()
+            except ValueError:
+                return
             # Frozen dataclass — bypass normal attribute protection.
             object.__setattr__(self, "reason", default)
 
-
-_patched_post_init._ministack_patched = True  # type: ignore[attr-defined]
+    _patched_post_init._ministack_patched = True  # type: ignore[attr-defined]
+    return _patched_post_init
 
 
 def install() -> None:
     """Install the reason-phrase patch. Idempotent."""
-    if getattr(h11.InformationalResponse.__post_init__, "_ministack_patched", False):
-        return
-    h11.InformationalResponse.__post_init__ = _patched_post_init
+    for event in (h11.InformationalResponse, h11.Response):
+        if not getattr(event.__post_init__, "_ministack_patched", False):
+            event.__post_init__ = _with_default_reason(event.__post_init__)

@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **HTTP/1.1 status lines carry their reason phrase** — final responses were written as `HTTP/1.1 200 `, so a CloudFront Function saw an empty `statusDescription`. They now read `HTTP/1.1 200 OK`, `404 Not Found`. Contributed by @skialpine.
 - **Responses carry one `Date`** — a proxied response carried the target's `Date` and a second one from Hypercorn. The app now adds `Date` to a response that has none, including a WebSocket handshake, and Hypercorn adds none; an ALB writes its own `Date` in place of an instance or IP target's, as AWS does, and CloudFront keeps the origin's. Hypercorn's own error responses, such as a malformed request's 400 and a WebSocket handshake refused with `websocket.close`, carry one `Date` too. Contributed by @skialpine.
 - **CloudFront — `X-Amz-Cf-Id` and `Via` have CloudFront's shape** — the data plane sent 56 characters of standard base64 without padding as `X-Amz-Cf-Id` and a 13-character token in `Via`. It now sends URL-safe base64 of 40 bytes with its `==` padding, and `Via: 1.1 <32 hex>.cloudfront.net (CloudFront)`. Contributed by @skialpine.
 - **ALB — the listener's CORS response headers are applied** — `routing.http.response.access_control_*.header_value` set with `ModifyListenerAttributes` had no effect. Each non-empty value is now added to the listener's responses, replacing the target's header of that name. Contributed by @skialpine.

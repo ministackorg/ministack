@@ -607,6 +607,19 @@ def test_unit_h11_informational_has_reason_phrase():
         f"expected canonical reason phrase, got: {out!r}"
 
 
+def test_unit_h11_response_has_reason_phrase():
+    """A final response carries its standard reason phrase too: AWS endpoints answer 'HTTP/1.1 404 Not Found'."""
+    import h11
+
+    import ministack.app  # noqa: F401
+
+    conn = h11.Connection(our_role=h11.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    conn.next_event()
+    out = conn.send(h11.Response(status_code=404, headers=[]))
+    assert out.startswith(b"HTTP/1.1 404 Not Found\r\n"), f"expected canonical reason phrase, got: {out!r}"
+
+
 def test_wire_expect_100_continue_returns_canonical_status_line():
     """End-to-end: a raw PUT with Expect: 100-continue against ministack must
     receive a 100 Continue with the reason phrase intact (issue #389)."""
