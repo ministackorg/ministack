@@ -1287,14 +1287,15 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
     # so the API's own corsConfiguration is applied (#406). A Function URL owns its
-    # CORS config the same way, as does a registered custom domain. Skip the generic
-    # wildcard preflight in all three cases.
+    # CORS config the same way, as does a registered custom domain. An OPTIONS
+    # request to a load balancer goes on to its target. Skip the generic wildcard preflight for each.
     host = headers.get("host", "")
     owns_cors = (
         _parse_execute_api_url(host, path) is not None
         or _parse_lambda_url(host, path) is not None
         or _resolve_custom_domain_request(host, path) is not None
         or _parse_cloudfront_dataplane_host(host) is not None
+        or _is_potential_alb_request(host, path)
     )
     for response in (
         None if owns_cors else _handle_options_request(method, path, headers, query_params, request_id),

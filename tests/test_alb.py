@@ -2936,3 +2936,34 @@ def test_elbv2_dataplane_forwards_repeated_query_keys(elbv2):
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _stop_server(server)
+
+
+def test_elbv2_dataplane_forwards_options_to_the_target(elbv2):
+    """An OPTIONS request reaches the target, and the client sees the target's status and headers;
+    the gateway answers no preflight of its own for a load balancer."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Allow", "GET, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-options"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", method="OPTIONS",
+                           headers={"Origin": "https://app.example.test", "Access-Control-Request-Method": "GET"})
+        resp = _req.urlopen(req)
+        assert resp.status == 204
+        assert resp.headers.get("Allow") == "GET, OPTIONS"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
