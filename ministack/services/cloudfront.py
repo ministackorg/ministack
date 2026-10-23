@@ -5867,6 +5867,8 @@ def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None 
     result["x-cache"] = x_cache
     result["x-amz-cf-pop"] = "LOC50-C1"
     result["x-amz-cf-id"] = request_id or _cf_request_id()
+    if not any(k.lower() == "server" for k in result):
+        result["server"] = "CloudFront"
     return result
 
 

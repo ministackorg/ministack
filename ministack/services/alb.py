@@ -2350,6 +2350,17 @@ def _target_headers(lb_arn, listener, headers, client_ip):
     return out
 
 
+def _with_alb_server(response):
+    """A response the load balancer makes itself (Lambda target, fixed-response, redirect, authentication, its own
+    errors) carries its Server header; an instance or IP target's response keeps the target's own, or none."""
+    from ministack.core.responses import StreamingResponse
+
+    status, headers, body = response
+    if isinstance(body, StreamingResponse) or any(k.lower() == "server" for k in headers):
+        return response
+    return status, {**headers, "Server": "awselb/2.0"}, body
+
+
 async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
                            raw_query_string=None):
     lb_arn = lb["LoadBalancerArn"]
@@ -2358,8 +2369,8 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
     matching = [l for l in candidates if l.get("Port", 80) == port] or candidates
 
     if not matching:
-        return (503, {"Content-Type": "application/json"},
-                json.dumps({"message": f"No listeners configured for '{lb['LoadBalancerName']}'"}).encode())
+        return _with_alb_server((503, {"Content-Type": "application/json"},
+                json.dumps({"message": f"No listeners configured for '{lb['LoadBalancerName']}'"}).encode()))
 
     listener = matching[0]
     l_arn = listener["ListenerArn"]
@@ -2384,13 +2395,13 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
                 target_host = target_headers.get("host")
                 if target_host and _lb_attr(lb_arn, "routing.http.preserve_host_header.enabled", "false") != "true":
                     target_host = _target_host_header(target_host, listener.get("Port", 80))
-                return await _execute_actions(actions, method, path,
-                                              target_headers, body, query_params, port,
-                                              lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
-                                              raw_query_string=raw_query_string)
+                return _with_alb_server(await _execute_actions(actions, method, path,
+                                                               target_headers, body, query_params, port,
+                                                               lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
+                                                               raw_query_string=raw_query_string))
 
-    return (502, {"Content-Type": "application/json"},
-            json.dumps({"message": "No matching ALB rule found"}).encode())
+    return _with_alb_server((502, {"Content-Type": "application/json"},
+            json.dumps({"message": "No matching ALB rule found"}).encode()))
 
 
 def reset():

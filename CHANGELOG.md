@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **ALB and CloudFront responses carry only their own headers** — the gateway added `x-amzn-requestid` and `x-amz-request-id` to both and `Access-Control-Allow-Origin: *` to ALB responses. They now carry what the target or origin sent, plus the load balancer's or CloudFront's own: `Server: awselb/2.0` on a response the load balancer makes itself (a Lambda target's, fixed-response, redirect, authentication, its own errors), and `Server: CloudFront` when the origin sends none. Contributed by @skialpine.
 - **Responses carry no Hypercorn `Server` header** — every response carried `Server: hypercorn-h11`, which no AWS endpoint sends. Hypercorn no longer adds it; services that send their own `Server` are unchanged. Contributed by @skialpine.
 - **ALB — `Accept-Encoding` reaches HTTP targets** — the data plane dropped the client's `Accept-Encoding`, so a target never compressed its response. It is now forwarded, and the target's encoded response is passed through unchanged. Contributed by @skialpine.
 - **API Gateway — an HTTP API's `rawQueryString` is the query string as the client sent it** — a bare key gained an `=` (`?flag` reached the function as `flag=`). Both the Lambda proxy event and the REQUEST authorizer event now carry the request's own query string. Contributed by @skialpine.

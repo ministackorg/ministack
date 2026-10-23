@@ -613,6 +613,7 @@ def test_elbv2_dataplane_fixed_response(elbv2, lam):
         resp = _req.urlopen(_req.Request(url, method="GET"))
         assert resp.status == 200
         assert resp.read() == b"maintenance"
+        assert resp.headers["Server"] == "awselb/2.0"
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
@@ -3006,3 +3007,21 @@ def test_elbv2_dataplane_passes_accept_encoding_and_a_gzip_response_through(elbv
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _stop_server(server)
+
+
+def test_elbv2_dataplane_adds_no_cors_or_request_id_headers(elbv2):
+    """An ALB passes the target's response headers through; CORS and request ids are the application's."""
+    server, thread = _start_fixed_body_server(b"ok")
+    lb_name = "dp-alb-plain"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/")
+        assert resp.read() == b"ok"
+        names = {name.lower() for name, _ in resp.getheaders()}
+        assert not names & {"access-control-allow-origin", "x-amzn-requestid", "x-amz-request-id"}
+        assert resp.headers["Server"].startswith("BaseHTTP")  # the target's own, not the load balancer's
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

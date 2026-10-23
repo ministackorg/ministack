@@ -2645,7 +2645,8 @@ async def _handle_special_data_plane_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
         headers, body, query_params, client_ip,
     ):
-        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+        # A distribution adds its own headers (Via, X-Amz-Cf-Id, X-Amz-Cf-Pop, X-Cache), not an API's request ids.
+        return response
     # Before S3 virtual hosting, which would read the collection id as a bucket.
     if _AOSS_COLLECTION_HOST_RE.match(host) and (
         response := await _get_module("opensearchserverless").handle_dataplane(
@@ -2664,7 +2665,8 @@ async def _handle_special_data_plane_request(
             response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
         return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
     if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string):
-        return _with_data_plane_headers(response, request_id)
+        # A load balancer passes its target's headers through; CORS and request ids are the application's.
+        return response
     return None
 
 

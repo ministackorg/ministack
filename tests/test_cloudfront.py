@@ -6184,6 +6184,7 @@ def test_registered_alb_origin_without_a_listener_on_the_origin_port_answers_502
     status, headers, _body = _get(dist_host, "/anything")
     assert status == 502
     assert headers.get("X-Cache") == "Error from cloudfront"
+    assert {k.lower(): v for k, v in headers.items()}["server"] == "CloudFront"
 
 
 def test_unregistered_alb_hostname_is_still_refused(cloudfront):
@@ -6377,3 +6378,14 @@ def test_function_url_origin_over_http_is_unreachable(cloudfront, function_url_o
 def test_unregistered_function_url_hostname_is_still_refused(cloudfront):
     host = f"{_uuid_mod.uuid4()}.lambda-url.us-east-1.on.aws"
     assert _get(_function_url_dist(cloudfront, host), "/hello")[0] == 502
+
+
+def test_distribution_adds_no_request_id_headers_of_its_own(cf_raw_origin_stack):
+    """CloudFront adds Via, X-Amz-Cf-Id, X-Amz-Cf-Pop and X-Cache; an origin that sends no request id gets none."""
+    status, headers, _body = _get(cf_raw_origin_stack, "/hello")
+    assert status == 200
+    names = {name.lower() for name in headers}
+    assert "x-amz-cf-id" in names
+    assert not names & {"x-amzn-requestid", "x-amz-request-id"}
+    # The origin's own Server passes through.
+    assert {k.lower(): v for k, v in headers.items()}["server"].startswith("BaseHTTP")
