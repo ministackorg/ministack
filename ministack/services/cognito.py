@@ -4330,7 +4330,6 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     mfa_config = pool.get("MfaConfiguration", "OFF")
     if mfa_config == "OFF":
         return None
-    preferred = user.get("_preferred_mfa", "")
     enabled_mfa = user.get("_mfa_enabled", [])
     # OPTIONAL: only challenge if user has TOTP set up
     if mfa_config == "OPTIONAL" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
@@ -5218,7 +5217,6 @@ def _confirmation_code_error(action: str, data: dict):
 def _confirm_sign_up(data):
     cid = data.get("ClientId")
     username = data.get("Username")
-    code = data.get("ConfirmationCode", "")
 
     pool = None
     for p in _user_pools.values():

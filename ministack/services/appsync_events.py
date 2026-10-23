@@ -115,10 +115,6 @@ def _restore_api_child_store(
         store.set_scoped(account_id, region, api_id, value)
 
 
-def load_persisted_state(data):
-    return _restore_state(data)
-
-
 def _restore_state(data):
     if not data:
         return
@@ -129,8 +125,8 @@ def _restore_state(data):
     _restore_api_child_store(_api_keys, data.get("api_keys", {}))
 
 
-# Same contract as apigateway.py (used by app.py persistence loader)
-load_persisted_state = _restore_state
+def load_persisted_state(data):
+    return _restore_state(data)
 
 
 

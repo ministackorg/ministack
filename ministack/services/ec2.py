@@ -3984,7 +3984,6 @@ def _modify_volume_attribute(p):
 
 def _describe_volume_attribute(p):
     vol_id = _p(p, "VolumeId")
-    attribute = _p(p, "Attribute") or "autoEnableIO"
     return _xml(200, "DescribeVolumeAttributeResponse", f"""
         <volumeId>{vol_id}</volumeId>
         <autoEnableIO><value>false</value></autoEnableIO>""")

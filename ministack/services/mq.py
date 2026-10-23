@@ -509,7 +509,6 @@ def _create_broker(body: dict) -> tuple:
     engine_version = body.get("engineVersion") or engine_versions[0]
     deployment_mode = str(body.get("deploymentMode", "SINGLE_INSTANCE")).upper()
     host_instance_type = body.get("hostInstanceType", "mq.m5.large")
-    storage_type = body.get("storageType", "EBS")
 
     # Create broker in state
     broker_id = new_uuid()

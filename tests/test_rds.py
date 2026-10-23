@@ -4818,6 +4818,31 @@ def test_rds_create_read_replica(rds):
         rds.delete_db_instance(DBInstanceIdentifier="rr-source", SkipFinalSnapshot=True)
 
 
+def test_rds_max_allocated_storage_only_with_storage_autoscaling(rds):
+    """MaxAllocatedStorage is set only when storage autoscaling is on; a value equal to AllocatedStorage turns it off."""
+    plain = f"rds-noauto-{_uuid_mod.uuid4().hex[:8]}"
+    scaled = f"rds-auto-{_uuid_mod.uuid4().hex[:8]}"
+    replica = f"rds-auto-rr-{_uuid_mod.uuid4().hex[:8]}"
+    common = dict(DBInstanceClass="db.t3.micro", Engine="postgres", MasterUsername="admin",
+                  MasterUserPassword="secret123", AllocatedStorage=20)
+    describe = lambda iid: rds.describe_db_instances(DBInstanceIdentifier=iid)["DBInstances"][0]  # noqa: E731
+    try:
+        assert "MaxAllocatedStorage" not in rds.create_db_instance(DBInstanceIdentifier=plain, **common)["DBInstance"]
+        assert "MaxAllocatedStorage" not in describe(plain)
+        rds.create_db_instance(DBInstanceIdentifier=scaled, MaxAllocatedStorage=100, **common)
+        assert describe(scaled)["MaxAllocatedStorage"] == 100
+        rds.create_db_instance_read_replica(DBInstanceIdentifier=replica, SourceDBInstanceIdentifier=scaled)
+        assert "MaxAllocatedStorage" not in describe(replica)
+        rds.modify_db_instance(DBInstanceIdentifier=scaled, MaxAllocatedStorage=20, ApplyImmediately=True)
+        assert "MaxAllocatedStorage" not in describe(scaled)
+    finally:
+        for iid in (replica, scaled, plain):
+            try:
+                rds.delete_db_instance(DBInstanceIdentifier=iid, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
+
+
 def test_rds_create_read_replica_source_not_found(rds):
     """CreateDBInstanceReadReplica fails when the source instance does not exist."""
     with pytest.raises(ClientError) as exc:

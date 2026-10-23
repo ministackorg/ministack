@@ -43,8 +43,7 @@ _tags = AccountRegionScopedDict()
 _commands = AccountRegionScopedDict()
 _service_settings = AccountRegionScopedDict()
 
-# SettingIds are the botocore ssm model's list; (default value, default LastModifiedDate) observed on AWS
-# (GetServiceSetting, us-east-1, 2026-10-10), except high-throughput-enabled (ResetServiceSetting API reference example).
+# The botocore model's SettingIds with the (value, LastModifiedDate) AWS reports before any update.
 _SERVICE_SETTING_DEFAULTS = {
     "/ssm/parameter-store/high-throughput-enabled": ("false", 1555532571.138),
     "/ssm/parameter-store/default-parameter-tier": ("Standard", 1565131339.38),
@@ -57,8 +56,7 @@ _SERVICE_SETTING_DEFAULTS = {
     "/ssm/appmanager/appmanager-enabled": ("False", 1604983265.572),
     "/ssm/opsinsights/opscenter": ("Disabled", 1622077352.094),
 }
-# Accepted SettingValues per the UpdateServiceSetting API reference; an id missing here takes any string.
-# The error message is observed for default-parameter-tier; its format for the other ids is inferred.
+# SettingValues the UpdateServiceSetting API reference lists; an id not here takes any string.
 _SERVICE_SETTING_VALUES = {
     "/ssm/parameter-store/high-throughput-enabled": ("true", "false"),
     "/ssm/parameter-store/default-parameter-tier": ("Standard", "Advanced", "Intelligent-Tiering"),
@@ -384,7 +382,7 @@ def _put_parameter(data):
         "LastModifiedDate": now,
         "DataType": data.get("DataType", "text"),
         "Description": data.get("Description", existing.get("Description", "") if existing else ""),
-        "Tier": data.get("Tier") or _default_tier(data, value),
+        "Tier": data.get("Tier") or _default_tier(data, value, existing),
         "AllowedPattern": data.get("AllowedPattern", ""),
         "Policies": data.get("Policies", []),
         "Labels": [],
@@ -1136,12 +1134,15 @@ def _service_setting_out(setting_id):
     }
 
 
-def _default_tier(data, value):
-    """Tier of a parameter put without one: the account and region's default-parameter-tier setting."""
+def _default_tier(data, value, existing):
+    """Tier of a put without one: the default-parameter-tier setting; an Advanced parameter stays Advanced."""
+    if existing and existing.get("Tier") == "Advanced":
+        return "Advanced"
     setting = _service_settings.get(_DEFAULT_TIER_SETTING)
     tier = setting["value"] if setting else "Standard"
     if tier == "Intelligent-Tiering":
-        return "Advanced" if len(value.encode()) > 4096 or data.get("Policies") else "Standard"
+        needs_advanced = len(value.encode()) > 4096 or data.get("Policies") or len(_parameters) > 10000
+        return "Advanced" if needs_advanced else "Standard"
     return tier
 
 

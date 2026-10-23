@@ -704,7 +704,6 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     host = headers.get("host", "")
     target = headers.get("x-amz-target", "")
     auth = headers.get("authorization", "")
-    content_type = headers.get("content-type", "")
 
     # 1. Check X-Amz-Target header (most reliable for JSON-based services)
     if target:

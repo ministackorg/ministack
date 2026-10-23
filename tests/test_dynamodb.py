@@ -5494,7 +5494,7 @@ def test_dynamodb_execute_transaction_multi_insert(ddb):
             {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "a"}]},
             {"Statement": f'INSERT INTO "{name}" VALUE {{\'pk\': ?}}', "Parameters": [{"S": "b"}]},
         ])
-        assert len(r["Responses"]) == 2
+        assert r["Responses"] == []
         for pk in ("a", "b"):
             got = ddb.get_item(TableName=name, Key={"pk": {"S": pk}})
             assert "Item" in got
@@ -7616,7 +7616,9 @@ def test_dynamodb_gsi_multi_attribute_keys(ddb):
                            ("a = :a AND b = :b AND s1 > :s1 AND s2 = :s2", {"s1": "a", "s2": "1"})):
             with pytest.raises(ClientError) as exc:
                 query(cond, a="x", b="y", **vals)
-            assert exc.value.response["Error"]["Message"] == "Query key condition not supported"
+            assert exc.value.response["Error"]["Message"] == (
+                "RANGE key attributes s1 must have equality conditions specified in the query "
+                "because a condition is present on key attribute s2")
     finally:
         ddb.delete_table(TableName=name)
 

@@ -1108,10 +1108,6 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- Target-based (JSON body) services ---
 
     if service == "events":
-        try:
-            event_data = json.loads(body or b"{}")
-        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-            event_data = {}
         buses = eventbridge_resource_arns(body, region, account_id)
         if buses:
             return buses[0]

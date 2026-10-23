@@ -4603,6 +4603,9 @@ def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_t
     (3600, 840, None, None, None),
     (3600, 960, None, 403, "Request is not yet valid"),
     (3600, 0, ("X-Amz-Expires", "abc"), 400, "X-Amz-Expires should be a number"),
+    (3600, 0, ("X-Amz-Expires", "-1"), 400, "X-Amz-Expires must be non-negative"),
+    (3600, 0, ("X-Amz-Expires", None), 400, "requires the X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature, "
+                                            "X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters."),
     (3600, 0, ("X-Amz-Date", "2026"), 400, "X-Amz-Date must be in the ISO8601 Long Format"),
 ])
 def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, skew, change, status, code):
@@ -4627,7 +4630,9 @@ def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, s
         url = urlsplit(client.generate_presigned_url(
             "get_object", Params={"Bucket": "test-bucket", "Key": "object"}, ExpiresIn=expires))
     query = parse_qs(url.query)
-    if change:
+    if change and change[1] is None:
+        query.pop(change[0])
+    elif change:
         query[change[0]] = [change[1]]
 
     error = s3_svc._verify_presigned_sigv4("GET", url.path, {"host": url.netloc}, query)
@@ -4635,7 +4640,7 @@ def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, s
     if auth_enabled and status:
         assert error[0] == status and code in error[2].decode()
     elif change:
-        assert b"SignatureDoesNotMatch" in error[2]
+        assert error[0] == 403  # SignatureDoesNotMatch, or Request has expired for a negative X-Amz-Expires
     else:
         assert error is None
 
@@ -5835,6 +5840,46 @@ def test_s3_put_object_with_explicit_sha256_value_validated(s3):
 
     s3.delete_object(Bucket=bucket, Key="ok")
     s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_complete_multipart_upload_checks_mpu_object_size(s3):
+    bucket = "mpu-object-size-bucket"
+    s3.create_bucket(Bucket=bucket)
+    body = b"x" * 10
+    uid = s3.create_multipart_upload(Bucket=bucket, Key="obj")["UploadId"]
+    etag = s3.upload_part(Bucket=bucket, Key="obj", UploadId=uid, PartNumber=1, Body=body)["ETag"]
+    parts = {"Parts": [{"PartNumber": 1, "ETag": etag}]}
+
+    for declared in (11, 9, 0):
+        with pytest.raises(ClientError) as exc:
+            s3.complete_multipart_upload(Bucket=bucket, Key="obj", UploadId=uid,
+                                         MultipartUpload=parts, MpuObjectSize=declared)
+        error = exc.value.response
+        assert error["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert error["Error"]["Code"] == "InvalidRequest"
+        assert error["Error"]["Message"] == (
+            f"The provided 'x-amz-mp-object-size' header value {declared} does not match what was computed: 10")
+
+    def _invalid_size(request, **_):
+        request.headers["x-amz-mp-object-size"] = "abc"
+
+    s3.meta.events.register_first("before-sign.s3.CompleteMultipartUpload", _invalid_size)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.complete_multipart_upload(Bucket=bucket, Key="obj", UploadId=uid, MultipartUpload=parts)
+    finally:
+        s3.meta.events.unregister("before-sign.s3.CompleteMultipartUpload", _invalid_size)
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert exc.value.response["Error"]["Message"] == "Value for x-amz-mp-object-size header is invalid: 'abc'"
+
+    with pytest.raises(ClientError) as exc:
+        s3.head_object(Bucket=bucket, Key="obj")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert [(p["PartNumber"], p["Size"]) for p in s3.list_parts(Bucket=bucket, Key="obj", UploadId=uid)["Parts"]] == [
+        (1, 10)]
+
+    s3.complete_multipart_upload(Bucket=bucket, Key="obj", UploadId=uid, MultipartUpload=parts, MpuObjectSize=10)
+    assert s3.head_object(Bucket=bucket, Key="obj")["ContentLength"] == 10
 
 
 def test_s3_multipart_checksum_sha256_composite(s3):

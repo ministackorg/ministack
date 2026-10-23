@@ -987,8 +987,6 @@ def _create_db_instance(params):
         "ProcessorFeatures": [],
         "DeletionProtection": deletion_protection,
         "AssociatedRoles": [],
-        "MaxAllocatedStorage": int(
-            _evaluate_params(params, "MaxAllocatedStorage") or str(allocated_storage)),
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
@@ -1862,9 +1860,6 @@ def _instance_xml(i):
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection', False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
-        <MaxAllocatedStorage>
-            {i.get('MaxAllocatedStorage', i.get('AllocatedStorage', 20))}
-        </MaxAllocatedStorage>
         <TagList>{tag_xml}</TagList>
         {cert_xml}
         <CustomerOwnedIpEnabled>

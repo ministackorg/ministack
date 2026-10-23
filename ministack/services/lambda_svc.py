@@ -1371,7 +1371,6 @@ def invoke_durable_resume(function_name: str, durable_arn: str, original_event: 
     func = _functions.get(canonical)
     if not func:
         return
-    config = func.get("config") or func
     # Set the durable context to the SAME ARN/token so the SDK reads the
     # accumulated operations as InitialExecutionState (replay path).
     _durable_ctx.set({
@@ -1731,21 +1730,14 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
-# The shape of a layer version ARN that can exist on AWS: a 12-digit account, a
-# name of at most 140 of [a-zA-Z0-9-_], and a version from 1 with no leading zero.
+# A layer version ARN that can exist on AWS.
 _POSSIBLE_LAYER_VERSION_ARN_RE = re.compile(
     r"arn:aws:lambda:[a-z0-9-]+:[0-9]{12}:layer:[a-zA-Z0-9-_]{1,140}:[1-9][0-9]*"
 )
 
 
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Another account's layer. A layer MiniStack holds answers through its grant,
-    so a version it does not hold or does not grant is denied, as on AWS. A layer
-    it does not hold resolves as an empty version: on AWS it may be a public
-    vendor or AWS extension, and offline a real ARN looks like a made-up one, so
-    any account and version that could exist resolve. Its bytes are not
-    available, so it has CodeSize 0, leaves out what only the publisher knows,
-    and does not run. An ARN that cannot name a layer version on AWS is denied."""
+    """Another account's layer: through its grant if MiniStack holds it, else an empty version."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
@@ -5868,8 +5860,7 @@ def _resolve_layer_zip(attachment: str | dict) -> bytes | None:
     """Return attached content, including versions deleted since attachment."""
     if isinstance(attachment, dict):
         if attachment.get("CodeSize") == 0:
-            # Attached as an empty layer MiniStack did not hold; a version
-            # published under that ARN later must not load without its grant.
+            # An empty layer never loads content published under its ARN later.
             return None
         attachment = attachment.get("Arn", "")
     try:
@@ -6479,9 +6470,7 @@ def _list_layer_versions(layer_name: str, query_params: dict):
 
 
 def _layer_name_too_long(layer_name: str):
-    """GetLayerVersion's LayerName limit. It covers the whole value, a layer ARN
-    included, and is checked before the version. GetLayerVersionByArn has no
-    LayerName member and no such limit."""
+    """GetLayerVersion's 140-character LayerName limit, checked before the version."""
     if len(layer_name) <= 140:
         return None
     return error_response_json(

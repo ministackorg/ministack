@@ -670,7 +670,7 @@ async def _invoke_rest_api(method, path, headers, body, query_params):
             "RestApiStatusCode": resp.status_code,
             "RestApiResponse": payload,
         })
-    except Exception as e:
+    except Exception:
         logger.exception("MWAA InvokeRestApi failure")
         # AWS doesn't leak the underlying Python exception text. The
         # InternalServerException message is opaque to the caller.
