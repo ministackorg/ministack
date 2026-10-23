@@ -2056,7 +2056,10 @@ async def _handle_execute_api_request(
             http_api_path = apigw_v2.decode_http_api_path(raw_path)
             if http_api_path.startswith(prefix):
                 execute_path = http_api_path[len(prefix):]
-        return await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        status, resp_headers, resp_body = await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        # An HTTP API names its request id apigw-requestid (16 base64 characters); x-amzn-requestid is a REST API's.
+        resp_headers.setdefault("apigw-requestid", base64.b64encode(os.urandom(11)).decode())
+        return status, resp_headers, resp_body
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
@@ -2402,6 +2405,8 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     status, headers, body = response
     if wildcard_cors and "Access-Control-Allow-Origin" not in headers:
         headers["Access-Control-Allow-Origin"] = "*"
+    if "apigw-requestid" in headers:
+        return status, headers, body
     # An API Gateway gateway response already carries the id it rendered.
     request_id = headers.setdefault("x-amzn-requestid", request_id)
     if include_s3_id:
