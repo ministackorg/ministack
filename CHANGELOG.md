@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **OpenSearch — `OPENSEARCH_JAVA_OPTS`** — a small machine could not cap the heap of the engine containers MiniStack starts; the setting is now passed to each of them (per-domain and Serverless collection), and unset passes nothing. Contributed by @skialpine.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
