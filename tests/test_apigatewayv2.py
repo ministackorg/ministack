@@ -1348,6 +1348,44 @@ def test_apigw_v2_event_omits_null_fields_when_absent(apigw, lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_http_api_response_request_id_header(apigw, lam):
+    """AWS: observed 2026-09-07, us-east-1, an HTTP API's integration responses: apigw-requestid
+    (e.g. Ct26qjlpoAMEbVg=) and no x-amzn-requestid or x-amz-request-id. AWS Knowledge Center
+    "collect-api-gateway-extended-request-ids": HTTP API apigw-requestid, REST API x-amz-apigw-id."""
+    import re
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-reqid-{_uuid.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n")},
+    )
+    api_id = apigw.create_api(Name=f"reqid-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /reqid", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    try:
+        req = _urlreq.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/reqid")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        assert re.fullmatch(r"[A-Za-z0-9+/]{15}=", resp.headers["apigw-requestid"])
+        assert resp.headers["x-amzn-requestid"] is None
+        assert resp.headers["x-amz-request-id"] is None
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_raw_query_string_percent_encoded(apigw, lam):
     """rawQueryString must stay percent-encoded like AWS: a space in a value comes
     back as %20, not a literal space (which breaks lambda_http / http::Uri) — #1035."""
