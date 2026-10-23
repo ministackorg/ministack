@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextlib
 import copy
+import functools
 import io
 import json
 import os
@@ -15484,6 +15485,12 @@ def test_lambda_env_disables_host_prefix_injection_by_default(lam):
         lam.delete_function(FunctionName=own)
 
 
+@functools.cache
+def _revision_zip(content):
+    """One zip per content, so equal content compares equal (zip entries carry a timestamp)."""
+    return _make_zip(content)
+
+
 @pytest.fixture
 def functions(monkeypatch):
     store = AccountRegionScopedDict()
@@ -15491,7 +15498,7 @@ def functions(monkeypatch):
         store[name] = {
             "config": {"RevisionId": "function-before", "Architectures": ["x86_64"],
                        "Description": "original", "Version": "$LATEST"},
-            "code_zip": b"original-code", "versions": {}, "next_version": 1,
+            "code_zip": _revision_zip("original-code"), "versions": {}, "next_version": 1,
             "aliases": {alias: {"RevisionId": "alias-before", "FunctionVersion": "1",
                                 "Description": "original"} for alias in ("live", "other")},
         }
@@ -15505,7 +15512,7 @@ def functions(monkeypatch):
 def _update(operation, revision="function-before", value="changed", name="revision-test"):
     data = {"RevisionId": revision} if revision is not None else {}
     if operation == "code":
-        return _lambda_mod._update_code(name, {**data, "ZipFile": base64.b64encode(value.encode()).decode()})
+        return _lambda_mod._update_code(name, {**data, "ZipFile": base64.b64encode(_revision_zip(value)).decode()})
     if operation == "config":
         return _lambda_mod._update_config(name, {**data, "Description": value})
     return _lambda_mod._update_alias(name, "live", {**data, "Description": value, "FunctionVersion": "2"})
@@ -15615,11 +15622,11 @@ def test_competing_updates_with_same_revision_have_one_winner(functions, monkeyp
     if first == "alias":
         assert record["aliases"]["live"]["Description"] == "winner"
     elif first == "code":
-        assert record["code_zip"] == b"winner"
+        assert record["code_zip"] == _revision_zip("winner")
         assert record["config"]["Description"] == "original"
     else:
         assert record["config"]["Description"] == "winner"
-        assert record["code_zip"] == b"original-code"
+        assert record["code_zip"] == _revision_zip("original-code")
 
 
 def test_slow_code_update_does_not_block_independent_resources(functions, monkeypatch):
@@ -15629,7 +15636,7 @@ def test_slow_code_update_does_not_block_independent_resources(functions, monkey
     def fetch(*args, **kwargs):
         entered.set()
         assert release.wait(5)
-        return b"new-code"
+        return _revision_zip("new-code")
 
     monkeypatch.setattr(_lambda_mod, "_fetch_code_from_s3", fetch)
     with ThreadPoolExecutor(max_workers=2) as pool:
