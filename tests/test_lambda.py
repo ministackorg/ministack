@@ -2079,6 +2079,48 @@ def test_lambda_create_from_s3(lam, s3):
     assert resp["StatusCode"] == 200
     assert json.loads(resp["Payload"].read())["s3"] is True
 
+_NOT_A_ZIP = b"this is not a zipfile, just a random string"
+_UNZIP_MSG = "Could not unzip uploaded file. Please check your file, then try to upload again."
+
+
+def _refused_package_errors(lam, s3, package, tag):
+    """The error each operation answers to ``package``; UpdateFunctionCode reads it from S3."""
+    bucket = "lambda-code-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=f"{tag}-ok.zip", Body=_make_zip("def handler(event, context): return 1"))
+    s3.put_object(Bucket=bucket, Key=f"{tag}-bad.zip", Body=package)
+    created = lam.create_function(
+        FunctionName=f"lam-{tag}-update", Runtime="python3.11", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"S3Bucket": bucket, "S3Key": f"{tag}-ok.zip"},
+    )
+    calls = (
+        lambda: lam.create_function(FunctionName=f"lam-{tag}-create", Runtime="python3.11", Role=_LAMBDA_ROLE,
+                                    Handler="index.handler", Code={"ZipFile": package}),
+        lambda: lam.update_function_code(FunctionName=f"lam-{tag}-update", S3Bucket=bucket, S3Key=f"{tag}-bad.zip"),
+        lambda: lam.publish_layer_version(LayerName=f"lam-{tag}-layer", Content={"ZipFile": package}),
+    )
+    errors = []
+    for call in calls:
+        with pytest.raises(ClientError) as exc:
+            call()
+        errors.append(exc.value.response["Error"])
+    # a refused update keeps the previous code, revision and modification time
+    after = lam.get_function_configuration(FunctionName=f"lam-{tag}-update")
+    assert {k: after[k] for k in ("CodeSha256", "RevisionId", "LastModified")} == {
+        k: created[k] for k in ("CodeSha256", "RevisionId", "LastModified")}
+    return errors
+
+
+def test_lambda_rejects_a_package_that_is_not_a_zip(lam, s3):
+    errors = _refused_package_errors(lam, s3, _NOT_A_ZIP, "notzip")
+    assert [(e["Code"], e["Message"]) for e in errors] == [("InvalidParameterValueException", _UNZIP_MSG)] * 3
+
+
+def test_lambda_rejects_an_empty_package(lam, s3):
+    errors = _refused_package_errors(lam, s3, b"", "empty")
+    assert [(e["Code"], e["Message"]) for e in errors] == [("InvalidParameterValueException", _UNZIP_MSG)] * 3
+
+
 def test_lambda_update_code_from_s3(lam, s3):
     bucket = "lambda-code-bucket"
     buf = io.BytesIO()
