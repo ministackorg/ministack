@@ -4622,7 +4622,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     run_kwargs: dict = {
         "image": image,
         "environment": container_env,
-        "ports": {"8080/tcp": None},
         "detach": True,
         "stdin_open": False,
         "labels": container_reaper.own_labels("lambda"),
@@ -4660,6 +4659,9 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         run_kwargs["mounts"] = mounts
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+    else:
+        # The runtime is reached on its network address when there is one; otherwise on loopback only.
+        run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
 
     # AWS runs a function on the architecture it declares. Docker otherwise
     # picks the host's, so an arm64 function on an x86_64 host quietly ran as

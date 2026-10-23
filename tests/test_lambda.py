@@ -7946,6 +7946,19 @@ def _spawn_capture_run_kwargs(monkeypatch, *, endpoint, docker_flags="", config_
     return captured
 
 
+@pytest.mark.parametrize("network", ["", "example-net"])
+def test_lambda_container_publishes_its_runtime_port_on_loopback_only(monkeypatch, network):
+    """With DOCKER_NETWORK the runtime is reached on that network and no port is published (#2365)."""
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", network)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    captured = _spawn_capture_run_kwargs(monkeypatch, endpoint="http://localhost:4566")
+    if network:
+        assert captured["network"] == network
+        assert "ports" not in captured
+    else:
+        assert captured["ports"] == {"8080/tcp": ("127.0.0.1", None)}
+
+
 @pytest.mark.parametrize("timeout", [3, 301, 900])
 @pytest.mark.parametrize("package_type", ["Zip", "Image"])
 @pytest.mark.parametrize("in_container", [False, True])
