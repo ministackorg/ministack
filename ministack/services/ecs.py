@@ -1239,7 +1239,8 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     desired = svc.get("desiredCount", 0)
     td_arn = svc.get("taskDefinition", "")
     cluster_arn = svc.get("clusterArn", "")
-    launch_type = svc.get("launchType", "EC2")
+    launch_type = svc.get("launchType")
+    strategy = svc.get("capacityProviderStrategy")
     network_cfg = svc.get("networkConfiguration", {})
 
     if desired == 0:
@@ -1329,6 +1330,7 @@ def _reconcile_service_tasks(cluster_name, svc_key):
                 "group": f"service:{svc_name}",
                 "startedBy": svc_name,
                 "launchType": launch_type,
+                "capacityProviderStrategy": strategy,
                 "platformVersion": svc.get("platformVersion", ""),
                 "networkConfiguration": network_cfg,
                 "enableExecuteCommand": svc.get("enableExecuteCommand", False),
@@ -1349,6 +1351,32 @@ def _reconcile_service_tasks(cluster_name, svc_key):
     # there is no lifecycle watcher to schedule the steady-state transition.
     if primary and primary.get("rolloutState") == "IN_PROGRESS" and not _get_docker():
         _complete_service_deployment(cluster_name, svc_key)
+
+
+_BOTH_LAUNCH_CHOICES = ("Specifying both a launch type and capacity provider strategy is not supported. "
+                        "Remove one and try again.")
+_FARGATE_PROVIDERS = ("FARGATE", "FARGATE_SPOT")
+
+
+def _launch_choice(data, cluster):
+    """(launchType, capacityProviderStrategy, error): a strategy omits the launch type, and with
+    neither the cluster's default strategy applies, else EC2."""
+    strategy = data.get("capacityProviderStrategy") or None
+    launch_type = data.get("launchType")
+    if strategy and launch_type:
+        return None, None, error_response_json("InvalidParameterException", _BOTH_LAUNCH_CHOICES, 400)
+    if strategy or launch_type:
+        return launch_type, strategy, None
+    default = (cluster or {}).get("defaultCapacityProviderStrategy") or None
+    return (None, default, None) if default else ("EC2", None, None)
+
+
+def _task_capacity(launch_type, strategy):
+    """The launch type a task runs on and the capacity provider it was placed with."""
+    if not strategy:
+        return launch_type or "EC2", None
+    provider = max(strategy, key=lambda item: (item.get("base", 0), item.get("weight", 0)))["capacityProvider"]
+    return ("FARGATE" if provider in _FARGATE_PROVIDERS else "EC2"), provider
 
 
 def _create_service(data):
@@ -1379,10 +1407,13 @@ def _create_service(data):
     desired = data.get("desiredCount", 1)
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:service/{cluster_name}/{name}"
     now = _iso()
-    launch_type = data.get("launchType", "EC2")
+    launch_type, strategy, err = _launch_choice(data, _clusters[cluster_name])
+    if err:
+        return err
 
     deployment = _make_deployment(td_arn, desired)
     deployment["launchType"] = launch_type
+    deployment["capacityProviderStrategy"] = strategy
 
     svc = {
         "serviceArn": arn,
@@ -1394,6 +1425,7 @@ def _create_service(data):
         "pendingCount": 0,
         "status": "ACTIVE",
         "launchType": launch_type,
+        "capacityProviderStrategy": strategy,
         "platformVersion": data.get("platformVersion", ""),
         "platformFamily": data.get("platformFamily", ""),
         "networkConfiguration": data.get("networkConfiguration", {}),
@@ -1552,7 +1584,8 @@ def _update_service(data):
                 dep["status"] = "ACTIVE"
         new_dep = _make_deployment(
             td_arn, new_desired if new_desired is not None else svc["desiredCount"])
-        new_dep["launchType"] = svc.get("launchType", "EC2")
+        new_dep["launchType"] = svc.get("launchType")
+        new_dep["capacityProviderStrategy"] = svc.get("capacityProviderStrategy")
         # A replacement remains IN_PROGRESS until its own tasks stabilize.
         new_dep["rolloutState"] = "IN_PROGRESS"
         new_dep["rolloutStateReason"] = ""
@@ -1580,7 +1613,10 @@ def _update_service(data):
     if "loadBalancers" in data:
         svc["loadBalancers"] = data["loadBalancers"]
     if "capacityProviderStrategy" in data:
-        svc["capacityProviderStrategy"] = data["capacityProviderStrategy"]
+        # An empty strategy moves the service back to a launch type.
+        strategy = data["capacityProviderStrategy"] or None
+        svc["capacityProviderStrategy"] = strategy
+        svc["launchType"] = None if strategy else (svc.get("launchType") or "EC2")
 
     if changed:
         svc["events"].insert(0, {
@@ -2584,7 +2620,10 @@ def _run_task(data):
         "overrides", {"containerOverrides": [], "inferenceAcceleratorOverrides": []}
     )
     container_overrides = copy.deepcopy(overrides.get("containerOverrides", []))
-    launch_type = data.get("launchType", "EC2")
+    launch_type, strategy, err = _launch_choice(data, _clusters[cluster_name])
+    if err:
+        return err
+    launch_type, capacity_provider = _task_capacity(launch_type, strategy)
     platform_version = data.get("platformVersion", "")
     platform_family = ""
     if launch_type == "FARGATE":
@@ -2639,6 +2678,7 @@ def _run_task(data):
             "lastStatus": initial_status,
             "desiredStatus": "RUNNING",
             "launchType": launch_type,
+            "capacityProviderName": capacity_provider,
             "cpu": td.get("cpu", "256"),
             "memory": td.get("memory", "512"),
             "platformVersion": platform_version,

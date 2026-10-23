@@ -4459,3 +4459,52 @@ def test_ecs_unavailable_registry_secret_fails_start_without_exposing_secret(
     assert not client.images.registry_calls
     if secret:
         assert secret not in task["stoppedReason"]
+
+
+def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
+    cluster = f"cps-{_uuid_mod.uuid4().hex[:8]}"
+    bare = f"{cluster}-bare"
+    fargate = [{"capacityProvider": "FARGATE", "weight": 1}]
+    ecs.create_cluster(clusterName=cluster)
+    ecs.create_cluster(clusterName=bare)
+    ecs.put_cluster_capacity_providers(cluster=cluster, capacityProviders=["FARGATE", "FARGATE_SPOT"],
+                                       defaultCapacityProviderStrategy=fargate)
+    ecs.register_task_definition(family=cluster, requiresCompatibilities=["FARGATE"], networkMode="awsvpc",
+                                 cpu="256", memory="512",
+                                 containerDefinitions=[{"name": "app", "image": "nginx:alpine", "essential": True}])
+    net = {"awsvpcConfiguration": {"subnets": ["subnet-00000001"]}}
+    try:
+        created = ecs.create_service(cluster=cluster, serviceName="given", taskDefinition=cluster, desiredCount=0,
+                                     capacityProviderStrategy=fargate, networkConfiguration=net)["service"]
+        described = ecs.describe_services(cluster=cluster, services=["given"])["services"][0]
+        for svc in (created, described, created["deployments"][0]):
+            assert svc["capacityProviderStrategy"] == fargate
+            assert "launchType" not in svc
+
+        default = ecs.create_service(cluster=cluster, serviceName="default", taskDefinition=cluster,
+                                     desiredCount=0, networkConfiguration=net)["service"]
+        assert default["capacityProviderStrategy"] == fargate and "launchType" not in default
+        plain = ecs.create_service(cluster=bare, serviceName="plain", taskDefinition=cluster, desiredCount=0)["service"]
+        assert plain["launchType"] == "EC2" and "capacityProviderStrategy" not in plain
+
+        with pytest.raises(ClientError) as exc:
+            ecs.create_service(cluster=cluster, serviceName="both", taskDefinition=cluster, launchType="FARGATE",
+                               capacityProviderStrategy=fargate, networkConfiguration=net)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == (
+            "Specifying both a launch type and capacity provider strategy is not supported. Remove one and try again.")
+
+        reverted = ecs.update_service(cluster=cluster, service="given", capacityProviderStrategy=[])["service"]
+        assert reverted["launchType"] == "EC2" and "capacityProviderStrategy" not in reverted
+
+        task = ecs.run_task(cluster=cluster, taskDefinition=cluster, networkConfiguration=net,
+                            capacityProviderStrategy=[{"capacityProvider": "FARGATE_SPOT", "weight": 1}])["tasks"][0]
+        assert (task["launchType"], task["capacityProviderName"]) == ("FARGATE", "FARGATE_SPOT")
+        ecs.stop_task(cluster=cluster, task=task["taskArn"])
+    finally:
+        for c, names in ((cluster, ("given", "default")), (bare, ("plain",))):
+            for name in names:
+                try:
+                    ecs.delete_service(cluster=c, service=name, force=True)
+                except ClientError:
+                    pass

@@ -8655,7 +8655,8 @@ def _ecs_service_create(logical_id, props, stack_name):
         "cluster": cluster,
         "taskDefinition": props.get("TaskDefinition", ""),
         "desiredCount": props.get("DesiredCount", 1),
-        "launchType": props.get("LaunchType", "EC2"),
+        "launchType": props.get("LaunchType"),
+        "capacityProviderStrategy": _pascal_to_camel(props.get("CapacityProviderStrategy") or []),
         "loadBalancers": _pascal_to_camel(props.get("LoadBalancers") or []),
         "networkConfiguration": _pascal_to_camel(props.get("NetworkConfiguration") or {}),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
@@ -8663,7 +8664,9 @@ def _ecs_service_create(logical_id, props, stack_name):
     deployment_configuration = _ecs_deployment_configuration(props)
     if deployment_configuration is not None:
         request["deploymentConfiguration"] = deployment_configuration
-    _ecs._create_service(request)
+    response = _ecs._create_service(request)
+    if response[0] >= 400:
+        raise ValueError(f"AWS::ECS::Service create failed: {response[2]!r}")
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:service/{cluster}/{name}"
     return arn, {"ServiceArn": arn, "Name": name}
 
@@ -8681,6 +8684,7 @@ def _ecs_service_update(physical_id, old_props, new_props, stack_name):
         "HealthCheckGracePeriodSeconds": "healthCheckGracePeriodSeconds",
         "EnableExecuteCommand": "enableExecuteCommand",
         "PlatformVersion": "platformVersion",
+        "CapacityProviderStrategy": "capacityProviderStrategy",
     }
     for cf_property, ecs_property in property_map.items():
         if new_props.get(cf_property) != old_props.get(cf_property):
