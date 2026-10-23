@@ -44,6 +44,7 @@ Data plane:
 
 import asyncio
 import base64
+import codecs
 import json
 import logging
 import os
@@ -3285,10 +3286,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     continue
                 if item is None:
                     return
-                if isinstance(item, bytes):
-                    await send({"type": "websocket.send", "bytes": item})
-                else:
-                    await send({"type": "websocket.send", "text": str(item)})
+                await send({"type": "websocket.send", "text": item})
 
         drain_task = asyncio.create_task(_drain_outbox())
 
@@ -3377,6 +3375,29 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
 # @connections management API
 # ==========================================================================
 
+def _replace_like_api_gateway(error: UnicodeDecodeError) -> tuple[str, int]:
+    """Replace one invalid UTF-8 sequence with U+FFFD, as API Gateway does for PostToConnection data.
+
+    API Gateway replaces the same bytes as Python's ``errors="replace"`` except for an encoded
+    surrogate: ED followed by A0-BF, plus one continuation byte if present, becomes a single
+    U+FFFD where Python emits one per byte.
+    """
+    data, start = error.object, error.start
+    if data[start] == 0xED and start + 1 < len(data) and 0xA0 <= data[start + 1] <= 0xBF:
+        end = start + 2
+        if end < len(data) and 0x80 <= data[end] <= 0xBF:
+            end += 1
+        return "\ufffd", end
+    return "\ufffd", error.end
+
+
+codecs.register_error("ministack-apigateway-replace", _replace_like_api_gateway)
+
+
+def _post_to_connection_text(data: bytes) -> str:
+    return data.decode("utf-8", errors="ministack-apigateway-replace")
+
+
 async def handle_connections_api(method: str, api_id: str, stage: str,
                                   connection_id: str, body: bytes, headers: dict):
     """Serve the @connections runtime API.
@@ -3401,7 +3422,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
         # Push the message into the connection outbox; drain_task will forward it.
         try:
             if body:
-                await conn["outbox"].put(body)
+                await conn["outbox"].put(_post_to_connection_text(body))
         except Exception as exc:
             return 500, {"Content-Type": "application/json"}, json.dumps(
                 {"message": str(exc)}

@@ -727,7 +727,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
     request_uri = _apply_default_root_object(parsed.get("default_root_object", ""), raw_uri)
     request_query = dict(query_params or {})
     literal_query_string = None  # set when a function rearranges querystring into a literal string
-    function_touched_querystring = False  # set when a function's returned request names a querystring object
+    function_touched_querystring = False  # set when a function returns a changed querystring object
 
     request_function_arn = behavior["functions"].get("viewer-request")
     if request_function_arn:
@@ -767,7 +767,7 @@ async def handle_request(dist: dict, method: str, path: str, raw_uri: str, raw_q
             # A function rewrote the querystring as a literal string (functions-event-structure).
             literal_query_string = qs_field
             request_query = {}
-        elif qs_field is not None:
+        elif qs_field is not None and qs_field != event["request"]["querystring"]:
             function_touched_querystring = True
             request_query = {}
             for name, field in qs_field.items():
