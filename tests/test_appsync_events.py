@@ -236,6 +236,10 @@ def _asgi_response(messages: list[dict]) -> tuple[int, dict[str, str], bytes]:
     return start["status"], hdrs, body_msg.get("body", b"")
 
 
+# The API key the ``api`` fixture registered on each API it created.
+_API_KEYS: dict[str, str] = {}
+
+
 def _create_namespace(appsync, api_id, name):
     return appsync.create_channel_namespace(apiId=api_id, name=name)["channelNamespace"]
 
@@ -258,19 +262,23 @@ def _publish_http(
     api_id,
     channel,
     events,
-    api_key="da2-local-test-key",
+    api_key=None,
     *,
     authorization=None,
     host_header=None,
+    extra_headers=None,
 ):
     """POST /event on the {apiId}.appsync-api.* virtual host (or ``host_header`` override)."""
     conn = http.client.HTTPConnection("127.0.0.1", _PORT, timeout=5)
     body = json.dumps({"channel": channel, "events": events})
     hh = host_header or f"{api_id}.appsync-api.us-east-1.amazonaws.com"
+    if api_key is None:
+        api_key = _API_KEYS.get(api_id, "da2-local-test-key")
     hdrs = {
         "Host": hh,
         "Content-Type": "application/json",
-        "x-api-key": api_key,
+        **({"x-api-key": api_key} if api_key else {}),
+        **(extra_headers or {}),
     }
     if authorization:
         hdrs["Authorization"] = authorization
@@ -291,7 +299,7 @@ def _event_host_request(api_id, method, path, body: bytes):
     conn.request(method, path, body=body, headers={
         "Host": f"{api_id}.appsync-api.us-east-1.amazonaws.com",
         "Content-Type": "application/json",
-        "x-api-key": "da2-local-test-key",
+        "x-api-key": _API_KEYS.get(api_id, "da2-local-test-key"),
     })
     resp = conn.getresponse()
     data = resp.read()
@@ -304,13 +312,13 @@ def _open_subscriber(api_id, *, auth_header: dict | None = None):
 
     Sends ``Sec-WebSocket-Protocol: header-<b64>, aws-appsync-event-ws`` and
     waits for the ``connection_ack``. When ``auth_header`` is None, a default
-    ``{"host":..., "x-api-key":"da2-local-test-key"}`` payload is supplied —
+    ``{"host":..., "x-api-key": <the API's key>}`` payload is supplied —
     matching how a real client would wrap API_KEY credentials.
     """
     host_header = f"{api_id}.appsync-realtime-api.us-east-1.amazonaws.com"
     http_host = f"{api_id}.appsync-api.us-east-1.amazonaws.com"
     if auth_header is None:
-        auth_header = {"host": http_host, "x-api-key": "da2-local-test-key"}
+        auth_header = {"host": http_host, "x-api-key": _API_KEYS.get(api_id, "da2-local-test-key")}
     protocols = f"{_encode_auth_header(auth_header)}, aws-appsync-event-ws"
     ws = _WSClient(host_header=host_header, path="/event/realtime", subprotocol=protocols)
     ws.send_json({"type": "connection_init"})
@@ -367,6 +375,7 @@ def api(appsync):
     created = _create_api(appsync, f"events-{suffix}")
     api_id = created["apiId"]
     _create_namespace(appsync, api_id, "default")
+    _API_KEYS[api_id] = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
     yield api_id
     try:
         appsync.delete_api(apiId=api_id)
@@ -576,6 +585,51 @@ def test_publish_unknown_namespace_rejected(api):
     status, body = _publish_http(api, "/does-not-exist/room", [json.dumps("x")])
     assert status == 401
     assert body == {"errors": [{"errorType": "UnauthorizedException"}]}
+
+
+@pytest.mark.auth_contract
+def test_publish_follows_the_authorization_modes_contract(auth_enabled, iam_user, appsync):
+    """Under AUTH=true an API_KEY namespace needs a valid key and an AWS_IAM namespace a signature."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import REGION, second_access_key
+
+    modes = lambda *types: [{"authType": t} for t in types]  # noqa: E731
+    api_id = appsync.create_api(name=f"events-auth-{int(time.time() * 1000)}", eventConfig={
+        "authProviders": modes("API_KEY", "AWS_IAM"), "connectionAuthModes": modes("API_KEY", "AWS_IAM"),
+        "defaultPublishAuthModes": modes("API_KEY"), "defaultSubscribeAuthModes": modes("API_KEY"),
+    })["api"]["apiId"]
+    try:
+        _create_namespace(appsync, api_id, "keyed")
+        appsync.create_channel_namespace(apiId=api_id, name="iam", publishAuthModes=modes("AWS_IAM"),
+                                         subscribeAuthModes=modes("AWS_IAM"))
+        key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "appsync:EventPublish", "Resource": "*"}]})
+        host = f"{api_id}.appsync-api.us-east-1.amazonaws.com"
+        with second_access_key(user) as (key_id, secret):
+            body = json.dumps({"channel": "/iam/c", "events": [json.dumps("x")]})
+            request = AWSRequest(method="POST", url=f"http://{host}/event", data=body,
+                                 headers={"Content-Type": "application/json"})
+            SigV4Auth(Credentials(key_id, secret), "appsync", REGION).add_auth(request)
+            signed = _publish_http(api_id, "/iam/c", [json.dumps("x")], api_key="",
+                                   authorization=request.headers["Authorization"],
+                                   extra_headers={"X-Amz-Date": request.headers["X-Amz-Date"]})
+        answers = [
+            _publish_http(api_id, "/keyed/c", [json.dumps("x")], api_key=""),
+            _publish_http(api_id, "/keyed/c", [json.dumps("x")], api_key="da2-notakeyofthisapi"),
+            _publish_http(api_id, "/keyed/c", [json.dumps("x")], api_key=key),
+            _publish_http(api_id, "/iam/c", [json.dumps("x")], api_key=key),
+            signed,
+        ]
+    finally:
+        appsync.delete_api(apiId=api_id)
+    refused = {"errors": [{"errorType": "UnauthorizedException"}]}
+    wrong_key = {"errors": [{"errorType": "UnauthorizedException",
+                             "message": "You are not authorized to make this call."}]}
+    expected = [(401, refused), (401, wrong_key), 200, (401, refused), 200] if auth_enabled else [200] * 5
+    assert [answer[0] if answer[0] == 200 else answer for answer in answers] == expected
 
 
 @pytest.mark.parametrize("payload, status, error_type, message", [
@@ -1345,6 +1399,8 @@ def test_websocket_server_sends_keepalive():
 # Handshake auth (header-<b64> subprotocol)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(os.environ.get("AUTH", "").lower() == "true",
+                    reason="AUTH=true checks the connection's authorization")
 def test_websocket_accepts_without_header_subprotocol_in_lax_mode(api):
     """Default MiniStack config is lax — missing header-<b64> still accepts."""
     host_header = f"{api}.appsync-realtime-api.us-east-1.amazonaws.com"
@@ -1387,7 +1443,7 @@ def test_websocket_frame_authorization_falls_back_to_connection_auth(api):
     ws = _open_subscriber(
         api,
         auth_header={"host": f"{api}.appsync-api.us-east-1.amazonaws.com",
-                     "x-api-key": "da2-local-test-key"},
+                     "x-api-key": _API_KEYS[api]},
     )
     try:
         resp = _subscribe(ws, "sub-fallback", "/default/room-x")

@@ -1261,6 +1261,8 @@ _signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.Cont
     "ministack_signed_request", default=None)
 # The access key whose signature this request already passed, once checked.
 _verified_key: contextvars.ContextVar[str] = contextvars.ContextVar("ministack_verified_key", default="")
+# Whether the request carries no credentials: no Authorization header and no query signature.
+_anonymous: contextvars.ContextVar[bool] = contextvars.ContextVar("ministack_anonymous", default=False)
 
 
 def caller_verified(access_key_id: str, account_id: str) -> bool:
@@ -1286,6 +1288,9 @@ def pin_signed_request(
     presigned = not authorization.startswith("AWS4-HMAC-SHA256") and (
         _query_signed(query_params) or _sigv4a_s3_presign(query_params))
     access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
+    # AWS reads query credentials without X-Amz-Algorithm as none at all.
+    _anonymous.set(not authorization and not any(
+        _query_value(query_params or {}, name) for name in ("X-Amz-Algorithm", "AWSAccessKeyId")))
     # The key the policy check will use; it must be the one the signature is checked for.
     claimed = extract_access_key_id({"authorization": authorization}, query_params)
     header_signed = authorization.startswith("AWS4-HMAC-SHA256") or _sigv4a_header(authorization, payload_hash)
@@ -1544,6 +1549,17 @@ def check_credentials(access_key_id: str) -> AuthError | None:
 # Top-level enforcement entry point
 # ---------------------------------------------------------------------------
 
+# Signed in the SDK models, yet served without credentials: the links in SNS subscription messages.
+_UNSIGNED_LINK_ACTIONS = frozenset({"sns:ConfirmSubscription", "sns:Unsubscribe"})
+
+
+def _served_unsigned(service: str, iam_action: str) -> bool:
+    """Whether AWS serves this action without credentials: an operation its SDK model sends unsigned, or a link."""
+    from ministack.core.iam_actions import unsigned_operations
+
+    return iam_action in _UNSIGNED_LINK_ACTIONS or iam_action.partition(":")[2] in unsigned_operations(service)
+
+
 # Actions that AWS always allows regardless of IAM policies.
 # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html
 _ALWAYS_ALLOWED_ACTIONS = frozenset({
@@ -1623,6 +1639,10 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     account_id = get_account_id()
     # S3, API Gateway methods and function URLs can be called anonymously: an unsigned request is not checked.
     anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
+    if _anonymous.get() and not anonymous_ok and not _served_unsigned(service, iam_action):
+        from ministack.core.iam_actions import anonymous_denial_message
+
+        return AuthError("MissingAuthenticationToken", anonymous_denial_message(service, iam_action, resource_arn))
     unsigned = anonymous_ok and not access_key_id and _signed_request.get() is None
     checked = None if unsigned else authenticate(access_key_id or "", account_id)
     if isinstance(checked, AuthError):

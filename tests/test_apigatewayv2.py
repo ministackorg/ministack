@@ -1348,6 +1348,44 @@ def test_apigw_v2_event_omits_null_fields_when_absent(apigw, lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_http_api_response_request_id_header(apigw, lam):
+    """AWS: observed 2026-09-07, us-east-1, an HTTP API's integration responses: apigw-requestid
+    (e.g. Ct26qjlpoAMEbVg=) and no x-amzn-requestid or x-amz-request-id. AWS Knowledge Center
+    "collect-api-gateway-extended-request-ids": HTTP API apigw-requestid, REST API x-amz-apigw-id."""
+    import re
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-reqid-{_uuid.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n")},
+    )
+    api_id = apigw.create_api(Name=f"reqid-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /reqid", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    try:
+        req = _urlreq.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/reqid")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        assert re.fullmatch(r"[A-Za-z0-9+/]{15}=", resp.headers["apigw-requestid"])
+        assert resp.headers["x-amzn-requestid"] is None
+        assert resp.headers["x-amz-request-id"] is None
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
 def test_apigw_raw_query_string_percent_encoded(apigw, lam):
     """rawQueryString must stay percent-encoded like AWS: a space in a value comes
     back as %20, not a literal space (which breaks lambda_http / http::Uri) — #1035."""
@@ -2571,6 +2609,17 @@ class _WSClient:
         except socket.timeout:
             return None
 
+    def recv_frame(self, timeout: float = 15.0) -> tuple[int, bytes] | None:
+        """Return the next data or close frame as (opcode, payload), skipping ping/pong."""
+        self._sock.settimeout(timeout)
+        try:
+            while True:
+                frame = self._recv_frame()
+                if frame is None or frame[0] in (0x1, 0x2, 0x8):
+                    return frame
+        except socket.timeout:
+            return None
+
     def _recv_all(self, n: int) -> bytes:
         while len(self._buf) < n:
             chunk = self._sock.recv(max(4096, n - len(self._buf)))
@@ -2827,6 +2876,63 @@ def test_ws_post_to_connection_from_management_api(apigw, lam):
         assert pushed == "server-push-payload"
     finally:
         ws.close()
+
+
+def test_ws_post_to_connection_sends_text_frames(apigw, lam):
+    """PostToConnection data arrives as a text frame, with bytes that aren't UTF-8 replaced by U+FFFD, as on AWS."""
+    import urllib.request
+
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="p2c-text")
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod", headers={"Host": host})
+    try:
+        ws.send(json.dumps({"action": "sendMessage"}))
+        conn_id = json.loads(ws.recv())["connectionId"]
+
+        for data, delivered in (
+            (b'{"kind":"changes"}', b'{"kind":"changes"}'),
+            (b"\xff\xfe\x00\x01", b"\xef\xbf\xbd\xef\xbf\xbd\x00\x01"),
+            (b"\xed\xa0\x80A", b"\xef\xbf\xbdA"),
+        ):
+            req = urllib.request.Request(
+                f"http://{host}/prod/@connections/{conn_id}", data=data, method="POST", headers={"Host": host},
+            )
+            assert urllib.request.urlopen(req, timeout=30).status == 200
+            assert ws.recv_frame(timeout=3) == (0x1, delivered)
+    finally:
+        ws.close()
+
+
+@pytest.mark.parametrize("posted, delivered", [
+    ("fffe0001", "efbfbdefbfbd0001"),  # lone-invalid
+    ("80", "efbfbd"),  # lone-continuation
+    ("e282", "efbfbd"),  # truncated-3byte
+    ("e28241", "efbfbd41"),  # truncated-3byte-then-ascii
+    ("f09f98", "efbfbd"),  # truncated-4byte
+    ("f09f9841", "efbfbd41"),  # truncated-4byte-then-ascii
+    ("c0af", "efbfbdefbfbd"),  # overlong-2byte
+    ("e080af", "efbfbdefbfbdefbfbd"),  # overlong-3byte
+    ("f0808080", "efbfbdefbfbdefbfbdefbfbd"),  # overlong-4byte
+    ("f4908080", "efbfbdefbfbdefbfbdefbfbd"),  # above-max-codepoint
+    ("f5808080", "efbfbdefbfbdefbfbdefbfbd"),  # invalid-lead-f5
+    ("f09f9880", "f09f9880"),  # valid-emoji
+    ("41e282f09f98804280", "41efbfbdf09f988042efbfbd"),  # mixed
+    ("eda080", "efbfbd"),  # high-surrogate
+    ("edb080", "efbfbd"),  # low-surrogate
+    ("edbfbf", "efbfbd"),  # max-surrogate
+    ("eda0bdedb880", "efbfbdefbfbd"),  # surrogate-pair-cesu8
+    ("eda0", "efbfbd"),  # truncated-surrogate-at-end
+    ("eda041", "efbfbd41"),  # truncated-surrogate-then-ascii
+    ("eda08041", "efbfbd41"),  # surrogate-then-ascii
+    ("41eda0", "41efbfbd"),  # ascii-then-truncated-surrogate
+    ("ed41", "efbfbd41"),  # lead-ed-then-ascii
+    ("ed", "efbfbd"),  # lead-ed-at-end
+    ("ed9fbf", "ed9fbf"),  # below-surrogates-valid
+    ("ee8080", "ee8080"),  # after-surrogates-valid
+])
+def test_ws_post_to_connection_text_replaces_invalid_utf8_like_aws(posted, delivered):
+    """Each pair is what API Gateway delivered (eu-west-1, 2026-10-22) for data posted with PostToConnection."""
+    assert _apigw._post_to_connection_text(bytes.fromhex(posted)).encode().hex() == delivered
 
 
 def test_ws_non_boot_region_routes_and_management_api():

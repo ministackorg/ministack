@@ -6335,6 +6335,139 @@ def test_unverifiable_credentials_are_refused_contract(auth_enabled, iam_user):
             assert status >= 400 if auth_enabled else status == 200, (authorization, query)
 
 
+# A call per protocol family, and the code and status AWS answers it without credentials.
+_ANONYMOUS_CALLS = {
+    "sts": (lambda c: c.get_caller_identity(), "MissingAuthenticationToken", 403),
+    "sns": (lambda c: c.list_topics(), "MissingAuthenticationToken", 403),
+    "sqs": (lambda c: c.list_queues(), "AccessDenied", 403),
+    "dynamodb": (lambda c: c.list_tables(), "MissingAuthenticationTokenException", 400),
+    "kms": (lambda c: c.list_keys(), "MissingAuthenticationTokenException", 400),
+    "lambda": (lambda c: c.list_functions(), "MissingAuthenticationTokenException", 403),
+    "secretsmanager": (lambda c: c.list_secrets(), "UnrecognizedClientException", 400),
+}
+
+
+def _anonymous_client(service):
+    from botocore import UNSIGNED
+    from conftest import make_client
+
+    return make_client(service, {"signature_version": UNSIGNED})
+
+
+def _refusal(call):
+    """The error code and status a call answers, or None when it succeeds."""
+    try:
+        call()
+    except ClientError as e:
+        return e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"]
+    return None
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service", sorted(_ANONYMOUS_CALLS))
+def test_request_without_credentials_is_anonymous_contract(auth_enabled, iam_user, service):
+    """A request without credentials is refused in the service's own error; signed, the same call is served."""
+    call, code, status = _ANONYMOUS_CALLS[service]
+    signed = iam_user(policy={"Version": "2012-10-17",
+                              "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}).client(service)
+    assert _refusal(lambda: call(signed)) is None
+    assert _refusal(lambda: call(_anonymous_client(service))) == ((code, status) if auth_enabled else None)
+
+
+@pytest.mark.auth_contract
+def test_resource_policy_for_everyone_does_not_admit_anonymous_contract(auth_enabled):
+    """A queue or topic policy that allows "*" still needs a signed request."""
+    import uuid
+
+    from conftest import make_client
+
+    name = f"anonymous-{uuid.uuid4().hex[:8]}"
+    sqs, sns = make_client("sqs"), make_client("sns")
+    queue = sqs.create_queue(QueueName=name)["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    topic = sns.create_topic(Name=name)["TopicArn"]
+    try:
+        sqs.set_queue_attributes(QueueUrl=queue, Attributes={"Policy": json.dumps({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": "*", "Action": "sqs:SendMessage", "Resource": queue_arn}]})})
+        sns.set_topic_attributes(TopicArn=topic, AttributeName="Policy", AttributeValue=json.dumps({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": "*", "Action": "SNS:Publish", "Resource": topic}]}))
+        sent = _refusal(lambda: _anonymous_client("sqs").send_message(QueueUrl=queue, MessageBody="m"))
+        published = _refusal(lambda: _anonymous_client("sns").publish(TopicArn=topic, Message="m"))
+        if auth_enabled:
+            assert (sent, published) == (("AccessDenied", 403), ("MissingAuthenticationToken", 403))
+            assert "Messages" not in sqs.receive_message(QueueUrl=queue)
+        else:
+            assert (sent, published) == (None, None)
+    finally:
+        sqs.delete_queue(QueueUrl=queue)
+        sns.delete_topic(TopicArn=topic)
+
+
+@pytest.mark.auth_contract
+def test_query_credentials_without_an_algorithm_are_anonymous_contract(auth_enabled, iam_user):
+    """X-Amz-Credential and X-Amz-Signature without X-Amz-Algorithm count as no credentials, not as that key's user."""
+    import urllib.error
+    import urllib.request
+    from urllib.parse import parse_qsl, urlsplit
+
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import ENDPOINT, REGION, second_access_key
+
+    user = iam_user(policy={"Version": "2012-10-17",
+                            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    with second_access_key(user) as (key, secret):
+        request = AWSRequest(method="GET", url=f"{ENDPOINT}/?Action=GetCallerIdentity&Version=2011-06-15")
+        SigV4QueryAuth(Credentials(key, secret), "sts", REGION, expires=300).add_auth(request)
+        query = [(k, v) for k, v in parse_qsl(urlsplit(request.url).query) if k != "X-Amz-Algorithm"]
+        try:
+            with urllib.request.urlopen(f"{ENDPOINT}/?{urlencode(query)}", timeout=10) as resp:
+                answer = resp.status, resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            answer = exc.code, exc.read().decode()
+    if auth_enabled:
+        assert answer[0] == 403 and "<Code>MissingAuthenticationToken</Code>" in answer[1]
+    else:
+        assert answer[0] == 200
+
+
+@pytest.mark.auth_contract
+def test_operations_aws_serves_without_credentials_contract(auth_enabled):
+    """Operations the SDKs send unsigned, the SNS subscription links and the health endpoint are still served."""
+    import urllib.request
+    import uuid
+
+    from conftest import ENDPOINT, make_client
+
+    with urllib.request.urlopen(f"{ENDPOINT}/_ministack/health", timeout=10) as resp:
+        assert resp.status == 200
+    idp, identity = _anonymous_client("cognito-idp"), _anonymous_client("cognito-identity")
+    assert _refusal(lambda: idp.initiate_auth(
+        ClientId="noclient", AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": "u", "PASSWORD": "p"},
+    )) == ("ResourceNotFoundException", 400)
+    pool = make_client("cognito-identity").create_identity_pool(
+        IdentityPoolName=f"anonymous{uuid.uuid4().hex[:8]}", AllowUnauthenticatedIdentities=True)["IdentityPoolId"]
+    try:
+        assert identity.get_id(IdentityPoolId=pool)["IdentityId"]
+    finally:
+        make_client("cognito-identity").delete_identity_pool(IdentityPoolId=pool)
+    assumed = _refusal(lambda: _anonymous_client("sts").assume_role_with_web_identity(
+        RoleArn="arn:aws:iam::000000000000:role/none", RoleSessionName="session", WebIdentityToken="not-a-token"))
+    assert assumed is None or assumed[0] != "MissingAuthenticationToken"
+    sns = make_client("sns")
+    topic = sns.create_topic(Name=f"anonymous-{uuid.uuid4().hex[:8]}")["TopicArn"]
+    try:
+        assert _refusal(lambda: _anonymous_client("sns").confirm_subscription(TopicArn=topic, Token="0" * 64))[0] in (
+            "InvalidParameter", "InvalidParameterException")
+    finally:
+        sns.delete_topic(TopicArn=topic)
+    assert _refusal(lambda: idp.list_user_pools(MaxResults=1)) == (
+        ("MissingAuthenticationTokenException", 400) if auth_enabled else None)
+
+
 @pytest.mark.auth_contract
 def test_s3_sigv2_signatures_are_verified_contract(auth_enabled, iam_user):
     """SigV2 header and query signatures are checked for an IAM user, and still work when they are right."""
