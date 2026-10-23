@@ -964,20 +964,22 @@ _VERIFIED_ACCESS_ID_FIELDS = (
 )
 
 
+def _va_arn(kind, rtype, value, region, account_id):
+    """The id's ARN when it exists, ``<type>/*`` when it doesn't or is a deleting endpoint (which answers NotFound)."""
+    from ministack.services import ec2
+
+    record = ec2._VA_STORES[kind].get_scoped(account_id, region, value)
+    if record is not None and record.get("Status") != "deleting":
+        return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{value}"
+    return f"arn:aws:ec2:{region}:{account_id}:{rtype}/*"
+
+
 def _verified_access_resource(action, query_params, region, account_id):
-    """The resource AWS names in a Verified Access denial: the id's ARN when
-    the resource exists, ``<type>/*`` when it does not. Attach and Detach move
-    on to the trust provider when the instance id is malformed, and
-    CreateVerifiedAccessEndpoint names the first subnet it knows, then the first
-    security group it knows, then a known network interface, then the group, then ``verified-access-endpoint/*``."""
+    """The resource AWS names in a Verified Access denial (see verified_access_resource_arns for the rest)."""
     from ministack.services import ec2
 
     def name(kind, rtype, value):
-        record = ec2._VA_STORES[kind].get_scoped(account_id, region, value)
-        # A deleting endpoint answers NotFound, so it is named like a missing one.
-        if record is not None and record.get("Status") != "deleting":
-            return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{value}"
-        return f"arn:aws:ec2:{region}:{account_id}:{rtype}/*"
+        return _va_arn(kind, rtype, value, region, account_id)
 
     new = _VERIFIED_ACCESS_CREATE_RESOURCES.get(action)
     if new:
@@ -1011,6 +1013,53 @@ def _verified_access_resource(action, query_params, region, account_id):
             continue
         return name(kind, rtype, value)
     return "*"
+
+
+# Every resource type AWS authorizes each call on (Service Authorization Reference).
+_VERIFIED_ACCESS_AUTHORIZED = {
+    "AttachVerifiedAccessTrustProvider": ("instance", "trust-provider"),
+    "DetachVerifiedAccessTrustProvider": ("instance", "trust-provider"),
+    "CreateVerifiedAccessGroup": ("new-group", "instance"),
+    "ModifyVerifiedAccessGroup": ("group", "instance"),
+    "CreateVerifiedAccessEndpoint": ("network-interface", "security-group", "subnet", "new-endpoint", "group"),
+    "ModifyVerifiedAccessEndpoint": ("subnet", "endpoint", "group"),
+}
+
+
+def verified_access_resource_arns(query_params: dict, region: str, account_id: str) -> list[str]:
+    """The resources a Verified Access call is authorized on: the one AWS names in a denial, then the others."""
+    action = _query_param(query_params, "Action")
+    if "VerifiedAccess" not in action or action.startswith("DescribeVerifiedAccess"):
+        return []
+
+    def listed(member):
+        lead = member + "."
+        return [v for k in query_params if k.startswith(lead) and (v := _query_param(query_params, k))]
+
+    def arns(kind):
+        if kind == "new-group":
+            return [f"arn:aws:ec2:{region}:{account_id}:verified-access-group/*"]
+        if kind == "new-endpoint":
+            return [f"arn:aws:ec2:{region}:{account_id}:verified-access-endpoint/*"]
+        if kind in ("instance", "trust-provider", "group", "endpoint"):
+            member, store = {"instance": ("VerifiedAccessInstanceId", "Instance"),
+                             "trust-provider": ("VerifiedAccessTrustProviderId", "TrustProvider"),
+                             "group": ("VerifiedAccessGroupId", "Group"),
+                             "endpoint": ("VerifiedAccessEndpointId", "Endpoint")}[kind]
+            value = _query_param(query_params, member)
+            return [_va_arn(store, f"verified-access-{kind}", value, region, account_id)] if value else []
+        if kind == "subnet":
+            ids = listed("LoadBalancerOptions.SubnetId")
+        elif kind == "security-group":
+            ids = listed("SecurityGroupId")
+        else:
+            ids = [v for v in (_query_param(query_params, "NetworkInterfaceOptions.NetworkInterfaceId"),) if v]
+        return [f"arn:aws:ec2:{region}:{account_id}:{kind}/{v}" for v in ids]
+
+    resources = [_verified_access_resource(action, query_params, region, account_id)]
+    for kind in _VERIFIED_ACCESS_AUTHORIZED.get(action, ()):
+        resources += [arn for arn in arns(kind) if arn not in resources]
+    return resources
 
 
 def extract_resource_arn(service: str, method: str, path: str,

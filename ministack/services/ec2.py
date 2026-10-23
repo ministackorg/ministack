@@ -7416,9 +7416,7 @@ _VA_STORES = {}
 
 
 def _va_lookup(p, kind, prefix_only=True, listed=False):
-    """(record, error) for the id member of ``kind``: format, then existence.
-    Trust provider calls hold the whole id to the pattern and word NotFound as
-    the Describe calls do."""
+    """(record, error) for the id member of ``kind``: format, then existence."""
     value = _p(p, _VA_ID_MEMBERS[kind][0])
     err = _va_bad_id(kind, value, prefix_only=prefix_only)
     if err:
@@ -7490,18 +7488,7 @@ def _va_next_token_xml(token):
 
 
 def _va_describe(p, kind, bounds, members=(), exclusive=False):
-    """Run the checks shared by the Verified Access Describe* calls.
-
-    ``kind`` names the id list (``<member>.N``), ``members`` the single-id
-    members the call also takes, in the order AWS checks them, and
-    ``exclusive`` that those members cannot be sent together. ``bounds`` is the
-    MaxResults range AWS enforces, which is not always the botocore one.
-    The checks run in AWS's order: MaxResults is an integer, the id list is not
-    paged, ids are well formed, MaxResults is in range, the members are well
-    formed and not combined, NextToken is one MiniStack issued, and ids and members exist.
-    Filter names other than the tag filters are ignored, as AWS ignores them.
-    Returns (selected_records, next_token, error_response).
-    """
+    """Shared Describe* checks, in AWS's order; returns (page, next_token, error). ``bounds`` is AWS's MaxResults range."""
     id_member = _VA_ID_MEMBERS[kind][0]
     ids = _parse_member_list(p, id_member)
     values = [(m, _p(p, _VA_ID_MEMBERS[m][0])) for m in members]
@@ -7871,10 +7858,7 @@ def _delete_verified_access_instance(p):
 
 
 def _va_attachment_args(p, detach):
-    """(instance, trust provider, error) for Attach/Detach. AWS looks up each
-    well-formed id first, instance before provider, and reports a malformed id
-    (the provider's first) only when no lookup failed. Attach holds the
-    provider id's prefix to the pattern, Detach the whole id."""
+    """(instance, provider, error): each well-formed id is looked up first, then a malformed one is reported."""
     err = _va_require(p, "VerifiedAccessInstanceId", "VerifiedAccessTrustProviderId")
     if err:
         return None, None, err
@@ -8197,9 +8181,7 @@ def _va_get_policy_xml(record):
 
 
 def _va_modify_policy(record, p):
-    """Apply a Modify*Policy request; returns an error response or None.
-    A document needs PolicyEnabled=true, PolicyEnabled=true needs a document,
-    and disabling the policy drops its document."""
+    """A document needs PolicyEnabled=true and vice versa; disabling drops the document."""
     enabled = _p(p, "PolicyEnabled")
     has_document = "PolicyDocument" in p
     if enabled == "true" and not has_document:
@@ -8303,9 +8285,7 @@ def _va_live_endpoints():
 
 
 def _va_settle(ep):
-    """AWS answers pending on create and updating on modify, and the endpoint
-    is active once AWS has applied the change; MiniStack applies it at once,
-    so the next read sees active."""
+    """MiniStack applies a change at once, so the next read after pending/updating is active."""
     if ep["Status"] in ("pending", "updating"):
         ep["Status"] = "active"
 
@@ -8343,9 +8323,7 @@ _VA_PREFIX_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?")
 
 
 def _va_options_value_error(p, prefix, xml_prefix, tcp=True):
-    """Protocol and port values, both reported when both are bad; on create,
-    HTTP/HTTPS then refuses PortRanges, and tcp refuses a Port and needs
-    PortRanges. AWS names the network-interface options EniOptions here."""
+    """Protocol and port values; on create, PortRanges only with tcp, which takes no Port."""
     protocol = _p(p, f"{prefix}.Protocol")
     port = _p(p, f"{prefix}.Port")
     bad = []

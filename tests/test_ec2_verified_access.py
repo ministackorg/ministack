@@ -1946,3 +1946,55 @@ def test_verified_access_create_permission_contract(auth_enabled, iam_user):
     else:
         inst_id = _instance(denied)
         denied.delete_verified_access_instance(VerifiedAccessInstanceId=inst_id)
+
+
+@pytest.mark.auth_contract
+def test_verified_access_deny_on_each_authorized_resource_holds(auth_enabled, iam_user):
+    """AWS authorizes a group move on the group and the instance, and a detach on the instance and the provider."""
+    admin = make_client("ec2")
+    inst_id, oidc_id = _instance_with_provider(admin)
+    device_id = _device_provider(admin)["VerifiedAccessTrustProviderId"]
+    _attach(admin, inst_id, device_id)
+    group_id = _group(admin, inst_id, Description="before")
+    prefix = "arn:aws:ec2:us-east-1:000000000000:"
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "ec2:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "ec2:ModifyVerifiedAccessGroup", "Resource": f"{prefix}verified-access-group/{group_id}"},
+        {"Effect": "Deny", "Action": "ec2:DetachVerifiedAccessTrustProvider",
+         "Resource": f"{prefix}verified-access-trust-provider/{device_id}"},
+    ]}).client("ec2")
+    try:
+        calls = (
+            lambda: client.modify_verified_access_group(VerifiedAccessGroupId=group_id, VerifiedAccessInstanceId=inst_id,
+                                                        Description="after"),
+            lambda: client.detach_verified_access_trust_provider(VerifiedAccessInstanceId=inst_id,
+                                                                 VerifiedAccessTrustProviderId=device_id),
+        )
+        for call in calls:
+            if auth_enabled:
+                with pytest.raises(ClientError) as exc:
+                    call()
+                assert (_status(exc), _error(exc)[0]) == (403, "UnauthorizedOperation")
+            else:
+                call()
+        group = admin.describe_verified_access_groups(VerifiedAccessGroupIds=[group_id])["VerifiedAccessGroups"][0]
+        assert group["Description"] == ("before" if auth_enabled else "after")
+        assert (device_id in _provider_ids(admin, inst_id)) is auth_enabled
+    finally:
+        _cleanup(admin, groups=[group_id], instances=[inst_id], providers=[oidc_id, device_id])
+
+
+def test_verified_access_resource_arns_cover_every_authorized_resource():
+    from ministack.core.iam_actions import verified_access_resource_arns
+
+    prefix = "arn:aws:ec2:us-east-1:000000000000:"
+    params = {"Action": "CreateVerifiedAccessEndpoint", "VerifiedAccessGroupId": "vagr-00000000000000009",
+              "LoadBalancerOptions.SubnetId.1": "subnet-a", "LoadBalancerOptions.SubnetId.2": "subnet-b",
+              "SecurityGroupId.1": "sg-a"}
+    arns = verified_access_resource_arns(params, "us-east-1", "000000000000")
+    assert set(arns) == {prefix + r for r in ("security-group/sg-a", "subnet/subnet-a", "subnet/subnet-b",
+                                                   "verified-access-endpoint/*", "verified-access-group/*")}
+    assert verified_access_resource_arns({"Action": "CreateVerifiedAccessGroup", "VerifiedAccessInstanceId": "vai-00000000000000009"},
+                                         "us-east-1", "000000000000") == [
+        prefix + "verified-access-instance/*", prefix + "verified-access-group/*"]
+    assert verified_access_resource_arns({"Action": "DescribeVerifiedAccessGroups"}, "us-east-1", "000000000000") == []

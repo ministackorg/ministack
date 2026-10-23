@@ -2946,6 +2946,7 @@ async def _dispatch_service_request(
             request_tag_context,
             s3_access_point_resources,
             s3_service_context,
+            verified_access_resource_arns,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -3075,6 +3076,16 @@ async def _dispatch_service_request(
                     )
                     if denied:
                         resource_arn = extra_arn  # named in the AccessDenied message
+                        break
+            # A Verified Access call is also checked on every other resource it names.
+            if service == "ec2" and not denied:
+                for extra_arn in verified_access_resource_arns(routing_params, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn, service_context=service_context,
+                    )
+                    if denied:
+                        resource_arn = extra_arn
                         break
             if (
                 denied
