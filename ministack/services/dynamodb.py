@@ -5628,13 +5628,15 @@ def _import_log_stream(import_arn):
 def _log_import_error(import_arn, bucket, key, item_index, message):
     """One item-level error, in the shape the documented log event carries:
     ``{"itemS3Pointer": {...}, "importArn": ..., "errorMessages": [...]}``."""
+    from ministack.services import cloudwatch_logs as _cwl
+
     try:
         stream = _import_log_stream(import_arn)
     except Exception:
         logger.debug("DynamoDB import %s: error log unavailable", import_arn, exc_info=True)
         return
     ts = int(time.time() * 1000)
-    stream["events"].append({
+    _cwl._append_log_events(stream, [{
         "timestamp": ts,
         "message": json.dumps({
             "itemS3Pointer": {"bucket": bucket, "key": key, "itemIndex": item_index},
@@ -5642,11 +5644,7 @@ def _log_import_error(import_arn, bucket, key, item_index, message):
             "errorMessages": [message],
         }),
         "ingestionTime": ts,
-    })
-    if stream["firstEventTimestamp"] is None:
-        stream["firstEventTimestamp"] = ts
-    stream["lastEventTimestamp"] = ts
-    stream["lastIngestionTime"] = ts
+    }])
 
 
 def _import_source_objects(s3_source, compression):

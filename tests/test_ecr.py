@@ -7,6 +7,7 @@ import boto3
 import pytest
 import requests
 from botocore.exceptions import ClientError
+from conftest import inprocess_iam_user, routed_request
 
 from ministack.core.responses import (
     get_account_id,
@@ -149,6 +150,50 @@ def test_ecr_repository_policy(ecr):
         assert False, "Should have raised"
     except botocore.exceptions.ClientError as e:
         assert "RepositoryPolicyNotFoundException" in str(e)
+
+
+def _policy_repository(effect, principal):
+    """A repository whose policy has one statement, without a Resource, on ecr:ListImages."""
+    name = f"rp-{_uuid_mod.uuid4().hex[:8]}"
+    _create_repository(name)
+    ecr_svc._set_repository_policy({"repositoryName": name, "policyText": json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": effect, "Principal": {"AWS": principal}, "Action": "ecr:ListImages"}]})})
+    return name
+
+
+def _list_images(key, name, field="__type"):
+    status, _headers, body = routed_request(
+        key, "ecr", "POST", "/", json.dumps({"repositoryName": name}).encode(),
+        {"content-type": "application/x-amz-json-1.1",
+         "x-amz-target": "AmazonEC2ContainerRegistry_V20150921.ListImages"})
+    return status, json.loads(body).get(field)
+
+
+_ALLOW_ECR = {"Statement": [{"Effect": "Allow", "Action": "ecr:*", "Resource": "*"}]}
+
+
+def test_repository_policy_naming_the_user_allows_without_identity_policy(auth):
+    key, user = inprocess_iam_user()
+    assert _list_images(key, _policy_repository("Allow", user)) == (200, None)
+
+
+def test_repository_policy_naming_the_account_needs_an_identity_policy(auth):
+    name = _policy_repository("Allow", "arn:aws:iam::000000000000:root")
+    key, _user = inprocess_iam_user()
+    assert _list_images(key, name) == (403, "AccessDeniedException")
+    key, _user = inprocess_iam_user(_ALLOW_ECR)
+    assert _list_images(key, name) == (200, None)
+
+
+def test_repository_policy_deny_beats_an_identity_allow(auth):
+    key, user = inprocess_iam_user(_ALLOW_ECR)
+    name = _policy_repository("Deny", user)
+    assert _list_images(key, name) == (403, "AccessDeniedException")
+    assert _list_images(key, name, "message") == (403, (
+        f"User: {user} is not authorized to perform: ecr:ListImages on resource: "
+        f"arn:aws:ecr:us-east-1:000000000000:repository/{name} with an explicit deny in a resource-based policy"))
+
 
 def test_ecr_image_tag_mutability(ecr):
     ecr.put_image_tag_mutability(repositoryName="test-app", imageTagMutability="IMMUTABLE")

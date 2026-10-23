@@ -10,6 +10,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError, ParamValidationError
+from conftest import inprocess_iam_user, routed_request
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -1031,6 +1032,79 @@ def test_kms_get_put_key_policy(kms_client):
     got = kms_client.get_key_policy(KeyId=key_id, PolicyName="default")
     assert got["Policy"] == custom
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.fixture
+def auth_key(monkeypatch):
+    """Create keys in-process, optionally with a key policy, under AUTH=true."""
+    import ministack.app as app_mod
+    from ministack.services import kms as _kms
+
+    created = []
+
+    def make(*statements):
+        data = {"KeySpec": "SYMMETRIC_DEFAULT", "KeyUsage": "ENCRYPT_DECRYPT"}
+        if statements:
+            data["Policy"] = json.dumps({"Version": "2012-10-17", "Statement": [
+                {"Effect": effect, "Principal": {"AWS": principal}, "Action": action, "Resource": "*"}
+                for effect, principal, action in statements]})
+        status, _headers, body = _kms._create_key(data)
+        assert status == 200
+        created.append(json.loads(body)["KeyMetadata"]["KeyId"])
+        return created[-1]
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    yield make
+    for key_id in created:
+        _kms._keys.pop(key_id, None)
+
+
+def _kms_call(access_key, operation, key_id, field="__type"):
+    params = {"KeyId": key_id}
+    if operation == "Encrypt":
+        params["Plaintext"] = base64.b64encode(b"hi").decode()
+    else:
+        params["KeySpec"] = "AES_256"
+    status, _headers, body = routed_request(
+        access_key, "kms", "POST", "/", json.dumps(params).encode(),
+        {"content-type": "application/x-amz-json-1.1", "x-amz-target": f"TrentService.{operation}"})
+    return status, json.loads(body).get(field)
+
+
+_ALLOW_KMS = {"Statement": [{"Effect": "Allow", "Action": "kms:*", "Resource": "*"}]}
+_DENIED = (403, "AccessDeniedException")
+
+
+def test_key_policy_naming_the_user_allows_without_identity_policy(auth_key):
+    access_key, user = inprocess_iam_user()
+    key_id = auth_key(("Allow", user, "kms:Encrypt"))
+    assert _kms_call(access_key, "Encrypt", key_id) == (200, None)
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+
+
+def test_key_policy_that_names_neither_user_nor_account_denies_an_identity_allow(auth_key):
+    access_key, user = inprocess_iam_user(_ALLOW_KMS)
+    key_id = auth_key(("Allow", "arn:aws:iam::000000000000:user/someone-else", "kms:*"))
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+
+
+def test_default_key_policy_hands_the_decision_to_identity_policies(auth_key):
+    key_id = auth_key()
+    access_key, _user = inprocess_iam_user()
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+    access_key, _user = inprocess_iam_user(_ALLOW_KMS)
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == (200, None)
+
+
+def test_key_policy_deny_beats_an_identity_allow(auth_key):
+    access_key, user = inprocess_iam_user(_ALLOW_KMS)
+    key_id = auth_key(("Allow", "arn:aws:iam::000000000000:root", "kms:*"), ("Deny", user, "kms:GenerateDataKey"))
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+    assert _kms_call(access_key, "GenerateDataKey", key_id, "message") == (403, (
+        f"User: {user} is not authorized to perform: kms:GenerateDataKey on resource: "
+        f"arn:aws:kms:us-east-1:000000000000:key/{key_id} with an explicit deny in a resource-based policy"))
+    assert _kms_call(access_key, "Encrypt", key_id) == (200, None)
+
 
 def test_kms_tag_untag_list_v2(kms_client):
     """TagResource / UntagResource / ListResourceTags."""
@@ -2796,3 +2870,84 @@ def test_kms_create_grant_rejects_primary_pending_replica_deletion():
         assert east.list_grants(KeyId=key_id)["Grants"] == []
     finally:
         west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("days,accepted", [(6, False), (7, True), (30, True), (31, False)])
+def test_kms_schedule_key_deletion_window_is_7_to_30_days(kms_client, days, accepted):
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    if accepted:
+        assert kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)["KeyState"] == "PendingDeletion"
+    else:
+        with pytest.raises(ClientError) as exc:
+            kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)
+        assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                               "Message": "PendingWindowInDays must be between 7 and 30"}
+        assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+
+
+def test_kms_rsassa_pss_uses_a_digest_length_salt(kms_client):
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    digest = hashlib.sha256(b"payload").digest()
+    signature = kms_client.sign(KeyId=key_id, Message=digest, MessageType="DIGEST",
+                         SigningAlgorithm="RSASSA_PSS_SHA_256")["Signature"]
+    public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+    public_key.verify(signature, digest, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                                     salt_length=padding.PSS.DIGEST_LENGTH),
+                      utils.Prehashed(hashes.SHA256()))
+
+
+def test_kms_rsa_encryption_honours_the_named_algorithm(kms_client):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+    sha256 = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    blob = public_key.encrypt(b"secret", sha256)
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob, EncryptionAlgorithm="RSAES_OAEP_SHA_1")
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    assert kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob,
+                       EncryptionAlgorithm="RSAES_OAEP_SHA_256")["Plaintext"] == b"secret"
+    sha1_blob = kms_client.encrypt(KeyId=key_id, Plaintext=b"secret", EncryptionAlgorithm="RSAES_OAEP_SHA_1")["CiphertextBlob"]
+    assert kms_client.decrypt(KeyId=key_id, CiphertextBlob=sha1_blob,
+                       EncryptionAlgorithm="RSAES_OAEP_SHA_1")["Plaintext"] == b"secret"
+
+
+def test_kms_sign_refuses_a_wrong_digest_length_or_algorithm(kms_client):
+    ec_key = kms_client.create_key(KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=ec_key, Message=b"x" * 20, MessageType="DIGEST", SigningAlgorithm="ECDSA_SHA_256")
+    err = exc.value.response
+    assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("ValidationException", 400)
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=ec_key, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="RSASSA_PSS_SHA_256")
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
+
+
+def test_kms_sign_unknown_algorithm_is_an_enum_validation_error(kms_client):
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=key_id, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="NOT_A_SIGNING_ALGORITHM")
+    error = exc.value.response["Error"]
+    assert error["Code"] == "ValidationException"
+    assert error["Message"].startswith(
+        "1 validation error detected: Value 'NOT_A_SIGNING_ALGORITHM' at 'signingAlgorithm' failed to satisfy "
+        "constraint: Member must satisfy enum value set: [RSASSA_PSS_SHA_256, ")
+
+
+def test_kms_rsa_decrypt_without_algorithm_is_invalid_ciphertext(kms_client):
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    blob = kms_client.encrypt(KeyId=key_id, Plaintext=b"secret", EncryptionAlgorithm="RSAES_OAEP_SHA_256")["CiphertextBlob"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob)
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
+    assert exc.value.response["Error"] == {
+        "Code": "InvalidKeyUsageException", "Message": "Algorithm SYMMETRIC_DEFAULT is incompatible with key spec RSA_2048."}

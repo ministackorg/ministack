@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, quote, unquote, urlencode
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
@@ -60,6 +60,8 @@ _LAMBDA_URL_RE = re.compile(r"^([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.la
 _AOSS_COLLECTION_HOST_RE = re.compile(r"^[a-z0-9]{3,40}\.[a-z0-9-]+\.aoss\.", re.IGNORECASE)
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
+# AppSync GraphQL data plane: POST /v1/apis/{apiId}/graphql.
+_APPSYNC_GRAPHQL_RE = re.compile(r"^/v1/apis/[^/]+/graphql$")
 # IoT data plane WebSocket: anything containing ".iot." in the host header.
 # Match AWS-shaped IoT hosts only — `iot.<region>.<host>`,
 # `data-ats.iot.<region>.<host>`, `data.iot.<region>.<host>`, and the
@@ -91,7 +93,7 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
     SigV4 signature *verification* is intentionally lax (any
-    well-formed credential is accepted); IoT policy enforcement is not yet
+    well-formed credential is accepted) unless AUTH=true; IoT policy enforcement is not yet
     feature. The point here is multi-tenancy isolation, not auth.
     """
     qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
@@ -168,6 +170,10 @@ _BODY_METHODS = ("POST", "PUT", "PATCH")
 _COGNITO_USERINFO_PATHS = ("/oauth2/userInfo", "/oauth2/userinfo")
 _RDS_DATA_PATHS = ("/Execute", "/BeginTransaction", "/CommitTransaction", "/RollbackTransaction", "/BatchExecute")
 _S3_CONTROL_PREFIX = "/v20180820/"
+# S3 Control tagging calls on a bucket ARN; older SDKs send TagResource as PUT.
+_S3_CONTROL_TAG_ACTIONS = {
+    "GET": "s3:ListTagsForResource", "POST": "s3:TagResource", "PUT": "s3:TagResource", "DELETE": "s3:UntagResource",
+}
 _SES_V2_PREFIX = "/v2/email"
 _ALB_PATH_PREFIX = "/_alb/"
 _NON_S3_VHOST_NAMES = frozenset(
@@ -204,6 +210,7 @@ _NON_S3_VHOST_NAMES = frozenset(
         "transfer",
         "cur",
         "budgets",
+        "kinesisanalytics",
         "cloudfront-kvs",
         "appsync-api",
         "appsync-realtime-api",
@@ -218,15 +225,21 @@ from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
     find_iam_access_key_account,
+    pin_request_origin,
+    pin_signed_body,
+    pin_signed_request,
 )
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
     fix_error_content_type,
+    fix_success_content_type,
     set_request_account_id,
+    set_request_client_ip,
     set_request_region,
 )
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
+from ministack.core.sigv4 import decode_header_value
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
 # See ministack/core/hypercorn_compat.py for the rationale (issue #389).
@@ -453,6 +466,7 @@ SERVICE_REGISTRY = {
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
     "budgets": {"module": "budgets"},
+    "kinesisanalyticsv2": {"module": "kinesisanalyticsv2"},
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
@@ -725,6 +739,7 @@ async def _read_request_body(receive, method: str, headers: dict) -> bytes:
             if not message.get("more_body", False):
                 break
         body = b"".join(chunks)
+    pin_signed_body(body)
     content_length = headers.get("content-length")
     if content_length is not None:
         content_length = content_length.strip()
@@ -876,6 +891,7 @@ def _handle_health_request(path: str, request_id: str):
         json.dumps(
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
+                "auth": "enabled" if AUTH else "disabled",
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
                 "version": _version(),
                 "iot_mtls": _iot_mtls_state,
@@ -1472,6 +1488,8 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
+            # Registered so request hooks such as CloudTrail recording see the module.
+            _loaded_modules.setdefault(mod_name, mod)
             if key in (
                 "stepfunctions._SFN_WAIT_SCALE",
                 "translate._JOB_RUN_SECONDS",
@@ -1547,15 +1565,85 @@ async def _handle_post_body_shortcuts(
 # ---------------------------------------------------------------------------
 
 
-async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str):
+_S3_CONTROL_MRAP_PREFIXES = ("/v20180820/mrap/", "/v20180820/async-requests/mrap/")
+
+
+def _s3control_mrap_arn(s3, path: str) -> str:
+    """IAM resource for an MRAP request: ``arn:aws:s3::<account>:accesspoint/<alias>``
+    for an existing MRAP named in the path, else the account's wildcard."""
+    from ministack.core.responses import get_account_id
+
+    account = get_account_id()
+    route = None if path.startswith("/v20180820/async-requests/") else s3.mrap_control_route(path)
+    record = s3.find_mrap(route[0]) if route and route[0] else None
+    return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
+
+
+def _s3control_access_point_arn(s3, path: str) -> str:
+    """IAM resource for an access point request: its regional ARN, or the
+    account's wildcard for ListAccessPoints."""
+    return s3.access_point_arn(s3.access_point_control_route(path)[0] or "*")
+
+
+def _s3control_object_lambda_arn(s3, path: str) -> str:
+    """IAM resource for an Object Lambda Access Point request."""
+    return s3.object_lambda_arn(s3.object_lambda_control_route(path)[0] or "*")
+
+
+async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,
+                                     headers: dict | None = None):
     """Handle S3 Control operations addressed via the /v20180820 path prefix."""
     if not path.startswith(_S3_CONTROL_PREFIX):
         return None
+
+    is_mrap = path.startswith(_S3_CONTROL_MRAP_PREFIXES) or path.rstrip("/") == "/v20180820/mrap/instances"
+    s3 = _get_module("s3")
+    is_object_lambda = s3.is_object_lambda_control_path(path)
+    if is_mrap or is_object_lambda or s3.is_access_point_control_path(path):
+        headers = headers or {}
+        if AUTH:
+            from ministack.core.iam_actions import s3control_action
+
+            action = s3control_action(method, path)
+            if action:
+                if is_mrap:
+                    resource = _s3control_mrap_arn(s3, path)
+                elif is_object_lambda:
+                    resource = _s3control_object_lambda_arn(s3, path)
+                else:
+                    resource = _s3control_access_point_arn(s3, path)
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id,
+                                             resource_arn=resource)
+                if denied:
+                    return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
+        if is_mrap:
+            handler = s3.handle_mrap_control
+        elif is_object_lambda:
+            handler = s3.handle_object_lambda_control
+        else:
+            handler = s3.handle_access_point_control
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or handler(method, path, headers, body, query_params)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
         arn = unquote(raw_arn)
         bucket_name = arn.split(":::")[-1].split("/")[0] if ":::" in arn else arn.split("/")[0]
+        resource_arn = arn if arn.startswith("arn:") else f"arn:aws:s3:::{bucket_name}"
+        iam_action = _S3_CONTROL_TAG_ACTIONS.get(method)
+        if iam_action and (denied := _enforce_data_plane("s3", iam_action, headers, query_params, request_id,
+                                                         resource_arn=resource_arn,
+                                                         named_resource=f'"{resource_arn}"')):
+            return denied
+        if not iam_action and (failure := _authenticate_only("s3", headers, query_params, request_id)):
+            return failure
 
         if method == "GET":
             tags = _get_module("s3")._bucket_tags.get(bucket_name, {})
@@ -1636,6 +1724,8 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
     # An undefined /v20180820 path answers 400 InvalidURI inside an
     # <ErrorResponse> wrapper, with <URI> echoing the bad segment (measured eu-north-1 2026-09-19).
     from xml.sax.saxutils import escape as _xml_esc
@@ -1662,17 +1752,37 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
     )
 
 
-async def _handle_rds_data_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_rds_data_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle RDS Data API operations before generic routing."""
     if path not in _RDS_DATA_PATHS:
         return None
+    if AUTH and (denied := _enforce_rds_data(method, path, headers, body, query_params, request_id)):
+        return denied
     return await _get_module("rds_data").handle_request(method, path, headers, body, query_params)
 
 
-async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+def _enforce_rds_data(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an RDS Data call as rds-data:<operation> on the cluster its body names."""
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+
+    iam_action = extract_iam_action("rds-data", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("rds-data", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("rds-data", method, path, headers, body, query_params, "", "")
+    return _enforce_data_plane("rds-data", iam_action, headers, query_params, request_id,
+                               resource_arn=resource_arn, named_resource=resource_arn)
+
+
+async def _handle_ses_v2_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle SES v2 REST API operations before generic routing."""
     if not path.startswith(_SES_V2_PREFIX):
         return None
+    if denied := _enforce_ses_v2(method, path, headers, body, query_params, request_id):
+        return denied
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
@@ -1746,6 +1856,12 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _execute_api_authorization_type(api_id: str, stage: str, method: str, execute_path: str) -> str | None:
+    """The authorization type of the REST method or HTTP API route an execute-api call reaches, or None."""
+    return (_get_module("apigateway_v1").method_authorization_type(api_id, stage, method, execute_path)
+            or _get_module("apigateway").route_authorization_type(api_id, stage, method, execute_path))
+
+
 def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
                          headers: dict, query_params: dict,
                          iam_action: str = "execute-api:Invoke"):
@@ -1765,14 +1881,30 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
     which AWS authorizes under that separate action.
     """
     from ministack.core.arn import execute_api_arn
+    from ministack.core.iam_evaluator import AuthError
     from ministack.core.responses import get_account_id
+    from ministack.core.sigv4 import foreign_authorization_failure
 
+    authorization = _execute_api_authorization_type(
+        api_id, stage, method, execute_path) if AUTH and iam_action == "execute-api:Invoke" else None
+    # Only an AWS_IAM method reads the caller's signature and policies.
+    if authorization not in (None, "AWS_IAM"):
+        return None
+    header = headers.get("authorization", "")
+    if authorization == "AWS_IAM" and header and not header.startswith("AWS4-HMAC-SHA256"):
+        # A REST method with AWS_IAM refuses an Authorization header that is not SigV4.
+        apigw_v1 = _get_module("apigateway_v1")
+        refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
+        if refused:
+            return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
     return _enforce_data_plane(
         "apigateway", iam_action, headers, query_params, "",
         resource_arn=execute_api_arn(
             extract_region(headers, query_params), get_account_id(),
             api_id, stage, method, execute_path,
         ),
+        auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+            api_id, stage, error, headers, query_params),
     )
 
 
@@ -2055,6 +2187,7 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
+_ACCESS_POINT_HOST_RE = re.compile(r"^(?P<name>[a-z0-9-]+)-(?P<account>\d{12})$")
 _MRAP_HOST_RE = re.compile(
     r"^([a-z0-9]+\.mrap)\.accesspoint\.s3-global\.amazonaws\.com$", re.IGNORECASE
 )
@@ -2077,6 +2210,33 @@ def _resolve_mrap_host(host: str):
         return None
 
 
+def _enforce_mrap_request(host: str, bucket: str, method: str, mrap_path: str, headers: dict, body: bytes,
+                          query_params: dict):
+    """Under AUTH=true, authorize an MRAP request on its member bucket and then on the MRAP itself."""
+    from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks, s3_service_context
+    from ministack.core.responses import get_account_id
+
+    s3_action = _s3_action(method, mrap_path, query_params)
+    if not AUTH or not s3_action:
+        return None
+    s3 = _get_module("s3")
+    s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
+    bucket_arn = extract_resource_arn("s3", method, mrap_path, s3_headers, body, query_params, "", "")
+    key = bucket_arn[len(f"arn:aws:s3:::{bucket}"):]
+    mrap_arn = f"arn:aws:s3::{get_account_id()}:accesspoint/{_MRAP_HOST_RE.match(host).group(1).lower()}"
+    service_context = s3_service_context(f"s3:{s3_action}", query_params, mrap_path, s3_headers)
+    for resource in (bucket_arn, mrap_arn + (f"/object{key}" if key else "")):
+        denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
+                                     service_context=service_context, named_resource=f'"{resource}"')
+        if denied:
+            return denied
+    for extra_action, extra_arn in s3_additional_checks(method, mrap_path, s3_headers, body, query_params):
+        denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+        if denied:
+            return denied
+    return None
+
+
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
     if _MRAP_HOST_RE.match(host.split(":")[0].strip()):
@@ -2087,27 +2247,66 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             return error
     mrap_bucket = _resolve_mrap_host(host)
     if mrap_bucket:
-        # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP and
-        # what MiniStack does not implement: verifying it means ECDSA P-256 key
-        # derivation, and the emulator does not verify header-signed SigV4
-        # requests either. So the presign parameters are dropped and the request
-        # is served unverified rather than rejected for a signature that could
-        # never have matched. A plain SigV4 presign is left alone and still
-        # verifies.
+        # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP.
+        # Under AUTH=true its signature is verified with the request's other
+        # credentials. Otherwise the presign parameters are dropped and the
+        # request is served unverified, as header-signed requests are. A plain
+        # SigV4 presign is left alone and still verifies.
         algorithm = (query_params.get("X-Amz-Algorithm") or [""])[0]
-        if "ECDSA" in str(algorithm).upper():
+        if "ECDSA" in str(algorithm).upper() and not AUTH:
             query_params = {
                 k: v for k, v in query_params.items()
                 if not k.lower().startswith("x-amz-")
             }
         mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
+        # The MRAP and its bucket both have to allow the request.
+        denied = _enforce_mrap_request(host.split(":")[0].strip(), mrap_bucket, method, mrap_path, headers, body,
+                                       query_params)
+        if denied:
+            return denied
         return await _get_module("s3").handle_request(
-            method, mrap_path, headers, body, query_params, signed_path=path
+            method, mrap_path, headers, body, query_params, signed_path=path,
+            enforce_bucket_region=False,
         )
 
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
+    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3` or unsigned.
+    access_point_region = access_point_alias = None
+    ap_match = _ACCESS_POINT_HOST_RE.match(bucket)
+    s3 = _get_module("s3")
+    if ap_match and s3.signed_service(headers, query_params) == "s3-object-lambda":
+        # An Object Lambda Access Point ARN, same host shape, signed for Object Lambda.
+        from ministack.services import s3_object_lambda
+
+        record, olap_region, olap_error = s3_object_lambda.resolve_host(
+            ap_match.group("name"), ap_match.group("account"), headers, query_params)
+        if olap_error:
+            return olap_error
+        if AUTH:
+            from ministack.core.iam_actions import s3_object_lambda_action
+
+            action = s3_object_lambda_action(method, path.lstrip("/"), query_params)
+            if action:
+                denied = _enforce_data_plane("s3-object-lambda", action, headers, query_params, "",
+                                             resource_arn=s3.object_lambda_arn(record["Name"], region=olap_region))
+                if denied:
+                    return denied
+        query = urlencode(query_params, doseq=True)
+        url = f"http://{host}{path}" + (f"?{query}" if query else "")
+        return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
+                                                     query_params, url)
+    if ap_match and s3.signed_service(headers, query_params) in ("s3", None):
+        target = s3.resolve_access_point_host(ap_match.group("name"), ap_match.group("account"),
+                                              s3._signed_region(headers, query_params))
+        if target is not None:
+            ap_bucket, ap_region, ap_error = target
+            if ap_error:
+                return ap_error
+            bucket, access_point_region = ap_bucket, ap_region
+            access_point_alias = s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"),
+                                                         ap_region)["Alias"]
     # CloudFront KVS data-plane clients (boto3 cloudfront-keyvaluestore with
     # inject_host_prefix=False) hit ministack with host=localhost and path
     # prefixed by /key-value-stores/. Host-name exclusion above doesn't fire,
@@ -2134,26 +2333,51 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks
+        upload_error = _get_module("s3").validate_upload_request(method, vhost_path, headers, query_params)
+        if upload_error is not None:
+            return upload_error
+        from ministack.core.iam_actions import (
+            _s3_action,
+            extract_resource_arn,
+            s3_access_point_resources,
+            s3_additional_checks,
+            s3_service_context,
+        )
 
-        s3_action = _s3_action(method, vhost_path, query_params)
+        # An access point ARN host is authorized as its alias.
+        iam_path = vhost_path if access_point_alias is None else f"/{access_point_alias}{vhost_path[len(bucket) + 1:]}"
+        s3_action = _s3_action(method, iam_path, query_params)
+        # x-amz-* headers hoisted into the query string count as the headers they stand for.
+        s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
         if s3_action:
-            s3_resource = extract_resource_arn("s3", method, vhost_path, headers, body, query_params, "", "")
-            denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=s3_resource)
-            if denied:
-                return denied
-            # A copy also reads its source, a batch delete is one check per
-            # key, an attributes call is a pair, a governance bypass its own action.
-            for extra_action, extra_arn in s3_additional_checks(method, vhost_path, headers, body, query_params):
-                denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+            s3_resource = extract_resource_arn("s3", method, iam_path, s3_headers, body, query_params, "", "")
+            service_context = s3_service_context(f"s3:{s3_action}", query_params, iam_path, s3_headers)
+            for resource, keys in s3_access_point_resources(s3_resource):
+                denied = _enforce_data_plane(
+                    "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
+                    service_context={**service_context, **keys},
+                )
                 if denied:
                     return denied
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            for extra_action, extra_arn in s3_additional_checks(method, iam_path, s3_headers, body, query_params):
+                for resource, keys in s3_access_point_resources(extra_arn):
+                    denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=resource,
+                                                 service_context=keys)
+                    if denied:
+                        return denied
 
     try:
+        # The access point an ARN host names, for its Block Public Access settings.
+        access_point = (s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"), access_point_region)
+                        if access_point_region else None)
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
         # virtual-hosted URL, which signed the canonical URI without the bucket,
         # verifies against what the client actually signed.
-        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path)
+        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path,
+                                                      access_point_region=access_point_region,
+                                                      access_point=access_point)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc
@@ -2180,25 +2404,50 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
         headers["Access-Control-Allow-Origin"] = "*"
     # An API Gateway gateway response already carries the id it rendered.
     request_id = headers.setdefault("x-amzn-requestid", request_id)
-    headers["x-amz-request-id"] = request_id
     if include_s3_id:
-        headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
+        headers.setdefault("x-amz-request-id", request_id)
+        headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        headers["x-amz-request-id"] = request_id
     return status, headers, body
+
+
+def _credential_failure(service: str, iam_action: str, request_id: str, denied, headers: dict):
+    """A failed authentication in the service's protocol, with the Content-Type AWS sends."""
+    from ministack.core.iam_actions import access_denied_response
+
+    status, resp_headers, body = access_denied_response(
+        service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
+    )
+    fix_error_content_type(service, status, resp_headers)
+    return status, resp_headers, body
+
+
+def _authenticate_only(service: str, headers: dict, query_params: dict, request_id: str):
+    """Under AUTH, refuse a request no IAM action covers when its credentials fail."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import check_credentials
+
+    failure = check_credentials(extract_access_key_id(headers, query_params))
+    return _credential_failure(service, "", request_id, failure, headers) if failure else None
 
 
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
-    service_context: dict | None = None,
+    service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
     ``service_context`` carries the request's own condition keys, for a path
     that has them. The generic router resolves those itself; a data-plane
     handler has to pass them, because it knows the resource the router does not.
+    ``named_resource`` is the resource an identity-policy denial names, in the
+    error Content-Type of the service, for the services that word it so.
     """
     if not AUTH:
         return None
-    from ministack.core.iam_actions import access_denied_response
+    from ministack.core.iam_actions import access_denied_response, identity_denial_message
     from ministack.core.iam_evaluator import AuthError, enforce
 
     access_key = extract_access_key_id(headers, query_params)
@@ -2206,11 +2455,75 @@ def _enforce_data_plane(
                      resource_arn=resource_arn, service_context=service_context)
     if denied:
         if isinstance(denied, AuthError):
-            return access_denied_response(
-                service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
-            )
-        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
-                                      explicit_deny=denied.decision == "Deny")
+            response = auth_error_response(denied) if auth_error_response else None
+            return response or _credential_failure(service, iam_action, request_id, denied, headers)
+        explicit = denied.decision == "Deny"
+        message = ""
+        if named_resource and not (explicit and denied.resource_policy_arn):
+            message = identity_denial_message(iam_action, denied.principal_arn, named_resource, explicit)
+        response = access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
+                                          message=message, explicit_deny=explicit,
+                                          resource_policy_arn=denied.resource_policy_arn)
+        if named_resource:
+            fix_error_content_type(service, response[0], response[1])
+        return response
+    return None
+
+
+def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an SES v2 call as ses:<operation> on the resource it names, which its denial names too."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+    from ministack.core.responses import get_account_id
+
+    iam_action = extract_iam_action("ses", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("sesv2", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("ses", method, path, headers, body, query_params,
+                                        extract_region(headers, query_params), get_account_id())
+    return _enforce_data_plane("sesv2", iam_action, headers, query_params, request_id, resource_arn=resource_arn,
+                               named_resource=resource_arn)
+
+
+def _iceberg_json_failure(failure):
+    """A credential failure as both Iceberg REST catalogs send it, in application/json."""
+    status, resp_headers, resp_body = failure
+    return status, {**resp_headers, "Content-Type": "application/json"}, resp_body
+
+
+def _enforce_iceberg(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an Iceberg REST call for the catalog the router serves it from, whatever it is signed for."""
+    from ministack.core.iam_actions import identity_denial_message
+    from ministack.core.iam_evaluator import AuthError, enforce
+
+    glue = _iceberg_targets_glue_catalog(path, query_params)
+    service = "glue" if glue else "s3tables"
+    catalog = _get_module(service)
+    # A route without the table bucket prefix answers 404 before any credential check.
+    if not glue and catalog.iceberg_lacks_prefix(method, path):
+        return None
+    checks = catalog.iceberg_iam_checks(method, path, body, query_params)
+    if not checks:
+        if failure := _authenticate_only(service, headers, query_params, request_id):
+            return _iceberg_json_failure(failure)
+        return None if glue else catalog.iceberg_prefix_error(method, path)
+    access_key, region = extract_access_key_id(headers, query_params), extract_region(headers, query_params)
+    for position, (iam_action, resource_arn) in enumerate(checks):
+        denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+        if isinstance(denied, AuthError):
+            return _iceberg_json_failure(_credential_failure(service, iam_action, request_id, denied, headers))
+        if not denied:
+            continue
+        resp_headers = {"Content-Type": "application/json",
+                        "x-amzn-errortype": "ForbiddenResponse" if glue else "IrcForbiddenResponse"}
+        if method == "HEAD":
+            return 403, resp_headers, b""
+        # S3 Tables names only the first action's denial; a later one answers "Access Denied".
+        message = identity_denial_message(iam_action, denied.principal_arn, resource_arn,
+                                          denied.decision == "Deny") if glue or position == 0 else "Access Denied"
+        error = {"message": message, "type": "AccessDeniedException" if glue else "forbidden", "code": 403}
+        return 403, resp_headers, json.dumps({"error": error}).encode()
     return None
 
 
@@ -2247,12 +2560,24 @@ async def _handle_special_data_plane_request(
     client_ip: str = "127.0.0.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
+    # S3 Object Lambda's WriteGetObjectResponse, on any host: its modeled host
+    # prefix `<route>.<host>` doesn't resolve locally, so the route header decides.
+    if method == "POST" and path == "/WriteGetObjectResponse" and headers.get("x-amz-request-route"):
+        from ministack.services import s3_object_lambda
+
+        denied = _enforce_data_plane("s3-object-lambda", "s3-object-lambda:WriteGetObjectResponse",
+                                     headers, query_params, request_id)
+        if denied:
+            return denied
+        return s3_object_lambda.write_get_object_response(headers, body)
     # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
     # prefix: the Glue Data Catalog (the lakehouse a Glue job and Firehose both
     # write) and S3 Tables. Dispatch between them so a table one writer commits,
     # the other reads. Must not fall through to S3 (which reads "iceberg" as a
     # bucket name).
     if path.startswith("/iceberg"):
+        if AUTH and (denied := _enforce_iceberg(method, path, headers, body, query_params, request_id)):
+            return denied
         try:
             if _iceberg_targets_glue_catalog(path, query_params):
                 result = _get_module("glue")._handle_iceberg_rest(method, path, query_params, body=body)
@@ -2269,11 +2594,11 @@ async def _handle_special_data_plane_request(
         except Exception as e:
             logger.exception("Error in Iceberg REST catalog: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
-    if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
+    if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
-    if response := await _handle_rds_data_request(method, path, headers, body, query_params):
+    if response := await _handle_rds_data_request(method, path, headers, body, query_params, request_id):
         return response
-    if response := await _handle_ses_v2_request(method, path, headers, body, query_params):
+    if response := await _handle_ses_v2_request(method, path, headers, body, query_params, request_id):
         return response
     if response := await _handle_ecr_registry_request(method, path, headers, body, query_params):
         return _with_data_plane_headers(response, request_id)
@@ -2532,8 +2857,8 @@ def _unknown_query_error(body: bytes, request_id: str):
         else "The requested action is not valid for this web service."
     )
     msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Query error envelopes carry no <?xml?> declaration (AWS captures).
     xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
         f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"
         f"<RequestId>{request_id}</RequestId></ErrorResponse>"
@@ -2571,7 +2896,16 @@ async def _dispatch_service_request(
     if service == "unknown_query":
         return _unknown_query_error(body, request_id)
 
-    if AUTH:
+    if AUTH and service == "s3":
+        upload_error = _get_module("s3").validate_upload_request(method, path, headers, query_params)
+        if upload_error is not None:
+            return upload_error
+
+    # AppSync authorizes a GraphQL request by the API's own authorization types.
+    appsync_graphql = service == "appsync" and method == "POST" and (
+        _APPSYNC_GRAPHQL_RE.match(path)
+        or (path == "/graphql" and re.search(r"\.appsync-api\.", headers.get("host", ""))))
+    if AUTH and not appsync_graphql:
         from ministack.core.iam_actions import (
             access_denied_response,
             agentcore_endpoint_arn,
@@ -2581,20 +2915,37 @@ async def _dispatch_service_request(
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
+            iot_resource_arns,
             logs_service_context,
+            request_tag_context,
+            s3_access_point_resources,
+            s3_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
 
         pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
+        if service == "ses" and (path.startswith("/v2/") or "sesv2" in headers.get("x-amz-target", "").lower()):
+            # SES v2 also answers on paths without /v2/email when the target header names it: authorize the call
+            # as the /v2/email operation it performs, never as an action the target header names.
+            v2_path = path if path.startswith(_SES_V2_PREFIX) else f"{_SES_V2_PREFIX}/{path.lstrip('/')}"
+            if denied := _enforce_ses_v2(method, v2_path, headers, body, query_params, request_id):
+                return denied
+            iam_action = None
+        elif iam_action is None and (failure := _authenticate_only(service, headers, query_params, request_id)):
+            return failure
         if iam_action is not None:
             access_key = extract_access_key_id(headers, query_params)
             resource_arn = extract_resource_arn(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
             service_context = (
-                dynamodb_service_context(body) if service == "dynamodb" else None
+                dynamodb_service_context(body) if service == "dynamodb"
+                else s3_service_context(iam_action, query_params, path,
+                                        _get_module("s3")._merge_hoisted_amz_headers(headers, query_params))
+                if service == "s3"
+                else None
             )
             if service == "logs":
                 from ministack.services import cloudwatch_logs
@@ -2612,6 +2963,8 @@ async def _dispatch_service_request(
                 service_context = logs_service_context(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
+            service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
             transaction_checks = (
@@ -2631,10 +2984,15 @@ async def _dispatch_service_request(
                         iam_action = item_action  # named in the AccessDenied message
                         break
             else:
-                denied = enforce(
-                    access_key, iam_action, service, region,
-                    resource_arn=resource_arn, service_context=service_context,
-                )
+                # Through an S3 access point alias the check is made on the access point and on its bucket.
+                for checked_arn, keys in (s3_access_point_resources(resource_arn) if service == "s3"
+                                          else [(resource_arn, {})]):
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=checked_arn, service_context={**service_context, **keys},
+                    )
+                    if denied:
+                        break
             # A malformed Logs tagging ARN fails validation ahead of a policy denial.
             if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
                 return logs_validation_error
@@ -2643,8 +3001,14 @@ async def _dispatch_service_request(
             if service == "s3" and not denied:
                 from ministack.core.iam_actions import s3_additional_checks
 
-                for extra_action, extra_arn in s3_additional_checks(method, path, headers, body, routing_params):
-                    denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
+                s3_headers = _get_module("s3")._merge_hoisted_amz_headers(headers, query_params)
+                extra_checks = [(extra_action, checked_arn, keys)
+                                for extra_action, extra_arn in s3_additional_checks(method, path, s3_headers, body,
+                                                                                    routing_params)
+                                for checked_arn, keys in s3_access_point_resources(extra_arn)]
+                for extra_action, checked_arn, keys in extra_checks:
+                    denied = enforce(access_key, extra_action, service, region, resource_arn=checked_arn,
+                                     service_context=keys)
                     if denied:
                         iam_action = extra_action
                         break
@@ -2676,6 +3040,16 @@ async def _dispatch_service_request(
                     )
                     if denied:
                         break
+            # A thing-group membership call is also checked on the thing it names.
+            if service == "iot" and not denied:
+                for extra_arn in iot_resource_arns(method, path, body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn, service_context=service_context,
+                    )
+                    if denied:
+                        resource_arn = extra_arn  # named in the AccessDenied message
+                        break
             if (
                 denied
                 and service == "bedrock-agentcore"
@@ -2690,18 +3064,11 @@ async def _dispatch_service_request(
                     denied = None
             if denied:
                 if isinstance(denied, AuthError):
-                    return access_denied_response(
-                        service,
-                        iam_action,
-                        "",
-                        request_id,
-                        error_code=denied.code,
-                        message=denied.message,
-                        headers=headers,
-                    )
+                    return _credential_failure(service, iam_action, request_id, denied, headers)
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                    resource_policy_arn=denied.resource_policy_arn,
                 )
 
     handler = SERVICE_HANDLERS.get(service)
@@ -2722,10 +3089,12 @@ async def _dispatch_service_request(
             json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
         )
 
-    # Real AWS picks an error's Content-Type from the service's protocol —
-    # normalize any generic envelope the service emitted to the wire value
-    # (evidence: diffs against committed real-AWS wire captures).
+    # Real AWS picks a response envelope's Content-Type from the service's
+    # protocol — normalize any generic envelope the service emitted to the
+    # wire value (evidence: diffs against committed real-AWS wire captures;
+    # multi-region for the success path).
     fix_error_content_type(service, status, resp_headers)
+    fix_success_content_type(service, status, resp_headers)
 
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
@@ -2831,10 +3200,7 @@ async def app(scope, receive, send):
     headers = {}
     for name, value in scope.get("headers", []):
         key = name.decode("latin-1").lower()
-        try:
-            decoded = value.decode("utf-8")
-        except UnicodeDecodeError:
-            decoded = value.decode("latin-1")
+        decoded = decode_header_value(value)
         if key in headers:
             # A field repeated across lines carries the same meaning as one
             # comma-joined value (RFC 9110 5.2), and dropping either line
@@ -2849,6 +3215,10 @@ async def app(scope, receive, send):
     # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
     if scope.get("scheme") == "https":
         headers.setdefault("x-forwarded-proto", "https")
+    set_request_client_ip((scope.get("client") or ("127.0.0.1",))[0])
+    if AUTH:
+        pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
+                           headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")
 
     request_id = str(uuid.uuid4())
 
@@ -2895,6 +3265,9 @@ async def app(scope, receive, send):
     ):
         return
 
+    if AUTH:
+        raw_path = scope.get("raw_path") or quote(path).encode()
+        pin_signed_request(method, raw_path.decode("latin-1"), query_params, scope.get("headers", []))
     try:
         body = await _read_request_body(receive, method, headers)
     except _RequestBodyDisconnected:
@@ -2991,9 +3364,10 @@ async def _handle_lifespan(scope, receive, send):
                 )
             )
             logger.info("Worker thread pool: %d threads", _max_workers)
-            from ministack.core.responses import install_docker_hub_fallback
+            if _docker_socket_present():
+                from ministack.core.responses import install_docker_hub_fallback
 
-            install_docker_hub_fallback()
+                install_docker_hub_fallback()
             _run_init_scripts()
             # Reap any container that survived a hard kill of the previous
             # process. Persistence strips container ids from snapshots, so any
@@ -3132,10 +3506,16 @@ _DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 _DOCKER_REAP_BOOT_DEADLINE = 10.0
 
 
+def _docker_socket_present() -> bool:
+    """False when DOCKER_HOST (or the default) names a unix socket that does not
+    exist, so the docker SDK is never imported on a host without a daemon."""
+    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
+    return not (sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]))
+
+
 def _reaper_docker_client():
     """Docker client for the periodic reaper, or None when there is no daemon."""
-    sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
-    if sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]):
+    if not _docker_socket_present():
         return None
     try:
         import docker

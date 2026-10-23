@@ -11,7 +11,11 @@ the MiniStack server and work with AUTH=false.
 """
 
 import asyncio
+import contextlib
+import contextvars
+import io
 import json
+import re
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
@@ -301,6 +305,16 @@ class TestEvaluate:
             {"Statement": [{"Effect": "Deny", "Action": "s3:Delete*", "Resource": "*"}]})
         assert evaluate(_ctx(action="s3:DeleteBucket"), [allow, deny]).decision == "Deny"
         assert evaluate(_ctx(action="s3:PutObject"), [allow, deny]).decision == "Allow"
+
+    def test_every_limit_must_allow(self):
+        identity = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "sqs:*"], "Resource": "*"}]})
+        boundary = parse_policy_document(
+            {"Statement": [{"Effect": "Allow", "Action": ["s3:*", "ec2:*"], "Resource": "*"}]})
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], [boundary]).decision == "Allow"
+        assert evaluate(_ctx(action="sqs:SendMessage"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="ec2:RunInstances"), [identity], [boundary]).decision == "ImplicitDeny"
+        assert evaluate(_ctx(action="s3:PutObject"), [identity], []).decision == "ImplicitDeny"
 
 
 # ---------------------------------------------------------------------------
@@ -745,12 +759,11 @@ class TestTrustPolicy:
                                 "Action": "sts:AssumeRole"}]}
         assert evaluate_trust_policy(trust, "arn:aws:iam::123456789012:root")
 
-    def test_service_principal_allows_matching_service(self):
-        """Service principal matches callers containing the service name."""
+    def test_service_principal_denies_user_named_after_service(self):
         trust = {"Statement": [{"Effect": "Allow",
                                 "Principal": {"Service": "lambda.amazonaws.com"},
                                 "Action": "sts:AssumeRole"}]}
-        assert evaluate_trust_policy(trust, "arn:aws:lambda:us-east-1:123:function:test")
+        assert not evaluate_trust_policy(trust, "arn:aws:iam::123456789012:user/lambda-ops")
 
     def test_service_principal_denies_unrelated_user(self):
         """A service principal does NOT allow arbitrary IAM users."""
@@ -786,6 +799,20 @@ class TestTrustPolicy:
         trust = {"Statement": [{"Effect": "Deny", "Principal": "*",
                                 "Action": "sts:AssumeRole"}]}
         assert not evaluate_trust_policy(trust, "arn:aws:iam::123:user/a")
+
+    def test_federated_principal_matches_only_web_identity(self):
+        provider = "arn:aws:iam::123456789012:oidc-provider/issuer.example.com"
+        trust = {"Statement": [
+            {"Effect": "Allow", "Principal": {"Federated": provider},
+             "Action": "sts:AssumeRoleWithWebIdentity"},
+            {"Effect": "Allow", "Principal": {"AWS": "123456789012"},
+             "Action": "sts:AssumeRoleWithWebIdentity"}]}
+        other = "arn:aws:iam::123456789012:oidc-provider/other.example.com"
+        for arn, allowed in ((provider, True), (other, False)):
+            ctx = EvalContext(principal_arn=arn, principal_type="WebIdentityUser",
+                              principal_account="123456789012", action="sts:AssumeRoleWithWebIdentity",
+                              resource_arn="*", region="")
+            assert evaluate_trust_policy(trust, arn, ctx) is allowed
 
     def test_string_json_input(self):
         trust_str = json.dumps({"Statement": [{"Effect": "Allow", "Principal": "*",
@@ -1085,6 +1112,182 @@ class TestEnforce:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("inline-user", None)
             iam_svc._user_inline_policies.pop("inline-user", None)
+
+
+_PROBES = {"S": "sqs:ListQueues", "D": "dynamodb:ListTables",
+           "B": "s3:ListAllMyBuckets", "L": "logs:DescribeLogGroups"}
+_IDENTITY = {"Statement": [{"Effect": "Allow", "Resource": "*",
+                            "Action": ["sqs:ListQueues", "dynamodb:ListTables", "logs:DescribeLogGroups"]}]}
+_BOUNDARY = {"Statement": [
+    {"Effect": "Allow", "Resource": "*",
+     "Action": ["sqs:ListQueues", "dynamodb:ListTables", "s3:ListAllMyBuckets"]},
+    {"Effect": "Deny", "Action": "dynamodb:ListTables", "Resource": "*"},
+]}
+
+
+def _allowed(access_key):
+    """The probe actions ``enforce`` lets through, as letters."""
+    return "".join(letter for letter, action in _PROBES.items()
+                   if enforce(access_key, action, action.split(":")[0], "us-east-1") is None)
+
+
+def _iam_call(action, **params):
+    from ministack.services import iam as iam_svc
+    status, _headers, body = iam_svc._IAM_HANDLERS[action](
+        {"Action": [action], **{k: [v] for k, v in params.items()}})
+    assert status == 200, body
+    return body
+
+
+@pytest.fixture
+def boundary_principals():
+    """A user and a role session with the probe identity policy, and a boundary policy."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+    boundary = "arn:aws:iam::000000000000:policy/probe-boundary"
+    iam_svc.store_policy(boundary, "probe-boundary", "/", json.dumps(_BOUNDARY))
+    _iam_call("CreateUser", UserName="probe-user")
+    _iam_call("PutUserPolicy", UserName="probe-user", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    iam_svc._access_keys["AKIATESTBOUNDARY01"] = {
+        "UserName": "probe-user", "AccessKeyId": "AKIATESTBOUNDARY01",
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    _iam_call("CreateRole", RoleName="probe-role", AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}))
+    _iam_call("PutRolePolicy", RoleName="probe-role", PolicyName="identity",
+              PolicyDocument=json.dumps(_IDENTITY))
+    sts_svc._sessions["ASIATESTBOUNDARY01"] = {
+        "Arn": "arn:aws:sts::000000000000:assumed-role/probe-role/s",
+        "UserId": "AROA123:s", "SecretAccessKey": "s", "PrincipalType": "AssumedRole",
+        "AccountId": "000000000000", "Expiration": time.time() + 3600,
+    }
+    try:
+        yield {"user": "AKIATESTBOUNDARY01", "role": "ASIATESTBOUNDARY01", "boundary": boundary}
+    finally:
+        sts_svc._sessions.pop("ASIATESTBOUNDARY01", None)
+        iam_svc._access_keys.pop("AKIATESTBOUNDARY01", None)
+        iam_svc._user_inline_policies.pop("probe-user", None)
+        iam_svc._users.pop("probe-user", None)
+        iam_svc._roles.pop("probe-role", None)
+        iam_svc._policies.pop(boundary, None)
+
+
+class TestPermissionsBoundary:
+    """A boundary limits identity policies: only actions both allow pass, and its Deny denies."""
+
+    @pytest.mark.parametrize("kind", ["user", "role"])
+    def test_boundary_limits_identity_policies(self, boundary_principals, kind):
+        key, boundary = boundary_principals[kind], boundary_principals["boundary"]
+        name = {"UserName": "probe-user"} if kind == "user" else {"RoleName": "probe-role"}
+        entity = "User" if kind == "user" else "Role"
+        assert _allowed(key) == "SDL"
+        _iam_call(f"Put{entity}PermissionsBoundary", PermissionsBoundary=boundary, **name)
+        assert _allowed(key) == "S"
+        _iam_call(f"Delete{entity}PermissionsBoundary", **name)
+        assert _allowed(key) == "SDL"
+
+    def test_boundary_set_at_creation(self, boundary_principals):
+        from ministack.services import iam as iam_svc
+        _iam_call("CreateUser", UserName="probe-user-2", PermissionsBoundary=boundary_principals["boundary"])
+        _iam_call("PutUserPolicy", UserName="probe-user-2", PolicyName="identity",
+                  PolicyDocument=json.dumps(_IDENTITY))
+        iam_svc._access_keys["AKIATESTBOUNDARY02"] = {
+            "UserName": "probe-user-2", "AccessKeyId": "AKIATESTBOUNDARY02",
+            "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+        }
+        try:
+            assert _allowed("AKIATESTBOUNDARY02") == "S"
+            denied = enforce("AKIATESTBOUNDARY02", "dynamodb:ListTables", "dynamodb", "us-east-1")
+            assert denied.decision == "Deny"
+        finally:
+            iam_svc._access_keys.pop("AKIATESTBOUNDARY02", None)
+            iam_svc._user_inline_policies.pop("probe-user-2", None)
+            iam_svc._users.pop("probe-user-2", None)
+
+
+def _sts_key(access_key, **params):
+    """Call STS in-process as ``access_key`` and return the issued access key."""
+    import re
+    from urllib.parse import urlencode
+
+    from ministack.services import sts as sts_svc
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={access_key}/20260930/us-east-1/sts/aws4_request",
+        "content-type": "application/x-www-form-urlencoded",
+    }
+    body = urlencode({"Version": "2011-06-15", **params}).encode()
+    status, _headers, payload = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+    assert status == 200, payload
+    return re.search(r"<AccessKeyId>(.*?)</AccessKeyId>", payload.decode()).group(1)
+
+
+def _allow(*actions, deny=None):
+    stmts = [{"Effect": "Allow", "Action": list(actions), "Resource": "*"}]
+    if deny:
+        stmts.append({"Effect": "Deny", "Action": deny, "Resource": "*"})
+    return json.dumps({"Version": "2012-10-17", "Statement": stmts})
+
+
+@pytest.fixture
+def issued_sessions():
+    from ministack.services import sts as sts_svc
+    before = set(sts_svc._sessions)
+    yield
+    for key in set(sts_svc._sessions) - before:
+        sts_svc._sessions.pop(key, None)
+
+
+class TestSessionPolicies:
+    """Session policies narrow a session to what both allow; a federated user without one gets nothing."""
+
+    def _assume(self, **params):
+        return _sts_key("test", Action="AssumeRole", RoleSessionName="s",
+                        RoleArn="arn:aws:iam::000000000000:role/probe-role", **params)
+
+    def test_session_policy_limits_the_role(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        logs = "arn:aws:iam::000000000000:policy/probe-logs"
+        iam_svc.store_policy(logs, "probe-logs", "/", _allow("logs:DescribeLogGroups"))
+        try:
+            assert _allowed(self._assume()) == "SDL"
+            assert _allowed(self._assume(Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))) == "S"
+            assert _allowed(self._assume(**{"PolicyArns.member.1.arn": logs})) == "L"
+            assert _allowed(self._assume(Policy=_allow("*", deny="dynamodb:ListTables"))) == "SL"
+        finally:
+            iam_svc._policies.pop(logs, None)
+
+    def test_session_policy_and_boundary_both_limit(self, boundary_principals, issued_sessions):
+        _iam_call("PutRolePermissionsBoundary", RoleName="probe-role",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(self._assume(Policy=_allow("dynamodb:ListTables", "logs:DescribeLogGroups"))) == ""
+        assert _allowed(self._assume(Policy=_allow("*"))) == "S"
+
+    def test_federated_user_is_limited_by_user_and_session_policies(self, boundary_principals, issued_sessions):
+        user = boundary_principals["user"]
+        fed = _sts_key(user, Action="GetFederationToken", Name="fed",
+                       Policy=_allow("sqs:ListQueues", "s3:ListAllMyBuckets"))
+        assert _allowed(fed) == "S"
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed")) == ""
+        _iam_call("PutUserPermissionsBoundary", UserName="probe-user",
+                  PermissionsBoundary=boundary_principals["boundary"])
+        assert _allowed(_sts_key(user, Action="GetFederationToken", Name="fed", Policy=_allow("*"))) == "S"
+
+    def test_federated_user_principal_tags_are_the_session_tags(self, boundary_principals, issued_sessions):
+        from ministack.services import iam as iam_svc
+        iam_svc._users["probe-user"]["Tags"] = [{"Key": "team", "Value": "blue"}, {"Key": "env", "Value": "dev"}]
+        fed = _sts_key(boundary_principals["user"], Action="GetFederationToken", Name="fed", Policy=_allow("*"),
+                       **{"Tags.member.1.Key": "TEAM", "Tags.member.1.Value": "green"})
+        keys = resolve_principal(fed, "000000000000").keys
+        assert keys["aws:principaltag/team"] == "green" and "aws:principaltag/env" not in keys
+        assert keys["aws:userid"] == "000000000000:fed" and "aws:username" not in keys
+
+    def test_root_federation_is_limited_by_the_session_policy(self, issued_sessions):
+        fed = _sts_key("test", Action="GetFederationToken", Name="fed", Policy=_allow("sqs:ListQueues"))
+        assert _allowed(fed) == "S"
+        assert resolve_principal(fed, "000000000000").arn == "arn:aws:sts::000000000000:federated-user/fed"
+
+
 class TestCustomerManagedPolicyResolution:
     """Customer policies belong to the explicit account and use full ARNs."""
 
@@ -1149,6 +1352,340 @@ class TestCustomerManagedPolicyResolution:
             policy["DefaultVersionId"] = "v1"
             assert evaluate(ctx, _gather_role_policies("app", self.OWNER)).decision == "Allow"
             assert (get_account_id(), get_region()) == (self.OTHER, "eu-west-1")
+
+
+class TestCombineResourcePolicy:
+    """An identity decision combined with the policy of the resource the request addresses."""
+
+    _USER = "arn:aws:iam::000000000000:user/u"
+
+    def _decide(self, identity, principal, effect="Allow", owner="000000000000", caller=_USER, limits=()):
+        from ministack.core.iam_evaluator import combine_resource_policy
+
+        ctx = EvalContext(principal_arn=caller, principal_type="User", principal_account="000000000000",
+                          action="sqs:SendMessage", resource_arn=f"arn:aws:sqs:us-east-1:{owner}:q",
+                          region="us-east-1")
+        policy = {"Statement": [{"Effect": effect, "Principal": {"AWS": principal},
+                                 "Action": "sqs:*", "Resource": "*"}]}
+        return combine_resource_policy(EvalResult(identity, caller), ctx, policy, owner, limits=limits).decision
+
+    @pytest.mark.parametrize("identity,principal,effect,owner,expected", [
+        ("ImplicitDeny", _USER, "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "*", "Allow", "000000000000", "Allow"),
+        ("ImplicitDeny", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "ImplicitDeny"),
+        ("ImplicitDeny", "000000000000", "Allow", "000000000000", "ImplicitDeny"),
+        ("Allow", "arn:aws:iam::000000000000:root", "Allow", "000000000000", "Allow"),
+        ("Allow", _USER, "Deny", "000000000000", "Deny"),
+        ("Allow", "arn:aws:iam::000000000000:user/other", "Deny", "000000000000", "Allow"),
+        ("ImplicitDeny", _USER, "Allow", "111111111111", "ImplicitDeny"),
+        ("Allow", "000000000000", "Allow", "111111111111", "Allow"),
+        ("Allow", "arn:aws:iam::111111111111:root", "Allow", "111111111111", "ImplicitDeny"),
+    ])
+    def test_decision(self, identity, principal, effect, owner, expected):
+        assert self._decide(identity, principal, effect, owner) == expected
+
+    def test_a_statement_naming_the_role_names_its_sessions(self):
+        session = "arn:aws:sts::000000000000:assumed-role/r/s"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/app/r", caller=session) == "Allow"
+        assert self._decide("ImplicitDeny", "arn:aws:iam::000000000000:role/x", caller=session) == "ImplicitDeny"
+
+    _SESSION = "arn:aws:sts::000000000000:assumed-role/r/s"
+
+    @pytest.mark.parametrize("caller,principal,limit_action,expected", [
+        (_USER, _USER, "sqs:ListQueues", "Allow"),
+        (_USER, "*", "sqs:ListQueues", "ImplicitDeny"),
+        (_SESSION, _SESSION, "sqs:ListQueues", "Allow"),
+        (_SESSION, "arn:aws:iam::000000000000:role/r", "sqs:ListQueues", "ImplicitDeny"),
+        (_SESSION, "arn:aws:iam::000000000000:role/r", "sqs:SendMessage", "Allow"),
+        ("arn:aws:sts::000000000000:federated-user/f", "arn:aws:sts::000000000000:federated-user/f",
+         "sqs:ListQueues", "ImplicitDeny"),
+    ])
+    def test_limits_narrow_a_resource_allow_unless_it_names_the_user_or_session(
+            self, caller, principal, limit_action, expected):
+        from ministack.core.iam_evaluator import parse_policy_document
+
+        limit = [parse_policy_document({"Statement": [
+            {"Effect": "Allow", "Action": limit_action, "Resource": "*"}]})]
+        assert self._decide("ImplicitDeny", principal, caller=caller, limits=(limit,)) == expected
+@contextlib.contextmanager
+def _iam_user(name, tags=()):
+    """A stored IAM user with one access key; yields the key and a setter for its inline policy."""
+    from ministack.core.responses import get_account_id
+    from ministack.services import iam as iam_svc
+    key = "AKIATEST" + name.upper().replace("-", "")
+    iam_svc._access_keys[key] = {"UserName": name, "AccessKeyId": key, "SecretAccessKey": "s",
+                                 "Status": "Active", "CreateDate": "2024-01-01"}
+    iam_svc._users[name] = {"UserName": name, "Arn": f"arn:aws:iam::{get_account_id()}:user/{name}",
+                            "UserId": "AIDA" + name.upper().replace("-", ""), "Path": "/",
+                            "AttachedPolicies": [], "Tags": list(tags)}
+    try:
+        yield key, lambda doc: iam_svc._user_inline_policies.__setitem__(name, {"p": doc})
+    finally:
+        iam_svc._access_keys.pop(key, None)
+        iam_svc._users.pop(name, None)
+        iam_svc._user_inline_policies.pop(name, None)
+
+
+def _allows(access_key, put_policy, condition):
+    """Whether *access_key* may call sqs:ListQueues under a policy gated on *condition*."""
+    put_policy(json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*", "Condition": condition}]}))
+    return enforce(access_key, "sqs:ListQueues", "sqs", "us-east-1") is None
+
+
+class TestGlobalConditionKeys:
+    """The caller and transport condition keys."""
+
+    @pytest.fixture
+    def user(self):
+        with _iam_user("ck-user", [{"Key": "Team", "Value": "blue"}]) as user:
+            yield user
+
+    @pytest.fixture
+    def role_session(self):
+        from ministack.core.responses import get_account_id
+        from ministack.services import iam as iam_svc
+        from ministack.services import sts as sts_svc
+        trust = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": get_account_id()},
+                                "Action": ["sts:AssumeRole", "sts:TagSession"]}]}
+        iam_svc._roles["ck-role"] = {"RoleName": "ck-role", "RoleId": "AROACKROLE", "AttachedPolicies": [],
+                                     "Arn": f"arn:aws:iam::{get_account_id()}:role/ck-role", "InlinePolicies": {},
+                                     "AssumeRolePolicyDocument": json.dumps(trust),
+                                     "Tags": [{"Key": "team", "Value": "red"}, {"Key": "dept", "Value": "ops"}]}
+        body = (f"Action=AssumeRole&RoleArn=arn:aws:iam::{get_account_id()}:role/ck-role&RoleSessionName=s1"
+                "&Tags.member.1.Key=team&Tags.member.1.Value=green").encode()
+        status, _, out = asyncio.run(sts_svc.handle_request("POST", "/", {}, body, {}))
+        assert status == 200
+        key = re.search(r"<AccessKeyId>([^<]+)", out.decode()).group(1)
+        yield key, lambda doc: iam_svc._roles["ck-role"]["InlinePolicies"].__setitem__("p", doc)
+        sts_svc._sessions.pop(key, None)
+        iam_svc._roles.pop("ck-role", None)
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"StringEquals": {"aws:username": "ck-user"}}, True),
+        ({"StringEquals": {"aws:userid": "AIDACKUSER"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/team": "blue"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/Team": "red"}}, False),
+        ({"Null": {"aws:MultiFactorAuthPresent": "false"}}, False),
+        ({"Null": {"aws:TokenIssueTime": "false"}}, False),
+    ])
+    def test_iam_user_keys(self, user, condition, allowed):
+        assert _allows(*user, condition) is allowed
+
+    def test_assumed_role_id_starts_with_the_role_id(self, role_session):
+        from ministack.services import sts as sts_svc
+        assert sts_svc._sessions[role_session[0]]["UserId"] == "AROACKROLE:s1"
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"Null": {"aws:username": "true"}}, True),
+        ({"StringEquals": {"aws:userid": "AROACKROLE:s1"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/team": "green"}}, True),
+        ({"StringEquals": {"aws:PrincipalTag/dept": "ops"}}, True),
+        ({"Bool": {"aws:MultiFactorAuthPresent": "false"}}, True),
+        ({"DateGreaterThan": {"aws:TokenIssueTime": "2020-01-01T00:00:00Z"}}, True),
+    ])
+    def test_assumed_role_session_keys(self, role_session, condition, allowed):
+        assert _allows(*role_session, condition) is allowed
+
+    def test_assume_role_json_protocol_keeps_session_tags(self, role_session):
+        from ministack.core.responses import get_account_id
+        from ministack.services import sts as sts_svc
+        body = json.dumps({"RoleArn": f"arn:aws:iam::{get_account_id()}:role/ck-role", "RoleSessionName": "s2",
+                           "Tags": [{"Key": "team", "Value": "white"}]}).encode()
+        headers = {"content-type": "application/x-amz-json-1.1",
+                   "x-amz-target": "AWSSecurityTokenServiceV20110615.AssumeRole"}
+        status, _, out = asyncio.run(sts_svc.handle_request("POST", "/", headers, body, {}))
+        key = json.loads(out)["Credentials"]["AccessKeyId"]
+        try:
+            assert _allows(key, role_session[1], {"StringEquals": {"aws:PrincipalTag/team": "white"}})
+        finally:
+            sts_svc._sessions.pop(key, None)
+
+    @pytest.mark.parametrize("condition,allowed", [
+        ({"IpAddress": {"aws:SourceIp": "10.1.2.0/24"}}, True),
+        ({"IpAddress": {"aws:SourceIp": "127.0.0.1/32"}}, False),
+        ({"Bool": {"aws:SecureTransport": "true"}}, True),
+    ])
+    def test_request_origin_keys(self, user, condition, allowed):
+        from ministack.core.iam_evaluator import pin_request_origin
+
+        def decide():
+            pin_request_origin("10.1.2.3", True)
+            return _allows(*user, condition)
+        assert contextvars.copy_context().run(decide) is allowed
+
+    def test_policy_simulation_ignores_the_request_origin(self):
+        from ministack.core.iam_evaluator import pin_request_origin
+        from ministack.services import iam as iam_svc
+        doc = json.dumps({"Statement": [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+            {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*",
+             "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]})
+        body = urlencode({"Action": "SimulateCustomPolicy", "PolicyInputList.member.1": doc,
+                          "ActionNames.member.1": "s3:GetObject"}).encode()
+
+        def simulate():
+            pin_request_origin("10.1.2.3", True)
+            return asyncio.run(iam_svc.handle_request("POST", "/", {}, body, {}))[2]
+        assert b"<EvalDecision>explicitDeny</EvalDecision>" in contextvars.copy_context().run(simulate)
+
+    @pytest.mark.parametrize("auth,scheme,headers,origin", [
+        (True, "https", [], ("10.9.8.7", True)),
+        (True, "http", [], ("10.9.8.7", False)),
+        (True, "http", [(b"x-forwarded-proto", b"https")], ("10.9.8.7", True)),
+        (False, "https", [], ("127.0.0.1", False)),
+    ])
+    def test_http_request_pins_the_client_address_and_scheme(self, monkeypatch, auth, scheme, headers, origin):
+        from ministack import app as app_mod
+        seen = []
+
+        async def capture(*args):
+            ctx = EvalContext("", "", "", "", "*", "us-east-1")
+            seen.append((ctx.source_ip, ctx.secure_transport))
+            return 200, {}, b"ok"
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            pass
+
+        monkeypatch.setattr(app_mod, "_handle_pre_body_request", capture)
+        monkeypatch.setattr(app_mod, "AUTH", auth)
+        asyncio.run(app_mod.app({"type": "http", "method": "GET", "path": "/", "scheme": scheme,
+                                 "client": ("10.9.8.7", 50000), "headers": [(b"host", b"sts.localhost"), *headers],
+                                 "query_string": b""}, receive, send))
+        assert seen == [origin]
+
+
+class TestRequestTagContext:
+    """aws:RequestTag/* and aws:TagKeys of create, tag and untag calls."""
+
+    @pytest.mark.parametrize("service,action,body,params,context", [
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q","tags":{"env":"dev"}}', {},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("sqs", "sqs:CreateQueue", b"", {"Tag.1.Key": ["env"], "Tag.1.Value": ["dev"]},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("dynamodb", "dynamodb:TagResource", b'{"Tags":[{"Key":"env","Value":"dev"},{"Key":"t","Value":"1"}]}', {},
+         {"aws:requesttag/env": "dev", "aws:requesttag/t": "1", "aws:TagKeys": ["env", "t"]}),
+        ("kms", "kms:CreateKey", b'{"Tags":[{"TagKey":"env","TagValue":"dev"}]}', {},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("iam", "iam:CreateUser", b"", {"Tags.member.1.Key": ["env"], "Tags.member.1.Value": ["dev"]},
+         {"aws:requesttag/env": "dev", "aws:TagKeys": ["env"]}),
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q","tags":{"Env":"a","env":"b"}}', {},
+         {"aws:requesttag/env": ["a", "b"], "aws:TagKeys": ["Env", "env"]}),
+        ("sns", "sns:UntagResource", b"", {"TagKeys.member.1": ["env"]}, {"aws:TagKeys": ["env"]}),
+        ("ssm", "ssm:RemoveTagsFromResource", b'{"TagKeys":["env"]}', {}, {"aws:TagKeys": ["env"]}),
+        ("lambda", "lambda:UntagResource", b"", {"tagKeys": ["env", "temp"]}, {"aws:TagKeys": ["env", "temp"]}),
+        ("sqs", "sqs:CreateQueue", b'{"QueueName":"q"}', {}, {}),
+        ("lambda", "lambda:InvokeFunction", b'{"Tags":{"env":"dev"}}', {}, {}),
+        ("sqs", "sqs:SendMessage", b'{"MessageBody":"x","tags":{"env":"dev"}}', {}, {}),
+    ])
+    def test_wire_shapes(self, service, action, body, params, context):
+        from ministack.core.iam_actions import request_tag_context
+        assert request_tag_context(service, action, body, params) == context
+
+    @pytest.mark.parametrize("tags,allowed", [
+        ({"env": "dev"}, True),
+        ({"env": "prod"}, False),
+        ({"env": "dev", "blocked": "1"}, False),
+        ({}, False),
+    ])
+    def test_create_is_decided_by_the_request_tags(self, tags, allowed):
+        from ministack.core.iam_actions import request_tag_context
+        body = json.dumps({"QueueName": "q", "tags": tags}).encode()
+        context = request_tag_context("sqs", "sqs:CreateQueue", body, {})
+        with _iam_user("rt-user") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [
+                {"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*",
+                 "Condition": {"StringEquals": {"aws:RequestTag/env": "dev"}}},
+                {"Effect": "Deny", "Action": "sqs:CreateQueue", "Resource": "*",
+                 "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": "blocked"}}},
+            ]}))
+            denied = enforce(key, "sqs:CreateQueue", "sqs", "us-east-1", service_context=context)
+        assert (denied is None) is allowed
+
+    @pytest.mark.parametrize("tags,allowed", [({}, True), ({"env": "dev"}, False)])
+    def test_tag_keys_is_absent_without_tags(self, tags, allowed):
+        from ministack.core.iam_actions import request_tag_context
+        body = json.dumps({"QueueName": "q", "tags": tags}).encode()
+        context = request_tag_context("sqs", "sqs:CreateQueue", body, {})
+        with _iam_user("rt-null") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [{"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*",
+                                                  "Condition": {"Null": {"aws:TagKeys": "true"}}}]}))
+            assert (enforce(key, "sqs:CreateQueue", "sqs", "us-east-1", service_context=context) is None) is allowed
+
+    @pytest.mark.parametrize("method,grant,allowed", [
+        ("POST", "function:f", True), ("GET", "function:f*", True), ("DELETE", "function:g", False)])
+    def test_lambda_tag_calls_match_a_function_scoped_grant(self, method, grant, allowed):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/2017-03-31/tags/arn:aws:lambda:us-east-1:000000000000:function:f"
+        action = extract_iam_action("lambda", method, path, {}, b"", {})
+        arn = extract_resource_arn("lambda", method, path, {}, b"", {}, "us-east-1", "000000000000")
+        with _iam_user("rt-fn") as (key, put_policy):
+            put_policy(json.dumps({"Statement": [{
+                "Effect": "Allow", "Action": ["lambda:TagResource", "lambda:UntagResource", "lambda:ListTags"],
+                "Resource": f"arn:aws:lambda:us-east-1:000000000000:{grant}"}]}))
+            denied = enforce(key, action, "lambda", "us-east-1", resource_arn=arn)
+        assert (denied is None) is allowed
+
+
+class TestResourceTagCondition:
+    """aws:ResourceTag/* from the tags of the resource a request names."""
+
+    def test_resource_tags_come_from_each_store(self):
+        from ministack.core.responses import get_account_id, get_region
+        from ministack.services import iam as iam_svc
+        from ministack.services import secretsmanager as sm
+        from ministack.services import sns, ssm
+        from ministack.services.tagging import resource_tags
+
+        acct, region = get_account_id(), get_region()
+        topic = f"arn:aws:sns:{region}:{acct}:rt-topic"
+        param = f"arn:aws:ssm:{region}:{acct}:parameter/rt-param"
+        sns._topics[topic] = {"tags": {"env": "dev"}}
+        ssm._tags[param] = {"env": "dev"}
+        secret = sm.create_secret_in_process("rt-secret", "v")
+        sm._secrets["rt-secret"]["Tags"] = [{"Key": "env", "Value": "dev"}]
+        iam_svc._roles["rt-role"] = {"RoleName": "rt-role", "Arn": f"arn:aws:iam::{acct}:role/rt-role",
+                                     "Tags": [{"Key": "env", "Value": "dev"}]}
+        try:
+            for arn in (topic, param, secret, f"arn:aws:iam::{acct}:role/rt-role"):
+                assert resource_tags(arn) == {"env": "dev"}, arn
+            assert resource_tags(f"arn:aws:sns:{region}:{acct}:missing") is None
+            assert resource_tags("arn:aws:s3:::bucket") is None
+            assert resource_tags("*") is None
+        finally:
+            sns._topics.pop(topic, None)
+            ssm._tags.pop(param, None)
+            sm._secrets.pop("rt-secret", None)
+            iam_svc._roles.pop("rt-role", None)
+
+    @pytest.mark.parametrize("condition,resource,allowed", [
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-dev", True),
+        ({"StringEquals": {"aws:ResourceTag/ENV": "dev"}}, "rt-dev", True),
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-prod", False),
+        ({"StringEquals": {"aws:ResourceTag/env": "dev"}}, "rt-missing", False),
+        ({"Null": {"aws:ResourceTag/env": "true"}}, "rt-missing", True),
+    ])
+    def test_read_is_decided_by_the_resource_tags(self, condition, resource, allowed):
+        from ministack.core.responses import get_account_id
+        with _iam_user("rt-reader") as (key, put_policy), _iam_user("rt-dev", [{"Key": "env", "Value": "dev"}]), \
+                _iam_user("rt-prod", [{"Key": "env", "Value": "prod"}]):
+            put_policy(json.dumps({"Statement": [
+                {"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*", "Condition": condition}]}))
+            denied = enforce(key, "iam:GetUser", "iam", "us-east-1",
+                             resource_arn=f"arn:aws:iam::{get_account_id()}:user/{resource}")
+        assert (denied is None) is allowed
+
+    def test_tags_a_service_supplies_keep_precedence(self):
+        from ministack.core.responses import get_account_id
+        with _iam_user("rt-ctx") as (key, put_policy), _iam_user("rt-prod", [{"Key": "env", "Value": "prod"}]):
+            put_policy(json.dumps({"Statement": [{"Effect": "Allow", "Action": "iam:GetUser", "Resource": "*",
+                                                  "Condition": {"StringEquals": {"aws:ResourceTag/env": "dev"}}}]}))
+            denied = enforce(key, "iam:GetUser", "iam", "us-east-1", service_context={"aws:ResourceTag/env": "dev"},
+                             resource_arn=f"arn:aws:iam::{get_account_id()}:user/rt-prod")
+        assert denied is None
 
 
 class TestSeededAwsManagedPolicies:
@@ -1273,7 +1810,7 @@ def _capture_enforced_arn(monkeypatch) -> dict:
     seen: dict[str, str] = {}
 
     def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*",
-                 service_context=None):
+                 service_context=None, auth_error_response=None):
         seen["action"] = iam_action
         seen["arn"] = resource_arn
         seen["context"] = service_context
@@ -1290,6 +1827,12 @@ class _NoApiModule:
     @staticmethod
     def find_api_scope(api_id):
         return None
+
+    @staticmethod
+    def method_authorization_type(api_id, stage, method, path):
+        return None
+
+    route_authorization_type = method_authorization_type
 
     @staticmethod
     async def handle_connections_api(method, api_id, stage, connection_id, body, headers):
@@ -1470,9 +2013,29 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("lambda", "POST", "/2015-03-31/functions/my-func/invocations", {}, b"", {}, "us-east-1", "123") == "arn:aws:lambda:us-east-1:123:function:my-func"
 
+    def test_lambda_function_named_by_arn(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        path = "/2015-03-31/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Amy-func/invocations"
+        assert extract_resource_arn(
+            "lambda", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:lambda:us-east-1:123:function:my-func"
+    @pytest.mark.parametrize("arn", [
+        "arn:aws:lambda:us-east-1:123:function:f", "arn%3Aaws%3Alambda%3Aus-east-1%3A123%3Afunction%3Af"])
+    @pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+    def test_lambda_tags(self, method, arn):
+        from ministack.core.iam_actions import extract_resource_arn
+        resolved = extract_resource_arn("lambda", method, f"/2017-03-31/tags/{arn}", {}, b"", {}, "us-east-1", "123")
+        assert resolved == "arn:aws:lambda:us-east-1:123:function:f"
+
     def test_sqs_queue_url(self):
         from ministack.core.iam_actions import extract_resource_arn
-        assert extract_resource_arn("sqs", "POST", "/", {}, b"", {"QueueUrl": ["http://localhost:4566/000000000000/my-queue"]}, "us-east-1", "123") == "arn:aws:sqs:us-east-1:123:my-queue"
+        url = "http://localhost:4566/000000000000/my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": [url]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:000000000000:my-queue"
+        assert extract_resource_arn(
+            "sqs", "POST", "/", {}, b"", {"QueueUrl": ["my-queue"]}, "us-east-1", "123"
+        ) == "arn:aws:sqs:us-east-1:123:my-queue"
 
     def test_sqs_create_queue(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1658,6 +2221,24 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("ssm", "POST", "/", {}, b"", {"Name": ["/app/config"]}, "us-east-1", "123") == "arn:aws:ssm:us-east-1:123:parameter/app/config"
 
+    @pytest.mark.parametrize("method,path,body,resource", [
+        ("GET", "/v2/email/account", b"", "*"),
+        ("POST", "/v2/email/list-identities", b"{}", "*"),
+        ("POST", "/v2/email/configuration-sets", b'{"ConfigurationSetName": "cs"}', "configuration-set/cs"),
+        ("DELETE", "/v2/email/configuration-sets/cs", b"", "configuration-set/cs"),
+        ("PUT", "/v2/email/configuration-sets/cs/event-destinations/d", b"{}", "configuration-set/cs"),
+        ("POST", "/v2/email/templates", b'{"TemplateName": "t"}', "template/t"),
+        ("GET", "/v2/email/templates/t", b"", "template/t"),
+        ("POST", "/v2/email/contact-lists", b'{"ContactListName": "c"}', "contact-list/c"),
+        ("GET", "/v2/email/identities/a.example.com", b"", "identity/a.example.com"),
+        ("GET", "/v2/email/custom-verification-email-templates/v", b"", "custom-verification-email-template/v"),
+        ("GET", "/v2/email/dedicated-ip-pools/p", b"", "dedicated-ip-pool/p"),
+        ("POST", "/v2/email/outbound-emails", b"{}", "*"),
+    ])
+    def test_ses_v2_resource(self, method, path, body, resource):
+        arn = extract_resource_arn("ses", method, path, {}, body, {}, "us-east-1", "123")
+        assert arn == (resource if resource == "*" else f"arn:aws:ses:us-east-1:123:{resource}")
+
     def test_signer_profile_and_job(self):
         from ministack.core.iam_actions import extract_resource_arn
         job_body = b'{"profileName": "fleet", "source": {"s3": {}}}'
@@ -1687,6 +2268,17 @@ class TestResourceArn:
     def test_cloudfront_distribution(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/distribution/E123ABC", {}, b"", {}, "us-east-1", "123") == "arn:aws:cloudfront::123:distribution/E123ABC"
+
+    def test_cloudfront_vpc_origin(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        for method, action in (("GET", "GetVpcOrigin"), ("PUT", "UpdateVpcOrigin"), ("DELETE", "DeleteVpcOrigin")):
+            assert extract_resource_arn("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {},
+                                        "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/vo_abc"
+            assert extract_iam_action("cloudfront", method, "/2020-05-31/vpc-origin/vo_abc", {}, b"", {}) == f"cloudfront:{action}"
+        # R2 U17/p1-create-on-A: CreateVpcOrigin authorizes on vpcorigin/*.
+        assert extract_resource_arn("cloudfront", "POST", "/2020-05-31/vpc-origin", {}, b"", {},
+                                    "us-east-1", "123") == "arn:aws:cloudfront::123:vpcorigin/*"
+        assert extract_resource_arn("cloudfront", "GET", "/2020-05-31/vpc-origin", {}, b"", {}, "us-east-1", "123") == "*"
 
     def test_route53_hostedzone(self):
         from ministack.core.iam_actions import extract_resource_arn
@@ -1796,6 +2388,14 @@ class TestResourceArn:
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/provisioning-templates/fleet", {}, b"", {}, "us-east-1", "123") == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
 
+    def test_iot_provisioning_claim(self):
+        from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+        path = "/provisioning-templates/fleet/provisioning-claim"
+        assert extract_iam_action("iot", "POST", path, {}, b"", {}) == "iot:CreateProvisioningClaim"
+        assert extract_resource_arn(
+            "iot", "POST", path, {}, b"", {}, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:provisioningtemplate/fleet"
+
     def test_iot_job_template(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn(
@@ -1820,6 +2420,46 @@ class TestResourceArn:
     def test_iot_collection_call_has_no_resource(self):
         from ministack.core.iam_actions import extract_resource_arn
         assert extract_resource_arn("iot", "GET", "/jobs", {}, b"", {}, "us-east-1", "123") == "*"
+
+    def test_iot_tagging_calls_authorize_on_the_named_resource(self):
+        from ministack.core.iam_actions import extract_resource_arn
+        group = "arn:aws:iot:us-east-1:123:thinggroup/fleet"
+        tag = json.dumps({"resourceArn": group, "tags": [{"Key": "k", "Value": "v"}]}).encode()
+        untag = json.dumps({"resourceArn": group, "tagKeys": ["k"]}).encode()
+        assert extract_resource_arn("iot", "POST", "/tags", {}, tag, {}, "us-east-1", "123") == group
+        assert extract_resource_arn("iot", "POST", "/untag", {}, untag, {}, "us-east-1", "123") == group
+        assert extract_resource_arn(
+            "iot", "GET", "/tags", {}, b"", {"resourceArn": [group]}, "us-east-1", "123"
+        ) == group
+        assert extract_resource_arn("iot", "GET", "/tags", {}, b"", {}, "us-east-1", "123") == "*"
+        # Only where the handler reads it: a second resourceArn elsewhere is not the target.
+        other = {"resourceArn": ["arn:aws:iot:us-east-1:123:thinggroup/other"]}
+        assert extract_resource_arn("iot", "POST", "/tags", {}, tag, other, "us-east-1", "123") == group
+        assert extract_resource_arn(
+            "iot", "GET", "/tags", {}, tag, other, "us-east-1", "123"
+        ) == "arn:aws:iot:us-east-1:123:thinggroup/other"
+        bad = json.dumps({"resourceArn": [group]}).encode()
+        assert extract_resource_arn("iot", "POST", "/untag", {}, bad, {}, "us-east-1", "123") == "*"
+
+    def test_iot_thing_group_membership_names_the_group_then_the_thing(self):
+        from ministack.core.iam_actions import extract_resource_arn, iot_resource_arns
+        head = "arn:aws:iot:us-east-1:123"
+        group, thing = f"{head}:thinggroup/fleet", f"{head}:thing/dev-1"
+        for path in ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup"):
+            for body in ({"thingGroupName": "fleet", "thingName": "dev-1"},
+                         {"thingGroupArn": group, "thingArn": thing},
+                         {"thingGroupArn": group.replace("us-east-1", "eu-west-3"), "thingArn": thing},
+                         {"thingGroupName": "fleet", "thingGroupArn": f"{head}:thinggroup/x", "thingName": "dev-1"}):
+                raw = json.dumps(body).encode()
+                assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == [group, thing]
+                assert extract_resource_arn("iot", "PUT", path, {}, raw, {}, "us-east-1", "123") == group
+            for raw in (b"{}", b"[]", b"not json", json.dumps({"thingGroupName": 1, "thingName": ["x"]}).encode()):
+                assert iot_resource_arns("PUT", path, raw, "us-east-1", "123") == ["*", "*"]
+        # DescribeThingGroup of a group with that name keeps its own resource.
+        assert iot_resource_arns("GET", "/thing-groups/addThingToThingGroup", b"", "us-east-1", "123") == []
+        assert extract_resource_arn(
+            "iot", "GET", "/thing-groups/addThingToThingGroup", {}, b"", {}, "us-east-1", "123"
+        ) == f"{head}:thinggroup/addThingToThingGroup"
 
     def test_iot_job_policy_from_the_cdk_actually_allows_the_call(self):
         """The two halves together, which is where this showed up. The CDK's
@@ -1871,22 +2511,23 @@ class TestResourceArn:
             service, "POST", path, headers, b"", {}, "eu-central-1", "123"
         ) == "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
 
-    def test_publish_resolves_the_same_topic_however_the_sdk_sent_it(self):
-        """Publish's URI label is non-greedy, so botocore percent-encodes the
-        separators and the ASGI server hands them back decoded. Both spellings
-        have to name one resource, or the grant matches on one path only."""
+    def test_publish_topic_arn_keeps_a_literal_percent_sequence(self):
+        """A %41 or %2F left in the decoded Publish path is part of the topic name and stays in the ARN."""
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
         from ministack.core.router import detect_service
 
         headers = _sigv4_headers("iotdata", "data-ats.iot.eu-central-1.amazonaws.com")
-        expected = "arn:aws:iot:eu-central-1:123:topic/sensors/rack-1/temperature"
-        for path in ("/topics/sensors/rack-1/temperature",
-                     "/topics/sensors%2Frack-1%2Ftemperature"):
-            service = detect_service("POST", path, headers, {})
-            assert extract_iam_action(service, "POST", path, headers, b"", {}) == "iot:Publish"
+        for method, path, action, topic in (
+            ("POST", "/topics/sensors/p%41q", "iot:Publish", "sensors/p%41q"),
+            ("POST", "/topics/sensors/p%2Fq", "iot:Publish", "sensors/p%2Fq"),
+            ("GET", "/retainedMessage/sensors/p%25q", "iot:GetRetainedMessage", "sensors/p%25q"),
+        ):
+            service = detect_service(method, path, headers, {})
+            assert service == "iot-data"
+            assert extract_iam_action(service, method, path, headers, b"", {}) == action
             assert extract_resource_arn(
-                service, "POST", path, headers, b"", {}, "eu-central-1", "123"
-            ) == expected
+                service, method, path, headers, b"", {}, "eu-central-1", "123"
+            ) == f"arn:aws:iot:eu-central-1:123:topic/{topic}"
 
     def test_create_job_resolves_through_the_router(self):
         from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
@@ -2187,14 +2828,24 @@ class TestResourceArn:
             async def send(message):
                 sent.append(message)
 
-            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(), "headers": [],
+            scope = {"type": "websocket", "path": "/prod", "query_string": query.encode(),
+                     "headers": [(b"host", b"d9506af4.execute-api.localhost")],
                      "extensions": {"websocket.http.response": {}}}
             asyncio.run(apigw_svc.handle_websocket(scope, receive, send, "d9506af4"))
             return sent[0].get("status"), json.loads(sent[1]["body"])["message"] if len(sent) > 1 else None
 
+        def presigned_query():
+            from botocore.auth import SigV4QueryAuth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+
+            request = AWSRequest(method="GET", url="https://d9506af4.execute-api.localhost/prod")
+            SigV4QueryAuth(Credentials(fake_key, "s"), "execute-api", "eu-central-1", 300).add_auth(request)
+            return request.url.split("?", 1)[1]
+
         try:
             unsigned = handshake("")
-            signed = handshake(f"X-Amz-Credential={fake_key}%2F20260101%2Feu-central-1%2Fexecute-api%2Faws4_request")
+            signed = handshake(presigned_query())
         finally:
             iam_svc._access_keys.pop(fake_key, None)
             iam_svc._users.pop("ws-user", None)
@@ -2384,6 +3035,32 @@ class TestActionExtraction:
         from ministack.core.iam_actions import extract_iam_action
         assert extract_iam_action("lambda", "POST", "/2015-03-31/functions", {}, b"", {}) == "lambda:CreateFunction"
         assert extract_iam_action("lambda", "POST", "/2015-03-31/functions/f/invocations", {}, b"", {}) == "lambda:InvokeFunction"
+
+    def test_lambda_tags_rest(self):
+        from ministack.core.iam_actions import extract_iam_action
+        path = "/2017-03-31/tags/arn:aws:lambda:us-east-1:000000000000:function:f"
+        assert extract_iam_action("lambda", "POST", path, {}, b"", {}) == "lambda:TagResource"
+        assert extract_iam_action("lambda", "DELETE", path, {}, b"", {"tagKeys": ["a"]}) == "lambda:UntagResource"
+        assert extract_iam_action("lambda", "GET", path, {}, b"", {}) == "lambda:ListTags"
+
+    def test_ses_v2_rest(self):
+        assert extract_iam_action("ses", "GET", "/v2/email/account", {}, b"", {}) == "ses:GetAccount"
+        assert extract_iam_action("ses", "POST", "/v2/email/list-identities", {}, b"{}", {}) == (
+            "ses:ListEmailIdentities")
+        assert extract_iam_action("ses", "DELETE", "/v2/email/configuration-sets/cs", {}, b"", {}) == (
+            "ses:DeleteConfigurationSet")
+        assert extract_iam_action("ses", "GET", "/v2/email/templates/t", {}, b"", {}) == "ses:GetEmailTemplate"
+        assert extract_iam_action("ses", "POST", "/", {}, b"", {"Action": ["ListIdentities"]}) == "ses:ListIdentities"
+        # older SDK models list with GET on the collection
+        assert extract_iam_action("ses", "GET", "/v2/email/identities", {}, b"", {}) == "ses:ListEmailIdentities"
+        assert extract_iam_action("ses", "GET", "/v2/email/configuration-sets", {}, b"", {}) == (
+            "ses:ListConfigurationSets")
+
+    def test_rds_data_rest(self):
+        for path, action in (("/Execute", "ExecuteStatement"), ("/BatchExecute", "BatchExecuteStatement"),
+                             ("/BeginTransaction", "BeginTransaction"), ("/CommitTransaction", "CommitTransaction"),
+                             ("/RollbackTransaction", "RollbackTransaction")):
+            assert extract_iam_action("rds-data", "POST", path, {}, b"{}", {}) == f"rds-data:{action}"
 
     def test_unknown_service_returns_none(self):
         from ministack.core.iam_actions import extract_iam_action
@@ -3060,8 +3737,6 @@ class TestS3EnforcementSites:
         "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/a.txt"}]}
     _EVERY_KEY = {"Statement": [{
         "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/*"}]}
-    _WRITE_ONLY = {"Statement": [{
-        "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::iam-sites-dst/*"}]}
 
     def test_vhost_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
@@ -3077,15 +3752,6 @@ class TestS3EnforcementSites:
         assert status != 403
         assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
 
-    def test_vhost_copy_without_read_on_the_source_is_denied(self, monkeypatch):
-        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
-        status, _headers, body = self._vhost(
-            "iam-sites-dst", "/k", "PUT", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
-        assert status == 403
-        assert b"AccessDenied" in body
-        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
-                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
-
     def test_path_style_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
         status, _headers, body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
@@ -3099,15 +3765,6 @@ class TestS3EnforcementSites:
         status, _headers, _body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
         assert status != 403
         assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
-
-    def test_path_style_copy_without_read_on_the_source_is_denied(self, monkeypatch):
-        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
-        status, _headers, body = self._path_style(
-            "PUT", "/iam-sites-dst/k", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
-        assert status == 403
-        assert b"AccessDenied" in body
-        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
-                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
 
     def test_a_primary_denial_stops_before_the_extra_checks(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, {"Statement": [
@@ -3151,7 +3808,7 @@ class TestAccessDeniedResponse:
 
     def test_custom_error_code_preserved(self):
         from ministack.core.iam_actions import access_denied_response
-        s, h, b = access_denied_response("s3", "s3:PutObject", "", "r1",
+        s, h, b = access_denied_response("dynamodb", "dynamodb:PutItem", "", "r1",
                                           error_code="ExpiredTokenException",
                                           message="Token expired")
         assert b"ExpiredTokenException" in b
@@ -3347,6 +4004,11 @@ class TestExtractResourceArn:
         assert self._arn("sqs", path="/000000000000/my-queue") == (
             "arn:aws:sqs:us-east-1:000000000000:my-queue")
 
+    def test_sqs_queue_in_another_account_keeps_its_owner(self):
+        body = json.dumps({"QueueUrl": "http://localhost:4566/111111111111/my-queue"}).encode()
+        assert self._arn("sqs", body=body) == "arn:aws:sqs:us-east-1:111111111111:my-queue"
+        assert self._arn("sqs", path="/111111111111/my-queue") == "arn:aws:sqs:us-east-1:111111111111:my-queue"
+
     def test_sqs_without_a_queue_falls_back_to_star(self):
         assert self._arn("sqs", body=json.dumps({"MaxResults": 10}).encode()) == "*"
 
@@ -3465,6 +4127,10 @@ def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_ta
     monkeypatch, policy_mode,
 ):
     """Run the real ASGI route, IAM evaluator, and SSM tag handlers."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     from ministack import app as app_mod
     from ministack.services import iam as iam_svc
     from ministack.services import ssm as ssm_svc
@@ -3499,15 +4165,14 @@ def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_ta
         async def send(message):
             sent.append(message)
 
+        request = AWSRequest(method="POST", url=f"https://ssm.{region}.amazonaws.com/", data=body, headers={
+            "x-amz-target": f"AmazonSSM.{action}", "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(Credentials(key, "test-secret"), "ssm", region).add_auth(request)
         scope = {
             "type": "http", "method": "POST", "path": "/", "query_string": b"",
-            "headers": [
-                (b"host", b"ssm.us-east-1.amazonaws.com"),
-                (b"x-amz-target", f"AmazonSSM.{action}".encode()),
-                (b"content-type", b"application/x-amz-json-1.1"),
-                (b"authorization", (
-                    f"AWS4-HMAC-SHA256 Credential={key}/20260928/{region}/ssm/aws4_request"
-                ).encode()),
+            "headers": [(b"host", b"ssm.us-east-1.amazonaws.com")] + [
+                (name.lower().encode(), value.encode()) for name, value in request.headers.items()
             ],
         }
         asyncio.run(app_mod.app(scope, receive, send))
@@ -3607,6 +4272,10 @@ def test_ssm_parameter_tag_actions_enforce_exact_resource_and_preserve_denied_ta
 
 
 def test_ssm_parameter_tag_authorization_is_scoped_to_request_account_and_region(monkeypatch):
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     from ministack import app as app_mod
     from ministack.services import iam as iam_svc
     from ministack.services import ssm as ssm_svc
@@ -3635,15 +4304,14 @@ def test_ssm_parameter_tag_authorization_is_scoped_to_request_account_and_region
         async def send(message):
             sent.append(message)
 
+        request = AWSRequest(method="POST", url=f"https://ssm.{region}.amazonaws.com/", data=body, headers={
+            "x-amz-target": "AmazonSSM.AddTagsToResource", "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(Credentials(key, "test-secret"), "ssm", region).add_auth(request)
         scope = {
             "type": "http", "method": "POST", "path": "/", "query_string": b"",
-            "headers": [
-                (b"host", f"ssm.{region}.amazonaws.com".encode()),
-                (b"x-amz-target", b"AmazonSSM.AddTagsToResource"),
-                (b"content-type", b"application/x-amz-json-1.1"),
-                (b"authorization", (
-                    f"AWS4-HMAC-SHA256 Credential={key}/20260928/{region}/ssm/aws4_request"
-                ).encode()),
+            "headers": [(b"host", f"ssm.{region}.amazonaws.com".encode())] + [
+                (name.lower().encode(), value.encode()) for name, value in request.headers.items()
             ],
         }
         asyncio.run(app_mod.app(scope, receive, send))
@@ -4165,6 +4833,915 @@ def test_http_iam_routing_respects_auth_mode(monkeypatch, auth_enabled, ambiguou
 
 
 # ---------------------------------------------------------------------------
+# Credential checks over HTTP: boto3 clients whose transport is the app itself
+# ---------------------------------------------------------------------------
+
+class _Body(io.BytesIO):
+    def stream(self, **_):
+        yield self.getvalue()
+
+
+def _asgi_send(request, extra_headers=(), **_):
+    """Serve a botocore request with the in-process app instead of the network."""
+    from urllib.parse import unquote, urlsplit
+
+    from botocore.awsrequest import AWSResponse
+
+    from ministack import app as app_mod
+
+    url = urlsplit(request.url)
+    body = request.body.read() if hasattr(request.body, "read") else request.body or b""
+    body = body.encode() if isinstance(body, str) else body
+    headers = {"host": url.netloc.encode()}
+    headers.update((k.lower(), v if isinstance(v, bytes) else str(v).encode("latin-1"))
+                   for k, v in request.headers.items())
+    scope = {"type": "http", "method": request.method, "path": unquote(url.path) or "/",
+             "raw_path": url.path.encode(), "query_string": url.query.encode(),
+             "headers": [(k.encode("latin-1"), v) for k, v in headers.items()] + list(extra_headers)}
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app_mod.app(scope, receive, send))
+    response_headers = {k.decode(): v.decode() for k, v in sent[0].get("headers", [])}
+    return AWSResponse(request.url, sent[0]["status"], response_headers,
+                       _Body(b"".join(m.get("body", b"") for m in sent[1:])))
+
+
+def _local_client(service, key="test", secret="test", token=None, **s3_config):
+    import boto3
+    from botocore.config import Config
+
+    client = boto3.client(
+        service, endpoint_url="http://localhost:4566", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret, aws_session_token=token,
+        config=Config(retries={"max_attempts": 1}, s3={"addressing_style": "path", **s3_config}),
+    )
+    client.meta.events.register("before-send", _asgi_send)
+    return client
+
+
+def _failure(call):
+    with pytest.raises(ClientError) as exc:
+        call()
+    return exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+
+
+_LIST_CALLS = {
+    "iam": lambda c: c.list_users(),
+    "sqs": lambda c: c.list_queues(),
+    "dynamodb": lambda c: c.list_tables(),
+    "lambda": lambda c: c.list_functions(),
+    "s3": lambda c: c.list_buckets(),
+    "ec2": lambda c: c.describe_regions(),
+    "ssm": lambda c: c.describe_parameters(),
+    "logs": lambda c: c.describe_log_groups(),
+}
+
+
+class TestCredentialErrors:
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "InvalidClientTokenId", 403),
+        ("sqs", "InvalidClientTokenId", 403),
+        ("dynamodb", "UnrecognizedClientException", 400),
+        ("lambda", "UnrecognizedClientException", 403),
+        ("s3", "InvalidAccessKeyId", 403),
+        ("ec2", "AuthFailure", 401),
+        ("ssm", "UnrecognizedClientException", 400),
+        ("logs", "UnrecognizedClientException", 400),
+    ])
+    def test_unknown_key_answers_the_protocols_code(self, monkeypatch, service, code, status):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        client = _local_client(service, "AKIAUNKNOWNKEY000001", "secret")
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    @pytest.mark.parametrize("service,content_type", [
+        ("iam", "text/xml"),
+        ("sqs", "application/x-amz-json-1.0"),
+        ("dynamodb", "application/x-amz-json-1.0"),
+        ("lambda", "application/json"),
+        ("s3", "application/xml"),
+        ("ec2", "text/xml;charset=UTF-8"),
+        ("ssm", "application/x-amz-json-1.1"),
+        ("logs", "application/x-amz-json-1.1"),
+    ])
+    def test_unknown_key_answers_the_protocols_content_type(self, monkeypatch, service, content_type):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        client = _local_client(service, "AKIAUNKNOWNKEY000001", "secret")
+        with pytest.raises(ClientError) as exc:
+            _LIST_CALLS[service](client)
+        assert exc.value.response["ResponseMetadata"]["HTTPHeaders"]["content-type"] == content_type
+
+    def test_unknown_key_is_ignored_without_auth(self, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        client = _local_client("dynamodb", "AKIAUNKNOWNKEY000001", "secret")
+        assert client.list_tables()["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "ExpiredToken", 403),
+        ("dynamodb", "ExpiredTokenException", 400),
+        ("lambda", "ExpiredTokenException", 403),
+        ("s3", "ExpiredToken", 400),
+        ("ec2", "RequestExpired", 400),
+    ])
+    def test_expired_session_answers_the_protocols_code(self, monkeypatch, service, code, status):
+        from ministack import app as app_mod
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        monkeypatch.setitem(sts_svc._sessions, "ASIAEXPIREDSESSION01", {
+            "Arn": "arn:aws:iam::000000000000:user/alice", "UserId": "AIDAALICE",
+            "SecretAccessKey": "session-secret", "SessionToken": "session-token",
+            "Expiration": time.time() - 1, "AccountId": "000000000000", "PrincipalType": "User",
+        })
+        client = _local_client(service, "ASIAEXPIREDSESSION01", "session-secret", "session-token")
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+
+@pytest.fixture
+def user_key(monkeypatch):
+    """An IAM user allowed everything, created through the app under AUTH=true."""
+    from ministack import app as app_mod
+    from ministack.services import iam as iam_svc
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam = _local_client("iam")
+    name = f"signer-{time.time_ns()}"
+    user = iam.create_user(UserName=name)["User"]
+    iam.put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps(
+        {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    yield key["AccessKeyId"], key["SecretAccessKey"]
+    iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+    iam.delete_user_policy(UserName=name, PolicyName="all")
+    iam.delete_user(UserName=name)
+    # DeleteUserPolicy leaves an empty map after its last policy is deleted.
+    iam_svc._user_inline_policies.pop_scoped(user["Arn"].split(":")[4], None, name, None)
+
+
+def _chunked_put(key, secret, url, data, *, bad_chunk=False):
+    """A PutObject streamed as signed aws-chunked chunks, as the Java and Go SDKs send it."""
+    import datetime as dt
+    import hashlib
+    import hmac
+
+    from botocore.awsrequest import AWSRequest
+
+    from ministack.core.sigv4 import derive_signing_key
+
+    amz_date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    scope = f"{amz_date[:8]}/us-east-1/s3/aws4_request"
+    signing_key = derive_signing_key(secret, amz_date[:8], "us-east-1", "s3")
+    chunks = [data, b""]
+    headers = {
+        "content-encoding": "aws-chunked", "host": "localhost:4566", "x-amz-date": amz_date,
+        "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "x-amz-decoded-content-length": str(len(data)),
+    }
+    signed = ";".join(sorted(headers))
+    path = url.split("localhost:4566", 1)[1]
+    canonical = "\n".join(["PUT", path, "", "".join(f"{h}:{headers[h]}\n" for h in sorted(headers)), signed,
+                           headers["x-amz-content-sha256"]])
+    string_to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    previous = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    headers["authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={key}/{scope}, SignedHeaders={signed}, Signature={previous}")
+    body = b""
+    for chunk in chunks:
+        previous = hmac.new(signing_key, "\n".join([
+            "AWS4-HMAC-SHA256-PAYLOAD", amz_date, scope, previous, hashlib.sha256(b"").hexdigest(),
+            hashlib.sha256(chunk).hexdigest()]).encode(), hashlib.sha256).hexdigest()
+        signature = "0" * 64 if bad_chunk and chunk else previous
+        body += f"{len(chunk):x};chunk-signature={signature}\r\n".encode() + chunk + b"\r\n"
+    return _asgi_send(AWSRequest(method="PUT", url=url, headers=headers, data=body).prepare())
+
+
+class TestS3UploadErrorParity:
+    """HTTP observations from AWS.Tools.S3 5.0.318, Osaka, 2026-10-16.
+
+    Fixed messages, statuses and XML child order were captured on real AWS
+    using path addressing and MaxErrorRetry=0, with Tokyo as the wrong region.
+    These tests replay the observations locally; they do not contact AWS.
+    Live identifiers are omitted; signing diagnostics use synthetic credentials.
+    """
+
+    @pytest.fixture
+    def upload_bucket(self, user_key):
+        bucket = f"upload-errors-{time.time_ns()}"
+        root = _local_client("s3")
+        root.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "ap-northeast-3"})
+        yield bucket
+        root.delete_bucket(Bucket=bucket)
+
+    @staticmethod
+    def upload(bucket, credentials, *, endpoint_region="ap-northeast-3", region="ap-northeast-3",
+               virtual=False, host=None):
+        from urllib.parse import quote
+
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        host = host or f"s3.{endpoint_region}.localhost:4566"
+        path = "/probe.txt" if virtual else f"/{quote(bucket)}/probe.txt"
+        host = f"{bucket}.{host}" if virtual else host
+        request = AWSRequest(method="PUT", url=f"http://{host}{path}", data=b"probe")
+        S3SigV4Auth(Credentials(*credentials), "s3", region).add_auth(request)
+        return _asgi_send(request.prepare())
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    @pytest.mark.parametrize("case,status,code,message,children", [
+        (
+            "invalid-bucket-name", 400, "InvalidBucketName", "The specified bucket is not valid.",
+            ["Code", "Message", "BucketName", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-regional-endpoint", 301, "PermanentRedirect",
+            "The bucket you are attempting to access must be addressed using the specified endpoint. "
+            "Please send all future requests to this endpoint.",
+            ["Code", "Message", "Endpoint", "Bucket", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-signing-region", 400, "AuthorizationHeaderMalformed",
+            "The authorization header is malformed; the region 'ap-northeast-1' is wrong; expecting 'ap-northeast-3'",
+            ["Code", "Message", "Region", "RequestId", "HostId"],
+        ),
+        (
+            "unknown-access-key", 403, "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            ["Code", "Message", "AWSAccessKeyId", "RequestId", "HostId"],
+        ),
+        (
+            "wrong-secret", 403, "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature you provided. "
+            "Check your key and signing method.",
+            ["Code", "Message", "AWSAccessKeyId", "StringToSign", "SignatureProvided", "StringToSignBytes",
+             "CanonicalRequest", "CanonicalRequestBytes", "RequestId", "HostId"],
+        ),
+        (
+            "missing-bucket", 404, "NoSuchBucket", "The specified bucket does not exist",
+            ["Code", "Message", "BucketName", "RequestId", "HostId"],
+        ),
+    ])
+    def test_observed_error_envelopes(self, user_key, upload_bucket, case, status, code, message, children, virtual):
+        import base64
+        import re
+        from xml.etree.ElementTree import fromstring
+
+        if case == "invalid-bucket-name" and virtual:
+            pytest.skip("Invalid bucket syntax was observed using path addressing")
+        bucket, credentials, options = upload_bucket, user_key, {"virtual": virtual}
+        if case == "invalid-bucket-name":
+            bucket, credentials = "invalid bucket", ("AKIAUNKNOWNKEY000001", "wrong")
+        elif case == "wrong-regional-endpoint":
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            options.update(endpoint_region="ap-northeast-1", region="ap-northeast-1")
+        elif case == "wrong-signing-region":
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            options["region"] = "ap-northeast-1"
+        elif case == "unknown-access-key":
+            bucket, credentials = "missing-upload-bucket", ("AKIAUNKNOWNKEY000001", "wrong")
+        elif case == "wrong-secret":
+            bucket, credentials = "missing-upload-bucket", (user_key[0], "wrong")
+        elif case == "missing-bucket":
+            bucket = "missing-upload-bucket"
+        response = self.upload(bucket, credentials, **options)
+        error = fromstring(response.content)
+        assert response.status_code == status
+        assert error.findtext("Code") == code
+        assert error.findtext("Message") == message
+        assert [child.tag for child in error] == children
+        assert response.headers["content-type"] == "application/xml"
+        assert error.findtext("RequestId") == response.headers["x-amz-request-id"]
+        assert re.fullmatch(r"[A-Z0-9]{16}", error.findtext("RequestId"))
+        assert error.findtext("HostId") == response.headers["x-amz-id-2"]
+        assert len(base64.b64decode(error.findtext("HostId"), validate=True)) >= 48
+        assert "location" not in response.headers
+        if case == "wrong-regional-endpoint":
+            assert response.headers["x-amz-bucket-region"] == "ap-northeast-3"
+            assert error.findtext("Endpoint") == f"{bucket}.s3.ap-northeast-3.localhost:4566"
+            assert error.findtext("Bucket") == bucket
+        else:
+            assert "x-amz-bucket-region" not in response.headers
+        if case in {"invalid-bucket-name", "missing-bucket"}:
+            assert error.findtext("BucketName") == bucket
+        if case == "wrong-signing-region":
+            assert error.findtext("Region") == "ap-northeast-3"
+        if case in {"unknown-access-key", "wrong-secret"}:
+            assert error.findtext("AWSAccessKeyId") == credentials[0]
+        if case == "wrong-secret":
+            import hashlib
+
+            from botocore.auth import S3SigV4Auth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+
+            for name in ("CanonicalRequest", "StringToSign"):
+                assert bytes.fromhex(error.findtext(name + "Bytes")).decode() == error.findtext(name)
+            signed_path = "/probe.txt" if virtual else f"/{bucket}/probe.txt"
+            assert error.findtext("CanonicalRequest").startswith(f"PUT\n{signed_path}\n")
+            document = error.findtext("StringToSign")
+            assert document.splitlines()[-1] == hashlib.sha256(error.findtext("CanonicalRequest").encode()).hexdigest()
+            request = AWSRequest()
+            request.context["timestamp"] = document.splitlines()[1]
+            signer = S3SigV4Auth(Credentials(*credentials), "s3", "ap-northeast-3")
+            assert signer.signature(document, request) == error.findtext("SignatureProvided")
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    @pytest.mark.parametrize("missing", [False, True])
+    @pytest.mark.parametrize("credential_kind", ["unknown", "wrong-secret", "valid"])
+    @pytest.mark.parametrize("endpoint_region,region", [
+        ("ap-northeast-3", "ap-northeast-3"),
+        ("ap-northeast-1", "ap-northeast-1"),
+        ("ap-northeast-3", "ap-northeast-1"),
+        ("ap-northeast-1", "ap-northeast-3"),
+    ])
+    def test_combined_failures(self, user_key, upload_bucket, virtual, missing, credential_kind,
+                               endpoint_region, region):
+        from xml.etree.ElementTree import fromstring
+
+        bucket = "missing-upload-bucket" if missing else upload_bucket
+        credentials = {"unknown": ("AKIAUNKNOWNKEY000001", "wrong"),
+                       "wrong-secret": (user_key[0], "wrong"), "valid": user_key}[credential_kind]
+        if not missing and endpoint_region != "ap-northeast-3":
+            expected = (301, "PermanentRedirect")
+        elif region != endpoint_region:
+            expected = (400, "AuthorizationHeaderMalformed")
+        elif credential_kind == "unknown":
+            expected = (403, "InvalidAccessKeyId")
+        elif credential_kind == "wrong-secret":
+            expected = (403, "SignatureDoesNotMatch")
+        elif missing:
+            expected = (404, "NoSuchBucket")
+        else:
+            expected = (200, None)
+        response = self.upload(bucket, credentials, virtual=virtual, endpoint_region=endpoint_region, region=region)
+        try:
+            code = fromstring(response.content).findtext("Code") if response.status_code != 200 else None
+            assert (response.status_code, code) == expected
+        finally:
+            if response.status_code == 200:
+                _local_client("s3").delete_object(Bucket=bucket, Key="probe.txt")
+
+    def test_invalid_name_precedes_scope_and_credentials(self, user_key):
+        from xml.etree.ElementTree import fromstring
+
+        response = self.upload("invalid bucket", ("AKIAUNKNOWNKEY000001", "wrong"), region="ap-northeast-1")
+        assert response.status_code == 400
+        assert fromstring(response.content).findtext("Code") == "InvalidBucketName"
+
+    @pytest.mark.parametrize("mode", [
+        "auth-disabled", "auth-disabled-wrong-region", "reserved-root", "bare-endpoint-wrong-region",
+    ])
+    def test_auth_modes_and_bare_endpoint(self, monkeypatch, user_key, upload_bucket, mode):
+        from ministack import app as app_mod
+
+        credentials, options = user_key, {}
+        if mode in {"auth-disabled", "auth-disabled-wrong-region"}:
+            monkeypatch.setattr(app_mod, "AUTH", False)
+            credentials = ("AKIAUNKNOWNKEY000001", "wrong")
+            if mode == "auth-disabled-wrong-region":
+                options.update(endpoint_region="ap-northeast-1", region="ap-northeast-1")
+        elif mode == "reserved-root":
+            credentials = ("test", "any-secret")
+        else:
+            options.update(host="localhost:4566", region="ap-northeast-1")
+        response = self.upload(upload_bucket, credentials, **options)
+        try:
+            if mode in {"auth-disabled-wrong-region", "bare-endpoint-wrong-region"}:
+                from xml.etree.ElementTree import fromstring
+
+                assert response.status_code == 301
+                assert fromstring(response.content).findtext("Code") == "PermanentRedirect"
+                assert response.headers["x-amz-bucket-region"] == "ap-northeast-3"
+            else:
+                assert response.status_code == 200
+        finally:
+            _local_client("s3").delete_object(Bucket=upload_bucket, Key="probe.txt")
+
+    @pytest.mark.parametrize("virtual", [False, True])
+    def test_policy_denial_still_applies(self, user_key, upload_bucket, virtual):
+        from ministack.services import iam as iam_svc
+
+        name = iam_svc._access_keys[user_key[0]]["UserName"]
+        iam = _local_client("iam")
+        iam.put_user_policy(UserName=name, PolicyName="deny-upload", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*"}],
+        }))
+        try:
+            assert self.upload(upload_bucket, user_key, virtual=virtual).status_code == 403
+        finally:
+            iam.delete_user_policy(UserName=name, PolicyName="deny-upload")
+
+    def test_missing_bucket_after_authentication_before_policy(self, user_key, upload_bucket):
+        from xml.etree.ElementTree import fromstring
+
+        from ministack.services import iam as iam_svc
+
+        name = iam_svc._access_keys[user_key[0]]["UserName"]
+        _local_client("iam").put_user_policy(UserName=name, PolicyName="all", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:PutObject",
+                "Resource": f"arn:aws:s3:::{upload_bucket}/*"}],
+        }))
+        response = self.upload("missing-upload-bucket", user_key)
+        assert response.status_code == 404
+        assert fromstring(response.content).findtext("Code") == "NoSuchBucket"
+
+    def test_foreign_bucket_routing_does_not_grant_access(self, user_key):
+        from xml.etree.ElementTree import fromstring
+
+        owner = _local_client("s3", "333333333333", "root-secret")
+        bucket = f"foreign-upload-{time.time_ns()}"
+        owner.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "ap-northeast-3"})
+        try:
+            response = self.upload(bucket, ("AKIAUNKNOWNKEY000001", "wrong"), endpoint_region="ap-northeast-1")
+            assert response.status_code == 301
+            assert fromstring(response.content).findtext("Code") == "PermanentRedirect"
+            response = self.upload(bucket, user_key)
+            assert response.status_code == 403
+            assert fromstring(response.content).findtext("Code") == "AccessDenied"
+        finally:
+            owner.delete_bucket(Bucket=bucket)
+
+
+class TestHeaderSignatures:
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "SignatureDoesNotMatch", 403),
+        ("sqs", "SignatureDoesNotMatch", 403),
+        ("dynamodb", "InvalidSignatureException", 400),
+        ("lambda", "InvalidSignatureException", 403),
+        ("s3", "SignatureDoesNotMatch", 403),
+        ("ec2", "AuthFailure", 401),
+    ])
+    def test_wrong_secret_answers_the_protocols_code(self, user_key, service, code, status):
+        client = _local_client(service, user_key[0], "wrong-secret")
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    def test_get_caller_identity_checks_the_signature(self, user_key):
+        client = _local_client("sts", user_key[0], "wrong-secret")
+        assert _failure(client.get_caller_identity) == ("SignatureDoesNotMatch", 403)
+        assert ":user/signer-" in _local_client("sts", *user_key).get_caller_identity()["Arn"]
+
+    @pytest.mark.parametrize("service", sorted(_LIST_CALLS))
+    def test_right_secret_passes(self, user_key, service):
+        _LIST_CALLS[service](_local_client(service, *user_key))
+
+    def test_paths_and_queries_sign_as_the_sdk_encodes_them(self, user_key):
+        s3 = _local_client("s3", *user_key)
+        bucket = f"signed-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            s3.put_object(Bucket=bucket, Key="dir/a b+c=ü.txt", Body=b"x")
+            assert s3.get_object(Bucket=bucket, Key="dir/a b+c=ü.txt")["Body"].read() == b"x"
+            assert s3.list_objects_v2(Bucket=bucket, Prefix="dir/a b")["KeyCount"] == 1
+        finally:
+            s3.delete_object(Bucket=bucket, Key="dir/a b+c=ü.txt")
+            s3.delete_bucket(Bucket=bucket)
+        lam = _local_client("lambda", *user_key)
+        function = "arn:aws:lambda:us-east-1:000000000000:function:a b"
+        assert _failure(lambda: lam.get_function(FunctionName=function)) != ("InvalidSignatureException", 403)
+        lam.list_functions(MaxItems=5, FunctionVersion="ALL")
+
+    @pytest.mark.parametrize("key", ["a%2Fb", "caf%c3%a9", "x%7Ey"])
+    def test_s3_signs_the_path_as_sent(self, user_key, key):
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        s3 = _local_client("s3", *user_key)
+        bucket = f"raw-path-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            request = AWSRequest(method="PUT", url=f"http://localhost:4566/{bucket}/{key}", data=b"x")
+            S3SigV4Auth(Credentials(*user_key), "s3", "us-east-1").add_auth(request)
+            assert _asgi_send(request.prepare()).status_code == 200
+        finally:
+            for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
+                s3.delete_object(Bucket=bucket, Key=item["Key"])
+            s3.delete_bucket(Bucket=bucket)
+
+    def test_pin_holds_no_root_key_request_and_ends_with_the_check(self, user_key):
+        from ministack.core import iam_evaluator
+
+        def pin(key):
+            iam_evaluator.pin_signed_request("GET", "/", {}, [
+                (b"host", b"localhost:4566"),
+                (b"authorization", f"AWS4-HMAC-SHA256 Credential={key}/20260101/us-east-1/sts/aws4_request, "
+                                   "SignedHeaders=host, Signature=0".encode()),
+            ])
+            return iam_evaluator._signed_request.get()
+
+        assert pin("test") is None
+        assert pin(user_key[0]) is not None
+        assert isinstance(iam_evaluator.authenticate(user_key[0], "000000000000"), iam_evaluator.AuthError)
+        assert iam_evaluator._signed_request.get() is None
+
+    def test_request_changed_after_signing_is_refused(self, user_key):
+        client = _local_client("dynamodb", *user_key)
+        client.meta.events.register_first(
+            "before-send", lambda request, **_: setattr(request, "body", b'{"Limit": 2}'))
+        assert _failure(lambda: client.list_tables(Limit=1)) == ("InvalidSignatureException", 400)
+
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "IncompleteSignature", 400),
+        ("dynamodb", "IncompleteSignatureException", 400),
+        ("lambda", "MissingAuthenticationTokenException", 403),
+        ("s3", "AuthorizationHeaderMalformed", 400),
+    ])
+    def test_incomplete_authorization_header_is_refused(self, user_key, service, code, status):
+        client = _local_client(service, *user_key)
+
+        def drop_signature(request, **_):
+            request.headers["Authorization"] = request.headers["Authorization"].split(b", Signature=")[0]
+
+        client.meta.events.register_first("before-send", drop_signature)
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    @pytest.mark.parametrize("service,code,status", [
+        ("iam", "SignatureDoesNotMatch", 403),
+        ("dynamodb", "InvalidSignatureException", 400),
+        ("s3", "AuthorizationHeaderMalformed", 400),
+    ])
+    def test_credential_date_must_match_the_request_date(self, user_key, service, code, status):
+        client = _local_client(service, *user_key)
+
+        def move_scope_date(request, **_):
+            request.headers["Authorization"] = re.sub(
+                rb"/\d{8}/", b"/20200101/", request.headers["Authorization"], count=1)
+
+        client.meta.events.register_first("before-send", move_scope_date)
+        assert _failure(lambda: _LIST_CALLS[service](client)) == (code, status)
+
+    def test_header_sent_on_two_lines_signs_as_its_comma_joined_value(self, user_key):
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        s3 = _local_client("s3", *user_key)
+        bucket = f"lines-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            request = AWSRequest(method="PUT", url=f"http://localhost:4566/{bucket}/k", data=b"x",
+                                 headers={"x-amz-meta-list": "a,b"})
+            S3SigV4Auth(Credentials(*user_key), "s3", "us-east-1").add_auth(request)
+            del request.headers["x-amz-meta-list"]
+            lines = [(b"x-amz-meta-list", b"a"), (b"x-amz-meta-list", b"b")]
+            assert _asgi_send(request.prepare(), lines).status_code == 200
+        finally:
+            s3.delete_object(Bucket=bucket, Key="k")
+            s3.delete_bucket(Bucket=bucket)
+
+    def test_s3_unsigned_and_chunked_payloads(self, user_key):
+        s3 = _local_client("s3", *user_key)
+        bucket = f"payloads-{time.time_ns()}"
+        s3.create_bucket(Bucket=bucket)
+        try:
+            unsigned = _local_client("s3", *user_key, payload_signing_enabled=False)
+            unsigned.put_object(Bucket=bucket, Key="unsigned", Body=b"abc")
+            wrong = _local_client("s3", user_key[0], "wrong-secret", payload_signing_enabled=False)
+            assert _failure(lambda: wrong.put_object(Bucket=bucket, Key="unsigned", Body=b"abc")) == (
+                "SignatureDoesNotMatch", 403)
+            url = f"http://localhost:4566/{bucket}/chunked"
+            assert _chunked_put(*user_key, url, b"hello chunks").status_code == 200
+            assert s3.get_object(Bucket=bucket, Key="chunked")["Body"].read() == b"hello chunks"
+            assert _chunked_put(user_key[0], "wrong-secret", url, b"x").status_code == 403
+            assert _chunked_put(*user_key, url, b"x", bad_chunk=True).status_code == 403
+        finally:
+            for name in ("unsigned", "chunked"):
+                s3.delete_object(Bucket=bucket, Key=name)
+            s3.delete_bucket(Bucket=bucket)
+
+    def test_root_key_signs_with_any_secret(self, user_key):
+        assert _local_client("dynamodb", "test", "anything").list_tables()["TableNames"] is not None
+
+    def test_signature_is_not_checked_without_auth(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        _local_client("dynamodb", user_key[0], "wrong-secret").list_tables()
+
+
+def _presigned(key, secret, service, query, token=None, edit=None):
+    """A GET presigned in its query string, as botocore's SigV4QueryAuth signs it: (code or None, status, body)."""
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    request = AWSRequest(method="GET", url=f"http://localhost:4566/?{query}")
+    SigV4QueryAuth(Credentials(key, secret, token), service, "us-east-1", 300).add_auth(request)
+    url = edit(request.url) if edit else request.url
+    response = _asgi_send(AWSRequest(method="GET", url=url).prepare())
+    body = response.content.decode()
+    code = re.search(r"<Code>([^<]*)</Code>", body) or re.search(r'"__type": "([^"]*)"', body)
+    return (code.group(1) if code else None), response.status_code, body
+
+
+_LIST_USERS = "Action=ListUsers&Version=2010-05-08"
+_LIST_QUEUES = "Action=ListQueues&Version=2012-11-05"
+
+
+def _drop(name):
+    return lambda url: re.sub(rf"&?{name}=[^&]*", "", url)
+
+
+class TestQuerySignatures:
+    def test_right_secret_passes(self, user_key):
+        assert _presigned(*user_key, "iam", _LIST_USERS)[:2] == (None, 200)
+
+    @pytest.mark.parametrize("service,query", [("iam", _LIST_USERS), ("sqs", _LIST_QUEUES)])
+    def test_wrong_or_forged_signature_is_refused(self, user_key, service, query):
+        assert _presigned(user_key[0], "wrong-secret", service, query)[:2] == ("SignatureDoesNotMatch", 403)
+        forged = _presigned(*user_key, service, query,
+                            edit=lambda url: re.sub(r"X-Amz-Signature=\w+", "X-Amz-Signature=" + "0" * 64, url))
+        assert forged[:2] == ("SignatureDoesNotMatch", 403)
+
+    def test_query_mode_sqs_failure_is_sqs_query_xml(self, user_key):
+        code, status, body = _presigned(user_key[0], "wrong-secret", "sqs", _LIST_QUEUES)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert body.startswith('<?xml version="1.0"?><ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
+                               "<Error><Type>Sender</Type><Code>SignatureDoesNotMatch</Code>")
+        assert "</Message><Detail/></Error><RequestId>" in body
+        assert _failure(lambda: _local_client("sqs", user_key[0], "wrong-secret").list_queues()) == (
+            "SignatureDoesNotMatch", 403)
+
+    def test_session_key_needs_its_token_and_signature(self, user_key):
+        session = _local_client("sts", *user_key).get_session_token()["Credentials"]
+        key, secret, token = session["AccessKeyId"], session["SecretAccessKey"], session["SessionToken"]
+        assert _presigned(key, secret, "sqs", _LIST_QUEUES, token)[:2] == (None, 200)
+        assert _presigned(key, secret, "sqs", _LIST_QUEUES)[:2] == ("InvalidClientTokenId", 403)
+        forged = _presigned(key, secret, "sqs", _LIST_QUEUES, token,
+                            edit=lambda url: re.sub(r"X-Amz-Signature=\w+", "X-Amz-Signature=" + "0" * 64, url))
+        assert forged[:2] == ("SignatureDoesNotMatch", 403)
+
+    def test_signature_outside_the_time_window_is_refused(self, user_key):
+        def to_2020(url):
+            url = re.sub(r"X-Amz-Date=\d{8}T\d{6}Z", "X-Amz-Date=20200101T000000Z", url)
+            return re.sub(r"%2F\d{8}%2F", "%2F20200101%2F", url)
+
+        code, status, body = _presigned(*user_key, "iam", _LIST_USERS, edit=to_2020)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert "Signature expired: 20200101T000000Z is now earlier than " in body
+
+    @pytest.mark.parametrize("name", ["X-Amz-Date", "X-Amz-SignedHeaders", "X-Amz-Signature"])
+    def test_missing_query_parameter_is_refused(self, user_key, name):
+        code, status, body = _presigned(*user_key, "sqs", _LIST_QUEUES, edit=_drop(name))
+        assert (code, status) == ("IncompleteSignature", 400)
+        assert (f"AWS query-string parameters must include &apos;{name}&apos;. "
+                "Re-examine the query-string parameters.") in body or (
+            f"AWS query-string parameters must include '{name}'. Re-examine the query-string parameters.") in body
+
+    def test_credential_must_have_five_elements(self, user_key):
+        code, status, body = _presigned(
+            *user_key, "sqs", _LIST_QUEUES,
+            edit=lambda url: re.sub(r"X-Amz-Credential=([^%]+)%2F[^&]*", r"X-Amz-Credential=\1%2Fus-east-1", url))
+        assert (code, status) == ("IncompleteSignature", 400)
+        assert "Credential must have exactly 5 slash-delimited elements" in body
+
+    def test_root_key_signs_with_any_secret(self, user_key):
+        assert _presigned("test", "anything", "iam", _LIST_USERS)[:2] == (None, 200)
+
+    def test_signature_is_not_checked_without_auth(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert _presigned(user_key[0], "wrong-secret", "iam", _LIST_USERS)[:2] == (None, 200)
+
+
+# SES v2 is authorized in its own handler; RDS Data, S3 Control and X-Ray (no
+# MiniStack service) map to no IAM action. All of them check credentials.
+_NO_ACTION_CALLS = {
+    "sesv2": lambda c: c.get_account(),
+    "xray": lambda c: c.get_sampling_rules(),
+    "rds-data": lambda c: c.execute_statement(
+        resourceArn="arn:aws:rds:us-east-1:000000000000:cluster:none",
+        secretArn="arn:aws:secretsmanager:us-east-1:000000000000:secret:none", sql="select 1"),
+    "s3control": lambda c: c.list_tags_for_resource(AccountId="000000000000", ResourceArn="arn:aws:s3:::none"),
+}
+
+
+def _contract_client(service, key, secret, token=None):
+    """A client of the running server with the given credentials and no retries."""
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, REGION
+
+    return boto3.client(service, endpoint_url=ENDPOINT, region_name=REGION, aws_access_key_id=key,
+                        aws_secret_access_key=secret, aws_session_token=token,
+                        config=Config(retries={"total_max_attempts": 1}, inject_host_prefix=False))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service,wrong_secret,unknown_key,expired,content_type", [
+    ("sesv2", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/x-amz-json-1.1"),
+    ("xray", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/json"),
+    ("rds-data", "InvalidSignatureException", "UnrecognizedClientException", "InvalidSignatureException",
+     "application/json"),
+    ("s3control", "SignatureDoesNotMatch", "InvalidAccessKeyId", "RequestTimeTooSkewed", "application/xml"),
+], ids=["sesv2", "xray", "rds-data", "s3control"])
+def test_credentials_without_an_iam_action_contract(auth_enabled, iam_user, service, wrong_secret, unknown_key,
+                                                    expired, content_type):
+    """A wrong secret, an unknown key, a session key without its token and a stale signature are refused."""
+    from botocore.config import Config
+    from conftest import make_client
+
+    user = iam_user(policy={"Version": "2012-10-17",
+                            "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]})
+    key_id = make_client("iam").list_access_keys(UserName=user.name)["AccessKeyMetadata"][0]["AccessKeyId"]
+    session = user.client("sts").get_session_token()["Credentials"]
+    call = _NO_ACTION_CALLS[service]
+
+    def answer(client):
+        try:
+            call(client)
+        except ClientError as e:
+            return e.response["Error"]["Code"], e.response["ResponseMetadata"]["HTTPStatusCode"], (
+                e.response["ResponseMetadata"]["HTTPHeaders"].get("content-type"))
+        return None, 200, None
+
+    with _signing_clock(-960):
+        stale = answer(user.client(service, config=Config(inject_host_prefix=False)))
+    answers = [
+        answer(_contract_client(service, key_id, "wrong-secret")),
+        answer(_contract_client(service, "AKIAUNKNOWNKEY000001", "secret")),
+        answer(_contract_client(service, session["AccessKeyId"], session["SecretAccessKey"])),
+        stale,
+    ]
+    control = answer(user.client(service, config=Config(inject_host_prefix=False)))
+    assert control[1] != 403
+    if auth_enabled:
+        assert [a[:2] for a in answers] == [(wrong_secret, 403), (unknown_key, 403), (unknown_key, 403),
+                                            (expired, 403)]
+        assert answers[0][2] == content_type
+    else:
+        assert answers == [control] * 4
+
+
+class TestSessionTokens:
+    @pytest.fixture
+    def session(self, user_key):
+        return _local_client("sts", *user_key).get_session_token()["Credentials"]
+
+    @pytest.mark.parametrize("service,missing,wrong", [
+        ("sqs", ("InvalidClientTokenId", 403), ("InvalidClientTokenId", 403)),
+        ("dynamodb", ("UnrecognizedClientException", 400), ("UnrecognizedClientException", 400)),
+        ("lambda", ("UnrecognizedClientException", 403), ("UnrecognizedClientException", 403)),
+        ("s3", ("InvalidAccessKeyId", 403), ("InvalidToken", 400)),
+        ("ec2", ("AuthFailure", 401), ("AuthFailure", 401)),
+    ])
+    def test_session_key_needs_its_own_token(self, session, service, missing, wrong):
+        key, secret, token = session["AccessKeyId"], session["SecretAccessKey"], session["SessionToken"]
+        _LIST_CALLS[service](_local_client(service, key, secret, token))
+        assert _failure(lambda: _LIST_CALLS[service](_local_client(service, key, secret))) == missing
+        assert _failure(lambda: _LIST_CALLS[service](_local_client(service, key, secret, token + "x"))) == wrong
+
+    def test_wrong_token_message_has_no_full_stop(self, session):
+        client = _local_client("dynamodb", session["AccessKeyId"], session["SecretAccessKey"], "other")
+        with pytest.raises(ClientError) as exc:
+            client.list_tables()
+        assert exc.value.response["Error"]["Message"] == "The security token included in the request is invalid"
+
+    def test_long_term_key_refuses_a_token(self, user_key, session):
+        client = _local_client("iam", *user_key, session["SessionToken"])
+        assert _failure(client.list_users) == ("InvalidClientTokenId", 403)
+
+    def test_tokens_are_not_checked_without_auth(self, session, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        _local_client("dynamodb", session["AccessKeyId"], session["SecretAccessKey"]).list_tables()
+
+
+@contextlib.contextmanager
+def _signing_clock(seconds):
+    """Sign as if the client clock ran ``seconds`` ahead."""
+    import datetime as dt
+    from unittest import mock
+
+    import botocore.auth
+
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=seconds)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        yield
+
+
+class TestClockSkew:
+    @pytest.mark.parametrize("service,minutes,code,status", [
+        ("sts", 15, "SignatureDoesNotMatch", 403),
+        ("dynamodb", 15, "InvalidSignatureException", 400),
+        ("s3", 15, "RequestTimeTooSkewed", 403),
+        ("lambda", 5, "InvalidSignatureException", 403),
+        ("ec2", 5, "AuthFailure", 401),
+    ])
+    def test_request_outside_the_services_window_is_refused(self, user_key, service, minutes, code, status):
+        call = _LIST_CALLS.get(service) or (lambda c: c.get_caller_identity())
+        client = _local_client(service, *user_key)
+        with _signing_clock(minutes * 60 - 60):
+            call(client)
+        with _signing_clock(-(minutes * 60 - 60)):
+            call(client)
+        with _signing_clock(minutes * 60 + 60):
+            assert _failure(lambda: call(client)) == (code, status)
+        with _signing_clock(-(minutes * 60 + 60)):
+            assert _failure(lambda: call(client)) == (code, status)
+
+    def test_message_names_both_times(self, user_key):
+        with _signing_clock(-1200), pytest.raises(ClientError) as exc:
+            _local_client("dynamodb", *user_key).list_tables()
+        assert re.fullmatch(r"Signature expired: \d{8}T\d{6}Z is now earlier than \d{8}T\d{6}Z "
+                            r"\(\d{8}T\d{6}Z - 15 min\.\)", exc.value.response["Error"]["Message"])
+
+    def test_skew_is_reported_before_an_unknown_key(self, user_key):
+        with _signing_clock(1200):
+            client = _local_client("dynamodb", "AKIAUNKNOWNKEY000001", "secret")
+            assert _failure(client.list_tables) == ("InvalidSignatureException", 400)
+
+    def test_root_key_and_auth_off_ignore_the_clock(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        with _signing_clock(1200):
+            _local_client("dynamodb").list_tables()
+            monkeypatch.setattr(app_mod, "AUTH", False)
+            _local_client("dynamodb", *user_key).list_tables()
+
+
+class TestExecuteApiAuthentication:
+    @pytest.fixture
+    def invoke(self, user_key):
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        from botocore.credentials import Credentials
+
+        apigw = _local_client("apigateway")
+        api = apigw.create_rest_api(name="iam-auth")["id"]
+        root = apigw.get_resources(restApiId=api)["items"][0]["id"]
+        method = {"restApiId": api, "resourceId": root, "httpMethod": "GET"}
+        apigw.put_method(**method, authorizationType="AWS_IAM")
+        apigw.put_integration(**method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+        apigw.put_method_response(**method, statusCode="200")
+        apigw.put_integration_response(**method, statusCode="200", responseTemplates={"application/json": '{"ok": 1}'})
+        for response_type in ("INVALID_SIGNATURE", "EXPIRED_TOKEN", "DEFAULT_4XX"):
+            apigw.put_gateway_response(restApiId=api, responseType=response_type, responseParameters={
+                "gatewayresponse.header.x-type": f"'{response_type}'"})
+        apigw.create_deployment(restApiId=api, stageName="p")
+
+        def call(key, secret, seconds=0, authorization=None, token=None):
+            request = AWSRequest(method="GET", url=f"http://{api}.execute-api.localhost:4566/p/")
+            with _signing_clock(seconds):
+                SigV4Auth(Credentials(key, secret, token), "execute-api", "us-east-1").add_auth(request)
+            if authorization:
+                request.headers.replace_header("Authorization", authorization(request.headers["Authorization"]))
+            response = _asgi_send(request.prepare())
+            return (response.status_code, response.headers.get("x-type"), response.headers.get("x-amzn-ErrorType"),
+                    json.loads(response.content).get("message"))
+
+        yield call
+        apigw.delete_rest_api(restApiId=api)
+
+    def test_aws_iam_failures_answer_through_gateway_responses(self, user_key, invoke):
+        assert invoke(*user_key)[0] == 200
+        assert invoke(user_key[0], "wrong-secret")[:3] == (403, "INVALID_SIGNATURE", "InvalidSignatureException")
+        status, response_type, error_type, message = invoke(*user_key, seconds=-1200)
+        assert (status, response_type, error_type) == (403, "INVALID_SIGNATURE", "InvalidSignatureException")
+        assert message.startswith("Signature expired: ") and message.endswith(" - 5 min.)")
+        assert invoke("AKIAUNKNOWNKEY000001", "secret") == (
+            403, "DEFAULT_4XX", "UnrecognizedClientException", "The security token included in the request is invalid.")
+        assert invoke(*user_key, authorization=lambda value: value.split(", Signature=")[0])[:3] == (
+            403, "DEFAULT_4XX", "IncompleteSignatureException")
+        assert invoke(*user_key, authorization=lambda value: re.sub(r"/\d{8}/", "/20200101/", value, count=1))[:3] == (
+            403, "INVALID_SIGNATURE", "InvalidSignatureException")
+
+    def test_expired_session_answers_through_expired_token(self, invoke, monkeypatch):
+        from ministack.services import sts as sts_svc
+
+        monkeypatch.setitem(sts_svc._sessions, "ASIAEXPIREDSESSION01", {
+            "Arn": "arn:aws:iam::000000000000:user/alice", "UserId": "AIDAALICE",
+            "SecretAccessKey": "session-secret", "SessionToken": "session-token",
+            "Expiration": time.time() - 1, "AccountId": "000000000000", "PrincipalType": "User",
+        })
+        assert invoke("ASIAEXPIREDSESSION01", "session-secret", token="session-token") == (
+            403, "EXPIRED_TOKEN", "ExpiredTokenException", "The security token included in the request is expired")
+
+    def test_root_key_and_auth_off_are_unchanged(self, user_key, invoke, monkeypatch):
+        from ministack import app as app_mod
+
+        assert invoke("test", "anything")[0] == 200
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert invoke(user_key[0], "wrong-secret")[0] == 200
+
+
+# ---------------------------------------------------------------------------
 # AssumeRole trust policy: matching denies and STS request conditions (AUTH=true)
 # ---------------------------------------------------------------------------
 
@@ -4355,6 +5932,50 @@ def test_trust_not_action_denies(trust_api, operation, deny_first, excluded, con
     _assume(trust_api, expected, ExternalId="deployment-id", RoleSessionName="deploy-123")
 
 
+def _tags(protocol, **tags):
+    if protocol == "json":
+        return {"Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}
+    return {f"Tags.member.{n}.{field}": text for n, (key, value) in enumerate(tags.items(), 1)
+            for field, text in (("Key", key), ("Value", value))}
+
+
+def test_trust_conditions_see_the_caller_principal_tags(trust_api):
+    call, _, _ = trust_api
+    _install_policy(trust_api, "CreateRole", _document(dict(
+        ALLOW, Condition={"StringEquals": {"aws:PrincipalTag/team": "blue"}})))
+    _assume(trust_api, 403, RoleSessionName="untagged")
+    assert call("iam", "TagUser", UserName="trust-deployer", **_tags("query", team="blue"))[0] == 200
+    _assume(trust_api, 200, RoleSessionName="tagged")
+
+
+@pytest.mark.parametrize("actions, tagged, expected", [
+    ("sts:AssumeRole", False, 200),
+    ("sts:AssumeRole", True, 403),
+    (["sts:AssumeRole", "sts:TagSession"], True, 200),
+])
+def test_trust_session_tags_need_tag_session(trust_api, actions, tagged, expected):
+    call, sessions, protocol = trust_api
+    _install_policy(trust_api, "CreateRole", _document(dict(ALLOW, Action=actions)))
+    status, _, body = call("sts", "AssumeRole", RoleArn=ROLE_ARN, RoleSessionName="tags",
+                           **(_tags(protocol, team="blue") if tagged else {}))
+    assert status == expected, body
+    if expected == 403:
+        assert f"{CALLER} is not authorized to perform: sts:TagSession on resource: {ROLE_ARN}".encode() in body
+    elif tagged:
+        assert [s["SessionTags"] for s in sessions.values()] == [[{"Key": "team", "Value": "blue"}]]
+
+
+@pytest.mark.parametrize("key, expected", [("team", 200), ("dept", 403)])
+def test_trust_conditions_see_session_tags_as_request_tags(trust_api, key, expected):
+    _, _, protocol = trust_api
+    _install_policy(trust_api, "CreateRole", _document(ALLOW, dict(
+        ALLOW, Action="sts:TagSession", Condition={"StringLike": {"aws:RequestTag/team": "*"}})))
+    call, _, _ = trust_api
+    status, _, body = call("sts", "AssumeRole", RoleArn=ROLE_ARN, RoleSessionName="tags",
+                           **_tags(protocol, **{key: "blue"}))
+    assert status == expected, body
+
+
 @pytest.mark.parametrize("operation", ["CreateRole", "UpdateAssumeRolePolicy"])
 @pytest.mark.parametrize("policy", [
     _document(ALLOW, dict(ALLOW, Effect="Deny")),
@@ -4481,3 +6102,389 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
     assert bool(dispatched) == (expected == 200)
     if expected == 403:
         assert f"apigateway:{method}" in json.loads(body)["message"]
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("POST", "/v20180820/async-requests/mrap/create", "s3:CreateMultiRegionAccessPoint"),
+    ("POST", "/v20180820/async-requests/mrap/delete", "s3:DeleteMultiRegionAccessPoint"),
+    ("POST", "/v20180820/async-requests/mrap/put-policy", "s3:PutMultiRegionAccessPointPolicy"),
+    ("GET", "/v20180820/async-requests/mrap/arn%3Aaws%3As3%3Aus-west-2%3A000000000000%3Aasync-request/mrap/create/t",
+     "s3:DescribeMultiRegionAccessPointOperation"),
+    ("GET", "/v20180820/mrap/instances", "s3:ListMultiRegionAccessPoints"),
+    ("GET", "/v20180820/mrap/instances/m1", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policy", "s3:GetMultiRegionAccessPointPolicy"),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
+     "s3:GetMultiRegionAccessPointRoutes"),
+    ("PATCH", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
+     "s3:SubmitMultiRegionAccessPointRoutes"),
+    ("GET", "/v20180820/mrap/instances/policy", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/routes", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policystatus", "s3:GetMultiRegionAccessPointPolicyStatus"),
+    ("GET", "/v20180820/mrap/instances/", None),
+    ("GET", "/v20180820/mrap/instances/m1/", None),
+    ("GET", "/v20180820/mrap/instances/m1/policy/", None),
+    ("GET", "/v20180820/mrap/instances/m1/x", None),
+    ("POST", "/v20180820/mrap/instances/m1/policy", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap", None),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes/", None),
+])
+def test_s3control_mrap_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+def test_s3control_mrap_denied_without_the_action(monkeypatch):
+    """Under AUTH=true an S3 Control MRAP call needs its own IAM action."""
+    import ministack.app as app
+    from ministack.services import iam as iam_svc
+
+    fake_key = "AKIATESTMRAPCTL0001"
+    iam_svc._access_keys[fake_key] = {
+        "UserName": "mrap-user", "AccessKeyId": fake_key,
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    iam_svc._users["mrap-user"] = {
+        "UserName": "mrap-user", "Arn": "arn:aws:iam::000000000000:user/mrap-user",
+        "UserId": "AIDAMRAP1", "CreateDate": "2024-01-01", "Path": "/",
+        "AttachedPolicies": [], "Tags": [],
+    }
+    iam_svc._user_inline_policies["mrap-user"] = {"p": json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": "s3:ListMultiRegionAccessPoints", "Resource": "*"}]})}
+    monkeypatch.setattr(app, "AUTH", True)
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={fake_key}/20261012/us-west-2/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "x-amz-account-id": "000000000000",
+    }
+    try:
+        listed = asyncio.run(app._handle_s3_control_request(
+            "/v20180820/mrap/instances", "GET", b"", {}, "rid", headers))
+        denied = asyncio.run(app._handle_s3_control_request(
+            "/v20180820/mrap/instances/nope", "GET", b"", {}, "rid", headers))
+    finally:
+        iam_svc._access_keys.pop(fake_key, None)
+        iam_svc._users.pop("mrap-user", None)
+        iam_svc._user_inline_policies.pop("mrap-user", None)
+    assert listed[0] == 200
+    assert denied[0] == 403
+    assert b"s3:GetMultiRegionAccessPoint" in denied[2]
+
+
+@pytest.mark.parametrize("addressing", ["path", "virtual"])
+def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
+    """s3:prefix, s3:delimiter and s3:max-keys come from a ListBucket or ListBucketVersions request."""
+    from ministack import app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    iam, root_s3 = _local_client("iam"), _local_client("s3")
+    name = f"prefix-{time.time_ns()}"
+    bucket = name
+    root_s3.create_bucket(Bucket=bucket)
+    iam.create_user(UserName=name)
+    iam.put_user_policy(UserName=name, PolicyName="home", PolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
+            "Resource": f"arn:aws:s3:::{bucket}",
+            "Condition": {"StringLike": {"s3:prefix": ["home/alice/*"]}, "StringEquals": {"s3:delimiter": "/"},
+                          "NumericLessThanEquals": {"s3:max-keys": "100"}},
+        }]}))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    try:
+        s3 = _local_client("s3", key["AccessKeyId"], key["SecretAccessKey"], addressing_style=addressing)
+        allowed = {"Prefix": "home/alice/", "Delimiter": "/", "MaxKeys": 100}
+        s3.list_objects_v2(Bucket=bucket, **allowed)
+        s3.list_objects(Bucket=bucket, **allowed)
+        s3.list_object_versions(Bucket=bucket, **allowed)
+        for refused in ({**allowed, "Prefix": "home/bob/"}, {**allowed, "Delimiter": "-"},
+                        {**allowed, "MaxKeys": 101}, {"Delimiter": "/", "MaxKeys": 100}):
+            assert _failure(lambda: s3.list_objects_v2(Bucket=bucket, **refused)) == ("AccessDenied", 403)
+        assert _failure(lambda: s3.list_object_versions(
+            Bucket=bucket, **{**allowed, "Prefix": "home/bob/"})) == ("AccessDenied", 403)
+    finally:
+        iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user_policy(UserName=name, PolicyName="home")
+        iam.delete_user(UserName=name)
+        root_s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("PUT", "/v20180820/accesspoint/ap1", "s3:CreateAccessPoint"),
+    ("GET", "/v20180820/accesspoint/ap1", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/ap1", "s3:DeleteAccessPoint"),
+    ("GET", "/v20180820/accesspoint", "s3:ListAccessPoints"),
+    ("PUT", "/v20180820/accesspoint/ap1/policy", "s3:PutAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/ap1/policy", "s3:GetAccessPointPolicy"),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy", "s3:DeleteAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/policy", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/policy", "s3:DeleteAccessPoint"),
+    ("POST", "/v20180820/accesspoint/ap1/policy", None),
+    ("POST", "/v20180820/accesspoint", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/x", None),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy/x", None),
+    ("PUT", "/v20180820/accesspoint//ap1/policy", None),
+    ("GET", "/v20180820/accesspoint/ap1/", None),
+    ("GET", "/v20180820/accesspoint/ap1/policyStatus", "s3:GetAccessPointPolicyStatus"),
+    ("PUT", "/v20180820/accesspoint/ap1/scope", "s3express:PutAccessPointScope"),
+])
+def test_s3control_access_point_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+def test_s3control_access_point_denied_without_the_action(monkeypatch):
+    """Under AUTH=true access point calls need their own action, on the access
+    point's regional ARN."""
+    import ministack.app as app
+
+    seen = _capture_enforced_arn(monkeypatch)
+    headers = {
+        "authorization": "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "x-amz-account-id": "000000000000",
+    }
+    monkeypatch.setattr(app, "AUTH", True)
+    asyncio.run(app._handle_s3_control_request("/v20180820/accesspoint/ap1/policy", "GET", b"", {}, "rid", headers))
+    assert seen["action"] == "s3:GetAccessPointPolicy"
+    assert seen["arn"].endswith(":000000000000:accesspoint/ap1")
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol", "s3:CreateAccessPointForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol", "s3:GetAccessPointForObjectLambda"),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol", "s3:DeleteAccessPointForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda", "s3:ListAccessPointsForObjectLambda"),
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol/configuration", "s3:PutAccessPointConfigurationForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/configuration", "s3:GetAccessPointConfigurationForObjectLambda"),
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:PutAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:GetAccessPointPolicyForObjectLambda"),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:DeleteAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/policy", "s3:GetAccessPointForObjectLambda"),
+    ("POST", "/v20180820/accesspointforobjectlambda/ol/policy", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/configuration", None),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/x", None),
+    ("PUT", "/v20180820/accesspointforobjectlambda//ol/policy", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/", None),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policyStatus", "s3:GetAccessPointPolicyStatusForObjectLambda"),
+])
+def test_s3control_object_lambda_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+@pytest.mark.parametrize("method,key,query,action", [
+    ("GET", "k.txt", {}, "s3-object-lambda:GetObject"),
+    ("HEAD", "k.txt", {}, "s3-object-lambda:GetObject"),
+    ("PUT", "k.txt", {}, "s3-object-lambda:PutObject"),
+    ("DELETE", "k.txt", {}, "s3-object-lambda:DeleteObject"),
+    ("GET", "", {"list-type": ["2"]}, "s3-object-lambda:ListBucket"),
+])
+def test_s3_object_lambda_data_plane_iam_action(method, key, query, action):
+    from ministack.core.iam_actions import s3_object_lambda_action
+
+    assert s3_object_lambda_action(method, key, query) == action
+
+
+def test_write_get_object_response_needs_its_iam_action(monkeypatch):
+    import ministack.app as app
+
+    seen = _capture_enforced_arn(monkeypatch)
+    monkeypatch.setattr(app, "AUTH", True)
+    headers = {"x-amz-request-route": "io-use1-unknown", "x-amz-request-token": "t",
+               "authorization": "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/s3-object-lambda/"
+                                "aws4_request, SignedHeaders=host, Signature=x"}
+    status = asyncio.run(app._handle_special_data_plane_request(
+        "POST", "/WriteGetObjectResponse", headers, b"", {}, "rid"))[0]
+    assert seen["action"] == "s3-object-lambda:WriteGetObjectResponse"
+    assert status == 400
+
+
+@pytest.mark.auth_contract
+def test_unverifiable_credentials_are_refused_contract(auth_enabled, iam_user):
+    """A credential this server cannot verify never acts as its key's user: another algorithm, SigV2, no Credential."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    from conftest import ENDPOINT, second_access_key
+
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "sqs:CreateQueue", "Resource": "*"}]})
+
+    def create_queue(authorization, query=""):
+        body = f"Action=CreateQueue&QueueName=unverifiable-{uuid.uuid4().hex[:8]}&Version=2012-11-05".encode()
+        request = urllib.request.Request(f"{ENDPOINT}/{query}", data=body, method="POST", headers={
+            "Content-Type": "application/x-www-form-urlencoded", "Authorization": authorization})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    with second_access_key(user) as (key, _secret):
+        scope = f"{key}/20261019/us-east-1/sqs/aws4_request"
+        for authorization, query in (
+            (f"AWS4-HMAC-SHA512 Credential={scope}, SignedHeaders=host, Signature=00", ""),
+            (f"AWS {key}:bogus", ""),
+            ("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00", ""),
+            ("AWS4-HMAC-SHA256 SignedHeaders=host, Signature=00", f"?X-Amz-Credential={scope.replace('/', '%2F')}"),
+        ):
+            status = create_queue(authorization, query)
+            assert status >= 400 if auth_enabled else status == 200, (authorization, query)
+
+
+@pytest.mark.auth_contract
+def test_s3_sigv2_signatures_are_verified_contract(auth_enabled, iam_user):
+    """SigV2 header and query signatures are checked for an IAM user, and still work when they are right."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    bucket = f"sigv2-{uuid.uuid4().hex[:8]}"
+    admin = make_client("s3")
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key="k", Body=b"v")
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]})
+    try:
+        with second_access_key(user) as (key, secret):
+            v2 = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=key,
+                              aws_secret_access_key=secret, config=Config(signature_version="s3"))
+            assert v2.get_object(Bucket=bucket, Key="k")["Body"].read() == b"v"
+            url = v2.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "k"})
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                assert resp.status == 200
+            try:
+                with urllib.request.urlopen(url.replace("Signature=", "Signature=AA"), timeout=10) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            assert status == (403 if auth_enabled else 200)
+    finally:
+        admin.delete_object(Bucket=bucket, Key="k")
+        admin.delete_bucket(Bucket=bucket)
+
+
+def _sigv4a_request(credentials, method, url, service, region_set, *, host=None, body=b"", headers=None,
+                    presign=False, signed_at=None):
+    """Send a SigV4a-signed request: botocore builds the canonical request, the key is the one SigV4a derives."""
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import quote
+
+    import requests
+    from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from ministack.core.sigv4 import SIGV4A, sigv4a_signing_key
+
+    base = (S3SigV4QueryAuth if presign else S3SigV4Auth) if service == "s3" else SigV4Auth
+
+    class SigV4aAuth(base):
+        def _modify_request_before_signing(self, request):
+            if not presign:
+                request.headers["X-Amz-Region-Set"] = region_set
+            super()._modify_request_before_signing(request)
+            if presign:
+                request.url = (request.url.replace("X-Amz-Algorithm=AWS4-HMAC-SHA256", f"X-Amz-Algorithm={SIGV4A}")
+                               + f"&X-Amz-Region-Set={quote(region_set, safe='')}")
+
+        def scope(self, request):
+            return f"{self.credentials.access_key}/{self.credential_scope(request)}"
+
+        def credential_scope(self, request):
+            return f"{request.context['timestamp'][:8]}/{self._service_name}/aws4_request"
+
+        def string_to_sign(self, request, canonical_request):
+            return SIGV4A + super().string_to_sign(request, canonical_request).removeprefix("AWS4-HMAC-SHA256")
+
+        def signature(self, string_to_sign, request):
+            key = sigv4a_signing_key(self.credentials.access_key, self.credentials.secret_key)
+            return key.sign(string_to_sign.encode(), ec.ECDSA(hashes.SHA256())).hex()
+
+        def _inject_signature_to_request(self, request, signature):
+            super()._inject_signature_to_request(request, signature)
+            if not presign:
+                authorization = request.headers["Authorization"].replace("AWS4-HMAC-SHA256", SIGV4A, 1)
+                del request.headers["Authorization"]
+                request.headers["Authorization"] = authorization
+
+    request = AWSRequest(method, url, data=body, headers={**({"host": host} if host else {}), **(headers or {})})
+    signer = SigV4aAuth(Credentials(*credentials), service, region_set, **({"expires": 60} if presign else {}))
+    with mock.patch("botocore.auth.get_current_datetime", lambda: signed_at or dt.datetime.now(dt.timezone.utc)):
+        signer.add_auth(request)
+    response = requests.request(method, request.url, data=body or None, headers=dict(request.headers.items()),
+                                timeout=30)
+    code = re.search(r"<Code>([^<]*)</Code>", response.text)
+    return response.status_code, code.group(1) if code else ""
+
+
+@pytest.mark.auth_contract
+def test_sigv4a_signatures_are_verified_contract(auth_enabled, iam_user):
+    """SigV4a header and presigned signatures are checked for an IAM user, with their date and region set."""
+    import datetime as dt
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    endpoint = ENDPOINT.rstrip("/")
+    bucket, name = f"sigv4a-{uuid.uuid4().hex[:8]}", f"sigv4a-{uuid.uuid4().hex[:8]}"
+    admin, account = make_client("s3"), make_client("sts").get_caller_identity()["Account"]
+    admin.create_bucket(Bucket=bucket)
+    admin.put_object(Bucket=bucket, Key="k", Body=b"v")
+    control = boto3.client("s3control", endpoint_url=ENDPOINT, region_name="us-west-2", aws_access_key_id="test",
+                           aws_secret_access_key="test", config=Config(inject_host_prefix=False))
+    control.create_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                             Details={"Name": name, "Regions": [{"Bucket": bucket}]})
+    alias = control.get_multi_region_access_point(AccountId=account, Name=name)["AccessPoint"]["Alias"]
+    mrap = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "*"}]})
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=20)
+    sts_call = {"body": b"Action=GetCallerIdentity&Version=2011-06-15",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}}
+    try:
+        with second_access_key(user) as (key, secret):
+            cases = [
+                # (service, method, url, host, region set, extra, refused under AUTH=true as)
+                ("sts", "POST", f"{endpoint}/", None, "*", sts_call, None),
+                ("sts", "POST", f"{endpoint}/", None, "*", {**sts_call, "wrong": True},
+                 (403, "SignatureDoesNotMatch")),
+                ("sts", "POST", f"{endpoint}/", None, "ap-south-1,ap-east-1", sts_call, (403, "InvalidClientTokenId")),
+                ("sts", "POST", f"{endpoint}/", None, "*", {**sts_call, "signed_at": old},
+                 (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {}, None),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"wrong": True}, (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "ap-south-1", {}, (400, "RegionSetMismatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"signed_at": old}, (403, "RequestTimeTooSkewed")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True}, None),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True, "wrong": True},
+                 (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/{bucket}/k", None, "*", {"presign": True, "signed_at": old},
+                 (403, "AccessDenied")),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {}, None),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {"presign": True}, None),
+                ("s3", "GET", f"{endpoint}/k", mrap, "*", {"wrong": True}, (403, "SignatureDoesNotMatch")),
+                ("s3", "GET", f"{endpoint}/k", mrap, "ap-south-1", {}, (400, "RegionSetMismatch")),
+            ]
+            for service, method, url, host, region_set, extra, refused in cases:
+                extra = dict(extra)
+                credentials = (key, "wrong" + secret if extra.pop("wrong", False) else secret)
+                result = _sigv4a_request(credentials, method, url, service, region_set, host=host, **extra)
+                expected = refused if auth_enabled and refused else (200, "")
+                assert result == expected, (service, url, host, region_set, extra)
+    finally:
+        control.delete_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                                 Details={"Name": name})
+        admin.delete_object(Bucket=bucket, Key="k")
+        admin.delete_bucket(Bucket=bucket)

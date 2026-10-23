@@ -183,17 +183,48 @@ pip install boto3 pytest pytest-xdist duckdb docker cbor2
 pytest tests/ -v
 
 # Control-plane parallel lane: excludes serial and live-container tests
-pytest tests/ -v -n 4 --dist=loadfile -m "not serial and not data_plane"
+pytest tests/ -v -n 4 --dist=loadfile -m "not serial and not data_plane and not auth_contract"
 
 # Control-plane serial/global-state lane
-pytest tests/ -v -m "serial and not data_plane"
+pytest tests/ -v -m "serial and not data_plane and not auth_contract"
 
 # Docker-backed data-plane lane (requires a Docker daemon and network)
 DOCKER_NETWORK=ministack-data-local LAMBDA_EXECUTOR=docker \
-pytest tests/ -v -m data_plane
+pytest tests/ -v -m "data_plane and not auth_contract"
 
 # Run a specific service
 pytest tests/ -v -k "cognito"
+```
+
+---
+
+## Testing Permission Behavior
+
+Test whether an operation is allowed or denied with an SDK/HTTP test in
+`tests/test_<service>.py` marked `auth_contract`. CI runs these against servers
+with `AUTH=false` and `AUTH=true`; the other jobs exclude them. `iam_user`
+creates a user with no permissions (pass `policy={...}` for an inline policy)
+and cleans up after the test; `auth_enabled` is the server's mode, checked
+against the `AUTH` the tests run with.
+
+```python
+@pytest.mark.auth_contract
+def test_list_buckets_without_permission(auth_enabled, iam_user):
+    client = iam_user().client("s3")
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_buckets()
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    else:
+        assert "Buckets" in client.list_buckets()
+```
+
+Run them locally with the server and pytest in the same mode, then repeat with
+`AUTH=true`:
+
+```bash
+AUTH=false IOT_MTLS_ENABLED=0 python -m hypercorn ministack.app:app --bind 127.0.0.1:4566
+AUTH=false pytest tests/ -m auth_contract -v
 ```
 
 ---

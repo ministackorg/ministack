@@ -728,7 +728,7 @@ def _put_s3_object(bucket, key, body):
     async def _put():
         headers = {"content-type": "application/octet-stream", "content-length": str(len(body)),
                    "host": "s3.localhost"}
-        await s3_svc.handle_request("PUT", f"/{bucket}/{key}", headers, body, {})
+        await s3_svc.handle_request("PUT", f"/{bucket}/{key}", headers, body, {}, internal=True)
 
     try:
         asyncio.get_running_loop().create_task(_put())

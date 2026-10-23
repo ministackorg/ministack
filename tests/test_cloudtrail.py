@@ -13,6 +13,7 @@ Tests are split into two sections:
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -37,6 +38,16 @@ MANAGEMENT_ADVANCED_SELECTORS = [
 ]
 
 
+EMPTY_DEPRECATED_STATUS = {
+    "LatestDeliveryAttemptSucceeded": "",
+    "LatestDeliveryAttemptTime": "",
+    "LatestNotificationAttemptSucceeded": "",
+    "LatestNotificationAttemptTime": "",
+    "TimeLoggingStarted": "",
+    "TimeLoggingStopped": "",
+}
+
+
 def _client(service, region=REGION):
     return boto3.client(
         service,
@@ -51,6 +62,21 @@ def _uid():
     import uuid
 
     return uuid.uuid4().hex[:8]
+
+
+def _raw_body(client, method, **params):
+    """Call an operation and return its JSON body before the SDK drops unmodeled members."""
+    bodies = []
+    event = f"before-parse.cloudtrail.{client.meta.method_to_api_mapping[method]}"
+    handler_id = f"raw-body-{_uid()}"
+    client.meta.events.register(
+        event, lambda response_dict, **_: bodies.append(json.loads(response_dict["body"])), unique_id=handler_id
+    )
+    try:
+        getattr(client, method)(**params)
+    finally:
+        client.meta.events.unregister(event, unique_id=handler_id)
+    return bodies[0]
 
 
 @pytest.fixture(scope="module")
@@ -98,6 +124,21 @@ def test_create_trail(ct):
     assert f"/{name}" in resp["TrailARN"]
 
 
+def test_create_trail_recursive_logging_defaults_to_true(ct):
+    name = f"trail-recursive-{_uid()}"
+    assert ct.create_trail(Name=name, S3BucketName="bucket")["RecursiveLogging"] is True
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is True
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is True
+
+
+def test_create_trail_stores_recursive_logging_false(ct):
+    name = f"trail-recursive-off-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", RecursiveLogging=False)
+    assert resp["RecursiveLogging"] is False
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is False
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is False
+
+
 def test_create_trail_duplicate(ct):
     name = f"trail-dup-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
@@ -112,6 +153,28 @@ def test_get_trail(ct):
     resp = ct.get_trail(Name=name)
     assert resp["Trail"]["Name"] == name
     assert "TrailARN" in resp["Trail"]
+
+
+def test_get_trail_and_describe_trails_return_the_trail_shape(ct):
+    name = f"trail-shape-{_uid()}"
+    created = ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    expected = {
+        "Name": name,
+        "S3BucketName": "bucket",
+        "IncludeGlobalServiceEvents": True,
+        "IsMultiRegionTrail": False,
+        "LogFileValidationEnabled": False,
+        "HomeRegion": REGION,
+        "TrailARN": created["TrailARN"],
+        "HasCustomEventSelectors": False,
+        "HasInsightSelectors": False,
+        "IsOrganizationTrail": False,
+        "RecursiveLogging": True,
+    }
+    assert _raw_body(ct, "get_trail", Name=name)["Trail"] == expected
+    assert _raw_body(ct, "describe_trails", trailNameList=[name])["trailList"] == [expected]
 
 
 def test_get_trail_by_arn(ct):
@@ -161,7 +224,7 @@ def test_read_trail_by_arn_from_different_request_region(ct):
     assert get_resp["Trail"]["Name"] == name
 
     status_resp = west_ct.get_trail_status(Name=arn)
-    assert status_resp["IsLogging"] is True
+    assert status_resp["IsLogging"] is False
 
     desc_resp = west_ct.describe_trails(trailNameList=[arn])
     assert [trail["TrailARN"] for trail in desc_resp["trailList"]] == [arn]
@@ -196,7 +259,7 @@ def test_multi_region_trail_is_shadow_visible_from_peer_region(ct):
     west_ct = _client("cloudtrail", region=WEST_REGION)
 
     assert west_ct.get_trail(Name=name)["Trail"]["HomeRegion"] == REGION
-    assert west_ct.get_trail_status(Name=name)["IsLogging"] is True
+    assert west_ct.get_trail_status(Name=name)["IsLogging"] is False
     assert west_ct.describe_trails(trailNameList=[name])["trailList"][0]["TrailARN"] == arn
     assert any(t["TrailARN"] == arn for t in west_ct.describe_trails()["trailList"])
     assert any(t["TrailARN"] == arn for t in west_ct.list_trails()["Trails"])
@@ -344,7 +407,36 @@ def test_get_trail_status(ct):
     name = f"trail-status-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
     resp = ct.get_trail_status(Name=name)
-    assert resp["IsLogging"] is True
+    assert resp["IsLogging"] is False
+
+
+def test_new_trail_is_not_logging_until_started(ct):
+    name = f"trail-new-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    status = ct.get_trail_status(Name=name)
+    status.pop("ResponseMetadata")
+    assert status == {"IsLogging": False, **EMPTY_DEPRECATED_STATUS}
+
+    ct.start_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    status.pop("ResponseMetadata")
+    assert status.keys() == {"IsLogging", "StartLoggingTime", *EMPTY_DEPRECATED_STATUS}
+    assert status["IsLogging"] is True
+
+
+def test_get_trail_status_returns_the_deprecated_string_members(ct):
+    name = f"trail-deprecated-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert {key: status[key] for key in EMPTY_DEPRECATED_STATUS} == {
+        **EMPTY_DEPRECATED_STATUS,
+        "TimeLoggingStarted": status["StartLoggingTime"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "TimeLoggingStopped": status["StopLoggingTime"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    raw = _raw_body(ct, "get_trail_status", Name=name)
+    assert all(isinstance(raw[key], int) for key in ("StartLoggingTime", "StopLoggingTime"))
 
 
 def test_get_trail_status_not_found(ct):
@@ -365,6 +457,7 @@ def test_start_stop_logging_flips_is_logging_state(ct):
     aws_cloudtrail data source asserts on this."""
     name = f"trail-state-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
     assert ct.get_trail_status(Name=name)["IsLogging"] is True
 
     ct.stop_logging(Name=name)
@@ -374,6 +467,38 @@ def test_start_stop_logging_flips_is_logging_state(ct):
 
     ct.start_logging(Name=name)
     assert ct.get_trail_status(Name=name)["IsLogging"] is True
+
+
+def test_restarted_trail_keeps_stop_logging_time(ct):
+    name = f"trail-restart-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    stopped = ct.get_trail_status(Name=name)
+
+    ct.start_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert status["IsLogging"] is True
+    assert status["StopLoggingTime"] == stopped["StopLoggingTime"]
+    assert status["StartLoggingTime"] >= stopped["StartLoggingTime"]
+
+
+def test_stop_logging_records_a_stop_only_on_a_logging_trail(ct):
+    name = f"trail-stop-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.stop_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert "StopLoggingTime" not in status
+    assert status["TimeLoggingStopped"] == ""
+
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    stopped = ct.get_trail_status(Name=name)
+    time.sleep(1.1)
+    ct.stop_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert status["StopLoggingTime"] == stopped["StopLoggingTime"]
+    assert status["TimeLoggingStopped"] == stopped["TimeLoggingStopped"]
 
 
 def test_list_trails_returns_summaries(ct):
@@ -400,6 +525,18 @@ def test_update_trail_persists_fields(ct):
     desc = ct.get_trail(Name=name)["Trail"]
     assert desc["S3BucketName"] == "updated"
     assert desc["IsMultiRegionTrail"] is True
+
+
+def test_update_trail_sets_and_keeps_recursive_logging(ct):
+    name = f"trail-update-recursive-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    assert ct.update_trail(Name=name, RecursiveLogging=False)["RecursiveLogging"] is False
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is False
+    # An update that leaves the member out keeps the stored value.
+    assert ct.update_trail(Name=name, IncludeGlobalServiceEvents=False)["RecursiveLogging"] is False
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is False
+    assert ct.update_trail(Name=name, RecursiveLogging=True)["RecursiveLogging"] is True
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is True
 
 
 def test_create_trail_persists_kms_key_id(ct):
@@ -956,6 +1093,25 @@ def test_cloudtrail_calls_not_self_recorded(ct):
         LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "DescribeTrails"}]
     )["Events"]
     assert len(after) == len(before)
+
+
+def test_recording_enabled_through_config_records_before_any_cloudtrail_call(monkeypatch):
+    import asyncio
+
+    import ministack.app as app
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import cloudtrail
+
+    monkeypatch.delenv("CLOUDTRAIL_RECORDING", raising=False)
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    monkeypatch.setattr(cloudtrail, "_recording_enabled", False)
+    monkeypatch.setattr(cloudtrail, "_events", AccountRegionScopedDict())
+    body = json.dumps({"cloudtrail._recording_enabled": "true"}).encode()
+    asyncio.run(app._handle_admin_config_request("/_ministack/config", "POST", body))
+
+    headers = {"x-amz-target": "AmazonSQS.ListQueues"}
+    app._maybe_record_cloudtrail("sqs", "POST", "/", headers, b"{}", {}, "req-1", REGION)
+    assert [event["EventName"] for event in cloudtrail._get_event_queue()] == ["ListQueues"]
 
 
 def test_recording_disabled_no_new_events(ct, s3):

@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import contextlib
+import copy
 import io
 import json
 import os
@@ -12,9 +14,10 @@ import urllib.error as _urlerr
 import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock, patch
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import boto3
 import pytest
@@ -25,9 +28,14 @@ from conftest import (
     ENDPOINT,
     LoopProbe,
     concurrent_burst,
+    inprocess_iam_user,
     make_probe_lambda,
     patch_endpoint_dns,
+    routed_request,
 )
+
+from ministack.core.responses import AccountRegionScopedDict, request_scope
+from ministack.services import lambda_svc as _lambda_mod
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -77,6 +85,20 @@ _LAMBDA_CODE = 'def handler(event, context):\n    return {"statusCode": 200, "bo
 _LAMBDA_CODE_V2 = 'def handler(event, context):\n    return {"statusCode": 200, "body": "v2"}\n'
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
+
+
+def _create_lambda_role(iam):
+    """Create ``lambda-role`` in the account of *iam*'s key unless it exists: AUTH=true needs it to exist."""
+    with contextlib.suppress(iam.exceptions.EntityAlreadyExistsException):
+        iam.create_role(RoleName="lambda-role", AssumeRolePolicyDocument=json.dumps({"Statement": [{
+            "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+
+
+@pytest.fixture(autouse=True)
+def _lambda_role(iam):
+    """The role ``_LAMBDA_ROLE`` names, per test since some reset the server."""
+    _create_lambda_role(iam)
+
 
 _NODE_CODE = (
     "exports.handler = async (event, context) => {"
@@ -1121,6 +1143,32 @@ def test_lambda_get_function_not_found(lam):
 def test_lambda_list_functions(lam):
     names = [f["FunctionName"] for f in _list_all_functions(lam)]
     assert "lam-create-test" in names
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("credential, code, message", [
+    (b"", "MissingAuthenticationTokenException", "Missing Authentication Token"),
+    (b"Credential=, ", "IncompleteSignatureException", "Authorization header requires 'Credential' parameter."),
+], ids=["left-out", "empty"])
+def test_lambda_list_functions_header_without_credential_contract(auth_enabled, iam_user, credential, code, message):
+    """Under AUTH=true Lambda answers a header without Credential as unauthenticated, an empty one as incomplete."""
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "lambda:ListFunctions", "Resource": "*"}]}).client("lambda")
+    client.list_functions(MaxItems=1)
+
+    def replace_credential(request, **_):
+        algorithm, _, fields = request.headers["Authorization"].partition(b" ")
+        request.headers["Authorization"] = algorithm + b" " + credential + fields.partition(b", ")[2]
+
+    client.meta.events.register_first("before-send", replace_credential)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_functions(MaxItems=1)
+        response = exc.value.response
+        assert (response["Error"]["Code"], response["ResponseMetadata"]["HTTPStatusCode"]) == (code, 403)
+        assert response["Error"]["Message"].startswith(message)
+    else:
+        assert "Functions" in client.list_functions(MaxItems=1)
 
 def test_lambda_delete_function(lam):
     lam.create_function(
@@ -2536,7 +2584,7 @@ def test_lambda_unknown_path_returns_404(lam):
     except urllib.error.HTTPError as e:
         assert e.code == 404
 
-def test_lambda_reset_terminates_workers(lam):
+def test_lambda_reset_terminates_workers(lam, iam):
     """/_ministack/reset must cleanly terminate warm Lambda workers."""
     import urllib.request
 
@@ -2563,6 +2611,7 @@ def test_lambda_reset_terminates_workers(lam):
         except Exception:
             if _attempt == 2:
                 raise
+    _create_lambda_role(iam)
 
     # Re-create and invoke — new worker means new boot time
     lam.create_function(
@@ -3094,13 +3143,12 @@ def test_lambda_rejects_cross_region_layers_on_create_and_update():
         east.delete_function(FunctionName=update_name)
 
 
-def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
-    """A foreign-account ARN with no grant behind it is refused.
-
-    The layer store is keyed by account and region, so rewriting the account
-    field of an ARN this account published must not hand back that layer's
-    content — and with no AddLayerVersionPermission statement naming the
-    caller, the attachment is denied on create and on update alike.
+def test_lambda_wrong_account_layer_attaches_empty_not_local_content(lam):
+    """Rewriting the account field of an ARN this account published must not hand
+    back that layer's content. The store is keyed by account and region, and
+    MiniStack holds no layer of that name in the other account, so the ARN
+    attaches as an empty layer, {Arn, CodeSize: 0}, on create and on update alike
+    (#2313 maintainer (3) and (4); the key set AWS gives an unsigned layer, C12).
     """
     suffix = _uuid_mod.uuid4().hex[:8]
 
@@ -3117,17 +3165,17 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
 
     create_name = f"wrong-account-layer-create-{suffix}"
     update_name = f"wrong-account-layer-update-{suffix}"
+    empty = [{"Arn": wrong_account_arn, "CodeSize": 0}]
     try:
-        with pytest.raises(ClientError) as create_exc:
-            lam.create_function(
-                FunctionName=create_name,
-                Runtime="python3.12",
-                Role=_LAMBDA_ROLE,
-                Handler="index.handler",
-                Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
-                Layers=[wrong_account_arn],
-            )
-        assert create_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        created = lam.create_function(
+            FunctionName=create_name,
+            Runtime="python3.12",
+            Role=_LAMBDA_ROLE,
+            Handler="index.handler",
+            Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
+            Layers=[wrong_account_arn],
+        )
+        assert created["Layers"] == empty
 
         lam.create_function(
             FunctionName=update_name,
@@ -3136,9 +3184,8 @@ def test_lambda_rejects_wrong_account_layers_on_create_and_update(lam):
             Handler="index.handler",
             Code={"ZipFile": _make_zip(_LAMBDA_CODE)},
         )
-        with pytest.raises(ClientError) as update_exc:
-            lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
-        assert update_exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        updated = lam.update_function_configuration(FunctionName=update_name, Layers=[wrong_account_arn])
+        assert updated["Layers"] == empty
 
         # The layer this account really published still resolves to its bytes.
         lam.update_function_configuration(FunctionName=update_name, Layers=[layer_arn])
@@ -3479,7 +3526,6 @@ def test_lambda_layer_version_arn_errors_do_not_fallback_to_local_layer(lam):
 
     bad_refs = [
         (wrong_region, "ResourceNotFoundException"),
-        (wrong_account, "AccessDeniedException"),
         (wrong_service, "ValidationException"),
         (missing_version, "ValidationException"),
     ]
@@ -3487,6 +3533,13 @@ def test_lambda_layer_version_arn_errors_do_not_fallback_to_local_layer(lam):
         with pytest.raises(ClientError) as exc:
             lam.get_layer_version_by_arn(Arn=layer_ref)
         assert exc.value.response["Error"]["Code"] == expected_code
+
+    # The same name in another account is a layer MiniStack does not hold: it reads
+    # as an empty version, never as this account's content (#2313 maintainer (3)).
+    other = lam.get_layer_version_by_arn(Arn=wrong_account)
+    other.pop("ResponseMetadata")
+    assert other == {"LayerArn": wrong_account.rsplit(":", 1)[0], "LayerVersionArn": wrong_account,
+                     "Version": pub["Version"], "Content": {"CodeSize": 0}}
 
     same_layer = lam.get_layer_version_by_arn(Arn=arn)
     assert same_layer["LayerVersionArn"] == arn
@@ -4795,6 +4848,10 @@ def test_esm_response_no_function_name_field(lam, sqs):
         sqs.delete_queue(QueueUrl=q_url)
 
 
+# Cross-account layers (#2313). Capture keys refer to the AWS captures listed in the issue's
+# evidence comment: "C.." (lambda-public-layer-accounts), "U.." (2313-uncertainties, -2),
+# "X:.." (2313-uncertainties-4) and "Y:.." (2313-uncertainties-5). "Maintainer (n)" is a
+# decision on the issue for what MiniStack cannot know offline.
 # CloudWatch Lambda Insights, the layer people reference cross-account; nothing resolves the version locally.
 _AWS_MANAGED_LAYER = "arn:aws:lambda:us-east-1:580247275435:layer:LambdaInsightsExtension:38"
 _OTHER_REGION_LAYER = "arn:aws:lambda:eu-central-1:580247275435:layer:LambdaInsightsExtension:38"
@@ -4882,27 +4939,52 @@ _DENIED = "AccessDeniedException"
     pytest.param("root-granted", f"arn:aws:iam::{_CALLER_ACCOUNT}:root", None, None, None,
                  id="account-root-arn-grant"),
     pytest.param("everyone-granted", "*", None, None, None, id="wildcard-grant"),
-    pytest.param("ungranted", None, None, _DENIED, _DENIED, id="no-grant"),
+    pytest.param("ungranted", None, None, _DENIED, _DENIED, id="no-grant"),  # C11
     pytest.param("granted-elsewhere", "111111111111", None, _DENIED, _DENIED, id="grant-to-another-account"),
+    # A layer MiniStack holds refuses a version it does not hold, as AWS refuses a
+    # version that does not exist (C5, U10) (maintainer (1)).
     pytest.param("partly-seeded", "*", _foreign_arn("partly-seeded", 35), _DENIED, _DENIED,
-                 id="missing-version-of-known-layer"),
-    # A name AWS does not publish, under the same account: the gate is the layer
-    # NAME, so this is still denied.
-    pytest.param(None, None, _foreign_arn("not-an-aws-extension", 38), _DENIED, _DENIED,
-                 id="unknown-foreign-layer"),
-    # An extension AWS publishes itself carries a public grant on AWS, so a
-    # template referencing it deploys there. It resolves here too; the bytes are
-    # not available offline, so CodeSize is 0 and the extension does not run.
+                 id="missing-version-of-held-layer"),
+    # A layer MiniStack does not hold resolves as an empty version (maintainer (4)):
+    # a public vendor layer (Datadog, C1) or an AWS extension (C3) answers 200 on
+    # AWS, and offline a made-up ARN looks the same as a real one, though AWS
+    # refuses the made-up one (C5, C6). CodeSize is 0 and the layer does not run.
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "464622532012"), None, None,
+                 id="unheld-vendor-layer"),
+    pytest.param(None, None, _foreign_arn("example-missing", 99999, "111111111111"), None, None,
+                 id="unheld-made-up-layer"),
+    # C3 captured :68 on AWS (200); any version resolves here (maintainer (4)).
     pytest.param(None, None, _AWS_MANAGED_LAYER, None, None, id="aws-published-extension"),
+    # Another region is refused with the same denial on read and attach (C13, U6:cross-region).
     pytest.param(None, None, _OTHER_REGION_LAYER, _DENIED, _DENIED, id="another-region"),
+    # Versions and names that cannot exist on AWS are refused with the same denial,
+    # on read and attach (X:version-0, X:version-leading-zero, X:name-141-chars).
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 0, "464622532012"), _DENIED, _DENIED,
+                 id="version-0"),
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", "0101", "464622532012"), _DENIED, _DENIED,
+                 id="version-leading-zero"),
+    pytest.param(None, None, _foreign_arn("a" * 141, 1, "464622532012"), _DENIED, _DENIED, id="name-141-chars"),
+    # An ARN AWS rejects on shape (X:account-11-digits: 400 ValidationException) is not
+    # resolved empty; it keeps the denial it had before #2313.
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "46462253201"), _DENIED, _DENIED,
+                 id="malformed-account-keeps-denial"),
+    # 12 non-ASCII digits: AWS's \d is ASCII, so presumably 400 there too (inferred from X:account-letters).
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "\u0664" * 12), _DENIED, _DENIED,
+                 id="non-ascii-digit-account-keeps-denial"),
+    pytest.param(None, None, _foreign_arn("Datadog.Extension", 101, "464622532012"), _DENIED, _DENIED,
+                 id="name-with-dot-keeps-denial"),  # X:name-with-dot (AWS: 400 ValidationException)
+    pytest.param(None, None, _foreign_arn("Datadog-Extension-ARM", 101, "464622532012").replace("arn:aws:", "arn:aws-cn:"),
+                 _DENIED, _DENIED, id="partition-cn-keeps-denial"),  # X:partition-cn (AWS: 400 / 500)
     pytest.param(None, None, _foreign_arn("nope-not-here", 1, _CALLER_ACCOUNT),
                  "InvalidParameterValueException", "ResourceNotFoundException", id="own-account-layer-missing"),
 ])
 def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach_error, read_error):
-    """A grant makes stored foreign content attachable and readable. Without
-    one — no statement, a statement naming another account, or no layer of that
-    name at all — the attachment and the read are denied. The resolver does not
-    read AUTH (see the next test)."""
+    """A held foreign layer answers through its grant: AWS resolves a `*` grant (C12)
+    and denies an unshared layer (C11); account and root-ARN grants and a grant to
+    another account follow the policy evaluator. Denials carry AWS's
+    AccessDeniedException message (C11, C5, C13). A layer MiniStack does not hold
+    resolves empty (maintainer (4)). The resolver does not read AUTH (see the next
+    tests)."""
     arn = arn or _foreign_arn(layer_name)
     with _foreign_layer(layer_name, granted_to=granted_to):
         version_config, attach, payload, read = _layer_verdicts(arn)
@@ -4919,9 +5001,142 @@ def test_lambda_cross_account_layer_verdicts(layer_name, granted_to, arn, attach
         assert not [key for key in payload if key.startswith("_")]
 
 
+_UNHELD_LAYER = "arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Extension-ARM:101"
+
+
+def test_lambda_unheld_cross_account_layer_reads_as_empty_version(caplog):
+    """GetLayerVersionByArn, and GetLayerVersion with the layer ARN as LayerName,
+    answer the same body, as on AWS (C14 calls[0] equals C1 calls[0]; maintainer (2)).
+    The body is the maintainer's empty layer (maintainer (3)): LayerArn derived from
+    the ARN as AWS derives it (C1), LayerVersionArn, Version, and Content.CodeSize 0
+    where AWS reports the real size. What only the publisher knows (C1: CodeSha256,
+    Location, CreatedDate, Description, CompatibleArchitectures, signing ARNs) is
+    left out. The log says the layer will not run."""
+    import ministack.services.lambda_svc as _lsvc
+    from ministack.core.responses import request_scope
+
+    expected = {"LayerArn": _UNHELD_LAYER.rsplit(":", 1)[0], "LayerVersionArn": _UNHELD_LAYER,
+                "Version": 101, "Content": {"CodeSize": 0}}
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION), caplog.at_level("WARNING", logger="lambda"):
+        by_arn = _lsvc._get_layer_version_by_arn(_UNHELD_LAYER)
+        by_name = _lsvc._get_layer_version(_UNHELD_LAYER.rsplit(":", 1)[0], 101)
+    for status, _headers, body in (by_arn, by_name):
+        assert status == 200, body
+        assert json.loads(body) == expected
+    assert any("is not held by MiniStack" in record.getMessage() and _UNHELD_LAYER in record.getMessage()
+               for record in caplog.records)
+
+
+def test_lambda_unheld_cross_account_layer_attaches(monkeypatch):
+    """CreateFunction, GetFunction, GetFunctionConfiguration and
+    UpdateFunctionConfiguration accept an unheld layer, as AWS does (C7 to C10: 201
+    and 200). AWS reports its real CodeSize and, for a signed layer, both signing
+    ARNs (C7 to C10). MiniStack reports {Arn, CodeSize: 0} (maintainer (3)), the key
+    set AWS gives an unsigned layer (C12)."""
+    import ministack.app as app_mod
+    from ministack.core.responses import request_scope
+    from ministack.services import lambda_svc
+
+    # In process, so the execution role is not created; AUTH=true would refuse it.
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    monkeypatch.setattr(lambda_svc, "_functions", AccountRegionScopedDict())
+    x86_layer = "arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Extension:101"
+    with request_scope(_CALLER_ACCOUNT, _FOREIGN_REGION):
+        status, _headers, body = lambda_svc._create_function({
+            "FunctionName": "unheld-layer-fn", "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+            "Handler": "index.handler", "Layers": [_UNHELD_LAYER],
+            "Code": {"ZipFile": base64.b64encode(_make_zip("def handler(e, c): return 1")).decode()}})
+        assert status == 201, body
+        created = json.loads(body)
+        assert created["Layers"] == [{"Arn": _UNHELD_LAYER, "CodeSize": 0}]
+        _status, _headers, body = lambda_svc._get_function("unheld-layer-fn")
+        assert json.loads(body)["Configuration"]["Layers"] == [{"Arn": _UNHELD_LAYER, "CodeSize": 0}]
+        status, _headers, body = lambda_svc._update_config(
+            "unheld-layer-fn", {"Layers": [x86_layer]})
+        assert status == 200, body
+        assert json.loads(body)["Layers"] == [{"Arn": x86_layer, "CodeSize": 0}]
+        _status, _headers, body = lambda_svc._get_function_config("unheld-layer-fn")
+        assert json.loads(body)["Layers"] == [{"Arn": x86_layer, "CodeSize": 0}]
+
+
+_LAYER_ARN_PREFIX = "arn:aws:lambda:us-east-1:464622532012:layer:"  # 44 characters
+
+
+@pytest.mark.parametrize(("layer_name", "version", "expected_status"), [
+    pytest.param(_LAYER_ARN_PREFIX + "a" * 96, 1, 200, id="arn-140-chars"),   # Y:arn-total-140 (AWS 403; M(4))
+    pytest.param(_LAYER_ARN_PREFIX + "a" * 97, 1, 400, id="arn-141-chars"),   # Y:arn-total-141
+    pytest.param(_LAYER_ARN_PREFIX + "a" * 97, 0, 400, id="arn-141-chars-version-0"),  # Y:arn-total-141-version-0
+    pytest.param("a" * 141, 1, 400, id="bare-name-141-chars"),                # Y:bare-name-141
+    pytest.param("a" * 140, 1, 404, id="bare-name-140-chars"),                # Y:bare-name-140
+])
+def test_lambda_get_layer_version_layer_name_length(lam, layer_name, version, expected_status):
+    """GetLayerVersion limits the whole LayerName, a layer ARN included, to 140
+    characters, before it checks the version (Y:*). A layer ARN of 140 characters
+    goes on to the by-ARN path, where an unheld layer resolves empty (maintainer (4);
+    AWS answers 403 for this made-up name, Y:arn-total-140)."""
+    if expected_status == 200:
+        assert lam.get_layer_version(LayerName=layer_name, VersionNumber=version)["Content"] == {"CodeSize": 0}
+        return
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version(LayerName=layer_name, VersionNumber=version)
+    error = exc.value.response
+    assert error["ResponseMetadata"]["HTTPStatusCode"] == expected_status
+    if expected_status == 400:
+        assert error["Error"]["Code"] == "ValidationException"
+        assert error["Error"]["Message"] == (
+            f"1 validation error detected: Value '{layer_name}' at 'layerName' failed to satisfy "
+            "constraint: Member must have length less than or equal to 140")
+    else:
+        assert error["Error"]["Message"] == "The resource you requested does not exist."
+
+
+def test_lambda_get_layer_version_by_arn_has_no_layer_name_limit(lam):
+    """GetLayerVersionByArn has no LayerName member, so a 141-character name in
+    this account's ARN keeps the not-found answer it had before. AWS applies no
+    length check on the by-ARN path (X:name-141-chars, Y:arn-total-141 by_arn: 403
+    for a foreign ARN, past validation); the own-account 404 is main's behavior,
+    inferred to match, not captured."""
+    arn = f"arn:aws:lambda:us-east-1:{_CALLER_ACCOUNT}:layer:{'a' * 141}:1"
+    with pytest.raises(ClientError) as exc:
+        lam.get_layer_version_by_arn(Arn=arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_held_cross_account_layer_with_every_version_deleted_is_denied():
+    """A layer MiniStack holds whose versions were all deleted is still held, so the
+    reference is denied (maintainer (1)), as AWS denies a version that does not
+    exist (C5)."""
+    arn = _foreign_arn("all-deleted")
+    with _foreign_layer("all-deleted", granted_to="*") as version_config:
+        version_config["_deleted"] = True
+        _config, attach, payload, read = _layer_verdicts(arn)
+    assert attach == read == (_DENIED, _layer_access_denied(arn))
+    assert payload is None
+
+
+def test_lambda_layer_attached_empty_never_loads_content_later():
+    """A layer attached while MiniStack did not hold it stays empty at cold start,
+    even if a version is published under that ARN afterwards: its content was never
+    granted at attach time. MiniStack-only, following maintainer (0) ("not run");
+    nothing on AWS corresponds."""
+    import ministack.services.lambda_svc as _lsvc
+
+    arn = _foreign_arn("published-later")
+    with _foreign_layer("published-later", granted_to="*") as version_config:
+        version_config["_zip_data"] = b"layer-bytes"
+        assert _lsvc._resolve_layer_zip({"Arn": arn, "CodeSize": 0}) is None
+        assert _lsvc._resolve_layer_zip({"Arn": arn, "CodeSize": _FOREIGN_CODE_SIZE}) == b"layer-bytes"
+
+
 def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatch):
     """Through the app with AUTH=true as an IAM user of the consuming account: the
     layer policy decides, and a denial names that user the way AWS does."""
+    from urllib.parse import quote
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
     import ministack.app as app_mod
     from ministack.services import iam as iam_svc
 
@@ -4948,13 +5163,15 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
         for granted_to in ("*", None):
             sent.clear()
             arn = _foreign_arn("auth-layer")
+            query = f"find=LayerVersion&Arn={quote(arn, safe='')}"
+            request = AWSRequest(method="GET", url=f"http://lambda.localhost/2018-10-31/layers?{query}")
+            SigV4Auth(Credentials(key, "s"), "lambda", _FOREIGN_REGION).add_auth(request)
             with _foreign_layer("auth-layer", granted_to=granted_to):
                 asyncio.run(app_mod.app({
                     "type": "http", "method": "GET", "path": "/2018-10-31/layers",
-                    "query_string": f"find=LayerVersion&Arn={arn}".encode(),
-                    "headers": [(b"host", b"lambda.localhost"), (b"authorization", (
-                        f"AWS4-HMAC-SHA256 Credential={key}/20260915/{_FOREIGN_REGION}/lambda/aws4_request, "
-                        "SignedHeaders=host, Signature=0").encode())],
+                    "query_string": query.encode(),
+                    "headers": [(b"host", b"lambda.localhost")] + [
+                        (name.lower().encode(), value.encode()) for name, value in request.headers.items()],
                 }, receive, send))
             status, body = sent[0]["status"], json.loads(sent[1]["body"])
             if granted_to:
@@ -4964,6 +5181,54 @@ def test_lambda_cross_account_layer_under_auth_names_the_calling_user(monkeypatc
     finally:
         for store, name, _record in seeded:
             store.pop_scoped(_CALLER_ACCOUNT, None, name, None)
+
+
+@pytest.fixture
+def granted_function(monkeypatch):
+    """A function whose policy grants lambda:GetFunction to the given principal, under AUTH=true."""
+    import ministack.app as app_mod
+    from ministack.services import lambda_svc
+
+    names = []
+
+    def make(principal):
+        name = f"rp-fn-{_uuid_mod.uuid4().hex[:8]}"
+        names.append(name)
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert lambda_svc._create_function({
+            "FunctionName": name, "Runtime": "python3.12", "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+            "Code": {"ZipFile": base64.b64encode(_make_zip("def handler(e, c): return 1")).decode()}})[0] == 201
+        lambda_svc._add_permission(name, {"StatementId": "s", "Action": "lambda:GetFunction", "Principal": principal})
+        monkeypatch.setattr(app_mod, "AUTH", True)
+        return name
+
+    yield make
+    for name in names:
+        lambda_svc._functions.pop(name, None)
+
+
+def test_function_policy_naming_the_user_allows_without_identity_policy(granted_function):
+    key, user = inprocess_iam_user()
+    name = granted_function(user)
+    assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
+    status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}/configuration")
+    assert (status, json.loads(body)["__type"]) == (403, "AccessDeniedException")
+
+
+def test_function_policy_applies_to_a_call_naming_the_function_by_arn(granted_function):
+    key, user = inprocess_iam_user()
+    name = granted_function(user)
+    arn = quote(f"arn:aws:lambda:us-east-1:000000000000:function:{name}", safe="")
+    assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{arn}")[0] == 200
+
+
+def test_function_policy_naming_the_account_needs_an_identity_policy(granted_function):
+    name = granted_function("000000000000")
+    key, _user = inprocess_iam_user()
+    status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")
+    assert (status, json.loads(body)["__type"]) == (403, "AccessDeniedException")
+    key, _user = inprocess_iam_user({"Statement": [{"Effect": "Allow", "Action": "lambda:GetFunction", "Resource": "*"}]})
+    assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
 
 
 @pytest.fixture
@@ -8631,6 +8896,89 @@ exports.handler = (event, ctx, cb) => {{
     assert received.get("body") == "test"
 
 
+@pytest.mark.parametrize("use_ssl", [False, True], ids=["plain", "use_ssl"])
+def test_nodejs_worker_https_call_forms_reach_the_gateway(tmp_path, use_ssl):
+    """Every https.request/https.get form and the SDK stubs reach the gateway, over TLS when its endpoint is https."""
+    import ssl
+    import subprocess
+    from http.server import ThreadingHTTPServer
+
+    seen = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _answer(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append((self.command, self.path, self.headers.get("X-Amz-Target")))
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-amz-json-1.1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_PUT = do_POST = _answer
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    env = {"AWS_ENDPOINT_URL": f"http://127.0.0.1:{port}"}
+    if use_ssl:
+        cert, key = tmp_path / "gw.crt", tmp_path / "gw.key"
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+            "-days", "1", "-subj", "/CN=gateway", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ], check=True, capture_output=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+        # A TLS-only listener, like the gateway under USE_SSL: a plain request fails the handshake.
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        env = {"AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}", "NODE_EXTRA_CA_CERTS": str(cert)}
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    handler_js = f"""\
+const https = require("https");
+const {{ SSMClient, DescribeParametersCommand }} = require("@aws-sdk/client-ssm");
+const base = "https://127.0.0.1:{port}";
+const call = (start) => new Promise((resolve) => {{
+  let req;
+  try {{
+    req = start((res) => {{ res.resume(); res.on("end", () => resolve(res.statusCode)); }});
+  }} catch (e) {{
+    return resolve(e.code || String(e));
+  }}
+  req.on("error", (e) => resolve(e.code || e.message));
+  if (!req.writableEnded) req.end();
+}});
+exports.handler = async () => ({{
+  urlOptions: await call((cb) => https.request(base + "/url-options", {{ method: "PUT" }}, cb)),
+  urlObject: await call((cb) => https.request(new URL(base + "/url-object"), cb)),
+  noPort: await call((cb) => https.request({{ hostname: "127.0.0.1", path: "/no-port", method: "PUT" }}, cb)),
+  port443: await call((cb) => https.request({{ hostname: "127.0.0.1", port: 443, path: "/port-443",
+    method: "PUT" }}, cb)),
+  getUrlOptions: await call((cb) => https.get(base + "/get", {{ headers: {{ "x-probe": "1" }} }}, cb)),
+  awsHost: await call((cb) => https.request({{ hostname: "ssm.us-east-1.amazonaws.com", path: "/aws-host",
+    method: "POST", headers: {{ host: "ssm.us-east-1.amazonaws.com" }} }}, cb)),
+  sdkStub: await new SSMClient({{}}).send(new DescribeParametersCommand({{}}))
+    .then(() => 200, (e) => e.code || String(e)),
+}});
+"""
+    try:
+        result = _run_nodejs_worker(handler_js, env_extra=env)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert result.get("status") == "ok", f"Handler failed: {result}"
+    assert set(result["result"].values()) == {200}, result["result"]
+    assert sorted(seen) == sorted([
+        ("PUT", "/url-options", None), ("GET", "/url-object", None), ("PUT", "/no-port", None),
+        ("PUT", "/port-443", None), ("GET", "/get", None), ("POST", "/aws-host", None),
+        ("POST", "/", "AmazonSSM.DescribeParameters"),
+    ])
+
+
 def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
     """End-to-end: a Node.js Lambda using @aws-sdk/client-ssm's
     PutParameterCommand actually creates a parameter on MiniStack's SSM
@@ -8687,6 +9035,108 @@ def test_nodejs_worker_aws_sdk_v3_stub_wire_roundtrip(lam, ssm):
             ssm.delete_parameter(Name=param_name)
         except Exception:
             pass
+
+
+@pytest.mark.skipif(os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+                    reason="the SDK stubs belong to the local Node executor")
+def test_nodejs_worker_aws_sdk_v3_stub_calls_the_functions_own_account():
+    """A stub call signs with the function's credentials, so it lands in the function's account."""
+    from conftest import make_client
+
+    if not shutil.which("node"):
+        pytest.skip("node not found on PATH")
+    account = "123456789012"
+    own = {name: boto3.client(name, endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=account,
+                              aws_secret_access_key="test") for name in ("lambda", "ssm", "iam")}
+    fname = f"sdk-account-{_uuid_mod.uuid4().hex[:8]}"
+    param_name = f"/ministack-test/{fname}"
+    code = (
+        "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
+        "exports.handler = async (event) => {\n"
+        "  await new SSMClient({}).send(new PutParameterCommand({\n"
+        "    Name: event.name, Value: 'v', Type: 'String', Overwrite: true }));\n"
+        "  return { ok: true };\n"
+        "};\n"
+    )
+    role = own["iam"].create_role(RoleName=fname, AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))["Role"]
+    own["iam"].put_role_policy(RoleName=fname, PolicyName="ssm", PolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "ssm:PutParameter", "Resource": "*"}]}))
+    own["lambda"].create_function(FunctionName=fname, Runtime="nodejs20.x", Role=role["Arn"],
+                                  Handler="index.handler", Code={"ZipFile": _make_zip_js(code, "index.js")})
+    try:
+        resp = own["lambda"].invoke(FunctionName=fname, Payload=json.dumps({"name": param_name}).encode())
+        assert json.loads(resp["Payload"].read()) == {"ok": True}
+        assert own["ssm"].get_parameter(Name=param_name)["Parameter"]["Value"] == "v"
+        with pytest.raises(ClientError):
+            make_client("ssm").get_parameter(Name=param_name)
+    finally:
+        own["lambda"].delete_function(FunctionName=fname)
+        with contextlib.suppress(ClientError):
+            own["ssm"].delete_parameter(Name=param_name)
+        own["iam"].delete_role_policy(RoleName=fname, PolicyName="ssm")
+        own["iam"].delete_role(RoleName=fname)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.skipif(os.environ.get("LAMBDA_EXECUTOR", "").lower() == "docker",
+                    reason="the SDK stubs belong to the local Node executor")
+def test_nodejs_sdk_stub_calls_run_as_the_execution_role_contract(auth_enabled, lam):
+    """The Node SDK stubs sign with the function's credentials, so the execution role's policy decides."""
+    from conftest import make_client
+
+    if not shutil.which("node"):
+        pytest.skip("node not found on PATH")
+    iam, suffix = make_client("iam"), _uuid_mod.uuid4().hex[:8]
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    roles = {}
+    for kind in ("allowed", "bare"):
+        roles[kind] = iam.create_role(RoleName=f"stub-{kind}-{suffix}", AssumeRolePolicyDocument=trust)["Role"]
+    iam.put_role_policy(RoleName=roles["allowed"]["RoleName"], PolicyName="calls", PolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["lambda:InvokeFunction", "ssm:PutParameter"], "Resource": "*"}]}))
+    callee = f"stub-callee-{suffix}"
+    code = (
+        "const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');\n"
+        "const { SSMClient, PutParameterCommand } = require('@aws-sdk/client-ssm');\n"
+        "exports.handler = async (event) => {\n"
+        "  const r = await new LambdaClient({}).send(\n"
+        "    new InvokeCommand({ FunctionName: event.target, Payload: '{}' }));\n"
+        "  let ssm = 'ok';\n"
+        "  try {\n"
+        "    await new SSMClient({}).send(new PutParameterCommand({\n"
+        "      Name: event.name, Value: 'v', Type: 'String', Overwrite: true }));\n"
+        "  } catch (e) { ssm = e.name; }\n"
+        "  return { status: r.StatusCode, ssm: ssm };\n"
+        "};\n"
+    )
+    callers = {kind: f"stub-{kind}-{suffix}" for kind in roles}
+    try:
+        lam.create_function(FunctionName=callee, Runtime="python3.12", Role=roles["allowed"]["Arn"],
+                            Handler="index.handler",
+                            Code={"ZipFile": _make_zip("def handler(event, context):\n    return 1\n")})
+        answers = {}
+        for kind, name in callers.items():
+            lam.create_function(FunctionName=name, Runtime="nodejs20.x", Role=roles[kind]["Arn"],
+                                Handler="index.handler", Code={"ZipFile": _make_zip_js(code, "index.js")})
+            resp = lam.invoke(FunctionName=name, Payload=json.dumps(
+                {"target": callee, "name": f"/stub-roles/{suffix}/{kind}"}).encode())
+            answers[kind] = json.loads(resp["Payload"].read())
+        assert answers["allowed"] == {"status": 200, "ssm": "ok"}
+        assert answers["bare"] == ({"status": 403, "ssm": "AccessDeniedException"} if auth_enabled
+                                   else {"status": 200, "ssm": "ok"})
+    finally:
+        for name in (callee, *callers.values()):
+            with contextlib.suppress(Exception):
+                lam.delete_function(FunctionName=name)
+        for kind in callers:
+            with contextlib.suppress(Exception):
+                make_client("ssm").delete_parameter(Name=f"/stub-roles/{suffix}/{kind}")
+        iam.delete_role_policy(RoleName=roles["allowed"]["RoleName"], PolicyName="calls")
+        for role in roles.values():
+            iam.delete_role(RoleName=role["RoleName"])
 
 
 def test_lambda_ruby_4_0_runtime_maps_to_official_image():
@@ -12662,6 +13112,76 @@ def test_node_context_shim_keeps_https_to_a_tls_gateway(tmp_path):
         server.server_close()
 
 
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_node_context_shim_sends_the_https_default_port_to_a_tls_gateway(tmp_path):
+    """Under USE_SSL a CDK or cfn-response style PUT (no port, or 443) reaches the gateway port over TLS."""
+    import http.server
+    import ssl
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            seen.append((self.path, self.headers.get("Host")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    cert, key = tmp_path / "gw.crt", tmp_path / "gw.key"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+        "-days", "1", "-subj", "/CN=gateway", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+    ], check=True, capture_output=True)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve) => {\n"
+            "  const opts = {hostname: '127.0.0.1', path: '/_ministack/cfn-response/tok', method: 'PUT'};\n"
+            "  if (event.port) opts.port = event.port;\n"
+            "  const req = event.url ? https.request(event.url, {method: 'PUT'}) : https.request(opts);\n"
+            "  req.on('response', (res) => resolve({status: res.statusCode}));\n"
+            "  req.on('error', (e) => resolve({error: e.code || String(e)}));\n"
+            "  req.end('{}');\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {**os.environ, "LAMBDA_TASK_ROOT": str(code_dir), "_MS_REAL_HANDLER": "index.handler",
+               "AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}", "NODE_EXTRA_CA_CERTS": str(cert)}
+        script = ("require(process.argv[1]).handler(JSON.parse(process.argv[2]), {})"
+                  ".then((r) => process.stdout.write(JSON.stringify(r)));")
+
+        def run(event):
+            proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), json.dumps(event)],
+                                  env=env, capture_output=True, text=True, timeout=30)
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)
+
+        # The CDK shape (no port), the cfn-response shape (443) and a URL without a port.
+        assert run({}) == {"status": 200}
+        assert run({"port": 443}) == {"status": 200}
+        assert run({"url": "https://127.0.0.1/_ministack/cfn-response/tok"}) == {"status": 200}
+        assert [path for path, _host in seen] == ["/_ministack/cfn-response/tok"] * 3
+        assert all(host == f"127.0.0.1:{port}" for _path, host in seen)
+        # Any other explicit port is left alone.
+        assert "error" in run({"port": port + 1})
+        assert len(seen) == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
     """The sweep drops extracted trees whose blob no longer backs any
     function, version, or layer version — and only those. References are read
@@ -14014,6 +14534,15 @@ def test_cognito_issuer_host_resolves_to_the_gateway_under_use_ssl(monkeypatch, 
         (lsvc._CONTAINER_CA_PATH, True), (lsvc._CONTAINER_BUNDLE_PATH, True)]
 
 
+def test_lambda_container_python_ssl_trusts_the_gateway_under_use_ssl(monkeypatch, tmp_path):
+    """urllib reads SSL_CERT_FILE, not the *_CA_BUNDLE vars, e.g. for a custom-resource ResponseURL PUT."""
+    from ministack.services import lambda_svc as lsvc
+
+    _rk, container_env, _mounts = _wire(
+        monkeypatch, USE_SSL="1", TMPDIR=str(tmp_path), MINISTACK_REGION="us-east-1")
+    assert container_env["SSL_CERT_FILE"] == lsvc._CONTAINER_BUNDLE_PATH
+
+
 def test_lambda_trust_files_are_copied_not_mounted_when_ministack_runs_in_docker(monkeypatch, tmp_path):
     """In a container the trust files are docker cp'd, not bind-mounted; a symlink is followed."""
     import tarfile
@@ -14859,3 +15388,256 @@ exports.handler = async () => {
     assert json.loads(payload) == {"ok": True}
     expected_logs = ["invoke-console-message", "invoke-stderr-message"]
     assert base64.b64decode(headers["X-Amz-Log-Result"]).decode().splitlines() == expected_logs
+
+
+def _regional(service, region):
+    return boto3.client(service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                        region_name=region, aws_access_key_id="test", aws_secret_access_key="test")
+
+
+_S3_CODE_REDIRECT = ("Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+                     "The bucket you are attempting to access must be addressed using the specified endpoint. "
+                     "Please send all future requests to this endpoint.")
+
+
+@pytest.fixture
+def use1_code_bucket(s3):
+    bucket = f"code-use1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="fn.zip", Body=_make_zip("def handler(e, c):\n    return 1\n"))
+    yield bucket
+    s3.delete_object(Bucket=bucket, Key="fn.zip")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_lambda_s3_code_region_create_and_update(lam, use1_code_bucket):
+    """S3 code must come from a bucket in the function's region (observed on
+    AWS 2026-10-12: eu-west-1 function, us-east-1 bucket)."""
+    euw1 = _regional("lambda", "eu-west-1")
+    name = f"s3-code-region-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        euw1.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                             Code={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    assert exc.value.response["Error"]["Message"] == _S3_CODE_REDIRECT
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    euw1.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                         Code={"ZipFile": _make_zip("def handler(e, c):\n    return 0\n")})
+    try:
+        with pytest.raises(ClientError) as exc:
+            euw1.update_function_code(FunctionName=name, S3Bucket=use1_code_bucket, S3Key="fn.zip")
+        assert exc.value.response["Error"]["Message"] == _S3_CODE_REDIRECT
+        # A same-region bucket still works.
+        lam.create_function(FunctionName=f"{name}-use1", Runtime="python3.12", Role=_LAMBDA_ROLE,
+                            Handler="index.handler", Code={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+        lam.delete_function(FunctionName=f"{name}-use1")
+    finally:
+        euw1.delete_function(FunctionName=name)
+
+
+def test_lambda_s3_code_region_publish_layer_version(use1_code_bucket):
+    euw1 = _regional("lambda", "eu-west-1")
+    layer = f"s3-code-region-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        euw1.publish_layer_version(LayerName=layer, Content={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    assert exc.value.response["Error"]["Message"] == (
+        "Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+        "The bucket is in this region: us-east-1. Please use this region to retry the request")
+    # The refused publish didn't consume a version number.
+    published = euw1.publish_layer_version(LayerName=layer, Content={"ZipFile": _make_zip("x = 1\n")})
+    assert published["Version"] == 1
+    euw1.delete_layer_version(LayerName=layer, VersionNumber=1)
+
+
+def test_lambda_env_disables_host_prefix_injection_by_default(lam):
+    """WriteGetObjectResponse's host prefix (<route>.<host>) doesn't resolve
+    from inside a Lambda, so boto3 in a handler is told not to inject it
+    unless the function sets the variable itself (#2159)."""
+    code = _make_zip("import os\ndef handler(e, c):\n    return os.environ.get('AWS_DISABLE_HOST_PREFIX_INJECTION')\n")
+    name = f"host-prefix-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": code})
+    own = f"{name}-own"
+    lam.create_function(FunctionName=own, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": code},
+                        Environment={"Variables": {"AWS_DISABLE_HOST_PREFIX_INJECTION": "false"}})
+    try:
+        assert json.loads(lam.invoke(FunctionName=name)["Payload"].read()) == "true"
+        assert json.loads(lam.invoke(FunctionName=own)["Payload"].read()) == "false"
+    finally:
+        lam.delete_function(FunctionName=name)
+        lam.delete_function(FunctionName=own)
+
+
+@pytest.fixture
+def functions(monkeypatch):
+    store = AccountRegionScopedDict()
+    for name in ("revision-test", "unrelated"):
+        store[name] = {
+            "config": {"RevisionId": "function-before", "Architectures": ["x86_64"],
+                       "Description": "original", "Version": "$LATEST"},
+            "code_zip": b"original-code", "versions": {}, "next_version": 1,
+            "aliases": {alias: {"RevisionId": "alias-before", "FunctionVersion": "1",
+                                "Description": "original"} for alias in ("live", "other")},
+        }
+    monkeypatch.setattr(_lambda_mod, "_functions", store)
+    for helper in ("invalidate_worker", "_pool_kill_function", "_sweep_extract_cache",
+                   "_schedule_state_transition", "_snapstart_provision_version_async"):
+        monkeypatch.setattr(_lambda_mod, helper, Mock())
+    return store
+
+
+def _update(operation, revision="function-before", value="changed", name="revision-test"):
+    data = {"RevisionId": revision} if revision is not None else {}
+    if operation == "code":
+        return _lambda_mod._update_code(name, {**data, "ZipFile": base64.b64encode(value.encode()).decode()})
+    if operation == "config":
+        return _lambda_mod._update_config(name, {**data, "Description": value})
+    return _lambda_mod._update_alias(name, "live", {**data, "Description": value, "FunctionVersion": "2"})
+
+
+@pytest.mark.parametrize("operation", ["code", "config", "alias"])
+def test_stale_revision_rejects_before_mutation_or_side_effects(functions, monkeypatch, operation):
+    fetch = Mock(side_effect=AssertionError("stale request fetched code"))
+    monkeypatch.setattr(_lambda_mod, "_fetch_code_from_s3", fetch)
+    before = copy.deepcopy(functions._data)
+    if operation == "code":
+        result = _lambda_mod._update_code("revision-test", {
+            "RevisionId": "stale", "S3Bucket": "unused", "S3Key": "unused",
+            "Architectures": ["arm64"], "Publish": True,
+            "S3ObjectStorageMode": "CustomerManaged", "SourceKMSKeyArn": "changed",
+        })
+    elif operation == "config":
+        result = _lambda_mod._update_config("revision-test", {
+            "RevisionId": "stale", "Description": "changed", "MemorySize": 512,
+            "Environment": {"Variables": {"CHANGED": "true"}},
+        })
+    else:
+        result = _lambda_mod._update_alias("revision-test", "live", {
+            "RevisionId": "stale", "FunctionVersion": "2", "Description": "changed",
+            "RoutingConfig": {"AdditionalVersionWeights": {"3": 0.1}},
+        })
+    status, _, body = result
+    assert status == 412
+    assert json.loads(body)["__type"] == "PreconditionFailedException"
+    assert functions._data == before
+    fetch.assert_not_called()
+    for helper in (_lambda_mod.invalidate_worker, _lambda_mod._pool_kill_function, _lambda_mod._sweep_extract_cache,
+                   _lambda_mod._schedule_state_transition, _lambda_mod._snapstart_provision_version_async):
+        helper.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["code", "config", "alias"])
+def test_matching_and_omitted_revisions_allow_updates(functions, operation):
+    revision = "alias-before" if operation == "alias" else "function-before"
+    status, _, body = _update(operation, revision)
+    assert status == 200
+    updated = json.loads(body)
+    assert updated["RevisionId"] != revision
+    assert _update(operation, revision)[0] == 412
+    assert _update(operation, updated["RevisionId"])[0] == 200
+    assert _update(operation, None)[0] == 200
+
+
+@pytest.mark.parametrize("style", ["keyword", "mixed", "data-keyword"])
+def test_revision_updates_preserve_keyword_call_support(functions, style):
+    assert _lambda_mod._update_code(name="revision-test", data={"RevisionId": "function-before"})[0] == 200
+    revision = functions["revision-test"]["config"]["RevisionId"]
+    assert _lambda_mod._update_config(name="revision-test", data={"RevisionId": revision})[0] == 200
+    data = {"RevisionId": "alias-before"}
+    if style == "keyword":
+        result = _lambda_mod._update_alias(func_name="revision-test", alias_name="live", data=data)
+    elif style == "mixed":
+        result = _lambda_mod._update_alias("revision-test", alias_name="live", data=data)
+    else:
+        result = _lambda_mod._update_alias("revision-test", "live", data=data)
+    assert result[0] == 200
+
+
+@pytest.mark.parametrize("first,second", [("code", "code"), ("code", "config"),
+                                        ("config", "code"), ("config", "config"),
+                                        ("alias", "alias")])
+def test_competing_updates_with_same_revision_have_one_winner(functions, monkeypatch, first, second):
+    entered, release, second_started, second_done = (threading.Event() for _ in range(4))
+    helper = "new_uuid" if first == "alias" else "_now_iso"
+    original = getattr(_lambda_mod, helper)
+    first_thread = []
+
+    def pause_first():
+        if threading.get_ident() == first_thread[0] and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "first update was not released"
+        return original()
+
+    monkeypatch.setattr(_lambda_mod, helper, pause_first)
+    revision = "alias-before" if first == "alias" else "function-before"
+
+    def run_first():
+        first_thread.append(threading.get_ident())
+        return _update(first, revision, "winner")
+
+    def run_second():
+        second_started.set()
+        try:
+            return _update(second, revision, "loser")
+        finally:
+            second_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner = pool.submit(run_first)
+        try:
+            assert entered.wait(5), "first update never reached mutation"
+            loser = pool.submit(run_second)
+            assert second_started.wait(5)
+            # Let an unguarded contender finish while the first revision is
+            # still current; a correctly serialized contender must wait.
+            second_done.wait(0.3)
+        finally:
+            release.set()
+        assert winner.result(timeout=5)[0] == 200
+        assert loser.result(timeout=5)[0] == 412
+    record = functions["revision-test"]
+    if first == "alias":
+        assert record["aliases"]["live"]["Description"] == "winner"
+    elif first == "code":
+        assert record["code_zip"] == b"winner"
+        assert record["config"]["Description"] == "original"
+    else:
+        assert record["config"]["Description"] == "winner"
+        assert record["code_zip"] == b"original-code"
+
+
+def test_slow_code_update_does_not_block_independent_resources(functions, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    prototype = copy.deepcopy(functions["revision-test"])
+
+    def fetch(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return b"new-code"
+
+    monkeypatch.setattr(_lambda_mod, "_fetch_code_from_s3", fetch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(_lambda_mod._update_code, "revision-test", {
+            "RevisionId": "function-before", "S3Bucket": "unused", "S3Key": "unused"})
+        try:
+            assert entered.wait(5)
+            assert pool.submit(_update, "config", name="unrelated").result(timeout=2)[0] == 200
+            assert pool.submit(_update, "alias", "alias-before").result(timeout=2)[0] == 200
+            for account, region in (("222222222222", "us-east-1"), ("000000000000", "eu-west-1")):
+                def other_tenant():
+                    with request_scope(account, region):
+                        functions["revision-test"] = copy.deepcopy(prototype)
+                        return _update("config")
+                assert pool.submit(other_tenant).result(timeout=2)[0] == 200
+        finally:
+            release.set()
+        assert slow.result(timeout=5)[0] == 200
+
+
+@pytest.mark.parametrize("operation", ["code", "config", "alias"])
+def test_missing_resource_keeps_not_found_response(functions, operation):
+    assert _update(operation, "stale", name="missing")[0] == 404
+    assert _lambda_mod._update_alias("revision-test", "missing", {"RevisionId": "stale"})[0] == 404

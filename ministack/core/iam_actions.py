@@ -12,9 +12,12 @@ import json
 import logging
 import os
 import re
+import uuid
 from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
+
+from ministack.core.arn import ArnParseError, parse_arn
 
 logger = logging.getLogger("ministack")
 
@@ -266,6 +269,46 @@ _S3_VERSIONED_ACTIONS: dict[str, str] = {
 }
 
 
+_S3CONTROL_MRAP_ASYNC_ACTIONS = {
+    "create": "s3:CreateMultiRegionAccessPoint",
+    "delete": "s3:DeleteMultiRegionAccessPoint",
+    "put-policy": "s3:PutMultiRegionAccessPointPolicy",
+}
+
+
+def s3control_action(method: str, path: str) -> str | None:
+    """IAM action for an S3 Control Multi-Region Access Point or access point request, or None."""
+    from urllib.parse import unquote
+
+    from ministack.services import s3
+
+    # Access point and MRAP instance actions come from the route the handler serves.
+    for in_family, route_of in ((s3.is_object_lambda_control_path, s3.object_lambda_control_route),
+                                (s3.is_access_point_control_path, s3.access_point_control_route)):
+        if in_family(path):
+            route = route_of(path)
+            return route[3].get(method) if route else None
+    instances = "/v20180820/mrap/instances"
+    if unquote(path) == instances or unquote(path).startswith(instances + "/"):
+        route = s3.mrap_control_route(path)
+        return route[3].get(method) if route else None
+    path = unquote(path).rstrip("/")
+    async_prefix = "/v20180820/async-requests/mrap/"
+    if path.startswith(async_prefix):
+        tail = path[len(async_prefix):]
+        if method == "POST":
+            return _S3CONTROL_MRAP_ASYNC_ACTIONS.get(tail)
+        return "s3:DescribeMultiRegionAccessPointOperation" if method == "GET" else None
+    return None
+
+
+def s3_object_lambda_action(method: str, key: str, query_params: dict) -> str | None:
+    """The ``s3-object-lambda:`` action for a request through an Object Lambda
+    Access Point: the S3 action the same request names, in that service."""
+    action = _s3_action(method, f"/olap/{key}" if key else "/olap", query_params or {})
+    return f"s3-object-lambda:{action}" if action else None
+
+
 def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     parts = [p for p in path.split("/") if p]
     depth = min(len(parts), 2)
@@ -393,9 +436,25 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
     return checks
 
 
+def s3_access_point_resources(resource_arn: str) -> list[tuple[str, dict]]:
+    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias."""
+    from ministack.services import s3 as s3_svc
+
+    alias, sep, key = resource_arn.removeprefix("arn:aws:s3:::").partition("/")
+    access_point = s3_svc.access_point_for_alias(alias) if resource_arn.startswith("arn:aws:s3:::") else None
+    if access_point is None:
+        return [(resource_arn, {})]
+    access_point_arn, bucket, keys = access_point
+    if sep:
+        return [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+    return [(access_point_arn, keys), (f"arn:aws:s3:::{bucket}", keys)]
+
+
 # Lambda REST path → IAM action
 def _lambda_action(method: str, path: str) -> str | None:
     parts = [p for p in path.split("/") if p]
+    if parts[1:2] == ["tags"]:
+        return {"POST": "TagResource", "DELETE": "UntagResource"}.get(method, "ListTags")
     if "functions" not in parts:
         if "layers" in parts:
             if method == "GET":
@@ -476,11 +535,13 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "airflow": ["mwaa"],
     "opensearch": ["opensearch"],
     "pipes": ["pipes"],
+    "rds-data": ["rds-data"],
     "resource-groups": ["resource-groups"],
     "route53": ["route53"],
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "ses": ["sesv2"],  # the v2 REST API; v1 names its Action
     "signer": ["signer"],
 }
 
@@ -543,8 +604,8 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
     return compiled, specificity, required_query
 
 
-def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, str, int, dict[str, str]]]:
-    """Load a botocore service model and compile its URI routes."""
+def _load_botocore_model(botocore_service: str) -> dict:
+    """Load a botocore service model, or {} when there is none."""
     try:
         import gzip
 
@@ -556,30 +617,33 @@ def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, 
 
     svc_dir = os.path.join(data_dir, botocore_service)
     if not os.path.isdir(svc_dir):
-        return []
+        return {}
 
     versions = sorted(os.listdir(svc_dir))
     if not versions:
-        return []
+        return {}
 
     model_path = os.path.join(svc_dir, versions[-1], "service-2.json.gz")
     if not os.path.exists(model_path):
         model_path = os.path.join(svc_dir, versions[-1], "service-2.json")
         if not os.path.exists(model_path):
-            return []
+            return {}
 
     try:
         if model_path.endswith(".gz"):
             import gzip
             with gzip.open(model_path, "rt") as f:
-                model = json.load(f)
-        else:
-            with open(model_path) as f:
-                model = json.load(f)
+                return json.load(f)
+        with open(model_path) as f:
+            return json.load(f)
     except Exception:
         logger.debug("AUTH: failed to load botocore model for %s", botocore_service)
-        return []
+        return {}
 
+
+def _load_botocore_routes(botocore_service: str) -> list[tuple[str, re.Pattern, str, int, dict[str, str]]]:
+    """Load a botocore service model and compile its URI routes."""
+    model = _load_botocore_model(botocore_service)
     routes = []
     for op_name, op_def in model.get("operations", {}).items():
         http = op_def.get("http", {})
@@ -732,6 +796,8 @@ def extract_iam_action(service: str, method: str, path: str,
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
         return f"{_IAM_NAMESPACE_BY_OPERATION.get((service, action_name), namespace)}:{action_name}"
+    if service == "ses" and method == "GET" and path.rstrip("/") in _SES_V2_LEGACY_LIST_ROUTES:
+        return f"ses:{_SES_V2_LEGACY_LIST_ROUTES[path.rstrip('/')]}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)
@@ -763,6 +829,9 @@ _SERVICE_PROTOCOL: dict[str, str] = {
     "sts": "query-xml",
     # Everything else defaults to JSON
 }
+
+# Services that name an authorization failure with their own code.
+_DENIED_CODES: dict[str, str] = {"sns": "AuthorizationError"}
 
 # Services whose Query API also answers JSON / smithy-rpc-v2-cbor, where the
 # error has to come back in the encoding the request arrived in.
@@ -854,6 +923,33 @@ def _kms_key_id_from_ciphertext(ciphertext_b64: str) -> str:
     return candidate if _KMS_KEY_ID_RE.match(candidate) else ""
 
 
+# Older SDK models send these SES v2 list calls as GET on the collection; the current model lists with POST.
+_SES_V2_LEGACY_LIST_ROUTES = {
+    "/v2/email/identities": "ListEmailIdentities",
+    "/v2/email/configuration-sets": "ListConfigurationSets",
+}
+
+# SES v2 path collection -> the resource type it names, and the body field that names it on create.
+_SES_V2_RESOURCES = {
+    "configuration-sets": ("configuration-set", "ConfigurationSetName"),
+    "contact-lists": ("contact-list", "ContactListName"),
+    "custom-verification-email-templates": ("custom-verification-email-template", "TemplateName"),
+    "dedicated-ip-pools": ("dedicated-ip-pool", "PoolName"),
+    "identities": ("identity", "EmailIdentity"),
+    "templates": ("template", "TemplateName"),
+}
+
+
+def _ses_v2_resource_arn(method: str, path: str, body: bytes, region: str, account_id: str) -> str:
+    """The SES v2 resource a /v2/email path or create body names, or '*'."""
+    parts = [p for p in path.split("/") if p]
+    if parts[:2] != ["v2", "email"] or len(parts) < 3 or parts[2] not in _SES_V2_RESOURCES:
+        return "*"
+    resource_type, create_field = _SES_V2_RESOURCES[parts[2]]
+    name = parts[3] if len(parts) > 3 else _safe_json_field(body, create_field) if method == "POST" else ""
+    return f"arn:aws:ses:{region}:{account_id}:{resource_type}/{name}" if name else "*"
+
+
 def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
@@ -897,10 +993,14 @@ def extract_resource_arn(service: str, method: str, path: str,
     if service == "lambda":
         # Path: /2015-03-31/functions/{name}/...
         path_parts = [p for p in path.split("/") if p]
+        if path_parts[1:2] == ["tags"] and len(path_parts) > 2:
+            return unquote("/".join(path_parts[2:]))
         if "functions" in path_parts:
             fi = path_parts.index("functions")
             if fi + 1 < len(path_parts):
-                func_name = path_parts[fi + 1]
+                func_name = unquote(path_parts[fi + 1])
+                if func_name.startswith("arn:"):
+                    return func_name
                 return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
         if "layers" in path_parts:
             li = path_parts.index("layers")
@@ -923,11 +1023,13 @@ def extract_resource_arn(service: str, method: str, path: str,
             # POST /{account_id}/{queue_name}
             parts = [p for p in path.split("/") if p]
             if len(parts) >= 2 and parts[-2].isdigit():
-                queue_url = parts[-1]
+                queue_url = "/".join(parts[-2:])
         if queue_url:
-            queue_name = queue_url.rstrip("/").split("/")[-1]
-            if queue_name:
-                return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+            # The queue belongs to the account its URL names, not always the caller's.
+            parts = queue_url.rstrip("/").split("/")
+            owner = parts[-2] if len(parts) >= 2 and re.fullmatch(r"\d{12}", parts[-2]) else account_id
+            if parts[-1]:
+                return f"arn:aws:sqs:{region}:{owner}:{parts[-1]}"
         # QueueName param (CreateQueue, GetQueueUrl)
         queue_name = _param(body, query_params, "QueueName")
         if queue_name:
@@ -1252,7 +1354,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         identity = _query_param(query_params, "Identity")
         if identity:
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
-        return "*"
+        return _ses_v2_resource_arn(method, path, body, region, account_id)
 
     if service == "signer":
         # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
@@ -1316,12 +1418,19 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudfront":
-        # REST: /2020-05-31/distribution/{id}
+        # REST: /2020-05-31/distribution/{id}, /2020-05-31/vpc-origin/{id}
         parts = [p for p in path.split("/") if p]
         if "distribution" in parts:
             di = parts.index("distribution")
             if di + 1 < len(parts):
                 return f"arn:aws:cloudfront::{account_id}:distribution/{parts[di + 1]}"
+        if "vpc-origin" in parts:
+            vi = parts.index("vpc-origin")
+            if vi + 1 < len(parts):
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/{parts[vi + 1]}"
+            if method == "POST":
+                # CreateVpcOrigin authorizes on every VPC origin of the account.
+                return f"arn:aws:cloudfront::{account_id}:vpcorigin/*"
         return "*"
 
     if service in ("cognito-idp", "cognito_idp"):
@@ -1523,12 +1632,22 @@ def extract_resource_arn(service: str, method: str, path: str,
         parts = [p for p in path.split("/") if p]
         # Publish and the retained-message calls take everything after the
         # prefix as the topic, and a topic is multi-level: the ARN is
-        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
-        # percent-encoded from the SDK, which is why iot_data._publish unquotes
-        # as well.
+        # topic/sensors/a/temperature, not topic/sensors. The path is already
+        # decoded, so a %41 left in it is part of the topic name.
         if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
-            topic = unquote("/".join(parts[1:]))
+            topic = "/".join(parts[1:])
             return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
+        # The tagging calls authorize on the resource they name in resourceArn,
+        # read from where the handler reads it: the body of a POST, the query of a GET.
+        if parts in (["tags"], ["untag"]):
+            arn = (_safe_json_field(body, "resourceArn") if method == "POST"
+                   else _query_param(query_params, "resourceArn"))
+            return arn if isinstance(arn, str) and arn else "*"
+        # A membership call is checked on the thing group and the thing its body
+        # names: the group here, the thing in iot_resource_arns()[1:].
+        membership = iot_resource_arns(method, path, body, region, account_id)
+        if membership:
+            return membership[0]
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1704,6 +1823,37 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     ]
 
 
+_IOT_MEMBERSHIP_PATHS = ("/thing-groups/addThingToThingGroup", "/thing-groups/removeThingFromThingGroup")
+
+
+def iot_resource_arns(method: str, path: str, body: bytes, region: str, account_id: str) -> list[str]:
+    """The thing group and the thing a thing-group membership call names, in the order AWS checks them."""
+    if method not in ("PUT", "POST") or path not in _IOT_MEMBERSHIP_PATHS:
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    arns = []
+    for field, rtype in (("thingGroup", "thinggroup"), ("thing", "thing")):
+        # The handler refuses a body whose name and ARN differ, and an ARN of
+        # another region names the resource of the request's region.
+        name, arn = data.get(f"{field}Name"), data.get(f"{field}Arn")
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            spec = None
+        if isinstance(name, str) and name:
+            arns.append(f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}")
+        elif spec and spec.service == "iot" and spec.account_id == account_id and spec.resource.startswith(f"{rtype}/"):
+            arns.append(f"arn:aws:iot:{region}:{account_id}:{spec.resource}")
+        else:
+            arns.append(arn if isinstance(arn, str) and arn else "*")
+    return arns
+
+
 def logs_service_context(action: str, body: bytes, resource_arn: str,
                          region: str, account_id: str) -> dict:
     """Tag conditions from the Logs payload and the existing scoped resource.
@@ -1788,6 +1938,48 @@ def dynamodb_transaction_checks(
     return checks
 
 
+def s3_service_context(iam_action: str, query_params: dict | None, path: str = "",
+                       headers: dict | None = None) -> dict:
+    """The S3 condition keys a request carries: listing keys, a write's encryption and ACL, a read's object tags."""
+    if iam_action in ("s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"):
+        return _s3_object_context(iam_action, query_params or {}, path, headers or {})
+    if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
+        return {}
+    context = {}
+    for param in ("prefix", "delimiter", "max-keys"):
+        value = (query_params or {}).get(param)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if value is not None:
+            context[f"s3:{param}"] = value
+    return context
+
+
+def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
+    """s3:x-amz-server-side-encryption, s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
+    from ministack.services import s3 as s3_svc
+
+    bucket, _, key = path.lstrip("/").partition("/")
+    context: dict = {}
+    if not key:
+        return context
+    if iam_action == "s3:PutObject":
+        # A part and the completion carry no headers: the upload's own request decides.
+        upload_id = _query_param(query_params, "uploadId")
+        sse = s3_svc.upload_encryption_header(upload_id) if upload_id else headers.get("x-amz-server-side-encryption")
+        if sse:
+            context["s3:x-amz-server-side-encryption"] = sse
+        if not upload_id:
+            for name in ("x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
+                         "x-amz-grant-write-acp", "x-amz-grant-full-control"):
+                if headers.get(name):
+                    context[f"s3:{name}"] = headers[name]
+    else:
+        for name, value in s3_svc.object_tags_for_condition(bucket, key, query_params).items():
+            context[f"s3:ExistingObjectTag/{name}"] = value
+    return context
+
+
 def dynamodb_service_context(body: bytes) -> dict:
     """The DynamoDB condition keys a request carries.
 
@@ -1835,10 +2027,163 @@ def dynamodb_service_context(body: bytes) -> dict:
     return context
 
 
+_TAG_MEMBERS = frozenset({"Tags", "tags", "TagKeys"})
+_TAG_OPERATIONS: dict[str, frozenset[str]] = {}
+_QUERY_TAG_RE = re.compile(r"^((?:.+\.)?Tags?(?:\.member)?\.\d+)\.Key$")
+_QUERY_TAG_KEY_RE = re.compile(r"^(?:TagKeys?(?:\.member)?\.\d+|tagKeys)$")
+
+
+def _tag_operations(service: str) -> frozenset[str]:
+    """The operations of *service* whose input carries tags or tag keys."""
+    if service not in _TAG_OPERATIONS:
+        ops = set()
+        for name in _BOTOCORE_SERVICE_MAP.get(service) or [service]:
+            model = _load_botocore_model(name)
+            shapes = model.get("shapes", {})
+            for op_name, op in model.get("operations", {}).items():
+                members = shapes.get(op.get("input", {}).get("shape"), {}).get("members", {})
+                if _TAG_MEMBERS & members.keys():
+                    ops.add(op_name)
+        _TAG_OPERATIONS[service] = frozenset(ops)
+    return _TAG_OPERATIONS[service]
+
+
+def request_tag_context(service: str, iam_action: str, body: bytes, params: dict) -> dict:
+    """aws:RequestTag/<key> for every tag a request sets and aws:TagKeys for every key it sets or removes."""
+    if iam_action.split(":", 1)[-1] not in _tag_operations(service):
+        return {}
+    tags: list[tuple[str, str]] = []
+    keys: list[str] = []
+    try:
+        data = json.loads(body) if body[:1] == b"{" else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if isinstance(data, dict):
+        raw = data.get("Tags", data.get("tags"))
+        if isinstance(raw, dict):
+            tags += [(str(k), str(v)) for k, v in raw.items()]
+        for tag in raw if isinstance(raw, list) else []:
+            if isinstance(tag, dict):
+                key = tag.get("Key", tag.get("TagKey", tag.get("key")))
+                tags.append((str(key), str(tag.get("Value", tag.get("TagValue", tag.get("value", ""))))))
+        if isinstance(data.get("TagKeys"), list):
+            keys += [str(k) for k in data["TagKeys"]]
+    for name, value in params.items():
+        match = _QUERY_TAG_RE.match(name)
+        if match:
+            tags.append((_query_param(params, name), _query_param(params, f"{match.group(1)}.Value")))
+        elif _QUERY_TAG_KEY_RE.match(name):
+            keys += value if isinstance(value, list) else [value]
+    values: dict[str, list[str]] = {}
+    for name, value in tags:
+        values.setdefault(f"aws:RequestTag/{name}".lower(), []).append(value)
+    context: dict = {key: found[0] if len(found) == 1 else found for key, found in values.items()}
+    if tags or keys:
+        context["aws:TagKeys"] = [name for name, _ in tags] + keys
+    return context
+# Authentication failures by the evaluator's code: the Query API code and
+# status (also REST-XML and the query-compatible JSON services), the JSON code,
+# and S3's code, status and message.
+_UNKNOWN_KEY = (
+    "InvalidClientTokenId", 403, "UnrecognizedClientException",
+    ("InvalidAccessKeyId", 403, "The AWS Access Key Id you provided does not exist in our records."),
+)
+_INCOMPLETE = (
+    "IncompleteSignature", 400, "IncompleteSignatureException",
+    ("AuthorizationHeaderMalformed", 400, "The authorization header is malformed; the authorization header "
+                                          "requires three components: Credential, SignedHeaders, and Signature."),
+)
+_AUTH_FAILURES: dict[str, tuple[str, int, str, tuple[str, int, str]]] = {
+    "UnrecognizedClientException": _UNKNOWN_KEY,
+    "InvalidClientTokenId": _UNKNOWN_KEY,
+    "ExpiredTokenException": (
+        "ExpiredToken", 403, "ExpiredTokenException",
+        ("ExpiredToken", 400, "The provided token has expired."),
+    ),
+    "InvalidToken": (
+        "InvalidClientTokenId", 403, "UnrecognizedClientException",
+        ("InvalidToken", 400, "The provided token is malformed or otherwise invalid."),
+    ),
+    "SignatureDoesNotMatch": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("SignatureDoesNotMatch", 403, "The request signature we calculated does not match the signature "
+                                       "you provided. Check your key and signing method."),
+    ),
+    "CredentialDateMismatch": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("AuthorizationHeaderMalformed", 400, "The authorization header is malformed; Invalid credential date. "
+                                              "Date is not the same as X-Amz-Date."),
+    ),
+    "RequestTimeTooSkewed": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("RequestTimeTooSkewed", 403, "The difference between the request time and the current time is too large."),
+    ),
+    "RequestExpired": (
+        "SignatureDoesNotMatch", 403, "InvalidSignatureException",
+        ("AccessDenied", 403, "Request has expired"),
+    ),
+    "IncompleteSignature": _INCOMPLETE,
+    "MissingAuthorizationParameter": _INCOMPLETE,
+    "UnsupportedSignature": (
+        "IncompleteSignature", 400, "IncompleteSignatureException",
+        ("InvalidRequest", 400, "The authorization mechanism you have provided is not supported. "
+                                "Please use AWS4-HMAC-SHA256."),
+    ),
+}
+
+_QUERY_COMPATIBLE = frozenset({"sqs"})
+
+_EC2_AUTH_FAILURE = ("AuthFailure", 401, "AWS was not able to validate the provided access credentials")
+_EC2_FAILURES = {"ExpiredTokenException": ("RequestExpired", 400, "Request has expired.")}
+
+
+def _auth_failure(service: str, code: str, message: str, headers: dict) -> tuple[str, int, str]:
+    """The code, status and message a service answers for a failed authentication."""
+    if service == "lambda" and code == "MissingAuthorizationParameter":
+        return "MissingAuthenticationTokenException", 403, "Missing Authentication Token"
+    query_code, query_status, json_code, s3_failure = _AUTH_FAILURES[code]
+    protocol = _SERVICE_PROTOCOL.get(service)
+    if service == "s3":
+        return s3_failure
+    if service == "ec2":
+        return _EC2_FAILURES.get(code, _EC2_AUTH_FAILURE)
+    if protocol == "rest-xml":
+        return query_code, 403, message
+    if protocol or service in _QUERY_COMPATIBLE:
+        return query_code, query_status, message
+    return json_code, 400 if headers.get("x-amz-target") else 403, message
+
+
+def _resource_policy_denial(service: str, action: str, principal_arn: str, resource_arn: str) -> str:
+    """A denial's message when an explicit Deny in the resource's own policy decided, in the service's spelling."""
+    prefix, _, name = action.partition(":")
+    if service == "sqs":
+        action = f"{prefix}:{name.lower()}"
+    elif service == "sns":
+        action = f"SNS:{name}"
+    elif service == "s3":
+        resource_arn = f'"{resource_arn}"'
+    elif service == "apigateway":
+        account = resource_arn.split(":")[4]
+        resource_arn = resource_arn.replace(f":{account}:", f":********{account[-4:]}:", 1)
+    return (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
+            "with an explicit deny in a resource-based policy")
+
+
+def identity_denial_message(action: str, principal_arn: str, resource: str, explicit_deny: bool) -> str:
+    """The message of a denial an identity-based policy decided, naming the resource."""
+    reason = (
+        "with an explicit deny in an identity-based policy" if explicit_deny
+        else f"because no identity-based policy allows the {action} action"
+    )
+    return f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource} {reason}"
+
+
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
-                           resource_arn: str = "*", explicit_deny: bool = False) -> tuple:
+                           resource_arn: str = "*", explicit_deny: bool = False,
+                           resource_policy_arn: str = "") -> tuple:
     """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
@@ -1849,25 +2194,32 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     if service in {"ssm", "logs"} and not error_code:
         # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
         # capitalized Message naming the resource, as observed on live AWS.
-        reason = (
-            "with an explicit deny in an identity-based policy" if explicit_deny
-            else f"because no identity-based policy allows the {action} action"
-        )
-        message = (
-            f"User: {principal_arn} is not authorized to perform: {action} "
-            f"on resource: {resource_arn} {reason}"
-        )
+        message = identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
+    if service == "iot-data":
+        # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
+        # for a failed authentication, no message for a policy denial.
+        return (
+            403, {"Content-Type": "application/json", "x-amzn-errortype": "ForbiddenException:"},
+            json.dumps({"message": "Forbidden" if error_code else None, "traceId": str(uuid.uuid4())}).encode(),
+        )
+    if not message and explicit_deny and resource_policy_arn:
+        message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
     if not message:
         reason = (
             "with an explicit deny in an identity-based policy" if explicit_deny
             else f"because no identity-based policy allows the {action} action"
         )
-        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
-    code = error_code or "AccessDenied"
+        # IoT names the resource, "*" for an action that takes none.
+        on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
+    code = error_code or _DENIED_CODES.get(service, "AccessDenied")
+    status = 403
+    if code in _AUTH_FAILURES:
+        code, status, message = _auth_failure(service, code, message, headers or {})
     protocol = _SERVICE_PROTOCOL.get(service, "json")
     if service in _CBOR_CAPABLE:
         # CloudWatch answers the legacy Query API in XML but botocore 1.42+
@@ -1885,7 +2237,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         json_type = code if code != "AccessDenied" else "AccessDeniedException"
         try:
             import cbor2
-            return (403,
+            return (status,
                     {"Content-Type": "application/cbor", "smithy-protocol": "rpc-v2-cbor"},
                     cbor2.dumps({"__type": json_type, "message": message}))
         except ImportError:
@@ -1902,7 +2254,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             f"<Message>{_esc_msg}</Message>"
             f"<RequestId>{_esc_rid}</RequestId></Error>"
         )
-        return 403, {"Content-Type": "application/xml"}, body.encode()
+        return status, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "ec2-xml":
         ec2_code = "UnauthorizedOperation" if code == "AccessDenied" else _esc_code
@@ -1914,18 +2266,27 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             f"</Error></Errors>"
             f"<RequestID>{_esc_rid}</RequestID></Response>"
         )
-        return 403, {"Content-Type": "application/xml"}, body.encode()
+        return status, {"Content-Type": "application/xml"}, body.encode()
 
     if protocol == "query-xml":
+        # Query error envelopes carry no <?xml?> declaration (AWS captures).
         ns = _QUERY_XML_NS.get(service, "https://iam.amazonaws.com/doc/2010-05-08/")
         body = (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<ErrorResponse xmlns="{ns}">'
             f"<Error><Type>Sender</Type><Code>{_esc_code}</Code>"
             f"<Message>{_esc_msg}</Message></Error>"
             f"<RequestId>{_esc_rid}</RequestId></ErrorResponse>"
         )
-        return 403, {"Content-Type": "text/xml"}, body.encode()
+        return status, {"Content-Type": "text/xml"}, body.encode()
+
+    if service == "sqs" and headers is not None and not headers.get("x-amz-target"):
+        # A query-mode SQS request is answered in SQS's query XML (live AWS capture).
+        body = (
+            '<?xml version="1.0"?><ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
+            f"<Error><Type>Sender</Type><Code>{_esc_code}</Code><Message>{_esc_msg}</Message><Detail/></Error>"
+            f"<RequestId>{_esc_rid}</RequestId></ErrorResponse>"
+        )
+        return status, {"Content-Type": "text/xml"}, body.encode()
 
     # JSON protocol (DynamoDB, Lambda, KMS, Logs, Glue, etc.)
     json_type = code if code != "AccessDenied" else "AccessDeniedException"
@@ -1933,11 +2294,11 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         "__type": json_type,
         "message": message,
     })
-    return (
-        403,
-        {
-            "Content-Type": "application/x-amz-json-1.0",
-            "x-amzn-errortype": json_type,
-        },
-        body.encode(),
-    )
+    reply_headers = {
+        "Content-Type": "application/x-amz-json-1.0",
+        "x-amzn-errortype": json_type,
+    }
+    if service == "sqs":
+        # awsQueryCompatible: SDKs report the legacy code from this header.
+        reply_headers["x-amzn-query-error"] = f"{code};Sender"
+    return status, reply_headers, body.encode()

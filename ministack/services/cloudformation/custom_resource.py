@@ -7,6 +7,8 @@ import logging
 import os
 import threading
 
+from ministack.core.tls import use_ssl_enabled
+
 logger = logging.getLogger("cloudformation")
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -41,8 +43,14 @@ def reset():
         _pending.clear()
 
 
+def _gateway_url() -> str:
+    """The gateway's base URL, in the scheme it serves."""
+    scheme = "https" if use_ssl_enabled() else "http"
+    return f"{scheme}://{_HOST}:{_PORT}"
+
+
 def _response_url(token: str) -> str:
-    return f"http://{_HOST}:{_PORT}/_ministack/cfn-response/{token}"
+    return f"{_gateway_url()}/_ministack/cfn-response/{token}"
 
 
 def _normalise_resource_properties(value):

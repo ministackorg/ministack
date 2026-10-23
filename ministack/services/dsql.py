@@ -1206,9 +1206,10 @@ def reset():
 
             docker_client = rds._get_docker()
             if docker_client:
-                for c in docker_client.containers.list(
-                    all=True, filters={"label": "ministack=dsql"}
-                ):
+                for c in docker_client.containers.list(all=True, filters={"label": [
+                    "ministack=dsql",
+                    f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+                ]}):
                     try:
                         c.stop(timeout=2)
                         c.remove(v=True)

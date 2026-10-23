@@ -12,15 +12,19 @@ Operations: PutMetricData, GetMetricStatistics, GetMetricData, ListMetrics,
             PutDashboard, GetDashboard, DeleteDashboards, ListDashboards.
 """
 
+import base64
 import copy
+import functools
 import json
 import logging
 import os
 import re
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
+from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
@@ -40,6 +44,8 @@ _metrics = AccountRegionScopedDict()
 # dashboards/history have no ARN so legacy data lands in the default region.
 _alarms = AccountRegionScopedDict()
 _composite_alarms = AccountRegionScopedDict()
+# Composite alarm name -> names of its children that changed state since its last transition, newest first.
+_composite_triggers = AccountRegionScopedDict()
 # Alarm state-change history, per-account+region. Stored under a single key
 # "entries" so the standard list manipulation still applies to the caller's scope.
 _alarm_history = AccountRegionScopedDict()
@@ -111,6 +117,7 @@ def get_state():
         "metrics": copy.deepcopy(_metrics),
         "alarms": copy.deepcopy(_alarms),
         "composite_alarms": copy.deepcopy(_composite_alarms),
+        "composite_triggers": copy.deepcopy(_composite_triggers),
         "alarm_history": copy.deepcopy(_alarm_history),
         "dashboards": copy.deepcopy(_dashboards),
         "resource_tags": copy.deepcopy(_resource_tags),
@@ -126,6 +133,7 @@ def _restore_state(data):
         _metrics.update(data.get("metrics", {}))
         _alarms.update(data.get("alarms", {}))
         _composite_alarms.update(data.get("composite_alarms", {}))
+        _composite_triggers.update(data.get("composite_triggers", {}))
         _alarm_history.update(data.get("alarm_history", {}))
         _dashboards.update(data.get("dashboards", {}))
         _resource_tags.update(data.get("resource_tags", {}))
@@ -335,6 +343,7 @@ def _evaluate_alarm(alarm):
         alarm["StateUpdatedTimestamp"] = int(time.time())
         _record_history(alarm["AlarmName"], old_state, new_state, reason)
         _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+        _evaluate_parent_alarms(alarm)
 
 
 def _evaluate_all_alarms():
@@ -345,11 +354,14 @@ def _evaluate_all_alarms():
             logger.debug("alarm eval error", exc_info=True)
 
 
-def _record_history(alarm_name, old_state, new_state, reason):
+def _record_history(alarm_name, old_state, new_state, reason, alarm_type="MetricAlarm", reason_data=None):
+    new = {"stateValue": new_state, "stateReason": reason}
+    if reason_data is not None:
+        new["stateReasonData"] = reason_data
     _history_entries().append(
         {
             "AlarmName": alarm_name,
-            "AlarmType": "MetricAlarm",
+            "AlarmType": alarm_type,
             "Timestamp": _ts_iso(time.time()),
             "HistoryItemType": "StateUpdate",
             "HistorySummary": f"Alarm updated from {old_state} to {new_state}",
@@ -357,7 +369,7 @@ def _record_history(alarm_name, old_state, new_state, reason):
                 {
                     "version": "1.0",
                     "oldState": {"stateValue": old_state},
-                    "newState": {"stateValue": new_state, "stateReason": reason},
+                    "newState": new,
                 }
             ),
         }
@@ -514,7 +526,9 @@ async def handle_request(method, path, headers, body, query_params):
                 logger.error("JSON decode error: %s", e)
                 cbor_data = {}
         else:
-            for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
+            # Blank values kept: "Tags.member.2.Value=" is an empty value on
+            # AWS, while an absent member is null.
+            for k, v in parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True).items():
                 params[k] = v
 
     action = ""
@@ -984,10 +998,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": cbor_data.get("ExtendedStatistic"),
             "Period": int(cbor_data.get("Period", 60)),
             "EvaluationPeriods": int(cbor_data.get("EvaluationPeriods", 1)),
-            "DatapointsToAlarm": int(
-                cbor_data.get("DatapointsToAlarm")
-                or cbor_data.get("EvaluationPeriods", 1)
-            ),
+            "DatapointsToAlarm": _optional_int(cbor_data.get("DatapointsToAlarm")),
             "Threshold": float(cbor_data.get("Threshold", 0)),
             "ComparisonOperator": cbor_data.get("ComparisonOperator"),
             "TreatMissingData": cbor_data.get("TreatMissingData", "missing"),
@@ -1040,11 +1051,7 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "ExtendedStatistic": _p(params, "ExtendedStatistic") or None,
             "Period": int(_p(params, "Period") or "60"),
             "EvaluationPeriods": int(_p(params, "EvaluationPeriods") or "1"),
-            "DatapointsToAlarm": int(
-                _p(params, "DatapointsToAlarm")
-                or _p(params, "EvaluationPeriods")
-                or "1"
-            ),
+            "DatapointsToAlarm": _optional_int(_p(params, "DatapointsToAlarm") or None),
             "Threshold": float(_p(params, "Threshold") or "0"),
             "ComparisonOperator": _p(params, "ComparisonOperator"),
             "TreatMissingData": _p(params, "TreatMissingData") or "missing",
@@ -1067,7 +1074,22 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
         }
 
     is_new = name not in _alarms
+    tags = _alarm_request_tags(params, cbor_data, is_cbor, is_json)
+    refused = _alarm_tags_refusal(tags, alarm["DatapointsToAlarm"], is_new, is_cbor, is_json)
+    if refused:
+        return refused
+
+    # AWS describes DatapointsToAlarm only when the request sets it (absent
+    # and null alike); keep it off the record otherwise.
+    if alarm["DatapointsToAlarm"] is None:
+        del alarm["DatapointsToAlarm"]
+
     _alarms[name] = alarm
+    # PutMetricAlarm applies Tags on creation only; on an existing alarm they
+    # are ignored on every protocol (TagResource and UntagResource change them).
+    # A key sent twice keeps its last value.
+    if is_new and tags:
+        _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
 
     if is_new:
         _record_history(
@@ -1084,6 +1106,429 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
     if is_json:
         return _json_ok({})
     return _xml(200, "PutMetricAlarmResponse", "")
+
+
+_ALARM_TAG_LIMIT = 50
+
+
+_QUERY_TAG_MEMBER = re.compile(r"Tags\.member\.([1-9][0-9]*)\.(Key|Value)")
+
+
+def _alarm_request_tags(params, cbor_data, is_cbor, is_json=False):
+    """An alarm request's Tags as sent, or None when absent. Query members are
+    read in index order, and one sent without Key or Value keeps that member
+    missing (AWS reports it as null)."""
+    if is_cbor or is_json:
+        return cbor_data.get("Tags")
+    members = {}
+    for param in params:
+        match = _QUERY_TAG_MEMBER.fullmatch(param)
+        if match:
+            members.setdefault(int(match.group(1)), {})[match.group(2)] = _p(params, param)
+    return [members[index] for index in sorted(members)] if members else None
+
+
+def _string_member_type_error(value):
+    """AWS's SerializationException text for a JSON/CBOR value sent where a
+    String is expected ("" where AWS sends no message), or None for a string
+    or null."""
+    if value is None or isinstance(value, str):
+        return None
+    if isinstance(value, bool):
+        return f"{'TRUE' if value else 'FALSE'}_VALUE cannot be converted to String"
+    if isinstance(value, int):
+        return "NUMBER_VALUE cannot be converted to String"
+    if isinstance(value, float):
+        return "DECIMAL_VALUE cannot be converted to String"
+    if isinstance(value, dict):
+        return "Start of structure or map found where not expected"
+    return ""
+
+
+def _tags_serialization_error(tags):
+    """The first wrong JSON type in Tags, in document order, as (code, message,
+    status), or None."""
+    if tags is None:
+        return None
+    if isinstance(tags, dict):
+        return "MalformedInput", "Start of structure or map found where not expected", 400
+    if not isinstance(tags, list):
+        return "MalformedInput", "Unexpected field type", 400
+    for tag in tags:
+        if tag is None:
+            return "InternalFailure", "", 500
+        if isinstance(tag, list):
+            return "MalformedInput", "", 400
+        if not isinstance(tag, dict):
+            return "MalformedInput", "Unexpected value type in payload", 400
+        for field in tag:
+            if field in ("Key", "Value"):
+                message = _string_member_type_error(tag[field])
+                if message is not None:
+                    return "MalformedInput", message, 400
+    return None
+
+
+def _tag_constraint_errors(tags):
+    """Constraint messages for each tag in order, Value before Key."""
+    errors = []
+    for i, tag in enumerate(tags or [], 1):
+        value, key = tag.get("Value"), tag.get("Key")
+        if value is None:
+            errors.append(f"Value null at 'tags.{i}.member.value' failed to satisfy constraint: Member must not be null")
+        elif len(value) > 256:
+            errors.append(f"Value '{value}' at 'tags.{i}.member.value' failed to satisfy constraint: "
+                          "Member must have length less than or equal to 256")
+        if key is None:
+            errors.append(f"Value null at 'tags.{i}.member.key' failed to satisfy constraint: Member must not be null")
+        elif not key:
+            errors.append(f"Value '' at 'tags.{i}.member.key' failed to satisfy constraint: "
+                          "Member must have length greater than or equal to 1")
+        elif len(key) > 128:
+            errors.append(f"Value '{key}' at 'tags.{i}.member.key' failed to satisfy constraint: "
+                          "Member must have length less than or equal to 128")
+    return errors
+
+
+_TAG_SPECIAL_CHARS = "_.:/=+-@"
+_TAG_CHARS_MESSAGE = ("Tags can only contain letters, numbers, spaces, and the following special characters: "
+                      "_ . : / = + - @")
+_MAX_LISTED_VALIDATION_ERRORS = 10
+
+
+def _java_hashmap_order(keys):
+    """Distinct keys in the iteration order of a java.util.HashMap they were
+    put into: String.hashCode over UTF-16 units, spread (h ^ h >>> 16), default
+    capacity 16 doubled past a 0.75 load, insertion order within a bucket."""
+    unique = list(dict.fromkeys(keys))
+    capacity = 16
+    while len(unique) > capacity * 0.75:
+        capacity *= 2
+
+    def bucket(key):
+        units = key.encode("utf-16-be")
+        h = 0
+        for i in range(0, len(units), 2):
+            h = (31 * h + int.from_bytes(units[i:i + 2], "big")) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (capacity - 1)
+
+    return sorted(unique, key=lambda key: (bucket(key), unique.index(key)))
+
+
+def _tagset_error(tags):
+    """The tag-set check AWS runs on create after the member constraints, on
+    the tags de-duplicated by key (a later value replaces an earlier one): a
+    character error anywhere, then the first too-long value, then the first
+    too-long key, in the tag map's iteration order. Length counts UTF-16
+    units; a tag whose key is too long is not checked further."""
+    def too_long(text, limit):
+        return len(text.encode("utf-16-le")) // 2 > limit
+
+    def bad_chars(text):
+        return not all(unicodedata.category(ch)[0] in "LNZ" or ch in _TAG_SPECIAL_CHARS for ch in text)
+
+    values = {tag["Key"]: tag["Value"] for tag in tags or []}
+    order = _java_hashmap_order(tag["Key"] for tag in tags or [])
+    usable = [key for key in order if not too_long(key, 128)]
+    if any(bad_chars(key) or (not too_long(values[key], 256) and bad_chars(values[key])) for key in usable):
+        return _TAG_CHARS_MESSAGE
+    long_value = next((values[key] for key in usable if too_long(values[key], 256)), None)
+    if long_value is not None:
+        text, type_name = long_value, "TagValue"
+    else:
+        text = next((key for key in order if too_long(key, 128)), None)
+        if text is None:
+            return None
+        type_name = "TagKey"
+    return f"'{text}' is not a valid value for com.amazon.aws.platform.billing.tagset.type.{type_name} - it is too long"
+
+
+def _composite_system_tag_error(tags):
+    """PutCompositeAlarm's check of aws: keys, after the tag-set check, in the
+    same tag-map order (the first aws: key in that order is named)."""
+    for key in _java_hashmap_order(tag["Key"] for tag in tags or []):
+        if key.startswith("aws:"):
+            if ":" not in key[4:]:
+                return f"Invalid System Tag: {key} is missing Vendor Id."
+            return f"Invalid System Tag: {key} is not whitelisted for vendor:cloudwatch"
+        if key.lower().startswith("aws:"):
+            return f'Invalid System Tag: {key} must be prefixed with "aws:" in lowercase.'
+    return None
+
+
+def _alarm_tags_refusal(tags, datapoints, is_new, is_cbor, is_json, composite=False):
+    """The error AWS answers for an alarm's Tags (and PutMetricAlarm's
+    DatapointsToAlarm), in AWS's order, or None. A refused call stores
+    nothing. The two calls differ only in how they refuse an aws: key."""
+    def refuse(code, message, status):
+        return _error(code, "" if is_cbor and code == "MalformedInput" else message, status,
+                      use_json=is_json, use_cbor=is_cbor)
+
+    if is_cbor or is_json:
+        wrong_type = _tags_serialization_error(tags)
+        if wrong_type:
+            return refuse(*wrong_type)
+    # The aws: prefix is refused only when the call creates the alarm (an
+    # update ignores its Tags), and before the member constraints.
+    if is_new and not composite and any(isinstance(t.get("Key"), str) and t["Key"].lower().startswith("aws:")
+                                        for t in tags or []):
+        return refuse("AccessDenied", 'The provided tag keys must not start with any case of "aws:"', 403)
+    errors = _tag_constraint_errors(tags)
+    if datapoints is not None and datapoints < 1:
+        errors.append(f"Value '{datapoints}' at 'datapointsToAlarm' failed to satisfy constraint: "
+                      "Member must have value greater than or equal to 1")
+    if errors:
+        # AWS lists at most ten, and counts only those.
+        errors = errors[:_MAX_LISTED_VALIDATION_ERRORS]
+        count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected"
+        return refuse("ValidationError", f"{count}: {'; '.join(errors)}", 400)
+    if is_new:
+        invalid = _tagset_error(tags) or (_composite_system_tag_error(tags) if composite else None)
+        if invalid:
+            return refuse("ValidationError", invalid, 400)
+    if is_new and len({t["Key"] for t in tags or []}) > _ALARM_TAG_LIMIT:
+        return refuse("ValidationError", "The resultant tag set must not have more than 50 user tags.", 400)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Composite alarm rules
+# ---------------------------------------------------------------------------
+
+_RULE_TOKEN = re.compile(r'[(),]|"(?:[^"\\]|\\.)*"|[^\s(),"]+|\S')
+_RULE_STATES = ("ALARM", "OK", "INSUFFICIENT_DATA")
+_RULE_OPERAND = "'(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA"
+# Nesting cap, so the result never depends on the process recursion limit (jsonata raises it).
+_RULE_MAX_DEPTH = 256
+
+
+@functools.lru_cache(maxsize=512)
+def _parse_alarm_rule(rule):
+    """Parse an AlarmRule into a tree of tuples, raising ValueError with the AWS message."""
+    tokens = [(m.group(), m.start()) for m in _RULE_TOKEN.finditer(rule)] + [("<EOF>", len(rule))]
+    at = depth = 0
+
+    def word():
+        return tokens[at][0]
+
+    def fail(expected=None):
+        text, pos = tokens[at]
+        expected = f", must be: {expected}" if expected else ""
+        raise ValueError(f"Error in AlarmRule [Unsupported token '{text}' at char {pos}{expected}]")
+
+    def take(expected):
+        nonlocal at
+        if word() != expected:
+            fail()
+        at += 1
+
+    def ref():
+        nonlocal at
+        text = tokens[at][0]
+        if text in ("(", ")", ",", '"', "<EOF>"):
+            fail()
+        at += 1
+        return re.sub(r"\\(.)", r"\1", text[1:-1]) if text.startswith('"') else text
+
+    def operand():
+        nonlocal at, depth
+        w = word()
+        if w in ("NOT", "(") and depth >= _RULE_MAX_DEPTH:
+            fail()
+        at += 1
+        if w == "NOT":
+            depth += 1
+            node = ("not", operand())
+            depth -= 1
+            return node
+        if w == "(":
+            depth += 1
+            node = disjunction()
+            take(")")
+            depth -= 1
+            return node
+        if w in ("TRUE", "FALSE"):
+            return ("const", w == "TRUE")
+        if w in _RULE_STATES:
+            take("(")
+            name = ref()
+            take(")")
+            return ("state", w, name)
+        if w == "AT_LEAST":
+            take("(")
+            count = re.fullmatch(r"(\d+)(%?)", tokens[at][0])
+            if not count:
+                fail()
+            at += 1
+            take(",")
+            negate = word() == "NOT"
+            at += negate
+            state = word()
+            if state not in _RULE_STATES:
+                fail()
+            at += 1
+            take(",")
+            take("(")
+            names = [ref()]
+            while word() == ",":
+                at += 1
+                names.append(ref())
+            take(")")
+            take(")")
+            return ("at_least", int(count.group(1)), bool(count.group(2)), negate, state, tuple(names))
+        at -= 1
+        fail(_RULE_OPERAND)
+
+    def conjunction():
+        nonlocal at
+        nodes = [operand()]
+        while word() == "AND":
+            at += 1
+            nodes.append(operand())
+        return nodes[0] if len(nodes) == 1 else ("and", *nodes)
+
+    def disjunction():
+        nonlocal at
+        nodes = [conjunction()]
+        while word() == "OR":
+            at += 1
+            nodes.append(conjunction())
+        return nodes[0] if len(nodes) == 1 else ("or", *nodes)
+
+    try:
+        tree = disjunction()
+    except RecursionError:
+        fail()
+    if at != len(tokens) - 1:
+        fail("<EOF>, 'AND', 'OR'")
+    return tree
+
+
+def _rule_alarm_state(ref):
+    name = _rule_ref_name(ref)
+    alarm = (_alarms.get(name) or _composite_alarms.get(name)) if name else None
+    return alarm["StateValue"] if alarm else None
+
+
+def _rule_true(node):
+    """Truth of a parsed AlarmRule over the current alarm states."""
+    kind = node[0]
+    if kind == "const":
+        return node[1]
+    if kind == "state":
+        return _rule_alarm_state(node[2]) == node[1]
+    if kind == "not":
+        return not _rule_true(node[1])
+    if kind == "and":
+        return all(_rule_true(child) for child in node[1:])
+    if kind == "or":
+        return any(_rule_true(child) for child in node[1:])
+    _, count, percent, negate, state, refs = node
+    hits = sum((_rule_alarm_state(r) == state) != negate for r in refs)
+    return hits * 100 >= count * len(refs) if percent else hits >= count
+
+
+def _rule_matches(node, target):
+    """Alarm references whose own condition gives the rule the value target (NOT flips it), in rule order."""
+    kind = node[0]
+    if kind == "state":
+        return [node[2]] if (_rule_alarm_state(node[2]) == node[1]) == target else []
+    if kind == "at_least":
+        _, _, _, negate, state, refs = node
+        return [r for r in refs if ((_rule_alarm_state(r) == state) != negate) == target]
+    if kind == "not":
+        return _rule_matches(node[1], not target)
+    if kind == "const":
+        return []
+    return [r for child in node[1:] for r in _rule_matches(child, target)]
+
+
+def _rule_refs(node):
+    """Alarm references of a parsed AlarmRule, in rule order."""
+    if node[0] == "state":
+        return [node[2]]
+    if node[0] == "at_least":
+        return list(node[5])
+    if node[0] == "const":
+        return []
+    return [r for child in node[1:] for r in _rule_refs(child)]
+
+
+def _rule_ref_name(ref):
+    """Alarm name for a rule reference (a name or an alarm ARN of this account and region)."""
+    return _alarm_name_from_local_arn(ref) if ref.startswith("arn:") else ref
+
+
+def _composite_children(alarm):
+    """Names of the alarms a composite alarm's rule references, in rule order."""
+    try:
+        refs = _rule_refs(_parse_alarm_rule(alarm.get("AlarmRule", "")))
+    except ValueError:
+        return []
+    return list(dict.fromkeys(name for name in map(_rule_ref_name, refs) if name))
+
+
+def _composite_rule_state(alarm):
+    return "ALARM" if _rule_true(_parse_alarm_rule(alarm["AlarmRule"])) else "OK"
+
+
+def _matching_children(alarm, state):
+    """Children whose condition in the rule agrees with state, the most recently changed first."""
+    refs = _rule_matches(_parse_alarm_rule(alarm["AlarmRule"]), state == "ALARM")
+    names = {n for n in map(_rule_ref_name, refs) if n and n != alarm["AlarmName"]}
+    # Whole-second timestamps tie often: the alarm created later counts as the more recent one.
+    created = [n for n in list(_alarms.keys()) + list(_composite_alarms.keys()) if n in names]
+    return sorted(reversed(created), reverse=True,
+                  key=lambda n: (_alarms.get(n) or _composite_alarms[n]).get("StateUpdatedTimestamp", 0))
+
+
+def _transition_composite(alarm, new_state, reason, triggers, seen=frozenset()):
+    """Move a composite alarm to new_state and re-evaluate the composite alarms above it."""
+    triggering = []
+    for name in triggers:
+        child = _alarms.get(name) or _composite_alarms.get(name)
+        if child:
+            at = datetime.fromtimestamp(child.get("StateUpdatedTimestamp", time.time()), tz=timezone.utc)
+            triggering.append({
+                "arn": child["AlarmArn"],
+                "state": {
+                    "value": child["StateValue"],
+                    "timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.") + f"{at.microsecond // 1000:03d}+0000",
+                },
+            })
+    reason_data = {"triggeringAlarms": triggering}
+    old_state = alarm["StateValue"]
+    now = int(time.time())
+    alarm["StateValue"] = new_state
+    alarm["StateReason"] = reason
+    alarm["StateReasonData"] = json.dumps(reason_data, separators=(",", ":"))
+    alarm["StateUpdatedTimestamp"] = now
+    alarm["StateTransitionedTimestamp"] = now
+    _composite_triggers.pop(alarm["AlarmName"], None)
+    _record_history(alarm["AlarmName"], old_state, new_state, reason, "CompositeAlarm", reason_data)
+    _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+    _evaluate_parent_alarms(alarm, seen)
+
+
+def _evaluate_parent_alarms(child, seen=frozenset()):
+    """Re-evaluate the composite alarms whose rule references child after its state changed."""
+    name = child["AlarmName"]
+    # A composite already on this path is part of a cycle: stop there.
+    seen = seen | {name}
+    for parent in list(_composite_alarms.values()):
+        parent_name = parent["AlarmName"]
+        if parent_name in seen or name not in _composite_children(parent):
+            continue
+        pending = [name] + [n for n in _composite_triggers.get(parent_name, []) if n != name]
+        _composite_triggers[parent_name] = pending
+        new_state = _composite_rule_state(parent)
+        if new_state != parent["StateValue"]:
+            at = datetime.fromtimestamp(child["StateUpdatedTimestamp"], tz=timezone.utc)
+            reason = (f"{child['AlarmArn']} transitioned to {child['StateValue']} at "
+                      f"{at.strftime('%A %d %B, %Y %H:%M:%S')} UTC")
+            # Named: the children that changed since the last transition and agree with the new state.
+            agree = set(_matching_children(parent, new_state))
+            _transition_composite(parent, new_state, reason, [n for n in pending if n in agree], seen)
 
 
 def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
@@ -1116,7 +1561,33 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
             insuff_actions.append(_p(params, f"InsufficientDataActions.member.{ii}"))
             ii += 1
 
-    _composite_alarms[name] = {
+    # Tags are checked before the rule, and stored only when the call creates
+    # the alarm (an update ignores them), as with PutMetricAlarm.
+    is_new = name not in _composite_alarms
+    tags = _alarm_request_tags(params, cbor_data, is_cbor, is_json)
+    refused = _alarm_tags_refusal(tags, None, is_new, is_cbor, is_json, composite=True)
+    if refused:
+        return refused
+
+    try:
+        refs = _rule_refs(_parse_alarm_rule(alarm_rule))
+    except ValueError as exc:
+        return _error("ValidationError", str(exc), 400, use_json=is_json, use_cbor=is_cbor)
+    missing = []
+    for ref in dict.fromkeys(refs):
+        child = _rule_ref_name(ref)
+        if not child or (child not in _alarms and child not in _composite_alarms):
+            missing.append(ref if ref.startswith("arn:") else
+                           f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{ref}")
+    if missing:
+        return _error(
+            "ValidationError",
+            f"Could not save the composite alarm as alarms [{', '.join(missing)}] in the alarm rule do not exist",
+            400, use_json=is_json, use_cbor=is_cbor,
+        )
+
+    existing = _composite_alarms.get(name)
+    alarm = {
         "AlarmName": name,
         "AlarmArn": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}",
         "AlarmDescription": desc,
@@ -1130,6 +1601,21 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
         "InsufficientDataActions": insuff_actions,
         "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
+    # An update keeps the state; the new rule is evaluated at once and moves it only when the result differs.
+    if existing:
+        for key in ("StateValue", "StateReason", "StateReasonData", "StateUpdatedTimestamp",
+                    "StateTransitionedTimestamp"):
+            if key in existing:
+                alarm[key] = existing[key]
+    _composite_alarms[name] = alarm
+    if is_new and tags:
+        _resource_tags[alarm["AlarmArn"]] = {t["Key"]: t["Value"] for t in tags}
+    new_state = _composite_rule_state(alarm)
+    if not existing or new_state != alarm["StateValue"]:
+        verb = "was updated and its new alarm rule evaluates to" if existing else \
+            "was created and its alarm rule evaluates to"
+        _transition_composite(alarm, new_state, f"{alarm['AlarmArn']} {verb} {new_state}",
+                              _matching_children(alarm, new_state))
     if is_cbor:
         return _cbor_ok({})
     if is_json:
@@ -1142,13 +1628,41 @@ def _put_composite_alarm(params, cbor_data, is_cbor, is_json=False):
 # ---------------------------------------------------------------------------
 
 
+def _max_records_error(raw):
+    """ValidationError message for a MaxRecords outside 1..100, else None."""
+    if raw in (None, ""):
+        return None
+    value = int(raw)
+    if value < 1:
+        bound = "greater than or equal to 1"
+    elif value > 100:
+        bound = "less than or equal to 100"
+    else:
+        return None
+    return (f"1 validation error detected: Value '{value}' at 'maxRecords' failed to satisfy constraint: "
+            f"Member must have value {bound}")
+
+
+def _encode_page_token(position):
+    return base64.urlsafe_b64encode(position.encode()).decode().rstrip("=")
+
+
+def _decode_page_token(token):
+    """Position carried by a token from _encode_page_token, or None for any other string."""
+    try:
+        return base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+    except ValueError:
+        return None
+
+
 def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
     if is_cbor or is_json:
         names = cbor_data.get("AlarmNames", [])
         prefix = cbor_data.get("AlarmNamePrefix")
         state = cbor_data.get("StateValue")
-        alarm_types = cbor_data.get("AlarmTypes", ["MetricAlarm", "CompositeAlarm"])
-        max_records = cbor_data.get("MaxRecords", 100)
+        alarm_types = cbor_data.get("AlarmTypes") or ["MetricAlarm"]
+        max_records = cbor_data.get("MaxRecords")
+        next_token = cbor_data.get("NextToken")
     else:
         names = [
             _p(params, f"AlarmNames.member.{i}")
@@ -1161,8 +1675,14 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
             _p(params, f"AlarmTypes.member.{i}")
             for i in range(1, 11)
             if _p(params, f"AlarmTypes.member.{i}")
-        ] or ["MetricAlarm", "CompositeAlarm"]
-        max_records = int(_p(params, "MaxRecords") or "100")
+        ] or ["MetricAlarm"]
+        max_records = _p(params, "MaxRecords")
+        next_token = _p(params, "NextToken")
+
+    invalid = _max_records_error(max_records)
+    if invalid:
+        return _error("ValidationError", invalid, 400, use_json=is_json, use_cbor=is_cbor)
+    max_records = int(max_records or 50)
 
     metric_alarms = []
     composite_results = []
@@ -1187,19 +1707,33 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
                 continue
             composite_results.append(alarm)
 
-    metric_alarms = metric_alarms[:max_records]
+    # One listing in name order across both types; MaxRecords counts them together.
+    listing = sorted(
+        [(a["AlarmName"], 0, a) for a in metric_alarms] + [(a["AlarmName"], 1, a) for a in composite_results],
+        key=lambda entry: entry[:2],
+    )
+    # As on AWS, the token is the name of the next page's first alarm and a page starts at the first name at or
+    # after it, so any string is a valid token and alarms created or deleted between pages shift nothing.
+    if next_token:
+        listing = [entry for entry in listing if entry[0] >= next_token]
+    page = listing[:max_records]
+    token = listing[max_records][0] if len(listing) > max_records else None
+    metric_alarms = [a for _, kind, a in page if kind == 0]
+    composite_results = [a for _, kind, a in page if kind == 1]
 
     if is_cbor:
-        return _cbor_ok(
-            {
-                "MetricAlarms": [_cbor_alarm(a) for a in metric_alarms],
-                "CompositeAlarms": [_cbor_alarm(a) for a in composite_results],
-            }
-        )
+        result = {
+            "MetricAlarms": [_cbor_alarm(a) for a in metric_alarms],
+            "CompositeAlarms": [_cbor_alarm(a) for a in composite_results],
+        }
+        if token:
+            result["NextToken"] = token
+        return _cbor_ok(result)
     if is_json:
-        return _json_ok(
-            {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
-        )
+        result = {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
+        if token:
+            result["NextToken"] = token
+        return _json_ok(result)
 
     metric_members = "".join(
         f"<member><AlarmName>{a['AlarmName']}</AlarmName><AlarmArn>{a['AlarmArn']}</AlarmArn>"
@@ -1207,7 +1741,8 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
         f"<Namespace>{a.get('Namespace','')}</Namespace><Threshold>{a.get('Threshold','')}</Threshold>"
         f"<ComparisonOperator>{a.get('ComparisonOperator','')}</ComparisonOperator>"
         f"<EvaluationPeriods>{a.get('EvaluationPeriods','')}</EvaluationPeriods>"
-        f"<StateReason>{a.get('StateReason','')}</StateReason>"
+        + (f"<DatapointsToAlarm>{a['DatapointsToAlarm']}</DatapointsToAlarm>" if "DatapointsToAlarm" in a else "")
+        + f"<StateReason>{a.get('StateReason','')}</StateReason>"
         f"</member>"
         for a in metric_alarms
     )
@@ -1225,6 +1760,7 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
         f"<DescribeAlarmsResult>"
         f"<MetricAlarms>{metric_members}</MetricAlarms>"
         f"<CompositeAlarms>{comp_members}</CompositeAlarms>"
+        f"{f'<NextToken>{token}</NextToken>' if token else ''}"
         f"</DescribeAlarmsResult>",
     )
 
@@ -1277,29 +1813,66 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         history_type = cbor_data.get("HistoryItemType")
         start_date = _parse_ts(cbor_data.get("StartDate"))
         end_date = _parse_ts(cbor_data.get("EndDate"))
-        max_records = int(cbor_data.get("MaxRecords", 100))
+        alarm_types = cbor_data.get("AlarmTypes") or ["MetricAlarm"]
+        max_records = cbor_data.get("MaxRecords")
+        next_token = cbor_data.get("NextToken")
+        scan_by = cbor_data.get("ScanBy")
     else:
         alarm_name = _p(params, "AlarmName")
         history_type = _p(params, "HistoryItemType")
         start_date = _parse_ts(_p(params, "StartDate"))
         end_date = _parse_ts(_p(params, "EndDate"))
-        max_records = int(_p(params, "MaxRecords") or "100")
+        alarm_types = [
+            _p(params, f"AlarmTypes.member.{i}")
+            for i in range(1, 11)
+            if _p(params, f"AlarmTypes.member.{i}")
+        ] or ["MetricAlarm"]
+        max_records = _p(params, "MaxRecords")
+        next_token = _p(params, "NextToken")
+        scan_by = _p(params, "ScanBy")
 
-    items = list(_history_entries())
+    items = [(i, h) for i, h in enumerate(_history_entries()) if h.get("AlarmType", "MetricAlarm") in alarm_types]
     if alarm_name:
-        items = [h for h in items if h["AlarmName"] == alarm_name]
+        items = [(i, h) for i, h in items if h["AlarmName"] == alarm_name]
     if history_type:
-        items = [h for h in items if h["HistoryItemType"] == history_type]
+        items = [(i, h) for i, h in items if h["HistoryItemType"] == history_type]
     if start_date is not None:
-        items = [h for h in items if _parse_ts(h["Timestamp"]) >= start_date]
+        items = [(i, h) for i, h in items if _parse_ts(h["Timestamp"]) >= start_date]
     if end_date is not None:
-        items = [h for h in items if _parse_ts(h["Timestamp"]) <= end_date]
-    items = items[:max_records]
+        items = [(i, h) for i, h in items if _parse_ts(h["Timestamp"]) <= end_date]
+
+    invalid = _max_records_error(max_records)
+    if invalid:
+        return _error("ValidationError", invalid, 400, use_json=is_json, use_cbor=is_cbor)
+    max_records = int(max_records or 50)
+    start = None
+    if next_token:
+        start = _decode_page_token(next_token)
+        if start is None or not start.isdigit():
+            return _error("InvalidNextToken", f"Invalid NextToken : {next_token}", 400,
+                          use_json=is_json, use_cbor=is_cbor)
+        start = int(start)
+
+    # Entries are stored oldest first and only appended; ScanBy defaults to TimestampDescending.
+    # The token holds the stored index of the next entry, so new entries do not shift a scan.
+    descending = scan_by != "TimestampAscending"
+    if descending:
+        items.reverse()
+    if start is not None:
+        items = [(i, h) for i, h in items if (i <= start if descending else i >= start)]
+    token = _encode_page_token(str(items[max_records][0])) if len(items) > max_records else None
+    items = [h for _, h in items[:max_records]]
 
     if is_cbor:
-        return _cbor_ok({"AlarmHistoryItems": [_cbor_history_item(i) for i in items]})
+        result = {"AlarmHistoryItems": [_cbor_history_item(i) for i in items]}
+        if token:
+            result["NextToken"] = token
+        return _cbor_ok(result)
     if is_json:
-        return _json_ok({"AlarmHistoryItems": items})
+        result = {"AlarmHistoryItems": items}
+        if token:
+            result["NextToken"] = token
+        return _json_ok(result)
 
     members = "".join(
         f"<member><AlarmName>{h['AlarmName']}</AlarmName>"
@@ -1312,6 +1885,7 @@ def _describe_alarm_history(params, cbor_data, is_cbor, is_json=False):
         200,
         "DescribeAlarmHistoryResponse",
         f"<DescribeAlarmHistoryResult><AlarmHistoryItems>{members}</AlarmHistoryItems>"
+        f"{f'<NextToken>{token}</NextToken>' if token else ''}"
         f"</DescribeAlarmHistoryResult>",
     )
 
@@ -1331,9 +1905,28 @@ def _delete_alarms(params, cbor_data, is_cbor, is_json=False):
             names.append(_p(params, f"AlarmNames.member.{i}"))
             i += 1
 
+    composites = [n for n in dict.fromkeys(names) if n in _composite_alarms]
+    if len(composites) > 1:
+        return _error(
+            "ValidationError",
+            f"Cannot delete [{len(composites)}] Composite Alarms as only one composite alarm delete is allowed "
+            f"in single request",
+            400, use_json=is_json, use_cbor=is_cbor,
+        )
+    for n in names:
+        if (n in _alarms or n in _composite_alarms) and any(
+            n in _composite_children(parent) for parent in _composite_alarms.values()
+        ):
+            return _error(
+                "ValidationError",
+                f"Cannot delete {n} as there are composite alarm(s) depending on it.",
+                400, use_json=is_json, use_cbor=is_cbor,
+            )
+
     for n in names:
         _alarms.pop(n, None)
         _composite_alarms.pop(n, None)
+        _composite_triggers.pop(n, None)
         _resource_tags.pop(f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{n}", None)
 
     if is_cbor:
@@ -1408,16 +2001,24 @@ def _set_alarm_state(params, cbor_data, is_cbor, is_json=False):
             "ResourceNotFound", f"Alarm {name} not found", 404, use_json=is_json, use_cbor=is_cbor
         )
 
+    is_composite = name not in _alarms
     old_state = alarm["StateValue"]
     alarm["StateValue"] = new_state
     alarm["StateReason"] = reason
     if reason_data:
         alarm["StateReasonData"] = reason_data
+    elif is_composite:
+        alarm.pop("StateReasonData", None)
     alarm["StateUpdatedTimestamp"] = int(time.time())
 
     if old_state != new_state:
-        _record_history(name, old_state, new_state, reason)
+        if is_composite:
+            # The rule is evaluated again only when one of its children changes state.
+            alarm["StateTransitionedTimestamp"] = alarm["StateUpdatedTimestamp"]
+            _composite_triggers.pop(name, None)
+        _record_history(name, old_state, new_state, reason, "CompositeAlarm" if is_composite else "MetricAlarm")
         _dispatch_alarm_actions(alarm, old_state, new_state, reason)
+        _evaluate_parent_alarms(alarm)
 
     if is_cbor:
         return _cbor_ok({})
@@ -1685,6 +2286,11 @@ def _p(params, key, default=""):
     return val[0] if isinstance(val, list) else val
 
 
+def _optional_int(value):
+    """``int(value)``, or ``None`` when the request leaves the member unset."""
+    return None if value is None else int(value)
+
+
 def _cbor_timestamp(value):
     """Encode an epoch/ISO timestamp as CBOR tag 1 (epoch date-time).
 
@@ -1839,6 +2445,10 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
+# AWS escapes the Query error message, quotes included (&quot;).
+_XML_QUOTE = {'"': "&quot;"}
+
+
 def _error(code, message, status, use_json=False, use_cbor=False):
     if use_cbor:
         try:
@@ -1853,10 +2463,12 @@ def _error(code, message, status, use_json=False, use_cbor=False):
             {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": code},
             json.dumps({"__type": code, "message": message}).encode(),
         )
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
+    fault_type = "Sender" if status < 500 else "Receiver"
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<ErrorResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'
-        f"    <Error><Code>{code}</Code><Message>{message}</Message></Error>\n"
+        f"    <Error><Type>{fault_type}</Type><Code>{code}</Code>"
+        f"<Message>{_xml_escape(message, _XML_QUOTE)}</Message></Error>\n"
         f"    <RequestId>{new_uuid()}</RequestId>\n"
         f"</ErrorResponse>"
     ).encode("utf-8")
@@ -1892,8 +2504,14 @@ def cloudformation_set_metric_alarm_tags(name: str, tags: list) -> None:
     _resource_tags[arn] = {t["Key"]: t.get("Value", "") for t in tags}
 
 
-def cloudformation_delete_metric_alarm(name: str) -> None:
-    """Remove a metric alarm created from a template (not composite alarms)."""
+def cloudformation_delete_metric_alarm(name: str, refuse_dependents: bool = False) -> None:
+    """Remove a metric alarm created from a template (not composite alarms).
+
+    ``refuse_dependents`` makes a stack delete fail, as DeleteAlarms does, while a composite alarm still needs it.
+    """
+    if refuse_dependents and name in _alarms and any(
+            name in _composite_children(parent) for parent in _composite_alarms.values()):
+        raise ValueError(f"Cannot delete {name} as there are composite alarm(s) depending on it.")
     _alarms.pop(name, None)
     _resource_tags.pop(
         f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}", None
@@ -1924,6 +2542,7 @@ def cloudformation_delete_dashboard(name: str) -> None:
 def reset():
     _alarms.clear()
     _composite_alarms.clear()
+    _composite_triggers.clear()
     _alarm_history.clear()
     _metrics.clear()
     _resource_tags.clear()

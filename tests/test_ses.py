@@ -301,6 +301,182 @@ def test_ses_v2_configuration_set_crud(sesv2):
     lst2 = sesv2.list_configuration_sets()
     assert "my-cfg-set" not in lst2["ConfigurationSets"]
 
+
+def _sesv2_error(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+
+def test_ses_v2_configuration_set_options(sesv2):
+    """GetConfigurationSet returns the options; each Put call replaces its option and clears what it leaves out."""
+    bare, name = f"cs-bare-{_uuid_mod.uuid4().hex[:8]}", f"cs-opts-{_uuid_mod.uuid4().hex[:8]}"
+    sesv2.create_configuration_set(ConfigurationSetName=bare)
+    sesv2.create_configuration_set(
+        ConfigurationSetName=name,
+        DeliveryOptions={"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 600},
+        ReputationOptions={"ReputationMetricsEnabled": False},
+        SendingOptions={"SendingEnabled": False},
+        SuppressionOptions={"SuppressedReasons": ["BOUNCE", "COMPLAINT"]},
+        VdmOptions={"DashboardOptions": {"EngagementMetrics": "DISABLED"}},
+        Tags=[{"Key": "team", "Value": "a"}])
+
+    def get(set_name=name):
+        out = sesv2.get_configuration_set(ConfigurationSetName=set_name)
+        out.pop("ResponseMetadata")
+        return out
+
+    try:
+        assert get(bare) == {
+            "ConfigurationSetName": bare, "ReputationOptions": {"ReputationMetricsEnabled": True},
+            "SendingOptions": {"SendingEnabled": True}, "Tags": []}
+        assert get() == {
+            "ConfigurationSetName": name,
+            "DeliveryOptions": {"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 600},
+            "ReputationOptions": {"ReputationMetricsEnabled": False},
+            "SendingOptions": {"SendingEnabled": False},
+            "SuppressionOptions": {"SuppressedReasons": ["BOUNCE", "COMPLAINT"]},
+            "VdmOptions": {"DashboardOptions": {"EngagementMetrics": "DISABLED"}},
+            "Tags": [{"Key": "team", "Value": "a"}]}
+        assert _sesv2_error(sesv2.create_configuration_set, ConfigurationSetName=name) == (
+            "AlreadyExistsException", f"Configuration set <{name}> already exists.")
+        assert get()["DeliveryOptions"] == {"TlsPolicy": "REQUIRE", "MaxDeliverySeconds": 600}
+
+        sesv2.put_configuration_set_delivery_options(ConfigurationSetName=name, TlsPolicy="OPTIONAL")
+        assert get()["DeliveryOptions"] == {"TlsPolicy": "OPTIONAL"}
+        sesv2.put_configuration_set_delivery_options(ConfigurationSetName=name)
+        assert "DeliveryOptions" not in get()
+        sesv2.put_configuration_set_reputation_options(ConfigurationSetName=name, ReputationMetricsEnabled=True)
+        sesv2.put_configuration_set_reputation_options(ConfigurationSetName=name)
+        assert get()["ReputationOptions"] == {"ReputationMetricsEnabled": False}
+
+        # Sending enabled again gives the reputation metrics a fresh start.
+        sesv2.put_configuration_set_sending_options(ConfigurationSetName=name, SendingEnabled=True)
+        reputation = get()["ReputationOptions"]
+        assert reputation["ReputationMetricsEnabled"] is False
+        assert isinstance(reputation["LastFreshStart"], datetime)
+        assert get()["SendingOptions"] == {"SendingEnabled": True}
+        sesv2.put_configuration_set_sending_options(ConfigurationSetName=name)
+        assert get()["SendingOptions"] == {"SendingEnabled": False}
+
+        sesv2.put_configuration_set_suppression_options(ConfigurationSetName=name, SuppressedReasons=[])
+        assert get()["SuppressionOptions"] == {"SuppressedReasons": []}
+        sesv2.put_configuration_set_suppression_options(ConfigurationSetName=name)
+        assert "SuppressionOptions" not in get()
+        sesv2.put_configuration_set_vdm_options(
+            ConfigurationSetName=name, VdmOptions={"GuardianOptions": {"OptimizedSharedDelivery": "DISABLED"}})
+        assert get()["VdmOptions"] == {"GuardianOptions": {"OptimizedSharedDelivery": "DISABLED"}}
+        sesv2.put_configuration_set_vdm_options(ConfigurationSetName=name)
+        sesv2.put_configuration_set_archiving_options(ConfigurationSetName=name)
+        sesv2.put_configuration_set_tracking_options(ConfigurationSetName=name)
+        assert set(get()) == {"ConfigurationSetName", "ReputationOptions", "SendingOptions", "Tags"}
+
+        assert _sesv2_error(sesv2.put_configuration_set_tracking_options,
+                            ConfigurationSetName=name, HttpsPolicy="REQUIRE") == (
+            "BadRequestException", "CustomRedirectDomain must be specified.")
+        missing = f"cs-missing-{_uuid_mod.uuid4().hex[:8]}"
+        for call, kwargs in ((sesv2.get_configuration_set, {}),
+                             (sesv2.put_configuration_set_sending_options, {"SendingEnabled": True})):
+            assert _sesv2_error(call, ConfigurationSetName=missing, **kwargs) == (
+                "NotFoundException", f"Configuration set <{missing}> does not exist.")
+    finally:
+        sesv2.delete_configuration_set(ConfigurationSetName=bare)
+        sesv2.delete_configuration_set(ConfigurationSetName=name)
+
+
+def test_ses_v2_configuration_set_event_destinations(sesv2, sns):
+    """Event types are sorted, Enabled defaults to false, an updated destination is replaced and listed last."""
+    name = f"cs-dest-{_uuid_mod.uuid4().hex[:8]}"
+    topic = sns.create_topic(Name=f"{name}-events")["TopicArn"]
+    cloudwatch = {"CloudWatchDestination": {"DimensionConfigurations": [{
+        "DimensionName": "campaign", "DimensionValueSource": "MESSAGE_TAG", "DefaultDimensionValue": "none"}]}}
+    sesv2.create_configuration_set(ConfigurationSetName=name)
+
+    def destinations():
+        out = sesv2.get_configuration_set_event_destinations(ConfigurationSetName=name)
+        out.pop("ResponseMetadata")
+        return out
+
+    def create(dest, **definition):
+        return sesv2.create_configuration_set_event_destination(
+            ConfigurationSetName=name, EventDestinationName=dest, EventDestination=definition)
+
+    try:
+        assert destinations() == {}
+        create("cw", MatchingEventTypes=["SEND", "OPEN", "DELIVERY", "BOUNCE"], **cloudwatch)
+        create("sns", Enabled=True, MatchingEventTypes=["COMPLAINT"], SnsDestination={"TopicArn": topic})
+        assert destinations() == {"EventDestinations": [
+            {"Name": "cw", "Enabled": False, "MatchingEventTypes": ["BOUNCE", "DELIVERY", "OPEN", "SEND"],
+             **cloudwatch},
+            {"Name": "sns", "Enabled": True, "MatchingEventTypes": ["COMPLAINT"],
+             "SnsDestination": {"TopicArn": topic}},
+        ]}
+        assert _sesv2_error(create, dest="cw", MatchingEventTypes=["SEND"], **cloudwatch) == (
+            "AlreadyExistsException",
+            f"An event destination with name <cw> already exists for configuration set <{name}>.")
+
+        sesv2.update_configuration_set_event_destination(
+            ConfigurationSetName=name, EventDestinationName="cw",
+            EventDestination={"Enabled": True, "MatchingEventTypes": ["REJECT"],
+                              "SnsDestination": {"TopicArn": topic}})
+        assert [d["Name"] for d in destinations()["EventDestinations"]] == ["sns", "cw"]
+        assert destinations()["EventDestinations"][1] == {
+            "Name": "cw", "Enabled": True, "MatchingEventTypes": ["REJECT"], "SnsDestination": {"TopicArn": topic}}
+
+        refused = [
+            (sesv2.update_configuration_set_event_destination,
+             {"EventDestinationName": "sns", "EventDestination": {"Enabled": False}},
+             ("BadRequestException", "At least one event type must be specified.")),
+            (sesv2.update_configuration_set_event_destination,
+             {"EventDestinationName": "nope", "EventDestination": {"MatchingEventTypes": ["SEND"], **cloudwatch}},
+             ("NotFoundException",
+              f"An event destination with name <nope> does not exist for configuration set <{name}>.")),
+            (sesv2.delete_configuration_set_event_destination, {"EventDestinationName": "nope"},
+             ("NotFoundException",
+              f"An event destination with name <nope> does not exist for configuration set <{name}>.")),
+            (sesv2.create_configuration_set_event_destination,
+             {"EventDestinationName": "low", "EventDestination": {"MatchingEventTypes": ["send"], **cloudwatch}},
+             ("BadRequestException", "The event destination contains an invalid event type.")),
+            (sesv2.create_configuration_set_event_destination,
+             {"EventDestinationName": "none", "EventDestination": {"Enabled": True, **cloudwatch}},
+             ("BadRequestException", "At least one event type must be specified.")),
+            (sesv2.create_configuration_set_event_destination,
+             {"EventDestinationName": "none", "EventDestination": {"MatchingEventTypes": ["SEND"]}},
+             ("BadRequestException", "Event destination is not provided.")),
+            (sesv2.create_configuration_set_event_destination,
+             {"EventDestinationName": "two", "EventDestination": {
+                 "MatchingEventTypes": ["SEND"], "SnsDestination": {"TopicArn": topic}, **cloudwatch}},
+             ("BadRequestException", "Please provide only one destination with each request. Either a Firehose "
+              "Destination or a Cloudwatch Destination or an SNS Destination or an EventBridge Destination.")),
+            (sesv2.create_configuration_set_event_destination,
+             {"EventDestinationName": "dim", "EventDestination": {
+                 "MatchingEventTypes": ["SEND"], "CloudWatchDestination": {"DimensionConfigurations": [{
+                     "DimensionName": "campaign", "DimensionValueSource": "messageTag",
+                     "DefaultDimensionValue": "none"}]}}},
+             ("BadRequestException", "invalid CloudWatch dimension source")),
+            (sesv2.create_configuration_set_event_destination,
+             {"EventDestinationName": "bad name!", "EventDestination": {"MatchingEventTypes": ["SEND"], **cloudwatch}},
+             ("BadRequestException", "Invalid event destination name <bad name!>: "
+              "only alphanumeric ASCII characters, '_', and '-' are allowed.")),
+        ]
+        for call, kwargs, expected in refused:
+            assert _sesv2_error(call, ConfigurationSetName=name, **kwargs) == expected
+        assert _sesv2_error(sesv2.get_configuration_set_event_destinations,
+                            ConfigurationSetName=f"{name}-missing") == (
+            "NotFoundException", f"Configuration set <{name}-missing> does not exist.")
+
+        sesv2.delete_configuration_set_event_destination(ConfigurationSetName=name, EventDestinationName="sns")
+        assert [d["Name"] for d in destinations()["EventDestinations"]] == ["cw"]
+        sesv2.delete_configuration_set(ConfigurationSetName=name)
+        assert _sesv2_error(sesv2.get_configuration_set_event_destinations, ConfigurationSetName=name)[0] == (
+            "NotFoundException")
+    finally:
+        try:
+            sesv2.delete_configuration_set(ConfigurationSetName=name)
+        except ClientError:
+            pass
+        sns.delete_topic(TopicArn=topic)
+
 def test_ses_v2_list_routes_old_and_new(sesv2):
     """SDKs since botocore 1.43.106 list with POST /v2/email/list-identities and
     /list-configuration-sets (paging and Filter in the body); older ones GET."""
@@ -340,6 +516,64 @@ def test_ses_v2_get_account(sesv2):
     resp = sesv2.get_account()
     assert resp["SendingEnabled"] is True
     assert resp["ProductionAccessEnabled"] is True
+
+
+_SES_V2_ARN = "arn:aws:ses:us-east-1:000000000000"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("call,action,resource,reason", [
+    (lambda ses, n: ses.get_account(), "GetAccount", "*", None),
+    (lambda ses, n: ses.list_email_identities(), "ListEmailIdentities", "*", None),
+    (lambda ses, n: ses.create_configuration_set(ConfigurationSetName=f"{n}-other"),
+     "CreateConfigurationSet", "configuration-set/{n}-other", None),
+    (lambda ses, n: ses.get_configuration_set(ConfigurationSetName=f"{n}-other"),
+     "GetConfigurationSet", "configuration-set/{n}-other", None),
+    (lambda ses, n: ses.create_email_template(TemplateName=f"{n}-other", TemplateContent={"Subject": "s"}),
+     "CreateEmailTemplate", "template/{n}-other", None),
+    (lambda ses, n: ses.get_email_identity(EmailIdentity=f"{n}-other.example.com"),
+     "GetEmailIdentity", "identity/{n}-other.example.com", None),
+    (lambda ses, n: ses.get_email_template(TemplateName=f"{n}-denied"),
+     "GetEmailTemplate", "template/{n}-denied", "with an explicit deny in an identity-based policy"),
+], ids=["account", "list", "create-set", "get-set", "create-template", "identity", "explicit-deny"])
+def test_ses_v2_authorization_contract(auth_enabled, iam_user, sesv2, call, action, resource, reason):
+    """An SES v2 call is authorized as ses:<operation> on the resource its path or create body names."""
+    name = f"sesv2-{_uuid_mod.uuid4().hex[:8]}"
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow",
+         "Action": ["ses:CreateConfigurationSet", "ses:GetConfigurationSet", "ses:DeleteConfigurationSet"],
+         "Resource": f"{_SES_V2_ARN}:configuration-set/{name}-allowed"},
+        {"Effect": "Allow", "Action": "ses:GetEmailTemplate", "Resource": f"{_SES_V2_ARN}:template/{name}-allowed"},
+        {"Effect": "Deny", "Action": "ses:GetEmailTemplate", "Resource": f"{_SES_V2_ARN}:template/{name}-denied"},
+    ]})
+    ses = user.client("sesv2")
+    try:
+        ses.create_configuration_set(ConfigurationSetName=f"{name}-allowed")
+        ses.get_configuration_set(ConfigurationSetName=f"{name}-allowed")
+        ses.delete_configuration_set(ConfigurationSetName=f"{name}-allowed")
+        assert _sesv2_error(ses.get_email_template, TemplateName=f"{name}-allowed")[0] == "NotFoundException"
+        if not auth_enabled:
+            try:
+                call(ses, name)
+            except ClientError as error:
+                assert error.response["Error"]["Code"] == "NotFoundException"
+            return
+        with pytest.raises(ClientError) as exc:
+            call(ses, name)
+        resource = resource if resource == "*" else f"{_SES_V2_ARN}:{resource.format(n=name)}"
+        reason = reason or f"because no identity-based policy allows the ses:{action} action"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+        assert exc.value.response["Error"]["Message"] == (
+            f"User: {user.arn} is not authorized to perform: ses:{action} on resource: {resource} {reason}")
+    finally:
+        for cleanup in (lambda: sesv2.delete_configuration_set(ConfigurationSetName=f"{name}-other"),
+                        lambda: sesv2.delete_email_template(TemplateName=f"{name}-other")):
+            try:
+                cleanup()
+            except ClientError:
+                pass
+
 
 def test_ses_v2_send_email_with_v1_template(ses, sesv2):
     """A template created with v1 CreateTemplate renders through v2 SendEmail."""
@@ -1736,3 +1970,33 @@ def test_ses_send_email_rejects_non_ascii_address(ses):
     ses.send_email(Source="sender@example.com", Destination={"ToAddresses": ["user@xn--xample-9ua.com"]},
                    Message={"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}})
 
+
+
+@pytest.mark.auth_contract
+def test_ses_v2_target_header_route_is_authorized_contract(auth_enabled, iam_user):
+    """SES v2 on a path without /v2/email, selected by the target header, is authorized like the prefixed call."""
+    import urllib.error
+    import urllib.request
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    from conftest import ENDPOINT, make_client, second_access_key
+
+    name = f"tpl-{uuid4().hex[:8]}"
+    sesv2 = make_client("sesv2")
+    sesv2.create_email_template(TemplateName=name, TemplateContent={"Subject": "s", "Text": "t"})
+    with second_access_key(iam_user()) as (key, secret):
+        request = AWSRequest(method="DELETE", url=f"{ENDPOINT}/templates/{name}", headers={"x-amz-target": "sesv2"})
+        SigV4Auth(Credentials(key, secret), "ses", "us-east-1").add_auth(request)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    request.url, method="DELETE", headers=dict(request.headers)), timeout=10) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+    if auth_enabled:
+        assert status == 403
+        sesv2.delete_email_template(TemplateName=name)
+    else:
+        assert status == 200

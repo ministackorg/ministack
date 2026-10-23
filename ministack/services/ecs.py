@@ -1483,7 +1483,7 @@ def _delete_service(data):
 
 def _describe_services(data):
     cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
-    if cluster_name is None:
+    if cluster_name is None or cluster_name not in _clusters:
         return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
     refs = data.get("services", [])
     include = set(data.get("include", []))
@@ -3537,7 +3537,7 @@ def reset():
 
     docker_client = _get_docker()
     if docker_client:
-        # Stop + remove every ministack=ecs container (running OR exited).
+        # Stop + remove this instance's ministack=ecs containers (running OR exited).
         # Including exited ones matters because short-lived commands
         # (echo, wget probes) leave Exited containers behind that otherwise
         # only the background reaper would remove.
@@ -3547,7 +3547,10 @@ def reset():
             # run's worth of tasks one at a time is tens of seconds during which
             # every other request is blocked.
             container_reaper.drop_containers(
-                docker_client.containers.list(all=True, filters={"label": "ministack=ecs"}),
+                docker_client.containers.list(all=True, filters={"label": [
+                    "ministack=ecs",
+                    f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+                ]}),
                 stop_timeout=2, force=True)
         except Exception:
             pass

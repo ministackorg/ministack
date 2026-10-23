@@ -5,6 +5,7 @@ Pytest fixtures for MiniStack integration tests.
 import concurrent.futures
 import contextlib
 import io
+import json
 import os
 import socket
 import statistics
@@ -13,7 +14,8 @@ import time
 import urllib.request
 import uuid
 import zipfile
-from urllib.parse import urlparse
+from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
 
 import boto3
 import pytest
@@ -61,8 +63,10 @@ def patch_endpoint_dns():
         return _real_getaddrinfo(host, port, *args, **kwargs)
 
     socket.getaddrinfo = _patched
-    yield
-    socket.getaddrinfo = _real_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = _real_getaddrinfo
 
 
 def make_client(service, additional_config_kwargs=None):
@@ -110,6 +114,142 @@ def iot_test_ca(registration_code, common_name="ministack-test-ca"):
     ca_pem, ca_key_pem = generate_ca(common_name=common_name)
     verification_pem = sign_leaf_certificate(ca_pem, ca_key_pem, common_name=registration_code)[0]
     return ca_pem, ca_key_pem, verification_pem
+
+
+@pytest.fixture(scope="session")
+def auth_enabled():
+    """Verify the running server's IAM mode before exercising auth contracts."""
+    expected = os.environ.get("AUTH", "false").lower()
+    if expected not in {"true", "false"}:
+        pytest.fail("Auth contracts require AUTH=true or AUTH=false.", pytrace=False)
+    try:
+        with urllib.request.urlopen(f"{ENDPOINT.rstrip('/')}/_ministack/health", timeout=5) as response:
+            actual = json.load(response).get("auth")
+    except (OSError, ValueError) as exc:
+        pytest.fail(f"Cannot read MiniStack auth mode at {ENDPOINT}: {exc}", pytrace=False)
+    if actual not in ("enabled", "disabled"):
+        pytest.fail("MiniStack health response lacks auth=enabled/disabled; restart with current code.", pytrace=False)
+    expected_state = "enabled" if expected == "true" else "disabled"
+    if actual != expected_state:
+        pytest.fail(
+            f"Auth mode mismatch: tests expect AUTH={expected}, but {ENDPOINT} reports "
+            f"auth={actual}. Restart the server with the expected mode.",
+            pytrace=False,
+        )
+    return actual == "enabled"
+
+
+@pytest.fixture(autouse=True)
+def _verify_auth_contract_mode(request):
+    # Verify even marked tests that don't need different expectations per mode.
+    if request.node.get_closest_marker("auth_contract"):
+        request.getfixturevalue("auth_enabled")
+
+
+@pytest.fixture
+def iam_user(auth_enabled):
+    """Factory for API-created IAM users; no permissions unless explicitly supplied.
+
+    Returns an object with name, arn, and client(service, region=..., config=...).
+    Only this fixture's users, keys, policies, and clients are cleaned up.
+    """
+    with contextlib.ExitStack() as cleanup:
+        admin = make_client("iam")
+        cleanup.callback(admin.close)
+
+        def create(*, policy=None):
+            name = f"auth-user-{uuid.uuid4().hex}"
+            user = admin.create_user(UserName=name)["User"]
+            cleanup.callback(admin.delete_user, UserName=name)
+            key = admin.create_access_key(UserName=name)["AccessKey"]
+            cleanup.callback(admin.delete_access_key, UserName=name, AccessKeyId=key["AccessKeyId"])
+            if policy is not None:
+                admin.put_user_policy(UserName=name, PolicyName="test-policy", PolicyDocument=json.dumps(policy))
+                cleanup.callback(admin.delete_user_policy, UserName=name, PolicyName="test-policy")
+
+            session = boto3.Session(
+                aws_access_key_id=key["AccessKeyId"],
+                aws_secret_access_key=key["SecretAccessKey"],
+                region_name=REGION,
+            )
+
+            def client(service, *, region=REGION, config=None):
+                defaults = Config(retries={"total_max_attempts": 1}, connect_timeout=5, read_timeout=10)
+                result = session.client(
+                    service, endpoint_url=ENDPOINT, region_name=region,
+                    config=defaults.merge(config) if config is not None else defaults,
+                )
+                cleanup.callback(result.close)
+                return result
+
+            return SimpleNamespace(name=name, arn=user["Arn"], client=client)
+
+        yield create
+
+
+@contextlib.contextmanager
+def second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def inprocess_iam_user(identity_policy=None):
+    """An in-process IAM user with an access key in the default account: ``((key id, secret), arn)``."""
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+
+    name = f"user-{uuid.uuid4().hex[:8]}"
+    key = ("AKIA" + uuid.uuid4().hex[:16].upper(), uuid.uuid4().hex)
+    arn = f"arn:aws:iam::{get_account_id()}:user/{name}"
+    with request_scope(get_account_id(), REGION):
+        iam_svc._users[name] = {"UserName": name, "Arn": arn, "UserId": "AIDA" + key[0][4:],
+                                "CreateDate": "2026-01-01", "Path": "/", "AttachedPolicies": [], "Tags": []}
+        iam_svc._access_keys[key[0]] = {"UserName": name, "AccessKeyId": key[0], "SecretAccessKey": key[1],
+                                        "Status": "Active", "CreateDate": "2026-01-01"}
+        if identity_policy:
+            iam_svc._user_inline_policies[name] = {"p": json.dumps(identity_policy)}
+    return key, arn
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    """AUTH=true for the in-process app."""
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+
+
+def routed_request(key, service, method, path, body=b"", headers=None, host="localhost:4566"):
+    """One in-process request through the whole app, SigV4-signed with *key* ``(key id, secret)`` unless it is None."""
+    import asyncio
+
+    from botocore.auth import S3SigV4Auth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    import ministack.app as app_mod
+
+    request = AWSRequest(method, f"http://{host}{path}", data=body, headers={"host": host, **(headers or {})})
+    if key:
+        (S3SigV4Auth if service == "s3" else SigV4Auth)(Credentials(*key), service, REGION).add_auth(request)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app_mod.app({
+        "type": "http", "method": method, "path": unquote(path), "raw_path": path.encode(), "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in request.headers.items()]}, receive, send))
+    return (sent[0]["status"], {k.decode().lower(): v.decode() for k, v in sent[0].get("headers", [])},
+            b"".join(m.get("body", b"") for m in sent[1:]))
 
 
 _SERIAL_TESTS = {
@@ -322,9 +462,13 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_unregistered_cert_gets_connack_5",
     "tests/test_iot_data.py::test_mtls_mqtt5_refusal_is_v5_connack",
     "tests/test_iot_data.py::test_mtls_inactive_cert_refused",
+    "tests/test_iot_data.py::test_mtls_auth_refusal_closes_without_connack",
     "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
     "tests/test_iot_data.py::test_mtls_registered_cert_connects_whatever_its_ca",
     "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
+    "tests/test_iot_data.py::test_mtls_provisioning_claim_connects_and_provisions",
+    "tests/test_iot_data.py::test_mtls_auth_provisioning_claim_is_held_to_its_templates_topics",
+    "tests/test_iot_data.py::test_mtls_provisioning_hook_names_the_thing",
     "tests/test_iot_data.py::test_mtls_jitr_certificate_is_listed_by_its_ca",
     "tests/test_iot_data.py::test_mtls_jitr_auto_registers_an_unknown_cert_without_connack",
     "tests/test_iot_data.py::test_mtls_jitr_under_an_sni_only_ca_needs_sni",
@@ -334,6 +478,7 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_listener_survives_reset",
     "tests/test_iot_data.py::test_mtls_reset_rebinds_with_a_device_connected",
     "tests/test_iot_data.py::test_mtls_shutdown_completes_with_a_device_connected",
+    "tests/test_iot_data.py::test_mtls_auth_evaluates_iot_connect",
 }
 
 
@@ -809,6 +954,11 @@ def cur():
 @pytest.fixture(scope="session")
 def budgets():
     return make_client("budgets")
+
+
+@pytest.fixture(scope="session")
+def kinesisanalyticsv2():
+    return make_client("kinesisanalyticsv2")
 
 
 @pytest.fixture(scope="session")

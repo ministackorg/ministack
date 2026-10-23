@@ -3,27 +3,32 @@
 """IAM policy evaluation engine.
 
 Implements the AWS IAM policy evaluation algorithm (single-account,
-no SCPs/permissions boundaries/session policies) behind the AUTH=true flag.
+no SCPs) behind the AUTH=true flag.
 
 Evaluation order:
-  1. Explicit Deny in any applicable policy → DENY
-  2. Explicit Allow in any applicable policy → ALLOW
+  1. Explicit Deny in any applicable policy, boundary or session policy → DENY
+  2. Explicit Allow in an identity policy, also allowed by the boundary
+     and the session policies → ALLOW
   3. No matching Allow → implicit DENY
 """
 
 import contextvars
 import datetime as _dt
 import hmac
+import importlib
 import ipaddress
 import json
 import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 logger = logging.getLogger("ministack")
+
+_request_origin: contextvars.ContextVar[tuple[str, bool]] = contextvars.ContextVar(
+    "ministack_request_origin", default=("127.0.0.1", False))
 
 
 # ---------------------------------------------------------------------------
@@ -44,16 +49,17 @@ class ParsedStatement:
 @dataclass
 class EvalContext:
     principal_arn: str
-    principal_type: str  # "User", "AssumedRole", "Root"
+    principal_type: str  # "User", "AssumedRole", "FederatedUser", "Root"
     principal_account: str
     action: str  # "s3:PutObject"
     resource_arn: str  # "*" until per-service resource ARN construction
     region: str
-    source_ip: str = "127.0.0.1"
-    secure_transport: bool = False
+    source_ip: str = field(default_factory=lambda: _request_origin.get()[0])
+    secure_transport: bool = field(default_factory=lambda: _request_origin.get()[1])
     request_tags: dict[str, str] = field(default_factory=dict)
     tag_keys: list[str] = field(default_factory=list)
     service_context: dict[str, Any] = field(default_factory=dict)
+    principal_keys: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -62,14 +68,17 @@ class EvalResult:
     principal_arn: str = ""
     matched_sid: str = ""
     reason: str = ""
+    resource_policy_arn: str = ""  # set when the resource's own policy denied
 
 
 @dataclass
 class PrincipalInfo:
     arn: str
-    type: str  # "User", "AssumedRole", "Root"
+    type: str  # "User", "AssumedRole", "FederatedUser", "Root"
     account: str
     policies: list[list[ParsedStatement]] | None  # None = root (allow-all)
+    keys: dict[str, Any] = field(default_factory=dict)
+    limits: list[list[list[ParsedStatement]]] = field(default_factory=list)
 
 
 @dataclass
@@ -77,6 +86,7 @@ class AuthError:
     """Authentication failure (before policy evaluation)."""
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
+    details: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +233,8 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         # role conditions its S3 grant on this key, so leaving it unresolved
         # denied every `cdk deploy` under AUTH=true.
         return _account_from_arn(ctx.resource_arn) or ctx.principal_account
+    if k in ctx.principal_keys:
+        return ctx.principal_keys[k]
     if k in ctx.service_context:
         return ctx.service_context[k]
     if k == "aws:principalorgid":
@@ -560,43 +572,35 @@ def validate_policy_document(doc: str | dict) -> str | None:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
+def _first_match(ctx: EvalContext, stmts: list[ParsedStatement],
+                 effect: str) -> ParsedStatement | None:
+    for stmt in stmts:
+        if (stmt.effect == effect
+                and _action_matches(ctx.action, stmt.actions, stmt.not_actions)
+                and _resource_matches(ctx.resource_arn, stmt.resources, stmt.not_resources)
+                and _conditions_met(stmt.conditions, ctx)):
+            return stmt
+    return None
+
+
 def evaluate(ctx: EvalContext,
-             policies: list[list[ParsedStatement]]) -> EvalResult:
+             policies: list[list[ParsedStatement]],
+             *limits: list[list[ParsedStatement]]) -> EvalResult:
     """Evaluate all policies against a request context.
 
     ``policies`` is a list of parsed-statement lists (one per policy document).
+    Each of ``limits`` (a permissions boundary, the session policies) has the same shape: a Deny in
+    it denies, and an Allow in ``policies`` counts only if every limit allows.
     Returns Allow, Deny, or ImplicitDeny.
     """
-    # Flatten all statements
-    all_stmts: list[ParsedStatement] = []
-    for stmts in policies:
-        all_stmts.extend(stmts)
-
-    # Step 1: explicit Deny
-    for stmt in all_stmts:
-        if stmt.effect != "Deny":
-            continue
-        if not _action_matches(ctx.action, stmt.actions, stmt.not_actions):
-            continue
-        if not _resource_matches(ctx.resource_arn, stmt.resources, stmt.not_resources):
-            continue
-        if not _conditions_met(stmt.conditions, ctx):
-            continue
-        return EvalResult("Deny", ctx.principal_arn, stmt.sid, "Explicit deny")
-
-    # Step 2: explicit Allow
-    for stmt in all_stmts:
-        if stmt.effect != "Allow":
-            continue
-        if not _action_matches(ctx.action, stmt.actions, stmt.not_actions):
-            continue
-        if not _resource_matches(ctx.resource_arn, stmt.resources, stmt.not_resources):
-            continue
-        if not _conditions_met(stmt.conditions, ctx):
-            continue
-        return EvalResult("Allow", ctx.principal_arn, stmt.sid, "Explicit allow")
-
-    # Step 3: implicit deny
+    layers = [[stmt for stmts in layer for stmt in stmts] for layer in (policies, *limits)]
+    for stmts in layers:
+        deny = _first_match(ctx, stmts, "Deny")
+        if deny:
+            return EvalResult("Deny", ctx.principal_arn, deny.sid, "Explicit deny")
+    allow = _first_match(ctx, layers[0], "Allow")
+    if allow and all(_first_match(ctx, stmts, "Allow") for stmts in layers[1:]):
+        return EvalResult("Allow", ctx.principal_arn, allow.sid, "Explicit allow")
     return EvalResult("ImplicitDeny", ctx.principal_arn, "",
                       "No matching Allow statement")
 
@@ -634,6 +638,11 @@ def pin_request_caller(headers: dict, query_params: dict | None = None) -> None:
     if not AUTH:
         return
     _request_caller_arn.set(request_caller_arn(headers, query_params))
+
+
+def pin_request_origin(source_ip: str, secure_transport: bool) -> None:
+    """Remember the caller's address and transport for this request's policy checks."""
+    _request_origin.set((source_ip, secure_transport))
 
 
 def caller_arn() -> str:
@@ -675,8 +684,34 @@ def _service_principal_matches(principal: Any, service: str) -> bool:
                if isinstance(s, str))
 
 
+_ACCOUNT_PRINCIPAL = re.compile(r"\d{12}|arn:aws[a-z-]*:iam::\d{12}:root")
+
+
+def _names_caller(principal: Any, caller_arn: str) -> bool:
+    """Whether a statement Principal names the caller itself (its ARN, its role, or ``*``), not only its account."""
+    if isinstance(principal, dict):
+        principal = principal.get("AWS", [])
+    if isinstance(principal, str):
+        principal = [principal]
+    return any(isinstance(p, str) and not _ACCOUNT_PRINCIPAL.fullmatch(p)
+               and _principal_matches({"AWS": p}, caller_arn) for p in principal)
+
+
+def _names_caller_directly(principal: Any, caller_arn: str) -> bool:
+    """Whether a statement Principal names the caller's own IAM user or role-session ARN, which no limit narrows."""
+    if not re.fullmatch(r"arn:aws[a-z-]*:(iam::\d{12}:user/.+|sts::\d{12}:assumed-role/.+)", caller_arn):
+        return False
+    if isinstance(principal, dict):
+        principal = principal.get("AWS", [])
+    if isinstance(principal, str):
+        principal = [principal]
+    return caller_arn in principal
+
+
 def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
-                             service: str | None = None) -> EvalResult:
+                             service: str | None = None,
+                             named_only: bool = False,
+                             direct_only: bool = False) -> EvalResult:
     """Evaluate a resource-based policy for the principal in *ctx*.
 
     Such a document names the principals it applies to, so a statement counts
@@ -701,7 +736,13 @@ def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
         if not isinstance(stmt, dict):
             continue
         principal = stmt.get("Principal", {})
-        if isinstance(principal, dict):
+        if direct_only:
+            if _names_caller_directly(principal, ctx.principal_arn):
+                applicable.append(stmt)
+        elif named_only:
+            if _names_caller(principal, ctx.principal_arn):
+                applicable.append(stmt)
+        elif isinstance(principal, dict):
             if _principal_matches({"AWS": principal.get("AWS", [])},
                                   ctx.principal_arn):
                 applicable.append(stmt)
@@ -710,6 +751,62 @@ def evaluate_resource_policy(doc: str | dict | None, ctx: EvalContext,
         elif _principal_matches(principal, ctx.principal_arn):
             applicable.append(stmt)
     return evaluate(ctx, [parse_policy_document({"Statement": applicable})])
+
+
+def combine_resource_policy(identity: EvalResult, ctx: EvalContext,
+                            policy: str | dict | None, owner_account: str | None,
+                            required: bool = False,
+                            limits: tuple = ()) -> EvalResult:
+    """Combine an identity decision with the resource's own policy: a Deny in either wins."""
+    # In the owner's account an Allow in either suffices, but a resource statement naming
+    # only the account delegates to identity policies; across accounts both must allow.
+    # With *required* (a KMS key policy) the resource policy must allow in the owner's account too.
+    # *limits* (boundary, session policies) narrow a resource Allow unless it names the user or session itself.
+    if identity.decision == "Deny":
+        return identity
+    resource = evaluate_resource_policy(policy, ctx)
+    if resource.decision == "Deny":
+        resource.resource_policy_arn = ctx.resource_arn
+        return resource
+    same_account = owner_account in (None, ctx.principal_account)
+    if identity.decision == "Allow" and (
+            resource.decision == "Allow" or (same_account and not required)):
+        return identity
+    if same_account and resource.decision == "Allow":
+        named = evaluate_resource_policy(policy, ctx, named_only=True)
+        within_limits = all(_first_match(ctx, [stmt for stmts in layer for stmt in stmts], "Allow")
+                            for layer in limits)
+        if named.decision == "Allow" and (
+                within_limits
+                or evaluate_resource_policy(policy, ctx, direct_only=True).decision == "Allow"):
+            return named
+    return resource if identity.decision == "Allow" else identity
+
+
+# Services whose resources carry their own policy: the module and the function
+# returning ``(policy, owner account)`` for a resource ARN, or None.
+_RESOURCE_POLICY_LOOKUPS = {
+    "sqs": ("sqs", "queue_policy_for_arn"),
+    "sns": ("sns", "topic_policy_for_arn"),
+    "s3": ("s3", "bucket_policy_for_arn"),
+    "lambda": ("lambda_svc", "function_policy_for_arn"),
+    "secretsmanager": ("secretsmanager", "secret_policy_for_arn"),
+    "ecr": ("ecr", "repository_policy_for_arn"),
+    "kms": ("kms", "key_policy_for_arn"),
+    "apigateway": ("apigateway_v1", "rest_api_policy_for_arn"),
+}
+
+# A key policy must allow even the owner's own users and roles.
+_POLICY_REQUIRED = frozenset({"kms"})
+
+
+def _resource_policy(service: str, resource_arn: str) -> tuple | None:
+    """The request resource's own policy and owner account, when its service keeps one."""
+    lookup = _RESOURCE_POLICY_LOOKUPS.get(service)
+    if lookup is None or not resource_arn.startswith("arn:"):
+        return None
+    module = importlib.import_module(f"ministack.services.{lookup[0]}")
+    return getattr(module, lookup[1])(resource_arn)
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +876,27 @@ def _gather_user_policies(user_name: str, account_id: str) -> list[list[ParsedSt
                     if stmts:
                         policies.append(stmts)
     return policies
+
+
+def _permissions_boundary(store, name: str,
+                          account_id: str) -> list[list[list[ParsedStatement]]]:
+    """The evaluation limits a user's or role's permissions boundary sets."""
+    arn = (store.get_scoped(account_id, None, name) or {}).get("PermissionsBoundary")
+    if not arn:
+        return []
+    doc = _resolve_managed_policy_document(arn, account_id)
+    return [[parse_policy_document(doc) if doc else []]]
+
+
+def _session_policy_limits(session: dict,
+                           account_id: str) -> list[list[list[ParsedStatement]]]:
+    """The evaluation limits the session policies of an STS session set."""
+    passed = session.get("SessionPolicies")
+    if passed is None:
+        return []
+    docs = [passed["Policy"]] if passed.get("Policy") else []
+    docs += [_resolve_managed_policy_document(arn, account_id) for arn in passed.get("PolicyArns", [])]
+    return [[parse_policy_document(doc) for doc in docs if doc]]
 
 
 def _resolve_managed_policy_document(policy_arn: str,
@@ -1042,38 +1160,384 @@ def _is_root_key(access_key_id: str) -> bool:
     return is_root_access_key(access_key_id)
 
 
+def _principal_keys(credential: ResolvedCredential) -> dict[str, Any]:
+    """The condition keys that describe the caller, keyed in lower case."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    keys: dict[str, Any] = {"aws:userid": credential.principal_id}
+    entity = {}
+    if credential.principal_type == "User":
+        keys["aws:username"] = credential.principal_name
+        entity = iam_svc._users.get_scoped(credential.account_id, None, credential.principal_name)
+    elif credential.principal_type == "AssumedRole":
+        entity = iam_svc._roles.get_scoped(
+            credential.account_id, None, _role_name_from_assumed_arn(credential.principal_arn))
+    tags = list((entity or {}).get("Tags") or [])
+    session = sts_svc._sessions.get(credential.access_key_id)
+    if session is not None:
+        tags += session.get("SessionTags") or []
+        keys["aws:multifactorauthpresent"] = "false"
+        if isinstance(session.get("IssuedAt"), (int, float)):
+            keys["aws:tokenissuetime"] = _dt.datetime.fromtimestamp(
+                session["IssuedAt"], _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    keys.update({f"aws:principaltag/{t['Key'].lower()}": t["Value"] for t in tags})
+    return keys
+
+
 def resolve_principal(access_key_id: str,
-                      account_id: str) -> PrincipalInfo | AuthError:
+                      account_id: str, credential: ResolvedCredential | None = None) -> PrincipalInfo | AuthError:
     """Resolve an access key to a principal and their policies.
 
     Returns a ``PrincipalInfo`` on success or an ``AuthError`` when
     authentication fails (unknown key, inactive key, expired session).
+    A ``credential`` the caller already resolved skips the key lookup.
     """
     from ministack.core.responses import _account_from_sts_session
 
     account_id = _account_from_sts_session(access_key_id) or account_id
-    credential = resolve_credential(access_key_id, account_id)
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+
+    credential = credential or resolve_credential(access_key_id, account_id)
     if isinstance(credential, CredentialResolutionError):
         return AuthError(credential.code, credential.message)
+    session = sts_svc._sessions.get(access_key_id) or {}
+    limits = []
     if credential.principal_type == "Root":
         policies = None
     elif credential.principal_type == "User":
         policies = _gather_user_policies(credential.principal_name, account_id)
+        limits = _permissions_boundary(iam_svc._users, credential.principal_name, account_id)
     elif credential.principal_type == "AssumedRole":
-        policies = _gather_role_policies(
-            _role_name_from_assumed_arn(credential.principal_arn), account_id
-        )
+        role_name = _role_name_from_assumed_arn(credential.principal_arn)
+        policies = _gather_role_policies(role_name, account_id)
+        limits = _permissions_boundary(iam_svc._roles, role_name, account_id)
+    elif credential.principal_type == "FederatedUser":
+        user_name = session.get("PrincipalName")
+        if user_name:
+            policies = _gather_user_policies(user_name, account_id)
+            limits = _permissions_boundary(iam_svc._users, user_name, account_id)
+        else:
+            # Federated by the account root, which holds every permission.
+            policies = [parse_policy_document({"Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}})]
     else:
         return AuthError(
             "UnrecognizedClientException",
             "The security token included in the request is invalid.",
         )
+    if policies is not None:
+        limits += _session_policy_limits(session, account_id)
     return PrincipalInfo(
         arn=credential.principal_arn,
         type=credential.principal_type,
         account=credential.account_id,
         policies=policies,
+        keys=_principal_keys(credential),
+        limits=limits,
     )
+
+
+@dataclass(frozen=True)
+class SignedRequest:
+    """A header- or query-signed request as it arrived."""
+
+    access_key_id: str
+    method: str
+    raw_path: str
+    query_params: dict
+    headers: dict
+    body: bytes = b""
+    presigned: bool = False
+    handshake: bool = False
+    # Credentials this server cannot verify (another algorithm, a key the signature does not cover).
+    unverifiable: bool = False
+    # A SigV2 (HmacV1) header or query signature, checked against the path S3 signs.
+    sigv2: bool = False
+    auth_path: str = ""
+
+
+_signed_request: contextvars.ContextVar[SignedRequest | None] = contextvars.ContextVar(
+    "ministack_signed_request", default=None)
+# The access key whose signature this request already passed, once checked.
+_verified_key: contextvars.ContextVar[str] = contextvars.ContextVar("ministack_verified_key", default="")
+
+
+def caller_verified(access_key_id: str, account_id: str) -> bool:
+    """Whether the request's SigV4/SigV2 signature for this key checks out (root keys are not checked)."""
+    if not access_key_id:
+        return False
+    if _is_root_key(access_key_id) or _verified_key.get() == access_key_id:
+        return True
+    checked = authenticate(access_key_id, account_id)
+    return checked is not None and not isinstance(checked, AuthError)
+
+
+def pin_signed_request(
+    method: str, raw_path: str, query_params: dict, raw_headers: list, handshake: bool = False,
+) -> None:
+    """Keep a request signed with an IAM user or STS session key as sent, for its signature check."""
+    from ministack.core.router import extract_access_key_id
+    from ministack.core.sigv4 import decode_header_value
+
+    _verified_key.set("")
+    authorization = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"authorization"), b""))
+    payload_hash = decode_header_value(next((v for n, v in raw_headers if n.lower() == b"x-amz-content-sha256"), b""))
+    presigned = not authorization.startswith("AWS4-HMAC-SHA256") and (
+        _query_signed(query_params) or _sigv4a_s3_presign(query_params))
+    access_key_id = extract_access_key_id({"authorization": authorization}, query_params if presigned else None)
+    # The key the policy check will use; it must be the one the signature is checked for.
+    claimed = extract_access_key_id({"authorization": authorization}, query_params)
+    header_signed = authorization.startswith("AWS4-HMAC-SHA256") or _sigv4a_header(authorization, payload_hash)
+    verifiable = (header_signed or presigned) and bool(claimed) and access_key_id == claimed
+    sigv2 = authorization.startswith("AWS ") or bool(
+        _query_value(query_params or {}, "AWSAccessKeyId") and _query_value(query_params or {}, "Signature")
+        and not _query_value(query_params or {}, "SignatureVersion"))
+    if sigv2 and claimed and not _is_root_key(claimed) and not authorization.startswith("AWS4-"):
+        headers = {name.decode("latin-1").lower(): decode_header_value(value) for name, value in raw_headers}
+        from ministack.app import _ACCESS_POINT_HOST_RE, _extract_s3_vhost_bucket
+        from ministack.services.s3 import resolve_access_point_host
+        bucket = _extract_s3_vhost_bucket(headers.get("host", ""))
+        access_point = _ACCESS_POINT_HOST_RE.match(bucket or "")
+        if access_point and resolve_access_point_host(access_point["name"], access_point["account"], None):
+            bucket = None  # an access point host signs its path without a bucket
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, headers, sigv2=True,
+                                          auth_path=f"/{bucket}{raw_path}" if bucket else raw_path))
+        return
+    # A SigV4 signature that names no key is checked too: it is incomplete or names an unknown key.
+    names_no_key = not claimed and (authorization.startswith("AWS4-HMAC-SHA256") or presigned)
+    if not verifiable and not names_no_key and _signature_attempted(authorization, query_params) and not (
+            claimed and _is_root_key(claimed)) and not _s3_presigned_query(query_params):
+        _signed_request.set(SignedRequest(claimed, method, raw_path, query_params, {}, unverifiable=True))
+        return
+    if not (verifiable or names_no_key) or (access_key_id and _is_root_key(access_key_id)):
+        _signed_request.set(None)
+        return
+    headers: dict[str, str] = {}
+    for name, value in raw_headers:
+        key, text = name.decode("latin-1").lower(), decode_header_value(value)
+        # SigV4 signs a header sent on several lines as its values joined by a bare comma.
+        headers[key] = f"{headers[key]},{text}" if key in headers else text
+    _signed_request.set(SignedRequest(
+        access_key_id, method, raw_path, query_params, headers, presigned=presigned, handshake=handshake))
+
+
+def _sigv2_check(request: SignedRequest, account_id: str) -> AuthError | ResolvedCredential:
+    """Verify a SigV2 (HmacV1) header or query signature as S3 computes it."""
+    from urllib.parse import urlencode, urlsplit
+
+    from botocore.auth import HmacV1Auth
+    from botocore.awsrequest import HTTPHeaders
+    from botocore.credentials import Credentials
+
+    from ministack.core.responses import _account_from_sts_session
+
+    query = request.query_params or {}
+    presigned = not request.headers.get("authorization", "").startswith("AWS ")
+    token = (_query_value(query, "x-amz-security-token") if presigned
+             else request.headers.get("x-amz-security-token", ""))
+    credential = resolve_credential(request.access_key_id,
+                                    _account_from_sts_session(request.access_key_id) or account_id, token)
+    if isinstance(credential, CredentialResolutionError):
+        return AuthError(credential.code, credential.message)
+    headers = HTTPHeaders()
+    for name, value in request.headers.items():
+        headers[name] = value
+    pairs = [(k, v) for k, values in query.items() for v in (values if isinstance(values, list) else [values])]
+    split = urlsplit("http://host" + request.auth_path + ("?" + urlencode(pairs) if pairs else ""))
+    if presigned:
+        # A query signature signs Expires where a header signature signs Date.
+        signed_date = _query_value(query, "Expires")
+        if not signed_date.isdigit() or int(signed_date) < time.time():
+            return AuthError("SignatureDoesNotMatch", "Request has expired")
+        given = _query_value(query, "Signature")
+    else:
+        signed_date = request.headers.get("date", "")
+        given = request.headers["authorization"].split(":", 1)[-1]
+
+    class _Signer(HmacV1Auth):
+        def _get_date(self):  # the date the client signed, not the time of this check
+            return signed_date
+
+    signer = _Signer(Credentials(credential.access_key_id, credential.secret_access_key, token or None))
+    expected = signer.get_signature(request.method, split, headers)
+    if not hmac.compare_digest(given.encode(), expected.encode()):
+        return AuthError("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
+                                                  "you provided. Check your key and signing method.")
+    _verified_key.set(request.access_key_id)
+    return credential
+
+
+def _query_value(query_params: dict, name: str) -> str:
+    found = query_params.get(name) or query_params.get(name.lower()) or [""]
+    return found[0] if isinstance(found, list) else found
+
+
+def _signature_attempted(authorization: str, query_params: dict) -> bool:
+    """Whether a request carries any AWS signature or credential, valid or not."""
+    if authorization.startswith(("AWS4-", "AWS ")):
+        return True
+    return any(_query_value(query_params or {}, name) for name in (
+        "X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Signature", "AWSAccessKeyId", "Signature"))
+
+
+def _s3_presigned_query(query_params: dict) -> bool:
+    """A complete SigV4 presigned S3 URL, which S3 verifies itself."""
+    query_params = query_params or {}
+    scope = _query_value(query_params, "X-Amz-Credential").split("/")
+    return (_query_value(query_params, "X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and bool(scope[0])
+            and len(scope) == 5 and scope[3] == "s3" and bool(_query_value(query_params, "X-Amz-Signature")))
+
+
+def _sigv4a_header(authorization: str, payload_hash: str) -> bool:
+    """A SigV4a header signature that signs its region set and does not sign its body in chunks."""
+    from ministack.core.sigv4 import SIGV4A
+
+    if not authorization.startswith(SIGV4A + " "):
+        return False
+    fields = dict(part.strip().partition("=")[::2] for part in authorization.split(" ", 1)[1].split(","))
+    return ("x-amz-region-set" in fields.get("SignedHeaders", "").split(";")
+            and not payload_hash.startswith("STREAMING-AWS4-ECDSA"))
+
+
+def _sigv4a_s3_presign(query_params: dict) -> bool:
+    """A SigV4a presigned S3 URL; the S3 handler checks only SigV4 ones itself."""
+    from ministack.core.sigv4 import SIGV4A
+
+    scope = _query_value(query_params or {}, "X-Amz-Credential").split("/")
+    return _query_value(query_params or {}, "X-Amz-Algorithm") == SIGV4A and len(scope) == 4 and scope[2] == "s3"
+
+
+def _query_signed(query_params: dict) -> bool:
+    """A SigV4 query-string signature; S3 checks its own presigned URLs."""
+    def value(name):
+        found = query_params.get(name) or query_params.get(name.lower()) or [""]
+        return found[0] if isinstance(found, list) else found
+
+    scope = value("X-Amz-Credential").split("/")
+    return value("X-Amz-Algorithm") == "AWS4-HMAC-SHA256" and (len(scope) < 4 or scope[3] != "s3")
+
+
+def pin_signed_body(body: bytes) -> None:
+    """Add the body as it arrived, before any decoding, to the pinned request."""
+    request = _signed_request.get()
+    if request is not None:
+        _signed_request.set(replace(request, body=body))
+
+
+def authenticate_handshake(scope: dict) -> AuthError | ResolvedCredential | None:
+    """Check a WebSocket upgrade signed in its Authorization header or query string, as ``authenticate`` does."""
+    from urllib.parse import parse_qs, quote
+
+    from ministack.core.responses import get_account_id
+
+    raw_path = scope.get("raw_path") or quote(scope.get("path", "")).encode()
+    query_params = parse_qs(scope.get("query_string", b"").decode("utf-8", "replace"), keep_blank_values=True)
+    pin_signed_request("GET", raw_path.decode("latin-1"), query_params, scope.get("headers", []), handshake=True)
+    request = _signed_request.get()
+    if request is None:
+        return None
+    try:
+        account_id = find_iam_access_key_account(request.access_key_id) or get_account_id()
+    except AmbiguousAccessKeyError:
+        account_id = get_account_id()
+    return authenticate(request.access_key_id, account_id)
+
+
+def authenticate(access_key_id: str, account_id: str) -> AuthError | ResolvedCredential | None:
+    """Check the pinned request's time, session token and signature: its credential, a failure, or None."""
+    from ministack.core.responses import _account_from_sts_session, get_region
+    from ministack.core.sigv4 import (
+        header_signature_failure,
+        parse_header_signature,
+        parse_query_signature,
+        presigned_request_is_expired,
+        region_set_covers,
+        request_time_failure,
+    )
+
+    request = _signed_request.get()
+    if request is None or request.access_key_id != access_key_id:
+        return None
+    _signed_request.set(None)  # checked once; the request's later checks skip it
+    if request.unverifiable:
+        return AuthError("UnsupportedSignature", "The request signature does not conform to AWS standards.")
+    if request.sigv2:
+        return _sigv2_check(request, account_id)
+    if request.presigned:
+        signature = parse_query_signature(request.query_params)
+    else:
+        signature = parse_header_signature(request.headers)
+    if isinstance(signature, tuple):
+        return AuthError(*signature)
+    if request.presigned and signature.region_set is not None:
+        # A SigV4a presigned URL is good until its X-Amz-Expires, however long ago it was signed.
+        expires = _query_value(request.query_params, "X-Amz-Expires")
+        try:
+            expired = bool(expires) and presigned_request_is_expired(signature.amz_date, expires)
+        except ValueError:
+            expired = True
+        if expired:
+            return AuthError("RequestExpired", "Request has expired")
+    else:
+        skewed = request_time_failure(signature)
+        if skewed:
+            return AuthError(*skewed)
+    if signature.region_set is not None and signature.service != "s3" and not region_set_covers(
+            signature.region_set, get_region()):
+        # A region set without the region serving the request is refused like an unknown key; S3 checks its own.
+        unknown = _unknown_access_key()
+        return AuthError(unknown.code, unknown.message)
+    if request.presigned:
+        token = (request.query_params.get("X-Amz-Security-Token") or [""])[0]
+    else:
+        token = request.headers.get("x-amz-security-token", "")
+    credential = resolve_credential(
+        access_key_id, _account_from_sts_session(access_key_id) or account_id, token,
+    ) if access_key_id else _unknown_access_key()
+    if isinstance(credential, CredentialResolutionError):
+        if credential.code == "InvalidToken":
+            # AWS treats a session key without its token as unknown, and any other token as invalid.
+            if token:
+                return AuthError("InvalidToken", "The security token included in the request is invalid")
+            credential = _unknown_access_key()
+        return AuthError(credential.code, credential.message)
+    failure = header_signature_failure(
+        signature, credential.secret_access_key, request.method, request.raw_path,
+        request.query_params, request.headers, request.body, presigned=request.presigned,
+        explain=request.handshake,
+    )
+    if failure:
+        details = {}
+        if signature.service == "s3" and failure[0] == "SignatureDoesNotMatch":
+            from ministack.core.sigv4 import header_signing_documents
+
+            canonical, string_to_sign = header_signing_documents(
+                signature, request.method, request.raw_path, request.query_params, request.headers, request.body,
+                presigned=request.presigned,
+            )
+            details = {
+                "AWSAccessKeyId": access_key_id,
+                "StringToSign": string_to_sign,
+                "SignatureProvided": signature.signature,
+                "StringToSignBytes": string_to_sign.encode("utf-8").hex(" "),
+                "CanonicalRequest": canonical,
+                "CanonicalRequestBytes": canonical.encode("utf-8").hex(" "),
+            }
+        return AuthError(*failure, details=details)
+    _verified_key.set(access_key_id)
+    return credential
+
+
+def check_credentials(access_key_id: str) -> AuthError | None:
+    """Authenticate a request no IAM action covers, with the checks enforce() makes before any policy."""
+    from ministack.core.responses import get_account_id
+
+    account_id = get_account_id()
+    checked = authenticate(access_key_id or "", account_id)
+    if checked is None:
+        checked = resolve_principal(access_key_id or "", account_id)
+    return checked if isinstance(checked, AuthError) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1090,7 +1554,7 @@ _ALWAYS_ALLOWED_ACTIONS = frozenset({
 
 def resolve_caller_identity(access_key_id: str) -> dict | None:
     """Display identity for a caller's access key — no signature verification
-    (never modeled) and no policy evaluation, just the same key resolution the
+    and no policy evaluation, just the same key resolution the
     evaluator uses, shaped for API Gateway's IAM-authorized proxy events.
 
     Returns None for an unknown key. The ``session`` value is the raw
@@ -1140,6 +1604,12 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
     return None
 
 
+def _names_condition_key(policies: list[list[ParsedStatement]], prefix: str) -> bool:
+    """Whether a condition in *policies* uses a key starting with *prefix* (lower case)."""
+    return any(key.lower().startswith(prefix) for stmts in policies for stmt in stmts
+               for block in stmt.conditions.values() if isinstance(block, dict) for key in block)
+
+
 def enforce(access_key_id: str, iam_action: str, service: str,
             region: str, resource_arn: str = "*",
             service_context: dict[str, Any] | None = None) -> EvalResult | AuthError | None:
@@ -1148,14 +1618,21 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
     or an ``EvalResult`` for authorization denials.
     """
+    from ministack.core.responses import get_account_id
+
+    account_id = get_account_id()
+    # S3, API Gateway methods and function URLs can be called anonymously: an unsigned request is not checked.
+    anonymous_ok = service == "s3" or iam_action in ("execute-api:Invoke", "lambda:InvokeFunctionUrl")
+    unsigned = anonymous_ok and not access_key_id and _signed_request.get() is None
+    checked = None if unsigned else authenticate(access_key_id or "", account_id)
+    if isinstance(checked, AuthError):
+        return checked
+
     # Actions that AWS never denies, regardless of policies
     if iam_action in _ALWAYS_ALLOWED_ACTIONS:
         return None
 
-    from ministack.core.responses import get_account_id
-
-    account_id = get_account_id()
-    principal = resolve_principal(access_key_id or "", account_id)
+    principal = resolve_principal(access_key_id or "", account_id, checked)
 
     # Authentication failure
     if isinstance(principal, AuthError):
@@ -1165,6 +1642,13 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     if principal.policies is None:
         return None
 
+    context = {key.lower(): value for key, value in (service_context or {}).items()}
+    # A request that names no tags has no aws:TagKeys.
+    context.setdefault("aws:tagkeys", None)
+    if _names_condition_key(principal.policies, "aws:resourcetag/"):
+        from ministack.services.tagging import resource_tags
+        for name, value in (resource_tags(resource_arn) or {}).items():
+            context.setdefault(f"aws:resourcetag/{name}".lower(), value)
     ctx = EvalContext(
         principal_arn=principal.arn,
         principal_type=principal.type,
@@ -1172,12 +1656,24 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         action=iam_action,
         resource_arn=resource_arn,
         region=region,
-        service_context={
-            key.lower(): value for key, value in (service_context or {}).items()
-        },
+        service_context=context,
+        principal_keys=principal.keys,
     )
 
-    result = evaluate(ctx, principal.policies)
+    result = evaluate(ctx, principal.policies, *principal.limits)
+    found = _resource_policy(service, resource_arn)
+    if found is None and service == "s3" and "s3:dataaccesspointarn" in context:
+        if (iam_action in ("s3:PutBucketPolicy", "s3:DeleteBucketPolicy") and result.decision != "Deny"
+                and resource_arn == context["s3:dataaccesspointarn"]):
+            # An access point refuses bucket policy writes as an explicit Deny of its own.
+            return EvalResult("Deny", principal_arn=principal.arn, resource_policy_arn=resource_arn)
+        # A data request through an access point meets the access point policy on the access point ARN.
+        from ministack.services.s3 import access_point_policy_for_arn
+
+        found = access_point_policy_for_arn(resource_arn)
+    if found is not None:
+        result = combine_resource_policy(result, ctx, *found, required=service in _POLICY_REQUIRED,
+                                         limits=principal.limits)
 
     if result.decision == "Allow":
         return None
@@ -1242,6 +1738,8 @@ def evaluate_trust_policy(trust_doc: str | dict,
       - ``{"AWS": "ACCT"}`` — account ID shorthand
       - ``{"Service": "lambda.amazonaws.com"}`` — service principal
       - ``{"AWS": ["arn1", "arn2"]}`` — list of principals
+      - ``{"Federated": "PROVIDER"}`` — web identity provider, for
+        ``sts:AssumeRoleWithWebIdentity`` only
     """
     if isinstance(trust_doc, str):
         try:
@@ -1263,6 +1761,7 @@ def evaluate_trust_policy(trust_doc: str | dict,
             principal_account=_account_from_arn(caller_arn) or "",
             action="sts:AssumeRole", resource_arn="*", region="",
         )
+    federated = ctx.action == "sts:AssumeRoleWithWebIdentity"
     allowed = False
     for stmt in statements:
         if not isinstance(stmt, dict):
@@ -1276,11 +1775,11 @@ def evaluate_trust_policy(trust_doc: str | dict,
             actions = [actions]
         if isinstance(not_actions, str):
             not_actions = [not_actions]
-        if not (actions or not_actions) or not _action_matches("sts:AssumeRole", actions, not_actions):
+        if not (actions or not_actions) or not _action_matches(ctx.action, actions, not_actions):
             continue
         # Check Principal
         principal = stmt.get("Principal", {})
-        if not _principal_matches(principal, caller_arn):
+        if not _trust_principal_matches(principal, caller_arn, federated):
             continue
         if not _conditions_met(stmt.get("Condition", {}), ctx):
             continue
@@ -1289,6 +1788,16 @@ def evaluate_trust_policy(trust_doc: str | dict,
         allowed = True
 
     return allowed
+
+
+def _trust_principal_matches(principal: Any, caller_arn: str, federated: bool) -> bool:
+    """Whether a trust-policy Principal names the caller or, if *federated*, the provider."""
+    if not federated:
+        return _principal_matches(principal, caller_arn)
+    if principal == "*":
+        return True
+    providers = principal.get("Federated", []) if isinstance(principal, dict) else []
+    return caller_arn in ([providers] if isinstance(providers, str) else providers)
 
 
 def _principal_matches(principal: Any, caller_arn: str) -> bool:
@@ -1325,20 +1834,8 @@ def _principal_matches(principal: Any, caller_arn: str) -> bool:
             # Also match account root against any principal in that account
             if p.endswith(":root") and f":{p.split(':')[4]}:" in caller_arn:
                 return True
-        # Service principals — match if the caller ARN looks like it came from
-        # that service (e.g., lambda.amazonaws.com allows Lambda-invoked assumes).
-        # In local dev, service principals are typically used by MiniStack's own
-        # service dispatch (Lambda, ECS, etc.), so we also allow if the caller
-        # is root (service-to-service calls use root credentials internally).
-        svc_principals = principal.get("Service", [])
-        if isinstance(svc_principals, str):
-            svc_principals = [svc_principals]
-        if svc_principals:
-            if ":root" in caller_arn:
-                return True
-            for svc in svc_principals:
-                # Extract service prefix: "lambda.amazonaws.com" → "lambda"
-                svc_prefix = svc.split(".")[0] if "." in svc else svc
-                if svc_prefix in caller_arn:
-                    return True
+        # No IAM principal is a service, but MiniStack's own service calls
+        # use root credentials, so a Service principal lets root through.
+        if principal.get("Service") and caller_arn.endswith(":root"):
+            return True
     return False

@@ -64,7 +64,8 @@ def iot_endpoint_hosts() -> "list[str]":
 
 
 def _generated_cert_names() -> "list[str]":
-    return cognito_idp_hosts() + iot_endpoint_hosts()
+    # Docker Lambda containers reach the gateway as host.docker.internal.
+    return ["host.docker.internal"] + cognito_idp_hosts() + iot_endpoint_hosts()
 
 
 def ca_bundle_path(cert_path: str) -> "str | None":
@@ -145,7 +146,7 @@ def trust_gateway_cert(env: dict) -> None:
     env.setdefault("NODE_EXTRA_CA_CERTS", cert_path)
     bundle = ca_bundle_path(cert_path)
     if bundle:
-        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
             env.setdefault(var, bundle)
 
 

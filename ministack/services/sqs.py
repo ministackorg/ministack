@@ -118,12 +118,6 @@ def _enforce_queue_policy(q: dict, iam_action: str) -> None:
     Policy carries an explicit Deny for them. Cross-account callers need an
     explicit Allow in the Policy, exactly like real SQS, which answers
     AccessDenied (403) otherwise.
-
-    Known boundary under AUTH=true: a caller with no identity Allow whose
-    access comes from this Policy alone is denied by the app-level identity
-    check before this resource check runs, where real SQS would allow the
-    union. Lifting that needs the identity layer to defer to the resource
-    layer, which no AUTH=true server harness here can verify.
     """
     from ministack.app import AUTH
     if not AUTH:
@@ -149,6 +143,14 @@ def _enforce_queue_policy(q: dict, iam_action: str) -> None:
                                   owner is None or owner == caller):
         raise _Err("AccessDenied",
                    f"Access to the resource https://sqs.{get_region()}.amazonaws.com/ is denied.", 403)
+
+
+def queue_policy_for_arn(queue_arn: str) -> tuple[str, str] | None:
+    """The queue's Policy and owner account, for the identity check."""
+    q = _queue_by_arn(queue_arn)
+    if q is None:
+        return None
+    return q["attributes"].get("Policy") or "", _owner_from_queue_arn(queue_arn)[0]
 
 
 def queue_policy_allows(queue_arn: str, service: str,
@@ -689,10 +691,15 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         _prune_dedup(q)
         cached = q["dedup_cache"].get(dedup_cache_key)
         if cached:
+            # A dedup hit keeps the first message, but AWS answers with the
+            # digests of *this* request's body and attributes, not the first
+            # message's. SDKs that verify the digests (e.g. .NET, Java) reject
+            # a response that carries the cached ones.
             r: dict = {"MessageId": cached["id"],
-                       "MD5OfMessageBody": cached["md5"]}
-            if cached.get("md5a"):
-                r["MD5OfMessageAttributes"] = cached["md5a"]
+                       "MD5OfMessageBody": hashlib.md5(body_text.encode()).hexdigest()}
+            md5a_now = _md5_msg_attrs(msg_attrs)
+            if md5a_now:
+                r["MD5OfMessageAttributes"] = md5a_now
             if cached.get("seq"):
                 r["SequenceNumber"] = cached["seq"]
             return r
@@ -786,8 +793,7 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
         fa = _filter_msg_attrs(m["message_attributes"], msg_attr_names)
         if fa:
             entry["MessageAttributes"] = fa
-            if m["md5_attrs"]:
-                entry["MD5OfMessageAttributes"] = m["md5_attrs"]
+            entry["MD5OfMessageAttributes"] = _md5_msg_attrs(fa)
         out.append(entry)
 
     return {"Messages": out} if out else {}
@@ -938,11 +944,16 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:SetQueueAttributes")
     incoming = data.get("Attributes") or {}
-    if "RedrivePolicy" in incoming:
+    if "RedrivePolicy" in incoming and incoming["RedrivePolicy"] != "":
         _validate_redrive_policy(str(incoming["RedrivePolicy"]))
     _validate_numeric_attrs(incoming)
     for k, v in incoming.items():
-        q["attributes"][k] = str(v)
+        if k in {"Policy", "RedrivePolicy", "RedriveAllowPolicy"} and v == "":
+            # An empty value removes the policy (Terraform's policy-resource delete).
+            q["attributes"].pop(k, None)
+            logger.debug("Removed queue attribute %s from %s", k, url)
+        else:
+            q["attributes"][k] = str(v)
     q["attributes"]["LastModifiedTimestamp"] = str(int(time.time()))
     return {}
 

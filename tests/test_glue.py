@@ -2445,6 +2445,228 @@ def test_iceberg_dispatch_routes_glue_vs_s3tables():
     assert targets_glue("/iceberg/v1/config", {}) is False
 
 
+def test_iceberg_iam_checks_read_body_names_as_the_handlers_do():
+    """The checks read createNamespace, createTable and transaction bodies as the handlers do."""
+    from ministack.services.glue import iceberg_iam_checks
+
+    arn = "arn:aws:glue:us-east-1:000000000000"
+    catalog = "/iceberg/v1/catalogs/000000000000"
+    assert iceberg_iam_checks("POST", f"{catalog}/namespaces", b'{"namespace": ["db"]}', {})[-1] == (
+        "glue:CreateDatabase", f"{arn}:database/db")
+    assert iceberg_iam_checks("POST", f"{catalog}/namespaces/db/tables", b'{"name": ["x"]}', {})[-1] == (
+        "glue:CreateTable", f"{arn}:table/db/['x']")
+    change = b'{"table-changes": [{"identifier": {"namespace": "db", "name": "t"}}]}'
+    assert iceberg_iam_checks("POST", f"{catalog}/transactions/commit", change, {})[-1] == (
+        "glue:UpdateTable", f"{arn}:table/db/t")
+    for unread in (b"", b"[]", b'{"table-changes": [[]]}'):
+        assert iceberg_iam_checks("POST", f"{catalog}/transactions/commit", unread, {}) == [("glue:UpdateTable", "*")]
+
+
+def _glue_iceberg_signed(credentials, method, path, body=None, query=None, service="glue"):
+    """One Iceberg REST call signed for glue (or another service) over HTTP: status, body (JSON or None), headers."""
+    import urllib.error
+    import urllib.request
+
+    from botocore.auth import S3SigV4Auth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from conftest import ENDPOINT
+
+    request = AWSRequest(method=method, url=f"{ENDPOINT}/iceberg/v1/{path}", params=query or {},
+                         data=json.dumps(body).encode() if body is not None else None)
+    (S3SigV4Auth if service == "s3" else SigV4Auth)(credentials, service, "us-east-1").add_auth(request)
+    prepared = request.prepare()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                prepared.url, data=prepared.body, method=method, headers=dict(prepared.headers))) as response:
+            status, content, headers = response.status, response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        status, content, headers = error.code, error.read(), error.headers
+    return status, json.loads(content) if content else None, {k.lower(): v for k, v in headers.items()}
+
+
+@pytest.fixture
+def glue_iceberg_user(glue, iam_user):
+    """A Glue database with Iceberg tables t and u, and a factory for users of it signing with a second access key."""
+    import contextlib
+    import uuid
+
+    from botocore.credentials import Credentials
+    from conftest import make_client
+
+    database = f"irc_{uuid.uuid4().hex[:8]}"
+    glue.create_database(DatabaseInput={"Name": database})
+    root = Credentials("test", "test")
+    for table in ("t", "u"):
+        assert _glue_iceberg_signed(root, "POST", f"catalogs/000000000000/namespaces/{database}/tables", {
+            "name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}})[0] == 200
+    iam = make_client("iam")
+    with contextlib.ExitStack() as cleanup:
+        def drop_databases():
+            for found in glue.get_databases()["DatabaseList"]:
+                if found["Name"].startswith(database):
+                    glue.delete_database(Name=found["Name"])
+
+        cleanup.callback(drop_databases)
+
+        def create(statements=None):
+            user = iam_user(policy={"Version": "2012-10-17", "Statement": statements} if statements else None)
+            key = iam.create_access_key(UserName=user.name)["AccessKey"]
+            cleanup.callback(iam.delete_access_key, UserName=user.name, AccessKeyId=key["AccessKeyId"])
+            return user, Credentials(key["AccessKeyId"], key["SecretAccessKey"])
+
+        yield database, create
+
+
+def _glue_iceberg_denial(user, action, resource, reason=None):
+    """The Iceberg error body of a glue identity-policy denial."""
+    reason = reason or f"because no identity-based policy allows the glue:{action} action"
+    resource = resource if resource == "*" else f"arn:aws:glue:us-east-1:000000000000:{resource}"
+    return {"error": {"message": f"User: {user.arn} is not authorized to perform: glue:{action} on resource: "
+                                 f"{resource} {reason}", "type": "AccessDeniedException", "code": 403}}
+
+
+# Iceberg REST routes on the Glue catalog: method, path, body, the glue actions each needs with the resources it
+# checks them on (catalog, then database, then table), and MiniStack's status once they are allowed.
+_DATABASE = ["catalog", "database/{db}"]
+_TABLE_T = ["catalog", "database/{db}", "table/{db}/t"]
+_GLUE_ICEBERG_ROUTES = {
+    "config": ("GET", "config", None, [("GetCatalog", ["catalog"])], 200),
+    "list-namespaces": ("GET", "namespaces", None, [("GetDatabases", ["catalog"])], 200),
+    "create-namespace": ("POST", "namespaces", {"namespace": ["{db}_{new}"]},
+                         [("CreateDatabase", ["catalog", "database/{db}_{new}"])], 200),
+    "load-namespace": ("GET", "namespaces/{db}", None, [("GetDatabase", _DATABASE)], 200),
+    "namespace-exists": ("HEAD", "namespaces/{db}", None, [("GetDatabase", _DATABASE)], 200),
+    "drop-namespace": ("DELETE", "namespaces/{db}", None, [("DeleteDatabase", _DATABASE)], 501),
+    "namespace-properties": ("POST", "namespaces/{db}/properties", {"updates": {"k": "v"}},
+                             [("GetDatabase", _DATABASE), ("UpdateDatabase", _DATABASE)], 501),
+    "list-tables": ("GET", "namespaces/{db}/tables", None, [("GetTables", _DATABASE)], 200),
+    "create-table": ("POST", "namespaces/{db}/tables", {"name": "{new}"},
+                     [("CreateTable", ["catalog", "database/{db}", "table/{db}/{new}"])], 200),
+    "load-table": ("GET", "namespaces/{db}/tables/t", None, [("GetTable", _TABLE_T)], 200),
+    "table-exists": ("HEAD", "namespaces/{db}/tables/t", None, [("GetTable", _TABLE_T)], 200),
+    "update-table": ("POST", "namespaces/{db}/tables/t", {"requirements": [], "updates": []},
+                     [("UpdateTable", _TABLE_T)], 200),
+    "drop-table": ("DELETE", "namespaces/{db}/tables/t", None, [("DeleteTable", _TABLE_T)], 501),
+    "commit-transaction": ("POST", "transactions/commit", {"table-changes": [
+        {"identifier": {"namespace": ["{db}"], "name": "t"}, "requirements": [], "updates": []}]},
+        [("UpdateTable", _TABLE_T)], 200),
+}
+
+
+def _glue_iceberg_fill(value, names):
+    """A path, body or resource template with {name} placeholders filled from ``names``."""
+    text = json.dumps(value)
+    for key, name in names.items():
+        text = text.replace("{" + key + "}", name)
+    return json.loads(text)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("service", ["glue", "s3tables", "s3", "sts"])
+@pytest.mark.parametrize("route", list(_GLUE_ICEBERG_ROUTES))
+def test_glue_iceberg_route_contract(auth_enabled, glue_iceberg_user, route, service):
+    """Each Iceberg route on the Glue catalog needs exactly its glue actions, whatever service it is signed for."""
+    database, create = glue_iceberg_user
+    method, path, body, actions, served = _GLUE_ICEBERG_ROUTES[route]
+    glue_arn = "arn:aws:glue:us-east-1:000000000000"
+    allowed_names = {"db": database, "new": "a"}
+    user, signer = create([
+        {"Effect": "Allow", "Action": f"glue:{action}",
+         "Resource": [f"{glue_arn}:{resource}" for resource in _glue_iceberg_fill(resources, allowed_names)]}
+        for action, resources in actions])
+    nobody, refused_signer = create()
+    query = {"warehouse": "000000000000"} if path == "config" else None
+    path = path if path == "config" else f"catalogs/000000000000/{path}"
+    calls = [_glue_iceberg_signed(credentials, method, *_glue_iceberg_fill([path, body], names), query=query,
+                                  service=service)
+             for credentials, names in ((signer, allowed_names), (refused_signer, {"db": database, "new": "n"}))]
+    assert calls[0][0] == served
+    if not auth_enabled:
+        assert calls[1][0] == served
+        return
+    status, error, headers = calls[1]
+    assert (status, headers["content-type"], headers["x-amzn-errortype"]) == (403, "application/json",
+                                                                              "ForbiddenResponse")
+    assert error == (None if method == "HEAD" else _glue_iceberg_denial(nobody, actions[0][0], "catalog"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("method,path,body,action,resource,reason", [
+    ("GET", "namespaces/{db}_new", None, "GetDatabase", "database/{db}_new", None),
+    ("POST", "namespaces/{db}/properties", {"updates": {"k": "v"}}, "UpdateDatabase", "catalog", None),
+    ("GET", "namespaces/{db}/tables/u", None, "GetTable", "table/{db}/u", None),
+    ("POST", "namespaces/{db}/tables/t", {"requirements": [], "updates": []}, "UpdateTable", "table/{db}/t",
+     "with an explicit deny in an identity-based policy"),
+], ids=["absent-namespace", "namespace-properties", "other-table", "explicit-deny"])
+def test_glue_iceberg_authorization_contract(auth_enabled, glue_iceberg_user, method, path, body, action, resource,
+                                             reason):
+    """A denial names the first resource the policy does not cover: the catalog, then the database, then the table."""
+    database, create = glue_iceberg_user
+    glue_arn = "arn:aws:glue:us-east-1:000000000000"
+    scope = [f"{glue_arn}:catalog", f"{glue_arn}:database/{database}"]
+    user, signer = create([
+        {"Effect": "Allow", "Resource": scope,
+         "Action": ["glue:GetCatalog", "glue:GetDatabases", "glue:GetDatabase", "glue:UpdateTable"]},
+        {"Effect": "Allow", "Action": "glue:GetTable", "Resource": [*scope, f"{glue_arn}:table/{database}/t"]},
+        {"Effect": "Deny", "Action": "glue:UpdateTable", "Resource": f"{glue_arn}:table/{database}/t"},
+    ])
+    assert _glue_iceberg_signed(signer, "GET", "config", query={"warehouse": "000000000000"})[0] == 200
+    assert [database] in _glue_iceberg_signed(signer, "GET", "catalogs/:/namespaces")[1]["namespaces"]
+    assert _glue_iceberg_signed(signer, "GET", f"catalogs/000000000000/namespaces/{database}/tables/t")[0] == 200
+    status, error, headers = _glue_iceberg_signed(
+        signer, method, "catalogs/000000000000/" + path.format(db=database), body)
+    if not auth_enabled:
+        assert status != 403
+        return
+    assert (status, headers["content-type"], headers["x-amzn-errortype"]) == (
+        403, "application/json", "ForbiddenResponse")
+    assert error == _glue_iceberg_denial(user, action, resource.format(db=database), reason)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("catalog", [":", "arn:aws:glue:us-east-1:000000000000:catalog"], ids=["colon", "arn"])
+def test_glue_iceberg_catalog_forms_contract(auth_enabled, glue_iceberg_user, catalog):
+    """MiniStack serves its default catalog for any {catalog}, so every form is authorized as that catalog."""
+    database, create = glue_iceberg_user
+    allowed, signer = create([{"Effect": "Allow", "Action": "glue:GetDatabases",
+                               "Resource": "arn:aws:glue:us-east-1:000000000000:catalog"}])
+    nobody, refused_signer = create([{"Effect": "Allow", "Action": "glue:GetDatabase", "Resource": "*"}])
+    assert [database] in _glue_iceberg_signed(signer, "GET", f"catalogs/{catalog}/namespaces")[1]["namespaces"]
+    status, error, _ = _glue_iceberg_signed(refused_signer, "GET", f"catalogs/{catalog}/namespaces")
+    if not auth_enabled:
+        assert status == 200
+        return
+    assert (status, error) == (403, _glue_iceberg_denial(nobody, "GetDatabases", "catalog"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("body", ["t", "t-and-u", "no-changes", "no-object"])
+def test_glue_iceberg_transaction_commit_contract(auth_enabled, glue_iceberg_user, body):
+    """transactions/commit needs glue:UpdateTable on each table it changes, on * when it names none."""
+    database, create = glue_iceberg_user
+    glue_arn = "arn:aws:glue:us-east-1:000000000000"
+    change = {"identifier": {"namespace": [database], "name": "t"}, "requirements": [], "updates": []}
+    bodies = {"t": {"table-changes": [change]},
+              "t-and-u": {"table-changes": [change, {**change, "identifier": {"namespace": [database], "name": "u"}}]},
+              "no-changes": {}, "no-object": "table-changes"}
+    allowed, signer = create([{"Effect": "Allow", "Action": "glue:UpdateTable", "Resource": [
+        f"{glue_arn}:catalog", f"{glue_arn}:database/{database}", f"{glue_arn}:table/{database}/t"]}])
+    nobody, refused_signer = create()
+    path = "catalogs/000000000000/transactions/commit"
+    committed = _glue_iceberg_signed(signer, "POST", path, bodies[body])
+    refused = _glue_iceberg_signed(refused_signer, "POST", path, bodies[body])
+    if not auth_enabled:
+        assert (committed[0], refused[0]) == ((500, 500) if body == "no-object" else (200, 200))
+        return
+    unread = body in ("no-changes", "no-object")
+    assert refused[:2] == (403, _glue_iceberg_denial(nobody, "UpdateTable", "*" if unread else "catalog"))
+    if body == "t":
+        assert committed[0] == 200
+    else:
+        assert committed[:2] == (403, _glue_iceberg_denial(allowed, "UpdateTable", "*" if unread else
+                                                           f"table/{database}/u"))
+
+
 def test_non_catalogs_prefix_returns_501():
     """Bare-warehouse prefixes (`/v1/{warehouse}/namespaces`) are the
     S3 Tables shape, not Glue's — reject rather than guess."""

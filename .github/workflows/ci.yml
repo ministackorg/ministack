@@ -70,16 +70,9 @@ jobs:
             shard_count: 2
 
     env:
+      AUTH: "false"
       # Control-plane tests must not contact the Docker daemon.
       DOCKER_HOST: unix:///no-existent/docker.sock
-
-    services:
-      redis:
-        image: public.ecr.aws/docker/library/redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
 
     steps:
       - uses: actions/checkout@v6
@@ -97,6 +90,19 @@ jobs:
 
       - name: Install dependencies
         run: uv pip install --system -e ".[test]" -r requirements.txt
+
+      - name: Start Redis
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          IMAGE=redis:7-alpine
+          docker pull "$IMAGE" || { IMAGE=public.ecr.aws/docker/library/redis:7-alpine; docker pull "$IMAGE"; }
+          docker run -d --name redis -p 6379:6379 "$IMAGE"
+          for i in $(seq 1 15); do
+            docker exec redis redis-cli ping && break
+            sleep 1
+          done
+          docker exec redis redis-cli ping
 
       - name: Start MiniStack
         run: |
@@ -128,9 +134,9 @@ jobs:
             exit 0
           fi
           if [ "${{ matrix.mode }}" = "serial" ]; then
-            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial and not data_plane" --durations=10
+            pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "serial and not data_plane and not auth_contract" --durations=10
           else
-            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial and not data_plane" --durations=25
+            pytest ${{ steps.shard.outputs.files }} -v -n 3 --dist=loadfile -m "not serial and not data_plane and not auth_contract" --durations=25
           fi
 
       - name: Upload MiniStack log
@@ -139,6 +145,69 @@ jobs:
         with:
           name: ministack-${{ matrix.mode }}-shard-${{ matrix.shard_index }}.log
           path: ministack.log
+
+  authorization:
+    name: authorization (AUTH=${{ matrix.auth }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        auth: ["false", "true"]
+    env:
+      AUTH: ${{ matrix.auth }}
+      DOCKER_HOST: unix:///no-existent/docker.sock
+      IOT_MTLS_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv pip install --system -e ".[test]" -r requirements.txt
+
+      - name: Start MiniStack
+        run: |
+          mkdir -p test-results
+          python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 > test-results/ministack.log 2>&1 &
+          echo "MINISTACK_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4566/_ministack/health && break
+            sleep 2
+          done
+          curl -sf http://localhost:4566/_ministack/health
+
+      - name: Run authorization contracts
+        run: |
+          pytest tests/ -v --tb=short -m auth_contract \
+            --junitxml=test-results/authorization.xml \
+            --basetemp=test-results/pytest --durations=10
+
+      - name: Stop MiniStack
+        if: always()
+        run: |
+          if [ -n "${MINISTACK_PID:-}" ] && kill -0 "$MINISTACK_PID" 2>/dev/null; then
+            kill -TERM "$MINISTACK_PID"
+            for i in $(seq 1 10); do
+              kill -0 "$MINISTACK_PID" 2>/dev/null || exit 0
+              sleep 1
+            done
+            kill -KILL "$MINISTACK_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload authorization logs and results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: authorization-${{ matrix.auth }}
+          path: test-results/
 
   data-plane:
     name: data plane (docker, ${{ matrix.shard_index }}, ${{ matrix.shard_count }})
@@ -155,18 +224,12 @@ jobs:
             shard_index: 1
             shard_count: 2
     env:
+      AUTH: "false"
       DOCKER_NETWORK: ministack-data-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard_index }}
       LAMBDA_EXECUTOR: docker
       OPENSEARCH_DATAPLANE: "1"
       DSQL_STRICT: "1"
       MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
-    services:
-      redis:
-        image: public.ecr.aws/docker/library/redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
     steps:
       - uses: actions/checkout@v6
 
@@ -189,6 +252,19 @@ jobs:
           docker info
           docker network create "$DOCKER_NETWORK"
           docker network inspect "$DOCKER_NETWORK"
+
+      - name: Start Redis
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          IMAGE=redis:7-alpine
+          docker pull "$IMAGE" || { IMAGE=public.ecr.aws/docker/library/redis:7-alpine; docker pull "$IMAGE"; }
+          docker run -d --name redis -p 6379:6379 "$IMAGE"
+          for i in $(seq 1 15); do
+            docker exec redis redis-cli ping && break
+            sleep 1
+          done
+          docker exec redis redis-cli ping
 
       - name: Start MiniStack
         run: |
@@ -220,7 +296,7 @@ jobs:
             echo "No tests for this shard"
             exit 0
           fi
-          pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "data_plane" --durations=25
+          pytest ${{ steps.shard.outputs.files }} -v --tb=short -m "data_plane and not auth_contract" --durations=25
 
       - name: Upload MiniStack log
         if: always()
@@ -290,7 +366,7 @@ jobs:
 
   test-result:
     name: test
-    needs: [control-plane, data-plane, no-image-build]
+    needs: [control-plane, data-plane, authorization, no-image-build]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -298,4 +374,5 @@ jobs:
       - run: |
           test "${{ needs['control-plane'].result }}" = "success"
           test "${{ needs['data-plane'].result }}" = "success"
+          test "${{ needs.authorization.result }}" = "success"
           test "${{ needs['no-image-build'].result }}" = "success"

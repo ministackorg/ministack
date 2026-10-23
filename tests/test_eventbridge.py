@@ -1247,6 +1247,36 @@ def test_eventbridge_update_archive(eb):
     eb.delete_archive(ArchiveName=name)
 
 
+def test_eventbridge_archive_kms_key_identifier(eb):
+    bus_arn = eb.describe_event_bus(Name="default")["Arn"]
+    key_prefix = bus_arn.split(":event-bus/")[0].replace(":events:", ":kms:")
+    key = f"{key_prefix}:key/archive-key"
+    other = f"{key_prefix}:key/other-key"
+    plain = f"plain-archive-{_uuid_mod.uuid4().hex[:8]}"
+    name = f"kms-archive-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(ArchiveName=plain, EventSourceArn=bus_arn)
+    try:
+        assert "KmsKeyIdentifier" not in eb.describe_archive(ArchiveName=plain)
+
+        eb.create_archive(ArchiveName=name, EventSourceArn=bus_arn, KmsKeyIdentifier=key)
+        assert eb.describe_archive(ArchiveName=name)["KmsKeyIdentifier"] == key
+
+        eb.update_archive(ArchiveName=name, Description="no key in request")
+        assert eb.describe_archive(ArchiveName=name)["KmsKeyIdentifier"] == key
+
+        eb.update_archive(ArchiveName=name, KmsKeyIdentifier=other)
+        assert eb.describe_archive(ArchiveName=name)["KmsKeyIdentifier"] == other
+
+        eb.update_archive(ArchiveName=name, KmsKeyIdentifier="")
+        assert "KmsKeyIdentifier" not in eb.describe_archive(ArchiveName=name)
+    finally:
+        for archive in (plain, name):
+            try:
+                eb.delete_archive(ArchiveName=archive)
+            except ClientError:
+                pass
+
+
 def test_eventbridge_put_remove_permission(eb):
     import uuid as _uuid
 
@@ -5770,3 +5800,4 @@ def test_eventbridge_api_destination_dynamic_http_parameters_use_original_event(
         )["Targets"][0]["HttpParameters"] == http_parameters
     finally:
         server.shutdown()
+

@@ -660,6 +660,9 @@ def _sign(data):
     else:
         message = message_b64
 
+    err = _algorithm_error(rec, algorithm, "SigningAlgorithms")
+    if err:
+        return err
     if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
         if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
             return error_response_json(
@@ -696,6 +699,9 @@ def _sign(data):
         })
 
     pad, hash_algo = _signing_params(algorithm)
+    err = _digest_length_error(algorithm, message_type, message, hash_algo)
+    if err:
+        return err
     if hash_algo is None:
         return error_response_json(
             "UnsupportedOperationException",
@@ -754,6 +760,9 @@ def _verify(data):
     message = base64.b64decode(message_b64) if isinstance(message_b64, str) else message_b64
     signature = base64.b64decode(signature_b64) if isinstance(signature_b64, str) else signature_b64
 
+    err = _algorithm_error(rec, algorithm, "SigningAlgorithms")
+    if err:
+        return err
     public_key = rec["_private_key"].public_key()
     if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
         if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
@@ -788,7 +797,10 @@ def _verify(data):
             "SigningAlgorithm": algorithm,
         })
 
-    pad, hash_algo = _signing_params(algorithm, for_verify=True)
+    pad, hash_algo = _signing_params(algorithm)
+    err = _digest_length_error(algorithm, message_type, message, hash_algo)
+    if err:
+        return err
     if hash_algo is None:
         return error_response_json(
             "UnsupportedOperationException",
@@ -824,7 +836,43 @@ def _verify(data):
     })
 
 
-def _signing_params(algorithm, for_verify=False):
+_SIGNING_ALGORITHM_ENUM = (
+    "RSASSA_PSS_SHA_256", "RSASSA_PSS_SHA_384", "RSASSA_PSS_SHA_512", "RSASSA_PKCS1_V1_5_SHA_256",
+    "RSASSA_PKCS1_V1_5_SHA_384", "RSASSA_PKCS1_V1_5_SHA_512", "ECDSA_SHA_256", "ECDSA_SHA_384", "ECDSA_SHA_512",
+    "ED25519_SHA_512", "ED25519_PH_SHA_512", "SM2DSA", "ML_DSA_SHAKE_256",
+)
+
+
+def _algorithm_error(rec, algorithm, field):
+    """InvalidKeyUsageException for an algorithm the key spec doesn't support."""
+    if algorithm in rec.get(field, []):
+        return None
+    if field == "SigningAlgorithms" and algorithm not in _SIGNING_ALGORITHM_ENUM:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at 'signingAlgorithm' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_SIGNING_ALGORITHM_ENUM)}]",
+            400,
+        )
+    return error_response_json(
+        "InvalidKeyUsageException",
+        f"Algorithm {algorithm} is incompatible with key spec {rec.get('KeySpec', '')}.",
+        400,
+    )
+
+
+def _digest_length_error(algorithm, message_type, message, hash_algo):
+    if message_type == "DIGEST" and hash_algo is not None and len(message) != hash_algo.digest_size:
+        return error_response_json("ValidationException", f"Digest is invalid length for algorithm {algorithm}.", 400)
+    return None
+
+
+def _oaep_padding(algorithm):
+    digest = hashes.SHA1() if algorithm == "RSAES_OAEP_SHA_1" else hashes.SHA256()
+    return padding.OAEP(mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None)
+
+
+def _signing_params(algorithm):
     """Return (padding, hash_algorithm) for a signing algorithm.
 
     For RSA algorithms, padding is a padding object.
@@ -834,8 +882,8 @@ def _signing_params(algorithm, for_verify=False):
     if not HAS_CRYPTO:
         return None, None
 
-    # PSS salt_length must be MAX_LENGTH for signing, AUTO for verification
-    pss_salt = padding.PSS.AUTO if for_verify else padding.PSS.MAX_LENGTH
+    # AWS KMS signs RSASSA_PSS with a salt as long as the digest (key spec reference).
+    pss_salt = padding.PSS.DIGEST_LENGTH
 
     algo_map = {
         "RSASSA_PKCS1_V1_5_SHA_256": (padding.PKCS1v15(), hashes.SHA256()),
@@ -1072,15 +1120,12 @@ def _encrypt(data):
         err = _require_crypto("Encrypt")
         if err:
             return err
+        algorithm = data.get("EncryptionAlgorithm", "SYMMETRIC_DEFAULT")
+        err = _algorithm_error(rec, algorithm, "EncryptionAlgorithms")
+        if err:
+            return err
         public_key = rec["_private_key"].public_key()
-        ciphertext = public_key.encrypt(
-            plaintext,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None,
-            ),
-        )
+        ciphertext = public_key.encrypt(plaintext, _oaep_padding(algorithm))
     else:
         return error_response_json(
             "UnsupportedOperationException",
@@ -1160,15 +1205,12 @@ def _decrypt(data):
         err = _require_crypto("Decrypt")
         if err:
             return err
+        algorithm = data.get("EncryptionAlgorithm", "SYMMETRIC_DEFAULT")
+        if algorithm not in rec.get("EncryptionAlgorithms", []):
+            # Observed on AWS: RSA Decrypt without a matching algorithm is an opaque invalid ciphertext.
+            return error_response_json("InvalidCiphertextException", "", 400)
         try:
-            plaintext = rec["_private_key"].decrypt(
-                ciphertext,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None,
-                ),
-            )
+            plaintext = rec["_private_key"].decrypt(ciphertext, _oaep_padding(algorithm))
         except ValueError:
             # AWS KMS doesn't surface the underlying crypto library's error
             # text; the documented InvalidCiphertextException message format
@@ -1500,7 +1542,7 @@ def _stamp_alias(alias_arn, created):
 # ---- Grants ----
 #
 # Grants are stored and listed, but MiniStack does not evaluate them when
-# authorizing other calls, the same way key policies are not evaluated.
+# authorizing other calls.
 
 _GRANT_OPERATIONS = {
     "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
@@ -1746,6 +1788,14 @@ def _get_key_rotation_status(data):
 # ---- Key Policy ----
 
 
+def key_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The key policy and owner account, for the identity check."""
+    rec = _resolve_key(resource_arn)
+    if not rec:
+        return None
+    return rec.get("Policy") or "", get_account_id()
+
+
 def _get_key_policy(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
@@ -1906,10 +1956,12 @@ def _key_metadata_in_region(rec, region):
 
 
 def _schedule_key_deletion(data):
+    days = data.get("PendingWindowInDays", 30)
+    if isinstance(days, int) and not 7 <= days <= 30:
+        return error_response_json("ValidationException", "PendingWindowInDays must be between 7 and 30", 400)
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
-    days = data.get("PendingWindowInDays", 30)
     state = "PendingDeletion"
     if rec.get("MultiRegion"):
         others = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]

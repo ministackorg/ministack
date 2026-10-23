@@ -10,6 +10,7 @@ import uuid as _uuid_mod
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
@@ -891,6 +892,69 @@ def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
     live = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
     assert live["FunctionConfig"]["Comment"] == "v2"
 
+    cloudfront.delete_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+    )
+
+
+def test_cloudfront_function_development_status_follows_publish_and_association(cloudfront):
+    """The DEVELOPMENT stage reports UNPUBLISHED only while it holds changes that
+    were never published, then UNASSOCIATED, or DEPLOYED while a cache
+    behavior references the function. Terraform's aws_cloudfront_function.status
+    reads this stage."""
+    name = f"fn-status-{_uuid_mod.uuid4().hex[:8]}"
+
+    def dev_status():
+        return cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]["Status"]
+
+    def listed_dev_status():
+        items = cloudfront.list_functions(Stage="DEVELOPMENT")["FunctionList"].get("Items", [])
+        return next(it["Status"] for it in items if it["Name"] == name)
+
+    cr = cloudfront.create_function(
+        Name=name,
+        FunctionConfig={"Comment": "v1", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; }",
+    )
+    assert cr["FunctionSummary"]["Status"] == "UNPUBLISHED"
+    assert dev_status() == "UNPUBLISHED"
+
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(cr))
+    assert dev_status() == "UNASSOCIATED"
+    assert listed_dev_status() == "UNASSOCIATED"
+
+    upd = cloudfront.update_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+        FunctionConfig={"Comment": "v2", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; } // v2",
+    )
+    assert upd["FunctionSummary"]["Status"] == "UNPUBLISHED"
+    assert dev_status() == "UNPUBLISHED"
+    assert listed_dev_status() == "UNPUBLISHED"
+
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(upd))
+    assert dev_status() == "UNASSOCIATED"
+
+    fn_arn = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+    cfg = copy.deepcopy(_CF_DIST_CONFIG)
+    cfg["CallerReference"] = f"cf-fn-status-{_uuid_mod.uuid4().hex[:12]}"
+    cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {
+        "Quantity": 1,
+        "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}],
+    }
+    dist = cloudfront.create_distribution(DistributionConfig=cfg)
+    assert dev_status() == "DEPLOYED"
+    assert listed_dev_status() == "DEPLOYED"
+
+    dist_id = dist["Distribution"]["Id"]
+    cfg["Enabled"] = False
+    cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {"Quantity": 0}
+    upd_dist = cloudfront.update_distribution(Id=dist_id, IfMatch=dist["ETag"], DistributionConfig=cfg)
+    assert dev_status() == "UNASSOCIATED"
+
+    cloudfront.delete_distribution(Id=dist_id, IfMatch=upd_dist["ETag"])
     cloudfront.delete_function(
         Name=name,
         IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
@@ -1916,15 +1980,6 @@ def test_cloudfront_list_origin_access_identities_empty(cloudfront):
 def test_cloudfront_list_streaming_distributions_empty(cloudfront):
     resp = cloudfront.list_streaming_distributions()
     lst = resp["StreamingDistributionList"]
-    assert lst["MaxItems"] == 100
-    assert lst["IsTruncated"] is False
-    assert lst["Quantity"] == 0
-    assert lst.get("Items", []) == []
-
-
-def test_cloudfront_list_vpc_origins_empty(cloudfront):
-    resp = cloudfront.list_vpc_origins()
-    lst = resp["VpcOriginList"]
     assert lst["MaxItems"] == 100
     assert lst["IsTruncated"] is False
     assert lst["Quantity"] == 0
@@ -3003,3 +3058,1601 @@ def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
         raw = resp.read()
     assert b"ns0:" not in raw, "namespace prefixes leaked into the response XML"
     assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw
+
+
+def test_cf_distribution_webacl_associate_disassociate(cloudfront):
+    sfx = _uuid_mod.uuid4().hex[:8]
+    created = cloudfront.create_distribution(DistributionConfig=_custom_origin_distribution_config(f"acl-{sfx}"))
+    dist_id = created["Distribution"]["Id"]
+    acl_arn = f"arn:aws:wafv2:us-east-1:000000000000:global/webacl/test/{sfx}"
+
+    assoc = cloudfront.associate_distribution_web_acl(Id=dist_id, WebACLArn=acl_arn, IfMatch=created["ETag"])
+    assert assoc["Id"] == dist_id
+    assert assoc["WebACLArn"] == acl_arn
+    assert assoc["ETag"] != created["ETag"]
+
+    cfg = cloudfront.get_distribution_config(Id=dist_id)
+    assert cfg["DistributionConfig"]["WebACLId"] == acl_arn
+    assert cfg["ETag"] == assoc["ETag"]
+    assert cloudfront.get_distribution(Id=dist_id)["Distribution"]["DistributionConfig"]["WebACLId"] == acl_arn
+
+    # a stale ETag is refused
+    with pytest.raises(ClientError) as exc:
+        cloudfront.associate_distribution_web_acl(Id=dist_id, WebACLArn=acl_arn, IfMatch=created["ETag"])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    dis = cloudfront.disassociate_distribution_web_acl(Id=dist_id, IfMatch=assoc["ETag"])
+    assert dis["Id"] == dist_id
+    assert dis["ETag"] != assoc["ETag"]
+    assert cloudfront.get_distribution_config(Id=dist_id)["DistributionConfig"].get("WebACLId", "") == ""
+
+    with pytest.raises(ClientError) as exc:
+        cloudfront.associate_distribution_web_acl(Id="E0000000000000", WebACLArn=acl_arn, IfMatch="x")
+    assert exc.value.response["Error"]["Code"] == "EntityNotFound"
+
+
+# ---------------------------------------------------------------------------
+# VPC origins
+#
+# Every expectation below was captured against AWS (us-east-1, 2026-10-20/21,
+# boto3 1.43.106) for ministackorg/ministack#2312. Docstrings name the capture:
+# "V <claim>" is captures/cloudfront-vpc-origins.json, "R1 <key>/<step>" is
+# captures/2312-round1.json, "R2 <key>/<step>" captures/2312-round2.json, "R3" captures/2312-round3.json
+# "R3b" captures/2312-round3b.json, "R4" captures/2312-round4-wrong-root.json, "R5"
+# captures/2312-round5.json and "R6" captures/2312-round6-edges.json.
+# ---------------------------------------------------------------------------
+
+_VO_ACCOUNT = "000000000000"
+_VO_NS = "http://cloudfront.amazonaws.com/doc/2020-05-31/"
+_VO_STALE = "The request failed because it didn't meet the preconditions in one or more request-header fields."
+_VO_BAD_IF_MATCH = "The If-Match version is missing or not valid for the resource."
+_VO_NOT_FOUND = "The specified vpc origin does not exist"
+_VO_NO_RESOURCE = "The specified resource doesn't exist. Update your request and try again."
+
+
+_vo_endpoints = {}
+
+
+def _vo_endpoint(kind="alb", index=0):
+    """A real load balancer or instance in MiniStack, created once per worker; AWS checks that the
+    endpoint exists (R1 V-arn/nlb-missing, alb-other-region, ec2-short-id; V C35)."""
+    key = (kind, index)
+    if key not in _vo_endpoints:
+        if kind == "instance":
+            ec2 = make_client("ec2")
+            instance = ec2.run_instances(ImageId="ami-00000000", MinCount=1, MaxCount=1, InstanceType="t3.nano")
+            instance_id = instance["Instances"][0]["InstanceId"]
+            _vo_endpoints[key] = f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/{instance_id}"
+        else:
+            lb = make_client("elbv2").create_load_balancer(
+                Name=f"vo-{kind}-{index}-{_uuid_mod.uuid4().hex[:8]}", Scheme="internal",
+                Type="network" if kind == "nlb" else "application")
+            _vo_endpoints[key] = lb["LoadBalancers"][0]["LoadBalancerArn"]
+    return _vo_endpoints[key]
+
+
+def _vo_cfg(**overrides):
+    cfg = {"Name": f"vo-{_uuid_mod.uuid4().hex[:12]}", "Arn": _vo_endpoint(), "HTTPPort": 80, "HTTPSPort": 443,
+           "OriginProtocolPolicy": "https-only", "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}}
+    cfg.update(overrides)
+    return cfg
+
+
+def _vo_delete(cloudfront, vo_id):
+    try:
+        cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=cloudfront.get_vpc_origin(Id=vo_id)["ETag"])
+    except ClientError:
+        pass
+
+
+@pytest.fixture
+def vpc_origin(cloudfront):
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    try:
+        yield created
+    finally:
+        _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+
+
+def _vo_error(exc_info):
+    resp = exc_info.value.response
+    return resp["ResponseMetadata"]["HTTPStatusCode"], resp["Error"]["Code"], resp["Error"].get("Message")
+
+
+def _vo_raw(method, path, body=None, headers=None):
+    """(status, headers, body) of an unsigned request; used where botocore refuses the input."""
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(f"{ENDPOINT}{path}", data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, dict(resp.headers), resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
+
+
+def _vo_raw_error(method, path, body=None, headers=None):
+    status, _, text = _vo_raw(method, path, body, headers)
+    code = re.search(r"<Code>([^<]*)</Code>", text)
+    message = re.search(r"<Message>([^<]*)</Message>", text)
+    return status, code.group(1) if code else None, message.group(1) if message else None
+
+
+def _vo_cfg_xml(cfg, omit=(), http=None, https=None, ssl=None):
+    parts = []
+    for tag, value in (("Name", cfg["Name"]), ("Arn", cfg["Arn"]),
+                       ("HTTPPort", cfg["HTTPPort"] if http is None else http),
+                       ("HTTPSPort", cfg["HTTPSPort"] if https is None else https),
+                       ("OriginProtocolPolicy", cfg["OriginProtocolPolicy"])):
+        if tag not in omit:
+            parts.append(f"<{tag}>{value}</{tag}>")
+    if ssl is not None:
+        parts.append(ssl)
+    return "".join(parts)
+
+
+def _vo_create_xml(inner):
+    return (f'<CreateVpcOriginRequest xmlns="{_VO_NS}"><VpcOriginEndpointConfig>{inner}'
+            "</VpcOriginEndpointConfig></CreateVpcOriginRequest>")
+
+
+def test_cloudfront_vpc_origin_create_answers_deploying(cloudfront):
+    """V C1, C2, C4, C5; R1 U-create/create-A-default-ssl: 202, an absolute Location, Deploying,
+    CreatedTime == LastModifiedTime, and TLSv1/TLSv1.1/TLSv1.2 when OriginSslProtocols is omitted."""
+    cfg = _vo_cfg()
+    cfg.pop("OriginSslProtocols")
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=cfg)
+    vo = created["VpcOrigin"]
+    try:
+        assert created["ResponseMetadata"]["HTTPStatusCode"] == 202
+        assert created["Location"] == f"https://cloudfront.amazonaws.com/2020-05-31/vpc-origin/{vo['Id']}"
+        assert re.fullmatch(r"vo_[A-Za-z0-9]{22}", vo["Id"])
+        assert vo["Arn"] == f"arn:aws:cloudfront::{_VO_ACCOUNT}:vpcorigin/{vo['Id']}"
+        assert vo["AccountId"] == _VO_ACCOUNT
+        assert vo["Status"] == "Deploying"
+        assert vo["CreatedTime"] == vo["LastModifiedTime"]
+        assert vo["VpcOriginEndpointConfig"] == {**cfg, "OriginSslProtocols": {
+            "Quantity": 3, "Items": ["TLSv1", "TLSv1.1", "TLSv1.2"]}}
+    finally:
+        _vo_delete(cloudfront, vo["Id"])
+
+
+def test_cloudfront_vpc_origin_get_after_create_is_deployed_with_next_etag(cloudfront, vpc_origin):
+    """R1 U6/transitions-*: once deployed, Get answers Deployed with a new ETag, so the create's ETag
+    is stale: R3b U13/update-B-stale-etag-in-use (412 for B's create ETag once deployed). V C7: an explicit
+    OriginSslProtocols round-trips."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    got = cloudfront.get_vpc_origin(Id=vo_id)
+    assert got["VpcOrigin"]["Status"] == "Deployed"
+    assert got["ETag"] != vpc_origin["ETag"]
+    assert got["VpcOrigin"]["VpcOriginEndpointConfig"]["OriginSslProtocols"] == {"Quantity": 1, "Items": ["TLSv1.2"]}
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_vpc_origin(Id=vo_id, IfMatch=vpc_origin["ETag"],
+                                     VpcOriginEndpointConfig=got["VpcOrigin"]["VpcOriginEndpointConfig"])
+    assert _vo_error(exc) == (412, "PreconditionFailed", _VO_STALE)
+
+
+def test_cloudfront_vpc_origin_responses_carry_ip_address_type(vpc_origin):
+    """R1 U-create/create-A-default-ssl and U11/page-size-1-page-1 (raw bodies): AWS sends
+    <IpAddressType>ipv4</IpAddressType> in the config and in list summaries."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    _, _, text = _vo_raw("GET", f"/2020-05-31/vpc-origin/{vo_id}")
+    assert "<OriginSslProtocols><Quantity>1</Quantity><Items><SslProtocol>TLSv1.2</SslProtocol></Items>" \
+           "</OriginSslProtocols><IpAddressType>ipv4</IpAddressType></VpcOriginEndpointConfig>" in text
+    _, _, text = _vo_raw("GET", "/2020-05-31/vpc-origin")
+    assert "</OriginEndpointArn><IpAddressType>ipv4</IpAddressType></VpcOriginSummary>" in text
+
+
+def test_cloudfront_vpc_origin_tags(cloudfront):
+    """V C6; R1 U12: create-time tags are kept, TagResource and UntagResource answer 204 (also for a key
+    that isn't set), a tag is overwritten in place, and ListTagsForResource sorts by key."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(), Tags={"Items": [
+        {"Key": "team", "Value": "edge"}, {"Key": "Owner", "Value": "me"}]})
+    arn = created["VpcOrigin"]["Arn"]
+    try:
+        tagged = cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]})
+        assert tagged["ResponseMetadata"]["HTTPStatusCode"] == 204
+        untagged = cloudfront.untag_resource(Resource=arn, TagKeys={"Items": ["a", "zz"]})
+        assert untagged["ResponseMetadata"]["HTTPStatusCode"] == 204
+        cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "b", "Value": "3"}]})
+        assert cloudfront.list_tags_for_resource(Resource=arn)["Tags"]["Items"] == [
+            {"Key": "Owner", "Value": "me"}, {"Key": "b", "Value": "3"}, {"Key": "team", "Value": "edge"}]
+    finally:
+        _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+
+
+def test_cloudfront_vpc_origin_tags_unknown_arn(cloudfront):
+    """V C45: Tag, Untag and ListTags on an unknown vpcorigin ARN answer 404 NoSuchResource."""
+    arn = f"arn:aws:cloudfront::{_VO_ACCOUNT}:vpcorigin/vo_Y769dEbaneau0o63mXNjrY"
+    for call in (lambda: cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "a", "Value": "1"}]}),
+                 lambda: cloudfront.untag_resource(Resource=arn, TagKeys={"Items": ["a"]}),
+                 lambda: cloudfront.list_tags_for_resource(Resource=arn)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert _vo_error(exc) == (404, "NoSuchResource", _VO_NO_RESOURCE)
+
+
+def test_cloudfront_vpc_origin_names_are_unique_endpoints_are_not(cloudfront, vpc_origin):
+    """R1 U8/create-identical-to-A: a second origin with the same name answers 409.
+    R1 U8/create-on-endpoint-of-A: a second origin on the same endpoint is accepted."""
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig={**cfg, "Arn": _vo_endpoint("alb", 1)})
+    assert _vo_error(exc) == (409, "EntityAlreadyExists",
+                              "Another vpc origin with the same name already exists within the aws account.")
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=cfg["Arn"]))
+    try:
+        assert other["ResponseMetadata"]["HTTPStatusCode"] == 202
+    finally:
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+
+
+def test_cloudfront_vpc_origin_update(cloudfront, vpc_origin):
+    """R1 U4/update-A-https-8443 and get-A-after-update: 202, Deploying, the change applied, a new ETag
+    and LastModifiedTime; the deployed origin then has another ETag (R1 U4/transitions-A-until-Deployed),
+    and the ETag from before the update answers 412 on Update and Delete (R1 U1/update-A-old-etag-deployed,
+    delete-A-old-etag-deployed)."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    before = cloudfront.get_vpc_origin(Id=vo_id)
+    cfg = before["VpcOrigin"]["VpcOriginEndpointConfig"]
+    time.sleep(0.01)
+    updated = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=before["ETag"],
+                                           VpcOriginEndpointConfig={**cfg, "HTTPSPort": 8443})
+    assert updated["ResponseMetadata"]["HTTPStatusCode"] == 202
+    assert updated["VpcOrigin"]["Status"] == "Deploying"
+    assert updated["VpcOrigin"]["VpcOriginEndpointConfig"]["HTTPSPort"] == 8443
+    assert updated["ETag"] != before["ETag"]
+    after = cloudfront.get_vpc_origin(Id=vo_id)
+    assert after["VpcOrigin"]["Status"] == "Deployed"
+    assert after["VpcOrigin"]["VpcOriginEndpointConfig"]["HTTPSPort"] == 8443
+    assert after["VpcOrigin"]["CreatedTime"] == before["VpcOrigin"]["CreatedTime"]
+    assert after["ETag"] not in (before["ETag"], updated["ETag"])
+    for stale in (before["ETag"],):
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_vpc_origin(Id=vo_id, IfMatch=stale, VpcOriginEndpointConfig=cfg)
+        assert _vo_error(exc) == (412, "PreconditionFailed", _VO_STALE)
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=stale)
+        assert _vo_error(exc) == (412, "PreconditionFailed", _VO_STALE)
+
+
+def test_cloudfront_vpc_origin_update_unchanged_and_onto_another_endpoint(cloudfront, vpc_origin):
+    """R1 U5/update-D-deployed-unchanged: an update that changes nothing is accepted (202).
+    R1 U8/update-dupA-onto-endpoint-of-B: so is moving onto an endpoint another origin uses."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    got = cloudfront.get_vpc_origin(Id=vo_id)
+    cfg = got["VpcOrigin"]["VpcOriginEndpointConfig"]
+    same = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig=cfg)
+    assert same["ResponseMetadata"]["HTTPStatusCode"] == 202
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=_vo_endpoint("alb", 1)))
+    try:
+        moved = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=cloudfront.get_vpc_origin(Id=vo_id)["ETag"],
+                                             VpcOriginEndpointConfig={**cfg, "Arn": other["VpcOrigin"]["VpcOriginEndpointConfig"]["Arn"]})
+        assert moved["ResponseMetadata"]["HTTPStatusCode"] == 202
+    finally:
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+
+
+def test_cloudfront_vpc_origin_update_and_delete_id_and_if_match_errors(cloudfront, vpc_origin):
+    """V C8, C9, C10: a malformed id answers 400 "Id format is invalid" before anything else.
+    R1 U2, U1: If-Match "x" or a made-up ETag answers 400 InvalidIfMatchVersion.
+    R1 U3/update-unknown-real-etag, delete-unknown-real-etag (with the create ETag) and R1 U10/delete-C-after-gone
+    (with the deployed ETag): a real ETag on an unknown id is 404. Update with the deployed ETag on an unknown id
+    isn't captured on its own (U-8)."""
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    etag = cloudfront.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])["ETag"]
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    unknown = "vo_Y769dEbaneau0o63mXNjrY"
+    cases = [
+        ("vo_doesnotexist", "x", (400, "InvalidArgument", "Id format is invalid")),
+        (vo_id, "x", (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)),
+        (vo_id, "E1ABCDEFGHIJKL", (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)),
+        (unknown, "x", (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)),
+        (unknown, etag, (404, "EntityNotFound", _VO_NOT_FOUND)),
+    ]
+    for target, if_match, expected in cases:
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_vpc_origin(Id=target, IfMatch=if_match, VpcOriginEndpointConfig=cfg)
+        assert _vo_error(exc) == expected
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_vpc_origin(Id=target, IfMatch=if_match)
+        assert _vo_error(exc) == expected
+    assert cloudfront.get_vpc_origin(Id=vo_id)["ETag"] == etag  # R1 U15: failed calls change nothing
+
+
+def test_cloudfront_vpc_origin_missing_if_match(cloudfront, vpc_origin):
+    """R1 U2/update-A-no-if-match-valid-body, delete-A-no-if-match: no If-Match is a MalformedXML null
+    error. R1 U2/update-A-no-if-match-empty-config and U3/update-A-no-if-match-bad-policy: it joins the
+    body's own problems, last."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    path = f"/2020-05-31/vpc-origin/{vo_id}"
+    null_if_match = "Value null at 'ifMatch' failed to satisfy constraint: Member must not be null"
+    body = f'<VpcOriginEndpointConfig xmlns="{_VO_NS}">{_vo_cfg_xml(cfg)}</VpcOriginEndpointConfig>'
+    assert _vo_raw_error("PUT", path, body) == (400, "MalformedXML", f"1 validation error detected: {null_if_match}")
+    assert _vo_raw_error("DELETE", path) == (400, "MalformedXML", f"1 validation error detected: {null_if_match}")
+    nulls = "; ".join(f"Value null at 'vpcOriginEndpointConfig.{m}' failed to satisfy constraint: Member must not be null"
+                      for m in ("hTTPPort", "name", "originProtocolPolicy", "hTTPSPort", "arn"))
+    assert _vo_raw_error("PUT", path, f'<VpcOriginEndpointConfig xmlns="{_VO_NS}"></VpcOriginEndpointConfig>') == (
+        400, "MalformedXML", f"6 validation errors detected: {nulls}; {null_if_match}")
+    bad = body.replace("<OriginProtocolPolicy>https-only<", "<OriginProtocolPolicy>redirect-to-https<")
+    assert _vo_raw_error("PUT", path, bad) == (
+        400, "MalformedXML",
+        "2 validation errors detected: Value 'redirect-to-https' at 'vpcOriginEndpointConfig.originProtocolPolicy' "
+        "failed to satisfy constraint: Member must satisfy enum value set: [https-only, http-only, match-viewer]; "
+        f"{null_if_match}")
+
+
+def test_cloudfront_vpc_origin_update_check_order(cloudfront, vpc_origin):
+    """R1 U3/update-A-fake-etag-bad-policy: schema problems come before a bad If-Match;
+    U3/update-A-fake-etag-not-xml: so does a body that isn't XML; U3/update-A-fake-etag-port0: a bad If-Match
+    comes before the range checks; U9/update-A-current-etag-*: with a good If-Match they apply as on Create."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    etag = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+    fake = "E1ABCDEFGHIJKL"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_vpc_origin(Id=vo_id, IfMatch=fake, VpcOriginEndpointConfig={**cfg, "OriginProtocolPolicy": "redirect-to-https"})
+    assert _vo_error(exc)[:2] == (400, "MalformedXML")
+    path = f"/2020-05-31/vpc-origin/{vo_id}"
+    assert _vo_raw_error("PUT", path, "this is not xml", {"If-Match": fake}) == (400, "MalformedInput", "Could not parse XML")
+    assert _vo_raw_error("PUT", path, f'<SomethingElse xmlns="{_VO_NS}"><Name>x</Name></SomethingElse>', {"If-Match": etag}) == (
+        400, "MalformedInput", "SomethingElse is not valid, expected VpcOriginEndpointConfig")  # R4 U-1/update-unknown-id-wrong-root
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_vpc_origin(Id=vo_id, IfMatch=fake, VpcOriginEndpointConfig={**cfg, "HTTPPort": 0})
+    assert _vo_error(exc) == (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)
+    for overrides, expected in (
+        ({"HTTPPort": 0}, (400, "InvalidArgument", "The parameter origin port is not within allowed range.")),
+        ({"OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, (
+            400, "InconsistentQuantities",
+            "The specified quantity of OriginSslProtocols (2) does not match the actual quantity supplied (1).")),
+        ({"Arn": "arn:aws:s3:::bucket"}, (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn Invalid Format.")),
+    ):
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_vpc_origin(Id=vo_id, IfMatch=etag, VpcOriginEndpointConfig={**cfg, **overrides})
+        assert _vo_error(exc) == expected
+    assert cloudfront.get_vpc_origin(Id=vo_id)["ETag"] == etag
+
+
+def test_cloudfront_vpc_origin_delete(cloudfront):
+    """R1 U10/delete-C: 202 with Status Deploying, a new ETag and LastModifiedTime. AWS then keeps the origin
+    for minutes (get-C-immediately); MiniStack removes it at once, so Get answers 404 EntityNotFound, its
+    tags 404 NoSuchResource and a second delete 404 (R1 U10/get-C-after-gone, list-tags-C-after-gone,
+    delete-C-after-gone)."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(), Tags={"Items": [{"Key": "k", "Value": "v"}]})
+    vo_id, arn = created["VpcOrigin"]["Id"], created["VpcOrigin"]["Arn"]
+    etag = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+    deleted = cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=etag)
+    assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 202
+    assert deleted["VpcOrigin"]["Status"] == "Deploying"
+    assert deleted["ETag"] not in (etag, created["ETag"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_vpc_origin(Id=vo_id)
+    assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.list_tags_for_resource(Resource=arn)
+    assert _vo_error(exc) == (404, "NoSuchResource", _VO_NO_RESOURCE)
+    with pytest.raises(ClientError) as exc:
+        cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=etag)
+    assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+    assert vo_id not in [s["Id"] for s in cloudfront.list_vpc_origins()["VpcOriginList"]["Items"]]
+
+
+@pytest.mark.parametrize("vo_id,status", [
+    ("vo_Y769dEbaneau0o63mXNjrY", 404),     # R1 U18/get-control-random-22
+    ("xy_Y769dEbaneau0o63mXNjrY", 404),     # R1 U18/get-other-prefix
+    ("vo_ptyvchyzihjtoldriibswp", 404),     # R1 U18/get-lower-only
+    ("vo_8792471471766075046691", 404),     # R1 U18/get-digits-only
+    ("vo_doesnotexist", 400),               # V C8/test-id
+    ("vo_Y769dEbaneau0o63mXNjr", 400),      # R1 U18/get-len21
+    ("vo_Y769dEbaneau0o63mXNjrYY", 400),    # R1 U18/get-len23
+    ("vo_Y769dEbane-au0o63mXNjr", 400),     # R1 U18/get-dash
+    ("vo_Y769dEbane_au0o63mXNjr", 400),     # R1 U18/get-underscore
+    ("VO_Y769dEbaneau0o63mXNjrY", 400),     # R1 U18/get-upper-prefix
+    ("voY769dEbaneau0o63mXNjrYab", 400),    # R1 U18/get-no-prefix-25
+    ("vo_a", 400),                          # R1 U18/get-len1
+    ("vo_Y769dEbaneau0o63mXNjr.", 400),     # R1 U18/get-dot
+    ("v_Y769dEbaneau0o63mXNjrY", 404),      # R2 U18/get-v-prefix
+    ("abcd_Y769dEbaneau0o63mXNjrY", 404),   # R2 U18/get-four-letter-prefix
+    ("x1_Y769dEbaneau0o63mXNjrY", 400),     # R2 U18/get-letter-digit-prefix
+    ("vo-Y769dEbaneau0o63mXNjrY", 400),     # R2 U18/get-dash-separator
+    ("_Y769dEbaneau0o63mXNjrY", 400),       # R2 U18/get-underscore-only-prefix
+    ("Vo_Y769dEbaneau0o63mXNjrY", 400),     # R2 U18/get-mixed-prefix
+    ("12_Y769dEbaneau0o63mXNjrY", 400),     # R2 U18/get-digits-prefix
+    ("dt_Y769dEbaneau0o63mXNjrYabcde", 400),  # R2 U18/get-tenant-like-27
+], ids=lambda v: str(v))
+def test_cloudfront_vpc_origin_get_id_format(cloudfront, vo_id, status):
+    """R1 U18, R2 U18 and V C8: an id that isn't lower-case letters, '_' and 22 letters or digits answers
+    400 "Id format is invalid"; a well-formed unknown id answers 404."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.get_vpc_origin(Id=vo_id)
+    expected = (404, "EntityNotFound", _VO_NOT_FOUND) if status == 404 else (400, "InvalidArgument", "Id format is invalid")
+    assert _vo_error(exc) == expected
+
+
+_VO_POLICY_ENUM = "Member must satisfy enum value set: [https-only, http-only, match-viewer]"
+_VO_SSL_ENUM = "Member must satisfy constraint: [Member must satisfy enum value set: [SSLv3, TLSv1, TLSv1.1, TLSv1.2]]"
+_VO_PORT_RANGE = (400, "InvalidArgument", "The parameter origin port is not within allowed range.")
+_VO_BAD_ARN = (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn Invalid Format.")
+_VO_OTHER_ACCOUNT = (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn contains a mismatched AWS account.")
+_VO_QTY_2_1 = (400, "InconsistentQuantities",
+               "The specified quantity of OriginSslProtocols (2) does not match the actual quantity supplied (1).")
+_VO_NO_PROTOCOLS = (400, "InvalidArgument",
+                    "The parameter OriginSslProtocols is not valid! Should be one or more from SSLv3, TLSv1, TLSv1.1, and TLSv1.2.")
+_VO_TLS13 = ("Value '[TLSv1.3]' at 'vpcOriginEndpointConfig.originSslProtocols.items' failed to satisfy constraint: "
+             + _VO_SSL_ENUM)
+_VO_REDIRECT = ("Value 'redirect-to-https' at 'vpcOriginEndpointConfig.originProtocolPolicy' failed to satisfy "
+                "constraint: " + _VO_POLICY_ENUM)
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({"OriginProtocolPolicy": "redirect-to-https"}, (400, "MalformedXML", f"1 validation error detected: {_VO_REDIRECT}")),  # V C20
+    ({"OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.3"]}}, (400, "MalformedXML", f"1 validation error detected: {_VO_TLS13}")),  # V C24
+    ({"OriginProtocolPolicy": "redirect-to-https", "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.3"]}},
+     (400, "MalformedXML", f"2 validation errors detected: {_VO_TLS13}; {_VO_REDIRECT}")),  # R1 V-order/policy+tls13
+    ({"OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.3", "TLSv1.1"]}}, (
+        400, "MalformedXML", "1 validation error detected: Value '[TLSv1.3, TLSv1.1]' at "
+        "'vpcOriginEndpointConfig.originSslProtocols.items' failed to satisfy constraint: " + _VO_SSL_ENUM)),  # R1 V-order/tls13+tls11
+    ({"OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.3"]}}, (400, "MalformedXML", f"1 validation error detected: {_VO_TLS13}")),  # R1 V-order/tls13+qty-mismatch
+    ({"HTTPPort": 0}, _VO_PORT_RANGE),  # V C21/zero
+    ({"HTTPPort": -1}, _VO_PORT_RANGE),  # V C21/minus-1
+    ({"HTTPPort": 65536}, _VO_PORT_RANGE),  # V C21/65536
+    ({"HTTPSPort": 0}, _VO_PORT_RANGE),  # V C22/zero
+    ({"HTTPSPort": 70000}, _VO_PORT_RANGE),  # V C22/70000
+    ({"HTTPPort": 1}, _VO_PORT_RANGE),  # R2 V-port/http-1
+    ({"HTTPPort": 79}, _VO_PORT_RANGE),  # R2 V-port/http-79
+    ({"HTTPPort": 81}, _VO_PORT_RANGE),  # R2 V-port/http-81
+    ({"HTTPPort": 1023}, _VO_PORT_RANGE),  # R2 V-port/http-1023
+    ({"HTTPSPort": 1}, _VO_PORT_RANGE),  # R2 V-port/https-1
+    ({"HTTPSPort": 444}, _VO_PORT_RANGE),  # R2 V-port/https-444
+    ({"HTTPSPort": 1023}, _VO_PORT_RANGE),  # R2 V-port/https-1023
+    ({"Name": "n" * 65, "HTTPPort": 0}, _VO_PORT_RANGE),  # R2 V-name/name-too-long+port0
+    ({"Name": "n" * 65, "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}},
+     (400, "InvalidArgument", "The parameter VPC Origin Name is too big.")),  # R2 V-name/name-too-long+qty-mismatch
+    ({"Name": "n" * 65, "OriginSslProtocols": {"Quantity": 0, "Items": []}},
+     (400, "InvalidArgument", "The parameter VPC Origin Name is too big.")),  # R2 V-name/name-too-long+qty0
+    ({"Name": "n" * 65, "Arn": "arn:aws:s3:::bucket"},
+     (400, "InvalidArgument", "The parameter VPC Origin Name is too big.")),  # R2 V-name/name-too-long+s3-arn
+    ({"Name": "n" * 65, "OriginProtocolPolicy": "redirect-to-https"},
+     (400, "MalformedXML", f"1 validation error detected: {_VO_REDIRECT}")),  # R2 V-name/name-too-long+bad-policy
+    ({"Name": ""}, (400, "InvalidArgument", "The parameter VPC Origin Name is too small or empty.")),  # R2 V-name/name-empty-string
+    ({"OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, _VO_QTY_2_1),  # V C25
+    ({"OriginSslProtocols": {"Quantity": 0, "Items": []}}, _VO_NO_PROTOCOLS),  # V C26/qty0-empty
+    ({"Arn": "arn:aws:s3:::bucket"}, _VO_BAD_ARN),  # V C23
+    ({"Arn": f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:targetgroup/tg/0123456789abcdef"}, _VO_BAD_ARN),  # V C35/nonexistent-targetgroup
+    ({"Arn": f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/gwy/example/0123456789abcdef"}, _VO_BAD_ARN),  # R1 V-arn/gwy-lb
+    ({"Arn": f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/example"}, _VO_BAD_ARN),  # R1 V-arn/classic-elb
+    ({"Arn": f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:listener/app/example/0123456789abcdef/0123456789abcdef"}, _VO_BAD_ARN),  # R1 V-arn/alb-listener
+    ({"Arn": f"arn:aws-cn:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"}, _VO_BAD_ARN),  # R1 V-arn/alb-other-partition
+    ({"Arn": f"arn:aws:elasticloadbalancing::{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"}, _VO_BAD_ARN),  # R1 V-arn/alb-no-region
+    ({"Arn": f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/xyz"}, _VO_BAD_ARN),  # R1 V-arn/ec2-bad-id
+    ({"Arn": f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:vpc/vpc-0123456789abcdef0"}, _VO_BAD_ARN),  # R1 V-arn/ec2-vpc
+    ({"Arn": "internal-alb.example.com"}, _VO_BAD_ARN),  # R1 V-arn/not-an-arn
+    ({"Arn": f"arn:aws:lambda:us-east-1:{_VO_ACCOUNT}:function:example"}, _VO_BAD_ARN),  # R1 V-arn/lambda
+    ({"Arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/vo-other/0123456789abcdef"}, _VO_OTHER_ACCOUNT),  # V C35/test-style-alb-account-000000000000
+    ({"Arn": "arn:aws:ec2:us-east-1:111122223333:instance/i-0123456789abcdef0"}, _VO_OTHER_ACCOUNT),  # R1 V-arn/ec2-other-account
+    ({"Name": "n" * 65}, (400, "InvalidArgument", "The parameter VPC Origin Name is too big.")),  # R1 V-name/name-65
+    ({"Name": "has space"}, (400, "InvalidArgument",
+                             "The parameter Name contains characters other than alphanumericals, dashes, and underscores.")),  # R1 V-name/name-space
+    ({"Name": "a/b"}, (400, "InvalidArgument",
+                       "The parameter Name contains characters other than alphanumericals, dashes, and underscores.")),  # R1 V-name/name-slash
+    ({"HTTPPort": 0, "Arn": "arn:aws:s3:::bucket"}, _VO_PORT_RANGE),  # R1 V-order/port0+s3-arn
+    ({"HTTPPort": 0, "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, _VO_PORT_RANGE),  # R1 V-order/port0+qty-mismatch
+    ({"Arn": "arn:aws:s3:::bucket", "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, _VO_QTY_2_1),  # R1 V-order/s3-arn+qty-mismatch
+    ({"HTTPPort": 0, "OriginSslProtocols": {"Quantity": 0, "Items": []}}, _VO_PORT_RANGE),  # R1 V-order/qty0+port0
+    ({"Arn": "arn:aws:s3:::bucket", "OriginSslProtocols": {"Quantity": 0, "Items": []}}, _VO_NO_PROTOCOLS),  # R1 V-order/qty0+s3-arn
+    ({"Arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/vo-other/0123456789abcdef", "HTTPPort": 0}, _VO_PORT_RANGE),  # R1 V-order/other-account+port0
+    ({"Arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/vo-other/0123456789abcdef", "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, _VO_QTY_2_1),  # R1 V-order/other-account+qty-mismatch
+    ({"OriginProtocolPolicy": "redirect-to-https", "HTTPPort": 0}, (400, "MalformedXML", f"1 validation error detected: {_VO_REDIRECT}")),  # R1 V-order/policy+port0
+    ({"Arn": "arn:aws:s3:::bucket", "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.3"]}},
+     (400, "MalformedXML", f"1 validation error detected: {_VO_TLS13}")),  # R1 V-order/s3-arn+tls13
+])
+def test_cloudfront_vpc_origin_create_rejects(cloudfront, overrides, expected):
+    """Create validation with AWS's codes and messages, and the order among them: schema problems
+    (MalformedXML) first, then the ports (80, 443 or 1024 to 65535), the name, the protocol quantity and
+    list, then the endpoint ARN's format and account. Each case names its capture."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(**overrides))
+    assert _vo_error(exc) == expected
+
+
+_VO_TLS13_XML = ("<OriginSslProtocols><Quantity>1</Quantity><Items><SslProtocol>TLSv1.3</SslProtocol></Items>"
+                 "</OriginSslProtocols>")
+
+
+def _vo_null(member):
+    return f"Value null at 'vpcOriginEndpointConfig{member}' failed to satisfy constraint: Member must not be null"
+
+
+@pytest.mark.parametrize("make_body,expected", [
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, http="eighty")), (400, "MalformedInput", None)),  # V C27; R1 U20/http-eighty (no <Message>)
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, http="80.0")), (400, "MalformedInput", None)),  # R1 U20/http-decimal
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, http=" 80 ")), (400, "MalformedInput", None)),  # R1 U20/http-space
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, http="")), (400, "MalformedInput", "missing value for decimal type")),  # R1 U20/http-empty
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, ssl="<OriginSslProtocols><Quantity>one</Quantity><Items>"
+                                                   "<SslProtocol>TLSv1.2</SslProtocol></Items></OriginSslProtocols>")),
+     (400, "MalformedInput", None)),  # V C31; R1 U20/qty-one
+    (lambda c: "this is not xml", (400, "MalformedInput", "Could not parse XML")),  # V C32; R1 U20/not-xml
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c)).replace("CreateVpcOriginRequest", "SomethingElse"),
+     (400, "MalformedInput", "SomethingElse is not valid, expected CreateVpcOriginRequest")),  # R1 U20/wrong-root
+    (lambda c: "", (400, "MalformedXML", "1 validation error detected: Value null at 'vpcOriginEndpointConfig' "
+                                          "failed to satisfy constraint: Member must not be null")),  # R1 U20/empty-body
+    (lambda c: f'<CreateVpcOriginRequest xmlns="{_VO_NS}"></CreateVpcOriginRequest>',
+     (400, "MalformedXML", "1 validation error detected: Value null at 'vpcOriginEndpointConfig' "
+                           "failed to satisfy constraint: Member must not be null")),  # V C29
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("HTTPPort",))), (400, "MalformedXML", f"1 validation error detected: {_vo_null('.hTTPPort')}")),  # V C28/missing-http
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("HTTPSPort",))), (400, "MalformedXML", f"1 validation error detected: {_vo_null('.hTTPSPort')}")),  # V C28/missing-https
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("Name",))), (400, "MalformedXML", f"1 validation error detected: {_vo_null('.name')}")),  # V C30/missing-name
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("Arn",))), (400, "MalformedXML", f"1 validation error detected: {_vo_null('.arn')}")),  # V C30/missing-arn
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("OriginProtocolPolicy",))),
+     (400, "MalformedXML", f"1 validation error detected: {_vo_null('.originProtocolPolicy')}")),  # V C33
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("Name", "Arn"))),
+     (400, "MalformedXML", f"2 validation errors detected: {_vo_null('.name')}; {_vo_null('.arn')}")),  # R1 V-order/raw-missing-name-and-arn
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("HTTPPort", "OriginProtocolPolicy"))),
+     (400, "MalformedXML", f"2 validation errors detected: {_vo_null('.hTTPPort')}; {_vo_null('.originProtocolPolicy')}")),  # R1 V-order/raw-missing-http-and-policy
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("Arn", "HTTPSPort"))),
+     (400, "MalformedXML", f"2 validation errors detected: {_vo_null('.hTTPSPort')}; {_vo_null('.arn')}")),  # R1 V-order/raw-missing-arn-and-https
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("HTTPPort",)).replace(">https-only<", ">redirect-to-https<")),
+     (400, "MalformedXML", f"2 validation errors detected: {_vo_null('.hTTPPort')}; {_VO_REDIRECT}")),  # R1 V-order/raw-missing-http-bad-policy
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, ssl="<OriginSslProtocols><Quantity>0</Quantity></OriginSslProtocols>")),
+     (400, "MalformedXML", f"1 validation error detected: {_vo_null('.originSslProtocols.items')}")),  # R1 U20/ssl-without-items
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, ssl="<OriginSslProtocols><Items><SslProtocol>TLSv1.2</SslProtocol>"
+                                                   "</Items></OriginSslProtocols>")),
+     (400, "MalformedXML", f"1 validation error detected: {_vo_null('.originSslProtocols.quantity')}")),  # R1 U20/ssl-without-quantity
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, ssl="<OriginSslProtocols><Quantity>0</Quantity><Items/></OriginSslProtocols>")),
+     _VO_NO_PROTOCOLS),  # V C26/raw-qty0-items-empty
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c).replace(f"<Name>{c['Name']}</Name>", "<Name></Name>")),
+     (400, "InvalidArgument", "The parameter VPC Origin Name is too small or empty.")),  # R1 V-name/raw-name-empty
+    (lambda c: _vo_create_xml(""), (400, "MalformedXML", "5 validation errors detected: " + "; ".join(
+        _vo_null(m) for m in (".hTTPPort", ".name", ".originProtocolPolicy", ".hTTPSPort", ".arn")))),  # R2 V-order/raw-empty-config
+    (lambda c: _vo_create_xml(_VO_TLS13_XML), (400, "MalformedXML", "6 validation errors detected: " + "; ".join(
+        [_vo_null(".hTTPPort"), _VO_TLS13] + [_vo_null(m) for m in (".name", ".originProtocolPolicy", ".hTTPSPort", ".arn")]))),  # R2 V-order/raw-only-bad-ssl
+    (lambda c: _vo_create_xml(f"<Name>{c['Name']}</Name><Arn>{c['Arn']}</Arn>"
+                              f"<OriginProtocolPolicy>redirect-to-https</OriginProtocolPolicy>{_VO_TLS13_XML}"),
+     (400, "MalformedXML", "4 validation errors detected: " + "; ".join(
+         [_vo_null(".hTTPPort"), _VO_TLS13, _VO_REDIRECT, _vo_null(".hTTPSPort")]))),  # R2 V-order/raw-name-arn-only-bad-policy-bad-ssl
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, omit=("Name",), ssl=_VO_TLS13_XML)),
+     (400, "MalformedXML", f"2 validation errors detected: {_VO_TLS13}; {_vo_null('.name')}")),  # R2 V-order/raw-all-but-name-bad-ssl
+    (lambda c: _vo_create_xml("<OriginSslProtocols><Items><SslProtocol>TLSv1.3</SslProtocol></Items></OriginSslProtocols>"),
+     (400, "MalformedXML", "7 validation errors detected: " + "; ".join(
+         [_vo_null(".hTTPPort"), _vo_null(".originSslProtocols.quantity"), _VO_TLS13]
+         + [_vo_null(m) for m in (".name", ".originProtocolPolicy", ".hTTPSPort", ".arn")]))),  # R3 V-order/raw-items-without-quantity-bad-ssl-rest-null
+    (lambda c: _vo_create_xml("<IpAddressType>bogus</IpAddressType>"), (400, "MalformedXML", "6 validation errors detected: " + "; ".join(
+        [_vo_null(m) for m in (".hTTPPort", ".name", ".originProtocolPolicy", ".hTTPSPort", ".arn")]
+        + ["Value 'bogus' at 'vpcOriginEndpointConfig.ipAddressType' failed to satisfy constraint: "
+           "Member must satisfy enum value set: [ipv4, dualstack]"]))),  # R3 V-order/raw-bad-ip-address-type-rest-null
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, http="eighty", omit=("Name",))), (400, "MalformedInput", None)),  # R3 V-order/raw-eighty-missing-name
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c, http="eighty").replace(">https-only<", ">nope<")),
+     (400, "MalformedInput", None)),  # R3 V-order/raw-eighty-bad-policy
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c) + "<IpAddressType>ipv6</IpAddressType>"),
+     (400, "MalformedXML", "1 validation error detected: Value 'ipv6' at 'vpcOriginEndpointConfig.ipAddressType' "
+                           "failed to satisfy constraint: Member must satisfy enum value set: [ipv4, dualstack]")),  # R2 V-ip/ip-address-type-ipv6
+    (lambda c: _vo_create_xml(_vo_cfg_xml(c) + "<IpAddressType></IpAddressType>"),
+     (400, "MalformedXML", "1 validation error detected: Value '' at 'vpcOriginEndpointConfig.ipAddressType' "
+                           "failed to satisfy constraint: Member must satisfy enum value set: [ipv4, dualstack]")),  # R2 V-ip/ip-address-type-empty
+])
+def test_cloudfront_vpc_origin_create_rejects_raw_xml(make_body, expected):
+    """Inputs botocore would refuse, sent as raw XML. Each case names its capture."""
+    assert _vo_raw_error("POST", "/2020-05-31/vpc-origin", make_body(_vo_cfg())) == expected
+
+
+@pytest.mark.parametrize("arn,message", [
+    (f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef",
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # V C35/nonexistent-alb-same-account
+    (f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/net/example/0123456789abcdef",
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-arn/nlb-missing
+    (f"arn:aws:elasticloadbalancing:us-west-2:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef",
+     "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound."),  # R1 V-arn/alb-other-region
+    (f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/i-12345678",
+     "The parameter VpcOriginEndpointConfig Arn InvalidInstanceID.NotFound."),  # R1 V-arn/ec2-short-id
+    (f"arn:aws:ec2:us-east-1:{_VO_ACCOUNT}:instance/i-0123456789abcdef0",
+     "The parameter VpcOriginEndpointConfig Arn InvalidInstanceID.Malformed."),  # V C35/nonexistent-ec2-instance
+    (f"arn:aws:ec2:us-west-2:{_VO_ACCOUNT}:instance/i-0123456789abcdef0",
+     "The parameter VpcOriginEndpointConfig Arn InvalidInstanceID.Malformed."),  # R1 V-arn/ec2-other-region
+], ids=["alb", "nlb", "alb-other-region", "ec2-short-id", "ec2", "ec2-other-region"])
+def test_cloudfront_vpc_origin_endpoint_must_exist(cloudfront, arn, message):
+    """An endpoint ARN with the right format and account must name a load balancer or instance that exists,
+    in the ARN's region."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=arn))
+    assert _vo_error(exc) == (400, "InvalidArgument", message)
+
+
+@pytest.mark.parametrize("kind", ["alb", "nlb", "instance"])
+def test_cloudfront_vpc_origin_accepts_existing_endpoints(cloudfront, kind):
+    """R1 U-create/create-A (ALB), create-N (NLB), V C35/create-real-ec2-instance: an existing ALB, NLB or
+    instance is accepted (202). MiniStack's ELBv2 names every load balancer's ARN `loadbalancer/app/...`, also
+    for Type=network, so the NLB case uses that ARN; the `loadbalancer/net/` format itself is covered by
+    R1 V-arn/nlb-missing in test_cloudfront_vpc_origin_endpoint_must_exist."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Arn=_vo_endpoint(kind)))
+    try:
+        assert created["ResponseMetadata"]["HTTPStatusCode"] == 202
+    finally:
+        _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+
+
+def test_cloudfront_vpc_origin_endpoint_checked_on_update(cloudfront, vpc_origin):
+    """R1 U9/update-A-current-etag-missing-alb: Update checks the endpoint too."""
+    got = cloudfront.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])
+    missing = f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"
+    with pytest.raises(ClientError) as exc:
+        cloudfront.update_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"], IfMatch=got["ETag"], VpcOriginEndpointConfig={
+            **got["VpcOrigin"]["VpcOriginEndpointConfig"], "Arn": missing})
+    assert _vo_error(exc) == (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.")
+
+
+def test_cloudfront_vpc_origin_name_limits_accepted(cloudfront):
+    """R1 V-name/name-64: a 64-character name is accepted; R1 U20/http-leading-zero: so is HTTPPort 080."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Name="n" * 52 + _uuid_mod.uuid4().hex[:12]))
+    _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+    cfg = _vo_cfg()
+    status, _, text = _vo_raw("POST", "/2020-05-31/vpc-origin", _vo_create_xml(_vo_cfg_xml(cfg, http="080")))
+    assert status == 202 and "<HTTPPort>80</HTTPPort>" in text
+    _vo_delete(cloudfront, re.search(r"<Id>([^<]+)</Id>", text).group(1))
+
+
+def test_cloudfront_vpc_origin_list_pagination(cloudfront):
+    """R1 U11/page-size-1-*, page-size-2-*, marker-is-A: sorted by id, NextMarker is the last id of a page
+    that leaves items behind, Marker is exclusive, and the last page has no NextMarker. V C37, C38, C39
+    and R1 V-list/max-items-zero (raw): no Marker or IsTruncated element, and an empty <Items/>."""
+    ids = sorted(cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())["VpcOrigin"]["Id"] for _ in range(3))
+    try:
+        listed = [s["Id"] for s in cloudfront.list_vpc_origins()["VpcOriginList"]["Items"]]
+        assert listed == sorted(listed)
+        seen, marker = [], None
+        while True:
+            kwargs = {"MaxItems": "1", **({"Marker": marker} if marker else {})}
+            page = cloudfront.list_vpc_origins(**kwargs)["VpcOriginList"]
+            assert set(page) <= {"NextMarker", "MaxItems", "Quantity", "Items"}
+            assert page["MaxItems"] == 1 and page["Quantity"] == len(page["Items"]) == 1
+            seen.append(page["Items"][0]["Id"])
+            if "NextMarker" not in page:
+                break
+            assert page["NextMarker"] == page["Items"][0]["Id"]
+            marker = page["NextMarker"]
+        assert seen == listed
+        after = cloudfront.list_vpc_origins(Marker=ids[0])["VpcOriginList"]["Items"]
+        assert [s["Id"] for s in after] == [i for i in listed if i > ids[0]]
+        status, _, text = _vo_raw("GET", "/2020-05-31/vpc-origin?MaxItems=0")
+        assert status == 200
+        assert re.search(r"<VpcOriginList[^>]*><MaxItems>0</MaxItems><Quantity>0</Quantity><Items\s*/></VpcOriginList>", text)
+    finally:
+        for vo_id in ids:
+            _vo_delete(cloudfront, vo_id)
+
+
+def test_cloudfront_vpc_origin_list_summary(cloudfront, vpc_origin):
+    """R1 U11 raw bodies: the summary fields and their values."""
+    vo = cloudfront.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])["VpcOrigin"]
+    summary = next(s for s in cloudfront.list_vpc_origins()["VpcOriginList"]["Items"] if s["Id"] == vo["Id"])
+    assert summary == {"Id": vo["Id"], "Name": vo["VpcOriginEndpointConfig"]["Name"], "Status": "Deployed",
+                       "CreatedTime": vo["CreatedTime"], "LastModifiedTime": vo["LastModifiedTime"], "Arn": vo["Arn"],
+                       "AccountId": _VO_ACCOUNT, "OriginEndpointArn": vo["VpcOriginEndpointConfig"]["Arn"]}
+
+
+@pytest.mark.parametrize("max_items,expected", [
+    (None, 100), ("5", 5), ("1000", 100), ("101", 100), ("", 100),
+], ids=["default", "5", "1000", "101", "empty"])
+def test_cloudfront_vpc_origin_list_max_items(cloudfront, max_items, expected):
+    """V C37/no-params, C38; R1 V-list/max-items-one-thousand, max-items-101, max-items-empty: the default
+    is 100, and a larger value comes back as 100."""
+    kwargs = {} if max_items is None else {"MaxItems": max_items}
+    assert cloudfront.list_vpc_origins(**kwargs)["VpcOriginList"]["MaxItems"] == expected
+
+
+@pytest.mark.parametrize("params,expected", [
+    ({"MaxItems": "abc"}, (400, "InvalidArgument", "MaxItems must be a non-zero positive integer.")),  # V C40
+    ({"MaxItems": "-1"}, (400, "InvalidArgument", "MaxItems must be a non-zero positive integer.")),  # V C41
+    ({"MaxItems": "1.5"}, (400, "InvalidArgument", "MaxItems must be a non-zero positive integer.")),  # R1 V-list/max-items-decimal
+    ({"Marker": "vo_doesnotexist"}, (404, "EntityNotFound", "The request contains an invalid marker.")),  # V C42/unknown-marker
+    ({"Marker": "vo_Y769dEbaneau0o63mXNjrY"}, (404, "EntityNotFound", "The request contains an invalid marker.")),  # V C42/random-marker
+], ids=["abc", "minus-1", "decimal", "bad-marker", "unknown-marker"])
+def test_cloudfront_vpc_origin_list_rejects(cloudfront, params, expected):
+    """V C40, C41, C42; R1 V-list/max-items-decimal."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.list_vpc_origins(**params)
+    assert _vo_error(exc) == expected
+
+
+@pytest.mark.parametrize("overrides", [
+    {"HTTPPort": 443}, {"HTTPPort": 1024}, {"HTTPPort": 65535},  # R2 V-port/http-443, http-1024, http-65535
+    {"HTTPSPort": 80}, {"HTTPSPort": 1024}, {"HTTPSPort": 65535},  # R2 V-port/https-80, https-1024, https-65535
+    {"OriginProtocolPolicy": "match-viewer",
+     "OriginSslProtocols": {"Quantity": 4, "Items": ["SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2"]}},  # R2 V-values/match-viewer-all-protocols
+    {"OriginProtocolPolicy": "http-only", "OriginSslProtocols": {"Quantity": 1, "Items": ["SSLv3"]}},  # R2 V-values/http-only-sslv3
+])
+def test_cloudfront_vpc_origin_accepts_values(cloudfront, overrides):
+    """R2 V-port, V-values: these ports, policies and protocols are accepted and echoed."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(**overrides))
+    try:
+        cfg = created["VpcOrigin"]["VpcOriginEndpointConfig"]
+        assert {k: cfg[k] for k in overrides} == overrides
+    finally:
+        _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+
+
+@pytest.mark.parametrize("items,stored", [
+    (["TLSv1.2", "TLSv1.2"], ["TLSv1.2"]),  # R2 V-name/duplicate-protocols
+    (["TLSv1.2", "TLSv1"], ["TLSv1", "TLSv1.2"]),  # R2 V-name/unordered-protocols
+], ids=["duplicates", "unordered"])
+def test_cloudfront_vpc_origin_protocols_stored_once_in_enum_order(cloudfront, items, stored):
+    """R2 V-name/duplicate-protocols, unordered-protocols: Quantity is checked against the items sent, then
+    each protocol is stored once, in the order SSLv3, TLSv1, TLSv1.1, TLSv1.2."""
+    created = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(
+        OriginSslProtocols={"Quantity": len(items), "Items": items}))
+    try:
+        assert created["VpcOrigin"]["VpcOriginEndpointConfig"]["OriginSslProtocols"] == {
+            "Quantity": len(stored), "Items": stored}
+    finally:
+        _vo_delete(cloudfront, created["VpcOrigin"]["Id"])
+
+
+@pytest.mark.parametrize("ip_type", ["ipv4", "dualstack"])
+def test_cloudfront_vpc_origin_ip_address_type(cloudfront, ip_type):
+    """R2 V-ip/ip-address-type-ipv4, ip-address-type-dualstack (raw): IpAddressType is accepted and echoed.
+    botocore 1.43 doesn't model the member, so the request is raw XML."""
+    cfg = _vo_cfg()
+    status, _, text = _vo_raw("POST", "/2020-05-31/vpc-origin",
+                              _vo_create_xml(_vo_cfg_xml(cfg) + f"<IpAddressType>{ip_type}</IpAddressType>"))
+    vo_id = re.search(r"<Id>([^<]+)</Id>", text).group(1)
+    try:
+        assert status == 202 and f"<IpAddressType>{ip_type}</IpAddressType>" in text
+        _, _, got = _vo_raw("GET", f"/2020-05-31/vpc-origin/{vo_id}")
+        assert f"<IpAddressType>{ip_type}</IpAddressType>" in got
+    finally:
+        _vo_delete(cloudfront, vo_id)
+
+
+def test_cloudfront_vpc_origin_names_are_case_sensitive(cloudfront, vpc_origin):
+    """R2 V-name/dup-name-other-case: the same name in another case is a different name."""
+    name = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]["Name"]
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Name=name.upper()))
+    _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+    assert other["ResponseMetadata"]["HTTPStatusCode"] == 202
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({"HTTPPort": 0}, _VO_PORT_RANGE),  # R2 V-name/dup-name+port0
+    ({"OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, _VO_QTY_2_1),  # R2 V-name/dup-name+qty-mismatch
+    ({"Arn": "arn:aws:s3:::bucket"}, _VO_BAD_ARN),  # R2 V-name/dup-name+s3-arn
+    ({"Arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/vo-other/0123456789abcdef"},
+     _VO_OTHER_ACCOUNT),  # R2 V-name/dup-name+other-account
+    ({"Arn": f"arn:aws:elasticloadbalancing:us-east-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"},
+     (400, "InvalidArgument", "The parameter VpcOriginEndpointConfig Arn LoadBalancerNotFound.")),  # R2 V-name/dup-name+missing-alb
+])
+def test_cloudfront_vpc_origin_name_taken_is_checked_last(cloudfront, vpc_origin, overrides, expected):
+    """R2 V-name/dup-name+*: a reused name is reported only after every other check passes."""
+    name = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]["Name"]
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(Name=name, **overrides))
+    assert _vo_error(exc) == expected
+
+
+_VO_IN_USE = ("The specified VPC origin is currently associated with one or more distributions. Please "
+              "disassociate the VPC origin from all distributions before updating or deleting")
+
+
+def _vo_distribution_config(vo_id, comment=""):
+    return {
+        "CallerReference": str(_uuid_mod.uuid4()), "Comment": comment, "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [{"Id": "api", "DomainName": "api.internal.example.com",
+                                              "VpcOriginConfig": {"VpcOriginId": vo_id}}]},
+        "DefaultCacheBehavior": {"TargetOriginId": "api", "ViewerProtocolPolicy": "redirect-to-https",
+                                 "CachePolicyId": "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"},
+    }
+
+
+def _vo_delete_distribution(cloudfront, dist_id):
+    got = cloudfront.get_distribution_config(Id=dist_id)
+    cfg = got["DistributionConfig"]
+    etag = got["ETag"]
+    if cfg["Enabled"]:
+        etag = cloudfront.update_distribution(Id=dist_id, IfMatch=etag, DistributionConfig={**cfg, "Enabled": False})["ETag"]
+    cloudfront.delete_distribution(Id=dist_id, IfMatch=etag)
+
+
+def test_cloudfront_vpc_origin_in_use_by_distribution(cloudfront, vpc_origin):
+    """R2 U15/create-distribution-on-B-deploying, get-distribution-immediate: the distribution keeps
+    VpcOriginConfig and AWS fills in OriginReadTimeout 30 and OriginKeepaliveTimeout 5.
+    R2 U13/delete-B-while-distribution-in-progress, update-B-while-referenced: while it names the origin,
+    Delete answers 409 CannotDeleteEntityWhileInUse and Update 409 CannotUpdateEntityWhileInUse.
+    R3b U13: a stale ETag (412) and the range checks come first; in use comes before a reused name; an
+    update that changes nothing is accepted."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    created = cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(vo_id))
+    dist_id = created["Distribution"]["Id"]
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    try:
+        origin = cloudfront.get_distribution(Id=dist_id)["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]
+        assert origin["VpcOriginConfig"] == {"VpcOriginId": vo_id, "OriginReadTimeout": 30, "OriginKeepaliveTimeout": 5}
+        got = cloudfront.get_vpc_origin(Id=vo_id)
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=got["ETag"])
+        assert _vo_error(exc) == (409, "CannotDeleteEntityWhileInUse", _VO_IN_USE)
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"],
+                                         VpcOriginEndpointConfig={**got["VpcOrigin"]["VpcOriginEndpointConfig"], "HTTPSPort": 8443})
+        assert _vo_error(exc) == (409, "CannotUpdateEntityWhileInUse", _VO_IN_USE)
+        cfg = got["VpcOrigin"]["VpcOriginEndpointConfig"]
+        for overrides, expected in (
+            ({"HTTPPort": 0}, _VO_PORT_RANGE),  # R3b U13/update-B-port0-in-use
+            ({"Name": other["VpcOrigin"]["VpcOriginEndpointConfig"]["Name"]},
+             (409, "CannotUpdateEntityWhileInUse", _VO_IN_USE)),  # R3b U13/update-B-name-of-A-in-use
+        ):
+            with pytest.raises(ClientError) as exc:
+                cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig={**cfg, **overrides})
+            assert _vo_error(exc) == expected
+        for call in (lambda: cloudfront.update_vpc_origin(Id=vo_id, IfMatch=vpc_origin["ETag"], VpcOriginEndpointConfig=cfg),
+                     lambda: cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=vpc_origin["ETag"])):
+            with pytest.raises(ClientError) as exc:  # R3b U13/update-B-stale-etag-in-use, delete-B-stale-etag-in-use
+                call()
+            assert _vo_error(exc) == (412, "PreconditionFailed", _VO_STALE)
+        same = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig=cfg)
+        # R3b U13/update-B-unchanged-in-use: 202 with the origin as stored, no new version.
+        assert same["ResponseMetadata"]["HTTPStatusCode"] == 202
+        assert same["ETag"] == got["ETag"]
+        assert same["VpcOrigin"]["Status"] == "Deployed"
+        assert same["VpcOrigin"]["LastModifiedTime"] == got["VpcOrigin"]["LastModifiedTime"]
+    finally:
+        _vo_delete_distribution(cloudfront, dist_id)
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+
+
+def test_cloudfront_vpc_origin_free_after_distribution_moves_off(cloudfront, vpc_origin):
+    """R3b U13/update-distribution-off-B, delete-B-right-after-distribution-update: once the distribution
+    no longer names the origin, the origin can be deleted at once."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    created = cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(vo_id))
+    dist_id = created["Distribution"]["Id"]
+    try:
+        got = cloudfront.get_distribution_config(Id=dist_id)
+        cfg = {**got["DistributionConfig"], "Enabled": False, "Origins": {"Quantity": 1, "Items": [{
+            "Id": "api", "DomainName": "origin.example.com",
+            "CustomOriginConfig": {"HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": "https-only",
+                                   "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]}}}]}}
+        cloudfront.update_distribution(Id=dist_id, IfMatch=got["ETag"], DistributionConfig=cfg)
+        deleted = cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=cloudfront.get_vpc_origin(Id=vo_id)["ETag"])
+        assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 202
+    finally:
+        _vo_delete_distribution(cloudfront, dist_id)
+
+
+def test_cloudfront_vpc_origin_id_in_comment_is_not_a_reference(cloudfront, vpc_origin):
+    """R2 U14/delete-A-id-only-in-comment: an origin named only in a distribution's Comment can be deleted."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    created = cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(
+        other["VpcOrigin"]["Id"], comment=f"other origin {vo_id}"))
+    try:
+        deleted = cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=cloudfront.get_vpc_origin(Id=vo_id)["ETag"])
+        assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 202
+    finally:
+        _vo_delete_distribution(cloudfront, created["Distribution"]["Id"])
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+
+
+@pytest.mark.parametrize("vo_id", ["vo_Y769dEbaneau0o63mXNjrY", "vo_doesnotexist"], ids=["unknown", "malformed"])
+def test_cloudfront_distribution_rejects_unknown_vpc_origin(cloudfront, vo_id):
+    """R2 U15/create-distribution-dunk, create-distribution-dbad: a VpcOriginId that names no origin
+    answers 404 EntityNotFound."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(vo_id))
+    assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+
+
+def test_cloudfront_vpc_origin_update_check_order_round2(cloudfront, vpc_origin):
+    """R2 V-order/update-bad-id-no-if-match, update-bad-id-bad-policy: the id format comes before the schema
+    problems. update-not-xml-no-if-match: a body that isn't XML comes before them too (and R5
+    V-edge/update-bad-id-not-xml: before the id format). update-stale-etag-port0, update-unknown-id-real-etag-port0:
+    the range checks come before the origin lookup and the 412. update-stale-etag-name-of-A: the 412 comes
+    before a reused name. R2 V-name/update-C-name-of-A, update-C-name-too-long: names are checked on Update."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    stale = vpc_origin["ETag"]
+    current = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    other_name = other["VpcOrigin"]["VpcOriginEndpointConfig"]["Name"]
+    try:
+        bad_policy = f'<VpcOriginEndpointConfig xmlns="{_VO_NS}">{_vo_cfg_xml({**cfg, "OriginProtocolPolicy": "nope"})}</VpcOriginEndpointConfig>'
+        assert _vo_raw_error("PUT", "/2020-05-31/vpc-origin/vo_doesnotexist", bad_policy) == (
+            400, "InvalidArgument", "Id format is invalid")
+        assert _vo_raw_error("PUT", f"/2020-05-31/vpc-origin/{vo_id}", "this is not xml") == (
+            400, "MalformedInput", "Could not parse XML")
+        assert _vo_raw_error("DELETE", "/2020-05-31/vpc-origin/vo_doesnotexist") == (
+            400, "InvalidArgument", "Id format is invalid")
+        cases = [
+            (vo_id, stale, {"HTTPPort": 0}, _VO_PORT_RANGE),
+            ("vo_Y769dEbaneau0o63mXNjrY", current, {"HTTPPort": 0}, _VO_PORT_RANGE),
+            (vo_id, stale, {"Name": other_name}, (412, "PreconditionFailed", _VO_STALE)),
+            (vo_id, current, {"Name": other_name}, (409, "EntityAlreadyExists",
+                                                    "Another vpc origin with the same name already exists within the aws account.")),
+            (vo_id, current, {"Name": "n" * 65}, (400, "InvalidArgument", "The parameter VPC Origin Name is too big.")),
+        ]
+        for target, if_match, overrides, expected in cases:
+            with pytest.raises(ClientError) as exc:
+                cloudfront.update_vpc_origin(Id=target, IfMatch=if_match, VpcOriginEndpointConfig={**cfg, **overrides})
+            assert _vo_error(exc) == expected
+    finally:
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("permission", ["none", "allow", "explicit-deny", "other-resource"])
+def test_cloudfront_vpc_origin_permission_contract(auth_enabled, iam_user, vpc_origin, permission):
+    """R2 U17/p2-get-A-try2 and p2-get-B: GetVpcOrigin is authorized on arn:aws:cloudfront::<account>:vpcorigin/<Id>;
+    p1-get-A: without a matching allow it answers 403 AccessDenied."""
+    vo_arn = vpc_origin["VpcOrigin"]["Arn"]
+    statements = []
+    if permission != "none":
+        resource = vo_arn.rsplit("/", 1)[0] + "/vo_other" if permission == "other-resource" else vo_arn
+        statements.append({"Effect": "Allow", "Action": "cloudfront:GetVpcOrigin", "Resource": resource})
+    if permission == "explicit-deny":
+        statements.append({"Effect": "Deny", "Action": "cloudfront:GetVpcOrigin", "Resource": vo_arn})
+    policy = {"Version": "2012-10-17", "Statement": statements} if statements else None
+    client = iam_user(policy=policy).client("cloudfront", region="us-east-1")
+    if auth_enabled and permission != "allow":
+        with pytest.raises(ClientError) as exc:
+            client.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        assert client.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])["VpcOrigin"]["Arn"] == vo_arn
+
+
+def test_cloudfront_update_distribution_rejects_unknown_vpc_origin(cloudfront, vpc_origin):
+    """R3b U15/update-distribution-unknown-vpc-origin-id: UpdateDistribution naming no origin answers 404
+    EntityNotFound."""
+    created = cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(vpc_origin["VpcOrigin"]["Id"]))
+    dist_id = created["Distribution"]["Id"]
+    try:
+        got = cloudfront.get_distribution_config(Id=dist_id)
+        cfg = copy.deepcopy(got["DistributionConfig"])
+        cfg["Origins"]["Items"][0]["VpcOriginConfig"]["VpcOriginId"] = "vo_Y769dEbaneau0o63mXNjrY"
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_distribution(Id=dist_id, IfMatch=got["ETag"], DistributionConfig=cfg)
+        assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+    finally:
+        _vo_delete_distribution(cloudfront, dist_id)
+
+
+def test_cloudfront_vpc_origin_etags_follow_the_version(cloudfront, vpc_origin):
+    """R1 U6, U4, U7, U10 (headers): every origin has the same ETag at the same version, and the version moves on at
+    the create, the end of its deployment, an update and the end of that deployment. MiniStack's values are uuid5s
+    (as for the managed policies). R1 U3/delete-unknown-real-etag, U10/delete-C-after-gone: an issued ETag on an
+    unknown id answers 404; R1 U1/update-A-fake-etag: a well-formed ETag that was never issued answers 400."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    other = cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg())
+    try:
+        assert other["ETag"] == vpc_origin["ETag"]
+        assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", vpc_origin["ETag"])
+        got = cloudfront.get_vpc_origin(Id=vo_id)
+        assert got["ETag"] == cloudfront.get_vpc_origin(Id=other["VpcOrigin"]["Id"])["ETag"] != vpc_origin["ETag"]
+        updated = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig={
+            **got["VpcOrigin"]["VpcOriginEndpointConfig"], "HTTPSPort": 8443})
+        after = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+        assert len({vpc_origin["ETag"], got["ETag"], updated["ETag"], after}) == 4
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_vpc_origin(Id="vo_Y769dEbaneau0o63mXNjrY", IfMatch=got["ETag"])
+        assert _vo_error(exc) == (404, "EntityNotFound", _VO_NOT_FOUND)
+        never_issued = str(_uuid_mod.uuid4())
+        for call in (lambda: cloudfront.delete_vpc_origin(Id=vo_id, IfMatch=never_issued),
+                     lambda: cloudfront.update_vpc_origin(Id=vo_id, IfMatch=never_issued,
+                                                          VpcOriginEndpointConfig=got["VpcOrigin"]["VpcOriginEndpointConfig"])):
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert _vo_error(exc) == (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)
+    finally:
+        _vo_delete(cloudfront, other["VpcOrigin"]["Id"])
+
+
+@pytest.mark.parametrize("inner_kw,expected", [
+    ({"https": ""}, (400, "MalformedInput", "missing value for decimal type")),  # R5 V-edge/https-empty
+    ({"ssl": "<OriginSslProtocols><Quantity></Quantity><Items><SslProtocol>TLSv1.2</SslProtocol></Items></OriginSslProtocols>"},
+     (400, "MalformedInput", "missing value for decimal type")),  # R5 V-edge/quantity-empty
+    ({"http": "99999999999"}, (400, "MalformedInput", None)),  # R5 V-edge/http-huge
+    ({"policy": ""}, (400, "MalformedXML", "1 validation error detected: Value '' at 'vpcOriginEndpointConfig.originProtocolPolicy' "
+                                           "failed to satisfy constraint: " + _VO_POLICY_ENUM)),  # R5 V-edge/policy-empty
+    ({"ssl": "<OriginSslProtocols><Quantity>1</Quantity><Items><SslProtocol></SslProtocol></Items></OriginSslProtocols>"},
+     (400, "MalformedXML", "1 validation error detected: Value '[]' at 'vpcOriginEndpointConfig.originSslProtocols.items' "
+                           "failed to satisfy constraint: " + _VO_SSL_ENUM)),  # R5 V-edge/ssl-protocol-empty
+], ids=["https-empty", "quantity-empty", "http-huge", "policy-empty", "ssl-protocol-empty"])
+def test_cloudfront_vpc_origin_create_rejects_raw_edges(inner_kw, expected):
+    """R5 V-edge: empty integers, an integer outside the 32-bit range, and empty enum values."""
+    cfg = _vo_cfg()
+    policy = inner_kw.pop("policy", None)
+    inner = _vo_cfg_xml(cfg, **inner_kw)
+    if policy is not None:
+        inner = inner.replace(">https-only<", f">{policy}<")
+    assert _vo_raw_error("POST", "/2020-05-31/vpc-origin", _vo_create_xml(inner)) == expected
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({"Name": "", "HTTPPort": 0}, _VO_PORT_RANGE),  # R5 V-edge/name-empty+port0
+    ({"Name": "a b", "HTTPPort": 0}, _VO_PORT_RANGE),  # R5 V-edge/name-bad-char+port0
+    ({"Name": "a b", "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}}, (
+        400, "InvalidArgument", "The parameter Name contains characters other than alphanumericals, dashes, and underscores.")),  # R5 V-edge/name-bad-char+qty-mismatch
+    ({"Name": "", "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2"]}},
+     (400, "InvalidArgument", "The parameter VPC Origin Name is too small or empty.")),  # R5 V-edge/name-empty+qty-mismatch
+    ({"Name": "a b" + "n" * 63}, (400, "InvalidArgument", "The parameter VPC Origin Name is too big.")),  # R5 V-edge/name-65-bad-char
+    ({"Arn": "arn:aws:elasticloadbalancing:us-east-1::loadbalancer/app/example/0123456789abcdef"}, _VO_BAD_ARN),  # R5 V-edge/arn-empty-account
+    ({"Arn": f"arn:aws:elasticloadbalancing:xx-fake-1:{_VO_ACCOUNT}:loadbalancer/app/example/0123456789abcdef"}, _VO_BAD_ARN),  # R5 V-edge/arn-fake-region
+], ids=["name-empty+port0", "name-bad-char+port0", "name-bad-char+qty", "name-empty+qty", "name-65-bad-char",
+        "arn-empty-account", "arn-fake-region"])
+def test_cloudfront_vpc_origin_create_rejects_edges(cloudfront, overrides, expected):
+    """R5 V-edge: the order inside the name checks (empty, too big, characters) and against the port and
+    quantity checks; an ARN with no account or a region AWS doesn't have is an invalid format."""
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_vpc_origin(VpcOriginEndpointConfig=_vo_cfg(**overrides))
+    assert _vo_error(exc) == expected
+
+
+def test_cloudfront_vpc_origin_plus_sign_integers(cloudfront):
+    """R5 V-edge/http-plus-80: HTTPPort +80 is accepted as 80. V-edge/max-items-plus-5: MaxItems +5 is 5;
+    max-items-space-5: ' 5' is refused; max-items-abc-bad-marker: the MaxItems error comes first."""
+    status, _, text = _vo_raw("POST", "/2020-05-31/vpc-origin", _vo_create_xml(_vo_cfg_xml(_vo_cfg(), http="+80")))
+    assert status == 202 and "<HTTPPort>80</HTTPPort>" in text
+    _vo_delete(cloudfront, re.search(r"<Id>([^<]+)</Id>", text).group(1))
+    assert cloudfront.list_vpc_origins(MaxItems="+5")["VpcOriginList"]["MaxItems"] == 5
+    for params in ({"MaxItems": " 5"}, {"MaxItems": "abc", "Marker": "vo_doesnotexist"}):
+        with pytest.raises(ClientError) as exc:
+            cloudfront.list_vpc_origins(**params)
+        assert _vo_error(exc) == (400, "InvalidArgument", "MaxItems must be a non-zero positive integer.")
+
+
+def test_cloudfront_vpc_origin_update_edges(cloudfront, vpc_origin):
+    """R5 V-edge/update-empty-if-match, delete-empty-if-match: an empty If-Match is InvalidIfMatchVersion.
+    update-empty-body: an empty body is a null vpcOriginEndpointConfig. update-bad-id-not-xml: the XML comes
+    before the id format. update-eighty-no-if-match: a non-integer comes before the ifMatch null.
+    update-A-omit-ssl, get-A-after-omit-ssl: an Update without OriginSslProtocols stores the default."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    etag = cloudfront.get_vpc_origin(Id=vo_id)["ETag"]
+    path = f"/2020-05-31/vpc-origin/{vo_id}"
+    body = f'<VpcOriginEndpointConfig xmlns="{_VO_NS}">{_vo_cfg_xml(cfg)}</VpcOriginEndpointConfig>'
+    assert _vo_raw_error("PUT", path, body, {"If-Match": ""}) == (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)
+    assert _vo_raw_error("DELETE", path, None, {"If-Match": ""}) == (400, "InvalidIfMatchVersion", _VO_BAD_IF_MATCH)
+    assert _vo_raw_error("PUT", path, "", {"If-Match": etag}) == (
+        400, "MalformedXML", "1 validation error detected: Value null at 'vpcOriginEndpointConfig' failed to satisfy "
+                             "constraint: Member must not be null")
+    assert _vo_raw_error("PUT", "/2020-05-31/vpc-origin/vo_doesnotexist", "this is not xml", {"If-Match": etag}) == (
+        400, "MalformedInput", "Could not parse XML")
+    eighty = f'<VpcOriginEndpointConfig xmlns="{_VO_NS}">{_vo_cfg_xml(cfg, http="eighty")}</VpcOriginEndpointConfig>'
+    assert _vo_raw_error("PUT", path, eighty) == (400, "MalformedInput", None)
+    no_ssl = {k: v for k, v in cfg.items() if k != "OriginSslProtocols"}
+    updated = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=etag, VpcOriginEndpointConfig=no_ssl)
+    assert updated["VpcOrigin"]["VpcOriginEndpointConfig"]["OriginSslProtocols"] == {
+        "Quantity": 3, "Items": ["TLSv1", "TLSv1.1", "TLSv1.2"]}
+
+
+def test_cloudfront_vpc_origin_in_use_normalized_and_omitted_protocols(cloudfront, vpc_origin):
+    """R5 V-edge/update-C-in-use-duplicate-protocols: while in use, duplicated protocols are the same config
+    (202, no new version). update-C-in-use-omit-ssl: leaving OriginSslProtocols out is a change (409)."""
+    vo_id = vpc_origin["VpcOrigin"]["Id"]
+    created = cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(vo_id))
+    try:
+        got = cloudfront.get_vpc_origin(Id=vo_id)
+        cfg = got["VpcOrigin"]["VpcOriginEndpointConfig"]
+        same = cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"], VpcOriginEndpointConfig={
+            **cfg, "OriginSslProtocols": {"Quantity": 2, "Items": ["TLSv1.2", "TLSv1.2"]}})
+        assert same["ResponseMetadata"]["HTTPStatusCode"] == 202 and same["ETag"] == got["ETag"]
+        with pytest.raises(ClientError) as exc:
+            cloudfront.update_vpc_origin(Id=vo_id, IfMatch=got["ETag"],
+                                         VpcOriginEndpointConfig={k: v for k, v in cfg.items() if k != "OriginSslProtocols"})
+        assert _vo_error(exc) == (409, "CannotUpdateEntityWhileInUse", _VO_IN_USE)
+    finally:
+        _vo_delete_distribution(cloudfront, created["Distribution"]["Id"])
+
+
+def test_cloudfront_distribution_vpc_origin_timeouts_and_empty_id(cloudfront, vpc_origin):
+    """R5 V-edge/create-distribution-read-timeout-only: a sent OriginReadTimeout is kept and
+    OriginKeepaliveTimeout defaults to 5. create-distribution-empty-vpc-origin-id: an empty VpcOriginId answers
+    400 InvalidArgument."""
+    cfg = _vo_distribution_config(vpc_origin["VpcOrigin"]["Id"])
+    cfg["Origins"]["Items"][0]["VpcOriginConfig"]["OriginReadTimeout"] = 60
+    created = cloudfront.create_distribution(DistributionConfig=cfg)
+    try:
+        origin = created["Distribution"]["DistributionConfig"]["Origins"]["Items"][0]
+        assert origin["VpcOriginConfig"] == {"VpcOriginId": vpc_origin["VpcOrigin"]["Id"], "OriginReadTimeout": 60,
+                                             "OriginKeepaliveTimeout": 5}
+    finally:
+        _vo_delete_distribution(cloudfront, created["Distribution"]["Id"])
+    with pytest.raises(ClientError) as exc:
+        cloudfront.create_distribution(DistributionConfig=_vo_distribution_config(""))
+    assert _vo_error(exc) == (400, "InvalidArgument", "The parameter vpcOriginId must not be empty for VPC Origin.")
+
+
+def test_cloudfront_vpc_origin_update_deserialization_before_id(cloudfront, vpc_origin):
+    """R6 V-edge2/bad-id-wrong-root, bad-id-eighty: a body that can't be read answers MalformedInput even for a
+    malformed id. unknown-id-int-2147483647 / 2147483648 (and the negative pair): the integer range is 32-bit.
+    unknown-id-mixed-empty-protocol: every item shows in the enum message, empty ones too."""
+    cfg = vpc_origin["VpcOrigin"]["VpcOriginEndpointConfig"]
+    etag = cloudfront.get_vpc_origin(Id=vpc_origin["VpcOrigin"]["Id"])["ETag"]
+
+    def put(vid, inner, root="VpcOriginEndpointConfig"):
+        return _vo_raw_error("PUT", f"/2020-05-31/vpc-origin/{vid}", f'<{root} xmlns="{_VO_NS}">{inner}</{root}>',
+                             {"If-Match": etag})
+
+    assert put("vo_doesnotexist", _vo_cfg_xml(cfg), root="SomethingElse") == (
+        400, "MalformedInput", "SomethingElse is not valid, expected VpcOriginEndpointConfig")
+    assert put("vo_doesnotexist", _vo_cfg_xml(cfg, http="eighty")) == (400, "MalformedInput", None)
+    unknown = "vo_Y769dEbaneau0o63mXNjrY"
+    for value, expected in (("2147483647", _VO_PORT_RANGE), ("2147483648", (400, "MalformedInput", None)),
+                            ("-2147483648", _VO_PORT_RANGE), ("-2147483649", (400, "MalformedInput", None))):
+        assert put(unknown, _vo_cfg_xml(cfg, http=value)) == expected
+    mixed = ("<OriginSslProtocols><Quantity>2</Quantity><Items><SslProtocol></SslProtocol><SslProtocol>TLSv1.2"
+             "</SslProtocol></Items></OriginSslProtocols>")
+    assert put(unknown, _vo_cfg_xml(cfg, ssl=mixed)) == (
+        400, "MalformedXML", "1 validation error detected: Value '[, TLSv1.2]' at "
+        "'vpcOriginEndpointConfig.originSslProtocols.items' failed to satisfy constraint: " + _VO_SSL_ENUM)
+
+
+@pytest.mark.parametrize("max_items,expected", [
+    ("99999999999", None), ("2147483648", None), ("-0", 0),
+], ids=["huge", "2147483648", "minus-0"])
+def test_cloudfront_vpc_origin_list_max_items_bounds(cloudfront, max_items, expected):
+    """R6 V-edge2/list-max-items-huge, list-max-items-2147483648: past the 32-bit range MaxItems is refused;
+    list-max-items-minus-0: -0 is 0."""
+    if expected is None:
+        with pytest.raises(ClientError) as exc:
+            cloudfront.list_vpc_origins(MaxItems=max_items)
+        assert _vo_error(exc) == (400, "InvalidArgument", "MaxItems must be a non-zero positive integer.")
+    else:
+        assert cloudfront.list_vpc_origins(MaxItems=max_items)["VpcOriginList"]["MaxItems"] == expected
+
+
+def _cf_create_tagged_function(cloudfront, name, **kwargs):
+    return cloudfront.create_function(
+        Name=name, FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+        FunctionCode=b"function handler(event) { return event.request; }", **kwargs)
+
+
+def _cf_delete_function_if_present(cloudfront, name):
+    try:
+        etag = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["ETag"]
+    except ClientError:
+        return
+    cloudfront.delete_function(Name=name, IfMatch=etag)
+
+
+def _cf_tag_items(cloudfront, arn):
+    return cloudfront.list_tags_for_resource(Resource=arn)["Tags"].get("Items", [])
+
+
+def test_cloudfront_create_function_stores_request_tags(cloudfront):
+    """CreateFunctionRequest's Tags are listed on the function ARN, and
+    TagResource / UntagResource then change that same set.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C1, C2, C3)."""
+    name = f"tagged-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "environment", "Value": "dev"}]})
+        assert fn["ResponseMetadata"]["HTTPStatusCode"] == 201
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        assert arn.endswith(f":function/{name}") and arn.startswith("arn:aws:cloudfront::")
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "environment", "Value": "dev"}]
+
+        cloudfront.tag_resource(Resource=arn, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        cloudfront.untag_resource(Resource=arn, TagKeys={"Items": ["environment"]})
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_with_empty_tags_has_none(cloudfront):
+    """AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C4)."""
+    name = f"untagged-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name, Tags={"Items": []})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        assert _cf_tag_items(cloudfront, arn) == []
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_tag_without_value_lists_empty_value(cloudfront):
+    """AWS: captured 2026-10-21 (2309-uncertainties U1:cf-tag-without-value,
+    U1:cf-tag-empty-value)."""
+    name = f"novalue-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "novalue"}, {"Key": "empty", "Value": ""}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        items = {t["Key"]: t["Value"] for t in _cf_tag_items(cloudfront, arn)}
+        assert items == {"novalue": "", "empty": ""}
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_already_exists_keeps_existing_tags(cloudfront):
+    """A refused second CreateFunction under the same name leaves the first
+    function's tags alone.
+    AWS: captured 2026-10-21 (2309-uncertainties U3:cf-already-exists-with-other-tags)."""
+    name = f"exists-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        with pytest.raises(ClientError) as exc:
+            _cf_create_tagged_function(cloudfront, name, Tags={"Items": [{"Key": "other", "Value": "x"}]})
+        assert exc.value.response["Error"]["Code"] == "FunctionAlreadyExists"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_delete_function_drops_its_tags(cloudfront):
+    """A function created again under a deleted function's name (same ARN)
+    starts without the old function's tags.
+    AWS: captured 2026-10-20 (cloudfront-function-and-alarm-tags C5, C6, C7)."""
+    name = f"recreated-fn-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(
+            cloudfront, name, Tags={"Items": [{"Key": "environment", "Value": "dev"}]})
+        arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+        deleted = cloudfront.delete_function(Name=name, IfMatch=fn["ETag"])
+        assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+        again = _cf_create_tagged_function(cloudfront, name, Tags={"Items": [{"Key": "team", "Value": "edge"}]})
+        assert again["ResponseMetadata"]["HTTPStatusCode"] == 201
+        assert again["FunctionSummary"]["FunctionMetadata"]["FunctionARN"] == arn
+        assert _cf_tag_items(cloudfront, arn) == [{"Key": "team", "Value": "edge"}]
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+_CF_PATTERN = "Member must satisfy regular expression pattern: ([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)"
+_CF_FILLER = [{"Key": "f1", "Value": "v"}, {"Key": "f2", "Value": "v"}]
+
+
+def _cf_unvalidated():
+    """boto3 without client-side checks, so it sends what AWS refuses."""
+    return __import__("conftest").make_client("cloudfront", additional_config_kwargs={"parameter_validation": False})
+
+
+def _cf_create_error(client, name, tags, **over):
+    kwargs = {"Name": name, "FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-2.0"},
+              "FunctionCode": b"function handler(event) { return event.request; }", "Tags": {"Items": tags}, **over}
+    with pytest.raises(ClientError) as exc:
+        client.create_function(**kwargs)
+    err = exc.value.response
+    return err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]
+
+
+def _cf_function_exists(cloudfront, name):
+    try:
+        cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")
+        return True
+    except ClientError:
+        return False
+
+
+def test_cloudfront_create_function_refuses_tag_constraint_violations(cloudfront):
+    """Member constraints come back as one MalformedXML: the code and runtime
+    first, then per tag Value before Key, per member length before pattern, at
+    most ten; nothing is created, and they come before FunctionAlreadyExists.
+    AWS: captured 2026-10-21 (2309-uncertainties F:empty-key, F:missing-key,
+    F:key-129, F:value-257, F:key-hash, F:key-amp, F:key-emoji, F:value-hash,
+    F:key-127-plus-emoji, F:key-hash-and-key-129, F:dup-and-key-129,
+    F:aws-prefix-and-key-129, F:dup-and-key-hash, F:dup-and-empty-code,
+    F:dup-and-bad-runtime, F:key-129-and-already-exists,
+    G:key-hash-and-value-hash-same-tag, G:key-129-and-value-257-same-tag,
+    G:key-129-hashes, G:missing-key-and-value-hash, G:eleven-bad-keys,
+    G:key-129-and-empty-code, G:key-129-and-bad-runtime; U10:cf-create-refused-empty-code;
+    H:bad-key-then-bad-value-next-tag, H:bad-value-then-bad-key-next-tag, H:key-combining-mark,
+    H:empty-code-and-bad-runtime)."""
+    raw = _cf_unvalidated()
+    dup = [{"Key": "dup", "Value": "a"}, {"Key": "dup", "Value": "b"}]
+
+    def at(i, field):
+        return f"at 'tags.items.{i}.member.{field}' failed to satisfy constraint:"
+
+    def one(text):
+        return f"1 validation error detected: {text}"
+
+    long_key, long_value = "k" * 129, "v" * 257
+    length_key = f"Value '{long_key}' {at(3, 'key')} Member must have length less than or equal to 128"
+    code_error = "Value at 'functionCode' failed to satisfy constraint: Member must have length greater than or equal to 1"
+    runtime_error = ("Value 'cloudfront-js-9.9' at 'functionConfig.runtime' failed to satisfy constraint: "
+                     "Member must satisfy enum value set: [cloudfront-js-1.0, cloudfront-js-2.0]")
+    cases = [
+        ([{"Key": "", "Value": "x"}], {}, one(f"Value '' {at(3, 'key')} Member must have length greater than or equal to 1")),
+        ([{"Value": "x"}], {}, one(f"Value null {at(3, 'key')} Member must not be null")),
+        ([{"Key": long_key, "Value": "x"}], {}, one(length_key)),
+        ([{"Key": "a", "Value": long_value}], {},
+         one(f"Value '{long_value}' {at(3, 'value')} Member must have length less than or equal to 256")),
+        ([{"Key": "a#b", "Value": "x"}], {}, one(f"Value 'a#b' {at(3, 'key')} {_CF_PATTERN}")),
+        ([{"Key": "a&b", "Value": "x"}], {}, one(f"Value 'a&b' {at(3, 'key')} {_CF_PATTERN}")),
+        ([{"Key": "a", "Value": "a#b"}], {}, one(f"Value 'a#b' {at(3, 'value')} {_CF_PATTERN}")),
+        ([{"Key": "k" * 127 + "\U0001F600", "Value": "x"}], {},
+         one(f"Value '{'k' * 127}\U0001F600' {at(3, 'key')} {_CF_PATTERN}")),
+        ([{"Key": "a#b", "Value": "c#d"}], {}, f"2 validation errors detected: Value 'c#d' {at(3, 'value')} {_CF_PATTERN}; "
+                                               f"Value 'a#b' {at(3, 'key')} {_CF_PATTERN}"),
+        ([{"Key": "#" * 129, "Value": "x"}], {},
+         f"2 validation errors detected: Value '{'#' * 129}' {at(3, 'key')} Member must have length less than or equal to 128; "
+         f"Value '{'#' * 129}' {at(3, 'key')} {_CF_PATTERN}"),
+        ([{"Value": "c#d"}], {}, f"2 validation errors detected: Value 'c#d' {at(3, 'value')} {_CF_PATTERN}; "
+                                 f"Value null {at(3, 'key')} Member must not be null"),
+        ([{"Key": "a#b", "Value": "x"}, {"Key": long_key, "Value": "x"}], {},
+         f"2 validation errors detected: Value 'a#b' {at(3, 'key')} {_CF_PATTERN}; "
+         f"Value '{long_key}' {at(4, 'key')} Member must have length less than or equal to 128"),
+        ([{"Key": f"a#{n}", "Value": "x"} for n in range(11)], {},
+         "10 validation errors detected: " + "; ".join(f"Value 'a#{n}' {at(n + 3, 'key')} {_CF_PATTERN}" for n in range(10))),
+        (dup + [{"Key": long_key, "Value": "x"}], {},
+         one(f"Value '{long_key}' {at(5, 'key')} Member must have length less than or equal to 128")),
+        ([{"Key": long_key, "Value": "x"}], {"FunctionCode": b""}, f"2 validation errors detected: {code_error}; {length_key}"),
+        ([{"Key": long_key, "Value": "x"}], {"FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-9.9"}},
+         f"2 validation errors detected: {runtime_error}; {length_key}"),
+        ([{"Key": "a#b", "Value": "x"}, {"Key": "c", "Value": "d#e"}], {},
+         f"2 validation errors detected: Value 'a#b' {at(3, 'key')} {_CF_PATTERN}; Value 'd#e' {at(4, 'value')} {_CF_PATTERN}"),
+        ([{"Key": "a", "Value": "b#c"}, {"Key": "d#e", "Value": "x"}], {},
+         f"2 validation errors detected: Value 'b#c' {at(3, 'value')} {_CF_PATTERN}; Value 'd#e' {at(4, 'key')} {_CF_PATTERN}"),
+        ([{"Key": "e\u0301", "Value": "x"}], {}, one(f"Value 'e\u0301' {at(3, 'key')} {_CF_PATTERN}")),
+        ([], {"FunctionCode": b"", "FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-9.9"}},
+         f"2 validation errors detected: {code_error}; {runtime_error}"),
+        (dup, {"FunctionCode": b""}, one(code_error)),
+        (dup, {"FunctionConfig": {"Comment": "", "Runtime": "cloudfront-js-9.9"}}, one(runtime_error)),
+    ]
+    for i, (tags, over, message) in enumerate(cases):
+        name = f"cf-constraint-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_create_error(raw, name, _CF_FILLER + tags, **over) == (400, "MalformedXML", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+
+    name = f"cf-constraint-exists-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _cf_create_tagged_function(cloudfront, name)
+        assert _cf_create_error(raw, name, _CF_FILLER + [{"Key": long_key, "Value": "x"}]) == (
+            400, "MalformedXML", one(length_key))
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_refuses_invalid_tagging(cloudfront):
+    """After the constraints and the name lookup, InvalidTagging: a repeated
+    key, then an aws: key, then more than 50 tags; nothing is created.
+    AWS: captured 2026-10-21 (2309-uncertainties F:dup-keys, U2:cf-duplicate-keys,
+    F:key-aws-prefix, F:key-AWS-prefix, F:51-tags, F:dup-and-aws-prefix,
+    F:51-tags-and-dup, F:51-tags-and-aws-prefix, F:dup-and-invalid-code,
+    F:dup-and-already-exists, H:two-dup-pairs-abba, H:mixed-case-Aws, H:AWS-then-aws,
+    H:aws-then-AWS)."""
+    raw = _cf_unvalidated()
+    many = [{"Key": f"k{n:02d}", "Value": "v"} for n in range(48)]
+    dup = [{"Key": "dup", "Value": "a"}, {"Key": "dup", "Value": "b"}]
+    cases = [
+        (dup, "Duplicate tag key: 'dup'."),
+        ([{"Key": "aws:x", "Value": "x"}], "Tag key cannot start with 'aws:'."),
+        ([{"Key": "AWS:x", "Value": "x"}], 'Invalid System Tag: AWS:x must be prefixed with "aws:" in lowercase.'),
+        (many + [{"Key": "k48", "Value": "v"}], "Too many tags."),
+        (dup + [{"Key": "aws:x", "Value": "x"}], "Duplicate tag key: 'dup'."),
+        (many + [{"Key": "k00", "Value": "again"}], "Duplicate tag key: 'k00'."),
+        (many + [{"Key": "aws:x", "Value": "x"}], "Tag key cannot start with 'aws:'."),
+        ([{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}, {"Key": "b", "Value": "3"}, {"Key": "a", "Value": "4"}],
+         "Duplicate tag key: 'b'."),
+        ([{"Key": "Aws:x", "Value": "x"}], 'Invalid System Tag: Aws:x must be prefixed with "aws:" in lowercase.'),
+        ([{"Key": "AWS:x", "Value": "x"}, {"Key": "aws:y", "Value": "y"}], "Tag key cannot start with 'aws:'."),
+        ([{"Key": "aws:y", "Value": "y"}, {"Key": "AWS:x", "Value": "x"}], "Tag key cannot start with 'aws:'."),
+    ]
+    for i, (tags, message) in enumerate(cases):
+        name = f"cf-tagging-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_create_error(raw, name, _CF_FILLER + tags) == (400, "InvalidTagging", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+    name = f"cf-tagging-code-{_uuid_mod.uuid4().hex[:8]}"
+    assert _cf_create_error(raw, name, _CF_FILLER + dup, FunctionCode=b"this is not javascript {{{") == (
+        400, "InvalidTagging", "Duplicate tag key: 'dup'.")
+
+    name = f"cf-tagging-exists-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _cf_create_tagged_function(cloudfront, name)
+        status, code, _ = _cf_create_error(raw, name, _CF_FILLER + dup)
+        assert (status, code) == (409, "FunctionAlreadyExists")
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_create_function_tag_values_aws_accepts(cloudfront):
+    """AWS: captured 2026-10-21 (2309-uncertainties F:key-128, F:value-256,
+    F:key-space-e-acute, F:key-specials, F:value-aws-prefix,
+    F:dup-keys-differing-case, F:50-tags, F:tags-without-items, G:missing-value,
+    U1:cf-tag-without-value, H:key-roman-numeral-Nl, H:key-superscript-No,
+    H:key-line-separator-Zl, I:raw-key-with-spaces-around)."""
+    cases = [
+        ([{"Key": "k" * 128, "Value": "x"}, {"Key": "a", "Value": "v" * 256}], {"k" * 128: "x", "a": "v" * 256}),
+        ([{"Key": "a b\u00e9", "Value": "x"}, {"Key": "_.:/=+-@", "Value": "x"}], {"a b\u00e9": "x", "_.:/=+-@": "x"}),
+        ([{"Key": "a", "Value": "aws:x"}, {"Key": "dup", "Value": "a"}, {"Key": "DUP", "Value": "b"}],
+         {"a": "aws:x", "dup": "a", "DUP": "b"}),
+        ([{"Key": f"k{n:02d}", "Value": "v"} for n in range(50)], {f"k{n:02d}": "v" for n in range(50)}),
+        ([{"Key": "novalue"}], {"novalue": ""}),
+        ([{"Key": "\u2160", "Value": "x"}, {"Key": "\u00b2", "Value": "x"}, {"Key": "a\u2028b", "Value": "x"},
+          {"Key": " a ", "Value": " b "}], {"\u2160": "x", "\u00b2": "x", "a\u2028b": "x", " a ": " b "}),
+    ]
+    raw = _cf_unvalidated()
+    for i, (tags, expected) in enumerate(cases):
+        name = f"cf-accepted-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        try:
+            fn = _cf_create_tagged_function(raw, name, Tags={"Items": tags})
+            arn = fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+            assert {t["Key"]: t["Value"] for t in _cf_tag_items(cloudfront, arn)} == expected, i
+        finally:
+            _cf_delete_function_if_present(cloudfront, name)
+    name = f"cf-accepted-noitems-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(raw, name, Tags={})
+        assert _cf_tag_items(cloudfront, fn["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]) == []
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)
+
+
+def _cf_raw_create_function(body):
+    """CreateFunction with an exact REST-XML body; returns (status, code, message)."""
+    import urllib.error
+    import urllib.request
+
+    from conftest import ENDPOINT
+    req = urllib.request.Request(f"{ENDPOINT}/2020-05-31/function", data=body.encode(), method="POST", headers={
+        "Content-Type": "application/xml",
+        "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/cloudfront/aws4_request, "
+                         "SignedHeaders=host, Signature=x"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, None, None
+    except urllib.error.HTTPError as e:
+        text = e.read().decode()
+        code = re.search(r"<Code>(.*?)</Code>", text)
+        message = re.search(r"<Message>(.*?)</Message>", text, re.S)
+        return e.code, code and code.group(1), message and message.group(1)
+
+
+def test_cloudfront_create_function_raw_xml_shapes(cloudfront):
+    """Shapes boto3 can't send: a missing FunctionCode, FunctionConfig or
+    Runtime and an empty Runtime join the MalformedXML list (code, config,
+    runtime, then tags); Tag elements directly under Tags are ignored; every
+    child of the last Items is a tag, whatever its name, and the last of two
+    Keys or Values counts; text in a tag without children, or an element
+    inside a Key or Value, is MalformedInput, then invalid base64 code, before
+    everything else; a missing or empty Name joins the MalformedXML list.
+    AWS: captured 2026-10-21 (2309-uncertainties H:raw-missing-code,
+    H:raw-missing-code-and-key-129, H:raw-missing-config, H:raw-missing-config-and-key-129,
+    H:raw-missing-runtime, H:raw-missing-runtime-and-key-129, H:raw-empty-runtime,
+    I:raw-empty-runtime-and-key-129, I:raw-missing-code-and-missing-config,
+    I:raw-missing-code-and-missing-runtime, H:raw-tags-direct-tag-children,
+    H:raw-tags-direct-valid-children, H:raw-items-non-tag-child,
+    I:raw-items-other-child-name-and-dup, N:cf-items-child-with-text-only,
+    N:cf-key-with-child-element, N:cf-items-child-without-key-or-value,
+    N:cf-key-nested-in-wrapper, N:cf-text-directly-in-items, N:cf-tag-with-two-keys,
+    L:cf-whitespace-only-tag, L:cf-value-with-child-element, L:cf-key-text-and-child,
+    L:cf-first-key-child-last-plain, L:cf-two-values, L:cf-pretty-printed-tag,
+    L:cf-text-before-child, L:cf-text-after-child, L:cf-two-items-elements,
+    L:cf-parse-error-without-name, L:cf-bad-base64-and-key-hash, L:cf-bad-base64-alone,
+    E:cf-tags-before-bad-base64-with-tag-parse-error, E:cf-bad-base64-before-tags-with-tag-parse-error,
+    E:cf-no-name-alone, E:cf-no-name-and-key-129, E:cf-empty-name-and-key-129)."""
+    import base64
+    from xml.sax.saxutils import escape
+    code = base64.b64encode(b"function handler(event) { return event.request; }").decode()
+    config = "<FunctionConfig><Comment></Comment><Runtime>cloudfront-js-2.0</Runtime></FunctionConfig>"
+    long_key = "k" * 129
+    key_error = (f"Value '{long_key}' at 'tags.items.1.member.key' failed to satisfy constraint: "
+                 "Member must have length less than or equal to 128")
+    long_items = f"<Tags><Items><Tag><Key>{long_key}</Key><Value>x</Value></Tag></Items></Tags>"
+    missing_code = "Value at 'functionCode' failed to satisfy constraint: Member must not be null"
+    missing_config = "Value null at 'functionConfig' failed to satisfy constraint: Member must not be null"
+    missing_runtime = "Value null at 'functionConfig.runtime' failed to satisfy constraint: Member must not be null"
+    empty_runtime = ("Value '' at 'functionConfig.runtime' failed to satisfy constraint: "
+                     "Member must satisfy enum value set: [cloudfront-js-1.0, cloudfront-js-2.0]")
+    no_runtime = "<FunctionConfig><Comment></Comment></FunctionConfig>"
+    blank_runtime = "<FunctionConfig><Comment></Comment><Runtime></Runtime></FunctionConfig>"
+
+    def body(name, code_xml, config_xml, tags_xml=""):
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<CreateFunctionRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">'
+                f"{code_xml}{config_xml}<Name>{escape(name)}</Name>{tags_xml}</CreateFunctionRequest>")
+
+    with_code = f"<FunctionCode>{code}</FunctionCode>"
+    refused = [
+        ("", config, "", f"1 validation error detected: {missing_code}"),
+        ("", config, long_items, f"2 validation errors detected: {missing_code}; {key_error}"),
+        (with_code, "", "", f"1 validation error detected: {missing_config}"),
+        (with_code, "", long_items, f"2 validation errors detected: {missing_config}; {key_error}"),
+        (with_code, no_runtime, "", f"1 validation error detected: {missing_runtime}"),
+        (with_code, no_runtime, long_items, f"2 validation errors detected: {missing_runtime}; {key_error}"),
+        (with_code, blank_runtime, "", f"1 validation error detected: {empty_runtime}"),
+        (with_code, blank_runtime, long_items, f"2 validation errors detected: {empty_runtime}; {key_error}"),
+        ("", "", "", f"2 validation errors detected: {missing_code}; {missing_config}"),
+        ("", no_runtime, "", f"2 validation errors detected: {missing_code}; {missing_runtime}"),
+    ]
+    for i, (code_xml, config_xml, tags_xml, message) in enumerate(refused):
+        name = f"cf-raw-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, code_xml, config_xml, tags_xml)) == (400, "MalformedXML", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+
+    for i, (items, message) in enumerate([
+        ("<Tag>just text</Tag>", "Unexpected complex element termination"),
+        ("<Tag>   </Tag>", "Unexpected complex element termination"),
+        ("<Tag><Key><b>x</b></Key><Value>v</Value></Tag>", "Start of list found where not expected"),
+        ("<Tag><Key>k</Key><Value><b>x</b></Value></Tag>", "Start of list found where not expected"),
+        ("<Tag><Key>a<b>x</b></Key><Value>v</Value></Tag>", "Start of list found where not expected"),
+        ("<Tag><Key><b>x</b></Key><Key>k</Key><Value>v</Value></Tag>", "Start of list found where not expected"),
+    ]):
+        name = f"cf-raw-parse-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, with_code, config, f"<Tags><Items>{items}</Items></Tags>")) == (
+            400, "MalformedInput", message), i
+        assert not _cf_function_exists(cloudfront, name), i
+    for i, items in enumerate(["<Tag></Tag>", "<Tag><Wrap><Key>k</Key></Wrap><Value>v</Value></Tag>"]):
+        name = f"cf-raw-nokey-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, with_code, config, f"<Tags><Items>{items}</Items></Tags>")) == (
+            400, "MalformedXML", "1 validation error detected: Value null at 'tags.items.1.member.key' "
+                                 "failed to satisfy constraint: Member must not be null"), i
+    for i, tags_xml in enumerate(["", "<Tags><Items><Tag><Key>a#b</Key><Value>x</Value></Tag></Items></Tags>"]):
+        name = f"cf-raw-b64-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        assert _cf_raw_create_function(body(name, "<FunctionCode>!!!not-base64!!!</FunctionCode>", config, tags_xml)) == (
+            400, "MalformedInput", "Invalid Base64 encoding"), i
+    assert _cf_raw_create_function(body("", with_code, config, "<Tags><Items><Tag>x</Tag></Items></Tags>").replace(
+        "<Name></Name>", "")) == (400, "MalformedInput", "Unexpected complex element termination")
+    bad_code = "<FunctionCode>!!!not-base64!!!</FunctionCode>"
+    parse_tags = "<Tags><Items><Tag>x</Tag></Items></Tags>"
+    for i, xml in enumerate([body(f"cf-b64-a-{i}", bad_code, config, parse_tags),
+                             body(f"cf-b64-b-{i}", "", config, parse_tags).replace(config, parse_tags + bad_code + config, 1)
+                             .replace(parse_tags + "</CreateFunctionRequest>", "</CreateFunctionRequest>")]):
+        assert _cf_raw_create_function(xml) == (400, "MalformedInput", "Unexpected complex element termination"), i
+    null_name = "Value null at 'name' failed to satisfy constraint: Member must not be null"
+    empty_name = ("Value '' at 'name' failed to satisfy constraint: Member must have length greater than or equal to 1; "
+                  "Value '' at 'name' failed to satisfy constraint: Member must satisfy regular expression pattern: "
+                  "[a-zA-Z0-9-_]{1,64}")
+    no_name = body("x", with_code, config, "").replace("<Name>x</Name>", "")
+    assert _cf_raw_create_function(no_name) == (400, "MalformedXML", f"1 validation error detected: {null_name}")
+    assert _cf_raw_create_function(body("x", with_code, config, long_items).replace("<Name>x</Name>", "")) == (
+        400, "MalformedXML", f"2 validation errors detected: {null_name}; {key_error}")
+    assert _cf_raw_create_function(body("", with_code, config, long_items)) == (
+        400, "MalformedXML", f"3 validation errors detected: {empty_name}; {key_error}")
+    name = f"cf-raw-dup-{_uuid_mod.uuid4().hex[:8]}"
+    assert _cf_raw_create_function(body(name, with_code, config, "<Tags><Items><Foo><Key>d</Key><Value>1</Value></Foo>"
+                                        "<Tag><Key>d</Key><Value>2</Value></Tag></Items></Tags>")) == (
+        400, "InvalidTagging", "Duplicate tag key: 'd'.")
+    accepted = [
+        ("<Tags><Tag><Key>aws:x</Key><Value>x</Value></Tag><Tag><Key>dup</Key><Value>a</Value></Tag>"
+         "<Tag><Key>dup</Key><Value>b</Value></Tag></Tags>", []),
+        ("<Tags><Tag><Key>team</Key><Value>edge</Value></Tag></Tags>", []),
+        ("<Tags><Items><Tag><Key>a</Key><Value>b</Value></Tag><Foo><Key>x</Key></Foo></Items></Tags>",
+         [{"Key": "a", "Value": "b"}, {"Key": "x", "Value": ""}]),
+        ("<Tags><Items><Tag><Key>a</Key><Value>b</Value></Tag>stray text</Items></Tags>", [{"Key": "a", "Value": "b"}]),
+        ("<Tags><Items><Tag><Key>first</Key><Key>second</Key><Value>v</Value></Tag></Items></Tags>",
+         [{"Key": "second", "Value": "v"}]),
+        ("<Tags><Items><Tag><Key>k</Key><Value>v1</Value><Value>v2</Value></Tag></Items></Tags>",
+         [{"Key": "k", "Value": "v2"}]),
+        ("<Tags><Items><Tag>\n  <Key>k</Key>\n  <Value>v</Value>\n</Tag></Items></Tags>", [{"Key": "k", "Value": "v"}]),
+        ("<Tags><Items><Tag>junk<Key>k</Key>junk<Value>v</Value></Tag></Items></Tags>", [{"Key": "k", "Value": "v"}]),
+        ("<Tags><Items><Tag><Key>first</Key><Value>v</Value></Tag></Items>"
+         "<Items><Tag><Key>second</Key><Value>v</Value></Tag></Items></Tags>", [{"Key": "second", "Value": "v"}]),
+    ]
+    for i, (tags_xml, expected) in enumerate(accepted):
+        name = f"cf-raw-ok-{i}-{_uuid_mod.uuid4().hex[:8]}"
+        try:
+            assert _cf_raw_create_function(body(name, with_code, config, tags_xml))[0] == 201, i
+            arn = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+            assert sorted(_cf_tag_items(cloudfront, arn), key=lambda t: t["Key"]) == expected, i
+        finally:
+            _cf_delete_function_if_present(cloudfront, name)
+
+
+def test_cloudfront_update_function_invalid_base64(cloudfront):
+    """AWS: captured 2026-10-21 (2309-uncertainties L:cf-update-function-bad-base64)."""
+    import urllib.error
+    import urllib.request
+
+    from conftest import ENDPOINT
+    name = f"cf-update-b64-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        fn = _cf_create_tagged_function(cloudfront, name)
+        body = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<UpdateFunctionRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">'
+                "<FunctionCode>!!!not-base64!!!</FunctionCode><FunctionConfig><Comment></Comment>"
+                "<Runtime>cloudfront-js-2.0</Runtime></FunctionConfig></UpdateFunctionRequest>")
+        req = urllib.request.Request(f"{ENDPOINT}/2020-05-31/function/{name}", data=body.encode(), method="PUT", headers={
+            "Content-Type": "application/xml", "If-Match": fn["ETag"],
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/cloudfront/aws4_request, "
+                             "SignedHeaders=host, Signature=x"})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req)
+        text = exc.value.read().decode()
+        assert exc.value.code == 400
+        assert re.search(r"<Code>(.*?)</Code>", text).group(1) == "MalformedInput"
+        assert re.search(r"<Message>(.*?)</Message>", text).group(1) == "Invalid Base64 encoding"
+    finally:
+        _cf_delete_function_if_present(cloudfront, name)

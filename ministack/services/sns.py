@@ -92,11 +92,6 @@ def _enforce_topic_policy(topic: dict, iam_action: str):
     every call passes, like the rest of the identity layer. Same-account
     callers then pass unless the Policy carries an explicit Deny for them;
     cross-account callers need an explicit Allow, like real SNS.
-
-    Known boundary under AUTH=true: a caller with no identity Allow whose
-    access comes from this Policy alone is denied by the app-level identity
-    check before this resource check runs, where real SNS would allow the
-    union (same caveat as the queue check).
     """
     from ministack.app import AUTH
     if not AUTH:
@@ -122,6 +117,14 @@ def _enforce_topic_policy(topic: dict, iam_action: str):
     return _error("AuthorizationError",
                   f"User: {ctx.principal_arn} is not authorized to perform: "
                   f"{iam_action} on resource: {topic_arn}", 403)
+
+
+def topic_policy_for_arn(topic_arn: str) -> tuple[str, str] | None:
+    """The topic's Policy and owner account, for the identity check."""
+    topic = _topic_by_arn_any_scope(_normalize_arn(topic_arn))
+    if topic is None:
+        return None
+    return topic.get("attributes", {}).get("Policy") or "", _topic_owner(topic)
 
 
 def _get_topic(topic_arn: str, action: str | None = None):
@@ -1671,9 +1674,9 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     error_type = "Sender" if status < 500 else "Receiver"
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">'
         f'<Error><Type>{error_type}</Type><Code>{code}</Code><Message>{_xml_escape(message)}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'

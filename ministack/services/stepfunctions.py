@@ -52,6 +52,7 @@ from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _service_model,
     error_response_json,
     get_account_id,
     get_region,
@@ -353,18 +354,181 @@ def _validate_definition_jsonata(definition_str) -> str | None:
     return walk(definition, "")
 
 
+_ENCRYPTION_TYPES = ("AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY")
+# What AWS stores when a CUSTOMER_MANAGED_KMS_KEY configuration has no reuse period.
+_DEFAULT_KMS_DATA_KEY_REUSE_PERIOD = 300
+
+
+def _default_encryption():
+    """The encryptionConfiguration a machine reports when no customer
+    managed key was set. A fresh dict each call, so no two records share one."""
+    return {"type": "AWS_OWNED_KEY"}
+
+
+# How AWS's JSON deserializer names a value of the wrong JSON type.
+def _json_token(value):
+    if isinstance(value, bool):
+        return "TRUE_VALUE" if value else "FALSE_VALUE"
+    if isinstance(value, (int, float)):
+        return "NUMBER_VALUE"
+    return "STRING_VALUE"
+
+
+def _wrong_json_type(value, expected):
+    """AWS's SerializationException message for a member of the wrong JSON
+    type, or None. expected is "Integer", "String" or "structure"."""
+    if isinstance(value, list):
+        return "Start of list found where not expected"
+    if isinstance(value, dict):
+        return None if expected == "structure" else "Start of structure or map found where not expected."
+    if expected == "structure":
+        return "Expected null"
+    if expected == "Integer":
+        if isinstance(value, (bool, str)):
+            return f"{_json_token(value)} can not be converted to an Integer"
+        return None
+    if isinstance(value, str):
+        return None
+    return f"{_json_token(value)} can not be converted to a String"
+
+
+def _encryption_serialization_error(cfg):
+    """The SerializationException AWS answers when encryptionConfiguration or
+    one of its members has the wrong JSON type. AWS reports one member,
+    checking them in the order reuse period, kmsKeyId, type whatever order
+    the request lists them in. A JSON null is not an error: AWS treats it as
+    an absent field. This exception's message member is "Message" on the
+    wire."""
+    if cfg is None:
+        return None
+    message = _wrong_json_type(cfg, "structure")
+    if message is None:
+        for member, expected in (("kmsDataKeyReusePeriodSeconds", "Integer"),
+                                 ("kmsKeyId", "String"), ("type", "String")):
+            if cfg.get(member) is not None:
+                message = _wrong_json_type(cfg[member], expected)
+                if message:
+                    break
+    if message is None:
+        return None
+    return error_response_json("SerializationException", message, 400, message_key="Message")
+
+
+def _with_integer_period(cfg):
+    """The configuration with a JSON number period read as an integer: AWS
+    accepts 300.5 and stores 300."""
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if isinstance(period, float):
+        return {**cfg, "kmsDataKeyReusePeriodSeconds": int(period)}
+    return cfg
+
+
+def _encryption_validation_error(cfg):
+    """The ValidationException for an encryptionConfiguration that breaks the
+    member constraints, or None. AWS reports every broken constraint in one
+    message, in the order reuse period, kmsKeyId, type."""
+    problems = []
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if isinstance(period, int) and not isinstance(period, bool):
+        if period < 60:
+            problems.append(
+                f"Value '{period}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+                "failed to satisfy constraint: Member must have value greater than or equal to 60")
+        elif period > 900:
+            problems.append(
+                f"Value '{period}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+                "failed to satisfy constraint: Member must have value less than or equal to 900")
+    key_id = cfg.get("kmsKeyId")
+    if isinstance(key_id, str):
+        if not key_id:
+            problems.append(
+                "Value '' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+                "constraint: Member must have length greater than or equal to 1")
+        elif len(key_id) > 2048:
+            problems.append(
+                f"Value '{key_id}' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+                "constraint: Member must have length less than or equal to 2048")
+    enc_type = cfg.get("type")
+    if enc_type is None:
+        problems.append(
+            "Value null at 'encryptionConfiguration.type' failed to satisfy "
+            "constraint: Member must not be null")
+    elif enc_type not in _ENCRYPTION_TYPES:
+        problems.append(
+            f"Value '{enc_type}' at 'encryptionConfiguration.type' failed to satisfy "
+            f"constraint: Member must satisfy enum value set: [{', '.join(_ENCRYPTION_TYPES)}]")
+    if not problems:
+        return None
+    count = (f"{len(problems)} validation error detected" if len(problems) == 1
+             else f"{len(problems)} validation errors detected")
+    return error_response_json("ValidationException", f"{count}: " + "; ".join(problems), 400)
+
+
+def _encryption_configuration_error(cfg):
+    """The InvalidEncryptionConfiguration for a well-formed configuration
+    whose members do not fit its type, or None. The key is not looked up in
+    KMS."""
+    if cfg["type"] == "CUSTOMER_MANAGED_KMS_KEY":
+        if cfg.get("kmsKeyId") is None:
+            return error_response_json(
+                "InvalidEncryptionConfiguration",
+                "Invalid Encryption Configuration: Must set a valid kmsKeyId.", 400)
+        return None
+    if cfg.get("kmsKeyId") is not None:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "Invalid Encryption Configuration: Custom kmsKeyId is not allowed when "
+            "selecting AWS_OWNED_KEY.", 400)
+    if cfg.get("kmsDataKeyReusePeriodSeconds") is not None:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "Invalid Encryption Configuration: Custom kmsDataKeyReusePeriodSeconds is not "
+            "allowed when selecting AWS_OWNED_KEY.", 400)
+    return None
+
+
+def _stored_encryption(cfg):
+    """The configuration a machine stores and describes for an accepted
+    request value: AWS_OWNED_KEY when absent, and a customer managed key with
+    the 300 second default when no reuse period was sent."""
+    if cfg is None or cfg["type"] == "AWS_OWNED_KEY":
+        return _default_encryption()
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    return {
+        "type": "CUSTOMER_MANAGED_KMS_KEY",
+        "kmsKeyId": cfg["kmsKeyId"],
+        "kmsDataKeyReusePeriodSeconds": (
+            _DEFAULT_KMS_DATA_KEY_REUSE_PERIOD if period is None else period),
+    }
+
+
 def _create_state_machine(data):
     name = data.get("name")
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
+    # AWS checks the encryptionConfiguration's JSON types and member
+    # constraints before the definition, and whether its members fit its
+    # type after the definition and before the existing-machine check.
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption)
+    if invalid:
+        return invalid
     invalid = _validate_definition_jsonata(data.get("definition"))
     if invalid:
         return error_response_json("InvalidDefinition", invalid, 400)
+    if encryption is not None:
+        invalid = _encryption_configuration_error(encryption)
+        if invalid:
+            return invalid
+    encryption = _stored_encryption(encryption)
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     if arn in _state_machines:
         # Creating the same machine twice is idempotent on AWS and makes SDK retry safe
-        # It checks the sfn itself: definition, type, logging and whether the call publishes
+        # It checks the sfn itself: definition, type, logging, encryption and whether the call publishes
         existing = _state_machines[arn]
         publishes = bool(data.get("publish"))
         if (data.get("definition", "{}") == existing["definition"]
@@ -372,6 +536,7 @@ def _create_state_machine(data):
                 and data.get("loggingConfiguration",
                              {"level": "OFF", "includeExecutionData": False})
                 == existing["loggingConfiguration"]
+                and encryption == existing.get("encryptionConfiguration", _default_encryption())
                 and publishes == bool(existing.get("createVersionArn"))
                 # AWS's idempotency check also covers versionDescription: a
                 # publishing re-create carrying a different description is a
@@ -408,6 +573,8 @@ def _create_state_machine(data):
         "loggingConfiguration": data.get(
             "loggingConfiguration",
             {"level": "OFF", "includeExecutionData": False}),
+        # Machines without a customer managed key report AWS_OWNED_KEY.
+        "encryptionConfiguration": encryption,
         # AWS rotates revisionId on every Create/Update. Callers use it
         # as an optimistic-concurrency precondition when publishing a
         # version (see _publish_state_machine_version).
@@ -443,6 +610,8 @@ def _create_state_machine(data):
             "type": _state_machines[arn]["type"],
             "loggingConfiguration": copy.deepcopy(
                 _state_machines[arn]["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                _state_machines[arn]["encryptionConfiguration"]),
         }
         response["stateMachineVersionArn"] = version_arn
     return json_response(response)
@@ -472,8 +641,10 @@ def _describe_state_machine(data):
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if sm:
-        return json_response({k: v for k, v in sm.items()
-                              if k not in _SM_INTERNAL_KEYS})
+        body = {k: v for k, v in sm.items() if k not in _SM_INTERNAL_KEYS}
+        # Machines persisted before encryptionConfiguration was stored.
+        body.setdefault("encryptionConfiguration", _default_encryption())
+        return json_response(body)
     # AWS's DescribeStateMachine also accepts a qualified version ARN
     # (arn:...:stateMachine:<name>:<N>) and returns the snapshot
     # captured at publish time, with stateMachineArn echoing the
@@ -492,6 +663,8 @@ def _describe_state_machine(data):
             "description": version.get("description", ""),
             "loggingConfiguration": version.get("loggingConfiguration")
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
+            "encryptionConfiguration": version.get("encryptionConfiguration")
+                or _default_encryption(),
             "revisionId": version.get("stateMachineRevisionId", ""),
         })
     # DescribeStateMachine on an alias ARN: AWS accepts it and returns
@@ -520,12 +693,31 @@ def _describe_state_machine(data):
 
 
 def _update_state_machine(data):
+    # AWS checks the encryptionConfiguration's JSON types and member
+    # constraints before it looks the machine up, and whether its members fit
+    # its type before the definition. Everything is checked before anything
+    # is written, so a refused call changes nothing.
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption)
+    if invalid:
+        return invalid
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if not sm:
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {arn} not found", 400)
+    if encryption is not None:
+        invalid = _encryption_configuration_error(encryption)
+        if invalid:
+            return invalid
+        if "definition" not in data:
+            return error_response_json(
+                "MissingRequiredParameter",
+                "The definition must be specified when updating the EncryptionConfiguration", 400)
     if "definition" in data:
         invalid = _validate_definition_jsonata(data["definition"])
         if invalid:
@@ -535,6 +727,8 @@ def _update_state_machine(data):
         sm["roleArn"] = data["roleArn"]
     if "loggingConfiguration" in data:
         sm["loggingConfiguration"] = data["loggingConfiguration"]
+    if encryption is not None:
+        sm["encryptionConfiguration"] = _stored_encryption(encryption)
     # Rotate revisionId so subsequent PublishStateMachineVersion calls
     # with a stale caller-supplied revisionId raise ConflictException
     # (matches AWS optimistic-concurrency semantics).
@@ -558,6 +752,8 @@ def _update_state_machine(data):
             "roleArn": sm["roleArn"],
             "type": sm["type"],
             "loggingConfiguration": copy.deepcopy(sm["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                sm.get("encryptionConfiguration") or _default_encryption()),
         }
         response["stateMachineVersionArn"] = version_arn
         response["revisionId"] = sm["revisionId"]
@@ -588,6 +784,19 @@ def _list_state_machines(data):
 # ---------------------------------------------------------------------------
 # Execution lifecycle
 # ---------------------------------------------------------------------------
+
+def _execution_version_arn(arn):
+    """The version ARN an execution of ``arn`` runs: the version itself, or
+    for an alias the version _resolve_state_machine_arn picks. None for a
+    base state machine."""
+    if arn in _state_machine_versions:
+        return arn
+    alias = _state_machine_aliases.get(arn)
+    routing = (alias or {}).get("routingConfiguration") or []
+    if routing:
+        return max(routing, key=lambda r: r.get("weight", 0)).get("stateMachineVersionArn")
+    return None
+
 
 def _resolve_state_machine_arn(arn):
     """Resolve a state-machine, version, or alias ARN to the base state-machine
@@ -637,6 +846,7 @@ def _start_execution(data):
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {sm_arn} not found", 400)
+    requested_arn = sm_arn
     sm_arn = base_arn
 
     sm = _state_machines[sm_arn]
@@ -666,6 +876,12 @@ def _start_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        # DescribeStateMachineForExecution reports the encryption configuration
+        # the execution started with: the version's when a version or an alias
+        # was named.
+        "encryptionConfiguration": copy.deepcopy(
+            (_state_machine_versions.get(_execution_version_arn(requested_arn)) or sm)
+            .get("encryptionConfiguration") or _default_encryption()),
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -749,7 +965,35 @@ def _describe_execution(data):
     return json_response(result)
 
 
+def _execution_sort_key(execution):
+    """AWS lists the most recent execution first: a running one by its
+    startDate, the rest by stopDate. The ARN breaks ties, so the order is
+    total and a token can resume it."""
+    return (execution["stopDate"] or execution["startDate"], execution["executionArn"])
+
+
+def _encode_execution_token(execution):
+    """Tokens carry the sort position of the last execution returned, not an
+    index, as AWS's do: with an offset, an execution started between pages
+    would repeat one."""
+    raw = json.dumps(list(_execution_sort_key(execution))).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_execution_token(token):
+    try:
+        moment, arn = json.loads(base64.urlsafe_b64decode(token.encode("ascii")))
+        return (str(moment), str(arn))
+    except Exception:
+        return None
+
+
 def _list_executions(data):
+    cursor = None
+    if data.get("nextToken"):
+        cursor = _decode_execution_token(data["nextToken"])
+        if cursor is None:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
     sm_arn = data.get("stateMachineArn")
     status_filter = data.get("statusFilter")
     all_execs = []
@@ -766,18 +1010,14 @@ def _list_executions(data):
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
         })
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
-    start = 0
-    if next_token:
-        try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_execs[start:start + max_results]
+    all_execs.sort(key=_execution_sort_key, reverse=True)
+    if cursor is not None:
+        all_execs = [e for e in all_execs if _execution_sort_key(e) < cursor]
+    max_results = int(data.get("maxResults") or 1000)
+    page = all_execs[:max_results]
     resp = {"executions": page}
-    if start + max_results < len(all_execs):
-        resp["nextToken"] = str(start + max_results)
+    if len(all_execs) > max_results:
+        resp["nextToken"] = _encode_execution_token(page[-1])
     return json_response(resp)
 
 
@@ -943,6 +1183,9 @@ def _describe_state_machine_for_execution(data):
         "definition": sm["definition"],
         "roleArn": sm["roleArn"],
         "updateDate": sm.get("creationDate", now_iso()),
+        "encryptionConfiguration": copy.deepcopy(
+            execution.get("encryptionConfiguration")
+            or sm.get("encryptionConfiguration") or _default_encryption()),
     })
 
 
@@ -1252,11 +1495,8 @@ def _test_state(data):
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
 
         elif state_type == "Fail":
-            result = {
-                "status": "FAILED",
-                "error": state_def.get("Error", "States.Fail"),
-                "cause": state_def.get("Cause", ""),
-            }
+            error, cause = _fail_state_error(state_def, input_data, ctx)
+            result = {"status": "FAILED", "error": error, "cause": cause}
 
         elif state_type == "Task":
             effective = _apply_input_path(state_def, input_data, ctx)
@@ -1552,9 +1792,7 @@ def _run_execution(exec_arn):
                 continue
 
             if state_type == "Fail":
-                raise _ExecutionError(
-                    state_def.get("Error", "States.Fail"),
-                    state_def.get("Cause", ""))
+                raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
             handler_fn = {
                 "Pass": _execute_pass,
@@ -2157,6 +2395,17 @@ def _evaluate_rule(rule, data, ctx=None):
 # ---------------------------------------------------------------------------
 
 def _execute_wait(state_def, raw_input, ctx=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        # JSONata Wait: Seconds and Timestamp may be expressions, and Output
+        # and Assign replace the JSONPath chain, as for Pass.
+        if "Seconds" in state_def:
+            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx))
+        elif "Timestamp" in state_def:
+            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx))
+        output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        _apply_state_assign(state_def, raw_input, ctx)
+        return output, _next_or_end(state_def)
+
     effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
@@ -2176,6 +2425,29 @@ def _execute_wait(state_def, raw_input, ctx=None):
     return output, _next_or_end(state_def)
 
 
+def _jsonata_wait_seconds(state_def, raw_input, ctx):
+    seconds = _jsonata_state_field(state_def, "Seconds", "number", raw_input, ctx)
+    if not float(seconds).is_integer():
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The Seconds field cannot be parsed as an integer: {json.dumps(seconds)}")
+    if seconds < 0:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"Seconds cannot be negative but was: {json.dumps(seconds)}")
+    return seconds
+
+
+def _jsonata_wait_timestamp(state_def, raw_input, ctx):
+    timestamp = _jsonata_state_field(state_def, "Timestamp", "string", raw_input, ctx)
+    if _parse_ts(timestamp) is None:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            "The Timestamp field cannot be parsed as an ISO-8601 extended offset "
+            f"date-time format string: {timestamp}")
+    return timestamp
+
+
 def _scaled_sleep(seconds):
     scaled = seconds * _SFN_WAIT_SCALE
     if scaled > 0:
@@ -2190,6 +2462,34 @@ def _sleep_until(iso_ts):
             _scaled_sleep(delta)
     except (ValueError, TypeError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Fail state
+# ---------------------------------------------------------------------------
+
+def _fail_state_error(state_def, raw_input, ctx=None):
+    """The error and cause a Fail state ends with. JSONata states may give
+    either as an expression; JSONPath states may select either from the
+    input with ErrorPath or CausePath. Both must be strings."""
+    return (_fail_state_field(state_def, "Error", "States.Fail", raw_input, ctx),
+            _fail_state_field(state_def, "Cause", "", raw_input, ctx))
+
+
+def _fail_state_field(state_def, field, default, raw_input, ctx):
+    if field in state_def and _state_query_language(state_def, ctx) == "JSONata":
+        return _jsonata_state_field(state_def, field, "string", raw_input, ctx)
+    path = state_def.get(f"{field}Path")
+    if path is None:
+        return state_def.get(field, default)
+    value = (_evaluate_intrinsic(path, raw_input, ctx) if path.startswith("States.")
+             else _resolve_path_or_ctx(path, raw_input, ctx))
+    if not isinstance(value, str):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The value referenced by {field}Path must be a string, "
+            f"but the value was: {json.dumps(value)}")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -2361,9 +2661,7 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
             return _apply_output_path(state_def,
                                       _apply_input_path(state_def, current_input, ctx), ctx)
         if state_type == "Fail":
-            raise _ExecutionError(
-                state_def.get("Error", "States.Fail"),
-                state_def.get("Cause", ""))
+            raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
         handler_fn = {
             "Pass": _execute_pass,
@@ -2508,6 +2806,32 @@ def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_outpu
             for item in value
         ]
     return value
+
+
+def _jsonata_state_field(state_def, field, expected, raw_input, ctx):
+    """A state field that may be a JSONata expression, evaluated and held to
+    the JSON type AWS requires of it."""
+    value = _apply_jsonata_template(state_def[field], raw_input, ctx)
+    if _json_type(value) != expected:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The JSONata expression specified for the field '{field}' returned an "
+            f"unexpected result type. Expected '{expected}', but was "
+            f"'{_json_type(value)}' for value: {json.dumps(value)}")
+    return value
+
+
+def _json_type(value):
+    """The JSON type name AWS reports for a JSONata result."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if _is_num(value):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
 
 
 def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):
@@ -3603,10 +3927,7 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    if service_info.get("param_case") == "lower-camel":
-        wire_data = _convert_keys_to_camel(input_data or {})
-    else:
-        wire_data = input_data
+    wire_data = _sdk_json_params(service_info, service_key, pascal_action, input_data)
     # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
     # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
     # without changing the state input or guessing whether the text is base64.
@@ -3647,11 +3968,73 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             and isinstance(result, dict) and "SecretBinary" in result):
         result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
-    # For JSON-protocol services, only convert top-level keys to avoid
-    # mangling user-defined data (e.g. DynamoDB attribute names).
-    if isinstance(result, dict):
-        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
-    return result
+    return _sdk_json_result(service_key, pascal_action, result)
+
+
+# The AWS SDK for Java v2 renames a member it cannot use as named, and Step
+# Functions returns that name: DynamoDB's NULL attribute value is Nul.
+_SDK_MEMBER_NAME_OVERRIDES = {("AttributeValue", "NULL"): "Nul"}
+
+
+def _sdk_json_result(service_key, action, result):
+    """A JSON-protocol aws-sdk result shaped by the operation's output model, as Step Functions returns it."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).output_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if isinstance(result, dict):
+            return {_api_name_to_sfn_key(k): v for k, v in result.items()}
+        return result
+    return _sdk_json_value(result, shape)
+
+
+def _sdk_json_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {
+            _SDK_MEMBER_NAME_OVERRIDES.get((shape.name, key), _api_name_to_sfn_key(key)):
+                _sdk_json_value(item, shape.members[key]) if key in shape.members else item
+            for key, item in value.items() if item is not None
+        }
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_value(item, shape.value) for key, item in value.items()}
+    if shape.type_name == "timestamp" and _is_num(value):
+        moment = datetime.fromtimestamp(value, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value
+
+
+_SDK_PARAM_NAME_OVERRIDES = {(shape, sdk): wire for (shape, wire), sdk in _SDK_MEMBER_NAME_OVERRIDES.items()}
+
+
+def _sdk_json_params(service_info, service_key, action, input_data):
+    """aws-sdk Parameters on the wire, renamed by the operation's input model; map keys are data."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).input_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if service_info.get("param_case") == "lower-camel":
+            return _convert_keys_to_camel(input_data or {})
+        return input_data
+    return _sdk_json_param_value(input_data or {}, shape)
+
+
+def _sdk_json_param_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict) and not getattr(shape, "is_document_type", False):
+        by_sdk_name = {_api_name_to_sfn_key(name): name for name in shape.members}
+        renamed = {}
+        for key, item in value.items():
+            name = (key if key in shape.members
+                    else _SDK_PARAM_NAME_OVERRIDES.get((shape.name, key)) or by_sdk_name.get(key, key))
+            member = shape.members.get(name)
+            renamed[name] = _sdk_json_param_value(item, member) if member is not None else item
+        return renamed
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_param_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_param_value(item, shape.value) for key, item in value.items()}
+    return value
 
 
 def _flatten_query_params(data, prefix=""):
@@ -3985,17 +4368,14 @@ def _api_name_to_sfn_key(name):
     SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
     (acronyms) are lowered except the last one when followed by a lowercase char.
     Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
-              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled,
+              SS -> Ss
     """
     if not name:
         return name
     result = []
     i = 0
     while i < len(name):
-        if i == 0:
-            result.append(name[i].upper())
-            i += 1
-            continue
         if name[i].isupper():
             j = i
             while j < len(name) and name[j].isupper():
@@ -4014,7 +4394,8 @@ def _api_name_to_sfn_key(name):
         else:
             result.append(name[i])
             i += 1
-    return "".join(result)
+    key = "".join(result)
+    return key[0].upper() + key[1:]
 
 
 def _convert_keys_to_sfn_convention(obj):
@@ -4059,12 +4440,14 @@ _EC2_FIELDS_BY_PARENT = {
     ("ipPermissionsEgress", "groups"): "UserIdGroupPairs",
     ("productCodes", "productCode"): "ProductCodeId",
     ("productCodes", "type"): "ProductCodeType",
+    ("snapshotSet", "status"): "State",
     ("volumeSet", "status"): "State",
 }
 
 # EC2 reuses some names depending on action. Special case for flattening
 _EC2_FIELDS_BY_ACTION = {
     ("AttachVolume", "status"): "State",
+    ("CreateSnapshot", "status"): "State",
     ("CreateVolume", "status"): "State",
     ("DetachVolume", "status"): "State",
     ("StartInstances", "instancesSet"): "StartingInstances",
@@ -5006,6 +5389,8 @@ def _publish_state_machine_version(data):
         "type": sm.get("type", "STANDARD"),
         "loggingConfiguration": copy.deepcopy(
             sm.get("loggingConfiguration", {"level": "OFF"})),
+        "encryptionConfiguration": copy.deepcopy(
+            sm.get("encryptionConfiguration") or _default_encryption()),
     }
     return json_response({
         "stateMachineVersionArn": version_arn,

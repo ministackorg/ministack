@@ -80,8 +80,12 @@ def _normalise_ecs(tag_list):
 
 def _collect_s3():
     import ministack.services.s3 as svc
+    region = get_region()
     for name, tags in svc._bucket_tags.items():
-        yield f"arn:aws:s3:::{name}", _normalise_flat(tags)
+        # Bucket ARNs carry no region, but GetResources only lists buckets
+        # homed in the region it is called in.
+        if svc.bucket_region(name) == region:
+            yield f"arn:aws:s3:::{name}", _normalise_flat(tags)
 
 
 def _collect_lambda():
@@ -244,6 +248,55 @@ _COLLECTORS = {
     "backup":            _collect_backup,
     "elasticache":       _collect_elasticache,
 }
+
+
+def _collect_iam():
+    import ministack.services.iam as svc
+    for store in (svc._users, svc._roles):
+        for entity in store.values():
+            yield entity.get("Arn", ""), _normalise_list(entity.get("Tags"))
+
+
+def _collect_ssm():
+    import ministack.services.ssm as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+def _collect_secretsmanager():
+    import ministack.services.secretsmanager as svc
+    for secret in svc._secrets.values():
+        yield secret.get("ARN", ""), _normalise_list(secret.get("Tags"))
+
+
+def _collect_iot():
+    import ministack.services.iot as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+# ARN service -> collector, for resolving aws:ResourceTag
+_RESOURCE_TAG_COLLECTORS = {
+    "dynamodb": _collect_dynamodb,
+    "iam": _collect_iam,
+    "iot": _collect_iot,
+    "kms": _collect_kms,
+    "lambda": _collect_lambda,
+    "secretsmanager": _collect_secretsmanager,
+    "sns": _collect_sns,
+    "sqs": _collect_sqs,
+    "ssm": _collect_ssm,
+}
+
+
+def resource_tags(arn: str) -> dict[str, str] | None:
+    """The tags of the resource *arn* names, or None when it is not a known resource."""
+    parts = arn.split(":", 5)
+    collect = _RESOURCE_TAG_COLLECTORS.get(parts[2]) if len(parts) == 6 else None
+    for candidate, tags in collect() if collect else ():
+        if candidate == arn:
+            return {t["Key"]: t["Value"] for t in tags}
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
