@@ -1040,6 +1040,12 @@ def path_echo_origin_port():
 @pytest.fixture(scope="module")
 def cf_raw_origin_stack(cloudfront, path_echo_origin_port):
     suffix = _uuid_mod.uuid4().hex[:10]
+    passthrough_fn_arn = None
+    if cloudfront_js.available():
+        passthrough_fn_arn = _create_function(
+            cloudfront, f"cf-dp-passthrough-{suffix}",
+            b"function handler(event) { return event.request; }\n",
+        )
     dist_config = {
         "CallerReference": f"cf-dp-raw-{suffix}",
         "Comment": "cloudfront_dataplane raw-path-fidelity test distribution",
@@ -1069,6 +1075,16 @@ def cf_raw_origin_stack(cloudfront, path_echo_origin_port):
             }],
         },
     }
+    if passthrough_fn_arn:
+        dist_config["CacheBehaviors"]["Quantity"] = 2
+        dist_config["CacheBehaviors"]["Items"].append({
+            "PathPattern": "/fn/*",
+            "TargetOriginId": "raw-origin", "ViewerProtocolPolicy": "allow-all",
+            "CachePolicyId": _CACHING_DISABLED, "OriginRequestPolicyId": _ALL_VIEWER,
+            "FunctionAssociations": {
+                "Quantity": 1, "Items": [{"FunctionARN": passthrough_fn_arn, "EventType": "viewer-request"}],
+            },
+        })
     dist = cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]
     return dist["DomainName"]
 
@@ -1099,6 +1115,16 @@ def test_query_string_forwarded_byte_exact_when_unmodified_and_fully_allowed(cf_
     # "/av/*" carries AllViewer (forwards every query-string parameter) and
     # no function: nothing should re-encode the viewer's own percent-encoding.
     raw_path = "/av/hello?a=%68%65%6c%6c%6f&b=1"
+    status, body = _raw_get(cf_raw_origin_stack, raw_path)
+    assert status == 200
+    assert json.loads(body)["path"] == raw_path
+
+
+def test_function_returning_the_request_keeps_a_bare_query_key(cf_raw_origin_stack):
+    """AWS: observed 2026-10-10, a distribution whose viewer-request function returns event.request:
+    GET /locations?type[] got the response a Rails origin gives the bare key (?type[]= gets another)."""
+    _skip_without_node()
+    raw_path = "/fn/hello?flag&a=1"
     status, body = _raw_get(cf_raw_origin_stack, raw_path)
     assert status == 200
     assert json.loads(body)["path"] == raw_path
