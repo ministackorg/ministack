@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.32] — 2026-10-23
+
 ### Added
 - **EC2 — Verified Access control plane** — instances, trust providers (`oidc`, and `jamf`, `crowdstrike` and `jumpcloud` devices), groups, `load-balancer` and `network-interface` endpoints, trust provider attachments, instance logging configuration, and group and endpoint policies, as the `aws_verifiedaccess_*` Terraform resources call them, with AWS's codes, messages and check order. Under `AUTH=true` each call is authorized on every resource AWS checks it against. No access evaluation or Cedar parsing; `rds` and `cidr` endpoints and `NativeApplicationOidcOptions` answer `UnsupportedOperation`. Contributed by @kharabasz.
 - **Step Functions — Distributed Map** — a Map whose `ProcessorConfig` mode is `DISTRIBUTED` ran inline, with no map run and its `ItemReader` ignored; it now creates a Map Run (`ListMapRuns`, `DescribeMapRun`, `UpdateMapRun`, `ListExecutions` with `mapRunArn`) whose items run as child executions under `<state machine>/<label>`, reads its items from S3 (`s3:getObject` as JSON, JSONL or CSV, `s3:listObjectsV2` object metadata, `MaxItems`), and fails with `States.ExceedToleratedFailureThreshold` past its tolerated failures. Reported by @cupidchan.
