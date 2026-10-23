@@ -2923,3 +2923,16 @@ def test_elbv2_target_headers_follow_xff_mode_and_trace_id_rules():
         assert "x-forwarded-for" not in alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"}, "127.0.0.1")
     finally:
         alb._lb_attrs.pop(lb_arn, None)
+
+
+def test_elbv2_dataplane_forwards_repeated_query_keys(elbv2):
+    """The target receives the query string as the client sent it."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-query"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/search?a=1&b=2&a=3&q=x%20y&flag")
+        assert json.loads(resp.read())["path"] == "/search?a=1&b=2&a=3&q=x%20y&flag"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)

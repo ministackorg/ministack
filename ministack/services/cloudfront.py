@@ -6074,7 +6074,7 @@ async def _fetch_from_alb_origin(lb: dict, origin: dict, method: str, uri: str, 
         status, response_headers, data = await asyncio.wait_for(
             alb.dispatch_request(lb, method, uri, alb_headers, body or b"",
                                  parse_qs(query_string, keep_blank_values=True), port,
-                                 client_ip="127.0.0.1"),
+                                 client_ip="127.0.0.1", raw_query_string=query_string),
             read_timeout,
         )
     except asyncio.TimeoutError as e:

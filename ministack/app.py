@@ -2162,7 +2162,9 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
-async def _handle_alb_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_alb_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict, raw_query_string: str | None = None,
+):
     """Handle ALB data-plane requests for host-based and /_alb-prefixed addressing."""
     if not _is_potential_alb_request(host, path):
         return None
@@ -2189,7 +2191,8 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
 
     try:
         return await alb_module.dispatch_request(
-            load_balancer, method, dispatch_path, headers, body, query_params, alb_port
+            load_balancer, method, dispatch_path, headers, body, query_params, alb_port,
+            raw_query_string=raw_query_string,
         )
     except Exception as e:
         logger.exception("Error in ALB data-plane dispatch: %s", e)
@@ -2651,7 +2654,7 @@ async def _handle_special_data_plane_request(
         if AUTH and (target := _s3_cors_target(host, path, path_style=False)):
             response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
         return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
-    if response := await _handle_alb_request(host, path, method, headers, body, query_params):
+    if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string):
         return _with_data_plane_headers(response, request_id)
     return None
 

@@ -1986,7 +1986,7 @@ def _oidc_first(value):
 # ---------------------------------------------------------------------------
 
 async def _execute_actions(actions, method, path, headers, body, query_params, listener_port=80,
-                           lb_arn="", target_host=None):
+                           lb_arn="", target_host=None, raw_query_string=None):
     """Run a rule's actions in Order until one produces a response.
 
     Authentication actions are gates: they either short-circuit with a redirect
@@ -2017,14 +2017,14 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
         if target_host and tg and tg.get("TargetType", "instance") in ("instance", "ip"):
             # Authentication used the client's Host; an instance or IP target gets the load balancer's.
             forwarded["host"] = target_host
-        return await _execute_action(action, method, path, forwarded, body, query_params)
+        return await _execute_action(action, method, path, forwarded, body, query_params, raw_query_string)
 
     # Every action was a gate that passed and none of them was terminal.
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "Rule has no terminal action"}).encode())
 
 
-async def _execute_action(action, method, path, headers, body, query_params):
+async def _execute_action(action, method, path, headers, body, query_params, raw_query_string=None):
     atype = action.get("Type", "").lower()
 
     if atype == "fixed-response":
@@ -2050,13 +2050,13 @@ async def _execute_action(action, method, path, headers, body, query_params):
 
     if atype == "forward":
         tg_arn = action.get("TargetGroupArn", "")
-        return await _forward_to_tg(tg_arn, method, path, headers, body, query_params)
+        return await _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Unsupported action type: {atype}"}).encode())
 
 
-async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
+async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string=None):
     tg = _tgs.get(tg_arn)
     if not tg:
         return (502, {"Content-Type": "application/json"},
@@ -2077,7 +2077,7 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
     if target_type in ("instance", "ip"):
         target = random.choice(registered)
         return await _proxy_http_target(target, tg, method, path,
-                                        headers, body, query_params)
+                                        headers, body, query_params, raw_query_string)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
@@ -2190,7 +2190,7 @@ async def _await_http_disconnect(receive) -> None:
             return
 
 
-async def _proxy_http_target(target, tg, method, path, headers, body, query_params):
+async def _proxy_http_target(target, tg, method, path, headers, body, query_params, raw_query_string=None):
     """Forward a data-plane request to an instance/ip target over HTTP.
 
     The target Id is used as the host to connect to — an IP address for
@@ -2206,8 +2206,11 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     host = str(target.get("Id", ""))
     port = int(target.get("Port") or tg.get("Port") or 80)
-    qs = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
-    target_path = path + (f"?{urlencode(qs)}" if qs else "")
+    # The request target reaches the target as received, like the CloudFront data plane forwards its query string.
+    if raw_query_string is None:
+        raw_query_string = urlencode({k: (v if isinstance(v, list) else [v])
+                                      for k, v in (query_params or {}).items()}, doseq=True)
+    target_path = path + (f"?{raw_query_string}" if raw_query_string else "")
 
     hop_by_hop = {"content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
@@ -2348,7 +2351,8 @@ def _target_headers(lb_arn, listener, headers, client_ip):
     return out
 
 
-async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None):
+async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
+                           raw_query_string=None):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
@@ -2383,7 +2387,8 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
                     target_host = _target_host_header(target_host, listener.get("Port", 80))
                 return await _execute_actions(actions, method, path,
                                               target_headers, body, query_params, port,
-                                              lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host)
+                                              lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
+                                              raw_query_string=raw_query_string)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "No matching ALB rule found"}).encode())
