@@ -740,3 +740,27 @@ def test_opensearch_engine_container_passes_java_opts(fake_docker, monkeypatch, 
 
     env = runs[0]["environment"]
     assert env.get("OPENSEARCH_JAVA_OPTS") == (value or None)
+
+
+@pytest.mark.serial
+def test_opensearch_reaper_spares_the_exited_engine_of_a_live_domain(fake_docker, monkeypatch):
+    """A live domain's engine is recorded under `_ContainerId`; the reaper must read that key."""
+    from ministack.core import container_reaper
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import opensearch as os_
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-os")
+    name = f"reaped-{_uid()}"
+    c = fake_docker.containers.run(
+        name=os_._container_name(name), labels=container_reaper.own_labels("opensearch")
+    )
+    c.status = "exited"
+    c.attrs["State"] = {"FinishedAt": ""}
+    os_._domains[name] = {"DomainName": name, "Created": True, "_ContainerId": c.id}
+
+    assert container_reaper.reap_abandoned(fake_docker) == 0
+    assert os_._container_name(name) in fake_docker.live()
+    os_._domains.pop(name)

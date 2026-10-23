@@ -734,7 +734,6 @@ def _new_domain_record(name, payload):
                         endpoint = f"{h}:{pt}"
                         live["Endpoint"] = endpoint
                         live["_Endpoint"] = endpoint
-                        live["_container_id"] = cid2
                         live["_ContainerId"] = cid2
                     live["Processing"] = False
             if orphaned and cid2:
@@ -1411,7 +1410,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 def _live_container_ids():
     ids = set()
     for _key, rec in _domains.all_items():
-        for field in ("_container_id", "_dashboards_container_id"):
+        for field in ("_ContainerId", "_DashboardsContainerId"):
             cid = rec.get(field)
             if cid:
                 ids.add(cid)
