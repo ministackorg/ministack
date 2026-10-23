@@ -3025,3 +3025,47 @@ def test_elbv2_dataplane_adds_no_cors_or_request_id_headers(elbv2):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_elbv2_dataplane_applies_the_listeners_cors_response_headers(elbv2):
+    """A non-empty routing.http.response.access_control_*.header_value is added to the listener's
+    responses (replacing the target's own), and an empty one reverts to the default."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "https://target.example.test")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-cors"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    prefix = "routing.http.response."
+
+    def fetch():
+        return _req.urlopen(f"{_endpoint}/_alb/{lb_name}/").headers
+
+    try:
+        assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+        assert fetch().get("Access-Control-Allow-Methods") is None
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "access_control_allow_origin.header_value", "Value": "https://app.example.test"},
+            {"Key": prefix + "access_control_allow_methods.header_value", "Value": "GET,POST"},
+        ])
+        headers = fetch()
+        assert headers.get_all("Access-Control-Allow-Origin") == ["https://app.example.test"]
+        assert headers.get("Access-Control-Allow-Methods") == "GET,POST"
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "access_control_allow_origin.header_value", "Value": ""},
+        ])
+        assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)

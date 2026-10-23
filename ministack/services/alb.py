@@ -2350,6 +2350,33 @@ def _target_headers(lb_arn, listener, headers, client_ip):
     return out
 
 
+# Listener attributes that add a response header; an empty value leaves the response alone.
+# https://docs.aws.amazon.com/elasticloadbalancing/latest/application/header-modification.html#insert-header
+_LISTENER_RESPONSE_HEADERS = {
+    f"routing.http.response.{attr}.header_value": header
+    for attr, header in (
+        ("access_control_allow_origin", "Access-Control-Allow-Origin"),
+        ("access_control_allow_methods", "Access-Control-Allow-Methods"),
+        ("access_control_allow_headers", "Access-Control-Allow-Headers"),
+        ("access_control_allow_credentials", "Access-Control-Allow-Credentials"),
+        ("access_control_expose_headers", "Access-Control-Expose-Headers"),
+        ("access_control_max_age", "Access-Control-Max-Age"),
+    )
+}
+
+
+def _with_listener_response_headers(listener_arn, response):
+    """Add the listener's configured response headers, replacing the target's header of that name."""
+    status, headers, body = response
+    added = {_LISTENER_RESPONSE_HEADERS[a["Key"]]: a["Value"]
+             for a in _listener_attrs.get(listener_arn, [])
+             if a["Key"] in _LISTENER_RESPONSE_HEADERS and a["Value"]}
+    if not added:
+        return response
+    replaced = {name.lower() for name in added}
+    return status, {**{k: v for k, v in headers.items() if k.lower() not in replaced}, **added}, body
+
+
 def _with_alb_server(response):
     """A response the load balancer makes itself (Lambda target, fixed-response, redirect, authentication, its own
     errors) carries its Server header; an instance or IP target's response keeps the target's own, or none."""
@@ -2395,10 +2422,11 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
                 target_host = target_headers.get("host")
                 if target_host and _lb_attr(lb_arn, "routing.http.preserve_host_header.enabled", "false") != "true":
                     target_host = _target_host_header(target_host, listener.get("Port", 80))
-                return _with_alb_server(await _execute_actions(actions, method, path,
-                                                               target_headers, body, query_params, port,
-                                                               lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
-                                                               raw_query_string=raw_query_string))
+                response = await _execute_actions(actions, method, path,
+                                                  target_headers, body, query_params, port,
+                                                  lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
+                                                  raw_query_string=raw_query_string)
+                return _with_listener_response_headers(l_arn, _with_alb_server(response))
 
     return _with_alb_server((502, {"Content-Type": "application/json"},
             json.dumps({"message": "No matching ALB rule found"}).encode()))
