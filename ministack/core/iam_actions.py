@@ -950,6 +950,69 @@ def _ses_v2_resource_arn(method: str, path: str, body: bytes, region: str, accou
     return f"arn:aws:ses:{region}:{account_id}:{resource_type}/{name}" if name else "*"
 
 
+# Verified Access creates are authorized on a wildcard of the new resource's
+# type; the other calls on the id they name, in this order.
+_VERIFIED_ACCESS_CREATE_RESOURCES = {
+    "CreateVerifiedAccessInstance": "verified-access-instance",
+    "CreateVerifiedAccessTrustProvider": "verified-access-trust-provider",
+}
+_VERIFIED_ACCESS_ID_FIELDS = (
+    ("VerifiedAccessEndpointId", "Endpoint", "verified-access-endpoint"),
+    ("VerifiedAccessGroupId", "Group", "verified-access-group"),
+    ("VerifiedAccessInstanceId", "Instance", "verified-access-instance"),
+    ("VerifiedAccessTrustProviderId", "TrustProvider", "verified-access-trust-provider"),
+)
+
+
+def _verified_access_resource(action, query_params, region, account_id):
+    """The resource AWS names in a Verified Access denial: the id's ARN when
+    the resource exists, ``<type>/*`` when it does not. Attach and Detach move
+    on to the trust provider when the instance id is malformed, and
+    CreateVerifiedAccessEndpoint names the first subnet it knows, then the first
+    security group it knows, then a known network interface, then the group, then ``verified-access-endpoint/*``."""
+    from ministack.services import ec2
+
+    def name(kind, rtype, value):
+        record = ec2._VA_STORES[kind].get_scoped(account_id, region, value)
+        # A deleting endpoint answers NotFound, so it is named like a missing one.
+        if record is not None and record.get("Status") != "deleting":
+            return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{value}"
+        return f"arn:aws:ec2:{region}:{account_id}:{rtype}/*"
+
+    new = _VERIFIED_ACCESS_CREATE_RESOURCES.get(action)
+    if new:
+        return f"arn:aws:ec2:{region}:{account_id}:{new}/*"
+    if action == "CreateVerifiedAccessEndpoint":
+        for field, store, rtype in (("LoadBalancerOptions.SubnetId", ec2._subnets, "subnet"),
+                                    ("SecurityGroupId", ec2._security_groups, "security-group")):
+            for index in range(1, 1 + sum(1 for k in query_params if k.startswith(field + "."))):
+                value = _query_param(query_params, f"{field}.{index}")
+                if value and store.contains_scoped(account_id, region, value):
+                    return f"arn:aws:ec2:{region}:{account_id}:{rtype}/{value}"
+        eni = _query_param(query_params, "NetworkInterfaceOptions.NetworkInterfaceId")
+        if eni and ec2._network_interfaces.contains_scoped(account_id, region, eni):
+            return f"arn:aws:ec2:{region}:{account_id}:network-interface/{eni}"
+        group = _query_param(query_params, "VerifiedAccessGroupId")
+        if group:
+            return name("Group", "verified-access-group", group)
+        return f"arn:aws:ec2:{region}:{account_id}:verified-access-endpoint/*"
+    fields = _VERIFIED_ACCESS_ID_FIELDS
+    if action == "ModifyVerifiedAccessGroup":
+        # Moving a group is checked on the instance it moves to first.
+        fields = sorted(fields, key=lambda f: f[0] != "VerifiedAccessInstanceId")
+    # Attach, Detach and a group move skip a malformed instance id.
+    skips_bad_instance = action in ("AttachVerifiedAccessTrustProvider", "DetachVerifiedAccessTrustProvider",
+                                    "ModifyVerifiedAccessGroup")
+    for field, kind, rtype in fields:
+        value = _query_param(query_params, field)
+        if not value:
+            continue
+        if skips_bad_instance and kind == "Instance" and ec2._va_bad_id(kind, value, prefix_only=True):
+            continue
+        return name(kind, rtype, value)
+    return "*"
+
+
 def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
@@ -1594,6 +1657,12 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "ec2":
         # EC2 uses query params. Try resource ID fields in priority order.
+        # Verified Access: the resource AWS names when it denies the call.
+        # These come before the generic fields: CreateVerifiedAccessEndpoint
+        # also carries SecurityGroupId.1.
+        action = _query_param(query_params, "Action")
+        if "VerifiedAccess" in action and not action.startswith("DescribeVerifiedAccess"):
+            return _verified_access_resource(action, query_params, region, account_id)
         _EC2_RESOURCE_FIELDS = [
             ("InstanceId.1", "instance"),
             ("InstanceId", "instance"),
