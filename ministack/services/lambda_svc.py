@@ -599,13 +599,17 @@ def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
     # without going through CreateFunction (no real code path does this).
 
 
-def _internalize_code_zip(func: dict) -> None:
-    """Replace a blob ref or legacy base64 string with bytes, in place."""
+def _internalize_code_zip(func: dict, blobs: dict[str, bytes | None]) -> None:
+    """Replace a blob ref or legacy base64 string with bytes, in place. ``blobs``
+    holds what this restore has read, so records sharing a blob share its bytes."""
     code = func.get("code_zip")
     if not code:
         return
     if isinstance(code, dict) and _BLOB_REF_KEY in code:
-        func["code_zip"] = _read_code_blob(code[_BLOB_REF_KEY])
+        sha = code[_BLOB_REF_KEY]
+        if sha not in blobs:
+            blobs[sha] = _read_code_blob(sha)
+        func["code_zip"] = blobs[sha]
     elif isinstance(code, str):
         # Legacy persistence shape (inline base64).
         func["code_zip"] = base64.b64decode(code)
@@ -653,27 +657,28 @@ def load_persisted_state(data) -> None:
 
 def _restore_state(data):
     if data:
+        blobs: dict[str, bytes | None] = {}
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountRegionScopedDict):
             for scoped_key, func in funcs._data.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 _functions._data[scoped_key] = func
         elif isinstance(funcs, AccountScopedDict):
             # Pre-region state. Code may be a content-addressed blob ref (#947)
             # or legacy inline base64 — _internalize_code_zip handles both.
             for (account_id, name), func in funcs._data.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 region = _region_from_function_record(func)
                 _functions._data[(account_id, region, name)] = func
         else:
             for name, func in funcs.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 region = _region_from_function_record(func)
                 _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))

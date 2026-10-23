@@ -9888,6 +9888,26 @@ def test_lambda_identical_code_dedups_to_single_blob(lambda_svc_isolated):
     assert len(files) == 1, [f.name for f in files]
 
 
+def test_lambda_restore_shares_one_bytes_object_per_blob(lambda_svc_isolated):
+    """Versions and functions whose code is one blob restore to one bytes object, as they are live
+    (PublishVersion reuses $LATEST's), not one copy each."""
+    svc, _ = lambda_svc_isolated
+    code, other = b"shared code" * 100, b"other code" * 100
+    versions = {str(n): {"code_zip": code, "config": {"Version": str(n)}} for n in (1, 2, 3)}
+    svc._functions["fn-a"] = _make_lambda_record("fn-a", code, versions=versions)
+    svc._functions["fn-b"] = _make_lambda_record("fn-b", other, versions={"1": {"code_zip": code, "config": {}}})
+    state = svc.get_state()
+    svc._functions._data.clear()
+    svc.load_persisted_state(state)
+
+    a = svc._functions._data[("000000000000", svc.get_region(), "fn-a")]
+    b = svc._functions._data[("000000000000", svc.get_region(), "fn-b")]
+    copies = [a["code_zip"], *(v["code_zip"] for v in a["versions"].values()), b["versions"]["1"]["code_zip"]]
+    assert all(c == code for c in copies)
+    assert len({id(c) for c in copies}) == 1
+    assert b["code_zip"] == other
+
+
 def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated):
     """Pre-existing lambda.json files (written before content-addressed
     storage) stored code_zip as inline base64. restore_state must accept
