@@ -6389,3 +6389,12 @@ def test_distribution_adds_no_request_id_headers_of_its_own(cf_raw_origin_stack)
     assert not names & {"x-amzn-requestid", "x-amz-request-id"}
     # The origin's own Server passes through.
     assert {k.lower(): v for k, v in headers.items()}["server"].startswith("BaseHTTP")
+
+
+def test_request_id_has_cloudfronts_shape(cf_raw_origin_stack):
+    """X-Amz-Cf-Id is 40 random bytes in URL-safe base64 with its padding, as CloudFront sends it."""
+    status, headers, _body = _get(cf_raw_origin_stack, "/hello")
+    assert status == 200
+    lowered = {name.lower(): value for name, value in headers.items()}
+    assert re.fullmatch(r"[A-Za-z0-9_-]{54}==", lowered["x-amz-cf-id"]), lowered["x-amz-cf-id"]
+    assert re.fullmatch(r"1\.1 [0-9a-f]{32}\.cloudfront\.net \(CloudFront\)", lowered["via"]), lowered["via"]

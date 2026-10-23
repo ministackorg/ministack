@@ -5854,11 +5854,11 @@ def _apply_response_headers_policy(headers: dict, policy_cfg: dict, viewer_origi
 
 
 def _cf_request_id() -> str:
-    return base64.b64encode(os.urandom(42)).decode().rstrip("=")
+    return base64.urlsafe_b64encode(os.urandom(40)).decode()
 
 
 def _cf_via_hash() -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=13))
+    return os.urandom(16).hex()
 
 
 def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None = None) -> dict:

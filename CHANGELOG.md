@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **CloudFront — `X-Amz-Cf-Id` and `Via` have CloudFront's shape** — the data plane sent 56 characters of standard base64 without padding as `X-Amz-Cf-Id` and a 13-character token in `Via`. It now sends URL-safe base64 of 40 bytes with its `==` padding, and `Via: 1.1 <32 hex>.cloudfront.net (CloudFront)`. Contributed by @skialpine.
 - **ALB — the listener's CORS response headers are applied** — `routing.http.response.access_control_*.header_value` set with `ModifyListenerAttributes` had no effect. Each non-empty value is now added to the listener's responses, replacing the target's header of that name. Contributed by @skialpine.
 - **ALB and CloudFront responses carry only their own headers** — the gateway added `x-amzn-requestid` and `x-amz-request-id` to both and `Access-Control-Allow-Origin: *` to ALB responses. They now carry what the target or origin sent, plus the load balancer's or CloudFront's own: `Server: awselb/2.0` on a response the load balancer makes itself (a Lambda target's, fixed-response, redirect, authentication, its own errors), and `Server: CloudFront` when the origin sends none. Contributed by @skialpine.
 - **Responses carry no Hypercorn `Server` header** — every response carried `Server: hypercorn-h11`, which no AWS endpoint sends. Hypercorn no longer adds it; services that send their own `Server` are unchanged. Contributed by @skialpine.
