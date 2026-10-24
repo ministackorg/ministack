@@ -669,6 +669,35 @@ def test_elbv2_dataplane_redirect(elbv2):
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
 
+def test_elbv2_dataplane_redirect_location_keeps_the_listener_port_and_query(elbv2):
+    import http.client as _http
+    from urllib.parse import urlparse as _urlparse
+
+    lb_arn = elbv2.create_load_balancer(Name="dp-alb-redir-q")["LoadBalancers"][0]["LoadBalancerArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "redirect", "RedirectConfig": {"Path": "/elsewhere", "StatusCode": "HTTP_302"}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        parsed = _urlparse(_endpoint)
+        conn = _http.HTTPConnection(parsed.hostname, parsed.port or 4566)
+        conn.request("GET", "/_alb/dp-alb-redir-q/x?y=1", headers={"Host": "app.example.test:9000"})
+        resp = conn.getresponse()
+        assert (resp.status, resp.getheader("Location")) == (302, "http://app.example.test:80/elsewhere?y=1")
+        conn.close()
+        elbv2.modify_listener(ListenerArn=l_arn, DefaultActions=[{"Type": "redirect", "RedirectConfig": {
+            "Path": "/elsewhere", "Query": "z=1&#{query}", "StatusCode": "HTTP_302"}}])
+        listener = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+        assert listener["DefaultActions"][0]["RedirectConfig"]["Query"] == "z=1&#{query}"
+        conn = _http.HTTPConnection(parsed.hostname, parsed.port or 4566)
+        conn.request("GET", "/_alb/dp-alb-redir-q/x?y=1", headers={"Host": "app.example.test:9000"})
+        assert conn.getresponse().getheader("Location") == "http://app.example.test:80/elsewhere?z=1&y=1"
+        conn.close()
+    finally:
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+
 def test_elbv2_dataplane_path_pattern_rule(elbv2, lam):
     """Path-pattern rule routes /api/* to one Lambda; default routes to another."""
     import urllib.request as _req

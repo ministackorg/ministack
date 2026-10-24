@@ -271,6 +271,7 @@ def _parse_actions(params, prefix="DefaultActions"):
                 "Port": _p(params, f"{prefix}.member.{i}.RedirectConfig.Port", "#{port}"),
                 "Host": _p(params, f"{prefix}.member.{i}.RedirectConfig.Host", "#{host}"),
                 "Path": _p(params, f"{prefix}.member.{i}.RedirectConfig.Path", "/#{path}"),
+                "Query": _p(params, f"{prefix}.member.{i}.RedirectConfig.Query", "#{query}"),
                 "StatusCode": rc_code,
             }
         oidc_issuer = _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.Issuer")
@@ -499,6 +500,7 @@ def _action_xml(a):
             f"<Port>{rc.get('Port','#{port}')}</Port>"
             f"<Host>{rc.get('Host','#{host}')}</Host>"
             f"<Path>{rc.get('Path','/#{path}')}</Path>"
+            f"<Query>{_esc(rc.get('Query', '#{query}'))}</Query>"
             f"<StatusCode>{rc.get('StatusCode','HTTP_301')}</StatusCode>"
             f"</RedirectConfig>"
         )
@@ -2038,15 +2040,18 @@ async def _execute_action(action, method, path, headers, body, query_params, raw
     if atype == "redirect":
         rc = action.get("RedirectConfig", {})
         code = int(rc.get("StatusCode", "HTTP_301").replace("HTTP_", ""))
+        # The #{...} placeholders take the listener's protocol and port (as X-Forwarded-Proto/Port carry
+        # them) and the request's query; the port is always written, as AWS does (`http://host:80/...`).
         src_host = headers.get("host", "localhost").split(":")[0]
-        proto = rc.get("Protocol", "#{protocol}").replace("#{protocol}", "http")
+        if raw_query_string is None:
+            raw_query_string = urlencode([(k, v) for k, vs in (query_params or {}).items()
+                                          for v in (vs if isinstance(vs, list) else [vs])])
+        proto = rc.get("Protocol", "#{protocol}").replace("#{protocol}", headers.get("x-forwarded-proto", "http")).lower()
         rhost = rc.get("Host", "#{host}").replace("#{host}", src_host)
-        rport = rc.get("Port", "#{port}").replace("#{port}", "")
+        rport = rc.get("Port", "#{port}").replace("#{port}", headers.get("x-forwarded-port", "80"))
         rpath = rc.get("Path", "/#{path}").replace("#{path}", path.lstrip("/"))
-        location = f"{proto}://{rhost}"
-        if rport and rport not in ("80", "443", ""):
-            location += f":{rport}"
-        location += rpath
+        rquery = rc.get("Query", "#{query}").replace("#{query}", raw_query_string)
+        location = f"{proto}://{rhost}:{rport}{rpath}" + (f"?{rquery}" if rquery else "")
         return code, {"Location": location, "Content-Type": "text/plain"}, b""
 
     if atype == "forward":
