@@ -564,18 +564,20 @@ def test_elbv2_dataplane_event_shape(elbv2, lam):
     )
     lb_arn, tg_arn, l_arn, fn_arn = _alb_setup(elbv2, lam, "dp-alb-evt", "dp-alb-evt-fn", fn_code)
     try:
-        url = f"{_endpoint}/_alb/dp-alb-evt/check?foo=bar"
+        url = f"{_endpoint}/_alb/dp-alb-evt/check?foo=bar&a=1&a=3&q=x%20y&flag"
         resp = _req.urlopen(_req.Request(url, method="GET"))
         body = json.loads(resp.read())
         assert "requestContext" in body
         assert "elb" in body["requestContext"]
         assert body["httpMethod"] == "GET"
         assert body["path"] == "/check"
-        assert body["queryStringParameters"].get("foo") == "bar"
+        # Single-value by default: the last value of a repeated key, not URL-decoded, and no multi-value keys.
+        assert body["queryStringParameters"] == {"foo": "bar", "a": "3", "q": "x%20y", "flag": ""}
+        assert "multiValueQueryStringParameters" not in body and "multiValueHeaders" not in body
+        assert body["body"] == ""
         assert body["headers"]["x-forwarded-for"] == "127.0.0.1"
         assert (body["headers"]["x-forwarded-proto"], body["headers"]["x-forwarded-port"]) == ("http", "80")
         assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", body["headers"]["x-amzn-trace-id"])
-        assert body["multiValueHeaders"]["x-forwarded-for"] == ["127.0.0.1"]
         assert body["isBase64Encoded"] is False
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-evt-fn")

@@ -2073,7 +2073,7 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_
     if target_type == "lambda":
         func_id = registered[0]["Id"]
         return await _invoke_lambda_target(func_id, tg_arn, method, path,
-                                           headers, body, query_params)
+                                           headers, body, query_params, raw_query_string)
 
     if target_type in ("instance", "ip"):
         target = random.choice(registered)
@@ -2084,7 +2084,7 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
 
-async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params):
+async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params, raw_query_string=None):
     try:
         from ministack.services import lambda_svc
     except ImportError:
@@ -2107,7 +2107,7 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode())
 
-    body_str = None
+    body_str = ""
     is_b64 = False
     if body:
         try:
@@ -2116,20 +2116,24 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
             body_str = base64.b64encode(body).decode("ascii")
             is_b64 = True
 
-    qs_single = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
-    qs_multi = {k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()}
-
     event = {
         "requestContext": {"elb": {"targetGroupArn": tg_arn}},
         "httpMethod": method.upper(),
         "path": path,
-        "queryStringParameters": qs_single,
-        "multiValueQueryStringParameters": qs_multi,
         "headers": {k.lower(): v for k, v in headers.items()},
-        "multiValueHeaders": {k.lower(): [v] for k, v in headers.items()},
         "body": body_str,
         "isBase64Encoded": is_b64,
     }
+    if any(a.get("Key") == "lambda.multi_value_headers.enabled" and a.get("Value") == "true"
+           for a in _tg_attrs.get(tg_arn, [])):
+        event["queryStringParameters"] = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
+        event["multiValueQueryStringParameters"] = {k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()}
+        event["multiValueHeaders"] = {k.lower(): [v] for k, v in headers.items()}
+    elif raw_query_string is not None:
+        # As the load balancer sends them: the last value of a repeated key, not URL-decoded.
+        event["queryStringParameters"] = dict(p.partition("=")[::2] for p in raw_query_string.split("&") if p)
+    else:
+        event["queryStringParameters"] = {k: (v[-1] if isinstance(v, list) else v) for k, v in query_params.items()}
 
     exec_record = lambda_svc._execution_record_for_config(func, config)
 
