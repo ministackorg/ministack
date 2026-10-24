@@ -2052,21 +2052,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            if query_language == "JSONata" and "Output" in catcher:
-                output = _apply_jsonata_output(
-                    catcher,
-                    raw_input,
-                    ctx,
-                    error_output=error_output,
-                    default=error_output,
-                )
-            else:
-                output = _apply_result_path_raw(
-                    catcher.get("ResultPath", "$"), raw_input, error_output)
-            if query_language == "JSONata":
-                # Catch handlers can also carry `Assign`. `$states.errorOutput`
-                # is available here; `$states.result` is not (per AWS).
-                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, query_language, error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -2565,7 +2551,7 @@ def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
             if catcher is None:
                 raise
             error_output = {"Error": err.error, "Cause": err.cause}
-            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, _state_query_language(state_def, ctx), error_output)
             return output, catcher["Next"]
 
 
@@ -3647,6 +3633,19 @@ def _find_matching_catcher(catchers, error):
         if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
+
+
+def _apply_catcher(catcher, raw_input, ctx, query_language, error_output):
+    """Build a caught error's output and apply the catcher's Assign."""
+    if query_language == "JSONata" and "Output" in catcher:
+        output = _apply_jsonata_output(catcher, raw_input, ctx, error_output=error_output, default=error_output)
+    else:
+        output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+    if query_language == "JSONata":
+        # Catch handlers can also carry `Assign`. `$states.errorOutput`
+        # is available here; `$states.result` is not (per AWS).
+        _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+    return output
 
 
 # ===================================================================
