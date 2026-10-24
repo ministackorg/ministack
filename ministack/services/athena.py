@@ -1295,11 +1295,8 @@ async def _save_query_results(query_id):
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
     bucket_name = p.netloc
-    key_prefix = p.path.lstrip("/").rstrip("/")
-    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
-    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
-    # the files land at bucket root.
-    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    # OutputLocation already ends in <id>.csv
+    csv_key = p.path.lstrip("/")
     meta_key = f"{csv_key}.metadata"
 
     # Write directly to the S3 service's in-memory store via the public

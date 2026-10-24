@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Athena — the result file is saved at the reported `OutputLocation`** — a query's `<id>.csv` and `<id>.csv.metadata` are now saved directly under the result location, at the path that `GetQueryExecution` reports, as AWS does. Before, they were saved one folder too deep, at `<location>/<id>.csv/<id>.csv`, so a client that read the reported path got `NoSuchKey`.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added

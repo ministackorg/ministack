@@ -880,6 +880,27 @@ def test_athena_workgroup_reports_engine_version(athena):
     assert version["EffectiveEngineVersion"] == "Athena engine version 3"
 
 
+def test_athena_result_file_is_at_reported_output_location(athena, s3):
+    bucket = f"athena-out-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    qid = athena.start_query_execution(
+        QueryString="SELECT 1 AS n",
+        ResultConfiguration={"OutputLocation": f"s3://{bucket}/out/"},
+    )["QueryExecutionId"]
+    for _ in range(30):
+        execution = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+        if execution["Status"]["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.1)
+    assert execution["Status"]["State"] == "SUCCEEDED", execution["Status"]
+    assert execution["ResultConfiguration"]["OutputLocation"] == f"s3://{bucket}/out/{qid}.csv"
+
+    keys = sorted(o["Key"] for o in s3.list_objects_v2(Bucket=bucket)["Contents"])
+    assert keys == [f"out/{qid}.csv", f"out/{qid}.csv.metadata"]
+    body = s3.get_object(Bucket=bucket, Key=f"out/{qid}.csv")["Body"].read().decode()
+    assert body.splitlines() == ["n", "1"]
+
+
 def _run_to_completion(athena, query, database):
     query_id = athena.start_query_execution(
         QueryString=query, QueryExecutionContext={"Database": database},
