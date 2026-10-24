@@ -1387,6 +1387,34 @@ def test_glue_spark_skips_docker_when_image_missing(glue):
     ), f"Job should reach terminal state without Docker image. Got: {run['JobRunState']}"
 
 
+_USER_IDS = {"--JOB_NAME": "user-value", "--JOB_RUN_ID": "user-value"}
+_DEFAULT_IDS = {"--JOB_NAME": "default-value", "--JOB_RUN_ID": "default-value"}
+_GLUE_IDS = {"--JOB_NAME": "my-job", "--JOB_RUN_ID": "jr_1"}
+
+
+@pytest.mark.parametrize("command,default_arguments,run_arguments,expected", [
+    ("glueetl", {}, {}, _GLUE_IDS),
+    ("glueetl", {}, _USER_IDS, _USER_IDS),
+    ("glueetl", _DEFAULT_IDS, {}, _GLUE_IDS),
+    ("gluestreaming", {}, {}, _GLUE_IDS),
+    ("gluestreaming", {}, _USER_IDS, _USER_IDS),
+    ("gluestreaming", _DEFAULT_IDS, {}, _GLUE_IDS),
+    ("pythonshell", {}, {}, {}),
+    ("pythonshell", {}, _USER_IDS, _USER_IDS),
+    ("pythonshell", _DEFAULT_IDS, {}, _DEFAULT_IDS),
+], ids=["etl", "etl-run-args", "etl-default-args", "streaming", "streaming-run-args", "streaming-default-args",
+        "shell", "shell-run-args", "shell-default-args"])
+def test_glue_script_args_job_name_and_run_id(command, default_arguments, run_arguments, expected):
+    """A Spark script gets --JOB_NAME and --JOB_RUN_ID from Glue. They replace DefaultArguments, and the run's
+    Arguments replace them. A pythonshell script gets only the arguments that the caller gave."""
+    from ministack.services import glue as _glue
+
+    job = {"Command": {"Name": command}, "DefaultArguments": {"--extra": "x", **default_arguments}}
+    args = _glue._script_args(job, "my-job", "jr_1", run_arguments)
+
+    assert args == {"--extra": "x", **expected}
+
+
 def test_glue_spark_image_for_version_maps_to_official_aws_image():
     """`GlueVersion: 4.0` and `3.0` map to the canonical `amazon/aws-glue-libs`
     images real AWS Glue uses for Spark. Override via `GLUE_DOCKER_IMAGE`."""

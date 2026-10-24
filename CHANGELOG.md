@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Glue — Spark job scripts get `--JOB_NAME` and `--JOB_RUN_ID`** — a Spark job run passed only the job's `DefaultArguments` and the run's `Arguments`, so a script that reads `JOB_NAME` or `JOB_RUN_ID` with `getResolvedOptions` failed; both now reach the script, as on AWS. They replace a value in `DefaultArguments`, and a value in the run's `Arguments` replaces them. `pythonshell` scripts don't get them, as on AWS. `GetJobRun` still shows only the arguments the caller gave.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
