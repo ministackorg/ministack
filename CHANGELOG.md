@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — a partial ARN as the `FunctionName`** — `123456789012:function:my-function[:qualifier]` resolved to the account ID as the function name, so `Invoke` and the other function operations failed with `Function not found: ...:function:123456789012`; it now resolves as the full ARN in the caller's region, as on AWS, and gives the same result as that full ARN.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
