@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Athena — an enforced workgroup overrides the client-side result location** — when a workgroup has `EnforceWorkGroupConfiguration: true`, `StartQueryExecution` now writes results to the workgroup's `OutputLocation`, even when the request gives its own `ResultConfiguration.OutputLocation`, as AWS does. Before, the request's location was used.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added

@@ -819,11 +819,14 @@ def _start_query_execution(data):
     query = data.get("QueryString", "")
     query_id = new_uuid()
     workgroup = data.get("WorkGroup", "primary")
-    output_location = data.get("ResultConfiguration", {}).get(
-        "OutputLocation"
-    ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
-        "ResultConfiguration", {}
-    ).get("OutputLocation")
+    wg_config = _workgroups.get(workgroup, {}).get("Configuration", {})
+    wg_output = wg_config.get("ResultConfiguration", {}).get("OutputLocation")
+    client_output = data.get("ResultConfiguration", {}).get("OutputLocation")
+    # An enforced workgroup overrides the client-side result location
+    if wg_config.get("EnforceWorkGroupConfiguration"):
+        output_location = wg_output or client_output
+    else:
+        output_location = client_output or wg_output
     if not output_location:
         return error_response_json(
             "InvalidRequestException",

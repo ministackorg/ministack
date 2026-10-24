@@ -875,6 +875,32 @@ def test_athena_list_and_get_databases_from_glue(athena, glue):
     assert err.value.response["Error"]["Code"] == "InvalidRequestException"
 
 
+@pytest.mark.parametrize("enforce,expected_prefix", [
+    (True, "s3://athena-wg-out/enforced/"),
+    (False, "s3://athena-client-out/"),
+])
+def test_athena_enforced_workgroup_overrides_client_output_location(athena, enforce, expected_prefix):
+    name = f"wg-enforce-{_uuid_mod.uuid4().hex[:8]}"
+    athena.create_work_group(
+        Name=name,
+        Configuration={
+            "EnforceWorkGroupConfiguration": enforce,
+            "ResultConfiguration": {"OutputLocation": "s3://athena-wg-out/enforced/"},
+        },
+    )
+    try:
+        qid = athena.start_query_execution(
+            QueryString="SELECT 1",
+            WorkGroup=name,
+            ResultConfiguration={"OutputLocation": "s3://athena-client-out/"},
+        )["QueryExecutionId"]
+        location = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"][
+            "ResultConfiguration"]["OutputLocation"]
+        assert location == f"{expected_prefix}{qid}.csv"
+    finally:
+        athena.delete_work_group(WorkGroup=name, RecursiveDeleteOption=True)
+
+
 def test_athena_workgroup_reports_engine_version(athena):
     version = athena.get_work_group(WorkGroup="primary")["WorkGroup"]["Configuration"]["EngineVersion"]
     assert version["EffectiveEngineVersion"] == "Athena engine version 3"
