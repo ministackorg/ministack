@@ -3007,6 +3007,19 @@ def test_elbv2_target_headers_follow_xff_mode_and_trace_id_rules():
         alb._lb_attrs.pop(lb_arn, None)
 
 
+def test_elbv2_dataplane_forwards_the_path_as_sent(elbv2):
+    """The target receives the path with its percent-encoding, as the client sent it."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-rawpath"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/reason/Custom%20Thing/a%2Fb")
+        assert json.loads(resp.read())["path"] == "/reason/Custom%20Thing/a%2Fb"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
 def test_elbv2_dataplane_forwards_repeated_query_keys(elbv2):
     """The target receives the query string as the client sent it."""
     server = _start_echo_server()

@@ -1992,7 +1992,7 @@ def _oidc_first(value):
 # ---------------------------------------------------------------------------
 
 async def _execute_actions(actions, method, path, headers, body, query_params, listener_port=80,
-                           lb_arn="", target_host=None, raw_query_string=None):
+                           lb_arn="", target_host=None, raw_query_string=None, raw_path=None):
     """Run a rule's actions in Order until one produces a response.
 
     Authentication actions are gates: they either short-circuit with a redirect
@@ -2023,14 +2023,14 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
         if target_host and tg and tg.get("TargetType", "instance") in ("instance", "ip"):
             # Authentication used the client's Host; an instance or IP target gets the load balancer's.
             forwarded["host"] = target_host
-        return await _execute_action(action, method, path, forwarded, body, query_params, raw_query_string)
+        return await _execute_action(action, method, path, forwarded, body, query_params, raw_query_string, raw_path)
 
     # Every action was a gate that passed and none of them was terminal.
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "Rule has no terminal action"}).encode())
 
 
-async def _execute_action(action, method, path, headers, body, query_params, raw_query_string=None):
+async def _execute_action(action, method, path, headers, body, query_params, raw_query_string=None, raw_path=None):
     atype = action.get("Type", "").lower()
 
     if atype == "fixed-response":
@@ -2059,13 +2059,13 @@ async def _execute_action(action, method, path, headers, body, query_params, raw
 
     if atype == "forward":
         tg_arn = action.get("TargetGroupArn", "")
-        return await _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string)
+        return await _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string, raw_path)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Unsupported action type: {atype}"}).encode())
 
 
-async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string=None):
+async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string=None, raw_path=None):
     tg = _tgs.get(tg_arn)
     if not tg:
         return (502, {"Content-Type": "application/json"},
@@ -2085,7 +2085,7 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_
 
     if target_type in ("instance", "ip"):
         target = random.choice(registered)
-        return await _proxy_http_target(target, tg, method, path,
+        return await _proxy_http_target(target, tg, method, raw_path or path,
                                         headers, body, query_params, raw_query_string)
 
     return (502, {"Content-Type": "application/json"},
@@ -2404,7 +2404,7 @@ def _with_alb_server(response):
 
 
 async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
-                           raw_query_string=None):
+                           raw_query_string=None, raw_path=None):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
@@ -2440,7 +2440,7 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
                 response = await _execute_actions(actions, method, path,
                                                   target_headers, body, query_params, port,
                                                   lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
-                                                  raw_query_string=raw_query_string)
+                                                  raw_query_string=raw_query_string, raw_path=raw_path)
                 return _with_listener_response_headers(l_arn, _with_alb_server(response))
 
     return _with_alb_server((502, {"Content-Type": "application/json"},

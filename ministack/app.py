@@ -2202,6 +2202,7 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
 
 async def _handle_alb_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict, raw_query_string: str | None = None,
+    raw_path: str | None = None,
 ):
     """Handle ALB data-plane requests for host-based and /_alb-prefixed addressing."""
     if not _is_potential_alb_request(host, path):
@@ -2210,12 +2211,17 @@ async def _handle_alb_request(
     alb_module = _get_module("alb")
     load_balancer = alb_module.find_lb_for_host(host)
     dispatch_path = path
+    # Instance and IP targets get the path as the client sent it, percent-encoding included.
+    raw_dispatch_path = raw_path
 
     if load_balancer is None and path.startswith(_ALB_PATH_PREFIX):
         path_parts = path[len(_ALB_PATH_PREFIX) :].split("/", 1)
         load_balancer = alb_module._find_lb_by_name(path_parts[0])
         if load_balancer:
             dispatch_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
+            if raw_path is not None and raw_path.startswith(_ALB_PATH_PREFIX):
+                raw_parts = raw_path[len(_ALB_PATH_PREFIX) :].split("/", 1)
+                raw_dispatch_path = "/" + raw_parts[1] if len(raw_parts) > 1 else "/"
 
     if load_balancer is None:
         return None
@@ -2230,7 +2236,7 @@ async def _handle_alb_request(
     try:
         return await alb_module.dispatch_request(
             load_balancer, method, dispatch_path, headers, body, query_params, alb_port,
-            raw_query_string=raw_query_string,
+            raw_query_string=raw_query_string, raw_path=raw_dispatch_path,
         )
     except Exception as e:
         logger.exception("Error in ALB data-plane dispatch: %s", e)
@@ -2693,7 +2699,7 @@ async def _handle_special_data_plane_request(
         if AUTH and (target := _s3_cors_target(host, path, path_style=False)):
             response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
         return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
-    if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string):
+    if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string, raw_path):
         # A load balancer passes its target's headers through; CORS and request ids are the application's.
         return response
     return None
