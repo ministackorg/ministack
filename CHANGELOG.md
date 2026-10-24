@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — JSONata `Catch` on `Map` and `Parallel` states** — a catcher's `Output` and `Assign` were ignored, so the caught error passed on unchanged and the catcher's variables were never set; both now apply, as on a `Task` state.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
