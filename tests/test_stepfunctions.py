@@ -8000,6 +8000,71 @@ def test_sfn_jsonata_undefined_variable_raises_query_eval_error(sfn_sync):
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+_SFN_ECHO_PROCESSOR = {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "Echo",
+                       "States": {"Echo": {"Type": "Pass", "End": True}}}
+
+
+def test_sfn_jsonata_inline_map_evaluates_its_fields(sfn_sync):
+    """A JSONata inline Map evaluates Items, ItemSelector, MaxConcurrency, Output and Assign. ItemSelector
+    reads the current item and variables from the outer scope."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-map-fields-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Init",
+            "States": {
+                "Init": {"Type": "Pass", "Assign": {"prefix": "item"}, "Next": "M"},
+                "M": {
+                    "Type": "Map",
+                    "Items": "{% $states.input.xs %}",
+                    "ItemSelector": {"v": "{% $states.context.Map.Item.Value %}", "p": "{% $prefix %}"},
+                    "MaxConcurrency": "{% 1 %}",
+                    "ItemProcessor": _SFN_ECHO_PROCESSOR,
+                    "Output": {"items": "{% $states.result %}"},
+                    "Assign": {"n": "{% $count($states.result) %}"},
+                    "Next": "After",
+                },
+                "After": {"Type": "Pass", "Output": {"map": "{% $states.input %}", "n": "{% $n %}"}, "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input=json.dumps({"xs": [10, 20]}))
+        assert resp["status"] == "SUCCEEDED", resp.get("cause")
+        assert json.loads(resp["output"]) == {
+            "map": {"items": [{"v": 10, "p": "item"}, {"v": 20, "p": "item"}]},
+            "n": 2,
+        }
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_sfn_jsonata_inline_map_items_not_an_array_fails(sfn_sync):
+    """A JSONata Map whose Items does not evaluate to an array fails with `States.QueryEvaluationError`."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-map-items-type-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "M",
+            "States": {
+                "M": {"Type": "Map", "Items": "{% 'x' %}", "ItemProcessor": _SFN_ECHO_PROCESSOR, "End": True},
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "FAILED"
+        assert resp.get("error") == "States.QueryEvaluationError"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_jsonata_assign_reuses_input(sfn_sync):
     """`Assign` can reference `$states.input` (always available)."""
     import uuid as _uuid_local

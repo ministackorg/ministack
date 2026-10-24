@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — JSONata fields on an inline `Map`** — `Items`, `ItemSelector`, `MaxConcurrency`, `Output` and `Assign` were ignored or read as JSONPath, so the Map iterated over the whole input, iterations got literal `{% ... %}` text, a `MaxConcurrency` expression failed with `States.Runtime`, and `Assign` variables were never set; all five are now evaluated, as on AWS. `Items` that is not an array fails with `States.QueryEvaluationError`.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
