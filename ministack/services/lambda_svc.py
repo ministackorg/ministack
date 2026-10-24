@@ -1133,13 +1133,32 @@ def _require_same_account_region_arn(spec, target_arn: str, target_kind: str):
     return None
 
 
+def _cross_account_stream_exists(spec, event_source_arn: str) -> bool:
+    from ministack.services import kinesis as _kin
+
+    stream_name = _kinesis_stream_name_from_arn_spec(spec)
+    stream = _kin._streams.get_scoped(spec.account_id, spec.region, stream_name) if stream_name else None
+    return bool(stream) and stream.get("StreamARN") == event_source_arn
+
+
 def _validate_event_source_arn(event_source_arn: str):
     spec, err = _parse_required_arn(event_source_arn, "eventSourceArn")
     if err:
         return None, err
     if spec.service not in {"sqs", "kinesis", "dynamodb"}:
         return None, _invalid_parameter_value(f"Unsupported event source ARN: {event_source_arn}")
-    scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
+    if spec.service == "kinesis" and spec.account_id != get_account_id():
+        # A stream in another account is readable through its resource policy
+        # (AWS Lambda developer guide, "Cross-account event source mappings");
+        # the policy is checked when the mapping polls. The region rule stays,
+        # and the stream must exist in its owner's account.
+        scope_err = None if spec.region == get_region() else _invalid_parameter_value(
+            f"The event source ARN {event_source_arn} must be in the same region as the Lambda function."
+        )
+        if scope_err is None and not _cross_account_stream_exists(spec, event_source_arn):
+            scope_err = _invalid_parameter_value(f"The event source ARN {event_source_arn} is invalid.")
+    else:
+        scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
     if scope_err:
         return None, scope_err
     if spec.service == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
@@ -7636,6 +7655,24 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
         logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
+def _cross_account_stream_readable(stream_arn, func_rec, func_name):
+    """Whether a mapping may read another account's stream. Under AUTH=true the
+    stream's resource policy must allow the function's execution role every
+    read the mapping makes; with auth disabled, as elsewhere, it passes. The
+    policy is evaluated on each pass, so removing the grant stops delivery."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
+    from ministack.services import kinesis as _kin
+
+    role_arn = (func_rec.get("config") or func_rec).get("Role", "")
+    role_name = role_arn.rsplit("/", 1)[-1] if ":role/" in role_arn else ""
+    if not role_name:
+        return False
+    session_arn = f"arn:aws:sts::{get_account_id()}:assumed-role/{role_name}/{func_name}"
+    return _kin.stream_policy_allows_read(stream_arn, session_arn, get_account_id())
+
+
 def _poll_kinesis():
     """Returns True if any shard advanced past a batch this pass (successfully
     invoked, or filtered out entirely)."""
@@ -7654,11 +7691,7 @@ def _poll_kinesis():
                 source_spec = parse_arn(source_arn)
             except ArnParseError:
                 continue
-            if (
-                source_spec.service != "kinesis"
-                or source_spec.account_id != get_account_id()
-                or source_spec.region != get_region()
-            ):
+            if source_spec.service != "kinesis" or source_spec.region != get_region():
                 continue
             stream_name = _kinesis_stream_name_from_arn_spec(source_spec)
             if not stream_name:
@@ -7670,8 +7703,17 @@ def _poll_kinesis():
             if func_rec is None:
                 continue
 
-            stream = _kin._streams.get(stream_name)
+            # The stream lives in its owner's account, which for a cross-account
+            # mapping is not the mapping's own.
+            stream = _kin._streams.get_scoped(source_spec.account_id, source_spec.region, stream_name)
             if not stream or stream.get("StreamARN") != source_arn or stream["StreamStatus"] != "ACTIVE":
+                continue
+            if source_spec.account_id != get_account_id() and not _cross_account_stream_readable(
+                    source_arn, func_rec, func_name):
+                esm["LastProcessingResult"] = (
+                    f"PROBLEM: Lambda is not authorized to read {source_arn}; "
+                    "its resource policy must allow the function's execution role."
+                )
                 continue
 
             esm_id = esm["UUID"]

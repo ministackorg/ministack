@@ -35,6 +35,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("kinesis")
@@ -47,6 +48,7 @@ ITERATOR_EXPIRY_SECONDS = 300
 _streams = AccountRegionScopedDict()
 _shard_iterators = AccountRegionScopedDict()
 _consumers = AccountRegionScopedDict()
+_resource_policies = AccountRegionScopedDict()  # stream or consumer ARN -> policy JSON
 # (ConsumerARN, ShardId) -> {"id", "started"} of the live SubscribeToShard
 _subscriptions = {}
 SUBSCRIPTION_SECONDS = 300
@@ -63,6 +65,7 @@ def get_state():
         "streams": copy.deepcopy(_streams),
         "shard_iterators": copy.deepcopy(_shard_iterators),
         "consumers": copy.deepcopy(_consumers),
+        "resource_policies": copy.deepcopy(_resource_policies),
     }
 
 
@@ -75,6 +78,7 @@ def _restore_state(data):
         _restore_stream_store(data.get("streams", {}))
         _restore_shard_iterator_store(data.get("shard_iterators", {}))
         _restore_consumer_store(data.get("consumers", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
 
 
 def _kinesis_arn_scope(value, default_account_id: str | None = None) -> tuple[str, str]:
@@ -401,6 +405,9 @@ async def handle_request(method, path, headers, body, query_params):
         "StopStreamEncryption": _stop_stream_encryption,
         "EnableEnhancedMonitoring": _enable_enhanced_monitoring,
         "DisableEnhancedMonitoring": _disable_enhanced_monitoring,
+        "PutResourcePolicy": _put_resource_policy,
+        "GetResourcePolicy": _get_resource_policy,
+        "DeleteResourcePolicy": _delete_resource_policy,
     }
 
     handler = handlers.get(action)
@@ -464,6 +471,7 @@ def _delete_stream(data):
         del _shard_iterators[tok]
     for carn in [a for a, c in _consumers.items() if c["StreamARN"] == stream["StreamARN"]]:
         del _consumers[carn]
+    _drop_resource_policies(stream["StreamARN"])
     del _streams[name]
     return json_response({})
 
@@ -1077,11 +1085,13 @@ def _deregister_consumer(data):
         if not consumer:
             return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
         del _consumers[consumer["ConsumerARN"]]
+        _resource_policies.pop(consumer["ConsumerARN"], None)
     elif stream_arn and consumer_name:
         consumer = _consumer_by_stream_and_name(stream_arn, consumer_name)
         if not consumer:
             return error_response_json("ResourceNotFoundException", "Consumer not found", 400)
         del _consumers[consumer["ConsumerARN"]]
+        _resource_policies.pop(consumer["ConsumerARN"], None)
     else:
         return error_response_json("ValidationException",
                                    "ConsumerARN or StreamARN+ConsumerName required", 400)
@@ -1404,8 +1414,131 @@ def _cbor_response(data: dict, status: int = 200):
     return status, {"Content-Type": "application/x-amz-cbor-1.1"}, body
 
 
+
+# ---------------------------------------------------------------------------
+# Resource policies (PutResourcePolicy / GetResourcePolicy / DeleteResourcePolicy)
+# ---------------------------------------------------------------------------
+
+def _policy_target(resource_arn):
+    """The stream or registered consumer a resource policy attaches to, in the
+    caller's account and region, or None."""
+    if not isinstance(resource_arn, str) or not resource_arn:
+        return None
+    return _resolve_stream_by_arn(resource_arn) or _consumer_from_arn(resource_arn)
+
+
+def _check_policy_resource(resource_arn):
+    """The error for a ResourceARN the caller cannot attach a policy to, or None.
+
+    The botocore docs for PutResourcePolicy: the calling identity must "belong
+    to the owner's account", so another account's ARN is AccessDeniedException.
+    """
+    if not resource_arn:
+        return error_response_json("InvalidArgumentException", "ResourceARN is required", 400)
+    account_id, region = _kinesis_arn_scope(resource_arn)
+    if account_id != get_account_id() or region != get_region():
+        return error_response_json(
+            "AccessDeniedException",
+            f"Account {get_account_id()} is not authorized to manage the resource policy of {resource_arn}",
+            400,
+        )
+    if _policy_target(resource_arn) is None:
+        return error_response_json("ResourceNotFoundException", f"Resource {resource_arn} not found", 400)
+    return None
+
+
+def _put_resource_policy(data):
+    resource_arn = data.get("ResourceARN")
+    err = _check_policy_resource(resource_arn)
+    if err:
+        return err
+    policy = data.get("Policy")
+    try:
+        document = json.loads(policy) if isinstance(policy, str) else None
+    except json.JSONDecodeError:
+        document = None
+    if not isinstance(document, dict) or not document.get("Statement"):
+        return error_response_json("InvalidArgumentException", "Policy is not a valid policy document", 400)
+    _resource_policies[resource_arn] = policy
+    return json_response({})
+
+
+def _get_resource_policy(data):
+    resource_arn = data.get("ResourceARN")
+    err = _check_policy_resource(resource_arn)
+    if err:
+        return err
+    # Policy is a required output member; a resource without one reports "{}".
+    return json_response({"Policy": _resource_policies.get(resource_arn) or "{}"})
+
+
+def _delete_resource_policy(data):
+    resource_arn = data.get("ResourceARN")
+    err = _check_policy_resource(resource_arn)
+    if err:
+        return err
+    if resource_arn not in _resource_policies:
+        return error_response_json("ResourceNotFoundException", f"No resource policy found for {resource_arn}", 400)
+    del _resource_policies[resource_arn]
+    return json_response({})
+
+
+def _drop_resource_policies(stream_arn):
+    """A deleted stream takes its own policy and its consumers' policies with it."""
+    for arn in [a for a in _resource_policies.keys() if a == stream_arn or a.startswith(stream_arn + "/consumer/")]:
+        del _resource_policies[arn]
+
+
+def stream_policy_for_arn(resource_arn):
+    """The resource policy and owner account of a stream or consumer ARN, for
+    the IAM evaluator. Looked up in the ARN's own account and region, since a
+    cross-account caller's request scope is its own account."""
+    account_id, region = _kinesis_arn_scope(resource_arn)
+    with request_scope(account_id, region):
+        if _policy_target(resource_arn) is None:
+            return None
+        return _resource_policies.get(resource_arn) or "", account_id
+
+
+# The read actions Lambda needs on a stream it maps (AWS Lambda developer guide,
+# "Cross-account event source mappings").
+_ESM_READ_ACTIONS = (
+    "kinesis:DescribeStream",
+    "kinesis:DescribeStreamSummary",
+    "kinesis:GetRecords",
+    "kinesis:GetShardIterator",
+    "kinesis:ListShards",
+)
+
+
+def stream_policy_allows_read(stream_arn, principal_arn, principal_account):
+    """Whether the stream's resource policy lets *principal_arn* (another
+    account's Lambda execution role session) do every read an event source
+    mapping needs. Only consulted under AUTH=true."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    found = stream_policy_for_arn(stream_arn)
+    if not found or not found[0]:
+        return False
+    policy, _owner = found
+    _account, region = _kinesis_arn_scope(stream_arn)
+    for action in _ESM_READ_ACTIONS:
+        ctx = EvalContext(
+            principal_arn=principal_arn,
+            principal_type="AssumedRole",
+            principal_account=principal_account,
+            action=action,
+            resource_arn=stream_arn,
+            region=region,
+        )
+        if evaluate_resource_policy(policy, ctx, service="kinesis").decision != "Allow":
+            return False
+    return True
+
+
 def reset():
     _streams.clear()
     _shard_iterators.clear()
     _consumers.clear()
+    _resource_policies.clear()
     _subscriptions.clear()

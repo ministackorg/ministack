@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Kinesis — stream resource policies and cross-account event source mappings** — `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` on stream and consumer ARNs answered `InvalidAction`, and `CreateEventSourceMapping` refused a stream in another account as invalid. Policies are now stored per stream or consumer in the owner's account, persisted, and dropped with their stream or consumer; only the owner's account can manage them (`AccessDeniedException` otherwise). A Lambda function can map a stream in another account in the same region, and the poller reads it from the owner's account. Under `AUTH=true` the stream's policy must allow the function's execution role `DescribeStream`, `DescribeStreamSummary`, `GetRecords`, `GetShardIterator` and `ListShards`; it is checked on every poll, so removing the grant stops delivery and the mapping's `LastProcessingResult` reports the problem. Under `AUTH=true` a stream policy also allows the users and roles of its own account that it names, as SQS and SNS policies do; Kinesis API calls naming another account's stream are still not served. Enhanced fan-out consumer ARNs as an event source are not covered.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
