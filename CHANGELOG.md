@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **ALB — `authenticate-oidc` on a 443 listener names its callback without the client's port** — the `redirect_uri` kept a port the client sent in `Host`. On a 443 listener it is now `https://<host>/oauth2/idpresponse`, as AWS sends it. Contributed by @skialpine.
 - **ALB — a redirect action's `Location` fills its placeholders as AWS does** — `#{protocol}` was always `http`, `#{port}` was dropped and `#{query}` was not applied, so the request's query string was lost. `#{protocol}` and `#{port}` are now the listener's, the port is always written (`http://host:80/path`), and the default `#{query}` keeps the request's query string; a configured `Query`, which was not stored, now applies and is described. Contributed by @skialpine.
 - **ALB — a Lambda target's event has the load balancer's shape** — it carried `queryStringParameters` with the first value of a repeated key, URL-decoded, plus `multiValueQueryStringParameters` and `multiValueHeaders`, and `body: null` without a body. With multi-value headers off (the default) it now carries `queryStringParameters` as the load balancer sends them, the last value of a repeated key and not decoded, no multi-value keys, and `body: ""`. Contributed by @skialpine.
 - **HTTP/1.1 status lines carry their reason phrase** — final responses were written as `HTTP/1.1 200 `, so a CloudFront Function saw an empty `statusDescription`. They now read `HTTP/1.1 200 OK`, `404 Not Found`. Contributed by @skialpine.

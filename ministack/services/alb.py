@@ -1950,6 +1950,9 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         return (401, {"Content-Type": "text/plain"}, b"Unauthorized")
 
     host = headers.get("host") or f"localhost:{listener_port}"
+    name, sep, client_port = host.rpartition(":")
+    if headers.get("x-forwarded-port") == "443" and sep and client_port.isdigit():
+        host = name  # On a 443 listener AWS names the callback without the client's port.
     proto = headers.get("x-forwarded-proto") or "http"
     redirect_uri = f"{proto}://{host}{OIDC_CALLBACK_PATH}"
     state = new_uuid()

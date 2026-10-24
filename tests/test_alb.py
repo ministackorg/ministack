@@ -965,6 +965,20 @@ def test_elbv2_dataplane_lambda_target_gets_the_host_as_sent(elbv2, lam):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-lhost-fn")
 
 
+def test_oidc_redirect_uri_on_a_443_listener_drops_the_clients_port(elbv2, lam):
+    name = "oidc-dp-443"
+    lb_arn, tg_arn, l_arn = _alb_with_oidc(elbv2, lam, name)
+    elbv2.modify_listener(ListenerArn=l_arn, Port=443, Protocol="HTTPS",
+                          Certificates=[{"CertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/x"}])
+    try:
+        status, headers, _ = _oidc_get("/private/thing", name)
+        assert status == 302
+        assert parse_qs(urlparse(headers["Location"]).query)["redirect_uri"] == [
+            f"https://{name}.alb.localhost/oauth2/idpresponse"]
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+
+
 def test_elbv2_target_host_follows_the_listener_port():
     from ministack.services import alb
 
