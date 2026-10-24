@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — restoring persisted state shares code between versions** — each function version got its own copy of its zip at boot, although versions share one blob file, so a state with many versions took gigabytes before the first request. Records that share a blob now share its bytes. Contributed by @skialpine.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
