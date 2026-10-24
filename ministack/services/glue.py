@@ -1817,25 +1817,59 @@ def _execute_subprocess(run, job, args, resolved):
 # Session.create_client covers every botocore vintage; the user script then
 # runs unmodified as __main__ with its own argv, so getResolvedOptions and
 # __name__ checks behave identically.
+# The patch is applied when the script first imports botocore.session, not
+# before. A deps zip on --py-files can hold its own botocore, and an early
+# import would load botocore from that zip, where it cannot read its data files.
 _GLUE_BOOT_SCRIPT = """\
 import os
 import runpy
 import sys
 
 _endpoint = os.environ.get("AWS_ENDPOINT_URL")
-if _endpoint:
-    try:
-        import botocore.session as _bs
-        _orig_create_client = _bs.Session.create_client
+
+
+class _PatchedSessionLoader:
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        _orig_create_client = module.Session.create_client
 
         def _create_client(self, *args, **kwargs):
             if not kwargs.get("endpoint_url"):
                 kwargs["endpoint_url"] = _endpoint
             return _orig_create_client(self, *args, **kwargs)
 
-        _bs.Session.create_client = _create_client
-    except Exception:
-        pass
+        module.Session.create_client = _create_client
+
+
+def _with_patch(spec):
+    if hasattr(spec.loader, "exec_module"):
+        spec.loader = _PatchedSessionLoader(spec.loader)
+    return spec
+
+
+class _BotocoreSessionFinder:
+    # Stays on sys.meta_path, so each load of botocore.session is patched, also after a find_spec probe or a reload.
+    def find_spec(self, name, path=None, target=None):
+        if name != "botocore.session":
+            return None
+        # The other finders resolve it from the sys.path of this import.
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(name, path, target)
+            if spec is not None:
+                return _with_patch(spec)
+        return None
+
+
+if _endpoint:
+    sys.meta_path.insert(0, _BotocoreSessionFinder())
 
 _script = {script!r}
 sys.argv = [_script] + sys.argv[1:]
