@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **OpenSearch — `OPENSEARCH_JAVA_OPTS`** — a small machine could not cap the heap of the engine containers MiniStack starts; the setting is now passed to each of them (per-domain and Serverless collection), and unset passes nothing. Contributed by @skialpine.
+
+### Fixed
+- **OpenSearch — the container reaper no longer removes a live domain's exited engine** — the reaper read a container id key that only the deferred create path set, so it took a domain's stopped engine for abandoned and removed it after two minutes; it now reads the key every domain record keeps. Contributed by @skialpine.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
