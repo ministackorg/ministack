@@ -3757,6 +3757,22 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
     return True
 
 
+def _kinesis_record_for_match(rec: dict) -> dict:
+    """The record a Kinesis filter pattern is matched against. AWS filters on
+    the metadata fields (``partitionKey``, ``sequenceNumber``, ...) next to the
+    event fields and on ``data`` as decoded JSON (AWS Lambda developer guide,
+    "Using event filtering with a Kinesis event source"). Data that isn't JSON
+    is left out, so a ``data`` pattern can't match it but metadata ones still can."""
+    flat = {k: v for k, v in rec.items() if k != "kinesis"}
+    flat.update(rec["kinesis"])
+    flat.pop("data", None)
+    try:
+        flat["data"] = json.loads(base64.b64decode(rec["kinesis"].get("data") or "", validate=True))
+    except (ValueError, TypeError):
+        pass
+    return flat
+
+
 def _apply_filter_criteria(records: list[dict], esm: dict) -> list[dict]:
     """Apply an ESM's FilterCriteria.Filters (OR across patterns) to a batch
     of records, returning only those matching at least one filter. If no
@@ -3781,7 +3797,7 @@ def _apply_filter_criteria(records: list[dict], esm: dict) -> list[dict]:
     for rec in records:
         # For SQS records the body is a string; AWS parses JSON bodies
         # automatically when the filter pattern targets `body.*` fields.
-        rec_for_match = dict(rec)
+        rec_for_match = _kinesis_record_for_match(rec) if isinstance(rec.get("kinesis"), dict) else dict(rec)
         body = rec.get("body")
         if isinstance(body, str):
             try:
