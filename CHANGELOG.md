@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — JSONata variables with the value `null`** — a variable assigned `null` read back as undefined, so `{% $var %}` failed with `States.QueryEvaluationError`; it now reads back as `null`, as on AWS. An unset variable still fails.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added
