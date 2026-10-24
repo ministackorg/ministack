@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — a package that is not a zip is refused** — `CreateFunction`, `UpdateFunctionCode` and `PublishLayerVersion` accepted a package that is not a zip (an empty file included) and answered success, `UpdateFunctionCode` keeping the previous code. They now answer `InvalidParameterValueException` `Could not unzip uploaded file. Please check your file, then try to upload again.` Contributed by @skialpine.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added

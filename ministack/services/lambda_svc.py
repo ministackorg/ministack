@@ -1302,6 +1302,17 @@ def _unzipped_size(zip_data: bytes | None) -> int:
         return 0
 
 
+def _reject_unreadable_zip(zip_data: bytes | None):
+    """A deployment package that is not a zip (an empty file included) is refused; None means no bytes were given."""
+    if zip_data is None or zipfile.is_zipfile(io.BytesIO(zip_data)):
+        return None
+    return error_response_json(
+        "InvalidParameterValueException",
+        "Could not unzip uploaded file. Please check your file, then try to upload again.",
+        400,
+    )
+
+
 def _validate_unzipped_size(zip_data: bytes | None):
     """A single deployment package's unzipped size against the 250 MB quota —
     used when publishing a layer version, whose own content must fit on its own."""
@@ -2346,7 +2357,7 @@ def _create_function(data: dict):
     layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
     if err:
         return err
-    err = _validate_total_unzipped_size(code_zip, layers_cfg)
+    err = _reject_unreadable_zip(code_zip) or _validate_total_unzipped_size(code_zip, layers_cfg)
     if err:
         return err
     if data.get("Layers") is not None:
@@ -2835,7 +2846,7 @@ def _update_code(name: str, data: dict):
                 f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
                 400,
             )
-    err = _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
+    err = _reject_unreadable_zip(code_zip) or _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
     if err is not None:
         return err
     if code_zip:
@@ -6407,7 +6418,7 @@ def _publish_layer_version(layer_name: str, data: dict):
             version_id=content.get("S3ObjectVersion"),
         )
 
-    err = _validate_unzipped_size(zip_data)
+    err = _reject_unreadable_zip(zip_data) or _validate_unzipped_size(zip_data)
     if err is not None:
         return err
 
