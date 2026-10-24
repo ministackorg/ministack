@@ -564,18 +564,20 @@ def test_elbv2_dataplane_event_shape(elbv2, lam):
     )
     lb_arn, tg_arn, l_arn, fn_arn = _alb_setup(elbv2, lam, "dp-alb-evt", "dp-alb-evt-fn", fn_code)
     try:
-        url = f"{_endpoint}/_alb/dp-alb-evt/check?foo=bar"
+        url = f"{_endpoint}/_alb/dp-alb-evt/check?foo=bar&a=1&a=3&q=x%20y&flag"
         resp = _req.urlopen(_req.Request(url, method="GET"))
         body = json.loads(resp.read())
         assert "requestContext" in body
         assert "elb" in body["requestContext"]
         assert body["httpMethod"] == "GET"
         assert body["path"] == "/check"
-        assert body["queryStringParameters"].get("foo") == "bar"
+        # Single-value by default: the last value of a repeated key, not URL-decoded, and no multi-value keys.
+        assert body["queryStringParameters"] == {"foo": "bar", "a": "3", "q": "x%20y", "flag": ""}
+        assert "multiValueQueryStringParameters" not in body and "multiValueHeaders" not in body
+        assert body["body"] == ""
         assert body["headers"]["x-forwarded-for"] == "127.0.0.1"
         assert (body["headers"]["x-forwarded-proto"], body["headers"]["x-forwarded-port"]) == ("http", "80")
         assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24}", body["headers"]["x-amzn-trace-id"])
-        assert body["multiValueHeaders"]["x-forwarded-for"] == ["127.0.0.1"]
         assert body["isBase64Encoded"] is False
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-evt-fn")
@@ -613,6 +615,7 @@ def test_elbv2_dataplane_fixed_response(elbv2, lam):
         resp = _req.urlopen(_req.Request(url, method="GET"))
         assert resp.status == 200
         assert resp.read() == b"maintenance"
+        assert resp.headers["Server"] == "awselb/2.0"
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
@@ -665,6 +668,35 @@ def test_elbv2_dataplane_redirect(elbv2):
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
         elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
+def test_elbv2_dataplane_redirect_location_keeps_the_listener_port_and_query(elbv2):
+    import http.client as _http
+    from urllib.parse import urlparse as _urlparse
+
+    lb_arn = elbv2.create_load_balancer(Name="dp-alb-redir-q")["LoadBalancers"][0]["LoadBalancerArn"]
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=80,
+        DefaultActions=[{"Type": "redirect", "RedirectConfig": {"Path": "/elsewhere", "StatusCode": "HTTP_302"}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        parsed = _urlparse(_endpoint)
+        conn = _http.HTTPConnection(parsed.hostname, parsed.port or 4566)
+        conn.request("GET", "/_alb/dp-alb-redir-q/x?y=1", headers={"Host": "app.example.test:9000"})
+        resp = conn.getresponse()
+        assert (resp.status, resp.getheader("Location")) == (302, "http://app.example.test:80/elsewhere?y=1")
+        conn.close()
+        elbv2.modify_listener(ListenerArn=l_arn, DefaultActions=[{"Type": "redirect", "RedirectConfig": {
+            "Path": "/elsewhere", "Query": "z=1&#{query}", "StatusCode": "HTTP_302"}}])
+        listener = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+        assert listener["DefaultActions"][0]["RedirectConfig"]["Query"] == "z=1&#{query}"
+        conn = _http.HTTPConnection(parsed.hostname, parsed.port or 4566)
+        conn.request("GET", "/_alb/dp-alb-redir-q/x?y=1", headers={"Host": "app.example.test:9000"})
+        assert conn.getresponse().getheader("Location") == "http://app.example.test:80/elsewhere?z=1&y=1"
+        conn.close()
+    finally:
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+
 
 def test_elbv2_dataplane_path_pattern_rule(elbv2, lam):
     """Path-pattern rule routes /api/* to one Lambda; default routes to another."""
@@ -871,6 +903,90 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         assert "services" in body
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
+def _start_echo_server():
+    """Answer every GET with the request target and headers the target received, as JSON."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            headers = {}
+            for name, value in self.headers.items():
+                headers.setdefault(name.lower(), []).append(value)
+            body = json.dumps({"path": self.path, "headers": headers}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _stop_server(server):
+    server.shutdown()
+    server.server_close()
+
+
+def test_elbv2_dataplane_forwards_the_client_host_header(elbv2):
+    """The target sees the client's Host, not its own address. On a default listener port (80)
+    AWS removes a port the client sent."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-host"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        for sent, received in (("app.example.test", "app.example.test"), ("app.example.test:8443", "app.example.test")):
+            req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": sent})
+            assert json.loads(_req.urlopen(req).read())["headers"]["host"] == [received]
+        elbv2.modify_load_balancer_attributes(LoadBalancerArn=lb_arn, Attributes=[
+            {"Key": "routing.http.preserve_host_header.enabled", "Value": "true"}])
+        req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": "app.example.test:8443"})
+        assert json.loads(_req.urlopen(req).read())["headers"]["host"] == ["app.example.test:8443"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_lambda_target_gets_the_host_as_sent(elbv2, lam):
+    fn_code = ("import json\n"
+               "def handler(event, context):\n"
+               "    return {'statusCode': 200, 'body': json.dumps(event['headers'])}\n")
+    lb_arn, tg_arn, l_arn, _fn_arn = _alb_setup(elbv2, lam, "dp-alb-lhost", "dp-alb-lhost-fn", fn_code)
+    try:
+        req = _req.Request(f"{_endpoint}/_alb/dp-alb-lhost/", headers={"Host": "app.example.test:9000"})
+        assert json.loads(_req.urlopen(req).read())["host"] == "app.example.test:9000"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-lhost-fn")
+
+
+def test_oidc_redirect_uri_on_a_443_listener_drops_the_clients_port(elbv2, lam):
+    name = "oidc-dp-443"
+    lb_arn, tg_arn, l_arn = _alb_with_oidc(elbv2, lam, name)
+    elbv2.modify_listener(ListenerArn=l_arn, Port=443, Protocol="HTTPS",
+                          Certificates=[{"CertificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/x"}])
+    try:
+        status, headers, _ = _oidc_get("/private/thing", name)
+        assert status == 302
+        assert parse_qs(urlparse(headers["Location"]).query)["redirect_uri"] == [
+            f"https://{name}.alb.localhost/oauth2/idpresponse"]
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+
+
+def test_elbv2_target_host_follows_the_listener_port():
+    from ministack.services import alb
+
+    assert alb._target_host_header("app.example.test:8443", 443) == "app.example.test"
+    assert alb._target_host_header("app.example.test", 8080) == "app.example.test:8080"
+    assert alb._target_host_header("app.example.test:9000", 8080) == "app.example.test:8080"
+    assert alb._target_host_header("[::1]:8080", 80) == "[::1]"
+    assert alb._target_host_header("[::1]", 8080) == "[::1]:8080"
 
 
 def _start_chunked_server(chunks, delay):
@@ -1263,6 +1379,42 @@ def test_elbv2_dataplane_streams_target_response(elbv2):
         assert first_byte_at < total_at - (delay * 3) / 2, (
             f"first byte at {first_byte_at:.3f}s, complete at {total_at:.3f}s — response was buffered"
         )
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_response_carries_the_load_balancers_date_once(elbv2):
+    """A load balancer writes its own Date in place of the target's; the response carries one."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _StaleDate(BaseHTTPRequestHandler):
+        def date_time_string(self, timestamp=None):
+            return "Mon, 01 Jan 2001 00:00:00 GMT"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StaleDate)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    lb_name = "dp-alb-date"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/", method="GET"))
+        resp.read()
+        dates = resp.headers.get_all("Date")
+        assert len(dates) == 1 and "2001" not in dates[0]
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         server.shutdown()
@@ -1688,7 +1840,7 @@ def test_unauthenticated_request_redirects_to_the_identity_provider(elbv2, lam):
         assert q["client_id"] == ["client-abc"]
         assert q["response_type"] == ["code"]
         assert q["scope"] == ["openid email"]
-        assert q["redirect_uri"][0].endswith("/oauth2/idpresponse")
+        assert q["redirect_uri"] == [f"http://{name}.alb.localhost:{_EXECUTE_PORT}/oauth2/idpresponse"]
         assert q["state"], "the provider must be given a state to return"
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
@@ -2853,3 +3005,161 @@ def test_elbv2_target_headers_follow_xff_mode_and_trace_id_rules():
         assert "x-forwarded-for" not in alb._target_headers(lb_arn, listener, {"x-forwarded-for": "127.0.0.4"}, "127.0.0.1")
     finally:
         alb._lb_attrs.pop(lb_arn, None)
+
+
+def test_elbv2_dataplane_forwards_the_path_as_sent(elbv2):
+    """The target receives the path with its percent-encoding, as the client sent it."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-rawpath"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/reason/Custom%20Thing/a%2Fb")
+        assert json.loads(resp.read())["path"] == "/reason/Custom%20Thing/a%2Fb"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_forwards_repeated_query_keys(elbv2):
+    """The target receives the query string as the client sent it."""
+    server = _start_echo_server()
+    lb_name = "dp-alb-query"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/search?a=1&b=2&a=3&q=x%20y&flag")
+        assert json.loads(resp.read())["path"] == "/search?a=1&b=2&a=3&q=x%20y&flag"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_forwards_options_to_the_target(elbv2):
+    """An OPTIONS request reaches the target, and the client sees the target's status and headers;
+    the gateway answers no preflight of its own for a load balancer."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Allow", "GET, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-options"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", method="OPTIONS",
+                           headers={"Origin": "https://app.example.test", "Access-Control-Request-Method": "GET"})
+        resp = _req.urlopen(req)
+        assert resp.status == 204
+        assert resp.headers.get("Allow") == "GET, OPTIONS"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_passes_accept_encoding_and_a_gzip_response_through(elbv2):
+    """The target receives the client's Accept-Encoding, and its gzip response reaches the client
+    still encoded."""
+    import gzip
+    import http.client
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            gzipped = "gzip" in (self.headers.get("Accept-Encoding") or "")
+            body = gzip.compress(b"compressed hello") if gzipped else b"plain hello"
+            self.send_response(200)
+            if gzipped:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-gzip"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    parsed = urlparse(_endpoint)
+    try:
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
+        conn.request("GET", f"/_alb/{lb_name}/", headers={"Accept-Encoding": "gzip"})
+        resp = conn.getresponse()
+        assert resp.getheader("Content-Encoding") == "gzip"
+        assert gzip.decompress(resp.read()) == b"compressed hello"
+        conn.close()
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_adds_no_cors_or_request_id_headers(elbv2):
+    """An ALB passes the target's response headers through; CORS and request ids are the application's."""
+    server, thread = _start_fixed_body_server(b"ok")
+    lb_name = "dp-alb-plain"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(f"{_endpoint}/_alb/{lb_name}/")
+        assert resp.read() == b"ok"
+        names = {name.lower() for name, _ in resp.getheaders()}
+        assert not names & {"access-control-allow-origin", "x-amzn-requestid", "x-amz-request-id"}
+        assert resp.headers["Server"].startswith("BaseHTTP")  # the target's own, not the load balancer's
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_elbv2_dataplane_applies_the_listeners_cors_response_headers(elbv2):
+    """A non-empty routing.http.response.access_control_*.header_value is added to the listener's
+    responses (replacing the target's own), and an empty one reverts to the default."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "https://target.example.test")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = "dp-alb-cors"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    prefix = "routing.http.response."
+
+    def fetch():
+        return _req.urlopen(f"{_endpoint}/_alb/{lb_name}/").headers
+
+    try:
+        assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+        assert fetch().get("Access-Control-Allow-Methods") is None
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "access_control_allow_origin.header_value", "Value": "https://app.example.test"},
+            {"Key": prefix + "access_control_allow_methods.header_value", "Value": "GET,POST"},
+        ])
+        headers = fetch()
+        assert headers.get_all("Access-Control-Allow-Origin") == ["https://app.example.test"]
+        assert headers.get("Access-Control-Allow-Methods") == "GET,POST"
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "access_control_allow_origin.header_value", "Value": ""},
+        ])
+        assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
