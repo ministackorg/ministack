@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Glue — a job's own botocore loads from where the script asks** — the Spark boot shim imported `botocore` before the job script ran, so a `--py-files` deps zip that holds botocore gave the zipped copy, and a script that then swapped the zip for its extracted folder failed with `DataNotFoundError: Unable to load data for: endpoints`; the shim now patches `Session.create_client` when the script first imports `botocore.session`, and still adds `endpoint_url` only when the caller sets none.
+
 ## [1.5.32] — 2026-10-23
 
 ### Added

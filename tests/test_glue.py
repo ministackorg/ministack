@@ -2762,6 +2762,92 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     assert run["JobRunState"] == "SUCCEEDED"
 
 
+# A small stand-in for botocore: create_client returns the endpoint_url it gets.
+_FAKE_BOTOCORE_SESSION = (
+    "ORIGIN = {origin!r}\n"
+    "class Session:\n"
+    "    def create_client(self, service, endpoint_url=None):\n"
+    "        return endpoint_url\n"
+)
+
+
+def _write_fake_botocore(root, origin):
+    (root / "botocore").mkdir(parents=True)
+    (root / "botocore" / "__init__.py").write_text("")
+    (root / "botocore" / "session.py").write_text(_FAKE_BOTOCORE_SESSION.format(origin=origin))
+
+
+def _run_glue_boot(tmp_path, script, pythonpath):
+    """Run the boot shim with the host Python, as spark-submit runs it, and return the job script's stdout."""
+    import subprocess
+    import sys
+
+    from ministack.services.glue import _GLUE_BOOT_SCRIPT
+
+    job = tmp_path / "job.py"
+    job.write_text(script)
+    boot = tmp_path / "_ministack_boot.py"
+    boot.write_text(_GLUE_BOOT_SCRIPT.format(script=str(job)))
+    env = {**os.environ, "AWS_ENDPOINT_URL": "http://ministack:4566", "PYTHONPATH": pythonpath}
+    proc = subprocess.run([sys.executable, str(boot)], capture_output=True, text=True, env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_glue_boot_patches_botocore_that_the_script_loads_after_it_swaps_its_deps_zip(tmp_path):
+    """A job that swaps its --py-files zip for an extracted folder gets botocore from the folder, with the patch."""
+    import zipfile
+
+    _write_fake_botocore(tmp_path / "zipped", "zip")
+    deps_zip = tmp_path / "glue-deps.zip"
+    with zipfile.ZipFile(deps_zip, "w") as zf:
+        for name in ("__init__.py", "session.py"):
+            zf.write(tmp_path / "zipped" / "botocore" / name, f"botocore/{name}")
+    _write_fake_botocore(tmp_path / "extracted", "folder")
+    script = (
+        "import sys\n"
+        f"sys.path.remove({str(deps_zip)!r})\n"
+        f"sys.path.insert(0, {str(tmp_path / 'extracted')!r})\n"
+        "import botocore.session\n"
+        "print(botocore.session.ORIGIN, botocore.session.Session().create_client('s3'))\n"
+    )
+
+    assert _run_glue_boot(tmp_path, script, str(deps_zip)) == "folder http://ministack:4566"
+
+
+@pytest.mark.parametrize("call,expected", [
+    ("create_client('s3')", "http://ministack:4566"),
+    ("create_client('s3', endpoint_url='http://custom:9000')", "http://custom:9000"),
+], ids=["default-endpoint", "caller-endpoint"])
+def test_glue_boot_sets_the_endpoint_only_when_the_caller_does_not(tmp_path, call, expected):
+    """botocore is not loaded before the script runs, and the patch keeps an endpoint_url that the caller sets."""
+    _write_fake_botocore(tmp_path / "site", "site")
+    script = (
+        "import sys\n"
+        "loaded_early = 'botocore' in sys.modules\n"
+        "import botocore.session\n"
+        f"print(loaded_early, botocore.session.Session().{call})\n"
+    )
+
+    assert _run_glue_boot(tmp_path, script, str(tmp_path / "site")) == f"False {expected}"
+
+
+def test_glue_boot_patches_botocore_after_a_find_spec_probe_and_a_reload(tmp_path):
+    """A find_spec check before the import does not use up the patch, and a reload is patched too."""
+    _write_fake_botocore(tmp_path / "site", "site")
+    script = (
+        "import importlib\n"
+        "import importlib.util\n"
+        "importlib.util.find_spec('botocore.session')\n"
+        "import botocore.session\n"
+        "first = botocore.session.Session().create_client('s3')\n"
+        "importlib.reload(botocore.session)\n"
+        "print(first, botocore.session.Session().create_client('s3'))\n"
+    )
+
+    assert _run_glue_boot(tmp_path, script, str(tmp_path / "site")) == "http://ministack:4566 http://ministack:4566"
+
+
 def test_glue_translate_loopback_conf_rewrites_only_gateway_loopbacks():
     from ministack.services.glue import _translate_loopback_conf
 
