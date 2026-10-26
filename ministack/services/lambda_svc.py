@@ -376,8 +376,11 @@ def _runtime_env_vars(config: dict) -> dict:
 # sha256, matching real Lambda's read-only /var/task — and both extraction
 # and every spawn take ``_provided_code_lock`` so no fork can overlap an
 # extraction write. Directories accumulate per distinct code sha within
-# ``tempfile.gettempdir()``; ``reset()`` removes them.
-_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), "ministack-provided-code")
+# ``tempfile.gettempdir()``; ``reset()`` removes them. Both caches are named
+# for this instance's gateway port: another MiniStack on the host shares the
+# temp directory and would otherwise remove a tree that is still in use.
+_GATEWAY_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), f"ministack-provided-code-{_GATEWAY_PORT}")
 _provided_code_lock = threading.Lock()
 _provided_code_dirs: dict[str, str] = {}
 
@@ -414,7 +417,7 @@ def _provided_runtime_code_dir(code_zip: bytes) -> str:
 # environment and mounts /var/task and /opt read-only. Directories accumulate
 # per distinct blob within ``tempfile.gettempdir()``; ``reset()`` removes
 # them, like the provided-runtime cache above.
-_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), "ministack-lambda-extract")
+_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), f"ministack-lambda-extract-{_GATEWAY_PORT}")
 _docker_extract_lock = threading.Lock()
 _docker_extract_dirs: dict[str, str] = {}
 

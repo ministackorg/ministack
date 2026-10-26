@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — two MiniStacks on one host no longer remove each other's function code** — the provided-runtime and Docker-executor extraction caches lived at fixed paths in the shared temp directory, so a second instance on the same host deleted a tree the first was still running from ("leftover from a previous process") and its `reset()` removed the first one's caches; an invocation then failed with `No such file or directory: .../bootstrap`. Both caches are now named for the instance's `GATEWAY_PORT`. Contributed by @skialpine.
 ### Added
 - **OpenSearch — engine containers run with a 512 MB heap** — every container MiniStack starts for a domain or Serverless collection used the image's 1 GB heap, too much for a small machine with several of them; each now runs with `-Xms512m -Xmx512m`, the heap OpenSearch's sample docker-compose uses. Contributed by @skialpine.
 
