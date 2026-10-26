@@ -1150,9 +1150,10 @@ def _validate_event_source_arn(event_source_arn: str):
     if spec.service == "kinesis" and spec.region != get_region():
         return None, _invalid_parameter_value(f"Event source region must match Lambda region {get_region()}")
     if spec.service == "kinesis" and spec.account_id != get_account_id():
-        # Another account's stream is not readable here; this is what AWS answers when it cannot read it.
-        return None, _invalid_parameter_value(
-            "Received Exception while reading from provided stream. No account found for the given parameters")
+        # Another account's stream is read through its resource policy; _create_esm checks it can be read.
+        if not _kinesis_stream_name_from_arn_spec(spec):
+            return None, _invalid_parameter_value(f"Invalid event source ARN: {event_source_arn}")
+        return spec, None
     scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
     if scope_err:
         return None, scope_err
@@ -7201,6 +7202,31 @@ def _validate_scaling_config(data: dict, source_arn: str = ""):
     return None
 
 
+def _cross_account_stream_read_error(stream_arn: str, func_name: str, qualifier: str | None):
+    """Why a mapping cannot read another account's stream, as AWS answers when it tries, or None."""
+    from ministack.app import AUTH
+    from ministack.services import kinesis as _kin
+
+    spec = parse_arn(stream_arn)
+    prefix = "Received Exception while reading from provided stream. "
+    if not any(account == spec.account_id for (account, _region, _name), _s in _kin._streams.all_items()):
+        return _invalid_parameter_value(prefix + "No account found for the given parameters")
+    name = _kinesis_stream_name_from_arn_spec(spec)
+    stream = _kin._streams.get_scoped(spec.account_id, spec.region, name)
+    if not stream or stream.get("StreamARN") != stream_arn:
+        return _invalid_parameter_value(prefix + f"Stream {name} under account {spec.account_id} not found.")
+    if AUTH:
+        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+        role = ((func_rec or {}).get("config") or {}).get("Role", "")
+        denied = _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id())
+        if denied:
+            session, action = denied
+            return _invalid_parameter_value(
+                prefix + f"User: {session} is not authorized to perform: {action} on resource: {stream_arn} "
+                f"because no resource-based policy allows the {action} action")
+    return None
+
+
 def _create_esm(data: dict):
     err = _validate_scaling_config(data, data.get("EventSourceArn", ""))
     if err:
@@ -7217,6 +7243,10 @@ def _create_esm(data: dict):
     event_source_spec, err = _validate_event_source_arn(event_source_arn)
     if err:
         return err
+    if event_source_spec.service == "kinesis" and event_source_spec.account_id != get_account_id():
+        err = _cross_account_stream_read_error(event_source_arn, func_name, qualifier)
+        if err:
+            return err
 
     enabled = data.get("Enabled", True)
     if isinstance(enabled, str):
@@ -7677,6 +7707,17 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
         logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
+def _cross_account_read_blocked(stream_arn, func_rec, func_name) -> bool:
+    """Under AUTH=true the stream's policy must still allow the function's role on every pass."""
+    from ministack.app import AUTH
+    from ministack.services import kinesis as _kin
+
+    if not AUTH:
+        return False
+    role = (func_rec.get("config") or {}).get("Role", "")
+    return _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id()) is not None
+
+
 def _poll_kinesis():
     """Returns True if any shard advanced past a batch this pass (successfully
     invoked, or filtered out entirely)."""
@@ -7695,11 +7736,7 @@ def _poll_kinesis():
                 source_spec = parse_arn(source_arn)
             except ArnParseError:
                 continue
-            if (
-                source_spec.service != "kinesis"
-                or source_spec.account_id != get_account_id()
-                or source_spec.region != get_region()
-            ):
+            if source_spec.service != "kinesis" or source_spec.region != get_region():
                 continue
             stream_name = _kinesis_stream_name_from_arn_spec(source_spec)
             if not stream_name:
@@ -7711,8 +7748,11 @@ def _poll_kinesis():
             if func_rec is None:
                 continue
 
-            stream = _kin._streams.get(stream_name)
+            # A cross-account mapping reads the stream in its owner's account, while its policy allows it.
+            stream = _kin._streams.get_scoped(source_spec.account_id, source_spec.region, stream_name)
             if not stream or stream.get("StreamARN") != source_arn or stream["StreamStatus"] != "ACTIVE":
+                continue
+            if source_spec.account_id != get_account_id() and _cross_account_read_blocked(source_arn, func_rec, func_name):
                 continue
 
             esm_id = esm["UUID"]

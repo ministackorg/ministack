@@ -15775,7 +15775,8 @@ def test_lambda_code_caches_belong_to_this_instance():
 @pytest.mark.parametrize("event_source_arn, message", [
     ("arn:aws:kinesis:us-west-2:000000000000:stream/esm-kinesis-source",
      "Event source region must match Lambda region us-east-1"),
-    ("arn:aws:kinesis:us-east-1:111111111111:stream/esm-kinesis-source",
+    # An account that holds nothing in this MiniStack, as AWS answered for an account that does not exist.
+    ("arn:aws:kinesis:us-east-1:987654321098:stream/esm-kinesis-source",
      "Received Exception while reading from provided stream. No account found for the given parameters"),
 ])
 def test_lambda_create_esm_kinesis_scope_messages_follow_aws(lam, event_source_arn, message):

@@ -1420,10 +1420,11 @@ def _cbor_response(data: dict, status: int = 200):
 # Resource policies (codes and messages as AWS answered them, us-east-1, 2026-10-26)
 # ---------------------------------------------------------------------------
 
-# The actions a policy may share (Kinesis Data Streams developer guide, "Controlling access").
+# The actions a policy may share (Kinesis Data Streams developer guide, "Controlling access", and
+# DescribeStream, which its cross-account Lambda section says to include).
 _POLICY_ACTIONS = {
-    "stream": {"kinesis:DescribeStreamSummary", "kinesis:GetRecords", "kinesis:GetShardIterator",
-               "kinesis:ListShards", "kinesis:PutRecord", "kinesis:PutRecords"},
+    "stream": {"kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
+               "kinesis:GetShardIterator", "kinesis:ListShards", "kinesis:PutRecord", "kinesis:PutRecords"},
     "consumer": {"kinesis:DescribeStreamConsumer", "kinesis:SubscribeToShard"},
 }
 
@@ -1523,6 +1524,40 @@ def _policy_resource(resource_arn, policy=None):
     if kind == "consumer" and not _consumer_from_arn(resource_arn):
         return None, error_response_json("ResourceNotFoundException", f"Consumer {resource_arn} not found", 400)
     return kind, None
+
+
+def stream_policy_for_arn(resource_arn):
+    """The resource policy and owner account of a stream or consumer, for the IAM evaluator; looked up
+    in the ARN's own account and region, since a cross-account caller's scope is its own account."""
+    from ministack.core.responses import request_scope
+
+    account_id, region = _kinesis_arn_scope(resource_arn)
+    with request_scope(account_id, region):
+        if not (_resolve_stream_by_arn(resource_arn) or _consumer_from_arn(resource_arn)):
+            return None
+        return _resource_policies.get(resource_arn) or "", account_id
+
+
+# What an event source mapping reads from a stream (Lambda developer guide, Kinesis permissions).
+_MAPPING_READ_ACTIONS = ("kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
+                         "kinesis:GetShardIterator", "kinesis:ListShards")
+
+
+def mapping_read_denied(stream_arn, role_arn, function_name, mapping_account):
+    """The first read a cross-account mapping's execution role may not make on the stream, or None.
+    Only the stream's resource policy can grant another account."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    found = stream_policy_for_arn(stream_arn)
+    policy = found[0] if found else ""
+    role_name = role_arn.rsplit("/", 1)[-1] if ":role/" in role_arn else ""
+    session = f"arn:aws:sts::{mapping_account}:assumed-role/{role_name}/{function_name}"
+    for action in _MAPPING_READ_ACTIONS:
+        ctx = EvalContext(principal_arn=session, principal_type="AssumedRole", principal_account=mapping_account,
+                          action=action, resource_arn=stream_arn, region=_kinesis_arn_scope(stream_arn)[1])
+        if not policy or evaluate_resource_policy(policy, ctx).decision != "Allow":
+            return session, action
+    return None
 
 
 def _put_resource_policy(data):

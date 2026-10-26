@@ -1073,3 +1073,82 @@ def test_kinesis_esm_filter_criteria_match_decoded_data_and_metadata(lam, kin, l
         lam.delete_event_source_mapping(UUID=esm)
         lam.delete_function(FunctionName=fn)
         kin.delete_stream(StreamName=stream)
+
+
+def _account_client(service, account):
+    return boto3.client(service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                        aws_access_key_id=account, aws_secret_access_key="test", region_name="us-east-1")
+
+
+def test_kinesis_esm_reads_a_stream_in_another_account(lam, logs, auth_enabled):
+    """A function in one account maps a stream in another (same region); records reach it. Under AUTH=true
+    the stream's resource policy must allow the function's execution role."""
+    if auth_enabled:
+        pytest.skip("account selection by access key needs AUTH unset")
+    owner = _account_client("kinesis", "111111111111")
+    stream = f"xacct-{_uuid_mod.uuid4().hex[:8]}"
+    owner.create_stream(StreamName=stream, ShardCount=1)
+    arn = owner.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    for n in range(3):
+        owner.put_record(StreamName=stream, Data=f"rec-{n}".encode(), PartitionKey="pk")
+
+    fn = f"xacct-fn-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", _FILTER_HANDLER)
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+    try:
+        missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+        with pytest.raises(ClientError) as exc:
+            lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=missing, StartingPosition="LATEST")
+        assert exc.value.response["Error"]["Message"] == (
+            "Received Exception while reading from provided stream. "
+            "Stream no-such-stream under account 111111111111 not found.")
+        esm = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=arn,
+                                              StartingPosition="TRIM_HORIZON")["UUID"]
+        received, deadline = [], time.time() + 30
+        while time.time() < deadline and len(received) < 3:
+            try:
+                events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]
+            except ClientError:
+                events = []
+            received = [line[len("XREC "):] for e in events for line in e["message"].splitlines()
+                        if line.startswith("XREC ")]
+            time.sleep(0.5)
+        assert received == ["rec-0", "rec-1", "rec-2"]
+        lam.delete_event_source_mapping(UUID=esm)
+    finally:
+        lam.delete_function(FunctionName=fn)
+        owner.delete_stream(StreamName=stream)
+
+
+def test_kinesis_mapping_read_needs_every_read_in_the_stream_policy():
+    """The stream policy must allow the function's role session every read a mapping makes."""
+    from ministack.core.responses import request_scope
+    from ministack.services import kinesis as kmod
+
+    owner, consumer, name = "111111111111", "222222222222", f"pol-{_uuid_mod.uuid4().hex[:8]}"
+    arn = f"arn:aws:kinesis:us-east-1:{owner}:stream/{name}"
+    role = f"arn:aws:iam::{consumer}:role/reader"
+    with request_scope(owner, "us-east-1"):
+        kmod._create_stream({"StreamName": name, "ShardCount": 1})
+    try:
+        assert kmod.mapping_read_denied(arn, role, "fn", consumer)[1] == "kinesis:DescribeStream"
+        reads = ["kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
+                 "kinesis:GetShardIterator", "kinesis:ListShards"]
+
+        def grant(actions):
+            with request_scope(owner, "us-east-1"):
+                kmod._resource_policies[arn] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"AWS": role}, "Action": actions, "Resource": arn}]})
+
+        grant(reads[:-1])
+        assert kmod.mapping_read_denied(arn, role, "fn", consumer)[1] == "kinesis:ListShards"
+        grant(reads)
+        assert kmod.mapping_read_denied(arn, role, "fn", consumer) is None
+        assert kmod.mapping_read_denied(arn, f"arn:aws:iam::{consumer}:role/other", "fn", consumer) is not None
+    finally:
+        with request_scope(owner, "us-east-1"):
+            kmod._resource_policies.pop(arn, None)
+            kmod._streams.pop(name, None)
