@@ -6299,7 +6299,7 @@ def test_streamed_alb_body_idle_past_the_read_timeout_is_an_origin_timeout():
 
 
 def _function_url_dist(cloudfront, url_host: str, protocol_policy: str = "https-only",
-                       origin_request_policy: str = _ALL_VIEWER_EXCEPT_HOST) -> str:
+                       origin_request_policy: str = _ALL_VIEWER_EXCEPT_HOST, response_function_arn: str = "") -> str:
     origin = {
         "Id": "url-origin", "DomainName": url_host,
         "CustomHeaders": {"Quantity": 1, "Items": [{"HeaderName": "X-Origin-Verify", "HeaderValue": "origin-token"}]},
@@ -6319,6 +6319,9 @@ def _function_url_dist(cloudfront, url_host: str, protocol_policy: str = "https-
             "CachePolicyId": _CACHING_DISABLED, "OriginRequestPolicyId": origin_request_policy,
         },
     }
+    if response_function_arn:
+        dist_config["DefaultCacheBehavior"]["FunctionAssociations"] = {
+            "Quantity": 1, "Items": [{"FunctionARN": response_function_arn, "EventType": "viewer-response"}]}
     return cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]["DomainName"]
 
 
@@ -6398,3 +6401,22 @@ def test_request_id_has_cloudfronts_shape(cf_raw_origin_stack):
     lowered = {name.lower(): value for name, value in headers.items()}
     assert re.fullmatch(r"[A-Za-z0-9_-]{54}==", lowered["x-amz-cf-id"]), lowered["x-amz-cf-id"]
     assert re.fullmatch(r"1\.1 [0-9a-f]{32}\.cloudfront\.net \(CloudFront\)", lowered["via"]), lowered["via"]
+
+
+def test_function_url_origin_response_headers_follow_aws(cloudfront, function_url_origin):
+    """Captured on AWS: no Server from an origin that sends none, and one request id, the Function URL's own."""
+    status, headers, _body = _get(_function_url_dist(cloudfront, function_url_origin["open"]), "/hello")
+    assert status == 200
+    names = [k.lower() for k in headers]
+    assert "server" not in names
+    assert names.count("x-amzn-requestid") == 1 and "x-amz-request-id" not in names
+
+
+def test_viewer_response_function_adds_cloudfront_server_when_the_origin_sends_none(cloudfront, function_url_origin):
+    _skip_without_node()
+    fn_arn = _create_function(cloudfront, f"cf-dp-server-{_uuid_mod.uuid4().hex[:8]}",
+                              b"function handler(event) { return event.response; }")
+    dist_host = _function_url_dist(cloudfront, function_url_origin["open"], response_function_arn=fn_arn)
+    status, headers, _body = _get(dist_host, "/hello")
+    assert status == 200
+    assert {k.lower(): v for k, v in headers.items()}["server"] == "CloudFront"

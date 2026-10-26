@@ -616,6 +616,9 @@ def test_elbv2_dataplane_fixed_response(elbv2, lam):
         assert resp.status == 200
         assert resp.read() == b"maintenance"
         assert resp.headers["Server"] == "awselb/2.0"
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": "routing.http.response.server.enabled", "Value": "false"}])
+        assert _req.urlopen(_req.Request(url, method="GET")).headers.get("Server") is None
     finally:
         elbv2.delete_listener(ListenerArn=l_arn)
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
@@ -3160,6 +3163,17 @@ def test_elbv2_dataplane_applies_the_listeners_cors_response_headers(elbv2):
             {"Key": prefix + "access_control_allow_origin.header_value", "Value": ""},
         ])
         assert fetch().get_all("Access-Control-Allow-Origin") == ["https://target.example.test"]
+        # The other insert headers on the same page behave the same way.
+        elbv2.modify_listener_attributes(ListenerArn=l_arn, Attributes=[
+            {"Key": prefix + "strict_transport_security.header_value", "Value": "max-age=31536000"},
+            {"Key": prefix + "content_security_policy.header_value", "Value": "default-src 'self'"},
+            {"Key": prefix + "x_content_type_options.header_value", "Value": "nosniff"},
+            {"Key": prefix + "x_frame_options.header_value", "Value": "DENY"},
+        ])
+        headers = fetch()
+        assert (headers.get("Strict-Transport-Security"), headers.get("Content-Security-Policy"),
+                headers.get("X-Content-Type-Options"), headers.get("X-Frame-Options")) == (
+            "max-age=31536000", "default-src 'self'", "nosniff", "DENY")
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _stop_server(server)

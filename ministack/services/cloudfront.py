@@ -5861,13 +5861,13 @@ def _cf_via_hash() -> str:
     return os.urandom(16).hex()
 
 
-def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None = None) -> dict:
+def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None = None, edge_server: bool = True) -> dict:
     result = dict(headers)
     result["via"] = f"1.1 {_cf_via_hash()}.cloudfront.net (CloudFront)"
     result["x-cache"] = x_cache
     result["x-amz-cf-pop"] = "LOC50-C1"
     result["x-amz-cf-id"] = request_id or _cf_request_id()
-    if not any(k.lower() == "server" for k in result):
+    if edge_server and not any(k.lower() == "server" for k in result):
         result["server"] = "CloudFront"
     return result
 
@@ -6451,5 +6451,7 @@ async def handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str
             response_headers["set-cookie"] = set_cookie_values if len(set_cookie_values) > 1 else set_cookie_values[0]
         response_body = _body_from_response_event(response, origin_body)
 
-    final_headers = _add_cloudfront_headers(response_headers, "Miss from cloudfront")
+    # An origin response without Server gets CloudFront's only when a viewer-response function ran (observed on AWS).
+    ran_response_function = bool(response_function_arn) and origin_status < 400
+    final_headers = _add_cloudfront_headers(response_headers, "Miss from cloudfront", edge_server=ran_response_function)
     return status, _render_headers(final_headers, title_case=True), response_body

@@ -2376,6 +2376,10 @@ _LISTENER_RESPONSE_HEADERS = {
         ("access_control_allow_credentials", "Access-Control-Allow-Credentials"),
         ("access_control_expose_headers", "Access-Control-Expose-Headers"),
         ("access_control_max_age", "Access-Control-Max-Age"),
+        ("strict_transport_security", "Strict-Transport-Security"),
+        ("content_security_policy", "Content-Security-Policy"),
+        ("x_content_type_options", "X-Content-Type-Options"),
+        ("x_frame_options", "X-Frame-Options"),
     )
 }
 
@@ -2392,13 +2396,17 @@ def _with_listener_response_headers(listener_arn, response):
     return status, {**{k: v for k, v in headers.items() if k.lower() not in replaced}, **added}, body
 
 
-def _with_alb_server(response):
+def _with_alb_server(response, listener_arn=None):
     """A response the load balancer makes itself (Lambda target, fixed-response, redirect, authentication, its own
-    errors) carries its Server header; an instance or IP target's response keeps the target's own, or none."""
+    errors) carries its Server header unless the listener's routing.http.response.server.enabled is false; an
+    instance or IP target's response keeps the target's own, or none."""
     from ministack.core.responses import StreamingResponse
 
     status, headers, body = response
     if isinstance(body, StreamingResponse) or any(k.lower() == "server" for k in headers):
+        return response
+    if listener_arn and any(a.get("Key") == "routing.http.response.server.enabled" and a.get("Value") == "false"
+                            for a in _listener_attrs.get(listener_arn, [])):
         return response
     return status, {**headers, "Server": "awselb/2.0"}, body
 
@@ -2441,10 +2449,10 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
                                                   target_headers, body, query_params, port,
                                                   lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
                                                   raw_query_string=raw_query_string, raw_path=raw_path)
-                return _with_listener_response_headers(l_arn, _with_alb_server(response))
+                return _with_listener_response_headers(l_arn, _with_alb_server(response, l_arn))
 
     return _with_alb_server((502, {"Content-Type": "application/json"},
-            json.dumps({"message": "No matching ALB rule found"}).encode()))
+            json.dumps({"message": "No matching ALB rule found"}).encode()), l_arn)
 
 
 def reset():

@@ -724,9 +724,8 @@ def test_opensearch_cold_image_publishes_the_real_endpoint(fake_docker, monkeypa
     assert rec["Endpoint"] == "localhost:19200"
 
 
-@pytest.mark.parametrize("value", ["-Xms512m -Xmx512m", ""])
-def test_opensearch_engine_container_passes_java_opts(fake_docker, monkeypatch, value):
-    """OPENSEARCH_JAVA_OPTS reaches the engine container when set; unset or empty adds nothing."""
+def test_opensearch_engine_container_has_a_512m_heap(fake_docker, monkeypatch):
+    """Every engine container runs with a 512 MB heap rather than the image's 1 GB."""
     from ministack.services import opensearch as os_
 
     runs = []
@@ -734,12 +733,10 @@ def test_opensearch_engine_container_passes_java_opts(fake_docker, monkeypatch, 
     monkeypatch.setattr(
         fake_docker.containers, "run", lambda **kw: (runs.append(kw), run(**kw))[1]
     )
-    monkeypatch.setattr(os_, "JAVA_OPTS", value)
 
-    os_.start_engine_container(fake_docker, f"java-opts-{_uid()}", {}, 19203)
+    os_.start_engine_container(fake_docker, f"heap-{_uid()}", {}, 19203)
 
-    env = runs[0]["environment"]
-    assert env.get("OPENSEARCH_JAVA_OPTS") == (value or None)
+    assert runs[0]["environment"]["OPENSEARCH_JAVA_OPTS"] == "-Xms512m -Xmx512m"
 
 
 @pytest.mark.serial

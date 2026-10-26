@@ -58,7 +58,6 @@ DASHBOARDS_ENABLED = os.environ.get("OPENSEARCH_DASHBOARDS", "0") == "1"
 BASE_PORT = int(os.environ.get("OPENSEARCH_BASE_PORT", "14571"))
 DASHBOARDS_BASE_PORT = int(os.environ.get("OPENSEARCH_DASHBOARDS_BASE_PORT", "15601"))
 DEFAULT_IMAGE = os.environ.get("OPENSEARCH_IMAGE", "opensearchproject/opensearch:2.15.0")
-JAVA_OPTS = os.environ.get("OPENSEARCH_JAVA_OPTS", "")
 DASHBOARDS_IMAGE = os.environ.get(
     "OPENSEARCH_DASHBOARDS_IMAGE", "opensearchproject/opensearch-dashboards:2.15.0"
 )
@@ -398,11 +397,11 @@ def start_engine_container(docker, name: str, labels: dict, host_port=None, volu
             # matching that here would block every smoke test.
             "DISABLE_SECURITY_PLUGIN": "true",
             "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "MinIstack-Admin-1!",
+            # The heap OpenSearch's own sample docker-compose uses, instead of the image's 1 GB per container.
+            "OPENSEARCH_JAVA_OPTS": "-Xms512m -Xmx512m",
         },
         ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
     )
-    if JAVA_OPTS:
-        run_kwargs["environment"]["OPENSEARCH_JAVA_OPTS"] = JAVA_OPTS
     if volumes is not None:
         run_kwargs["volumes"] = volumes
     if DOCKER_NETWORK:

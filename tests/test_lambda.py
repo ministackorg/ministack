@@ -15748,6 +15748,7 @@ def test_lambda_function_url_event_and_response_follow_aws(lam):
         assert event["requestContext"]["accountId"] == "anonymous"
         assert event["requestContext"]["requestId"] == request_id
         assert trace.startswith(headers["x-amzn-trace-id"] + ";Parent=")
+        assert len(resp.headers.get_all("x-amzn-RequestId")) == 1 and resp.headers.get("x-amz-request-id") is None
         assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=0;Lineage=1:[0-9a-f]{8}:0", trace)
     finally:
         lam.delete_function(FunctionName=name)
