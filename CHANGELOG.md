@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Aurora DSQL — `AWS IAM GRANT` and `AWS IAM REVOKE`** — with `DSQL_STRICT=1` both were a syntax error, so a migration that maps a Postgres role to an IAM role stopped there. Sent on their own over the simple query protocol (psql, psycopg2), a GRANT maps one or more ARNs to a role and a REVOKE unmaps them; the mappings read back through `sys.iam_pg_role_mappings` with DSQL's six columns and types, a rollback undoes a GRANT, and a GRANT after other DDL in the same transaction answers DSQL's `0A000`. Re-granting raises DSQL's NOTICE and revoking a missing mapping its WARNING; an unknown role answers `42704`, a value that is not an ARN `0P000`, and granting the signed-in role to itself `42501`. Contributed by @toby6578.
+
 ## [1.5.33] — 2026-10-26
 
 ### Added

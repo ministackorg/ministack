@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import socket
 import struct
 import threading
@@ -710,6 +711,8 @@ class TestClassifyStatement:
             ("SHOW server_version", "other"),
             ("GRANT SELECT ON t TO r", "other"),
             ("REVOKE SELECT ON t FROM r", "other"),
+            ("AWS IAM GRANT r TO 'arn:aws:iam::123456789012:role/x'", "ddl"),
+            ("aws iam revoke r FROM 'arn:aws:iam::123456789012:role/x'", "ddl"),
             # Leading comments must not hide the statement keyword.
             ("-- migration 004\nCREATE TABLE t (a int)", "ddl"),
             ("/* flyway */ INSERT INTO t VALUES (1)", "dml"),
@@ -733,6 +736,63 @@ class TestClassifyStatement:
     )
     def test_classify(self, sql, expected):
         assert pgproxy.classify_statement(sql) == expected
+
+
+class TestAwsIamParsing:
+    """``AWS IAM GRANT`` / ``REVOKE`` grammar and the errors DSQL raises for it
+    before touching a role (measured on Aurora DSQL, eu-west-1 2026-10-26)."""
+
+    def test_grant_with_several_arns(self):
+        trust = pgproxy.match_aws_iam(
+            "AWS IAM GRANT Probe_Role TO 'arn:aws:iam::123456789012:role/a', "
+            "'arn:aws:iam::123456789012:user/b'"
+        )
+        assert (trust.action, trust.role, trust.arns) == (
+            "GRANT", "probe_role",
+            ["arn:aws:iam::123456789012:role/a", "arn:aws:iam::123456789012:user/b"],
+        )
+        assert trust.tag == "AWS IAM GRANT"
+
+    def test_revoke_keeps_a_quoted_role_verbatim(self):
+        trust = pgproxy.match_aws_iam(
+            "aws iam revoke \"Mixed\" from 'arn:aws:iam::123456789012:role/a';"
+        )
+        assert (trust.action, trust.role, trust.tag) == ("REVOKE", "Mixed", "AWS IAM REVOKE")
+
+    def test_other_statements_are_not_matched(self):
+        assert pgproxy.match_aws_iam("GRANT r TO s") is None
+        assert pgproxy.match_aws_iam("SELECT 'AWS IAM GRANT'") is None
+
+    def test_an_arn_must_be_a_string_literal(self):
+        err = pgproxy.match_aws_iam(
+            'AWS IAM GRANT probe_role TO "arn:aws:iam::123456789012:role/Quoted"'
+        )
+        assert err.sqlstate == "42601"
+        assert err.message == (
+            'syntax error at or near ""arn:aws:iam::123456789012:role/Quoted""'
+        )
+
+    def test_a_value_that_is_not_an_arn_is_refused(self):
+        err = pgproxy.match_aws_iam("AWS IAM GRANT probe_role TO 'not-an-arn'")
+        assert (err.sqlstate, err.message) == ("0P000", "IAM role must look like an IAM ARN")
+
+    def test_comments_inside_the_statement_are_ignored(self):
+        trust = pgproxy.match_aws_iam(
+            "AWS IAM GRANT r /* trust */ TO -- the API\n"
+            "'arn:aws:iam::123456789012:role/a' -- done"
+        )
+        assert trust.arns == ["arn:aws:iam::123456789012:role/a"]
+
+    def test_grant_needs_to_and_revoke_needs_from(self):
+        assert pgproxy.match_aws_iam(
+            "AWS IAM GRANT r FROM 'arn:aws:iam::123456789012:role/a'"
+        ).message == 'syntax error at or near "FROM"'
+        assert pgproxy.match_aws_iam(
+            "AWS IAM REVOKE r TO 'arn:aws:iam::123456789012:role/a'"
+        ).message == 'syntax error at or near "TO"'
+        assert pgproxy.match_aws_iam("AWS IAM GRANT r TO").message == (
+            "syntax error at end of input"
+        )
 
 
 class TestSqlLexing:
@@ -2720,6 +2780,324 @@ class TestTransactionAbortSemantics:
             assert c.extended("INSERT INTO ab_x VALUES (1)").sqlstate == "25P02"
             assert c.simple("COMMIT").tag == "ROLLBACK"
             assert c.simple("SELECT count(*) FROM ab_x").rows == [("0",)]
+
+
+_PROBE_ROLE_ARN = "arn:aws:iam::123456789012:role/ministack-probe"
+_PROBE_USER_ARN = "arn:aws:iam::123456789012:user/ministack-probe"
+_IN_TXN_ARN = "arn:aws:iam::123456789012:role/InTxn"
+
+
+@requires_docker
+@pytest.mark.data_plane
+class TestAwsIamTrust:
+    """IAM trust over the wire. Messages, SQLSTATEs, the transaction rules and
+    the shape of sys.iam_pg_role_mappings were measured on Aurora DSQL,
+    eu-west-1 2026-10-26."""
+
+    @pytest.fixture
+    def role(self, dsql_proxy):
+        name = f"iam_{secrets.token_hex(4)}"
+        conn = _pg_connect(dsql_proxy)
+        conn.cursor().execute(f"CREATE ROLE {name} WITH LOGIN")
+        yield name
+        cur = conn.cursor()
+        cur.execute(
+            f"AWS IAM REVOKE {name} FROM '{_PROBE_ROLE_ARN}', '{_PROBE_USER_ARN}', '{_IN_TXN_ARN}'"
+        )
+        cur.execute(f"DROP ROLE {name}")
+        conn.close()
+
+    @staticmethod
+    def _mappings(cur, role):
+        cur.execute(
+            "SELECT arn, pg_role_name, grantor_pg_role_name "
+            f"FROM sys.iam_pg_role_mappings WHERE pg_role_name = '{role}' ORDER BY arn"
+        )
+        return cur.fetchall()
+
+    def test_the_view_has_dsqls_columns_and_types(self, dsql_proxy):
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT attname, format_type(atttypid, atttypmod), "
+                "(SELECT collname FROM pg_collation WHERE oid = attcollation) "
+                "FROM pg_attribute WHERE attrelid = 'sys.iam_pg_role_mappings'::regclass "
+                "AND attnum > 0 ORDER BY attnum"
+            )
+            assert cur.fetchall() == [
+                ("iam_oid", "oid", None),
+                ("arn", "text", "C"),
+                ("pg_role_oid", "oid", None),
+                ("pg_role_name", "name", "C"),
+                ("grantor_pg_role_oid", "oid", None),
+                ("grantor_pg_role_name", "name", "C"),
+            ]
+        finally:
+            conn.close()
+
+    def test_grant_maps_the_arn_and_reports_the_grantor(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            assert cur.statusmessage == "AWS IAM GRANT"
+            assert self._mappings(cur, role) == [(_PROBE_ROLE_ARN, role, "admin")]
+            cur.execute(
+                "SELECT m.pg_role_oid = r.oid, m.grantor_pg_role_oid = g.oid "
+                "FROM sys.iam_pg_role_mappings m JOIN pg_roles r ON r.rolname = m.pg_role_name "
+                f"JOIN pg_roles g ON g.rolname = 'admin' WHERE m.pg_role_name = '{role}'"
+            )
+            assert cur.fetchall() == [(True, True)]
+        finally:
+            conn.close()
+
+    def test_one_arn_keeps_one_iam_oid_across_roles(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"CREATE ROLE {role}_b")
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            cur.execute(f"AWS IAM GRANT {role}_b TO '{_PROBE_ROLE_ARN}'")
+            cur.execute(
+                "SELECT count(DISTINCT iam_oid) FROM sys.iam_pg_role_mappings "
+                f"WHERE pg_role_name IN ('{role}', '{role}_b')"
+            )
+            assert cur.fetchone() == (1,)
+            cur.execute(
+                "SELECT count(*) FROM pg_roles r JOIN sys.iam_pg_role_mappings m "
+                f"ON r.oid = m.iam_oid WHERE m.pg_role_name = '{role}'"
+            )
+            assert cur.fetchone() == (0,)
+            cur.execute(f"AWS IAM REVOKE {role}_b FROM '{_PROBE_ROLE_ARN}'")
+            cur.execute(f"DROP ROLE {role}_b")
+        finally:
+            conn.close()
+
+    def test_regranting_raises_a_notice_and_grants_the_rest(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            del conn.notices[:]
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}', '{_PROBE_USER_ARN}'")
+            assert cur.statusmessage == "AWS IAM GRANT"
+            assert conn.notices == [
+                f'NOTICE:  IAM role "{_PROBE_ROLE_ARN}" has already been granted access '
+                f'to role "{role}" by role "admin"\n'
+            ]
+            assert self._mappings(cur, role) == [
+                (_PROBE_ROLE_ARN, role, "admin"),
+                (_PROBE_USER_ARN, role, "admin"),
+            ]
+        finally:
+            conn.close()
+
+    def test_an_unknown_role_is_refused(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            for sql in (
+                f"AWS IAM GRANT missing_role TO '{_PROBE_ROLE_ARN}'",
+                f"AWS IAM REVOKE missing_role FROM '{_PROBE_ROLE_ARN}'",
+            ):
+                with pytest.raises(psycopg2.Error) as exc:
+                    conn.cursor().execute(sql)
+                assert exc.value.pgcode == "42704"
+                assert 'role "missing_role" does not exist' in str(exc.value)
+        finally:
+            conn.close()
+
+    def test_the_signed_in_role_cannot_grant_itself(self, dsql_proxy):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            with pytest.raises(psycopg2.Error) as exc:
+                conn.cursor().execute(f"AWS IAM GRANT admin TO '{_PROBE_ROLE_ARN}'")
+            assert exc.value.pgcode == "42501"
+            assert exc.value.pgerror.startswith(
+                'ERROR:  permission denied to grant IAM trust with role "admin"'
+            )
+            assert exc.value.diag.message_detail == (
+                'Only roles with the ADMIN option on role "admin" may grant IAM trust to this role.'
+            )
+        finally:
+            conn.close()
+
+    def test_rollback_undoes_a_grant(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy, autocommit=False)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_IN_TXN_ARN}'")
+            assert self._mappings(cur, role) == [(_IN_TXN_ARN, role, "admin")]
+            conn.rollback()
+            assert self._mappings(cur, role) == []
+        finally:
+            conn.close()
+
+    def test_a_grant_after_other_ddl_in_a_transaction_is_refused(self, dsql_proxy, role):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy, autocommit=False)
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE iam_after_ddl (id int PRIMARY KEY)")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(f"AWS IAM GRANT {role} TO '{_IN_TXN_ARN}'")
+            assert exc.value.pgcode == "0A000"
+            assert "multiple ddl statements not supported in a transaction" in str(exc.value)
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def test_a_grant_after_a_select_in_a_transaction_commits(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy, autocommit=False)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.execute(f"AWS IAM GRANT {role} TO '{_IN_TXN_ARN}'")
+            conn.commit()
+            assert self._mappings(cur, role) == [(_IN_TXN_ARN, role, "admin")]
+        finally:
+            conn.close()
+
+    def test_revoke_removes_the_mapping_and_warns_when_there_is_none(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}', '{_PROBE_USER_ARN}'")
+            cur.execute(f"AWS IAM REVOKE {role} FROM '{_PROBE_ROLE_ARN}'")
+            assert cur.statusmessage == "AWS IAM REVOKE"
+            assert self._mappings(cur, role) == [(_PROBE_USER_ARN, role, "admin")]
+            del conn.notices[:]
+            cur.execute(f"AWS IAM REVOKE {role} FROM '{_PROBE_ROLE_ARN}'")
+            assert cur.statusmessage == "AWS IAM REVOKE"
+            assert conn.notices == [
+                f'WARNING:  IAM role "{_PROBE_ROLE_ARN}" has not been granted access '
+                f'to role "{role}"\n'
+            ]
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("failure", ["unreachable", "refused by the backend"])
+    def test_a_catalog_that_cannot_be_created_leaves_the_connection_usable(
+        self, dsql_proxy, pg_backend, role, monkeypatch, failure
+    ):
+        psycopg2 = pytest.importorskip("psycopg2")
+        name = f"iam_db_{secrets.token_hex(4)}"
+        admin = psycopg2.connect(
+            host=pg_backend[0], port=pg_backend[1], user="postgres", dbname="postgres"
+        )
+        admin.autocommit = True
+        admin.cursor().execute(f"CREATE DATABASE {name}")
+        attempts = []
+
+        async def refused(conn):
+            attempts.append(conn.database)
+            if failure == "unreachable":
+                raise OSError("connection refused")
+            return "55P03 canceling statement due to lock timeout"
+
+        monkeypatch.setattr(pgproxy, "_create_iam_catalog", refused)
+        try:
+            conn = psycopg2.connect(
+                host="127.0.0.1", port=dsql_proxy, user="admin", password="x", dbname=name
+            )
+            conn.autocommit = True
+            try:
+                for _ in range(2):
+                    with pytest.raises(psycopg2.Error) as exc:
+                        conn.cursor().execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+                    assert exc.value.pgcode == "42P01"
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                assert cur.fetchone() == (1,)
+                assert attempts == [name, name]
+            finally:
+                conn.close()
+        finally:
+            admin.cursor().execute(f"DROP DATABASE {name} WITH (FORCE)")
+            admin.close()
+
+    def test_the_extended_protocol_is_refused(self, dsql_proxy, role):
+        with _WireClient(dsql_proxy) as c:
+            for sql in (
+                f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'",
+                f"AWS IAM GRANT admin TO '{_PROBE_ROLE_ARN}'",
+            ):
+                result = c.extended(sql)
+                assert result.sqlstate == "0A000"
+                assert "simple query protocol" in result.message
+            assert c.extended(
+                "SELECT count(*) FROM sys.iam_pg_role_mappings WHERE pg_role_name = $1", [role]
+            ).rows == [("0",)]
+
+    def test_quoting_holds_without_standard_conforming_strings(self, dsql_proxy, role):
+        psycopg2 = pytest.importorskip("psycopg2")
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute("SET standard_conforming_strings = off")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(
+                    "AWS IAM GRANT \"x\\' AS oid) SELECT 1, 2 WHERE false; "
+                    "CREATE TABLE iam_injected (id serial); --\" "
+                    "TO 'arn:aws:iam::123456789012:role/x'"
+                )
+            assert exc.value.pgcode == "42704"
+            cur.execute("SET standard_conforming_strings = on")
+            cur.execute(
+                "SELECT count(*) FROM pg_tables WHERE tablename = 'iam_injected'"
+            )
+            assert cur.fetchone() == (0,)
+            cur.execute(f"AWS IAM GRANT {role} TO 'arn:aws:iam::123456789012:role/a\\b'")
+            assert [m[0] for m in self._mappings(cur, role)] == [
+                "arn:aws:iam::123456789012:role/a\\b"
+            ]
+            cur.execute(f"AWS IAM REVOKE {role} FROM 'arn:aws:iam::123456789012:role/a\\b'")
+        finally:
+            conn.close()
+
+    def test_a_multi_statement_batch_is_refused(self, dsql_proxy, role):
+        with _WireClient(dsql_proxy) as c:
+            result = c.simple(f"SELECT 1; AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            assert result.sqlstate == "0A000"
+            assert "not in a batch" in result.message
+            assert c.simple(
+                f"SELECT count(*) FROM sys.iam_pg_role_mappings WHERE pg_role_name = '{role}'"
+            ).rows == [("0",)]
+
+    def test_the_catalog_appears_only_in_a_database_that_uses_it(
+        self, dsql_proxy, pg_backend
+    ):
+        psycopg2 = pytest.importorskip("psycopg2")
+        name = f"iam_db_{secrets.token_hex(4)}"
+        admin = psycopg2.connect(
+            host=pg_backend[0], port=pg_backend[1], user="postgres", dbname="postgres"
+        )
+        admin.autocommit = True
+        admin.cursor().execute(f"CREATE DATABASE {name}")
+        try:
+            main = _pg_connect(dsql_proxy)
+            main.cursor().execute("SELECT count(*) FROM sys.iam_pg_role_mappings")
+            main.close()
+            with _WireClient(dsql_proxy, database=name) as c:
+                result = c.extended(f"AWS IAM GRANT admin TO '{_PROBE_ROLE_ARN}'")
+                assert result.sqlstate == "0A000"
+            conn = psycopg2.connect(
+                host="127.0.0.1", port=dsql_proxy, user="admin", password="x", dbname=name
+            )
+            conn.autocommit = True
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT count(*) FROM pg_namespace WHERE nspname = 'sys'")
+                assert cur.fetchone() == (0,)
+                cur.execute("SELECT count(*) FROM sys.iam_pg_role_mappings")
+                assert cur.fetchone() == (0,)
+            finally:
+                conn.close()
+        finally:
+            admin.cursor().execute(f"DROP DATABASE {name} WITH (FORCE)")
+            admin.close()
 
 
 @requires_docker
