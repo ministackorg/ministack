@@ -2052,21 +2052,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            if query_language == "JSONata" and "Output" in catcher:
-                output = _apply_jsonata_output(
-                    catcher,
-                    raw_input,
-                    ctx,
-                    error_output=error_output,
-                    default=error_output,
-                )
-            else:
-                output = _apply_result_path_raw(
-                    catcher.get("ResultPath", "$"), raw_input, error_output)
-            if query_language == "JSONata":
-                # Catch handlers can also carry `Assign`. `$states.errorOutput`
-                # is available here; `$states.result` is not (per AWS).
-                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, query_language, error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -2565,7 +2551,7 @@ def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
             if catcher is None:
                 raise
             error_output = {"Error": err.error, "Cause": err.cause}
-            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, _state_query_language(state_def, ctx), error_output)
             return output, catcher["Next"]
 
 
@@ -2635,9 +2621,12 @@ def _run_map_items(state_def, raw_input, execution, ctx):
     # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
     # is applied per item below -- and ItemsPath must resolve against the untransformed input
     effective = _apply_input_path(state_def, raw_input, ctx)
+    is_jsonata = _state_query_language(state_def, ctx) == "JSONata"
 
-    items_path = state_def.get("ItemsPath", "$")
-    items = _resolve_path_or_ctx(items_path, effective, ctx)
+    if is_jsonata and "Items" in state_def:
+        items = _jsonata_state_field(state_def, "Items", "array", raw_input, ctx)
+    else:
+        items = _resolve_path_or_ctx(state_def.get("ItemsPath", "$"), effective, ctx)
     if not isinstance(items, list):
         items = [items]
 
@@ -2647,6 +2636,8 @@ def _run_map_items(state_def, raw_input, execution, ctx):
     iter_states = iterator.get("States", {})
     iter_start = iterator.get("StartAt")
     max_conc = state_def.get("MaxConcurrency", 0)
+    if is_jsonata and "MaxConcurrency" in state_def:
+        max_conc = _jsonata_state_field(state_def, "MaxConcurrency", "number", raw_input, ctx)
 
     results = [None] * len(items)
     errors = [None] * len(items)
@@ -2656,10 +2647,15 @@ def _run_map_items(state_def, raw_input, execution, ctx):
             item_ctx = copy.deepcopy(ctx)
             item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
             item_params = state_def.get("ItemSelector") or state_def.get("Parameters")
-            # ItemSelector $ paths resolve against the Map state's effective input,
-            # not the individual item. $$.Map.Item.Value provides the item.
-            item_input = (_resolve_params_obj(item_params, effective, item_ctx)
-                          if item_params else item)
+            if not item_params:
+                item_input = item
+            elif is_jsonata:
+                # $states.context.Map.Item.Value provides the item.
+                item_input = _apply_jsonata_template(item_params, raw_input, item_ctx)
+            else:
+                # ItemSelector $ paths resolve against the Map state's effective input,
+                # not the individual item. $$.Map.Item.Value provides the item.
+                item_input = _resolve_params_obj(item_params, effective, item_ctx)
             results[idx] = _run_sub_machine(
                 iter_states, iter_start, item_input, execution, item_ctx)
         except Exception as exc:
@@ -2682,6 +2678,11 @@ def _run_map_items(state_def, raw_input, execution, ctx):
         if err is not None:
             raise err if isinstance(err, _ExecutionError) else _ExecutionError(
                 "States.MapFailed", str(err))
+
+    if is_jsonata:
+        output = _apply_jsonata_output(state_def, raw_input, ctx, result=results, default=results)
+        _apply_state_assign(state_def, raw_input, ctx, result=results)
+        return output, _next_or_end(state_def)
 
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
@@ -3651,6 +3652,19 @@ def _find_matching_catcher(catchers, error):
         if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
+
+
+def _apply_catcher(catcher, raw_input, ctx, query_language, error_output):
+    """Build a caught error's output and apply the catcher's Assign."""
+    if query_language == "JSONata" and "Output" in catcher:
+        output = _apply_jsonata_output(catcher, raw_input, ctx, error_output=error_output, default=error_output)
+    else:
+        output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+    if query_language == "JSONata":
+        # Catch handlers can also carry `Assign`. `$states.errorOutput`
+        # is available here; `$states.result` is not (per AWS).
+        _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+    return output
 
 
 # ===================================================================
