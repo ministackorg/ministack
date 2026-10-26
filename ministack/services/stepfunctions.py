@@ -2052,21 +2052,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            if query_language == "JSONata" and "Output" in catcher:
-                output = _apply_jsonata_output(
-                    catcher,
-                    raw_input,
-                    ctx,
-                    error_output=error_output,
-                    default=error_output,
-                )
-            else:
-                output = _apply_result_path_raw(
-                    catcher.get("ResultPath", "$"), raw_input, error_output)
-            if query_language == "JSONata":
-                # Catch handlers can also carry `Assign`. `$states.errorOutput`
-                # is available here; `$states.result` is not (per AWS).
-                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, query_language, error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -2565,7 +2551,7 @@ def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
             if catcher is None:
                 raise
             error_output = {"Error": err.error, "Cause": err.cause}
-            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, _state_query_language(state_def, ctx), error_output)
             return output, catcher["Next"]
 
 
@@ -3087,13 +3073,17 @@ def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output
     # is the reserved variable. The document is left unset (None) so bare paths
     # do not resolve against the state input, which AWS reaches only via
     # `$states.input`.
-    bindings = dict(ctx.get("variables", {}))
-    bindings["states"] = states
     if jsonata is None:
         raise _ExecutionError(
             "States.QueryEvaluationError",
             "JSONata support requires the jsonata-python package, which is "
             "not installed in this build")
+    # jsonata-python reads a None binding as undefined, so a null variable uses its NULL_VALUE sentinel.
+    bindings = {
+        name: jsonata.utils.Utils.NULL_VALUE if value is None else value
+        for name, value in ctx.get("variables", {}).items()
+    }
+    bindings["states"] = states
     try:
         expr = jsonata.Jsonata.jsonata(expression, timeout=1000)
         _register_sfn_jsonata_functions(expr)
@@ -3662,6 +3652,19 @@ def _find_matching_catcher(catchers, error):
         if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
+
+
+def _apply_catcher(catcher, raw_input, ctx, query_language, error_output):
+    """Build a caught error's output and apply the catcher's Assign."""
+    if query_language == "JSONata" and "Output" in catcher:
+        output = _apply_jsonata_output(catcher, raw_input, ctx, error_output=error_output, default=error_output)
+    else:
+        output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+    if query_language == "JSONata":
+        # Catch handlers can also carry `Assign`. `$states.errorOutput`
+        # is available here; `$states.result` is not (per AWS).
+        _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+    return output
 
 
 # ===================================================================

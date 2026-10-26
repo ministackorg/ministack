@@ -921,6 +921,7 @@ When Docker is available, `StartApplication` for a `FLINK-1_19` or `FLINK-1_20` 
 | `OPENSEARCH_DATAPLANE` | `0` | Set `1` to spawn a real `opensearchproject/opensearch` container per `CreateDomain` and per OpenSearch Serverless `CreateCollection`. Default `0` returns a stub endpoint (`<domain>.ministack.local:9200`) — management plane only |
 | `OPENSEARCH_BASE_PORT` | `14571` | Starting host port for per-domain OpenSearch containers when `OPENSEARCH_DATAPLANE=1` |
 | `OPENSEARCH_IMAGE` | `opensearchproject/opensearch:2.15.0` | Image used when spawning per-domain OpenSearch containers |
+| `OPENSEARCH_JAVA_OPTS` | _(unset)_ | JVM options (for example `-Xms512m -Xmx512m`) passed as `OPENSEARCH_JAVA_OPTS` to every OpenSearch container, per-domain and OpenSearch Serverless collection; unset, nothing is passed and the image keeps its default heap (`jvm.options`, 1 GB) |
 | `OPENSEARCH_DASHBOARDS` | `0` | Set `1` (together with `OPENSEARCH_DATAPLANE=1`) to also spawn a per-domain `opensearchproject/opensearch-dashboards` sidecar; `DescribeDomain.DashboardEndpoint` is populated |
 | `OPENSEARCH_DASHBOARDS_BASE_PORT` | `15601` | Starting host port for per-domain Dashboards containers |
 | `OPENSEARCH_DASHBOARDS_IMAGE` | `opensearchproject/opensearch-dashboards:2.15.0` | Image used when spawning per-domain Dashboards containers |
