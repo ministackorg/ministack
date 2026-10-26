@@ -8000,6 +8000,39 @@ def test_sfn_jsonata_undefined_variable_raises_query_eval_error(sfn_sync):
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_jsonata_assign_null_variable_reads_back_as_null(sfn_sync):
+    """A variable with the value `null` reads back as `null`, not as undefined.
+    AWS keeps the two apart: only an unset variable fails."""
+    import uuid as _uuid_local
+    sm_name = f"jsonata-assign-null-{_uuid_local.uuid4().hex[:8]}"
+    sm_arn = sfn_sync.create_state_machine(
+        name=sm_name,
+        roleArn="arn:aws:iam::000000000000:role/test-role",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "SetNull",
+            "States": {
+                "SetNull": {
+                    "Type": "Pass",
+                    "Assign": {"v": None},
+                    "Next": "ReadNull",
+                },
+                "ReadNull": {
+                    "Type": "Pass",
+                    "Output": {"v": "{% $v %}"},
+                    "End": True,
+                },
+            },
+        }),
+    )["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+        assert resp["status"] == "SUCCEEDED"
+        assert json.loads(resp["output"]) == {"v": None}
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_jsonata_assign_reuses_input(sfn_sync):
     """`Assign` can reference `$states.input` (always available)."""
     import uuid as _uuid_local
