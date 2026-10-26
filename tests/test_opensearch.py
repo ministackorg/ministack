@@ -722,3 +722,45 @@ def test_opensearch_cold_image_publishes_the_real_endpoint(fake_docker, monkeypa
         f"readers prefer _Endpoint and it still says {rec['_Endpoint']!r}"
     )
     assert rec["Endpoint"] == "localhost:19200"
+
+
+@pytest.mark.parametrize("value", ["-Xms512m -Xmx512m", ""])
+def test_opensearch_engine_container_passes_java_opts(fake_docker, monkeypatch, value):
+    """OPENSEARCH_JAVA_OPTS reaches the engine container when set; unset or empty adds nothing."""
+    from ministack.services import opensearch as os_
+
+    runs = []
+    run = fake_docker.containers.run
+    monkeypatch.setattr(
+        fake_docker.containers, "run", lambda **kw: (runs.append(kw), run(**kw))[1]
+    )
+    monkeypatch.setattr(os_, "JAVA_OPTS", value)
+
+    os_.start_engine_container(fake_docker, f"java-opts-{_uid()}", {}, 19203)
+
+    env = runs[0]["environment"]
+    assert env.get("OPENSEARCH_JAVA_OPTS") == (value or None)
+
+
+@pytest.mark.serial
+def test_opensearch_reaper_spares_the_exited_engine_of_a_live_domain(fake_docker, monkeypatch):
+    """A live domain's engine is recorded under `_ContainerId`; the reaper must read that key."""
+    from ministack.core import container_reaper
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import opensearch as os_
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-os")
+    name = f"reaped-{_uid()}"
+    c = fake_docker.containers.run(
+        name=os_._container_name(name), labels=container_reaper.own_labels("opensearch")
+    )
+    c.status = "exited"
+    c.attrs["State"] = {"FinishedAt": ""}
+    os_._domains[name] = {"DomainName": name, "Created": True, "_ContainerId": c.id}
+
+    assert container_reaper.reap_abandoned(fake_docker) == 0
+    assert os_._container_name(name) in fake_docker.live()
+    os_._domains.pop(name)
