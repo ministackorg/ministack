@@ -58,6 +58,7 @@ DASHBOARDS_ENABLED = os.environ.get("OPENSEARCH_DASHBOARDS", "0") == "1"
 BASE_PORT = int(os.environ.get("OPENSEARCH_BASE_PORT", "14571"))
 DASHBOARDS_BASE_PORT = int(os.environ.get("OPENSEARCH_DASHBOARDS_BASE_PORT", "15601"))
 DEFAULT_IMAGE = os.environ.get("OPENSEARCH_IMAGE", "opensearchproject/opensearch:2.15.0")
+JAVA_OPTS = os.environ.get("OPENSEARCH_JAVA_OPTS", "")
 DASHBOARDS_IMAGE = os.environ.get(
     "OPENSEARCH_DASHBOARDS_IMAGE", "opensearchproject/opensearch-dashboards:2.15.0"
 )
@@ -400,6 +401,8 @@ def start_engine_container(docker, name: str, labels: dict, host_port=None, volu
         },
         ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
     )
+    if JAVA_OPTS:
+        run_kwargs["environment"]["OPENSEARCH_JAVA_OPTS"] = JAVA_OPTS
     if volumes is not None:
         run_kwargs["volumes"] = volumes
     if DOCKER_NETWORK:
@@ -731,7 +734,6 @@ def _new_domain_record(name, payload):
                         endpoint = f"{h}:{pt}"
                         live["Endpoint"] = endpoint
                         live["_Endpoint"] = endpoint
-                        live["_container_id"] = cid2
                         live["_ContainerId"] = cid2
                     live["Processing"] = False
             if orphaned and cid2:
@@ -1408,7 +1410,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 def _live_container_ids():
     ids = set()
     for _key, rec in _domains.all_items():
-        for field in ("_container_id", "_dashboards_container_id"):
+        for field in ("_ContainerId", "_DashboardsContainerId"):
             cid = rec.get(field)
             if cid:
                 ids.add(cid)

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextlib
 import copy
+import functools
 import io
 import json
 import os
@@ -2077,6 +2078,48 @@ def test_lambda_create_from_s3(lam, s3):
     resp = lam.invoke(FunctionName="lam-s3-code", Payload=b"{}")
     assert resp["StatusCode"] == 200
     assert json.loads(resp["Payload"].read())["s3"] is True
+
+_NOT_A_ZIP = b"this is not a zipfile, just a random string"
+_UNZIP_MSG = "Could not unzip uploaded file. Please check your file, then try to upload again."
+
+
+def _refused_package_errors(lam, s3, package, tag):
+    """The error each operation answers to ``package``; UpdateFunctionCode reads it from S3."""
+    bucket = "lambda-code-bucket"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=f"{tag}-ok.zip", Body=_make_zip("def handler(event, context): return 1"))
+    s3.put_object(Bucket=bucket, Key=f"{tag}-bad.zip", Body=package)
+    created = lam.create_function(
+        FunctionName=f"lam-{tag}-update", Runtime="python3.11", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"S3Bucket": bucket, "S3Key": f"{tag}-ok.zip"},
+    )
+    calls = (
+        lambda: lam.create_function(FunctionName=f"lam-{tag}-create", Runtime="python3.11", Role=_LAMBDA_ROLE,
+                                    Handler="index.handler", Code={"ZipFile": package}),
+        lambda: lam.update_function_code(FunctionName=f"lam-{tag}-update", S3Bucket=bucket, S3Key=f"{tag}-bad.zip"),
+        lambda: lam.publish_layer_version(LayerName=f"lam-{tag}-layer", Content={"ZipFile": package}),
+    )
+    errors = []
+    for call in calls:
+        with pytest.raises(ClientError) as exc:
+            call()
+        errors.append(exc.value.response["Error"])
+    # a refused update keeps the previous code, revision and modification time
+    after = lam.get_function_configuration(FunctionName=f"lam-{tag}-update")
+    assert {k: after[k] for k in ("CodeSha256", "RevisionId", "LastModified")} == {
+        k: created[k] for k in ("CodeSha256", "RevisionId", "LastModified")}
+    return errors
+
+
+def test_lambda_rejects_a_package_that_is_not_a_zip(lam, s3):
+    errors = _refused_package_errors(lam, s3, _NOT_A_ZIP, "notzip")
+    assert [(e["Code"], e["Message"]) for e in errors] == [("InvalidParameterValueException", _UNZIP_MSG)] * 3
+
+
+def test_lambda_rejects_an_empty_package(lam, s3):
+    errors = _refused_package_errors(lam, s3, b"", "empty")
+    assert [(e["Code"], e["Message"]) for e in errors] == [("InvalidParameterValueException", _UNZIP_MSG)] * 3
+
 
 def test_lambda_update_code_from_s3(lam, s3):
     bucket = "lambda-code-bucket"
@@ -9888,6 +9931,26 @@ def test_lambda_identical_code_dedups_to_single_blob(lambda_svc_isolated):
     assert len(files) == 1, [f.name for f in files]
 
 
+def test_lambda_restore_shares_one_bytes_object_per_blob(lambda_svc_isolated):
+    """Versions and functions whose code is one blob restore to one bytes object, as they are live
+    (PublishVersion reuses $LATEST's), not one copy each."""
+    svc, _ = lambda_svc_isolated
+    code, other = b"shared code" * 100, b"other code" * 100
+    versions = {str(n): {"code_zip": code, "config": {"Version": str(n)}} for n in (1, 2, 3)}
+    svc._functions["fn-a"] = _make_lambda_record("fn-a", code, versions=versions)
+    svc._functions["fn-b"] = _make_lambda_record("fn-b", other, versions={"1": {"code_zip": code, "config": {}}})
+    state = svc.get_state()
+    svc._functions._data.clear()
+    svc.load_persisted_state(state)
+
+    a = svc._functions._data[("000000000000", svc.get_region(), "fn-a")]
+    b = svc._functions._data[("000000000000", svc.get_region(), "fn-b")]
+    copies = [a["code_zip"], *(v["code_zip"] for v in a["versions"].values()), b["versions"]["1"]["code_zip"]]
+    assert all(c == code for c in copies)
+    assert len({id(c) for c in copies}) == 1
+    assert b["code_zip"] == other
+
+
 def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated):
     """Pre-existing lambda.json files (written before content-addressed
     storage) stored code_zip as inline base64. restore_state must accept
@@ -12892,6 +12955,9 @@ def _fresh_extract_cache(monkeypatch, tmp_path):
     """Point the extraction cache at an empty per-test root."""
     monkeypatch.setattr(lsvc, "_DOCKER_EXTRACT_CACHE", str(tmp_path / "extract"))
     monkeypatch.setattr(lsvc, "_docker_extract_dirs", {})
+    # reset() below also removes the provided-runtime cache, which this process shares with its server.
+    monkeypatch.setattr(lsvc, "_PROVIDED_CODE_CACHE", str(tmp_path / "provided"))
+    monkeypatch.setattr(lsvc, "_provided_code_dirs", {})
 
 
 def _count_extractions(monkeypatch):
@@ -15484,6 +15550,12 @@ def test_lambda_env_disables_host_prefix_injection_by_default(lam):
         lam.delete_function(FunctionName=own)
 
 
+@functools.cache
+def _revision_zip(content):
+    """One zip per content, so equal content compares equal (zip entries carry a timestamp)."""
+    return _make_zip(content)
+
+
 @pytest.fixture
 def functions(monkeypatch):
     store = AccountRegionScopedDict()
@@ -15491,7 +15563,7 @@ def functions(monkeypatch):
         store[name] = {
             "config": {"RevisionId": "function-before", "Architectures": ["x86_64"],
                        "Description": "original", "Version": "$LATEST"},
-            "code_zip": b"original-code", "versions": {}, "next_version": 1,
+            "code_zip": _revision_zip("original-code"), "versions": {}, "next_version": 1,
             "aliases": {alias: {"RevisionId": "alias-before", "FunctionVersion": "1",
                                 "Description": "original"} for alias in ("live", "other")},
         }
@@ -15505,7 +15577,7 @@ def functions(monkeypatch):
 def _update(operation, revision="function-before", value="changed", name="revision-test"):
     data = {"RevisionId": revision} if revision is not None else {}
     if operation == "code":
-        return _lambda_mod._update_code(name, {**data, "ZipFile": base64.b64encode(value.encode()).decode()})
+        return _lambda_mod._update_code(name, {**data, "ZipFile": base64.b64encode(_revision_zip(value)).decode()})
     if operation == "config":
         return _lambda_mod._update_config(name, {**data, "Description": value})
     return _lambda_mod._update_alias(name, "live", {**data, "Description": value, "FunctionVersion": "2"})
@@ -15615,11 +15687,11 @@ def test_competing_updates_with_same_revision_have_one_winner(functions, monkeyp
     if first == "alias":
         assert record["aliases"]["live"]["Description"] == "winner"
     elif first == "code":
-        assert record["code_zip"] == b"winner"
+        assert record["code_zip"] == _revision_zip("winner")
         assert record["config"]["Description"] == "original"
     else:
         assert record["config"]["Description"] == "winner"
-        assert record["code_zip"] == b"original-code"
+        assert record["code_zip"] == _revision_zip("original-code")
 
 
 def test_slow_code_update_does_not_block_independent_resources(functions, monkeypatch):
@@ -15629,7 +15701,7 @@ def test_slow_code_update_does_not_block_independent_resources(functions, monkey
     def fetch(*args, **kwargs):
         entered.set()
         assert release.wait(5)
-        return b"new-code"
+        return _revision_zip("new-code")
 
     monkeypatch.setattr(_lambda_mod, "_fetch_code_from_s3", fetch)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -15682,3 +15754,12 @@ def test_lambda_function_url_event_and_response_follow_aws(lam):
         assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=0;Lineage=1:[0-9a-f]{8}:0", trace)
     finally:
         lam.delete_function(FunctionName=name)
+
+
+def test_lambda_code_caches_belong_to_this_instance():
+    """The code caches are named for the instance's gateway port, so two MiniStacks on one host keep apart."""
+    from ministack.services import lambda_svc as lsvc
+
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    assert os.path.basename(lsvc._PROVIDED_CODE_CACHE) == f"ministack-provided-code-{port}"
+    assert os.path.basename(lsvc._DOCKER_EXTRACT_CACHE) == f"ministack-lambda-extract-{port}"
