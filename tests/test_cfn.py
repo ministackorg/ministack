@@ -37679,3 +37679,44 @@ def test_cfn_state_machine_refused_encryption_update_rolls_back(cfn, sfn, kms_cl
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
+
+
+def test_cfn_athena_workgroup_create_update_replace_delete(cfn):
+    """AWS::Athena::WorkGroup (template reference): Ref is the name, GetAtt CreationTime; Description,
+    State, Tags and WorkGroupConfiguration update in place, a new Name replaces the workgroup."""
+    athena = make_client("athena")
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name, first, second = f"cfn-athena-wg-{uid}", f"wg-{uid}", f"wg2-{uid}"
+
+    def template(name, description, state):
+        return json.dumps({
+            "Resources": {"WG": {"Type": "AWS::Athena::WorkGroup", "Properties": {
+                "Name": name, "Description": description, "State": state,
+                "Tags": [{"Key": "team", "Value": "data"}],
+                "WorkGroupConfiguration": {"ResultConfiguration": {"OutputLocation": f"s3://results-{uid}/"}},
+            }}},
+            "Outputs": {"Ref": {"Value": {"Ref": "WG"}}, "Created": {"Value": {"Fn::GetAtt": ["WG", "CreationTime"]}}},
+        })
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template(first, "one", "ENABLED"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "Ref") == first and _output(stack, "Created").isdigit()
+        wg = athena.get_work_group(WorkGroup=first)["WorkGroup"]
+        assert (wg["Description"], wg["State"]) == ("one", "ENABLED")
+        assert wg["Configuration"]["ResultConfiguration"]["OutputLocation"] == f"s3://results-{uid}/"
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(first, "two", "DISABLED"))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+        wg = athena.get_work_group(WorkGroup=first)["WorkGroup"]
+        assert (wg["Description"], wg["State"]) == ("two", "DISABLED")
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=template(second, "two", "ENABLED"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE" and _output(stack, "Ref") == second
+        names = {w["Name"] for w in athena.list_work_groups()["WorkGroups"]}
+        assert second in names and first not in names
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    assert second not in {w["Name"] for w in athena.list_work_groups()["WorkGroups"]}

@@ -509,6 +509,7 @@ subnet = ec2.create_subnet(
 | `AWS::ElastiCache::ReplicationGroup` | Replication group id | PrimaryEndPoint.Address, PrimaryEndPoint.Port, ReaderEndPoint.Address, ReaderEndPoint.Port, ReadEndPoint.Addresses, ReadEndPoint.Ports, ReadEndPoint.AddressesList, ReadEndPoint.PortsList (cluster mode disabled); ConfigurationEndPoint.Address, ConfigurationEndPoint.Port (cluster mode enabled) |
 | `AWS::ElastiCache::User` | User id | Arn, Status |
 | `AWS::ElastiCache::UserGroup` | User group id | Arn, Status |
+| `AWS::Athena::WorkGroup` | Workgroup name | CreationTime, WorkGroupConfiguration.EngineVersion.EffectiveEngineVersion |
 | `AWS::Glue::Database` | Database name | — |
 | `AWS::Glue::Table` | Table name | — |
 | `AWS::Glue::Partition` | `<catalog id>\|<database>\|<table>\|<values hash>` | IdentifierPartitionInputValues |
