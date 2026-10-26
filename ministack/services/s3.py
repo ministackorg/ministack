@@ -9054,25 +9054,79 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 # ---------------------------------------------------------------------------
 
 
-def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
-    """Resolve the on-disk path for an object and verify it lives under DATA_DIR.
+# A key is stored at its own path (so Athena and Glue can read the bytes) when a
+# file can hold it there; otherwise under this reserved directory, by an encoded
+# name. Keys a path cannot hold: a trailing or doubled slash, "." or ".."
+# segments, a key under another key's file or a file over another key's folder.
+_ENCODED_KEYS_DIR = ".ministack-keys"
 
-    Returns None if the resolved path escapes DATA_DIR (e.g. key contains `..`
-    or absolute path). Callers must treat None as "skip operation".
-    """
-    if account_id is None:
-        account_id = get_account_id()
-    root = os.path.realpath(DATA_DIR)
-    candidate = os.path.realpath(os.path.join(DATA_DIR, account_id, bucket, key))
+
+def _plain_path_key(key: str) -> bool:
+    if not key or "\x00" in key:
+        return False
+    parts = key.split("/")
+    return (parts[0] != _ENCODED_KEYS_DIR
+            and all(p not in ("", ".", "..") and len(p.encode()) <= 200
+                    and not p.endswith((".meta.json", ".tmp")) for p in parts))
+
+
+def _encoded_key_name(key: str) -> str:
+    # No "/" or "." survives, so the name is one path component and never a sidecar or temp name.
+    name = url_quote(key, safe="").replace(".", "%2E")
+    return name if len(name) <= 200 else "sha256-" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _under(root: str, candidate: str) -> bool:
     try:
-        if os.path.commonpath([root, candidate]) != root:
-            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-            return None
+        return candidate != root and os.path.commonpath([root, candidate]) == root
     except ValueError:
         # commonpath raises on mixed drives / unrelated paths — treat as escape.
-        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-        return None
-    return candidate
+        return False
+
+
+def _key_disk_path(base: str, key: str) -> str | None:
+    """Where ``key`` lives under ``base``: its own path, or its encoded name when
+    a file cannot hold it there (or it is already stored that way)."""
+    root = os.path.realpath(base)
+    encoded = os.path.join(root, _ENCODED_KEYS_DIR, _encoded_key_name(key))
+    if not _plain_path_key(key):
+        return encoded
+    plain = os.path.join(root, key)
+    if not _under(root, os.path.realpath(plain)):
+        return encoded
+    if os.path.isfile(plain) or os.path.isfile(plain + ".meta.json"):
+        return plain
+    if os.path.isfile(encoded) or os.path.isfile(encoded + ".meta.json"):
+        return encoded
+    parent = os.path.dirname(plain)
+    while parent != root:
+        if os.path.isfile(parent):
+            return encoded
+        parent = os.path.dirname(parent)
+    return encoded if os.path.isdir(plain) else plain
+
+
+def _other_key_disk_path(base: str, key: str, fpath: str) -> str | None:
+    """The key's other possible location, so a write to one clears a stale copy in the other."""
+    root = os.path.realpath(base)
+    encoded = os.path.join(root, _ENCODED_KEYS_DIR, _encoded_key_name(key))
+    if fpath != encoded:
+        return encoded
+    plain = os.path.join(root, key)
+    return plain if _plain_path_key(key) and _under(root, os.path.realpath(plain)) else None
+
+
+def _remove_key_files(fpath: str | None):
+    for path in (fpath, fpath and fpath + ".meta.json"):
+        if path and os.path.isfile(path):
+            os.remove(path)
+
+
+def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
+    """The on-disk path of an object, always under DATA_DIR."""
+    if account_id is None:
+        account_id = get_account_id()
+    return _key_disk_path(os.path.join(DATA_DIR, account_id, bucket), key)
 
 
 def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
@@ -9121,12 +9175,14 @@ def _persist_object(bucket: str, key: str, obj):
             data = obj.get("body")
             if data is not None:
                 _atomic_write(fpath, data)
-            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key)}
+            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key), "key": key}
             _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
             # Drop body from in-memory record to save RAM
             obj["body"] = None
         else:
             _atomic_write(fpath, obj)
+            _atomic_write(fpath + ".meta.json", json.dumps({"key": key}), text=True)
+        _remove_key_files(_other_key_disk_path(os.path.join(DATA_DIR, get_account_id(), bucket), key, fpath))
     except Exception as e:
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
 
@@ -9150,6 +9206,7 @@ def _persist_delete_marker(bucket_name: str, key: str, marker: dict):
             "version_id": marker.get("version_id"),
             "last_modified": marker.get("last_modified", ""),
             **_key_history_meta(bucket_name, key),
+            "key": key,
         }
         _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
     except Exception as e:
@@ -9194,16 +9251,10 @@ _VERSIONS_DIR = ".versions"
 def _version_disk_path(bucket: str, key: str, version_id: str, account_id: str = None) -> str | None:
     if account_id is None:
         account_id = get_account_id()
-    root = os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id))
-    candidate = os.path.realpath(os.path.join(root, key))
-    try:
-        if candidate == root or os.path.commonpath([root, candidate]) != root:
-            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-            return None
-    except ValueError:
-        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+    base = os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id)
+    if not _under(os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket)), os.path.realpath(base)):
         return None
-    return candidate
+    return _key_disk_path(base, key)
 
 
 def _version_file_exists(bucket_name: str, key: str, version_id: str, account_id: str = None) -> bool:
@@ -9283,11 +9334,8 @@ def _delete_persisted_object(bucket_name: str, key: str):
         fpath = _object_disk_path(bucket_name, key)
         if fpath is None:
             return
-        if os.path.exists(fpath):
-            os.remove(fpath)
-        meta_path = fpath + ".meta.json"
-        if os.path.exists(meta_path):
-            os.remove(meta_path)
+        _remove_key_files(fpath)
+        _remove_key_files(_other_key_disk_path(os.path.join(DATA_DIR, get_account_id(), bucket_name), key, fpath))
     except Exception as e:
         logger.warning("Failed to delete persisted S3 object %s/%s: %s", bucket_name, key, e)
 
@@ -9371,92 +9419,106 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
             "region": None,
         }
     bucket = _buckets._data[scoped_key]
-    for dirpath, _dirnames, filenames in os.walk(bucket_path):
-        for fname in filenames:
-            if fname.endswith(".meta.json"):
-                continue
-            abs_path = os.path.join(dirpath, fname)
-            key = os.path.relpath(abs_path, bucket_path)
-            meta_path = abs_path + ".meta.json"
-            meta = {}
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path) as mf:
-                        meta = json.load(mf)
-                except Exception:
-                    pass
-            # A delete marker's sidecar stands in for the object it hides: the
-            # data file belongs to the version underneath, not to the current
-            # key. Rebuild the marker (and the version it covers) instead of
-            # resurrecting the object as current.
-            if meta.get("is_delete_marker"):
-                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
-                continue
-            # Body stays on disk — only load metadata into memory.
-            # Compute size/etag from meta sidecar; fall back to reading
-            # the file only when the sidecar is missing or incomplete.
-            size = meta.get("size")
-            etag = meta.get("etag")
-            if size is None or not etag:
-                with open(abs_path, "rb") as f:
-                    data = f.read()
-                size = len(data)
-                etag = etag or f'"{md5_hash(data)}"'
-            bucket["objects"][key] = {
-                "body": None,
-                "content_type": meta.get("content_type", "application/octet-stream"),
-                "content_encoding": meta.get("content_encoding"),
-                "etag": etag,
-                "last_modified": meta.get("last_modified") or now_iso(),
-                "size": size,
-                "metadata": meta.get("metadata", {}),
-                "preserved_headers": meta.get("preserved_headers", {}),
-                "storage_class": meta.get("storage_class", "STANDARD"),
-                "checksums": meta.get("checksums", {}),
-            }
-            if meta.get("version_id"):
-                bucket["objects"][key]["version_id"] = meta["version_id"]
-            if "versions" in meta or "tags" in meta or "acl" in meta:
-                _load_persisted_history(account_id, bucket, bucket_name, key, meta)
-            elif meta.get("version_id"):
-                vkey = (bucket_name, key)
-                scoped_vkey = (account_id, vkey)
-                if scoped_vkey not in _object_versions._data:
-                    _object_versions._data[scoped_vkey] = []
-                _object_versions._data[scoped_vkey].append(
-                    {
-                        "version_id": meta["version_id"],
-                        "last_modified": meta.get("last_modified") or now_iso(),
-                        "etag": etag,
-                        "size": size,
-                        "is_latest": True,
-                        "data": None,
-                        "content_type": meta.get("content_type", "application/octet-stream"),
-                        "content_encoding": meta.get("content_encoding"),
-                        "metadata": meta.get("metadata", {}),
-                        "preserved_headers": meta.get("preserved_headers", {}),
-                        "storage_class": meta.get("storage_class", "STANDARD"),
-                        "checksums": meta.get("checksums", {}),
-                    }
-                )
-    # Delete markers whose data file is gone (a key that never held a body, or
-    # whose version was purged) live on as a lone sidecar.
-    for dirpath, _dirnames, filenames in os.walk(bucket_path):
-        for fname in filenames:
-            if not fname.endswith(".meta.json"):
-                continue
-            meta_path = os.path.join(dirpath, fname)
-            data_path = meta_path[: -len(".meta.json")]
-            if os.path.exists(data_path):
-                continue  # handled with its data file above
+    for abs_path, key in _persisted_key_files(bucket_path, sidecars=False):
+        meta_path = abs_path + ".meta.json"
+        meta = {}
+        if os.path.exists(meta_path):
             try:
                 with open(meta_path) as mf:
                     meta = json.load(mf)
             except Exception:
-                continue
-            if meta.get("is_delete_marker"):
-                key = os.path.relpath(data_path, bucket_path)
-                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+                pass
+        # A delete marker's sidecar stands in for the object it hides: the
+        # data file belongs to the version underneath, not to the current
+        # key. Rebuild the marker (and the version it covers) instead of
+        # resurrecting the object as current.
+        if meta.get("is_delete_marker"):
+            _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+            continue
+        # Body stays on disk — only load metadata into memory.
+        # Compute size/etag from meta sidecar; fall back to reading
+        # the file only when the sidecar is missing or incomplete.
+        size = meta.get("size")
+        etag = meta.get("etag")
+        if size is None or not etag:
+            with open(abs_path, "rb") as f:
+                data = f.read()
+            size = len(data)
+            etag = etag or f'"{md5_hash(data)}"'
+        bucket["objects"][key] = {
+            "body": None,
+            "content_type": meta.get("content_type", "application/octet-stream"),
+            "content_encoding": meta.get("content_encoding"),
+            "etag": etag,
+            "last_modified": meta.get("last_modified") or now_iso(),
+            "size": size,
+            "metadata": meta.get("metadata", {}),
+            "preserved_headers": meta.get("preserved_headers", {}),
+            "storage_class": meta.get("storage_class", "STANDARD"),
+            "checksums": meta.get("checksums", {}),
+        }
+        if meta.get("version_id"):
+            bucket["objects"][key]["version_id"] = meta["version_id"]
+        if "versions" in meta or "tags" in meta or "acl" in meta:
+            _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+        elif meta.get("version_id"):
+            vkey = (bucket_name, key)
+            scoped_vkey = (account_id, vkey)
+            if scoped_vkey not in _object_versions._data:
+                _object_versions._data[scoped_vkey] = []
+            _object_versions._data[scoped_vkey].append(
+                {
+                    "version_id": meta["version_id"],
+                    "last_modified": meta.get("last_modified") or now_iso(),
+                    "etag": etag,
+                    "size": size,
+                    "is_latest": True,
+                    "data": None,
+                    "content_type": meta.get("content_type", "application/octet-stream"),
+                    "content_encoding": meta.get("content_encoding"),
+                    "metadata": meta.get("metadata", {}),
+                    "preserved_headers": meta.get("preserved_headers", {}),
+                    "storage_class": meta.get("storage_class", "STANDARD"),
+                    "checksums": meta.get("checksums", {}),
+                }
+            )
+    # Delete markers whose data file is gone (a key that never held a body, or
+    # whose version was purged) live on as a lone sidecar.
+    for meta_path, key in _persisted_key_files(bucket_path, sidecars=True):
+        data_path = meta_path[: -len(".meta.json")]
+        if os.path.exists(data_path):
+            continue  # handled with its data file above
+        try:
+            with open(meta_path) as mf:
+                meta = json.load(mf)
+        except Exception:
+            continue
+        if meta.get("is_delete_marker"):
+            _load_persisted_delete_marker(account_id, bucket, bucket_name, meta.get("key") or key, meta)
+
+
+def _persisted_key_files(bucket_path, sidecars):
+    """(file, key) for a bucket's data files, or sidecars: plain paths first, then encoded names."""
+    for dirpath, dirnames, filenames in os.walk(bucket_path):
+        if dirpath == bucket_path and _ENCODED_KEYS_DIR in dirnames:
+            dirnames.remove(_ENCODED_KEYS_DIR)
+        for fname in filenames:
+            if fname.endswith(".meta.json") == sidecars and not fname.endswith(".tmp"):
+                path = os.path.join(dirpath, fname)
+                key = os.path.relpath(path[: -len(".meta.json")] if sidecars else path, bucket_path)
+                yield path, key
+    encoded_dir = os.path.join(bucket_path, _ENCODED_KEYS_DIR)
+    for fname in sorted(os.listdir(encoded_dir)) if os.path.isdir(encoded_dir) else []:
+        if fname.endswith(".meta.json") != sidecars or fname.endswith(".tmp"):
+            continue
+        path = os.path.join(encoded_dir, fname)
+        meta_path = path if sidecars else path + ".meta.json"
+        try:
+            with open(meta_path) as mf:
+                key = json.load(mf).get("key")
+        except Exception:
+            key = None
+        yield path, key or url_unquote(fname[: -len(".meta.json")] if sidecars else fname)
 
 
 def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):

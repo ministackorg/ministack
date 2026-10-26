@@ -12543,3 +12543,35 @@ def test_s3_missing_key_shapes_do_not_depend_on_auth(download_bucket, head_bucke
     status, headers, _body = _head(head_bucket, s3, key=None)
     assert status == 200
     assert (headers["x-amz-bucket-region"], headers["x-amz-bucket-arn"]) == (HOME, f"arn:aws:s3:::{head_bucket}")
+
+
+def test_s3_persisted_keys_a_path_cannot_hold_survive_a_restart(tmp_path, monkeypatch):
+    """Keys a file layout can't hold (a folder marker, a key under another key, doubled or dot
+    segments, a sidecar-like name) are saved, read back and reloaded as written."""
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    keys = ["dir/", "dir/child.txt", "dir/deeper/x.txt", "a", "a/b", "x//y", "p/./q", "../up", "n.meta.json",
+            "c/d/e", "c/d", "k" * 300]
+    for key in keys:
+        s3mod._persist_object("keys-bucket", key, {"body": key.encode(), "etag": '"e"', "size": len(key.encode()),
+                                                    "last_modified": s3mod.now_iso()})
+    for key in keys:
+        assert s3mod._read_body("keys-bucket", key, {"body": None}) == key.encode(), key
+    # Athena and Glue read ordinary keys at their own path.
+    assert open(tmp_path / "000000000000" / "keys-bucket" / "dir" / "child.txt", "rb").read() == b"dir/child.txt"
+
+    s3mod._buckets._data.pop(("000000000000", "keys-bucket"), None)
+    s3mod._load_persisted_bucket("000000000000", "keys-bucket", str(tmp_path / "000000000000" / "keys-bucket"))
+    restored = s3mod._buckets._data[("000000000000", "keys-bucket")]["objects"]
+    assert sorted(restored) == sorted(keys)
+    assert all(restored[key]["size"] == len(key.encode()) for key in keys)
+
+    # Once the key above it is gone, a rewrite moves the key back to its own path.
+    s3mod._delete_persisted_object("keys-bucket", "a/b")
+    s3mod._delete_persisted_object("keys-bucket", "a")
+    s3mod._persist_object("keys-bucket", "a/b", {"body": b"moved", "etag": '"e"', "size": 5,
+                                                 "last_modified": s3mod.now_iso()})
+    assert open(tmp_path / "000000000000" / "keys-bucket" / "a" / "b", "rb").read() == b"moved"
+    s3mod._buckets._data.pop(("000000000000", "keys-bucket"), None)
