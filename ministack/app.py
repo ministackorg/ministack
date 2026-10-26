@@ -822,7 +822,7 @@ def _asgi_header_list(headers: dict) -> list:
     return header_list
 
 
-async def _send_response(send, status, headers, body):
+async def _send_response(send, status, headers, body, *, head=False):
     """Send ASGI HTTP response."""
     from ministack.core.responses import StreamingResponse
 
@@ -830,7 +830,7 @@ async def _send_response(send, status, headers, body):
         raise TypeError("StreamingResponse requires _send_streaming_response(send, receive, ...)")
 
     body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
-    if "content-length" not in {k.lower() for k in headers}:
+    if not head and "content-length" not in {k.lower() for k in headers}:
         headers["Content-Length"] = str(len(body_bytes))
     await send(
         {
@@ -873,7 +873,7 @@ async def _send_streaming_response(send, receive, status, headers, streaming):
             pass
 
 
-async def _send_if_handled(send, response, receive=None) -> bool:
+async def _send_if_handled(send, response, receive=None, *, head=False) -> bool:
     """Send a response tuple and report whether the request was handled."""
     if response is None:
         return False
@@ -885,7 +885,7 @@ async def _send_if_handled(send, response, receive=None) -> bool:
             raise TypeError("StreamingResponse requires the ASGI receive channel")
         await _send_streaming_response(send, receive, status, headers, body)
     else:
-        await _send_response(send, status, headers, body)
+        await _send_response(send, status, headers, body, head=head)
     return True
 
 
@@ -2389,9 +2389,10 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        upload_error = _get_module("s3").validate_upload_request(method, vhost_path, headers, query_params)
-        if upload_error is not None:
-            return upload_error
+        object_error = (None if method in {"HEAD", "DELETE"} and access_point_region is not None else
+                        _get_module("s3").validate_object_request(method, vhost_path, headers, query_params))
+        if object_error is not None:
+            return object_error
         from ministack.core.iam_actions import (
             _s3_action,
             extract_resource_arn,
@@ -2977,9 +2978,9 @@ async def _dispatch_service_request(
         return _unknown_query_error(body, request_id)
 
     if AUTH and service == "s3":
-        upload_error = _get_module("s3").validate_upload_request(method, path, headers, query_params)
-        if upload_error is not None:
-            return upload_error
+        object_error = _get_module("s3").validate_object_request(method, path, headers, query_params)
+        if object_error is not None:
+            return object_error
 
     # AppSync authorizes a GraphQL request by the API's own authorization types.
     appsync_graphql = service == "appsync" and method == "POST" and (
@@ -3203,10 +3204,14 @@ async def _dispatch_service_request(
         {
             **cors,
             "x-amzn-requestid": request_id,
-            "x-amz-request-id": request_id,
-            "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
         }
     )
+    if service == "s3":
+        resp_headers.setdefault("x-amz-request-id", request_id)
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        resp_headers["x-amz-request-id"] = request_id
+        resp_headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
     return status, resp_headers, resp_body
 
 
@@ -3399,27 +3404,47 @@ async def app(scope, receive, send):
     ):
         return
 
-    if await _send_if_handled(
-        send,
-        await _handle_special_data_plane_request(
-            method, path, headers, body, query_params, request_id,
-            raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
-            raw_query_string=query_string,
-            client_ip=(scope.get("client") or ("127.0.0.1",))[0],
-        ),
-        receive,
-    ):
+    # Finalize ordinary S3 HEAD responses after both routing paths, including
+    # IAM denials. Presigns, access points and subresources keep their handlers.
+    head_path = None
+    # Iceberg routes are selected before S3, even when signed with scope s3.
+    if (AUTH and method == "HEAD" and not path.startswith("/iceberg")
+            and detect_service(method, path, headers, query_params) == "s3"):
+        host = headers.get("host", "")
+        bucket = _extract_s3_vhost_bucket(host)
+        candidate = f"/{bucket}{path}" if bucket else path
+        ap_match = _ACCESS_POINT_HOST_RE.match(bucket) if bucket else None
+        has_access_point = ap_match is not None and _get_module("s3").resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), extract_region(headers)) is not None
+        if (not _MRAP_HOST_RE.match(host.split(":")[0].strip())
+                and not (bucket and (_S3_VHOST_EXCLUDE_RE.search(host) or has_access_point
+                             or bucket in _NON_S3_VHOST_NAMES))
+                and _get_module("s3").is_standard_object_request(method, candidate, headers, query_params)):
+            head_path = candidate
+
+    response = await _handle_special_data_plane_request(
+        method, path, headers, body, query_params, request_id,
+        raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+        raw_query_string=query_string,
+        client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+    )
+    if response is not None and head_path is not None:
+        response = _get_module("s3").format_head_response(head_path, headers, response)
+    if await _send_if_handled(send, response, receive, head=head_path is not None):
         return
 
     status, resp_headers, resp_body = await _dispatch_service_request(
         method, path, headers, body, query_params, request_id
     )
+    if head_path is not None:
+        status, resp_headers, resp_body = _get_module("s3").format_head_response(
+            head_path, headers, (status, resp_headers, resp_body))
     from ministack.core.responses import StreamingResponse
 
     if isinstance(resp_body, StreamingResponse):
         await _send_streaming_response(send, receive, status, resp_headers, resp_body)
     else:
-        await _send_response(send, status, resp_headers, resp_body)
+        await _send_response(send, status, resp_headers, resp_body, head=head_path is not None)
 
 
 # ---------------------------------------------------------------------------

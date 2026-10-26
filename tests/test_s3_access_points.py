@@ -296,7 +296,9 @@ def test_access_point_arn_other_account_is_denied(access_point):
     assert exc.value.response["Error"]["Code"] in ("AccessDenied", "NoSuchAccessPoint")
 
 
-def test_access_point_arn_shaped_bucket_without_access_point_is_a_bucket():
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_access_point_arn_shaped_bucket_without_access_point_is_a_bucket(auth_enabled, method):
     """`<name>-<12 digits>` is a valid bucket name; with no access point of
     that name it is served as the bucket."""
     s3 = _client("s3", "us-east-1")
@@ -305,7 +307,11 @@ def test_access_point_arn_shaped_bucket_without_access_point_is_a_bucket():
     try:
         s3.put_object(Bucket=name, Key="b.txt", Body=b"bucket")
         host = f"{name}.{ENDPOINT.split('://', 1)[1]}"
-        assert _raw("GET", host, "/b.txt", "us-east-1")[2] == b"bucket"
+        status, headers, body = _raw(method, host, "/b.txt", "us-east-1")
+        assert status == 200
+        assert body == (b"bucket" if method == "GET" else b"")
+        if auth_enabled and method == "HEAD":
+            assert re.fullmatch(r"[A-Z0-9]{16}", headers["x-amz-request-id"])
     finally:
         s3.delete_object(Bucket=name, Key="b.txt")
         s3.delete_bucket(Bucket=name)
@@ -345,6 +351,45 @@ def test_access_point_alias_upload_permission_contract(
         )["ResponseMetadata"]["HTTPStatusCode"] == 200
         with root.get_object(Bucket=bucket, Key="contract-upload")["Body"] as body:
             assert body.read() == b"via alias"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("target,addressing_style", [("Alias", "path"), ("Alias", "virtual"), ("AccessPointArn", "virtual")])
+@pytest.mark.parametrize("allow_head", [False, True], ids=["no-permission", "allow"])
+def test_access_point_head_permission_contract(access_point, auth_enabled, iam_user, target, addressing_style, allow_head):
+    _, created = access_point
+    policy = {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if allow_head else None).client(
+        "s3", region="us-east-1", config=Config(s3={"addressing_style": addressing_style}))
+    if auth_enabled and not allow_head:
+        with pytest.raises(ClientError) as exc:
+            client.head_object(Bucket=created[target], Key="k.txt")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        response = client.head_object(Bucket=created[target], Key="k.txt")
+        assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert response["ContentLength"] == 5
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("target", ["Alias", "AccessPointArn"])
+@pytest.mark.parametrize("allow_delete", [False, True], ids=["no-permission", "allow"])
+def test_access_point_delete_permission_contract(bucket, access_point, auth_enabled, iam_user, target, allow_delete):
+    _, created = access_point
+    policy = {"Statement": [{"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if allow_delete else None).client("s3", region="us-east-1")
+    root = _client("s3", "us-east-1")
+    if auth_enabled and not allow_delete:
+        with pytest.raises(ClientError) as exc:
+            client.delete_object(Bucket=created[target], Key="k.txt")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        with root.get_object(Bucket=bucket, Key="k.txt")["Body"] as body:
+            assert body.read() == b"hello"
+    else:
+        assert client.delete_object(Bucket=created[target], Key="k.txt")["ResponseMetadata"]["HTTPStatusCode"] == 204
+        with pytest.raises(ClientError) as exc:
+            root.head_object(Bucket=bucket, Key="k.txt")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
 
 def _status(call):

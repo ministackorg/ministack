@@ -1431,8 +1431,8 @@ def _validate_bucket_name(name: str) -> bool:
     return True
 
 
-def _upload_error(code: str, message: str, status: int, **fields) -> tuple:
-    """Error envelope observed on real S3 PutObject (Osaka, 2026-10-16)."""
+def _object_error(code: str, message: str, status: int, **fields) -> tuple:
+    """Error envelope observed on real S3 PUT/GET/DELETE (Osaka, 2026-10-16/18/23)."""
     request_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
     host_id = base64.b64encode(os.urandom(57)).decode()
     root = Element("Error")
@@ -1443,27 +1443,61 @@ def _upload_error(code: str, message: str, status: int, **fields) -> tuple:
                     "x-amz-id-2": host_id}, _xml_body(root)
 
 
-def validate_upload_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
-    """Before IAM, check ordinary header-signed uploads in S3's observed order.
+def is_standard_object_request(method: str, path: str, headers: dict, query_params: dict) -> bool:
+    """Limit error precedence changes to ordinary header-signed bucket/object calls."""
+    bucket, key = _parse_bucket_key(path, headers)
+    return (method in {"PUT", "GET", "HEAD", "DELETE"} and bool(bucket) and (bool(key) or method == "HEAD")
+            and "x-amz-copy-source" not in headers and not query_params.keys() - {"x-id"}
+            and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            and not bucket.endswith((_ACCESS_POINT_ALIAS_SUFFIX, _OBJECT_LAMBDA_ALIAS_SUFFIX)))
+
+
+def format_head_response(path: str, headers: dict, response: tuple) -> tuple:
+    """HEAD observations from real S3, Osaka, 2026-10-23: no error body or length.
+
+    Run after IAM as well as preflight so a HeadBucket denial exposes location,
+    without granting access. Successful HeadObject retains its object metadata.
+    """
+    bucket, key = _parse_bucket_key(path, headers)
+    status, response_headers, _ = response
+    response_headers = {k: v for k, v in response_headers.items()
+                        if k.lower() != "content-length" or (key and status in {200, 206})}
+    if status == 301 or status >= 400:
+        response_headers["Content-Type"] = "application/xml"
+    # Preflight already supplies S3 IDs. Normal handlers may supply a UUID,
+    # and IAM denials may supply none: normalize only those request IDs while
+    # retaining an existing HostId and any already compatible RequestId.
+    if not re.fullmatch(r"[A-Z0-9]{16}", response_headers.get("x-amz-request-id", "")):
+        response_headers["x-amz-request-id"] = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    if not response_headers.get("x-amz-id-2"):
+        response_headers["x-amz-id-2"] = base64.b64encode(os.urandom(57)).decode()
+    owner = _bucket_owner_account(bucket) if _validate_bucket_name(bucket) else None
+    if not key and owner is not None:
+        record = _buckets.get_scoped(owner, None, bucket)
+        response_headers["x-amz-bucket-region"] = record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        if status == 200:
+            response_headers["x-amz-bucket-arn"] = f"arn:aws:s3:::{bucket}"
+    return status, response_headers, b""
+
+
+def validate_object_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
+    """Before IAM, check ordinary header-signed object calls in S3's observed order.
 
     Called only with AUTH=true. Regional hosts distinguish the endpoint region
     from the signing region. The handler still enforces the bucket's home
-    region for bare local endpoints. Copy, multipart, presigned and
-    bucket-subresource requests keep their existing validation paths.
+    region for bare local endpoints. GET checks the signing region before the
+    bucket's home; PUT, HEAD and DELETE check the home first. Copy, multipart, presigned and
+    subresource requests keep their existing validation paths.
     """
     from ministack.core.iam_actions import _auth_failure
     from ministack.core.iam_evaluator import AuthError, authenticate
     from ministack.core.sigv4 import parse_header_signature
 
     bucket, key = _parse_bucket_key(path, headers)
-    if (method != "PUT" or not key or "x-amz-copy-source" in headers
-            or query_params.keys() - {"x-id"}
-            or not headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
+    if not is_standard_object_request(method, path, headers, query_params):
         return None
-    if bucket.endswith((_ACCESS_POINT_ALIAS_SUFFIX, _OBJECT_LAMBDA_ALIAS_SUFFIX)):
-        return None  # The S3 handler resolves access point aliases before bucket lookup.
     if not _validate_bucket_name(bucket):
-        return _upload_error("InvalidBucketName", "The specified bucket is not valid.", 400, BucketName=bucket)
+        return _object_error("InvalidBucketName", "The specified bucket is not valid.", 400, BucketName=bucket)
     signature = parse_header_signature(headers)
     if isinstance(signature, tuple):
         return None  # Keep the shared malformed-signature handling.
@@ -1473,17 +1507,25 @@ def validate_upload_request(method: str, path: str, headers: dict, query_params:
     regional = re.search(r"(?:^|\.)s3[.-]([a-z]{2}(?:-[a-z]+)+-\d+)\.(.+)$", host)
     if regional:
         endpoint_region, suffix = regional.groups()
+        if method == "GET" and signature.region != endpoint_region:
+            return _object_error(
+                "AuthorizationHeaderMalformed", "The authorization header is malformed; "
+                f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
+            )
         bucket_region = (record or {}).get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
         if record is not None and bucket_region != endpoint_region:
-            response = _upload_error(
+            endpoint = f"{bucket}.s3.{bucket_region}.{suffix}"
+            fields = ({"Bucket": bucket, "Endpoint": endpoint} if method == "GET"
+                      else {"Endpoint": endpoint, "Bucket": bucket})
+            response = _object_error(
                 "PermanentRedirect", "The bucket you are attempting to access must be addressed using the specified "
                 "endpoint. Please send all future requests to this endpoint.", 301,
-                Endpoint=f"{bucket}.s3.{bucket_region}.{suffix}", Bucket=bucket,
+                **fields,
             )
             response[1]["x-amz-bucket-region"] = bucket_region
             return response
         if signature.region != endpoint_region:
-            return _upload_error(
+            return _object_error(
                 "AuthorizationHeaderMalformed", "The authorization header is malformed; "
                 f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
             )
@@ -1493,9 +1535,9 @@ def validate_upload_request(method: str, path: str, headers: dict, query_params:
         fields = denied.details
         if code == "InvalidAccessKeyId":
             fields = {"AWSAccessKeyId": signature.access_key_id}
-        return _upload_error(code, message, status, **fields)
+        return _object_error(code, message, status, **fields)
     if record is None:
-        return _upload_error("NoSuchBucket", "The specified bucket does not exist", 404, BucketName=bucket)
+        return _object_error("NoSuchBucket", "The specified bucket does not exist", 404, BucketName=bucket)
     return None
 
 
@@ -5389,12 +5431,17 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
-        status, err_headers, err_body = _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        from ministack.app import AUTH
+
+        if (AUTH and not query_params.keys() - {"x-id"}
+                and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
+            status, err_headers, err_body = _object_error(
+                "NoSuchKey", "The specified key does not exist.", 404, Key=key,
+            )
+        else:
+            status, err_headers, err_body = _error(
+                "NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}",
+            )
         # A key hidden by a delete marker announces the marker on its 404.
         err_headers.update(_delete_marker_404_headers(bucket_name, key))
         return status, err_headers, err_body

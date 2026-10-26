@@ -10329,6 +10329,7 @@ def test_s3_mrap_requests_are_authorized_on_the_bucket_and_the_mrap(
         with second_access_key(user) as credentials:
             for action, method, target, body, resource in [
                 ("GetObject", "GET", "/who.txt", b"", "/who.txt"),
+                ("GetObject", "HEAD", "/who.txt", b"", "/who.txt"),
                 ("PutObject", "PUT", "/mrap-put.txt", b"x", "/mrap-put.txt"),
                 ("ListBucket", "GET", "/?list-type=2", b"", ""),
             ]:
@@ -10337,7 +10338,11 @@ def test_s3_mrap_requests_are_authorized_on_the_bucket_and_the_mrap(
                     assert status == 200, data
                     continue
                 arn = (bucket_arn if denied_on == "bucket" else mrap_arn + ("/object" if resource else "")) + resource
-                assert status == 403 and ElementTree.fromstring(data).findtext("Code") == "AccessDenied"
+                assert status == 403
+                if method == "HEAD":
+                    assert data == b""
+                    continue
+                assert ElementTree.fromstring(data).findtext("Code") == "AccessDenied"
                 assert ElementTree.fromstring(data).findtext("Message") == (
                     f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" '
                     f"because no identity-based policy allows the s3:{action} action")
