@@ -26432,7 +26432,6 @@ def test_cfn_iam_policy_is_inline_not_managed(cfn, iam):
     role = f"cfn-pol-inl-role-{uid}"
     policy_name = f"cfn-pol-inl-{uid}"
     _cfn_policy_test_roles(iam, [role])
-    before = {p["Arn"] for p in iam.list_policies(Scope="Local")["Policies"]}
     template = json.dumps({
         "Resources": {"Pol": {"Type": "AWS::IAM::Policy", "Properties": {
             "PolicyName": policy_name,
@@ -26453,10 +26452,11 @@ def test_cfn_iam_policy_is_inline_not_managed(cfn, iam):
         document = _inline_role_document(iam, role, policy_name)
         assert document["Statement"][0]["Action"] == "s3:GetObject"
 
-        # Nothing managed: no attachment on the role and no new Local policy.
+        # Nothing managed: no attachment on the role and no Local policy of this name or stack. Other tests
+        # running in parallel create and delete Local policies, so the whole list can't be compared.
         assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
-        after = {p["Arn"] for p in iam.list_policies(Scope="Local")["Policies"]}
-        assert after == before
+        local = iam.list_policies(Scope="Local")["Policies"]
+        assert not [p["Arn"] for p in local if p["PolicyName"] == policy_name or uid in p["Arn"]]
 
         assert _output(stack, "Ref") == _output(stack, "Id")
         assert _output(stack, "Ref") != policy_name
