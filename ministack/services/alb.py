@@ -32,6 +32,7 @@ import socket
 import string
 import time
 import warnings
+from email.utils import formatdate
 from urllib.parse import parse_qs, urlencode
 from xml.sax.saxutils import escape as _esc
 
@@ -270,6 +271,7 @@ def _parse_actions(params, prefix="DefaultActions"):
                 "Port": _p(params, f"{prefix}.member.{i}.RedirectConfig.Port", "#{port}"),
                 "Host": _p(params, f"{prefix}.member.{i}.RedirectConfig.Host", "#{host}"),
                 "Path": _p(params, f"{prefix}.member.{i}.RedirectConfig.Path", "/#{path}"),
+                "Query": _p(params, f"{prefix}.member.{i}.RedirectConfig.Query", "#{query}"),
                 "StatusCode": rc_code,
             }
         oidc_issuer = _p(params, f"{prefix}.member.{i}.AuthenticateOidcConfig.Issuer")
@@ -498,6 +500,7 @@ def _action_xml(a):
             f"<Port>{rc.get('Port','#{port}')}</Port>"
             f"<Host>{rc.get('Host','#{host}')}</Host>"
             f"<Path>{rc.get('Path','/#{path}')}</Path>"
+            f"<Query>{_esc(rc.get('Query', '#{query}'))}</Query>"
             f"<StatusCode>{rc.get('StatusCode','HTTP_301')}</StatusCode>"
             f"</RedirectConfig>"
         )
@@ -1947,6 +1950,9 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         return (401, {"Content-Type": "text/plain"}, b"Unauthorized")
 
     host = headers.get("host") or f"localhost:{listener_port}"
+    name, sep, client_port = host.rpartition(":")
+    if headers.get("x-forwarded-port") == "443" and sep and client_port.isdigit():
+        host = name  # On a 443 listener AWS names the callback without the client's port.
     proto = headers.get("x-forwarded-proto") or "http"
     redirect_uri = f"{proto}://{host}{OIDC_CALLBACK_PATH}"
     state = new_uuid()
@@ -1986,7 +1992,7 @@ def _oidc_first(value):
 # ---------------------------------------------------------------------------
 
 async def _execute_actions(actions, method, path, headers, body, query_params, listener_port=80,
-                           lb_arn=""):
+                           lb_arn="", target_host=None, raw_query_string=None, raw_path=None):
     """Run a rule's actions in Order until one produces a response.
 
     Authentication actions are gates: they either short-circuit with a redirect
@@ -2013,14 +2019,18 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
             # request to a target that assumes the load balancer checked.
             return (501, {"Content-Type": "application/json"},
                     json.dumps({"message": "authenticate-cognito is not implemented"}).encode())
-        return await _execute_action(action, method, path, forwarded, body, query_params)
+        tg = _tgs.get(action.get("TargetGroupArn", "")) if atype == "forward" else None
+        if target_host and tg and tg.get("TargetType", "instance") in ("instance", "ip"):
+            # Authentication used the client's Host; an instance or IP target gets the load balancer's.
+            forwarded["host"] = target_host
+        return await _execute_action(action, method, path, forwarded, body, query_params, raw_query_string, raw_path)
 
     # Every action was a gate that passed and none of them was terminal.
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "Rule has no terminal action"}).encode())
 
 
-async def _execute_action(action, method, path, headers, body, query_params):
+async def _execute_action(action, method, path, headers, body, query_params, raw_query_string=None, raw_path=None):
     atype = action.get("Type", "").lower()
 
     if atype == "fixed-response":
@@ -2033,26 +2043,29 @@ async def _execute_action(action, method, path, headers, body, query_params):
     if atype == "redirect":
         rc = action.get("RedirectConfig", {})
         code = int(rc.get("StatusCode", "HTTP_301").replace("HTTP_", ""))
+        # The #{...} placeholders take the listener's protocol and port (as X-Forwarded-Proto/Port carry
+        # them) and the request's query; the port is always written, as AWS does (`http://host:80/...`).
         src_host = headers.get("host", "localhost").split(":")[0]
-        proto = rc.get("Protocol", "#{protocol}").replace("#{protocol}", "http")
+        if raw_query_string is None:
+            raw_query_string = urlencode([(k, v) for k, vs in (query_params or {}).items()
+                                          for v in (vs if isinstance(vs, list) else [vs])])
+        proto = rc.get("Protocol", "#{protocol}").replace("#{protocol}", headers.get("x-forwarded-proto", "http")).lower()
         rhost = rc.get("Host", "#{host}").replace("#{host}", src_host)
-        rport = rc.get("Port", "#{port}").replace("#{port}", "")
+        rport = rc.get("Port", "#{port}").replace("#{port}", headers.get("x-forwarded-port", "80"))
         rpath = rc.get("Path", "/#{path}").replace("#{path}", path.lstrip("/"))
-        location = f"{proto}://{rhost}"
-        if rport and rport not in ("80", "443", ""):
-            location += f":{rport}"
-        location += rpath
+        rquery = rc.get("Query", "#{query}").replace("#{query}", raw_query_string)
+        location = f"{proto}://{rhost}:{rport}{rpath}" + (f"?{rquery}" if rquery else "")
         return code, {"Location": location, "Content-Type": "text/plain"}, b""
 
     if atype == "forward":
         tg_arn = action.get("TargetGroupArn", "")
-        return await _forward_to_tg(tg_arn, method, path, headers, body, query_params)
+        return await _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string, raw_path)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Unsupported action type: {atype}"}).encode())
 
 
-async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
+async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_query_string=None, raw_path=None):
     tg = _tgs.get(tg_arn)
     if not tg:
         return (502, {"Content-Type": "application/json"},
@@ -2068,18 +2081,18 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params):
     if target_type == "lambda":
         func_id = registered[0]["Id"]
         return await _invoke_lambda_target(func_id, tg_arn, method, path,
-                                           headers, body, query_params)
+                                           headers, body, query_params, raw_query_string)
 
     if target_type in ("instance", "ip"):
         target = random.choice(registered)
-        return await _proxy_http_target(target, tg, method, path,
-                                        headers, body, query_params)
+        return await _proxy_http_target(target, tg, method, raw_path or path,
+                                        headers, body, query_params, raw_query_string)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": f"Target type '{target_type}' not supported."}).encode())
 
 
-async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params):
+async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, body, query_params, raw_query_string=None):
     try:
         from ministack.services import lambda_svc
     except ImportError:
@@ -2102,7 +2115,7 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Lambda function '{func_name}' not found"}).encode())
 
-    body_str = None
+    body_str = ""
     is_b64 = False
     if body:
         try:
@@ -2111,20 +2124,24 @@ async def _invoke_lambda_target(function_ref, tg_arn, method, path, headers, bod
             body_str = base64.b64encode(body).decode("ascii")
             is_b64 = True
 
-    qs_single = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
-    qs_multi = {k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()}
-
     event = {
         "requestContext": {"elb": {"targetGroupArn": tg_arn}},
         "httpMethod": method.upper(),
         "path": path,
-        "queryStringParameters": qs_single,
-        "multiValueQueryStringParameters": qs_multi,
         "headers": {k.lower(): v for k, v in headers.items()},
-        "multiValueHeaders": {k.lower(): [v] for k, v in headers.items()},
         "body": body_str,
         "isBase64Encoded": is_b64,
     }
+    if any(a.get("Key") == "lambda.multi_value_headers.enabled" and a.get("Value") == "true"
+           for a in _tg_attrs.get(tg_arn, [])):
+        event["queryStringParameters"] = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
+        event["multiValueQueryStringParameters"] = {k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()}
+        event["multiValueHeaders"] = {k.lower(): [v] for k, v in headers.items()}
+    elif raw_query_string is not None:
+        # As the load balancer sends them: the last value of a repeated key, not URL-decoded.
+        event["queryStringParameters"] = dict(p.partition("=")[::2] for p in raw_query_string.split("&") if p)
+    else:
+        event["queryStringParameters"] = {k: (v[-1] if isinstance(v, list) else v) for k, v in query_params.items()}
 
     exec_record = lambda_svc._execution_record_for_config(func, config)
 
@@ -2186,7 +2203,7 @@ async def _await_http_disconnect(receive) -> None:
             return
 
 
-async def _proxy_http_target(target, tg, method, path, headers, body, query_params):
+async def _proxy_http_target(target, tg, method, path, headers, body, query_params, raw_query_string=None):
     """Forward a data-plane request to an instance/ip target over HTTP.
 
     The target Id is used as the host to connect to — an IP address for
@@ -2202,11 +2219,13 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     host = str(target.get("Id", ""))
     port = int(target.get("Port") or tg.get("Port") or 80)
-    qs = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
-    target_path = path + (f"?{urlencode(qs)}" if qs else "")
+    # The request target reaches the target as received, like the CloudFront data plane forwards its query string.
+    if raw_query_string is None:
+        raw_query_string = urlencode({k: (v if isinstance(v, list) else [v])
+                                      for k, v in (query_params or {}).items()}, doseq=True)
+    target_path = path + (f"?{raw_query_string}" if raw_query_string else "")
 
-    hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
-                  "accept-encoding"}
+    hop_by_hop = {"content-length", "connection", "transfer-encoding"}
     fwd = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
@@ -2250,6 +2269,8 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         out_headers.setdefault(name.lower(), []).append(value)
     out_headers = {name: values[0] if len(values) == 1 else values
                    for name, values in out_headers.items()}
+    # The load balancer writes its own Date in place of the target's.
+    out_headers["date"] = formatdate(usegmt=True)
     status = resp.status
 
     async def _stream(send, receive):
@@ -2306,6 +2327,16 @@ def _lb_attr(lb_arn, key, default):
     return next((a["Value"] for a in _lb_attrs.get(lb_arn, []) if a.get("Key") == key), default)
 
 
+def _target_host_header(host, listener_port):
+    """The Host an ALB sends an instance or IP target: on listener port 80 or 443 the client's port is
+    dropped; on any other listener port it becomes the listener's, whatever port the client sent.
+    Observed on AWS (us-east-1, 2026-10-23); Lambda targets get the Host unmodified."""
+    name, sep, port = host.rpartition(":")
+    if not (sep and port.isdigit()):
+        name = host
+    return name if int(listener_port) in (80, 443) else f"{name}:{listener_port}"
+
+
 def _target_headers(lb_arn, listener, headers, client_ip):
     """The request fields a target receives: X-Forwarded-* and X-Amzn-Trace-Id set by the load balancer.
 
@@ -2334,15 +2365,54 @@ def _target_headers(lb_arn, listener, headers, client_ip):
     return out
 
 
-async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None):
+# Listener attributes that add a response header; an empty value leaves the response alone.
+# https://docs.aws.amazon.com/elasticloadbalancing/latest/application/header-modification.html#insert-header
+_LISTENER_RESPONSE_HEADERS = {
+    f"routing.http.response.{attr}.header_value": header
+    for attr, header in (
+        ("access_control_allow_origin", "Access-Control-Allow-Origin"),
+        ("access_control_allow_methods", "Access-Control-Allow-Methods"),
+        ("access_control_allow_headers", "Access-Control-Allow-Headers"),
+        ("access_control_allow_credentials", "Access-Control-Allow-Credentials"),
+        ("access_control_expose_headers", "Access-Control-Expose-Headers"),
+        ("access_control_max_age", "Access-Control-Max-Age"),
+    )
+}
+
+
+def _with_listener_response_headers(listener_arn, response):
+    """Add the listener's configured response headers, replacing the target's header of that name."""
+    status, headers, body = response
+    added = {_LISTENER_RESPONSE_HEADERS[a["Key"]]: a["Value"]
+             for a in _listener_attrs.get(listener_arn, [])
+             if a["Key"] in _LISTENER_RESPONSE_HEADERS and a["Value"]}
+    if not added:
+        return response
+    replaced = {name.lower() for name in added}
+    return status, {**{k: v for k, v in headers.items() if k.lower() not in replaced}, **added}, body
+
+
+def _with_alb_server(response):
+    """A response the load balancer makes itself (Lambda target, fixed-response, redirect, authentication, its own
+    errors) carries its Server header; an instance or IP target's response keeps the target's own, or none."""
+    from ministack.core.responses import StreamingResponse
+
+    status, headers, body = response
+    if isinstance(body, StreamingResponse) or any(k.lower() == "server" for k in headers):
+        return response
+    return status, {**headers, "Server": "awselb/2.0"}, body
+
+
+async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
+                           raw_query_string=None, raw_path=None):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
     matching = [l for l in candidates if l.get("Port", 80) == port] or candidates
 
     if not matching:
-        return (503, {"Content-Type": "application/json"},
-                json.dumps({"message": f"No listeners configured for '{lb['LoadBalancerName']}'"}).encode())
+        return _with_alb_server((503, {"Content-Type": "application/json"},
+                json.dumps({"message": f"No listeners configured for '{lb['LoadBalancerName']}'"}).encode()))
 
     listener = matching[0]
     l_arn = listener["ListenerArn"]
@@ -2364,12 +2434,17 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
             if actions:
                 target_headers = _target_headers(lb_arn, listener, headers,
                                                  client_ip or get_request_client_ip())
-                return await _execute_actions(actions, method, path,
-                                              target_headers, body, query_params, port,
-                                              lb_arn=lb.get("LoadBalancerArn", ""))
+                target_host = target_headers.get("host")
+                if target_host and _lb_attr(lb_arn, "routing.http.preserve_host_header.enabled", "false") != "true":
+                    target_host = _target_host_header(target_host, listener.get("Port", 80))
+                response = await _execute_actions(actions, method, path,
+                                                  target_headers, body, query_params, port,
+                                                  lb_arn=lb.get("LoadBalancerArn", ""), target_host=target_host,
+                                                  raw_query_string=raw_query_string, raw_path=raw_path)
+                return _with_listener_response_headers(l_arn, _with_alb_server(response))
 
-    return (502, {"Content-Type": "application/json"},
-            json.dumps({"message": "No matching ALB rule found"}).encode())
+    return _with_alb_server((502, {"Content-Type": "application/json"},
+            json.dumps({"message": "No matching ALB rule found"}).encode()))
 
 
 def reset():

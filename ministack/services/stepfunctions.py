@@ -3058,13 +3058,17 @@ def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output
     # is the reserved variable. The document is left unset (None) so bare paths
     # do not resolve against the state input, which AWS reaches only via
     # `$states.input`.
-    bindings = dict(ctx.get("variables", {}))
-    bindings["states"] = states
     if jsonata is None:
         raise _ExecutionError(
             "States.QueryEvaluationError",
             "JSONata support requires the jsonata-python package, which is "
             "not installed in this build")
+    # jsonata-python reads a None binding as undefined, so a null variable uses its NULL_VALUE sentinel.
+    bindings = {
+        name: jsonata.utils.Utils.NULL_VALUE if value is None else value
+        for name, value in ctx.get("variables", {}).items()
+    }
+    bindings["states"] = states
     try:
         expr = jsonata.Jsonata.jsonata(expression, timeout=1000)
         _register_sfn_jsonata_functions(expr)
