@@ -1147,6 +1147,12 @@ def _validate_event_source_arn(event_source_arn: str):
         return None, err
     if spec.service not in {"sqs", "kinesis", "dynamodb"}:
         return None, _invalid_parameter_value(f"Unsupported event source ARN: {event_source_arn}")
+    if spec.service == "kinesis" and spec.region != get_region():
+        return None, _invalid_parameter_value(f"Event source region must match Lambda region {get_region()}")
+    if spec.service == "kinesis" and spec.account_id != get_account_id():
+        # Another account's stream is not readable here; this is what AWS answers when it cannot read it.
+        return None, _invalid_parameter_value(
+            "Received Exception while reading from provided stream. No account found for the given parameters")
     scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
     if scope_err:
         return None, scope_err

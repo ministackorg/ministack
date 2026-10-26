@@ -1250,7 +1250,8 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "kinesis":
-        arn = _safe_json_field(body, "StreamARN")
+        # The resource-policy operations name their stream or consumer as ResourceARN.
+        arn = _safe_json_field(body, "ResourceARN") or _safe_json_field(body, "StreamARN")
         if arn:
             return arn
         name = _safe_json_field(body, "StreamName")

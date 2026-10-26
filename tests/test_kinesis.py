@@ -940,3 +940,79 @@ def test_subscription_captures_selection_before_runner_and_pruning(subscription_
             assert events[0]["ContinuationSequenceNumber"] == appended
 
     asyncio.run(exercise())
+
+
+def _kin_error(exc):
+    err = exc.value.response["Error"]
+    return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
+
+
+def test_kinesis_resource_policy_follows_aws(kin):
+    """Captured on AWS (us-east-1, 2026-10-26): codes, messages and check order of the resource-policy calls."""
+    name = f"rp-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    account = arn.split(":")[4]
+    consumer = kin.register_stream_consumer(StreamARN=arn, ConsumerName="c")["Consumer"]["ConsumerARN"]
+
+    def policy(resource, actions):
+        return json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "x", "Effect": "Allow",
+                           "Principal": {"AWS": f"arn:aws:iam::{account}:root"}, "Action": actions, "Resource": resource}]})
+
+    try:
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+        with pytest.raises(ClientError) as exc:
+            kin.delete_resource_policy(ResourceARN=arn)
+        assert _kin_error(exc) == (400, "ResourceNotFoundException", f"No resource policy found for resource ARN {arn}.")
+        for document, message in (
+            ("not json", "Policy validation error: This policy contains invalid Json"),
+            ("{}", "Policy validation error: Missing required field Version"),
+            ('{"Version":"2012-10-17"}', "Policy validation error: Missing required field Statement"),
+            (policy(consumer, ["kinesis:GetRecords"]), "Policy validation error: Resource policy contains invalid statement"
+             " at line 1, column 41: The resource policy's resource must be the same as the resource ARN."),
+        ):
+            with pytest.raises(ClientError) as exc:
+                kin.put_resource_policy(ResourceARN=arn, Policy=document)
+            assert _kin_error(exc) == (400, "InvalidArgumentException", message)
+        with pytest.raises(ClientError) as exc:
+            kin.put_resource_policy(ResourceARN=consumer, Policy=policy(consumer, ["kinesis:GetRecords"]))
+        assert _kin_error(exc) == (400, "InvalidArgumentException", "Policy validation error: Resource policy contains invalid"
+                                   ' statement at line 1, column 41: The following action names are invalid: "kinesis:GetRecords"')
+
+        stream_policy = policy(arn, ["kinesis:GetRecords", "kinesis:GetShardIterator"])
+        kin.put_resource_policy(ResourceARN=arn, Policy=stream_policy)
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == stream_policy
+        kin.put_resource_policy(ResourceARN=consumer, Policy=policy(consumer, ["kinesis:SubscribeToShard"]))
+        kin.delete_resource_policy(ResourceARN=arn)
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+        missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+        with pytest.raises(ClientError) as exc:
+            kin.get_resource_policy(ResourceARN=missing)
+        assert _kin_error(exc) == (400, "ResourceNotFoundException", f"Stream no-such-stream under account {account} not found.")
+        with pytest.raises(ClientError) as exc:
+            kin.get_resource_policy(ResourceARN=arn.replace(f":{account}:", ":111111111111:"))
+        assert _kin_error(exc) == (400, "UnrecognizedClientException", "No account found for the given parameters")
+        west = arn.replace(":us-east-1:", ":us-west-2:")
+        with pytest.raises(ClientError) as exc:
+            kin.get_resource_policy(ResourceARN=west)
+        assert _kin_error(exc) == (400, "InvalidArgumentException",
+                                   f"The region specified in the ARN '{west}' does not match the endpoint region")
+    finally:
+        kin.delete_stream(StreamName=name, EnforceConsumerDeletion=True)
+
+
+def test_kinesis_resource_policy_goes_with_its_stream(kin):
+    name = f"rp-del-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    account = arn.split(":")[4]
+    kin.put_resource_policy(ResourceARN=arn, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:root"}, "Action": "kinesis:GetRecords",
+        "Resource": arn}]}))
+    kin.delete_stream(StreamName=name)
+    kin.create_stream(StreamName=name, ShardCount=1)
+    try:
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    finally:
+        kin.delete_stream(StreamName=name)

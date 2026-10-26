@@ -4184,7 +4184,7 @@ def test_lambda_provided_runtime_docker_invoke(lam):
         lam.delete_function(FunctionName=func_name)
 
 
-def test_lambda_provided_runtime_env_has_function_vars():
+def test_lambda_provided_runtime_env_has_function_vars(monkeypatch, tmp_path):
     """_execute_function_provided re-injects AWS_LAMBDA_FUNCTION_MEMORY_SIZE /
     _VERSION / LOG_STREAM_NAME from the function config (#1060).
 
@@ -4229,6 +4229,9 @@ def test_lambda_provided_runtime_env_has_function_vars():
         },
         "code_zip": buf.getvalue(),
     }
+    # This process shares the server's cache directory, which a reset on the server removes; use a private one.
+    monkeypatch.setattr(lmod, "_PROVIDED_CODE_CACHE", str(tmp_path / "provided"))
+    monkeypatch.setattr(lmod, "_provided_code_dirs", {})
     result = lmod._execute_function_provided(func, {"ping": "pong"}, request_id="request-1")
     assert not result.get("error"), result
     body = result["body"]
@@ -4237,7 +4240,7 @@ def test_lambda_provided_runtime_env_has_function_vars():
     assert body["log_stream"]
 
 
-def test_lambda_provided_runtime_parallel_invocations():
+def test_lambda_provided_runtime_parallel_invocations(monkeypatch, tmp_path):
     """Concurrent provided.* invocations must not fail with ETXTBSY (#1051).
 
     Pre-fix, every invocation extracted the code zip into its own tempdir;
@@ -4278,6 +4281,9 @@ def test_lambda_provided_runtime_parallel_invocations():
         "code_zip": buf.getvalue(),
     }
 
+    # This process shares the server's cache directory, which a reset on the server removes; use a private one.
+    monkeypatch.setattr(lmod, "_PROVIDED_CODE_CACHE", str(tmp_path / "provided"))
+    monkeypatch.setattr(lmod, "_provided_code_dirs", {})
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(
             lambda i: lmod._execute_function_provided(func, {"n": i}, request_id=f"request-{i}"), range(8)))
@@ -15764,3 +15770,23 @@ def test_lambda_code_caches_belong_to_this_instance():
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     assert os.path.basename(lsvc._PROVIDED_CODE_CACHE) == f"ministack-provided-code-{port}"
     assert os.path.basename(lsvc._DOCKER_EXTRACT_CACHE) == f"ministack-lambda-extract-{port}"
+
+
+@pytest.mark.parametrize("event_source_arn, message", [
+    ("arn:aws:kinesis:us-west-2:000000000000:stream/esm-kinesis-source",
+     "Event source region must match Lambda region us-east-1"),
+    ("arn:aws:kinesis:us-east-1:111111111111:stream/esm-kinesis-source",
+     "Received Exception while reading from provided stream. No account found for the given parameters"),
+])
+def test_lambda_create_esm_kinesis_scope_messages_follow_aws(lam, event_source_arn, message):
+    """Captured on AWS (us-east-1, 2026-10-26)."""
+    name = f"esm-scope-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": _make_zip("def handler(e, c): return None")})
+    try:
+        with pytest.raises(ClientError) as exc:
+            lam.create_event_source_mapping(EventSourceArn=event_source_arn, FunctionName=name, StartingPosition="LATEST")
+        err = exc.value.response["Error"]
+        assert (err["Code"], err["Message"]) == ("InvalidParameterValueException", message)
+    finally:
+        lam.delete_function(FunctionName=name)
