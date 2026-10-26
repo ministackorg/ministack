@@ -5431,9 +5431,8 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
-        from ministack.app import AUTH
-
-        if (AUTH and not query_params.keys() - {"x-id"}
+        # The response shape AWS gives a header-signed GET, whatever MiniStack's AUTH setting.
+        if (not query_params.keys() - {"x-id"}
                 and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
             status, err_headers, err_body = _object_error(
                 "NoSuchKey", "The specified key does not exist.", 404, Key=key,

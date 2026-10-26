@@ -3408,7 +3408,7 @@ async def app(scope, receive, send):
     # IAM denials. Presigns, access points and subresources keep their handlers.
     head_path = None
     # Iceberg routes are selected before S3, even when signed with scope s3.
-    if (AUTH and method == "HEAD" and not path.startswith("/iceberg")
+    if (method == "HEAD" and not path.startswith("/iceberg")
             and detect_service(method, path, headers, query_params) == "s3"):
         host = headers.get("host", "")
         bucket = _extract_s3_vhost_bucket(host)
