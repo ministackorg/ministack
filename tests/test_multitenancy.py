@@ -6,7 +6,9 @@ in all ARN generation. Non-numeric keys (like "test") fall back to the default
 000000000000.
 """
 
+import io
 import os
+import zipfile
 
 import boto3
 from botocore.config import Config
@@ -103,13 +105,16 @@ def test_sqs_queues_isolated_by_account():
 def test_lambda_function_arn_uses_dynamic_account():
     """Lambda function ARN reflects the 12-digit access key."""
     lam = _client("lambda", access_key="999888777666")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context): return 1")
     try:
         lam.create_function(
             FunctionName="mt-func",
             Runtime="python3.12",
             Role="arn:aws:iam::999888777666:role/test",
             Handler="index.handler",
-            Code={"ZipFile": b"fake"},
+            Code={"ZipFile": buf.getvalue()},
         )
         resp = lam.get_function(FunctionName="mt-func")
         arn = resp["Configuration"]["FunctionArn"]

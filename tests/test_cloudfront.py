@@ -5813,6 +5813,7 @@ class _RawHeaderCaptureServer:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(5)
         self.port = self.sock.getsockname()[1]
+        self.last_request_line = ""
         self.last_header_lines: list = []
         self._stop = False
         self.thread = threading.Thread(target=self._serve, daemon=True)
@@ -5837,7 +5838,8 @@ class _RawHeaderCaptureServer:
                     data += chunk
                 head, _, _rest = data.partition(b"\r\n\r\n")
                 lines = head.decode("latin-1").split("\r\n")
-                self.last_header_lines = lines[1:]  # drop the request line
+                self.last_request_line = lines[0]
+                self.last_header_lines = lines[1:]
                 body = b"ok"
                 conn.sendall(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
@@ -6106,7 +6108,8 @@ def test_untrusted_origin_certificate_answers_502(cloudfront, untrusted_https_or
 # ---------------------------------------------------------------------------
 
 
-def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, read_timeout: int = 30) -> str:
+def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, read_timeout: int = 30,
+                     origin_request_policy_id: str | None = None) -> str:
     suffix = _uuid_mod.uuid4().hex[:10]
     origin = {
         "Id": "alb-origin",
@@ -6132,6 +6135,8 @@ def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, r
             "CachePolicyId": _CACHING_DISABLED,
         },
     }
+    if origin_request_policy_id:
+        dist_config["DefaultCacheBehavior"]["OriginRequestPolicyId"] = origin_request_policy_id
     return cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]["DomainName"]
 
 
@@ -6179,6 +6184,7 @@ def test_registered_alb_origin_without_a_listener_on_the_origin_port_answers_502
     status, headers, _body = _get(dist_host, "/anything")
     assert status == 502
     assert headers.get("X-Cache") == "Error from cloudfront"
+    assert {k.lower(): v for k, v in headers.items()}["server"] == "CloudFront"
 
 
 def test_unregistered_alb_hostname_is_still_refused(cloudfront):
@@ -6209,6 +6215,27 @@ def test_registered_alb_origin_relays_an_ip_target_response(cloudfront, elbv2, a
         assert len(xff_lines) == 1
         # CloudFront appends the viewer, then the load balancer appends CloudFront's address.
         assert xff_lines[0].split(":", 1)[1].strip() == "203.0.113.5, 127.0.0.1, 127.0.0.1"
+    finally:
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+
+
+def test_registered_alb_origin_forwards_the_query_string_as_the_viewer_sent_it(
+    cloudfront, elbv2, alb_origin, raw_header_server,
+):
+    tg_arn = elbv2.create_target_group(
+        Name=f"cf-alb-{_uuid_mod.uuid4().hex[:8]}", Protocol="HTTP", Port=raw_header_server.port,
+        VpcId="vpc-00000001", TargetType="ip",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    try:
+        elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": "127.0.0.1", "Port": raw_header_server.port}])
+        elbv2.modify_listener(ListenerArn=alb_origin["listener_arn"],
+                              DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}])
+        dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [],
+                                     origin_request_policy_id=_MANAGED_ALL_VIEWER_EXCEPT_HOST_ID)
+
+        status, _headers, _body = _get(dist_host, "/search?a=1&b=2&a=3&flag")
+        assert status == 200
+        assert raw_header_server.last_request_line == "GET /search?a=1&b=2&a=3&flag HTTP/1.1"
     finally:
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
 
@@ -6351,3 +6378,23 @@ def test_function_url_origin_over_http_is_unreachable(cloudfront, function_url_o
 def test_unregistered_function_url_hostname_is_still_refused(cloudfront):
     host = f"{_uuid_mod.uuid4()}.lambda-url.us-east-1.on.aws"
     assert _get(_function_url_dist(cloudfront, host), "/hello")[0] == 502
+
+
+def test_distribution_adds_no_request_id_headers_of_its_own(cf_raw_origin_stack):
+    """CloudFront adds Via, X-Amz-Cf-Id, X-Amz-Cf-Pop and X-Cache; an origin that sends no request id gets none."""
+    status, headers, _body = _get(cf_raw_origin_stack, "/hello")
+    assert status == 200
+    names = {name.lower() for name in headers}
+    assert "x-amz-cf-id" in names
+    assert not names & {"x-amzn-requestid", "x-amz-request-id"}
+    # The origin's own Server passes through.
+    assert {k.lower(): v for k, v in headers.items()}["server"].startswith("BaseHTTP")
+
+
+def test_request_id_has_cloudfronts_shape(cf_raw_origin_stack):
+    """X-Amz-Cf-Id is 40 random bytes in URL-safe base64 with its padding, as CloudFront sends it."""
+    status, headers, _body = _get(cf_raw_origin_stack, "/hello")
+    assert status == 200
+    lowered = {name.lower(): value for name, value in headers.items()}
+    assert re.fullmatch(r"[A-Za-z0-9_-]{54}==", lowered["x-amz-cf-id"]), lowered["x-amz-cf-id"]
+    assert re.fullmatch(r"1\.1 [0-9a-f]{32}\.cloudfront\.net \(CloudFront\)", lowered["via"]), lowered["via"]

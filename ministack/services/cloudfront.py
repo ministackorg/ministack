@@ -5854,11 +5854,11 @@ def _apply_response_headers_policy(headers: dict, policy_cfg: dict, viewer_origi
 
 
 def _cf_request_id() -> str:
-    return base64.b64encode(os.urandom(42)).decode().rstrip("=")
+    return base64.urlsafe_b64encode(os.urandom(40)).decode()
 
 
 def _cf_via_hash() -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=13))
+    return os.urandom(16).hex()
 
 
 def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None = None) -> dict:
@@ -5867,6 +5867,8 @@ def _add_cloudfront_headers(headers: dict, x_cache: str, request_id: str | None 
     result["x-cache"] = x_cache
     result["x-amz-cf-pop"] = "LOC50-C1"
     result["x-amz-cf-id"] = request_id or _cf_request_id()
+    if not any(k.lower() == "server" for k in result):
+        result["server"] = "CloudFront"
     return result
 
 
@@ -6074,7 +6076,7 @@ async def _fetch_from_alb_origin(lb: dict, origin: dict, method: str, uri: str, 
         status, response_headers, data = await asyncio.wait_for(
             alb.dispatch_request(lb, method, uri, alb_headers, body or b"",
                                  parse_qs(query_string, keep_blank_values=True), port,
-                                 client_ip="127.0.0.1"),
+                                 client_ip="127.0.0.1", raw_query_string=query_string),
             read_timeout,
         )
     except asyncio.TimeoutError as e:

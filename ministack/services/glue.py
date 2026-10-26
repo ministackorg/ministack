@@ -1706,6 +1706,15 @@ def _resolve_script(script_location):
     return None
 
 
+def _script_args(job, job_name, run_id, run_arguments):
+    """Return the arguments that the job script gets."""
+    default_arguments = job.get("DefaultArguments", {})
+    if not _is_spark_job(job):
+        return {**default_arguments, **run_arguments}
+    # Glue gives a Spark script its job name and run ID. They replace DefaultArguments, and the run's Arguments replace them.
+    return {**default_arguments, "--JOB_NAME": job_name, "--JOB_RUN_ID": run_id, **run_arguments}
+
+
 def _start_job_run(data):
     job_name = data.get("JobName")
     if job_name not in _jobs:
@@ -1740,6 +1749,8 @@ def _start_job_run(data):
         _job_runs[job_name] = []
     _job_runs[job_name].append(run)
 
+    script_args = _script_args(job, job_name, run_id, data.get("Arguments", {}))
+
     def _execute():
         run["JobRunState"] = "RUNNING"
         run["LastModifiedOn"] = int(time.time())
@@ -1758,11 +1769,11 @@ def _start_job_run(data):
                 logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
 
         if use_docker:
-            _execute_spark_docker(run, job, job_name, args, resolved, docker_client)
+            _execute_spark_docker(run, job, job_name, script_args, resolved, docker_client)
         elif _is_spark_job(job):
             run["JobRunState"] = "SUCCEEDED"
         elif resolved and resolved.endswith(".py"):
-            _execute_subprocess(run, job, args, resolved)
+            _execute_subprocess(run, job, script_args, resolved)
         else:
             run["JobRunState"] = "SUCCEEDED"
 
