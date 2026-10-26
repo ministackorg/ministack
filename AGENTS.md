@@ -73,6 +73,16 @@ before changing a service; it has the contribution process and examples.
 
 ## Before opening a PR
 
+- Brand-new GitHub accounts can only open issues, not PRs.
+- A contributor can have at most 5 open PRs. If the work was agreed
+  beforehand in an issue, the maintainers may lift the limit temporarily.
+- Every behavior change should be backed by real AWS evidence: a response
+  captured from a real AWS account. PRs based on documentation, botocore model
+  reading, LocalStack or other third-party recordings, or inference that turn
+  out to differ from AWS will be closed. PRs that are not in line with AWS are
+  closed and the maintainers implement the behavior themselves.
+- If you can't run against AWS, open an issue describing the behavior and
+  your workflow instead of a PR, and the maintainers will take it from there.
 - Update the supported-services table in `README.md` for a new service and
   follow the existing `CHANGELOG.md` format for user-facing changes.
 - Preserve explanatory dependency comments in `pyproject.toml` when changing

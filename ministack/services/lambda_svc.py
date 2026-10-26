@@ -376,8 +376,11 @@ def _runtime_env_vars(config: dict) -> dict:
 # sha256, matching real Lambda's read-only /var/task — and both extraction
 # and every spawn take ``_provided_code_lock`` so no fork can overlap an
 # extraction write. Directories accumulate per distinct code sha within
-# ``tempfile.gettempdir()``; ``reset()`` removes them.
-_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), "ministack-provided-code")
+# ``tempfile.gettempdir()``; ``reset()`` removes them. Both caches are named
+# for this instance's gateway port: another MiniStack on the host shares the
+# temp directory and would otherwise remove a tree that is still in use.
+_GATEWAY_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), f"ministack-provided-code-{_GATEWAY_PORT}")
 _provided_code_lock = threading.Lock()
 _provided_code_dirs: dict[str, str] = {}
 
@@ -414,7 +417,7 @@ def _provided_runtime_code_dir(code_zip: bytes) -> str:
 # environment and mounts /var/task and /opt read-only. Directories accumulate
 # per distinct blob within ``tempfile.gettempdir()``; ``reset()`` removes
 # them, like the provided-runtime cache above.
-_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), "ministack-lambda-extract")
+_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), f"ministack-lambda-extract-{_GATEWAY_PORT}")
 _docker_extract_lock = threading.Lock()
 _docker_extract_dirs: dict[str, str] = {}
 
@@ -599,13 +602,17 @@ def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
     # without going through CreateFunction (no real code path does this).
 
 
-def _internalize_code_zip(func: dict) -> None:
-    """Replace a blob ref or legacy base64 string with bytes, in place."""
+def _internalize_code_zip(func: dict, blobs: dict[str, bytes | None]) -> None:
+    """Replace a blob ref or legacy base64 string with bytes, in place. ``blobs``
+    holds what this restore has read, so records sharing a blob share its bytes."""
     code = func.get("code_zip")
     if not code:
         return
     if isinstance(code, dict) and _BLOB_REF_KEY in code:
-        func["code_zip"] = _read_code_blob(code[_BLOB_REF_KEY])
+        sha = code[_BLOB_REF_KEY]
+        if sha not in blobs:
+            blobs[sha] = _read_code_blob(sha)
+        func["code_zip"] = blobs[sha]
     elif isinstance(code, str):
         # Legacy persistence shape (inline base64).
         func["code_zip"] = base64.b64decode(code)
@@ -653,27 +660,28 @@ def load_persisted_state(data) -> None:
 
 def _restore_state(data):
     if data:
+        blobs: dict[str, bytes | None] = {}
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountRegionScopedDict):
             for scoped_key, func in funcs._data.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 _functions._data[scoped_key] = func
         elif isinstance(funcs, AccountScopedDict):
             # Pre-region state. Code may be a content-addressed blob ref (#947)
             # or legacy inline base64 — _internalize_code_zip handles both.
             for (account_id, name), func in funcs._data.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 region = _region_from_function_record(func)
                 _functions._data[(account_id, region, name)] = func
         else:
             for name, func in funcs.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 region = _region_from_function_record(func)
                 _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))
@@ -1300,6 +1308,17 @@ def _unzipped_size(zip_data: bytes | None) -> int:
             return sum(info.file_size for info in zf.infolist())
     except zipfile.BadZipFile:
         return 0
+
+
+def _reject_unreadable_zip(zip_data: bytes | None):
+    """A deployment package that is not a zip (an empty file included) is refused; None means no bytes were given."""
+    if zip_data is None or zipfile.is_zipfile(io.BytesIO(zip_data)):
+        return None
+    return error_response_json(
+        "InvalidParameterValueException",
+        "Could not unzip uploaded file. Please check your file, then try to upload again.",
+        400,
+    )
 
 
 def _validate_unzipped_size(zip_data: bytes | None):
@@ -2346,7 +2365,7 @@ def _create_function(data: dict):
     layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
     if err:
         return err
-    err = _validate_total_unzipped_size(code_zip, layers_cfg)
+    err = _reject_unreadable_zip(code_zip) or _validate_total_unzipped_size(code_zip, layers_cfg)
     if err:
         return err
     if data.get("Layers") is not None:
@@ -2835,7 +2854,7 @@ def _update_code(name: str, data: dict):
                 f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
                 400,
             )
-    err = _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
+    err = _reject_unreadable_zip(code_zip) or _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
     if err is not None:
         return err
     if code_zip:
@@ -3757,6 +3776,22 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
     return True
 
 
+def _kinesis_record_for_match(rec: dict) -> dict:
+    """The record a Kinesis filter pattern is matched against. AWS filters on
+    the metadata fields (``partitionKey``, ``sequenceNumber``, ...) next to the
+    event fields and on ``data`` as decoded JSON (AWS Lambda developer guide,
+    "Using event filtering with a Kinesis event source"). Data that isn't JSON
+    is left out, so a ``data`` pattern can't match it but metadata ones still can."""
+    flat = {k: v for k, v in rec.items() if k != "kinesis"}
+    flat.update(rec["kinesis"])
+    flat.pop("data", None)
+    try:
+        flat["data"] = json.loads(base64.b64decode(rec["kinesis"].get("data") or "", validate=True))
+    except (ValueError, TypeError):
+        pass
+    return flat
+
+
 def _apply_filter_criteria(records: list[dict], esm: dict) -> list[dict]:
     """Apply an ESM's FilterCriteria.Filters (OR across patterns) to a batch
     of records, returning only those matching at least one filter. If no
@@ -3781,7 +3816,7 @@ def _apply_filter_criteria(records: list[dict], esm: dict) -> list[dict]:
     for rec in records:
         # For SQS records the body is a string; AWS parses JSON bodies
         # automatically when the filter pattern targets `body.*` fields.
-        rec_for_match = dict(rec)
+        rec_for_match = _kinesis_record_for_match(rec) if isinstance(rec.get("kinesis"), dict) else dict(rec)
         body = rec.get("body")
         if isinstance(body, str):
             try:
@@ -6407,7 +6442,7 @@ def _publish_layer_version(layer_name: str, data: dict):
             version_id=content.get("S3ObjectVersion"),
         )
 
-    err = _validate_unzipped_size(zip_data)
+    err = _reject_unreadable_zip(zip_data) or _validate_unzipped_size(zip_data)
     if err is not None:
         return err
 

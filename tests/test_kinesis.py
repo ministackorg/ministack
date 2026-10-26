@@ -940,3 +940,62 @@ def test_subscription_captures_selection_before_runner_and_pruning(subscription_
             assert events[0]["ContinuationSequenceNumber"] == appended
 
     asyncio.run(exercise())
+
+
+_FILTER_HANDLER = """
+import base64
+
+def handler(event, context):
+    for r in event["Records"]:
+        print("XREC " + base64.b64decode(r["kinesis"]["data"]).decode())
+    return len(event["Records"])
+"""
+
+
+@pytest.mark.parametrize("pattern, expected", [
+    ({"data": {"kind": ["keep"]}}, ['{"kind": "keep"}', '{"kind": "keep", "n": 2}']),
+    ({"data": {"n": [{"numeric": [">", 1]}]}}, ['{"kind": "keep", "n": 2}']),
+    ({"partitionKey": ["pk-b"]}, ['{"kind": "drop"}', "not json"]),
+    ({"partitionKey": [{"prefix": "pk-"}], "data": {"kind": [{"exists": True}]}},
+     ['{"kind": "keep"}', '{"kind": "drop"}', '{"kind": "keep", "n": 2}']),
+], ids=["data-field", "data-numeric", "metadata-only-matches-non-json", "metadata-and-data"])
+def test_kinesis_esm_filter_criteria_match_decoded_data_and_metadata(lam, kin, logs, pattern, expected):
+    """Black box: the function only receives the records the pattern selects."""
+    stream = f"kin-filter-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    for data, pk in (('{"kind": "keep"}', "pk-a"), ('{"kind": "drop"}', "pk-b"),
+                     ("not json", "pk-b"), ('{"kind": "keep", "n": 2}', "pk-a")):
+        kin.put_record(StreamName=stream, Data=data.encode(), PartitionKey=pk)
+
+    fn = f"kin-filter-fn-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", _FILTER_HANDLER)
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn, EventSourceArn=arn, StartingPosition="TRIM_HORIZON",
+        FilterCriteria={"Filters": [{"Pattern": json.dumps(pattern)}]})["UUID"]
+    try:
+        received = []
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]
+            except ClientError:
+                events = []
+            received = [line[len("XREC "):] for e in events for line in e["message"].splitlines()
+                        if line.startswith("XREC ")]
+            if len(received) >= len(expected):
+                break
+            time.sleep(0.5)
+        time.sleep(2)  # nothing that should have been filtered turns up later
+        events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]
+        received = [line[len("XREC "):] for e in events for line in e["message"].splitlines()
+                    if line.startswith("XREC ")]
+        assert received == expected
+    finally:
+        lam.delete_event_source_mapping(UUID=esm)
+        lam.delete_function(FunctionName=fn)
+        kin.delete_stream(StreamName=stream)

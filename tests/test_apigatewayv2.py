@@ -1387,8 +1387,9 @@ def test_http_api_response_request_id_header(apigw, lam):
 
 
 def test_apigw_raw_query_string_percent_encoded(apigw, lam):
-    """rawQueryString must stay percent-encoded like AWS: a space in a value comes
-    back as %20, not a literal space (which breaks lambda_http / http::Uri) — #1035."""
+    """rawQueryString is the query string as the client sent it: a space in a value stays
+    %20, not a literal space (which breaks lambda_http / http::Uri) — #1035 — and a bare key
+    gains no "="."""
     import urllib.request as _urlreq
     import uuid as _uuid
 
@@ -1418,6 +1419,9 @@ def test_apigw_raw_query_string_percent_encoded(apigw, lam):
         body = json.loads(resp.read())
         assert "openid%20profile" in body["rawQs"]
         assert "openid profile" not in body["rawQs"]  # no literal space
+        req = _urlreq.Request(url.split("?")[0] + "?flag&a=1", method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        assert json.loads(_urlreq.urlopen(req).read())["rawQs"] == "flag&a=1"
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=fname)
@@ -1807,7 +1811,8 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
         b"def handler(event, context):\n"
         b"    tok = event.get('headers', {}).get('authorization', '')\n"
         b"    if tok == 'allow-me':\n"
-        b"        return {'isAuthorized': True, 'context': {'user': 'alice', 'admin': True}}\n"
+        b"        return {'isAuthorized': True, 'context': {'user': 'alice', 'admin': True,\n"
+        b"                                                  'rawQueryString': event.get('rawQueryString')}}\n"
         b"    return {'isAuthorized': False}\n"
     )
     int_code = (
@@ -1855,8 +1860,8 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
         host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
         url = f"http://{host}/$default/private"
 
-        def _call(token):
-            req = _urlreq.Request(url, method="GET")
+        def _call(token, query=""):
+            req = _urlreq.Request(url + query, method="GET")
             req.add_header("Host", host)
             if token is not None:
                 req.add_header("Authorization", token)
@@ -1872,10 +1877,10 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
 
         # Valid token -> isAuthorized: true -> 200, context reaches the
         # integration under requestContext.authorizer.lambda.
-        status, body = _call("allow-me")
+        status, body = _call("allow-me", "?flag&a=1")
         assert status == 200
         auth = json.loads(body)
-        assert auth == {"lambda": {"user": "alice", "admin": True}}
+        assert auth == {"lambda": {"user": "alice", "admin": True, "rawQueryString": "flag&a=1"}}
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=auth_fn)
