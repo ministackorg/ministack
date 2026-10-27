@@ -10,6 +10,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Added
 - **Aurora DSQL — `AWS IAM GRANT` and `AWS IAM REVOKE`** — with `DSQL_STRICT=1` both were a syntax error, so a migration that maps a Postgres role to an IAM role stopped there. Sent on their own over the simple query protocol (psql, psycopg2), a GRANT maps one or more ARNs to a role and a REVOKE unmaps them; the mappings read back through `sys.iam_pg_role_mappings` with DSQL's six columns and types, a rollback undoes a GRANT, and a GRANT after other DDL in the same transaction answers DSQL's `0A000`. Re-granting raises DSQL's NOTICE and revoking a missing mapping its WARNING; an unknown role answers `42704`, a value that is not an ARN `0P000`, and granting the signed-in role to itself `42501`. Contributed by @toby6578.
 
+### Fixed
+- **Athena — the result file is saved at the reported `OutputLocation`** — a query's `<id>.csv` and `<id>.csv.metadata` are now saved directly under the result location, at the path that `GetQueryExecution` reports, as AWS does. Before, they were saved one folder too deep, at `<location>/<id>.csv/<id>.csv`, so a client that read the reported path got `NoSuchKey`.
+- **Athena — an enforced workgroup overrides the client-side result location** — when a workgroup has `EnforceWorkGroupConfiguration: true`, `StartQueryExecution` now writes results to the workgroup's `OutputLocation`, even when the request gives its own `ResultConfiguration.OutputLocation`, as AWS does. Before, the request's location was used.
+- **Lambda — a partial ARN as the `FunctionName`** — `123456789012:function:my-function[:qualifier]` resolved to the account ID as the function name, so `Invoke` and the other function operations failed with `Function not found: ...:function:123456789012`; it now resolves as the full ARN in the caller's region, as on AWS, and gives the same result as that full ARN.
 ## [1.5.33] — 2026-10-26
 
 ### Added

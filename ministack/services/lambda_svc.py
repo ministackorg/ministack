@@ -982,32 +982,34 @@ process.stdin.on('end', async () => {
 # ---------------------------------------------------------------------------
 
 
+# A partial ARN: <account>:function:<name>[:<qualifier>]. A function name cannot contain ":".
+_PARTIAL_FUNCTION_ARN_RE = re.compile(r"^(\d{12}):function:([^:]+)(?::([^:]+))?$")
+
+
 def _resolve_name(name_or_arn: str) -> str:
     """Extract plain function name from a name, partial ARN, or full ARN."""
-    if not name_or_arn:
-        return ""
-    if name_or_arn.startswith("arn:"):
-        name, _qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
-        return name or name_or_arn
-    if ":" in name_or_arn:
-        return name_or_arn.split(":")[0]
-    return name_or_arn
+    return _resolve_name_and_qualifier(name_or_arn)[0]
 
 
 def _resolve_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
     """Extract (function_name, qualifier) from a name, partial ARN, or full ARN.
 
     Handles:
-      my-function                -> ("my-function", None)
-      my-function:v1             -> ("my-function", "v1")
-      arn:...:function:my-func   -> ("my-func", None)
-      arn:...:function:my-func:3 -> ("my-func", "3")
+      my-function                              -> ("my-function", None)
+      my-function:v1                           -> ("my-function", "v1")
+      123456789012:function:my-function        -> ("my-function", None)
+      123456789012:function:my-function:v1     -> ("my-function", "v1")
+      arn:...:function:my-func                 -> ("my-func", None)
+      arn:...:function:my-func:3               -> ("my-func", "3")
     """
     if not name_or_arn:
         return "", None
     if name_or_arn.startswith("arn:"):
         name, qualifier = _lambda_function_name_and_qualifier_from_arn(name_or_arn)
         return (name, qualifier) if name else (name_or_arn, None)
+    partial = _PARTIAL_FUNCTION_ARN_RE.match(name_or_arn)
+    if partial:
+        return partial.group(2), partial.group(3)
     if ":" in name_or_arn:
         name, qualifier = name_or_arn.split(":", 1)
         return name, qualifier or None
@@ -1037,6 +1039,9 @@ def _resolve_request_scoped_name(name_or_arn: str) -> str:
 def _resolve_request_scoped_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
     if not name_or_arn:
         return "", None
+    # AWS reads a partial ARN as the full ARN in the caller's region, so the account check below applies to it too.
+    if _PARTIAL_FUNCTION_ARN_RE.match(name_or_arn):
+        name_or_arn = f"arn:aws:lambda:{get_region()}:{name_or_arn}"
     if not name_or_arn.startswith("arn:"):
         return _resolve_name_and_qualifier(name_or_arn)
     try:

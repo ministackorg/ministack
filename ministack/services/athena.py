@@ -819,11 +819,14 @@ def _start_query_execution(data):
     query = data.get("QueryString", "")
     query_id = new_uuid()
     workgroup = data.get("WorkGroup", "primary")
-    output_location = data.get("ResultConfiguration", {}).get(
-        "OutputLocation"
-    ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
-        "ResultConfiguration", {}
-    ).get("OutputLocation")
+    wg_config = _workgroups.get(workgroup, {}).get("Configuration", {})
+    wg_output = wg_config.get("ResultConfiguration", {}).get("OutputLocation")
+    client_output = data.get("ResultConfiguration", {}).get("OutputLocation")
+    # An enforced workgroup overrides the client-side result location
+    if wg_config.get("EnforceWorkGroupConfiguration"):
+        output_location = wg_output or client_output
+    else:
+        output_location = client_output or wg_output
     if not output_location:
         return error_response_json(
             "InvalidRequestException",
@@ -1295,11 +1298,8 @@ async def _save_query_results(query_id):
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
     bucket_name = p.netloc
-    key_prefix = p.path.lstrip("/").rstrip("/")
-    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
-    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
-    # the files land at bucket root.
-    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    # OutputLocation already ends in <id>.csv
+    csv_key = p.path.lstrip("/")
     meta_key = f"{csv_key}.metadata"
 
     # Write directly to the S3 service's in-memory store via the public

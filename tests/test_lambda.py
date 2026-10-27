@@ -1201,6 +1201,39 @@ def test_lambda_invoke(lam):
     assert payload["statusCode"] == 200
     assert payload["body"] == "ok"
 
+@pytest.mark.parametrize("function_name,expected", [
+    ("my-function", ("my-function", None)),
+    ("my-function:v1", ("my-function", "v1")),
+    ("123456789012:function:my-function", ("my-function", None)),
+    ("123456789012:function:my-function:v1", ("my-function", "v1")),
+    ("arn:aws:lambda:us-east-1:123456789012:function:my-function", ("my-function", None)),
+    ("arn:aws:lambda:us-east-1:123456789012:function:my-function:v1", ("my-function", "v1")),
+])
+def test_lambda_resolve_name_accepts_every_function_name_form(function_name, expected):
+    """Every FunctionName form that the Invoke API accepts resolves to the function name and qualifier."""
+    from ministack.services.lambda_svc import _resolve_name, _resolve_name_and_qualifier
+
+    assert _resolve_name_and_qualifier(function_name) == expected
+    assert _resolve_name(function_name) == expected[0]
+
+
+def test_lambda_invoke_with_a_partial_arn(lam):
+    """A partial ARN invokes the function, and a missing function is reported by its name, not the account ID."""
+    fname = f"lam-partial-arn-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": _make_zip(_LAMBDA_CODE)})
+    try:
+        resp = lam.invoke(FunctionName=f"000000000000:function:{fname}", Payload=b"{}")
+        assert json.loads(resp["Payload"].read())["body"] == "ok"
+
+        with pytest.raises(ClientError) as exc:
+            lam.invoke(FunctionName=f"000000000000:function:{fname}-missing", Payload=b"{}")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert f":function:{fname}-missing" in exc.value.response["Error"]["Message"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
 @pytest.mark.parametrize("returned,expected", [
     ("'hello'", b'"hello"'), ("None", b"null"), ("[1, 'a']", b'[1, "a"]'), ("7", b"7"),
 ])
