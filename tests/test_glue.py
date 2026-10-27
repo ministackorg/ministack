@@ -2790,6 +2790,54 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     assert run["JobRunState"] == "SUCCEEDED"
 
 
+def test_glue_spark_submit_tracks_magic_commits_in_memory(tmp_path, monkeypatch):
+    """spark-submit fetches s3:// --py-files before Spark starts. Without in-memory tracking on every
+    S3A filesystem, Glue 5's magicv2 committer never completes a write to that bucket."""
+    from ministack.services import glue as _glue
+
+    monkeypatch.setattr(_glue, "_ministack_network", "")
+    monkeypatch.delenv("MINISTACK_HOST", raising=False)
+
+    created = {}
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            pass
+
+        def start(self):
+            pass
+
+        def wait(self, timeout=None):
+            return {"StatusCode": 0}
+
+        def logs(self, tail=None):
+            return b""
+
+        def remove(self, force=False, v=False):
+            pass
+
+    class _FakeContainers:
+        def get(self, name):
+            raise RuntimeError("no such container")
+
+        def create(self, **kwargs):
+            created.update(kwargs)
+            return _FakeContainer()
+
+    class _FakeDocker:
+        containers = _FakeContainers()
+
+    script = tmp_path / "job.py"
+    script.write_text("print('hi')")
+    args = {"--extra-py-files": "s3://out-bucket/deps.zip"}
+    _glue._execute_spark_docker({"Id": "jr_magic"}, {"Timeout": 1}, "magicjob", args, str(script), _FakeDocker())
+
+    command = created["command"]
+    setting = "spark.hadoop.fs.s3a.committer.magic.track.commits.in.memory.enabled=true"
+    assert setting in command
+    assert command[command.index(setting) - 1] == "--conf"
+
+
 # A small stand-in for botocore: create_client returns the endpoint_url it gets.
 _FAKE_BOTOCORE_SESSION = (
     "ORIGIN = {origin!r}\n"
