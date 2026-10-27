@@ -2,21 +2,29 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import re
 import struct
 import time
+import urllib.error
+import urllib.request
 import uuid
 import uuid as _uuid_mod
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit
 from xml.etree import ElementTree
+from xml.etree.ElementTree import fromstring
 
 import boto3
 import pytest
 import requests
+from botocore import UNSIGNED
+from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth
+from botocore.awsrequest import AWSRequest
 from botocore.config import Config
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 from conftest import (
     inprocess_iam_user,
@@ -10329,6 +10337,7 @@ def test_s3_mrap_requests_are_authorized_on_the_bucket_and_the_mrap(
         with second_access_key(user) as credentials:
             for action, method, target, body, resource in [
                 ("GetObject", "GET", "/who.txt", b"", "/who.txt"),
+                ("GetObject", "HEAD", "/who.txt", b"", "/who.txt"),
                 ("PutObject", "PUT", "/mrap-put.txt", b"x", "/mrap-put.txt"),
                 ("ListBucket", "GET", "/?list-type=2", b"", ""),
             ]:
@@ -10337,7 +10346,11 @@ def test_s3_mrap_requests_are_authorized_on_the_bucket_and_the_mrap(
                     assert status == 200, data
                     continue
                 arn = (bucket_arn if denied_on == "bucket" else mrap_arn + ("/object" if resource else "")) + resource
-                assert status == 403 and ElementTree.fromstring(data).findtext("Code") == "AccessDenied"
+                assert status == 403
+                if method == "HEAD":
+                    assert data == b""
+                    continue
+                assert ElementTree.fromstring(data).findtext("Code") == "AccessDenied"
                 assert ElementTree.fromstring(data).findtext("Message") == (
                     f'User: {user.arn} is not authorized to perform: s3:{action} on resource: "{arn}" '
                     f"because no identity-based policy allows the s3:{action} action")
@@ -11043,3 +11056,1522 @@ def test_s3_copy_source_in_the_query_string_is_authorized_contract(auth_enabled,
             for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
                 s3.delete_object(Bucket=bucket, Key=item["Key"])
             s3.delete_bucket(Bucket=bucket)
+
+
+# ---------------------------------------------------------------------------
+# S3 Access Points: the S3 Control API and the data plane through an access point ARN or alias.
+# ---------------------------------------------------------------------------
+
+
+ACCOUNT = "000000000000"
+
+
+def _client(service, region, account_key="test"):
+    return boto3.client(
+        service, endpoint_url=ENDPOINT, region_name=region,
+        aws_access_key_id=account_key, aws_secret_access_key="test",
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _s3control_dns():
+    """boto3 prefixes S3 Control and access point hosts with the account id."""
+    with patch_endpoint_dns():
+        yield
+
+
+def _uid():
+    return uuid.uuid4().hex[:8]
+
+
+@pytest.fixture
+def bucket():
+    """A bucket in us-east-1 holding k.txt."""
+    s3 = _client("s3", "us-east-1")
+    name = f"ap-data-{_uid()}"
+    s3.create_bucket(Bucket=name)
+    s3.put_object(Bucket=name, Key="k.txt", Body=b"hello")
+    yield name
+    for obj in s3.list_objects_v2(Bucket=name).get("Contents", []):
+        s3.delete_object(Bucket=name, Key=obj["Key"])
+    try:
+        s3.delete_bucket(Bucket=name)
+    except ClientError:
+        pass
+
+
+@pytest.fixture
+def access_point(bucket):
+    ctl = _client("s3control", "us-east-1")
+    name = f"ap-{_uid()}"
+    created = ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    yield name, created
+    try:
+        ctl.delete_access_point(AccountId=ACCOUNT, Name=name)
+    except ClientError:
+        pass
+
+
+# --- Control plane ---------------------------------------------------------
+
+def test_access_point_control_create_get_list_delete(bucket):
+    ctl = _client("s3control", "us-east-1")
+    name = f"ap-{_uid()}"
+    created = ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    arn = f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}"
+    assert created["AccessPointArn"] == arn
+    assert re.fullmatch(rf"{name[:20]}-[a-z0-9]{{29}}use1b-s3alias", created["Alias"])
+
+    ap = ctl.get_access_point(AccountId=ACCOUNT, Name=name)
+    assert (ap["Name"], ap["Bucket"], ap["BucketAccountId"], ap["NetworkOrigin"]) == (
+        name, bucket, ACCOUNT, "Internet")
+    assert ap["AccessPointArn"] == arn and ap["Alias"] == created["Alias"]
+    assert ap["PublicAccessBlockConfiguration"] == {
+        "BlockPublicAcls": True, "IgnorePublicAcls": True, "BlockPublicPolicy": True, "RestrictPublicBuckets": True}
+    assert ap["Endpoints"]["ipv4"] == "s3-accesspoint.us-east-1.amazonaws.com"
+    assert set(ap["Endpoints"]) == {"ipv4", "fips", "dualstack", "fips_dualstack"}
+    assert "CreationDate" in ap
+
+    second = f"ap-{_uid()}"
+    ctl.create_access_point(AccountId=ACCOUNT, Name=second, Bucket=bucket,
+                            VpcConfiguration={"VpcId": "vpc-0123456789abcdef0"})
+    try:
+        listed = ctl.list_access_points(AccountId=ACCOUNT, Bucket=bucket)["AccessPointList"]
+        assert sorted(a["Name"] for a in listed) == sorted([name, second])
+        assert {a["Name"]: a["NetworkOrigin"] for a in listed}[second] == "VPC"
+        page = ctl.list_access_points(AccountId=ACCOUNT, Bucket=bucket, MaxResults=1)
+        assert len(page["AccessPointList"]) == 1 and page["NextToken"]
+        rest = ctl.list_access_points(AccountId=ACCOUNT, Bucket=bucket, NextToken=page["NextToken"])
+        assert len(rest["AccessPointList"]) == 1
+    finally:
+        ctl.delete_access_point(AccountId=ACCOUNT, Name=second)
+
+    with pytest.raises(ClientError) as exc:
+        ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert exc.value.response["Error"]["Code"] == "AccessPointAlreadyOwnedByYou"
+    assert exc.value.response["Error"]["Message"] == (
+        "Your previous request to create the named accesspoint succeeded and you already own it.")
+
+    with pytest.raises(ClientError) as exc:
+        _client("s3", "us-east-1").delete_bucket(Bucket=bucket)
+    assert exc.value.response["Error"]["Code"] == "BucketHasAccessPointsAttached"
+
+    ctl.delete_access_point(AccountId=ACCOUNT, Name=name)
+    with pytest.raises(ClientError) as exc:
+        ctl.get_access_point(AccountId=ACCOUNT, Name=name)
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert (err["Code"], err["Message"], err["AccessPointName"]) == (
+        "NoSuchAccessPoint", "The specified accesspoint does not exist", name)
+
+
+def test_access_point_control_bucket_must_be_in_request_region(bucket):
+    with pytest.raises(ClientError) as exc:
+        _client("s3control", "eu-west-1").create_access_point(AccountId=ACCOUNT, Name=f"ap-{_uid()}", Bucket=bucket)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "InvalidRequest"
+    assert exc.value.response["Error"]["Message"] == (
+        "Amazon S3 AccessPoint can only be created for bucket in the same region")
+
+
+def test_access_point_control_same_name_in_another_region(bucket):
+    """Access point names are unique per account and region (observed)."""
+    euw1_s3 = _client("s3", "eu-west-1")
+    euw1_bucket = f"ap-euw1-{_uid()}"
+    euw1_s3.create_bucket(Bucket=euw1_bucket, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"})
+    name = f"ap-{_uid()}"
+    use1, euw1 = _client("s3control", "us-east-1"), _client("s3control", "eu-west-1")
+    use1.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    try:
+        alias = euw1.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=euw1_bucket)["Alias"]
+        assert alias.endswith("euw1b-s3alias")
+        assert euw1.get_access_point(AccountId=ACCOUNT, Name=name)["Bucket"] == euw1_bucket
+        assert use1.get_access_point(AccountId=ACCOUNT, Name=name)["Bucket"] == bucket
+        euw1.delete_access_point(AccountId=ACCOUNT, Name=name)
+    finally:
+        use1.delete_access_point(AccountId=ACCOUNT, Name=name)
+        euw1_s3.delete_bucket(Bucket=euw1_bucket)
+
+
+def test_access_point_control_policy_round_trip(access_point):
+    name, _ = access_point
+    ctl = _client("s3control", "us-east-1")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}/object/*"}]})
+    ctl.put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=policy)
+    assert ctl.get_access_point_policy(AccountId=ACCOUNT, Name=name)["Policy"] == policy
+    ctl.delete_access_point_policy(AccountId=ACCOUNT, Name=name)
+    with pytest.raises(ClientError) as exc:
+        ctl.get_access_point_policy(AccountId=ACCOUNT, Name=name)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+@pytest.mark.parametrize("method,path,status,fields", [
+    ("POST", "/{ap}/policy", 405, {"Method": "POST", "ResourceType": "ACCESSPOINTPOLICY"}),
+    ("PATCH", "/{ap}/policy", 405, {"Method": "PATCH", "ResourceType": "ACCESSPOINTPOLICY"}),
+    ("POST", "/{ap}", 405, {"Method": "POST", "ResourceType": "ACCESSPOINT"}),
+    ("POST", "", 405, {"Method": "POST", "ResourceType": "ACCESSPOINTS"}),
+    ("GET", "/{ap}/x", 400, {"URI": "accesspoint/{ap}/x"}),
+    ("DELETE", "/{ap}/x", 400, {}),
+    ("DELETE", "/{ap}/policy/x", 400, {}),
+    ("GET", "/{ap}/", 400, {}),
+    ("GET", "//{ap}", 400, {}),
+    ("PUT", "//{ap}/policy", 400, {}),
+    ("GET", "/", 400, {}),    ("GET", "/{ap}/policyStatus", 404, {"AccessPointName": "{ap}/policyStatus"}),
+    ("GET", "/{ap}/scope", 404, {}),
+])
+def test_access_point_control_unserved_requests(access_point, method, path, status, fields):
+    """Unserved methods answer 405, unparsed paths 400, unemulated routes 404; none changes the access point."""
+    name, _ = access_point
+    ctl = _client("s3control", "us-east-1")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}/object/*"}]})
+    ctl.put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=policy)
+    body = b"<PutAccessPointPolicyRequest><Policy>{}</Policy></PutAccessPointPolicyRequest>"
+    got, _, data = _raw(method, ENDPOINT.split("://", 1)[1], "/v20180820/accesspoint" + path.format(ap=name),
+                        "us-east-1", body if method == "PUT" else b"", headers={"x-amz-account-id": ACCOUNT})
+    code = {405: "MethodNotAllowed", 400: "InvalidURI", 404: "NoSuchAccessPoint"}[status]
+    assert (got, re.search(rb"<Code>(\w+)</Code>", data).group(1).decode()) == (status, code)
+    for tag, value in fields.items():
+        assert f"<{tag}>{value.format(ap=name)}</{tag}>".encode() in data
+    assert ctl.get_access_point_policy(AccountId=ACCOUNT, Name=name)["Policy"] == policy
+
+
+@pytest.mark.auth_contract
+def test_access_point_named_policy_needs_the_access_point_action(auth_enabled, iam_user, bucket):
+    """/v20180820/accesspoint/policy names an access point called "policy"."""
+    ctl = _client("s3control", "us-east-1")
+    ctl.create_access_point(AccountId=ACCOUNT, Name="policy", Bucket=bucket)
+    try:
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Action": ["s3:GetAccessPointPolicy", "s3:DeleteAccessPointPolicy"],
+            "Resource": "*"}]}).client("s3control", region="us-east-1")
+        user.delete_access_point_policy(AccountId=ACCOUNT, Name="policy")
+        if auth_enabled:
+            for call in (user.get_access_point, user.delete_access_point):
+                with pytest.raises(ClientError) as exc:
+                    call(AccountId=ACCOUNT, Name="policy")
+                assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+                assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert ctl.get_access_point(AccountId=ACCOUNT, Name="policy")["Bucket"] == bucket
+        else:
+            assert user.get_access_point(AccountId=ACCOUNT, Name="policy")["Bucket"] == bucket
+            user.delete_access_point(AccountId=ACCOUNT, Name="policy")
+    finally:
+        try:
+            ctl.delete_access_point(AccountId=ACCOUNT, Name="policy")
+        except ClientError:
+            pass
+
+
+@pytest.mark.auth_contract
+def test_access_point_policy_unserved_method_is_refused_before_authorization(auth_enabled, iam_user, access_point):
+    """POST on an access point policy answers 405 to any caller and returns no policy."""
+    name, _ = access_point
+    _client("s3control", "us-east-1").put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+            "Resource": f"arn:aws:s3:us-east-1:{ACCOUNT}:accesspoint/{name}/object/*"}]}))
+    user = iam_user()
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        signed = {"key": (key["AccessKeyId"], key["SecretAccessKey"]), "headers": {"x-amz-account-id": ACCOUNT}}
+        host, path = ENDPOINT.split("://", 1)[1], f"/v20180820/accesspoint/{name}/policy"
+        status, _, data = _raw("POST", host, path, "us-east-1", **signed)
+        assert status == 405 and b"<ResourceType>ACCESSPOINTPOLICY</ResourceType>" in data
+        assert b"<Policy>" not in data
+        assert _raw("GET", host, path, "us-east-1", **signed)[0] == (403 if auth_enabled else 200)
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+# --- Data plane --------------------------------------------------------------
+
+def _raw(method, host, path, region, body=b"", key=("test", "test"), headers=None):
+    """A SigV4-signed request with an explicit Host, no redirect handling."""
+    import hashlib
+    import http.client
+    from urllib.parse import urlparse
+
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    req = AWSRequest(method=method, url=f"http://{host}{path}", data=body, headers=headers)
+    req.headers["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
+    S3SigV4Auth(Credentials(*key), "s3", region).add_auth(req)
+    parsed = urlparse(ENDPOINT)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, path, body=body or None, headers={**dict(req.headers.items()), "Host": host})
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, data
+
+
+def test_access_point_arn_reaches_the_bucket(bucket, access_point):
+    name, created = access_point
+    s3 = _client("s3", "us-east-1")
+    arn = created["AccessPointArn"]
+    assert s3.get_object(Bucket=arn, Key="k.txt")["Body"].read() == b"hello"
+    s3.put_object(Bucket=arn, Key="through-ap.txt", Body=b"via ap")
+    assert s3.get_object(Bucket=bucket, Key="through-ap.txt")["Body"].read() == b"via ap"
+    keys = [o["Key"] for o in s3.list_objects_v2(Bucket=arn)["Contents"]]
+    assert keys == ["k.txt", "through-ap.txt"]
+    # A client configured for another region still signs for the ARN's region.
+    assert _client("s3", "eu-west-1").get_object(Bucket=arn, Key="k.txt")["Body"].read() == b"hello"
+
+
+def test_access_point_arn_wrong_region_signing_gets_the_redirect(access_point):
+    name, _ = access_point
+    host = f"{name}-{ACCOUNT}.{ENDPOINT.split('://', 1)[1]}"
+    status, headers, _ = _raw("GET", host, "/k.txt", "eu-west-1")
+    assert status == 301
+    assert headers["x-amz-bucket-region"] == "us-east-1"
+    assert _raw("GET", host, "/k.txt", "us-east-1")[0] == 200
+
+
+def test_access_point_arn_other_account_is_denied(access_point):
+    _, created = access_point
+    other = _client("s3", "us-east-1", account_key="111122223333")
+    with pytest.raises(ClientError) as exc:
+        other.get_object(Bucket=created["AccessPointArn"], Key="k.txt")
+    assert exc.value.response["Error"]["Code"] in ("AccessDenied", "NoSuchAccessPoint")
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_access_point_arn_shaped_bucket_without_access_point_is_a_bucket(auth_enabled, method):
+    """`<name>-<12 digits>` is a valid bucket name; with no access point of
+    that name it is served as the bucket."""
+    s3 = _client("s3", "us-east-1")
+    name = f"plain-{_uid()}-123456789012"
+    s3.create_bucket(Bucket=name)
+    try:
+        s3.put_object(Bucket=name, Key="b.txt", Body=b"bucket")
+        host = f"{name}.{ENDPOINT.split('://', 1)[1]}"
+        status, headers, body = _raw(method, host, "/b.txt", "us-east-1")
+        assert status == 200
+        assert body == (b"bucket" if method == "GET" else b"")
+        if auth_enabled and method == "HEAD":
+            assert re.fullmatch(r"[A-Z0-9]{16}", headers["x-amz-request-id"])
+    finally:
+        s3.delete_object(Bucket=name, Key="b.txt")
+        s3.delete_bucket(Bucket=name)
+
+
+def test_access_point_alias_works_as_a_bucket_name(bucket, access_point):
+    _, created = access_point
+    s3 = _client("s3", "us-east-1")
+    alias = created["Alias"]
+    assert s3.get_object(Bucket=alias, Key="k.txt")["Body"].read() == b"hello"
+    s3.put_object(Bucket=alias, Key="alias.txt", Body=b"via alias")
+    assert s3.get_object(Bucket=bucket, Key="alias.txt")["Body"].read() == b"via alias"
+    s3.copy_object(Bucket=bucket, Key="copied.txt", CopySource={"Bucket": alias, "Key": "k.txt"})
+    assert s3.get_object(Bucket=bucket, Key="copied.txt")["Body"].read() == b"hello"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("addressing_style", ["path", "virtual"])
+@pytest.mark.parametrize("allow_upload", [False, True], ids=["no-permission", "allow"])
+def test_access_point_alias_upload_permission_contract(
+    bucket, access_point, auth_enabled, iam_user, addressing_style, allow_upload,
+):
+    _, created = access_point
+    policy = {"Statement": [{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if allow_upload else None).client(
+        "s3", config=Config(s3={"addressing_style": addressing_style}),
+    )
+    root = _client("s3", "us-east-1")
+    if auth_enabled and not allow_upload:
+        with pytest.raises(ClientError) as exc:
+            client.put_object(Bucket=created["Alias"], Key="contract-upload", Body=b"via alias")
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert root.list_objects_v2(Bucket=bucket, Prefix="contract-upload")["KeyCount"] == 0
+    else:
+        assert client.put_object(
+            Bucket=created["Alias"], Key="contract-upload", Body=b"via alias",
+        )["ResponseMetadata"]["HTTPStatusCode"] == 200
+        with root.get_object(Bucket=bucket, Key="contract-upload")["Body"] as body:
+            assert body.read() == b"via alias"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("target,addressing_style", [("Alias", "path"), ("Alias", "virtual"), ("AccessPointArn", "virtual")])
+@pytest.mark.parametrize("allow_head", [False, True], ids=["no-permission", "allow"])
+def test_access_point_head_permission_contract(access_point, auth_enabled, iam_user, target, addressing_style, allow_head):
+    _, created = access_point
+    policy = {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if allow_head else None).client(
+        "s3", region="us-east-1", config=Config(s3={"addressing_style": addressing_style}))
+    if auth_enabled and not allow_head:
+        with pytest.raises(ClientError) as exc:
+            client.head_object(Bucket=created[target], Key="k.txt")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    else:
+        response = client.head_object(Bucket=created[target], Key="k.txt")
+        assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert response["ContentLength"] == 5
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("target", ["Alias", "AccessPointArn"])
+@pytest.mark.parametrize("allow_delete", [False, True], ids=["no-permission", "allow"])
+def test_access_point_delete_permission_contract(bucket, access_point, auth_enabled, iam_user, target, allow_delete):
+    _, created = access_point
+    policy = {"Statement": [{"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if allow_delete else None).client("s3", region="us-east-1")
+    root = _client("s3", "us-east-1")
+    if auth_enabled and not allow_delete:
+        with pytest.raises(ClientError) as exc:
+            client.delete_object(Bucket=created[target], Key="k.txt")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        with root.get_object(Bucket=bucket, Key="k.txt")["Body"] as body:
+            assert body.read() == b"hello"
+    else:
+        assert client.delete_object(Bucket=created[target], Key="k.txt")["ResponseMetadata"]["HTTPStatusCode"] == 204
+        with pytest.raises(ClientError) as exc:
+            root.head_object(Bucket=bucket, Key="k.txt")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def _ap_status(call):
+    try:
+        return call()["ResponseMetadata"]["HTTPStatusCode"]
+    except ClientError as exc:
+        return exc.response["ResponseMetadata"]["HTTPStatusCode"], exc.response["Error"]["Code"]
+
+
+def test_access_point_block_public_acls_refuses_public_acl_writes():
+    """An access point's BlockPublicAcls refuses public ACLs sent through it, whatever the bucket's settings."""
+    s3, ctl = _client("s3", "us-east-1"), _client("s3control", "us-east-1")
+    name = f"ap-acl-{_uid()}"
+    all_off = {k: False for k in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")}
+    s3.create_bucket(Bucket=name, ObjectOwnership="BucketOwnerPreferred")
+    s3.put_public_access_block(Bucket=name, PublicAccessBlockConfiguration=all_off)
+    s3.put_object(Bucket=name, Key="k.txt", Body=b"hello")
+    blocking = ctl.create_access_point(AccountId=ACCOUNT, Name=f"ap-on-{_uid()}", Bucket=name)
+    open_ap = ctl.create_access_point(
+        AccountId=ACCOUNT, Name=f"ap-off-{_uid()}", Bucket=name, PublicAccessBlockConfiguration=all_off)
+    try:
+        denied = (403, "AccessDenied")
+        for target in (blocking["Alias"], blocking["AccessPointArn"]):
+            assert _ap_status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="public-read")) == denied
+            assert _ap_status(lambda: s3.put_object_acl(Bucket=target, Key="k.txt", ACL="public-read")) == denied
+            assert _ap_status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="private")) == 200
+        for target in (open_ap["Alias"], open_ap["AccessPointArn"], name):
+            assert _ap_status(lambda: s3.put_object(Bucket=target, Key="w", Body=b"x", ACL="public-read")) == 200
+    finally:
+        for ap in (blocking, open_ap):
+            ctl.delete_access_point(AccountId=ACCOUNT, Name=ap["AccessPointArn"].rsplit("/", 1)[1])
+        for obj in s3.list_objects_v2(Bucket=name).get("Contents", []):
+            s3.delete_object(Bucket=name, Key=obj["Key"])
+        s3.delete_bucket(Bucket=name)
+
+
+def test_access_point_alias_from_another_account_is_denied(access_point):
+    _name, created = access_point
+    other = _client("s3", "us-east-1", account_key="111122223333")
+    with pytest.raises(ClientError) as exc:
+        other.get_object(Bucket=created["Alias"], Key="k.txt")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+
+
+def _access_point_policy(bucket, access_point_arn, grant, deny=None, condition=None):
+    """An identity policy allowing reads and copies on ``grant`` ("bucket", "access point" or "both")."""
+    arns = {"bucket": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            "access point": [access_point_arn, f"{access_point_arn}/object/*"]}
+    resources = arns["bucket"] + arns["access point"] if grant == "both" else arns[grant]
+    statements = [{"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+                   "Resource": resources}]
+    if deny or condition:
+        statements.append({"Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"],
+                           "Resource": arns[deny] if deny else "*", **({"Condition": condition} if condition else {})})
+    return {"Version": "2012-10-17", "Statement": statements}
+
+
+def _assert_access(auth_enabled, allowed, call):
+    """Under AUTH a refused call answers 403 AccessDenied; anything else succeeds."""
+    if auth_enabled and not allowed:
+        with pytest.raises(ClientError) as exc:
+            call()
+        error = exc.value.response
+        assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("AccessDenied", 403)
+    else:
+        call()
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("grant, deny, allowed", [
+    ("both", None, True),
+    ("bucket", None, False),
+    ("access point", None, False),
+    ("both", "access point", False),
+    ("both", "bucket", False),
+], ids=["both", "bucket-only", "access-point-only", "deny-access-point", "deny-bucket"])
+def test_access_point_request_needs_access_point_and_bucket_contract(auth_enabled, iam_user, bucket, access_point,
+                                                                     via, grant, deny, allowed):
+    """Through an access point a read and a listing are checked on the access point and on its bucket."""
+    _name, created = access_point
+    client = iam_user(policy=_access_point_policy(bucket, created["AccessPointArn"], grant, deny)).client("s3")
+    target = created[via]
+    _assert_access(auth_enabled, allowed, lambda: client.get_object(Bucket=target, Key="k.txt"))
+    _assert_access(auth_enabled, allowed, lambda: client.list_objects_v2(Bucket=target))
+    _assert_access(auth_enabled, grant != "access point" and deny != "bucket",
+                   lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("key, condition_value, through_access_point, through_bucket", [
+    ("s3:DataAccessPointArn", "arn", False, True),
+    ("s3:DataAccessPointAccount", ACCOUNT, False, True),
+    ("s3:AccessPointNetworkOrigin", "Internet", False, True),
+    ("s3:ExistingObjectTag/class", "secret", False, False),
+    ("s3:DataAccessPointArn", None, True, False),
+], ids=["arn", "account", "network-origin", "object-tag", "arn-absent"])
+def test_access_point_condition_keys_contract(auth_enabled, iam_user, bucket, access_point, via, key,
+                                              condition_value, through_access_point, through_bucket):
+    """A request through an access point carries its ARN, account and network origin, and the object's tags."""
+    _name, created = access_point
+    _client("s3", "us-east-1").put_object_tagging(Bucket=bucket, Key="k.txt",
+                                                  Tagging={"TagSet": [{"Key": "class", "Value": "secret"}]})
+    arn = created["AccessPointArn"]
+    condition = ({"Null": {key: "true"}} if condition_value is None
+                 else {"StringEquals": {key: arn if condition_value == "arn" else condition_value}})
+    client = iam_user(policy=_access_point_policy(bucket, arn, "both", condition=condition)).client("s3")
+    _assert_access(auth_enabled, through_access_point, lambda: client.get_object(Bucket=created[via], Key="k.txt"))
+    _assert_access(auth_enabled, through_bucket, lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("condition, through_bucket", [(False, False), (True, True)], ids=["deny", "deny-on-arn-key"])
+def test_access_point_request_meets_the_bucket_policy_contract(auth_enabled, iam_user, bucket, access_point, via,
+                                                               condition, through_bucket):
+    """The bucket policy applies through an access point and sees its ARN."""
+    _name, created = access_point
+    arn = created["AccessPointArn"]
+    user = iam_user(policy=_access_point_policy(bucket, arn, "both"))
+    statement = {"Effect": "Deny", "Principal": {"AWS": user.arn}, "Action": "s3:GetObject",
+                 "Resource": f"arn:aws:s3:::{bucket}/*"}
+    if condition:
+        statement["Condition"] = {"StringEquals": {"s3:DataAccessPointArn": arn}}
+    _client("s3", "us-east-1").put_bucket_policy(
+        Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [statement]}))
+    client = user.client("s3")
+    _assert_access(auth_enabled, False, lambda: client.get_object(Bucket=created[via], Key="k.txt"))
+    _assert_access(auth_enabled, through_bucket, lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+@pytest.mark.parametrize("grant, effect, delegate, allowed", [
+    ("bucket", "Allow", False, True),
+    (None, "Allow", True, True),
+    ("access point", None, True, True),
+    ("access point", "Allow", False, False),
+    ("both", "Deny", True, False),
+], ids=["allow-identity-on-bucket", "allow-delegated", "delegated-identity-on-access-point",
+        "allow-not-delegated", "deny"])
+def test_access_point_policy_contract(auth_enabled, iam_user, bucket, access_point, via, grant, effect, delegate,
+                                      allowed):
+    """The access point policy answers for the access point, the bucket policy or identity for the bucket."""
+    name, created = access_point
+    arn = created["AccessPointArn"]
+    user = iam_user(policy=_access_point_policy(bucket, arn, grant) if grant else None)
+    if delegate:
+        _client("s3", "us-east-1").put_bucket_policy(Bucket=bucket, Policy=json.dumps({
+            "Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "*",
+                "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+                "Condition": {"StringEquals": {"s3:DataAccessPointAccount": ACCOUNT}}}]}))
+    if effect:
+        _client("s3control", "us-east-1").put_access_point_policy(AccountId=ACCOUNT, Name=name, Policy=json.dumps({
+            "Version": "2012-10-17", "Statement": [{
+                "Effect": effect, "Principal": {"AWS": user.arn}, "Action": ["s3:GetObject", "s3:ListBucket"],
+                "Resource": [arn, f"{arn}/object/*"]}]}))
+    client = user.client("s3")
+    _assert_access(auth_enabled, allowed, lambda: client.get_object(Bucket=created[via], Key="k.txt"))
+    _assert_access(auth_enabled, allowed, lambda: client.list_objects_v2(Bucket=created[via]))
+    _assert_access(auth_enabled, grant in ("bucket", "both"), lambda: client.get_object(Bucket=bucket, Key="k.txt"))
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+def test_access_point_refuses_bucket_policy_writes_contract(auth_enabled, iam_user, bucket, access_point, via):
+    """Under AUTH an access point refuses PutBucketPolicy and DeleteBucketPolicy and serves GetBucketPolicy."""
+    _name, created = access_point
+    arn = created["AccessPointArn"]
+    client = iam_user(policy={"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": ["s3:PutBucketPolicy", "s3:GetBucketPolicy", "s3:DeleteBucketPolicy"],
+        "Resource": [f"arn:aws:s3:::{bucket}", arn]}]}).client("s3", region="us-east-1")
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{bucket}/*"}]})
+    client.put_bucket_policy(Bucket=bucket, Policy=policy)
+    assert client.get_bucket_policy(Bucket=created[via])["Policy"] == policy
+    for write in (lambda: client.delete_bucket_policy(Bucket=created[via]),
+                  lambda: client.put_bucket_policy(Bucket=created[via], Policy=policy)):
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                write()
+            error = exc.value.response["Error"]
+            assert error["Code"] == "AccessDenied"
+            assert error["Message"].endswith(f'on resource: "{arn}" with an explicit deny in a resource-based policy')
+            assert client.get_bucket_policy(Bucket=bucket)["Policy"] == policy
+        else:
+            write()
+    client.delete_bucket_policy(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_access_point_refuses_unsigned_requests_contract(auth_enabled, bucket, access_point):
+    """Under AUTH an unsigned request through an access point is refused; the bucket still serves it."""
+    _name, created = access_point
+    s3 = _client("s3", "us-east-1")
+    s3.put_bucket_ownership_controls(Bucket=bucket, OwnershipControls={
+        "Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]})
+    s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={k: False for k in (
+        "BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")})
+    s3.put_object(Bucket=bucket, Key="pub.txt", Body=b"public", ACL="public-read")
+    anon = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1",
+                        config=Config(signature_version=UNSIGNED, retries={"mode": "standard"}))
+    assert anon.get_object(Bucket=bucket, Key="pub.txt")["Body"].read() == b"public"
+    for target in (created["Alias"], created["AccessPointArn"]):
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                anon.get_object(Bucket=target, Key="pub.txt")
+            error = exc.value.response
+            assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidRequest", 400)
+        else:
+            assert anon.get_object(Bucket=target, Key="pub.txt")["Body"].read() == b"public"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("via", ["AccessPointArn", "Alias"])
+def test_access_point_sigv2_requests_contract(auth_enabled, iam_user, bucket, access_point, via):
+    """Through an access point a SigV2 presigned URL is served, a SigV2 Authorization header is refused under AUTH."""
+    _name, created = access_point
+    user = iam_user(policy=_access_point_policy(bucket, created["AccessPointArn"], "both"))
+    client = user.client("s3", region="us-east-1", config=Config(signature_version="s3"))
+    url = client.generate_presigned_url("get_object", Params={"Bucket": created[via], "Key": "k.txt"})
+    assert "AWSAccessKeyId=" in url
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        assert resp.read() == b"hello"
+    tampered = re.sub(r"Signature=[^&]+", "Signature=AAAA", url)
+    if auth_enabled:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(tampered, timeout=10)
+        assert exc.value.code == 403
+        assert b"<Code>SignatureDoesNotMatch</Code>" in exc.value.read()
+        with pytest.raises(ClientError) as exc:
+            client.get_object(Bucket=created[via], Key="k.txt")
+        error = exc.value.response
+        assert (error["Error"]["Code"], error["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidRequest", 400)
+    else:
+        with urllib.request.urlopen(tampered, timeout=10) as resp:
+            assert resp.read() == b"hello"
+        assert client.get_object(Bucket=created[via], Key="k.txt")["Body"].read() == b"hello"
+    assert client.get_object(Bucket=bucket, Key="k.txt")["Body"].read() == b"hello"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("grant, deny, condition, allowed", [
+    ("both", None, False, True),
+    ("bucket", None, False, False),
+    ("both", "access point", False, False),
+    ("both", None, True, False),
+], ids=["both", "bucket-only", "deny-access-point", "deny-on-arn-key"])
+def test_access_point_alias_copy_source_contract(auth_enabled, iam_user, bucket, access_point, grant, deny,
+                                                 condition, allowed):
+    """A copy source named by an alias is read through its access point."""
+    _name, created = access_point
+    arn = created["AccessPointArn"]
+    policy = _access_point_policy(bucket, arn, grant, deny,
+                                  {"StringEquals": {"s3:DataAccessPointArn": arn}} if condition else None)
+    client = iam_user(policy=policy).client("s3")
+    _assert_access(auth_enabled, allowed, lambda: client.copy_object(
+        Bucket=bucket, Key="copy.txt", CopySource={"Bucket": created["Alias"], "Key": "k.txt"}))
+    _assert_access(auth_enabled, True, lambda: client.copy_object(
+        Bucket=bucket, Key="copy.txt", CopySource={"Bucket": bucket, "Key": "k.txt"}))
+
+
+def test_access_point_control_invalid_name(bucket):
+    ctl = _client("s3control", "us-east-1")
+    with pytest.raises(ClientError) as exc:
+        ctl.create_access_point(AccountId=ACCOUNT, Name="Bad_Name", Bucket=bucket)
+    err = exc.value.response
+    assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("InvalidAccessPoint", 400)
+
+
+# ---------------------------------------------------------------------------
+# GetObject error order, as observed on AWS (Osaka and Tokyo, 2026-10-18), replayed locally.
+# ---------------------------------------------------------------------------
+
+
+HOME, TOKYO = "ap-northeast-3", "ap-northeast-1"
+_DOWNLOAD_PAYLOAD = b"download error validation"
+
+
+@pytest.fixture
+def download_bucket(s3):
+    name = f"download-errors-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": HOME})
+    s3.put_object(Bucket=name, Key="probe.txt", Body=_DOWNLOAD_PAYLOAD)
+    yield name
+    s3.delete_object(Bucket=name, Key="probe.txt")
+    s3.delete_bucket(Bucket=name)
+
+
+@pytest.fixture
+def download_client(download_bucket, iam_user):
+    return iam_user(policy={"Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{download_bucket}/*"},
+        {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{download_bucket}"},
+    ]}).client("s3", region=HOME)
+
+
+def _download(bucket, client, *, credential="valid", endpoint_region=HOME, region=HOME,
+              virtual=False, key="probe.txt", query="", root=False):
+    frozen = client._request_signer._credentials.get_frozen_credentials()
+    access_key, secret = frozen.access_key, frozen.secret_key
+    if credential == "unknown":
+        access_key, secret = "AKIAUNKNOWNKEY000001", "wrong"
+    elif credential == "wrong-secret":
+        secret = "wrong"
+    if root:
+        access_key, secret = "test", "any-secret"
+    target = urlsplit(ENDPOINT)
+    host = f"s3.{endpoint_region}.{target.netloc}"
+    path = f"/{quote(bucket)}/{quote(key, safe='/')}"
+    if virtual:
+        host, path = f"{bucket}.{host}", f"/{quote(key, safe='/')}"
+    request = AWSRequest(method="GET", url=f"http://{host}{path}{query}")
+    S3SigV4Auth(Credentials(access_key, secret), "s3", region).add_auth(request)
+    connection = http.client.HTTPConnection(target.hostname, target.port or 80, timeout=10)
+    try:
+        connection.request("GET", path + query, headers={**dict(request.headers), "Host": host})
+        response = connection.getresponse()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+def _assert_download_error(response, code, *, bucket, key="probe.txt", region=HOME, access_key=None):
+    _, headers, body = response
+    error = fromstring(body)
+    messages = {
+        "InvalidBucketName": "The specified bucket is not valid.",
+        "InvalidAccessKeyId": "The AWS Access Key Id you provided does not exist in our records.",
+        "SignatureDoesNotMatch": "The request signature we calculated does not match the signature you provided. "
+                                 "Check your key and signing method.",
+        "AuthorizationHeaderMalformed": f"The authorization header is malformed; the region '{region}' is wrong; "
+                                        f"expecting '{HOME if region == TOKYO else TOKYO}'",
+        "PermanentRedirect": "The bucket you are attempting to access must be addressed using the specified "
+                             "endpoint. Please send all future requests to this endpoint.",
+        "NoSuchBucket": "The specified bucket does not exist",
+        "NoSuchKey": "The specified key does not exist.",
+    }
+    details = {
+        "InvalidBucketName": ["BucketName"], "InvalidAccessKeyId": ["AWSAccessKeyId"],
+        "AuthorizationHeaderMalformed": ["Region"], "PermanentRedirect": ["Bucket", "Endpoint"],
+        "NoSuchBucket": ["BucketName"], "NoSuchKey": ["Key"],
+        "SignatureDoesNotMatch": ["AWSAccessKeyId", "StringToSign", "SignatureProvided", "StringToSignBytes",
+                                  "CanonicalRequest", "CanonicalRequestBytes"],
+    }
+    expected = ["Code", "Message", *details[code], "RequestId", "HostId"]
+    assert error.findtext("Code") == code
+    assert error.findtext("Message") == messages[code]
+    if code == "SignatureDoesNotMatch":
+        # Real GET responses varied the order of the signature diagnostics.
+        assert sorted(child.tag for child in error) == sorted(expected)
+        for name in ("CanonicalRequest", "StringToSign"):
+            assert bytes.fromhex(error.findtext(name + "Bytes")).decode() == error.findtext(name)
+        assert error.findtext("CanonicalRequest").startswith("GET\n")
+        assert error.findtext("StringToSign").splitlines()[-1] == hashlib.sha256(
+            error.findtext("CanonicalRequest").encode()).hexdigest()
+        assert re.fullmatch(r"[a-f0-9]{64}", error.findtext("SignatureProvided"))
+        signed = AWSRequest()
+        document = error.findtext("StringToSign")
+        signed.context["timestamp"] = document.splitlines()[1]
+        signer = S3SigV4Auth(Credentials(error.findtext("AWSAccessKeyId"), "wrong"), "s3", region)
+        assert signer.signature(document, signed) == error.findtext("SignatureProvided")
+    else:
+        assert [child.tag for child in error] == expected
+    assert headers["content-type"] == "application/xml"
+    assert error.findtext("RequestId") == headers["x-amz-request-id"]
+    assert re.fullmatch(r"[A-Z0-9]{16}", error.findtext("RequestId"))
+    assert error.findtext("HostId") == headers["x-amz-id-2"]
+    assert len(base64.b64decode(error.findtext("HostId"), validate=True)) >= 48
+    assert "location" not in headers
+    if code == "PermanentRedirect":
+        assert error.findtext("Endpoint") == f"{bucket}.s3.{HOME}.{urlsplit(ENDPOINT).netloc}"
+        assert error.findtext("Bucket") == bucket
+        assert headers["x-amz-bucket-region"] == HOME
+    else:
+        assert "x-amz-bucket-region" not in headers
+    if code in {"InvalidBucketName", "NoSuchBucket"}:
+        assert error.findtext("BucketName") == bucket
+    if code == "NoSuchKey":
+        assert error.findtext("Key") == key
+    if code == "AuthorizationHeaderMalformed":
+        assert error.findtext("Region") == (HOME if region == TOKYO else TOKYO)
+    if access_key is not None:
+        assert error.findtext("AWSAccessKeyId") == access_key
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True], ids=["path", "virtual"])
+@pytest.mark.parametrize("missing,credential,endpoint_region,region,expected,compat_expected", [
+    # Fixed first-response observations; AUTH=false is a separate local contract.
+    (False, "valid", HOME, HOME, (200, None), (200, None)),
+    (False, "unknown", HOME, HOME, (403, "InvalidAccessKeyId"), (200, None)),
+    (False, "wrong-secret", HOME, HOME, (403, "SignatureDoesNotMatch"), (200, None)),
+    (True, "valid", HOME, HOME, (404, "NoSuchBucket"), (404, "NoSuchBucket")),
+    (True, "unknown", HOME, HOME, (403, "InvalidAccessKeyId"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", HOME, HOME, (403, "SignatureDoesNotMatch"), (404, "NoSuchBucket")),
+    (False, "valid", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (400, "AuthorizationHeaderMalformed")),
+    (False, "unknown", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (400, "AuthorizationHeaderMalformed")),
+    (False, "wrong-secret", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (400, "AuthorizationHeaderMalformed")),
+    (True, "valid", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "unknown", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    # Existing-bucket valid/unknown + Tokyo endpoint/Osaka signature live in
+    # test_download_signing_region_precedes_home_and_credentials, including wire checks.
+    (False, "wrong-secret", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (200, None)),
+    (True, "valid", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "unknown", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (False, "valid", TOKYO, TOKYO, (301, "PermanentRedirect"), (301, "PermanentRedirect")),
+    (False, "unknown", TOKYO, TOKYO, (301, "PermanentRedirect"), (301, "PermanentRedirect")),
+    (False, "wrong-secret", TOKYO, TOKYO, (301, "PermanentRedirect"), (301, "PermanentRedirect")),
+    (True, "valid", TOKYO, TOKYO, (404, "NoSuchBucket"), (404, "NoSuchBucket")),
+    (True, "unknown", TOKYO, TOKYO, (403, "InvalidAccessKeyId"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", TOKYO, TOKYO, (403, "SignatureDoesNotMatch"), (404, "NoSuchBucket")),
+])
+def test_download_combined_errors(download_bucket, download_client, auth_enabled,
+                                  virtual, missing, credential, endpoint_region, region, expected, compat_expected):
+    bucket = f"missing-{download_bucket}" if missing else download_bucket
+    expected = expected if auth_enabled else compat_expected
+    response = _download(bucket, download_client, credential=credential, endpoint_region=endpoint_region,
+                         region=region, virtual=virtual)
+    code = fromstring(response[2]).findtext("Code") if response[0] != 200 else None
+    assert (response[0], code) == expected
+    if response[0] == 200:
+        assert response[2] == _DOWNLOAD_PAYLOAD
+    elif auth_enabled:
+        access_key = ("AKIAUNKNOWNKEY000001" if credential == "unknown"
+                      else download_client._request_signer._credentials.access_key)
+        _assert_download_error(response, code, bucket=bucket, region=region,
+                      access_key=access_key if code in {"InvalidAccessKeyId", "SignatureDoesNotMatch"} else None)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential", ["valid", "unknown"])
+def test_download_signing_region_precedes_home_and_credentials(download_bucket, download_client, s3,
+                                                                auth_enabled, virtual, credential):
+    # Fixed AWS observation: Osaka bucket + Tokyo endpoint + Osaka signature.
+    # Kept separately as the regression for GET's different priority from HEAD/DELETE.
+    response = _download(download_bucket, download_client, virtual=virtual, credential=credential,
+                         endpoint_region=TOKYO, region=HOME)
+    assert response[0] == (400 if auth_enabled else 200)
+    if auth_enabled:
+        _assert_download_error(response, "AuthorizationHeaderMalformed", bucket=download_bucket, region=HOME)
+    else:
+        assert response[2] == _DOWNLOAD_PAYLOAD
+    with s3.get_object(Bucket=download_bucket, Key="probe.txt")["Body"] as body:
+        assert body.read() == _DOWNLOAD_PAYLOAD
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential,region", [("valid", HOME), ("unknown", HOME), ("wrong-secret", HOME), ("valid", TOKYO)])
+def test_download_missing_key(download_bucket, download_client, auth_enabled, virtual, credential, region):
+    response = _download(download_bucket, download_client, virtual=virtual, credential=credential,
+                         region=region, key="missing.txt")
+    code = ("AuthorizationHeaderMalformed" if region != HOME else
+            "InvalidAccessKeyId" if credential == "unknown" else
+            "SignatureDoesNotMatch" if credential == "wrong-secret" else "NoSuchKey")
+    if not auth_enabled:
+        code = "AuthorizationHeaderMalformed" if region != HOME else "NoSuchKey"
+    assert (response[0], fromstring(response[2]).findtext("Code")) == (
+        400 if code == "AuthorizationHeaderMalformed" else 404 if code == "NoSuchKey" else 403, code,
+    )
+    if auth_enabled:
+        _assert_download_error(response, code, bucket=download_bucket, key="missing.txt", region=region)
+
+
+@pytest.mark.auth_contract
+def test_download_invalid_name_precedes_credentials(download_client, auth_enabled):
+    response = _download("invalid bucket", download_client, credential="unknown")
+    assert (response[0], fromstring(response[2]).findtext("Code")) == (
+        (400, "InvalidBucketName") if auth_enabled else (404, "NoSuchBucket")
+    )
+    if auth_enabled:
+        _assert_download_error(response, "InvalidBucketName", bucket="invalid bucket")
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("denial", ["implicit", "explicit"])
+def test_download_still_enforces_iam(download_bucket, iam_user, auth_enabled, virtual, denial):
+    policy = {"Statement": [{"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if denial == "explicit" else None).client("s3", region=HOME)
+    response = _download(download_bucket, client, virtual=virtual)
+    if auth_enabled:
+        assert (response[0], fromstring(response[2]).findtext("Code")) == (403, "AccessDenied")
+    else:
+        assert (response[0], response[2]) == (200, _DOWNLOAD_PAYLOAD)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_download_reserved_root_compatibility(download_bucket, s3, virtual):
+    response = _download(download_bucket, s3, virtual=virtual, root=True)
+    assert (response[0], response[2]) == (200, _DOWNLOAD_PAYLOAD)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("query", ["?versionId=null", "?tagging"])
+def test_download_subresources_keep_their_iam_path(download_bucket, iam_user, auth_enabled, virtual, query):
+    client = iam_user().client("s3", region=HOME)
+    response = _download(f"missing-{download_bucket}", client, virtual=virtual, query=query)
+    assert (response[0], fromstring(response[2]).findtext("Code")) == (
+        (403, "AccessDenied") if auth_enabled else (404, "NoSuchBucket")
+    )
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_download_does_not_grant_foreign_bucket_access(iam_user, auth_enabled, virtual):
+    owner = boto3.client("s3", endpoint_url=ENDPOINT, region_name=HOME,
+                         aws_access_key_id="333333333333", aws_secret_access_key="root-secret")
+    bucket = f"foreign-download-{uuid.uuid4().hex}"
+    owner.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": HOME})
+    owner.put_object(Bucket=bucket, Key="probe.txt", Body=b"private")
+    client = iam_user(policy={"Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}).client("s3")
+    try:
+        response = _download(bucket, client, virtual=virtual)
+        assert (response[0], fromstring(response[2]).findtext("Code")) == (403, "AccessDenied")
+    finally:
+        owner.delete_object(Bucket=bucket, Key="probe.txt")
+        owner.delete_bucket(Bucket=bucket)
+        owner.close()
+
+
+# ---------------------------------------------------------------------------
+# HeadObject and HeadBucket error order, as observed on AWS (Osaka and Tokyo, 2026-10-23), replayed locally.
+# ---------------------------------------------------------------------------
+
+
+_HEAD_PAYLOAD = b"head error validation"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("source", ["region", "authentication", "normal", "iam", "missing-request", "missing-host"])
+def test_head_finalizer_preserves_valid_identifiers(source):
+    """Pure formatting contract: no AUTH/IAM patch, no live AWS request."""
+    from ministack.core.iam_actions import access_denied_response
+    from ministack.services import s3
+
+    host_id = base64.b64encode(b"existing-host-id" * 4).decode()
+    if source in {"region", "authentication", "missing-host"}:
+        code, status = ("PermanentRedirect", 301) if source == "region" else ("InvalidAccessKeyId", 403)
+        response = s3._object_error(code, "formatting probe", status)
+        if source == "missing-host":
+            response[1].pop("x-amz-id-2")
+    elif source == "iam":
+        response = access_denied_response("s3", "s3:GetObject", "arn:aws:iam::000000000000:user/probe", "legacy-id")
+    else:
+        response = 200, {"Content-Type": "text/plain", "Content-Length": "4", "x-amz-id-2": host_id}, b""
+        if source == "normal":
+            response[1]["x-amz-request-id"] = "12345678-1234-1234-1234-123456789abc"
+    original_headers = dict(response[1])
+    result = s3.format_head_response("/id-format-probe/key", {}, response)
+    request_id = result[1]["x-amz-request-id"]
+    assert re.fullmatch(r"[A-Z0-9]{16}", request_id)
+    if re.fullmatch(r"[A-Z0-9]{16}", original_headers.get("x-amz-request-id", "")):
+        assert request_id == original_headers["x-amz-request-id"]
+    if original_headers.get("x-amz-id-2"):
+        assert result[1]["x-amz-id-2"] == original_headers["x-amz-id-2"]
+    assert len(base64.b64decode(result[1]["x-amz-id-2"], validate=True)) >= 48
+    assert result[2] == b""
+    assert s3.format_head_response("/id-format-probe/key", {}, result) == result
+    assert response[1] == original_headers
+
+
+@pytest.fixture
+def head_bucket(s3):
+    name = f"head-errors-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": HOME})
+    s3.put_object(Bucket=name, Key="probe.txt", Body=_HEAD_PAYLOAD, ContentType="text/plain")
+    yield name
+    s3.delete_object(Bucket=name, Key="probe.txt")
+    s3.delete_bucket(Bucket=name)
+
+
+@pytest.fixture
+def head_client(head_bucket, iam_user):
+    return iam_user(policy={"Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{head_bucket}/*"},
+        {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{head_bucket}"},
+    ]}).client("s3", region=HOME)
+
+
+def _head(bucket, client, *, key="probe.txt", virtual=False, credential="valid",
+          endpoint_region=HOME, region=HOME, root=False, query="", extra_headers=None, presigned=False):
+    frozen = client._request_signer._credentials.get_frozen_credentials()
+    access_key, secret = frozen.access_key, frozen.secret_key
+    if credential == "unknown":
+        access_key, secret = "AKIAUNKNOWNKEY000001", "wrong"
+    elif credential == "wrong-secret":
+        secret = "wrong"
+    if root:
+        access_key, secret = "test", "any-secret"
+    target = urlsplit(ENDPOINT)
+    host = f"s3.{endpoint_region}.{target.netloc}"
+    path = f"/{quote(bucket)}" + (f"/{quote(key, safe='/')}" if key else "")
+    if virtual:
+        host, path = f"{bucket}.{host}", f"/{quote(key, safe='/')}"
+    request = AWSRequest(method="HEAD", url=f"http://{host}{path}{query}", headers=extra_headers)
+    if presigned:
+        S3SigV4QueryAuth(Credentials(access_key, secret), "s3", region, expires=300).add_auth(request)
+        signed_url = urlsplit(request.url)
+        path, query = signed_url.path, "?" + signed_url.query
+    else:
+        S3SigV4Auth(Credentials(access_key, secret), "s3", region).add_auth(request)
+    connection = http.client.HTTPConnection(target.hostname, target.port or 80, timeout=10)
+    try:
+        connection.request("HEAD", path + query, headers={**dict(request.headers), "Host": host})
+        response = connection.getresponse()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+def _assert_wire(response, *, bucket, key, expected_region=None):
+    status, headers, body = response
+    assert body == b""
+    assert headers.get("x-amz-bucket-region") == expected_region
+    assert "x-amz-error-code" not in headers
+    assert "x-amz-error-message" not in headers
+    assert re.fullmatch(r"[A-Z0-9]{16}", headers["x-amz-request-id"])
+    assert len(base64.b64decode(headers["x-amz-id-2"], validate=True)) >= 48
+    if key and status == 200:
+        assert headers["content-length"] == str(len(_HEAD_PAYLOAD))
+        assert headers["content-type"] == "text/plain"
+    else:
+        assert "content-length" not in headers
+        assert headers["content-type"] == "application/xml"
+    assert headers.get("x-amz-bucket-arn") == (f"arn:aws:s3:::{bucket}" if not key and status == 200 else None)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key", ["probe.txt", ""], ids=["HeadObject", "HeadBucket"])
+@pytest.mark.parametrize("virtual", [False, True], ids=["path", "virtual"])
+@pytest.mark.parametrize("missing,credential,endpoint_region,region,expected,compat_expected", [
+    # Fixed first-response observations, separately for HeadObject and HeadBucket.
+    # Unlike GET, HEAD checks the bucket's home before the signing scope.
+    (False, "valid", HOME, HOME, 200, 200),
+    (False, "unknown", HOME, HOME, 403, 200),
+    (False, "wrong-secret", HOME, HOME, 403, 200),
+    (True, "valid", HOME, HOME, 404, 404),
+    (True, "unknown", HOME, HOME, 403, 404),
+    (True, "wrong-secret", HOME, HOME, 403, 404),
+    (False, "valid", HOME, TOKYO, 400, 400),
+    (False, "unknown", HOME, TOKYO, 400, 400),
+    (False, "wrong-secret", HOME, TOKYO, 400, 400),
+    (True, "valid", HOME, TOKYO, 400, 404),
+    (True, "unknown", HOME, TOKYO, 400, 404),
+    (True, "wrong-secret", HOME, TOKYO, 400, 404),
+    # Existing-bucket valid/unknown + Tokyo endpoint/Osaka signature live in
+    # test_head_home_precedes_signing_region_and_credentials, including wire checks.
+    (False, "wrong-secret", TOKYO, HOME, 301, 200),
+    (True, "valid", TOKYO, HOME, 400, 404),
+    (True, "unknown", TOKYO, HOME, 400, 404),
+    (True, "wrong-secret", TOKYO, HOME, 400, 404),
+    (False, "valid", TOKYO, TOKYO, 301, 301),
+    (False, "unknown", TOKYO, TOKYO, 301, 301),
+    (False, "wrong-secret", TOKYO, TOKYO, 301, 301),
+    (True, "valid", TOKYO, TOKYO, 404, 404),
+    (True, "unknown", TOKYO, TOKYO, 403, 404),
+    (True, "wrong-secret", TOKYO, TOKYO, 403, 404),
+])
+def test_head_combined_errors(head_bucket, head_client, auth_enabled,
+                              key, virtual, missing, credential, endpoint_region, region, expected, compat_expected):
+    bucket = f"missing-{head_bucket}" if missing else head_bucket
+    expected = expected if auth_enabled else compat_expected
+    response = _head(bucket, head_client, key=key, virtual=virtual, credential=credential,
+                     endpoint_region=endpoint_region, region=region)
+    assert response[0] == expected
+    assert response[2] == b""
+    if auth_enabled:
+        _assert_wire(response, bucket=bucket, key=key,
+                     expected_region=HOME if not missing and (not key or expected == 301) else None)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key", ["probe.txt", ""], ids=["HeadObject", "HeadBucket"])
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential", ["valid", "unknown"])
+def test_head_home_precedes_signing_region_and_credentials(head_bucket, head_client, s3,
+                                                           auth_enabled, key, virtual, credential):
+    # Fixed AWS regression: home-region redirect wins over signing/authentication errors.
+    response = _head(head_bucket, head_client, key=key, virtual=virtual, credential=credential,
+                     endpoint_region=TOKYO, region=HOME)
+    assert response[0] == (301 if auth_enabled else 200)
+    assert response[2] == b""
+    if auth_enabled:
+        _assert_wire(response, bucket=head_bucket, key=key, expected_region=HOME)
+    with s3.get_object(Bucket=head_bucket, Key="probe.txt")["Body"] as body:
+        assert body.read() == _HEAD_PAYLOAD
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential,region", [("valid", HOME), ("unknown", HOME), ("wrong-secret", HOME), ("valid", TOKYO)])
+def test_head_missing_key(head_bucket, head_client, auth_enabled, virtual, credential, region):
+    response = _head(head_bucket, head_client, key="missing.txt", virtual=virtual, credential=credential, region=region)
+    expected = 400 if region != HOME else 403 if auth_enabled and credential != "valid" else 404
+    assert response[0] == expected
+    if auth_enabled:
+        _assert_wire(response, bucket=head_bucket, key="missing.txt")
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key", ["probe.txt", ""])
+def test_head_invalid_name_precedes_credentials(head_client, auth_enabled, key):
+    response = _head("invalid bucket", head_client, key=key, credential="unknown")
+    assert response[0] == (400 if auth_enabled else 404)
+    if auth_enabled:
+        _assert_wire(response, bucket="invalid bucket", key=key)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key", ["probe.txt", ""])
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("denial", ["implicit", "explicit"])
+def test_head_still_enforces_iam(head_bucket, iam_user, auth_enabled, key, virtual, denial):
+    policy = {"Statement": [{"Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "*"}]}
+    client = iam_user(policy=policy if denial == "explicit" else None).client("s3", region=HOME)
+    response = _head(head_bucket, client, key=key, virtual=virtual)
+    assert response[0] == (403 if auth_enabled else 200)
+    if auth_enabled:
+        _assert_wire(response, bucket=head_bucket, key=key, expected_region=HOME if not key else None)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key", ["probe.txt", ""])
+@pytest.mark.parametrize("virtual", [False, True])
+def test_head_reserved_root_compatibility(head_bucket, s3, auth_enabled, key, virtual):
+    response = _head(head_bucket, s3, key=key, virtual=virtual, root=True)
+    assert response[0] == 200
+    if auth_enabled:
+        _assert_wire(response, bucket=head_bucket, key=key, expected_region=HOME if not key else None)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key", ["probe.txt", ""])
+@pytest.mark.parametrize("virtual", [False, True])
+def test_head_does_not_grant_foreign_bucket_access(iam_user, auth_enabled, key, virtual):
+    owner = boto3.client("s3", endpoint_url=ENDPOINT, region_name=HOME,
+                         aws_access_key_id="333333333333", aws_secret_access_key="root-secret")
+    bucket = f"foreign-head-{uuid.uuid4().hex}"
+    owner.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": HOME})
+    owner.put_object(Bucket=bucket, Key="probe.txt", Body=_HEAD_PAYLOAD)
+    client = iam_user(policy={"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}).client("s3")
+    try:
+        response = _head(bucket, client, key=key, virtual=virtual)
+        assert response[0] == 403
+        if auth_enabled:
+            _assert_wire(response, bucket=bucket, key=key, expected_region=HOME if not key else None)
+    finally:
+        owner.delete_object(Bucket=bucket, Key="probe.txt")
+        owner.delete_bucket(Bucket=bucket)
+        owner.close()
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_head_version_query_keeps_iam_path(head_bucket, iam_user, auth_enabled, virtual):
+    client = iam_user().client("s3", region=HOME)
+    response = _head(f"missing-{head_bucket}", client, virtual=virtual, query="?versionId=null")
+    assert response[0] == (403 if auth_enabled else 404)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential", ["valid", "wrong-secret"])
+def test_head_presigned_validation_is_preserved(head_bucket, head_client, s3, virtual, credential):
+    response = _head(head_bucket, head_client, virtual=virtual, credential=credential, presigned=True)
+    assert response[0] == (200 if credential == "valid" else 403)
+    assert response[2] == b""
+    if credential == "valid":
+        assert response[1]["content-length"] == str(len(_HEAD_PAYLOAD))
+        assert response[1]["content-type"] == "text/plain"
+    with s3.get_object(Bucket=head_bucket, Key="probe.txt")["Body"] as body:
+        assert body.read() == _HEAD_PAYLOAD
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_head_conditional_metadata(head_bucket, head_client, auth_enabled, virtual):
+    response = _head(head_bucket, head_client, virtual=virtual)
+    assert response[0] == 200
+    assert response[1]["content-length"] == str(len(_HEAD_PAYLOAD))
+    assert response[2] == b""
+    etag = response[1]["etag"]
+    response = _head(head_bucket, head_client, virtual=virtual, extra_headers={"If-None-Match": etag})
+    assert response[0] == 304
+    assert response[2] == b""
+    if auth_enabled:
+        assert "content-length" not in response[1]
+        assert "content-type" not in response[1]
+    response = _head(head_bucket, head_client, virtual=virtual, extra_headers={"If-Match": '"incorrect"'})
+    assert response[0] == 412
+    if auth_enabled:
+        _assert_wire(response, bucket=head_bucket, key="probe.txt")
+
+
+# ---------------------------------------------------------------------------
+# DeleteObject error order, as observed on AWS (Osaka and Tokyo, 2026-10-23), replayed locally.
+# ---------------------------------------------------------------------------
+
+
+_DELETE_PAYLOAD = b"delete error validation"
+
+
+@pytest.fixture
+def delete_bucket(s3):
+    name = f"delete-errors-{uuid.uuid4().hex}"
+    s3.create_bucket(Bucket=name, CreateBucketConfiguration={"LocationConstraint": HOME})
+    s3.put_object(Bucket=name, Key="probe.txt", Body=_DELETE_PAYLOAD)
+    yield name
+    s3.delete_object(Bucket=name, Key="probe.txt")
+    s3.delete_bucket(Bucket=name)
+
+
+@pytest.fixture
+def delete_client(delete_bucket, iam_user):
+    return iam_user(policy={"Statement": [
+        {"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": f"arn:aws:s3:::{delete_bucket}/*"},
+    ]}).client("s3", region=HOME)
+
+
+def _send(host, path, headers):
+    target = urlsplit(ENDPOINT)
+    connection = http.client.HTTPConnection(target.hostname, target.port or 80, timeout=10)
+    try:
+        connection.request("DELETE", path, headers={**headers, "Host": host})
+        response = connection.getresponse()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+def _delete(bucket, client, *, credential="valid", endpoint_region=HOME, region=HOME,
+            virtual=False, key="probe.txt", query="", root=False, extra_headers=None):
+    frozen = client._request_signer._credentials.get_frozen_credentials()
+    access_key, secret = frozen.access_key, frozen.secret_key
+    if credential == "unknown":
+        access_key, secret = "AKIAUNKNOWNKEY000001", "wrong"
+    elif credential == "wrong-secret":
+        secret = "wrong"
+    if root:
+        access_key, secret = "test", "any-secret"
+    host = f"s3.{endpoint_region}.{urlsplit(ENDPOINT).netloc}"
+    path = f"/{quote(bucket)}/{quote(key, safe='/')}"
+    if virtual:
+        host, path = f"{bucket}.{host}", f"/{quote(key, safe='/')}"
+    request = AWSRequest(method="DELETE", url=f"http://{host}{path}{query}", headers=extra_headers)
+    S3SigV4Auth(Credentials(access_key, secret), "s3", region).add_auth(request)
+    return _send(host, path + query, dict(request.headers))
+
+
+def _assert_state(client, bucket, *, deleted):
+    if deleted:
+        with pytest.raises(ClientError) as exc:
+            client.get_object(Bucket=bucket, Key="probe.txt")
+        assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    else:
+        with client.get_object(Bucket=bucket, Key="probe.txt")["Body"] as body:
+            assert body.read() == _DELETE_PAYLOAD
+
+
+def _assert_delete_error(response, code, *, bucket, region=HOME, endpoint_region=HOME, access_key=None):
+    _, headers, body = response
+    error = fromstring(body)
+    messages = {
+        "InvalidBucketName": "The specified bucket is not valid.",
+        "InvalidAccessKeyId": "The AWS Access Key Id you provided does not exist in our records.",
+        "SignatureDoesNotMatch": "The request signature we calculated does not match the signature you provided. "
+                                 "Check your key and signing method.",
+        "AuthorizationHeaderMalformed": f"The authorization header is malformed; the region '{region}' is wrong; "
+                                        f"expecting '{endpoint_region}'",
+        "PermanentRedirect": "The bucket you are attempting to access must be addressed using the specified "
+                             "endpoint. Please send all future requests to this endpoint.",
+        "NoSuchBucket": "The specified bucket does not exist",
+    }
+    details = {
+        "InvalidBucketName": ["BucketName"], "InvalidAccessKeyId": ["AWSAccessKeyId"],
+        "AuthorizationHeaderMalformed": ["Region"], "PermanentRedirect": ["Endpoint", "Bucket"],
+        "NoSuchBucket": ["BucketName"],
+        "SignatureDoesNotMatch": ["AWSAccessKeyId", "StringToSign", "SignatureProvided", "StringToSignBytes",
+                                  "CanonicalRequest", "CanonicalRequestBytes"],
+    }
+    expected = ["Code", "Message", *details[code], "RequestId", "HostId"]
+    assert error.findtext("Code") == code
+    assert error.findtext("Message") == messages[code]
+    if code == "SignatureDoesNotMatch":
+        # Diagnostic membership and consistency matter even if AWS varies field order.
+        assert sorted(child.tag for child in error) == sorted(expected)
+        for name in ("CanonicalRequest", "StringToSign"):
+            assert bytes.fromhex(error.findtext(name + "Bytes")).decode() == error.findtext(name)
+        assert error.findtext("CanonicalRequest").startswith("DELETE\n")
+        document = error.findtext("StringToSign")
+        assert document.splitlines()[-1] == hashlib.sha256(error.findtext("CanonicalRequest").encode()).hexdigest()
+        signed = AWSRequest()
+        signed.context["timestamp"] = document.splitlines()[1]
+        signer = S3SigV4Auth(Credentials(error.findtext("AWSAccessKeyId"), "wrong"), "s3", region)
+        assert signer.signature(document, signed) == error.findtext("SignatureProvided")
+    else:
+        assert [child.tag for child in error] == expected
+    assert headers["content-type"] == "application/xml"
+    assert error.findtext("RequestId") == headers["x-amz-request-id"]
+    assert re.fullmatch(r"[A-Z0-9]{16}", error.findtext("RequestId"))
+    assert error.findtext("HostId") == headers["x-amz-id-2"]
+    assert len(base64.b64decode(error.findtext("HostId"), validate=True)) >= 48
+    assert "location" not in headers
+    if code == "PermanentRedirect":
+        assert error.findtext("Endpoint") == f"{bucket}.s3.{HOME}.{urlsplit(ENDPOINT).netloc}"
+        assert error.findtext("Bucket") == bucket
+        assert headers["x-amz-bucket-region"] == HOME
+    else:
+        assert "x-amz-bucket-region" not in headers
+    if code in {"InvalidBucketName", "NoSuchBucket"}:
+        assert error.findtext("BucketName") == bucket
+    if code == "AuthorizationHeaderMalformed":
+        assert error.findtext("Region") == endpoint_region
+    if access_key is not None:
+        assert error.findtext("AWSAccessKeyId") == access_key
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True], ids=["path", "virtual"])
+@pytest.mark.parametrize("missing,credential,endpoint_region,region,expected,compat_expected", [
+    # Fixed first-response observations; DELETE success must also remove the object.
+    (False, "valid", HOME, HOME, (204, None), (204, None)),
+    (False, "unknown", HOME, HOME, (403, "InvalidAccessKeyId"), (204, None)),
+    (False, "wrong-secret", HOME, HOME, (403, "SignatureDoesNotMatch"), (204, None)),
+    (True, "valid", HOME, HOME, (404, "NoSuchBucket"), (404, "NoSuchBucket")),
+    (True, "unknown", HOME, HOME, (403, "InvalidAccessKeyId"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", HOME, HOME, (403, "SignatureDoesNotMatch"), (404, "NoSuchBucket")),
+    (False, "valid", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (400, "AuthorizationHeaderMalformed")),
+    (False, "unknown", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (400, "AuthorizationHeaderMalformed")),
+    (False, "wrong-secret", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (400, "AuthorizationHeaderMalformed")),
+    (True, "valid", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "unknown", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", HOME, TOKYO, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    # Existing-bucket valid/unknown + Tokyo endpoint/Osaka signature live in
+    # test_delete_home_precedes_signing_region_and_credentials, including state checks.
+    (False, "wrong-secret", TOKYO, HOME, (301, "PermanentRedirect"), (204, None)),
+    (True, "valid", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "unknown", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", TOKYO, HOME, (400, "AuthorizationHeaderMalformed"), (404, "NoSuchBucket")),
+    (False, "valid", TOKYO, TOKYO, (301, "PermanentRedirect"), (301, "PermanentRedirect")),
+    (False, "unknown", TOKYO, TOKYO, (301, "PermanentRedirect"), (301, "PermanentRedirect")),
+    (False, "wrong-secret", TOKYO, TOKYO, (301, "PermanentRedirect"), (301, "PermanentRedirect")),
+    (True, "valid", TOKYO, TOKYO, (404, "NoSuchBucket"), (404, "NoSuchBucket")),
+    (True, "unknown", TOKYO, TOKYO, (403, "InvalidAccessKeyId"), (404, "NoSuchBucket")),
+    (True, "wrong-secret", TOKYO, TOKYO, (403, "SignatureDoesNotMatch"), (404, "NoSuchBucket")),
+])
+def test_delete_combined_errors(delete_bucket, delete_client, s3, auth_enabled,
+                                virtual, missing, credential, endpoint_region, region, expected, compat_expected):
+    bucket = f"missing-{delete_bucket}" if missing else delete_bucket
+    expected = expected if auth_enabled else compat_expected
+    response = _delete(bucket, delete_client, virtual=virtual, credential=credential,
+                       endpoint_region=endpoint_region, region=region)
+    assert (response[0], fromstring(response[2]).findtext("Code") if response[2] else None) == expected
+    _assert_state(s3, delete_bucket, deleted=not missing and response[0] == 204)
+    if response[0] == 204:
+        assert response[2] == b""
+    elif auth_enabled:
+        access_key = "AKIAUNKNOWNKEY000001" if credential == "unknown" else delete_client._request_signer._credentials.access_key
+        _assert_delete_error(response, expected[1], bucket=bucket, region=region, endpoint_region=endpoint_region,
+                      access_key=access_key if expected[1] in {"InvalidAccessKeyId", "SignatureDoesNotMatch"} else None)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential", ["valid", "unknown"])
+def test_delete_home_precedes_signing_region_and_credentials(delete_bucket, delete_client, s3,
+                                                             auth_enabled, virtual, credential):
+    # Fixed AWS observation: redirect, including with an unknown access key.
+    response = _delete(delete_bucket, delete_client, virtual=virtual, credential=credential,
+                       endpoint_region=TOKYO, region=HOME)
+    assert response[0] == (301 if auth_enabled else 204)
+    if auth_enabled:
+        _assert_delete_error(response, "PermanentRedirect", bucket=delete_bucket, endpoint_region=TOKYO)
+    else:
+        assert response[2] == b""
+    _assert_state(s3, delete_bucket, deleted=not auth_enabled)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("credential,region", [("valid", HOME), ("unknown", HOME), ("wrong-secret", HOME), ("valid", TOKYO)])
+def test_delete_missing_key_is_idempotent(delete_bucket, delete_client, s3, auth_enabled, virtual, credential, region):
+    response = _delete(delete_bucket, delete_client, virtual=virtual, credential=credential, region=region, key="missing.txt")
+    code = ("AuthorizationHeaderMalformed" if region != HOME else
+            "InvalidAccessKeyId" if auth_enabled and credential == "unknown" else
+            "SignatureDoesNotMatch" if auth_enabled and credential == "wrong-secret" else None)
+    assert (response[0], fromstring(response[2]).findtext("Code") if response[2] else None) == (
+        400 if region != HOME else 403 if code else 204, code)
+    if code and auth_enabled:
+        _assert_delete_error(response, code, bucket=delete_bucket, region=region)
+    if not code:
+        assert response[2] == b""
+        assert _delete(delete_bucket, delete_client, virtual=virtual, key="missing.txt")[0] == 204
+    _assert_state(s3, delete_bucket, deleted=False)
+
+
+@pytest.mark.auth_contract
+def test_delete_invalid_name_precedes_credentials(delete_client, auth_enabled):
+    response = _delete("invalid bucket", delete_client, credential="unknown")
+    assert response[0] == (400 if auth_enabled else 404)
+    if auth_enabled:
+        _assert_delete_error(response, "InvalidBucketName", bucket="invalid bucket")
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("denial", ["implicit", "explicit"])
+def test_delete_still_enforces_iam(delete_bucket, iam_user, s3, auth_enabled, virtual, denial):
+    policy = {"Statement": [{"Effect": "Deny", "Action": "s3:DeleteObject", "Resource": "*"}]}
+    client = iam_user(policy=policy if denial == "explicit" else None).client("s3", region=HOME)
+    response = _delete(delete_bucket, client, virtual=virtual)
+    assert response[0] == (403 if auth_enabled else 204)
+    _assert_state(s3, delete_bucket, deleted=not auth_enabled)
+    assert _delete(delete_bucket, client, virtual=virtual, key="missing.txt")[0] == (403 if auth_enabled else 204)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_delete_reserved_root_compatibility(delete_bucket, s3, virtual):
+    assert _delete(delete_bucket, s3, virtual=virtual, root=True)[0] == 204
+    _assert_state(s3, delete_bucket, deleted=True)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_delete_does_not_grant_foreign_bucket_access(iam_user, auth_enabled, virtual):
+    owner = boto3.client("s3", endpoint_url=ENDPOINT, region_name=HOME,
+                         aws_access_key_id="333333333333", aws_secret_access_key="root-secret")
+    bucket = f"foreign-delete-{uuid.uuid4().hex}"
+    owner.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": HOME})
+    owner.put_object(Bucket=bucket, Key="probe.txt", Body=_DELETE_PAYLOAD)
+    client = iam_user(policy={"Statement": [{"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "*"}]}).client("s3")
+    try:
+        assert _delete(bucket, client, virtual=virtual)[0] == 403
+        _assert_state(owner, bucket, deleted=False)
+    finally:
+        owner.delete_object(Bucket=bucket, Key="probe.txt")
+        owner.delete_bucket(Bucket=bucket)
+        owner.close()
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("query", ["?versionId=null", "?tagging"])
+def test_delete_subresources_keep_their_iam_path(delete_bucket, iam_user, auth_enabled, virtual, query):
+    client = iam_user().client("s3", region=HOME)
+    response = _delete(f"missing-{delete_bucket}", client, virtual=virtual, query=query)
+    assert response[0] == (403 if auth_enabled else 404)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_delete_version_needs_its_own_permission(delete_bucket, delete_client, s3, auth_enabled, virtual):
+    response = _delete(delete_bucket, delete_client, virtual=virtual, query="?versionId=null")
+    assert response[0] == (403 if auth_enabled else 204)
+    _assert_state(s3, delete_bucket, deleted=not auth_enabled)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+def test_delete_failed_precondition_preserves_object(delete_bucket, delete_client, s3, virtual):
+    response = _delete(delete_bucket, delete_client, virtual=virtual, extra_headers={"If-Match": '"incorrect"'})
+    assert (response[0], fromstring(response[2]).findtext("Code")) == (412, "PreconditionFailed")
+    _assert_state(s3, delete_bucket, deleted=False)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("virtual", [False, True])
+@pytest.mark.parametrize("invalid", [False, True], ids=["valid", "bad-signature"])
+def test_delete_presigned_validation_is_preserved(delete_bucket, iam_user, s3, virtual, invalid):
+    client = iam_user(policy={"Statement": [
+        {"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": f"arn:aws:s3:::{delete_bucket}/*"},
+    ]}).client("s3", region=HOME, config=Config(signature_version="s3v4", s3={"addressing_style": "virtual" if virtual else "path"}))
+    target = urlsplit(client.generate_presigned_url("delete_object", Params={"Bucket": delete_bucket, "Key": "probe.txt"}))
+    query = dict(parse_qsl(target.query))
+    if invalid:
+        signature = query["X-Amz-Signature"]
+        query["X-Amz-Signature"] = ("0" if signature[0] != "0" else "1") + signature[1:]
+    response = _send(target.netloc, target.path + "?" + urlencode(query), {})
+    assert response[0] == (403 if invalid else 204)
+    _assert_state(s3, delete_bucket, deleted=not invalid)
+
+
+def test_s3_missing_key_shapes_do_not_depend_on_auth(download_bucket, head_bucket, s3):
+    """The NoSuchKey body and the HEAD error shape are AWS's whether or not MiniStack checks auth."""
+    status, _headers, body = _download(download_bucket, s3, key="no-such-key")
+    error = fromstring(body)
+    assert (status, error.findtext("Code"), error.findtext("Key")) == (404, "NoSuchKey", "no-such-key")
+    assert error.find("Resource") is None
+    status, headers, body = _head(head_bucket, s3, key="no-such-key")
+    assert (status, body) == (404, b"")
+    assert "content-length" not in headers
+    status, headers, _body = _head(head_bucket, s3, key=None)
+    assert status == 200
+    assert (headers["x-amz-bucket-region"], headers["x-amz-bucket-arn"]) == (HOME, f"arn:aws:s3:::{head_bucket}")
+
+
+def test_s3_persisted_keys_a_path_cannot_hold_survive_a_restart(tmp_path, monkeypatch):
+    """Keys a file layout can't hold (a folder marker, a key under another key, doubled or dot
+    segments, a sidecar-like name) are saved, read back and reloaded as written."""
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    monkeypatch.setattr(s3mod, "get_account_id", lambda: "000000000000")
+    keys = ["dir/", "dir/child.txt", "dir/deeper/x.txt", "a", "a/b", "x//y", "p/./q", "../up", "n.meta.json",
+            "c/d/e", "c/d", "k" * 300]
+    for key in keys:
+        s3mod._persist_object("keys-bucket", key, {"body": key.encode(), "etag": '"e"', "size": len(key.encode()),
+                                                    "last_modified": s3mod.now_iso()})
+    for key in keys:
+        assert s3mod._read_body("keys-bucket", key, {"body": None}) == key.encode(), key
+    # Athena and Glue read ordinary keys at their own path.
+    assert open(tmp_path / "000000000000" / "keys-bucket" / "dir" / "child.txt", "rb").read() == b"dir/child.txt"
+
+    s3mod._buckets._data.pop(("000000000000", "keys-bucket"), None)
+    s3mod._load_persisted_bucket("000000000000", "keys-bucket", str(tmp_path / "000000000000" / "keys-bucket"))
+    restored = s3mod._buckets._data[("000000000000", "keys-bucket")]["objects"]
+    assert sorted(restored) == sorted(keys)
+    assert all(restored[key]["size"] == len(key.encode()) for key in keys)
+
+    # Once the key above it is gone, a rewrite moves the key back to its own path.
+    s3mod._delete_persisted_object("keys-bucket", "a/b")
+    s3mod._delete_persisted_object("keys-bucket", "a")
+    s3mod._persist_object("keys-bucket", "a/b", {"body": b"moved", "etag": '"e"', "size": 5,
+                                                 "last_modified": s3mod.now_iso()})
+    assert open(tmp_path / "000000000000" / "keys-bucket" / "a" / "b", "rb").read() == b"moved"
+    s3mod._buckets._data.pop(("000000000000", "keys-bucket"), None)
