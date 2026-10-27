@@ -2025,6 +2025,67 @@ def test_dynamodb_transact_write_condition_cancel(ddb):
     resp = ddb.get_item(TableName="qa-ddb-transact", Key={"pk": {"S": "new-item"}})
     assert "Item" not in resp
 
+def test_dynamodb_transact_write_condition_checked_before_update_expression(ddb):
+    """A failed condition on a missing item cancels with ConditionalCheckFailed, as
+    UpdateItem does, even when the update expression reads an attribute the
+    missing item does not have. Reasons and their order match real DynamoDB."""
+    table = "qa-ddb-transact-cond-order"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    update = {
+        "TableName": table,
+        "Key": {"pk": {"S": "missing"}},
+        "UpdateExpression": "SET #c = #c + :one",
+        "ConditionExpression": "attribute_exists(#pk)",
+        "ExpressionAttributeNames": {"#c": "count", "#pk": "pk"},
+        "ExpressionAttributeValues": {":one": {"N": "1"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        ddb.update_item(**update)
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": update}])
+    assert exc.value.response["Error"]["Code"] == "TransactionCanceledException"
+    assert [r["Code"] for r in exc.value.response["CancellationReasons"]] == ["ConditionalCheckFailed"]
+    assert "Item" not in ddb.get_item(TableName=table, Key={"pk": {"S": "missing"}})
+
+    # An update-expression error on another member does not hide the failed condition.
+    no_condition = {
+        "TableName": table,
+        "Key": {"pk": {"S": "missing2"}},
+        "UpdateExpression": "SET #c = #c + :one",
+        "ExpressionAttributeNames": {"#c": "count"},
+        "ExpressionAttributeValues": {":one": {"N": "1"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": update}, {"Update": no_condition}])
+    assert [r["Code"] for r in exc.value.response["CancellationReasons"]] == ["ConditionalCheckFailed", "ValidationError"]
+
+    # A wrong-typed key still cancels before any condition is evaluated.
+    wrong_key = {**no_condition, "Key": {"pk": {"N": "1"}}}
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": wrong_key}, {"Update": update}])
+    assert [r["Code"] for r in exc.value.response["CancellationReasons"]] == ["ValidationError", "None"]
+
+    # A missing table is reported before the update-expression error.
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": no_condition}, {"Update": {**no_condition, "TableName": f"{table}-missing"}}])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ddb.scan(TableName=table)["Count"] == 0
+
+    # begins_with with a number operand is a ValidationException, not an internal error.
+    ddb.put_item(TableName=table, Item={"pk": {"S": "e"}, "count": {"S": "x"}})
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"ConditionCheck": {
+            "TableName": table, "Key": {"pk": {"S": "e"}}, "ConditionExpression": "begins_with(#c, :n)",
+            "ExpressionAttributeNames": {"#c": "count"}, "ExpressionAttributeValues": {":n": {"N": "1"}}}}])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
 def test_dynamodb_transact_write_multiple_failures_all_returned(ddb):
     """TransactWriteItems returns CancellationReasons for ALL failed conditions, not just the first."""
     table = "qa-ddb-transact"

@@ -4664,14 +4664,16 @@ def _transact_write_items(data):
 
     # Phase 1: wrong-typed keys and update-expression type errors surface as a
     # per-item ValidationError cancellation reason, not a top-level exception.
+    # Update-expression errors (expr_reasons) wait for the conditions, as in UpdateItem.
     val_reasons = {}
+    expr_reasons = {}
     for idx, transact in enumerate(items_list):
         op_type, op = _extract_transact_op(transact)
         if op is None:
             continue
         tbl = _tables.get(op.get("TableName", ""))
         if not tbl:
-            continue
+            return error_response_json("ResourceNotFoundException", "Requested resource not found", 400)
         key_src = op.get("Item", {}) if op_type == "Put" else op.get("Key", {})
         type_msg = _key_type_mismatch_reason(tbl, key_src)
         if type_msg:
@@ -4694,7 +4696,7 @@ def _transact_write_items(data):
                 try:
                     probe, _ = _apply_update_expression(probe, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
                 except ValueError as exc:
-                    val_reasons[idx] = str(exc)
+                    expr_reasons[idx] = str(exc)
                 else:
                     imsg = _index_key_type_reason(tbl, probe)
                     if imsg:
@@ -4713,21 +4715,26 @@ def _transact_write_items(data):
         op_type, op = _extract_transact_op(transact)
         if op is None:
             continue
-        tbl = _tables.get(op.get("TableName", ""))
-        if not tbl:
-            return error_response_json("ResourceNotFoundException", "Requested resource not found", 400)
+        tbl = _tables[op.get("TableName", "")]
         cond = op.get("ConditionExpression", "")
         if cond:
             if op_type == "Put":
                 existing = _get_item_by_key(tbl, _extract_key_from_item(tbl, op.get("Item", {})))
             else:
                 existing = _get_item_by_key(tbl, op.get("Key", {}))
-            if not _evaluate_condition(cond, existing or {}, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {})):
+            try:
+                holds = _evaluate_condition(cond, existing or {}, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
+            except ValueError as exc:
+                # e.g. begins_with on a number operand
+                return error_response_json("ValidationException", str(exc), 400)
+            if not holds:
                 fail_item = existing if op.get("ReturnValuesOnConditionCheckFailure") == "ALL_OLD" else None
                 failures[idx] = fail_item
 
-    if failures:
-        return _transact_cancel_response(len(items_list), failures)
+    # A failed condition wins over the member's own update-expression error.
+    expr_reasons = {i: msg for i, msg in expr_reasons.items() if i not in failures}
+    if failures or expr_reasons:
+        return _transact_cancel_response(len(items_list), failures, expr_reasons)
 
     _txn_write_effects: dict = {}
 
@@ -5075,17 +5082,20 @@ def _extract_transact_op(transact):
     return None, None
 
 
-def _transact_cancel_response(total, failures):
+def _transact_cancel_response(total, failures, val_reasons):
     """Build a TransactionCanceledException response.
 
     *failures* is a dict mapping failed item indices to the existing item
     (or ``None`` if ``ReturnValuesOnConditionCheckFailure`` was not ``ALL_OLD``).
     All entries in the dict are marked ``ConditionalCheckFailed``; the rest are
-    ``None``.  AWS returns a reason entry for every item in the transaction.
+    ``None``, or ``ValidationError`` for the indices in *val_reasons*.  AWS
+    returns a reason entry for every item in the transaction.
     """
     reasons = []
     for i in range(total):
-        if i in failures:
+        if i in val_reasons:
+            reasons.append({"Code": "ValidationError", "Message": val_reasons[i]})
+        elif i in failures:
             entry = {"Code": "ConditionalCheckFailed", "Message": "The conditional request failed"}
             if failures[i] is not None:
                 entry["Item"] = failures[i]
