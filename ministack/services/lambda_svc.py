@@ -376,8 +376,11 @@ def _runtime_env_vars(config: dict) -> dict:
 # sha256, matching real Lambda's read-only /var/task — and both extraction
 # and every spawn take ``_provided_code_lock`` so no fork can overlap an
 # extraction write. Directories accumulate per distinct code sha within
-# ``tempfile.gettempdir()``; ``reset()`` removes them.
-_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), "ministack-provided-code")
+# ``tempfile.gettempdir()``; ``reset()`` removes them. Both caches are named
+# for this instance's gateway port: another MiniStack on the host shares the
+# temp directory and would otherwise remove a tree that is still in use.
+_GATEWAY_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+_PROVIDED_CODE_CACHE = os.path.join(tempfile.gettempdir(), f"ministack-provided-code-{_GATEWAY_PORT}")
 _provided_code_lock = threading.Lock()
 _provided_code_dirs: dict[str, str] = {}
 
@@ -414,7 +417,7 @@ def _provided_runtime_code_dir(code_zip: bytes) -> str:
 # environment and mounts /var/task and /opt read-only. Directories accumulate
 # per distinct blob within ``tempfile.gettempdir()``; ``reset()`` removes
 # them, like the provided-runtime cache above.
-_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), "ministack-lambda-extract")
+_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), f"ministack-lambda-extract-{_GATEWAY_PORT}")
 _docker_extract_lock = threading.Lock()
 _docker_extract_dirs: dict[str, str] = {}
 
@@ -599,13 +602,17 @@ def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
     # without going through CreateFunction (no real code path does this).
 
 
-def _internalize_code_zip(func: dict) -> None:
-    """Replace a blob ref or legacy base64 string with bytes, in place."""
+def _internalize_code_zip(func: dict, blobs: dict[str, bytes | None]) -> None:
+    """Replace a blob ref or legacy base64 string with bytes, in place. ``blobs``
+    holds what this restore has read, so records sharing a blob share its bytes."""
     code = func.get("code_zip")
     if not code:
         return
     if isinstance(code, dict) and _BLOB_REF_KEY in code:
-        func["code_zip"] = _read_code_blob(code[_BLOB_REF_KEY])
+        sha = code[_BLOB_REF_KEY]
+        if sha not in blobs:
+            blobs[sha] = _read_code_blob(sha)
+        func["code_zip"] = blobs[sha]
     elif isinstance(code, str):
         # Legacy persistence shape (inline base64).
         func["code_zip"] = base64.b64decode(code)
@@ -653,27 +660,28 @@ def load_persisted_state(data) -> None:
 
 def _restore_state(data):
     if data:
+        blobs: dict[str, bytes | None] = {}
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountRegionScopedDict):
             for scoped_key, func in funcs._data.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 _functions._data[scoped_key] = func
         elif isinstance(funcs, AccountScopedDict):
             # Pre-region state. Code may be a content-addressed blob ref (#947)
             # or legacy inline base64 — _internalize_code_zip handles both.
             for (account_id, name), func in funcs._data.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 region = _region_from_function_record(func)
                 _functions._data[(account_id, region, name)] = func
         else:
             for name, func in funcs.items():
-                _internalize_code_zip(func)
+                _internalize_code_zip(func, blobs)
                 for ver in func.get("versions", {}).values():
-                    _internalize_code_zip(ver)
+                    _internalize_code_zip(ver, blobs)
                 region = _region_from_function_record(func)
                 _functions._data[(get_account_id(), region, name)] = func
         _layers.update(data.get("layers", {}))
@@ -1144,6 +1152,13 @@ def _validate_event_source_arn(event_source_arn: str):
         return None, err
     if spec.service not in {"sqs", "kinesis", "dynamodb"}:
         return None, _invalid_parameter_value(f"Unsupported event source ARN: {event_source_arn}")
+    if spec.service == "kinesis" and spec.region != get_region():
+        return None, _invalid_parameter_value(f"Event source region must match Lambda region {get_region()}")
+    if spec.service == "kinesis" and spec.account_id != get_account_id():
+        # Another account's stream is read through its resource policy; _create_esm checks it can be read.
+        if not _kinesis_stream_name_from_arn_spec(spec):
+            return None, _invalid_parameter_value(f"Invalid event source ARN: {event_source_arn}")
+        return spec, None
     scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
     if scope_err:
         return None, scope_err
@@ -1305,6 +1320,17 @@ def _unzipped_size(zip_data: bytes | None) -> int:
             return sum(info.file_size for info in zf.infolist())
     except zipfile.BadZipFile:
         return 0
+
+
+def _reject_unreadable_zip(zip_data: bytes | None):
+    """A deployment package that is not a zip (an empty file included) is refused; None means no bytes were given."""
+    if zip_data is None or zipfile.is_zipfile(io.BytesIO(zip_data)):
+        return None
+    return error_response_json(
+        "InvalidParameterValueException",
+        "Could not unzip uploaded file. Please check your file, then try to upload again.",
+        400,
+    )
 
 
 def _validate_unzipped_size(zip_data: bytes | None):
@@ -2351,7 +2377,7 @@ def _create_function(data: dict):
     layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
     if err:
         return err
-    err = _validate_total_unzipped_size(code_zip, layers_cfg)
+    err = _reject_unreadable_zip(code_zip) or _validate_total_unzipped_size(code_zip, layers_cfg)
     if err:
         return err
     if data.get("Layers") is not None:
@@ -2840,7 +2866,7 @@ def _update_code(name: str, data: dict):
                 f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
                 400,
             )
-    err = _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
+    err = _reject_unreadable_zip(code_zip) or _validate_total_unzipped_size(code_zip, func["config"].get("Layers"))
     if err is not None:
         return err
     if code_zip:
@@ -3762,6 +3788,22 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
     return True
 
 
+def _kinesis_record_for_match(rec: dict) -> dict:
+    """The record a Kinesis filter pattern is matched against. AWS filters on
+    the metadata fields (``partitionKey``, ``sequenceNumber``, ...) next to the
+    event fields and on ``data`` as decoded JSON (AWS Lambda developer guide,
+    "Using event filtering with a Kinesis event source"). Data that isn't JSON
+    is left out, so a ``data`` pattern can't match it but metadata ones still can."""
+    flat = {k: v for k, v in rec.items() if k != "kinesis"}
+    flat.update(rec["kinesis"])
+    flat.pop("data", None)
+    try:
+        flat["data"] = json.loads(base64.b64decode(rec["kinesis"].get("data") or "", validate=True))
+    except (ValueError, TypeError):
+        pass
+    return flat
+
+
 def _apply_filter_criteria(records: list[dict], esm: dict) -> list[dict]:
     """Apply an ESM's FilterCriteria.Filters (OR across patterns) to a batch
     of records, returning only those matching at least one filter. If no
@@ -3786,7 +3828,7 @@ def _apply_filter_criteria(records: list[dict], esm: dict) -> list[dict]:
     for rec in records:
         # For SQS records the body is a string; AWS parses JSON bodies
         # automatically when the filter pattern targets `body.*` fields.
-        rec_for_match = dict(rec)
+        rec_for_match = _kinesis_record_for_match(rec) if isinstance(rec.get("kinesis"), dict) else dict(rec)
         body = rec.get("body")
         if isinstance(body, str):
             try:
@@ -6412,7 +6454,7 @@ def _publish_layer_version(layer_name: str, data: dict):
             version_id=content.get("S3ObjectVersion"),
         )
 
-    err = _validate_unzipped_size(zip_data)
+    err = _reject_unreadable_zip(zip_data) or _validate_unzipped_size(zip_data)
     if err is not None:
         return err
 
@@ -7165,6 +7207,31 @@ def _validate_scaling_config(data: dict, source_arn: str = ""):
     return None
 
 
+def _cross_account_stream_read_error(stream_arn: str, func_name: str, qualifier: str | None):
+    """Why a mapping cannot read another account's stream, as AWS answers when it tries, or None."""
+    from ministack.app import AUTH
+    from ministack.services import kinesis as _kin
+
+    spec = parse_arn(stream_arn)
+    prefix = "Received Exception while reading from provided stream. "
+    if not any(account == spec.account_id for (account, _region, _name), _s in _kin._streams.all_items()):
+        return _invalid_parameter_value(prefix + "No account found for the given parameters")
+    name = _kinesis_stream_name_from_arn_spec(spec)
+    stream = _kin._streams.get_scoped(spec.account_id, spec.region, name)
+    if not stream or stream.get("StreamARN") != stream_arn:
+        return _invalid_parameter_value(prefix + f"Stream {name} under account {spec.account_id} not found.")
+    if AUTH:
+        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+        role = ((func_rec or {}).get("config") or {}).get("Role", "")
+        denied = _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id())
+        if denied:
+            session, action = denied
+            return _invalid_parameter_value(
+                prefix + f"User: {session} is not authorized to perform: {action} on resource: {stream_arn} "
+                f"because no resource-based policy allows the {action} action")
+    return None
+
+
 def _create_esm(data: dict):
     err = _validate_scaling_config(data, data.get("EventSourceArn", ""))
     if err:
@@ -7181,6 +7248,10 @@ def _create_esm(data: dict):
     event_source_spec, err = _validate_event_source_arn(event_source_arn)
     if err:
         return err
+    if event_source_spec.service == "kinesis" and event_source_spec.account_id != get_account_id():
+        err = _cross_account_stream_read_error(event_source_arn, func_name, qualifier)
+        if err:
+            return err
 
     enabled = data.get("Enabled", True)
     if isinstance(enabled, str):
@@ -7641,6 +7712,17 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
         logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
+def _cross_account_read_blocked(stream_arn, func_rec, func_name) -> bool:
+    """Under AUTH=true the stream's policy must still allow the function's role on every pass."""
+    from ministack.app import AUTH
+    from ministack.services import kinesis as _kin
+
+    if not AUTH:
+        return False
+    role = (func_rec.get("config") or {}).get("Role", "")
+    return _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id()) is not None
+
+
 def _poll_kinesis():
     """Returns True if any shard advanced past a batch this pass (successfully
     invoked, or filtered out entirely)."""
@@ -7659,11 +7741,7 @@ def _poll_kinesis():
                 source_spec = parse_arn(source_arn)
             except ArnParseError:
                 continue
-            if (
-                source_spec.service != "kinesis"
-                or source_spec.account_id != get_account_id()
-                or source_spec.region != get_region()
-            ):
+            if source_spec.service != "kinesis" or source_spec.region != get_region():
                 continue
             stream_name = _kinesis_stream_name_from_arn_spec(source_spec)
             if not stream_name:
@@ -7675,8 +7753,11 @@ def _poll_kinesis():
             if func_rec is None:
                 continue
 
-            stream = _kin._streams.get(stream_name)
+            # A cross-account mapping reads the stream in its owner's account, while its policy allows it.
+            stream = _kin._streams.get_scoped(source_spec.account_id, source_spec.region, stream_name)
             if not stream or stream.get("StreamARN") != source_arn or stream["StreamStatus"] != "ACTIVE":
+                continue
+            if source_spec.account_id != get_account_id() and _cross_account_read_blocked(source_arn, func_rec, func_name):
                 continue
 
             esm_id = esm["UUID"]

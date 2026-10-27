@@ -25,6 +25,7 @@ import ministack.services.apigateway as _apigw_v2
 import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.appconfig as _appconfig
 import ministack.services.appsync as _appsync
+import ministack.services.athena as _athena
 import ministack.services.autoscaling as _asg
 import ministack.services.backup as _backup
 import ministack.services.cloudfront as _cf
@@ -13498,6 +13499,56 @@ def _glue_reset_dropped(old_props, new_props, defaults):
     return {k: v for k, v in defaults.items() if k in old_props and k not in new_props}
 
 
+def _athena_workgroup_attributes(name):
+    workgroup = _athena._workgroups[name]
+    engine = (workgroup.get("Configuration") or {}).get("EngineVersion") or {}
+    selected = engine.get("SelectedEngineVersion")
+    effective = engine.get("EffectiveEngineVersion") or (
+        selected if selected and selected != "AUTO" else "Athena engine version 3")
+    return {
+        "CreationTime": str(workgroup["CreationTime"]),
+        "WorkGroupConfiguration.EngineVersion.EffectiveEngineVersion": effective,
+        "WorkGroupConfigurationUpdates.EngineVersion.EffectiveEngineVersion": effective,
+    }
+
+
+def _athena_workgroup_apply(name, props):
+    """The properties AWS updates in place (template reference: Update requires No interruption)."""
+    workgroup = _athena._workgroups[name]
+    workgroup["Description"] = props.get("Description", "")
+    workgroup["State"] = props.get("State") or "ENABLED"
+    workgroup["Configuration"] = copy.deepcopy(props.get("WorkGroupConfiguration") or {})
+    arn = _athena._arn_workgroup(name)
+    tags = _tag_map(props.get("Tags"))
+    if tags:
+        _athena._tags[arn] = tags
+    else:
+        _athena._tags.pop(arn, None)
+
+
+def _athena_workgroup_create(logical_id, props, stack_name):
+    name = props.get("Name")
+    if not name:
+        raise ValueError("Property validation failure: [The property {/Name} is required]")
+    _glue_call(_athena._create_workgroup, {"Name": name}, "AWS::Athena::WorkGroup", "create")
+    _athena_workgroup_apply(name, props)
+    return name, _athena_workgroup_attributes(name)
+
+
+def _athena_workgroup_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if new_props.get("Name") != physical_id or physical_id not in _athena._workgroups:
+        created = _athena_workgroup_create(logical_id or physical_id, new_props, stack_name)
+        if physical_id in _athena._workgroups and created[0] != physical_id:
+            _delete_predecessor(_athena_workgroup_delete, physical_id, old_props)
+        return created
+    _athena_workgroup_apply(physical_id, new_props)
+    return physical_id, _athena_workgroup_attributes(physical_id)
+
+
+def _athena_workgroup_delete(physical_id, props):
+    _athena._delete_workgroup({"WorkGroup": physical_id, "RecursiveDeleteOption": bool(props.get("RecursiveDeleteOption"))})
+
+
 def _glue_database_name(logical_id, props, stack_name):
     # DatabaseName is the schema's primary identifier, so it wins over
     # DatabaseInput.Name when both are given.
@@ -15029,6 +15080,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::RDS::DBInstance": _RDS_DB_INSTANCE_CREATE_ONLY,
     # Table, Partition and Connection replace on nested members
     # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
+    "AWS::Athena::WorkGroup": ("Name",),
     "AWS::Glue::Database": ("DatabaseName",),
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
@@ -15144,6 +15196,12 @@ _RESOURCE_HANDLERS = {
         "update": _ec_user_group_update,
         "update_with_logical_id": True,
         "delete": _ec_user_group_delete,
+    },
+    "AWS::Athena::WorkGroup": {
+        "create": _athena_workgroup_create,
+        "update": _athena_workgroup_update,
+        "update_with_logical_id": True,
+        "delete": _athena_workgroup_delete,
     },
     "AWS::Glue::Database": {
         "create": _glue_database_create,

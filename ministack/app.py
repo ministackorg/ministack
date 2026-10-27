@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+from email.utils import formatdate
 from urllib.parse import parse_qs, quote, unquote, urlencode
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -244,6 +245,40 @@ from ministack.core.sigv4 import decode_header_value
 # Must run before hypercorn emits its first Expect: 100-continue reply.
 # See ministack/core/hypercorn_compat.py for the rationale (issue #389).
 _install_hypercorn_compat()
+
+# AWS endpoints never answer with Hypercorn's Server header; a service that sends one sets its own.
+# Set on the class so every start path (ministack, ministack -d, python -m hypercorn) gets it.
+from hypercorn.config import Config as _HypercornConfig
+
+_HypercornConfig.include_server_header = False
+# Hypercorn appends its own Date even when the response has one; the app adds one when it is missing.
+_HypercornConfig.include_date_header = False
+
+import h11 as _h11
+from hypercorn.protocol.events import EndBody as _EndBody
+from hypercorn.protocol.events import Response as _StreamResponse
+from hypercorn.protocol.h11 import H11Protocol as _H11Protocol
+from hypercorn.protocol.ws_stream import WSStream as _WSStream
+
+
+async def _send_error_response(self, status_code: int) -> None:
+    """Hypercorn's own error response (a malformed request's 400), with the Date its config no longer adds."""
+    await self._send_h11_event(_h11.Response(status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"),
+        (b"date", formatdate(usegmt=True).encode()), *self.config.response_headers("h11")]))
+    await self._send_h11_event(_h11.EndOfMessage())
+
+
+async def _send_ws_error_response(self, status_code: int) -> None:
+    """Hypercorn's own WebSocket handshake refusal (websocket.close before accept), with its Date."""
+    await self.send(_StreamResponse(stream_id=self.stream_id, status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"), (b"date", formatdate(usegmt=True).encode())]))
+    await self.send(_EndBody(stream_id=self.stream_id))
+    await self.config.log.access(self.scope, {"status": status_code, "headers": []}, time.time() - self.start_time)
+
+
+_H11Protocol._send_error_response = _send_error_response
+_WSStream._send_error_response = _send_ws_error_response
 
 # ---------------------------------------------------------------------------
 # Lazy service loader — modules are imported on first request, not at startup.
@@ -787,7 +822,7 @@ def _asgi_header_list(headers: dict) -> list:
     return header_list
 
 
-async def _send_response(send, status, headers, body):
+async def _send_response(send, status, headers, body, *, head=False):
     """Send ASGI HTTP response."""
     from ministack.core.responses import StreamingResponse
 
@@ -795,7 +830,7 @@ async def _send_response(send, status, headers, body):
         raise TypeError("StreamingResponse requires _send_streaming_response(send, receive, ...)")
 
     body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
-    if "content-length" not in {k.lower() for k in headers}:
+    if not head and "content-length" not in {k.lower() for k in headers}:
         headers["Content-Length"] = str(len(body_bytes))
     await send(
         {
@@ -838,7 +873,7 @@ async def _send_streaming_response(send, receive, status, headers, streaming):
             pass
 
 
-async def _send_if_handled(send, response, receive=None) -> bool:
+async def _send_if_handled(send, response, receive=None, *, head=False) -> bool:
     """Send a response tuple and report whether the request was handled."""
     if response is None:
         return False
@@ -850,7 +885,7 @@ async def _send_if_handled(send, response, receive=None) -> bool:
             raise TypeError("StreamingResponse requires the ASGI receive channel")
         await _send_streaming_response(send, receive, status, headers, body)
     else:
-        await _send_response(send, status, headers, body)
+        await _send_response(send, status, headers, body, head=head)
     return True
 
 
@@ -1287,14 +1322,15 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
     # so the API's own corsConfiguration is applied (#406). A Function URL owns its
-    # CORS config the same way, as does a registered custom domain. Skip the generic
-    # wildcard preflight in all three cases.
+    # CORS config the same way, as does a registered custom domain. An OPTIONS
+    # request to a load balancer goes on to its target. Skip the generic wildcard preflight for each.
     host = headers.get("host", "")
     owns_cors = (
         _parse_execute_api_url(host, path) is not None
         or _parse_lambda_url(host, path) is not None
         or _resolve_custom_domain_request(host, path) is not None
         or _parse_cloudfront_dataplane_host(host) is not None
+        or _is_potential_alb_request(host, path)
     )
     for response in (
         None if owns_cors else _handle_options_request(method, path, headers, query_params, request_id),
@@ -1991,7 +2027,7 @@ async def _handle_cloudfront_dataplane_request(
 
 async def _handle_execute_api_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
-    raw_path: str | None = None,
+    raw_path: str | None = None, raw_query_string: str | None = None,
 ):
     """Handle API Gateway execute-api data plane requests (Host-based,
     path-based, and registered custom domains)."""
@@ -2061,7 +2097,9 @@ async def _handle_execute_api_request(
             http_api_path = apigw_v2.decode_http_api_path(raw_path)
             if http_api_path.startswith(prefix):
                 execute_path = http_api_path[len(prefix):]
-        status, resp_headers, resp_body = await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        status, resp_headers, resp_body = await apigw_v2.handle_execute(
+            api_id, stage, execute_path, method, headers, body, query_params, raw_query_string=raw_query_string,
+        )
         # An HTTP API names its request id apigw-requestid (16 base64 characters); x-amzn-requestid is a REST API's.
         resp_headers.setdefault("apigw-requestid", base64.b64encode(os.urandom(11)).decode())
         return status, resp_headers, resp_body
@@ -2162,7 +2200,10 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
-async def _handle_alb_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_alb_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict, raw_query_string: str | None = None,
+    raw_path: str | None = None,
+):
     """Handle ALB data-plane requests for host-based and /_alb-prefixed addressing."""
     if not _is_potential_alb_request(host, path):
         return None
@@ -2170,12 +2211,17 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
     alb_module = _get_module("alb")
     load_balancer = alb_module.find_lb_for_host(host)
     dispatch_path = path
+    # Instance and IP targets get the path as the client sent it, percent-encoding included.
+    raw_dispatch_path = raw_path
 
     if load_balancer is None and path.startswith(_ALB_PATH_PREFIX):
         path_parts = path[len(_ALB_PATH_PREFIX) :].split("/", 1)
         load_balancer = alb_module._find_lb_by_name(path_parts[0])
         if load_balancer:
             dispatch_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
+            if raw_path is not None and raw_path.startswith(_ALB_PATH_PREFIX):
+                raw_parts = raw_path[len(_ALB_PATH_PREFIX) :].split("/", 1)
+                raw_dispatch_path = "/" + raw_parts[1] if len(raw_parts) > 1 else "/"
 
     if load_balancer is None:
         return None
@@ -2189,7 +2235,8 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
 
     try:
         return await alb_module.dispatch_request(
-            load_balancer, method, dispatch_path, headers, body, query_params, alb_port
+            load_balancer, method, dispatch_path, headers, body, query_params, alb_port,
+            raw_query_string=raw_query_string, raw_path=raw_dispatch_path,
         )
     except Exception as e:
         logger.exception("Error in ALB data-plane dispatch: %s", e)
@@ -2342,9 +2389,10 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        upload_error = _get_module("s3").validate_upload_request(method, vhost_path, headers, query_params)
-        if upload_error is not None:
-            return upload_error
+        object_error = (None if method in {"HEAD", "DELETE"} and access_point_region is not None else
+                        _get_module("s3").validate_object_request(method, vhost_path, headers, query_params))
+        if object_error is not None:
+            return object_error
         from ministack.core.iam_actions import (
             _s3_action,
             extract_resource_arn,
@@ -2633,7 +2681,8 @@ async def _handle_special_data_plane_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
         headers, body, query_params, client_ip,
     ):
-        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+        # A distribution adds its own headers (Via, X-Amz-Cf-Id, X-Amz-Cf-Pop, X-Cache), not an API's request ids.
+        return response
     # Before S3 virtual hosting, which would read the collection id as a bucket.
     if _AOSS_COLLECTION_HOST_RE.match(host) and (
         response := await _get_module("opensearchserverless").handle_dataplane(
@@ -2642,17 +2691,22 @@ async def _handle_special_data_plane_request(
     ):
         return _with_data_plane_headers(response, request_id)
     if response := await _handle_execute_api_request(
-        host, path, method, headers, body, query_params, raw_path=raw_path
+        host, path, method, headers, body, query_params, raw_path=raw_path, raw_query_string=raw_query_string
     ):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+        # A Function URL names its own x-amzn-RequestId and X-Amzn-Trace-Id; it sends no other request ids.
+        status, resp_headers, resp_body = response
+        if not any(k.lower() == "x-amzn-requestid" for k in resp_headers):
+            resp_headers["x-amzn-RequestId"] = request_id
+        return status, resp_headers, resp_body
     if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
         if AUTH and (target := _s3_cors_target(host, path, path_style=False)):
             response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
         return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
-    if response := await _handle_alb_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id)
+    if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string, raw_path):
+        # A load balancer passes its target's headers through; CORS and request ids are the application's.
+        return response
     return None
 
 
@@ -2924,9 +2978,9 @@ async def _dispatch_service_request(
         return _unknown_query_error(body, request_id)
 
     if AUTH and service == "s3":
-        upload_error = _get_module("s3").validate_upload_request(method, path, headers, query_params)
-        if upload_error is not None:
-            return upload_error
+        object_error = _get_module("s3").validate_object_request(method, path, headers, query_params)
+        if object_error is not None:
+            return object_error
 
     # AppSync authorizes a GraphQL request by the API's own authorization types.
     appsync_graphql = service == "appsync" and method == "POST" and (
@@ -3150,10 +3204,14 @@ async def _dispatch_service_request(
         {
             **cors,
             "x-amzn-requestid": request_id,
-            "x-amz-request-id": request_id,
-            "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
         }
     )
+    if service == "s3":
+        resp_headers.setdefault("x-amz-request-id", request_id)
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        resp_headers["x-amz-request-id"] = request_id
+        resp_headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
     return status, resp_headers, resp_body
 
 
@@ -3162,8 +3220,25 @@ async def _dispatch_service_request(
 # ---------------------------------------------------------------------------
 
 
+_RESPONSE_START_MESSAGES = ("http.response.start", "websocket.accept", "websocket.http.response.start")
+
+
+def _with_date_header(send):
+    """AWS sends one Date per response: a proxied target's, or the endpoint's own when there is none."""
+    async def send_with_date(message):
+        if message["type"] in _RESPONSE_START_MESSAGES and not any(
+            name.lower() == b"date" for name, _ in message.get("headers", [])
+        ):
+            message = {**message, "headers": [*message.get("headers", []), (b"date", formatdate(usegmt=True).encode("ascii"))]}
+        await send(message)
+
+    return send_with_date
+
+
 async def app(scope, receive, send):
     """ASGI application entry point."""
+    if scope["type"] in ("http", "websocket"):
+        send = _with_date_header(send)
     if scope["type"] == "lifespan":
         await _handle_lifespan(scope, receive, send)
         return
@@ -3329,27 +3404,47 @@ async def app(scope, receive, send):
     ):
         return
 
-    if await _send_if_handled(
-        send,
-        await _handle_special_data_plane_request(
-            method, path, headers, body, query_params, request_id,
-            raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
-            raw_query_string=query_string,
-            client_ip=(scope.get("client") or ("127.0.0.1",))[0],
-        ),
-        receive,
-    ):
+    # Finalize ordinary S3 HEAD responses after both routing paths, including
+    # IAM denials. Presigns, access points and subresources keep their handlers.
+    head_path = None
+    # Iceberg routes are selected before S3, even when signed with scope s3.
+    if (method == "HEAD" and not path.startswith("/iceberg")
+            and detect_service(method, path, headers, query_params) == "s3"):
+        host = headers.get("host", "")
+        bucket = _extract_s3_vhost_bucket(host)
+        candidate = f"/{bucket}{path}" if bucket else path
+        ap_match = _ACCESS_POINT_HOST_RE.match(bucket) if bucket else None
+        has_access_point = ap_match is not None and _get_module("s3").resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), extract_region(headers)) is not None
+        if (not _MRAP_HOST_RE.match(host.split(":")[0].strip())
+                and not (bucket and (_S3_VHOST_EXCLUDE_RE.search(host) or has_access_point
+                             or bucket in _NON_S3_VHOST_NAMES))
+                and _get_module("s3").is_standard_object_request(method, candidate, headers, query_params)):
+            head_path = candidate
+
+    response = await _handle_special_data_plane_request(
+        method, path, headers, body, query_params, request_id,
+        raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+        raw_query_string=query_string,
+        client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+    )
+    if response is not None and head_path is not None:
+        response = _get_module("s3").format_head_response(head_path, headers, response)
+    if await _send_if_handled(send, response, receive, head=head_path is not None):
         return
 
     status, resp_headers, resp_body = await _dispatch_service_request(
         method, path, headers, body, query_params, request_id
     )
+    if head_path is not None:
+        status, resp_headers, resp_body = _get_module("s3").format_head_response(
+            head_path, headers, (status, resp_headers, resp_body))
     from ministack.core.responses import StreamingResponse
 
     if isinstance(resp_body, StreamingResponse):
         await _send_streaming_response(send, receive, status, resp_headers, resp_body)
     else:
-        await _send_response(send, status, resp_headers, resp_body)
+        await _send_response(send, status, resp_headers, resp_body, head=head_path is not None)
 
 
 # ---------------------------------------------------------------------------

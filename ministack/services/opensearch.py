@@ -397,6 +397,8 @@ def start_engine_container(docker, name: str, labels: dict, host_port=None, volu
             # matching that here would block every smoke test.
             "DISABLE_SECURITY_PLUGIN": "true",
             "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "MinIstack-Admin-1!",
+            # The heap OpenSearch's own sample docker-compose uses, instead of the image's 1 GB per container.
+            "OPENSEARCH_JAVA_OPTS": "-Xms512m -Xmx512m",
         },
         ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
     )
@@ -731,7 +733,6 @@ def _new_domain_record(name, payload):
                         endpoint = f"{h}:{pt}"
                         live["Endpoint"] = endpoint
                         live["_Endpoint"] = endpoint
-                        live["_container_id"] = cid2
                         live["_ContainerId"] = cid2
                     live["Processing"] = False
             if orphaned and cid2:
@@ -1408,7 +1409,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 def _live_container_ids():
     ids = set()
     for _key, rec in _domains.all_items():
-        for field in ("_container_id", "_dashboards_container_id"):
+        for field in ("_ContainerId", "_DashboardsContainerId"):
             cid = rec.get(field)
             if cid:
                 ids.add(cid)
