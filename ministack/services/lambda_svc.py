@@ -982,7 +982,7 @@ process.stdin.on('end', async () => {
 # ---------------------------------------------------------------------------
 
 
-# A partial ARN: <account>:function:<name>[:<qualifier>]. A function name cannot contain ":".
+# <account>:function:<name>[:<qualifier>]
 _PARTIAL_FUNCTION_ARN_RE = re.compile(r"^(\d{12}):function:([^:]+)(?::([^:]+))?$")
 
 
@@ -1039,7 +1039,7 @@ def _resolve_request_scoped_name(name_or_arn: str) -> str:
 def _resolve_request_scoped_name_and_qualifier(name_or_arn: str) -> tuple[str, str | None]:
     if not name_or_arn:
         return "", None
-    # AWS reads a partial ARN as the full ARN in the caller's region, so the account check below applies to it too.
+    # A partial ARN is the full ARN in the caller's region.
     if _PARTIAL_FUNCTION_ARN_RE.match(name_or_arn):
         name_or_arn = f"arn:aws:lambda:{get_region()}:{name_or_arn}"
     if not name_or_arn.startswith("arn:"):

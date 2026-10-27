@@ -2978,58 +2978,50 @@ class TestAwsIamTrust:
         finally:
             conn.close()
 
-    @pytest.mark.parametrize("failure", ["unreachable", "refused by the backend"])
-    def test_a_catalog_that_cannot_be_created_leaves_the_connection_usable(
-        self, dsql_proxy, pg_backend, role, monkeypatch, failure
-    ):
+    def test_dropping_a_role_with_a_mapping_is_refused(self, dsql_proxy, role):
         psycopg2 = pytest.importorskip("psycopg2")
-        name = f"iam_db_{secrets.token_hex(4)}"
-        admin = psycopg2.connect(
-            host=pg_backend[0], port=pg_backend[1], user="postgres", dbname="postgres"
-        )
-        admin.autocommit = True
-        admin.cursor().execute(f"CREATE DATABASE {name}")
-        attempts = []
-
-        async def refused(conn):
-            attempts.append(conn.database)
-            if failure == "unreachable":
-                raise OSError("connection refused")
-            return "55P03 canceling statement due to lock timeout"
-
-        monkeypatch.setattr(pgproxy, "_create_iam_catalog", refused)
+        conn = _pg_connect(dsql_proxy)
         try:
-            conn = psycopg2.connect(
-                host="127.0.0.1", port=dsql_proxy, user="admin", password="x", dbname=name
+            cur = conn.cursor()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            with pytest.raises(psycopg2.Error) as exc:
+                cur.execute(f"DROP ROLE IF EXISTS missing_role, {role}")
+            assert exc.value.pgcode == "2BP01"
+            assert exc.value.pgerror.startswith(
+                f'ERROR:  role "{role}" cannot be dropped because some objects depend on it'
             )
-            conn.autocommit = True
-            try:
-                for _ in range(2):
-                    with pytest.raises(psycopg2.Error) as exc:
-                        conn.cursor().execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
-                    assert exc.value.pgcode == "42P01"
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                assert cur.fetchone() == (1,)
-                assert attempts == [name, name]
-            finally:
-                conn.close()
+            cur.execute("SELECT count(*) FROM pg_roles WHERE rolname = %s", (role,))
+            assert cur.fetchone() == (1,)
         finally:
-            admin.cursor().execute(f"DROP DATABASE {name} WITH (FORCE)")
-            admin.close()
+            conn.close()
 
-    def test_the_extended_protocol_is_refused(self, dsql_proxy, role):
+    def test_a_rolled_back_grant_gives_its_iam_oid_back(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy, autocommit=False)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            conn.commit()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_IN_TXN_ARN}'")
+            cur.execute("SELECT iam_oid FROM sys.iam_pg_role_mappings WHERE arn = %s", (_IN_TXN_ARN,))
+            rolled_back = cur.fetchone()
+            conn.rollback()
+            cur.execute(f"AWS IAM GRANT {role} TO '{_PROBE_USER_ARN}'")
+            conn.commit()
+            cur.execute("SELECT iam_oid FROM sys.iam_pg_role_mappings WHERE arn = %s", (_PROBE_USER_ARN,))
+            assert cur.fetchone() == rolled_back
+        finally:
+            conn.close()
+
+    def test_grant_and_revoke_over_the_extended_protocol(self, dsql_proxy, role):
         with _WireClient(dsql_proxy) as c:
-            for sql in (
-                f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'",
-                f"AWS IAM GRANT admin TO '{_PROBE_ROLE_ARN}'",
-            ):
-                result = c.extended(sql)
-                assert result.sqlstate == "0A000"
-                assert "simple query protocol" in result.message
-            assert c.extended(
-                "SELECT count(*) FROM sys.iam_pg_role_mappings WHERE pg_role_name = $1", [role]
-            ).rows == [("0",)]
+            assert c.extended(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'").tag == "AWS IAM GRANT"
+            count = "SELECT count(*) FROM sys.iam_pg_role_mappings WHERE pg_role_name = $1"
+            assert c.extended(count, [role]).rows == [("1",)]
+            assert c.extended(f"AWS IAM REVOKE {role} FROM '{_PROBE_ROLE_ARN}'").tag == "AWS IAM REVOKE"
+            assert c.extended(count, [role]).rows == [("0",)]
+            result = c.extended(f"AWS IAM GRANT admin TO '{_PROBE_ROLE_ARN}'")
+            assert result.sqlstate == "42501"
+            assert c.extended("SELECT 1").rows == [("1",)]
 
     def test_quoting_holds_without_standard_conforming_strings(self, dsql_proxy, role):
         psycopg2 = pytest.importorskip("psycopg2")
@@ -3057,16 +3049,35 @@ class TestAwsIamTrust:
         finally:
             conn.close()
 
-    def test_a_multi_statement_batch_is_refused(self, dsql_proxy, role):
-        with _WireClient(dsql_proxy) as c:
-            result = c.simple(f"SELECT 1; AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
-            assert result.sqlstate == "0A000"
-            assert "not in a batch" in result.message
-            assert c.simple(
-                f"SELECT count(*) FROM sys.iam_pg_role_mappings WHERE pg_role_name = '{role}'"
-            ).rows == [("0",)]
+    def test_grant_in_a_multi_statement_batch(self, dsql_proxy, role):
+        conn = _pg_connect(dsql_proxy)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT 1; AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'")
+            assert cur.statusmessage == "AWS IAM GRANT"
+            del conn.notices[:]
+            cur.execute(
+                f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}' -- again\n; SELECT 2"
+            )
+            assert cur.fetchone() == (2,)
+            assert conn.notices == [
+                f'NOTICE:  IAM role "{_PROBE_ROLE_ARN}" has already been granted access '
+                f'to role "{role}" by role "admin"\n'
+            ]
+            assert self._mappings(cur, role) == [(_PROBE_ROLE_ARN, role, "admin")]
+        finally:
+            conn.close()
 
-    def test_the_catalog_appears_only_in_a_database_that_uses_it(
+    def test_a_grant_after_ddl_in_a_batch_is_refused(self, dsql_proxy, role):
+        with _WireClient(dsql_proxy) as c:
+            result = c.simple(
+                f"CREATE TABLE iam_batch_ddl (id int PRIMARY KEY); "
+                f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'"
+            )
+            assert result.sqlstate == "0A000"
+            assert result.message == "multiple ddl statements not supported in a transaction"
+
+    def test_admin_and_the_view_are_there_from_the_first_connection(
         self, dsql_proxy, pg_backend
     ):
         psycopg2 = pytest.importorskip("psycopg2")
@@ -3077,22 +3088,21 @@ class TestAwsIamTrust:
         admin.autocommit = True
         admin.cursor().execute(f"CREATE DATABASE {name}")
         try:
-            main = _pg_connect(dsql_proxy)
-            main.cursor().execute("SELECT count(*) FROM sys.iam_pg_role_mappings")
-            main.close()
-            with _WireClient(dsql_proxy, database=name) as c:
-                result = c.extended(f"AWS IAM GRANT admin TO '{_PROBE_ROLE_ARN}'")
-                assert result.sqlstate == "0A000"
             conn = psycopg2.connect(
                 host="127.0.0.1", port=dsql_proxy, user="admin", password="x", dbname=name
             )
             conn.autocommit = True
             try:
                 cur = conn.cursor()
-                cur.execute("SELECT count(*) FROM pg_namespace WHERE nspname = 'sys'")
-                assert cur.fetchone() == (0,)
+                cur.execute("SELECT count(*) FROM pg_roles WHERE rolname = 'admin'")
+                assert cur.fetchone() == (1,)
                 cur.execute("SELECT count(*) FROM sys.iam_pg_role_mappings")
                 assert cur.fetchone() == (0,)
+                cur.execute(
+                    "SELECT c.relname, c.relkind FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sys'"
+                )
+                assert cur.fetchall() == [("iam_pg_role_mappings", "v")]
             finally:
                 conn.close()
         finally:
