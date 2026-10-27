@@ -2109,6 +2109,10 @@ def _iam_trust_sql(trust, grantor):
         f"FOREACH _arn IN ARRAY {arns} LOOP {loop}"
         f"EXECUTE replace({view}, '{{rows}}', _rows); END LOOP; END"
     )
+    return _do_block(body)
+
+
+def _do_block(body):
     tag = "$iam$"
     while tag in body:
         tag = f"$iam_{secrets.token_hex(4)}$"
@@ -2119,22 +2123,6 @@ def _without_context(payload):
     """An ErrorResponse/NoticeResponse payload without its PL/pgSQL CONTEXT field."""
     fields = [f for f in payload.split(b"\0") if f and f[:1] != b"W"]
     return b"\0".join(fields) + b"\0\0"
-
-
-def _text_rows(frames):
-    rows = []
-    for type_byte, payload in frames:
-        if type_byte != b"D":
-            continue
-        (nfields,) = struct.unpack("!H", payload[:2])
-        i, row = 2, []
-        for _ in range(nfields):
-            (vlen,) = struct.unpack("!i", payload[i:i + 4])
-            i += 4
-            row.append(None if vlen < 0 else payload[i:i + vlen].decode("utf-8", "replace"))
-            i += max(vlen, 0)
-        rows.append(tuple(row))
-    return rows
 
 
 async def _prepare_backend(conn, b_reader, b_writer):
@@ -2171,28 +2159,23 @@ async def _run_iam_trust(conn, b_writer, trust):
     return out + _command_complete(trust.tag), None
 
 
-async def _check_drop_role(conn, b_writer, sql):
-    """DSQL refuses to drop a role that still has an IAM mapping (2BP01)."""
+def _drop_role_sql(conn, sql):
+    """A DO block that refuses (2BP01) to drop a role with an IAM mapping, else runs the DROP."""
     m = _DROP_ROLE_RE.match(sql)
     if not m or (conn.cluster_id, conn.database) not in _iam_ready:
         return None
     names = [fold_identifier(n)[0] for n in _split_top_level(m.group(1)) if n.strip()]
     if not names:
         return None
-    try:
-        frames = await _run_backend_capture(
-            conn, b_writer,
-            "SELECT pg_role_name FROM sys.iam_pg_role_mappings WHERE pg_role_name IN ("
-            + ", ".join(_sql_literal(n) for n in names) + ") LIMIT 1",
-        )
-    except Exception:
-        return None
-    rows = _text_rows(frames)
-    if not rows:
-        return None
-    return DsqlError(
-        "2BP01", f'role "{rows[0][0]}" cannot be dropped because some objects depend on it'
+    body = (
+        "DECLARE _name name; BEGIN "
+        "SELECT m.pg_role_name INTO _name FROM sys.iam_pg_role_mappings m WHERE m.pg_role_name IN ("
+        + ", ".join(_sql_literal(n) for n in names) + ") LIMIT 1; "
+        "IF FOUND THEN RAISE EXCEPTION USING ERRCODE = '2BP01', MESSAGE = "
+        "format('role \"%s\" cannot be dropped because some objects depend on it', _name); "
+        f"END IF; EXECUTE {_sql_literal(sql.rstrip().rstrip(';'))}; END"
     )
+    return _do_block(body)
 
 
 def _check_iam(conn, s, txn):
@@ -2223,6 +2206,7 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
       "rows"     — payload describes a synthetic result set (sys.jobs etc.)
       "rewrite"  — payload is a Rewrite to run on the backend as a job
       "iam"      — payload is an IamTrust to apply
+      "relabel"  — payload is (sql, tag): run sql, report it under tag
       "forward"  — payload is None; relay the statement untouched
 
     ``allow_probe`` is False when the backend is mid extended-protocol
@@ -2285,10 +2269,10 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
         err = await _check_statistics_limit(conn, b_writer, s)
         if err:
             return "error", err
-        err = await _check_drop_role(conn, b_writer, s)
-        if err:
-            return "error", err
 
+    drop = _drop_role_sql(conn, s)
+    if drop:
+        return "relabel", (drop, "DROP ROLE")
     return "forward", None
 
 
@@ -2407,6 +2391,13 @@ async def _handle_query(conn, sql, b_writer, c_writer):
             c_writer.write(out + _ready(_status(conn)))
             await c_writer.drain()
             return
+        if kind == "relabel":
+            _note_catalog(conn, s)
+            txn.apply(s)
+            conn.result_tags = [result[1]]
+            b_writer.write(_frame(b"Q", result[0].encode() + b"\0"))
+            await b_writer.drain()
+            return
         if kind == "iam":
             txn.apply(s)
             out, backend_err = await _run_iam_trust(conn, b_writer, result)
@@ -2471,8 +2462,12 @@ async def _handle_query(conn, sql, b_writer, c_writer):
                 sim.apply(s)
                 continue
             result = trust or validate(s, sim)
-            if not isinstance(result, (DsqlError, Rewrite)):
-                result = await _check_drop_role(conn, b_writer, s) or result
+            drop = None if isinstance(result, (DsqlError, Rewrite)) else _drop_role_sql(conn, s)
+            if drop:
+                batch.append(drop)
+                tags.append("DROP ROLE")
+                sim.apply(s)
+                continue
             if isinstance(result, (DsqlError, Rewrite)):
                 if isinstance(result, Rewrite):
                     # ASYNC rewrites only supported for single statements.
@@ -2595,11 +2590,11 @@ async def _ext_parse(conn, payload, b_writer, c_writer):
         await c_writer.drain()
         return
     if kind == "iam":
-        entry["tag"] = result.tag
+        kind, result = "relabel", (_iam_trust_sql(result, conn.user), result.tag)
+    if kind == "relabel":
+        entry["tag"] = result[1]
         sql_end = payload.index(b"\0", payload.index(b"\0") + 1)
-        payload = (
-            name.encode() + b"\0" + _iam_trust_sql(result, conn.user).encode() + payload[sql_end:]
-        )
+        payload = name.encode() + b"\0" + result[0].encode() + payload[sql_end:]
     conn.ext_stmts[name] = entry
     await _ext_forward(conn, b_writer, b"P", payload)
 

@@ -2995,6 +2995,36 @@ class TestAwsIamTrust:
         finally:
             conn.close()
 
+    def test_dropping_a_mapped_role_is_refused_in_a_batch_and_a_pipeline(
+        self, dsql_proxy, role
+    ):
+        with _WireClient(dsql_proxy) as c:
+            assert c.simple(f"AWS IAM GRANT {role} TO '{_PROBE_ROLE_ARN}'").ok
+            result = c.simple(f"SELECT 1; DROP ROLE {role}")
+            assert result.sqlstate == "2BP01"
+
+            def portal(sql):
+                return (
+                    c._frame(b"P", b"\0" + sql.encode() + b"\0" + struct.pack("!H", 0))
+                    + c._frame(b"B", b"\0\0" + struct.pack("!HHH", 0, 0, 0))
+                    + c._frame(b"E", b"\0" + struct.pack("!I", 0))
+                )
+
+            c.sock.sendall(portal("SELECT 1") + portal(f"DROP ROLE {role}") + c._frame(b"S", b""))
+            result = _WireResult(c._until_ready())
+            assert result.sqlstate == "2BP01"
+            assert result.message == (
+                f'role "{role}" cannot be dropped because some objects depend on it'
+            )
+
+    def test_dropping_an_unmapped_role_still_reports_drop_role(self, dsql_proxy):
+        name = f"iam_{secrets.token_hex(4)}"
+        with _WireClient(dsql_proxy) as c:
+            assert c.simple(f"CREATE ROLE {name}").ok
+            assert c.simple(f"DROP USER {name}").tag == "DROP ROLE"
+            assert c.extended(f"DROP ROLE IF EXISTS {name}").tag == "DROP ROLE"
+            assert c.simple(f"DROP ROLE {name}").sqlstate == "42704"
+
     def test_a_rolled_back_grant_gives_its_iam_oid_back(self, dsql_proxy, role):
         conn = _pg_connect(dsql_proxy, autocommit=False)
         try:
