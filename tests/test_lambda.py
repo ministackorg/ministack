@@ -1733,14 +1733,14 @@ def test_lambda_esm_sqs_failure_respects_visibility_timeout(lam, sqs):
 
     sqs.send_message(QueueUrl=q_url, MessageBody="trigger-failure")
 
-    # Wait until ESM has actually processed (and failed) the message
+    # Wait until the mapping has taken the message (an SQS mapping has no LastProcessingResult)
     for _ in range(40):
         time.sleep(0.5)
-        cur = lam.get_event_source_mapping(UUID=esm_uuid)
-        if cur.get("LastProcessingResult") == "FAILED":
+        attrs = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["ApproximateNumberOfMessagesNotVisible"])
+        if int(attrs["Attributes"]["ApproximateNumberOfMessagesNotVisible"]) >= 1:
             break
     else:
-        pytest.skip("ESM did not process message in time")
+        pytest.fail("ESM did not receive the message in time")
 
     # Disable ESM immediately after failure confirmed
     lam.update_event_source_mapping(UUID=esm_uuid, Enabled=False)

@@ -7138,6 +7138,25 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 # ---------------------------------------------------------------------------
 
 
+def esm_source_defaults(is_sqs: bool) -> dict:
+    """What AWS reports for a new mapping by source: a stream mapping has its retry,
+    age, batching and destination settings; an SQS one has none of them and no
+    LastProcessingResult."""
+    if is_sqs:
+        return {"StateTransitionReason": "USER_INITIATED", "BatchSize": 10}
+    return {
+        "StateTransitionReason": "User action",
+        "BatchSize": 100,
+        "LastProcessingResult": "No records processed",
+        "MaximumRetryAttempts": -1,
+        "MaximumRecordAgeInSeconds": -1,
+        "BisectBatchOnFunctionError": False,
+        "ParallelizationFactor": 1,
+        "TumblingWindowInSeconds": 0,
+        "DestinationConfig": {"OnFailure": {}},
+    }
+
+
 def _esm_response(esm: dict, state: str | None = None, modified_now: bool = False) -> dict:
     """Return ESM dict without internal-only fields.
 
@@ -7278,9 +7297,6 @@ def _create_esm(data: dict):
     enabled = data.get("Enabled", True)
     if isinstance(enabled, str):
         enabled = enabled.lower() != "false"
-    # Defaults and fields as AWS answers them: a stream mapping reports its
-    # retry, age, batching and destination settings; an SQS one does not, and
-    # has no LastProcessingResult.
     esm = {
         "UUID": esm_id,
         "EventSourceArn": event_source_arn,
@@ -7288,23 +7304,14 @@ def _create_esm(data: dict):
         "FunctionName": func_name,
         "Qualifier": qualifier,
         "State": "Enabled" if enabled else "Disabled",
-        "StateTransitionReason": "USER_INITIATED" if is_sqs else "User action",
-        "BatchSize": data.get("BatchSize", 10 if is_sqs else 100),
+        **esm_source_defaults(is_sqs),
         "MaximumBatchingWindowInSeconds": data.get("MaximumBatchingWindowInSeconds", 0),
         "LastModified": time.time(),
         "Enabled": enabled,
         "FunctionResponseTypes": data.get("FunctionResponseTypes", []),
     }
-    if not is_sqs:
-        esm.update({
-            "LastProcessingResult": "No records processed",
-            "MaximumRetryAttempts": -1,
-            "MaximumRecordAgeInSeconds": -1,
-            "BisectBatchOnFunctionError": False,
-            "ParallelizationFactor": 1,
-            "TumblingWindowInSeconds": 0,
-            "DestinationConfig": {"OnFailure": {}},
-        })
+    if "BatchSize" in data:
+        esm["BatchSize"] = data["BatchSize"]
     # Optional stream/poll settings — stored on create (previously only picked
     # up on UpdateEventSourceMapping), so GetEventSourceMapping echoes them and
     # the poller can honor MaximumRecordAgeInSeconds + the OnFailure destination.

@@ -5716,6 +5716,54 @@ def test_cfn_esm_filter_criteria_round_trips(cfn, lam, ddb):
     lam.delete_function(FunctionName="cfn-esm-fc-fn")
 
 
+def test_cfn_esm_reports_the_api_defaults_per_source(cfn, lam, ddb, sqs):
+    """A mapping created by CloudFormation reports what CreateEventSourceMapping does: a stream mapping's
+    retry, age and destination defaults and BatchSize 100; an SQS one BatchSize 10, no StartingPosition and
+    no LastProcessingResult."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(e,c): return None")
+    lam.create_function(FunctionName="cfn-esm-def-fn", Runtime="python3.11",
+                        Role="arn:aws:iam::000000000000:role/r", Handler="index.handler",
+                        Code={"ZipFile": buf.getvalue()})
+    table = ddb.create_table(
+        TableName="cfn-esm-def-table", KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST",
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"})
+    queue_url = sqs.create_queue(QueueName="cfn-esm-def-q")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    template = {"AWSTemplateFormatVersion": "2010-09-09", "Resources": {
+        "Stream": {"Type": "AWS::Lambda::EventSourceMapping", "Properties": {
+            "FunctionName": "cfn-esm-def-fn", "EventSourceArn": table["TableDescription"]["LatestStreamArn"],
+            "StartingPosition": "LATEST"}},
+        "Queue": {"Type": "AWS::Lambda::EventSourceMapping", "Properties": {
+            "FunctionName": "cfn-esm-def-fn", "EventSourceArn": queue_arn, "Enabled": "false"}},
+    }}
+    try:
+        cfn.create_stack(StackName="cfn-esm-def", TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, "cfn-esm-def")["StackStatus"] == "CREATE_COMPLETE"
+        mappings = {m["EventSourceArn"].split(":")[2]: m
+                    for m in lam.list_event_source_mappings(FunctionName="cfn-esm-def-fn")["EventSourceMappings"]}
+        stream, queue = mappings["dynamodb"], mappings["sqs"]
+        assert {k: stream[k] for k in ("StateTransitionReason", "BatchSize", "MaximumRetryAttempts",
+                                       "MaximumRecordAgeInSeconds", "BisectBatchOnFunctionError",
+                                       "ParallelizationFactor", "TumblingWindowInSeconds", "DestinationConfig",
+                                       "LastProcessingResult")} == {
+            "StateTransitionReason": "User action", "BatchSize": 100, "MaximumRetryAttempts": -1,
+            "MaximumRecordAgeInSeconds": -1, "BisectBatchOnFunctionError": False, "ParallelizationFactor": 1,
+            "TumblingWindowInSeconds": 0, "DestinationConfig": {"OnFailure": {}},
+            "LastProcessingResult": "No records processed"}
+        assert (queue["StateTransitionReason"], queue["BatchSize"], queue["State"]) == ("USER_INITIATED", 10, "Disabled")
+        for absent in ("StartingPosition", "LastProcessingResult", "MaximumRetryAttempts"):
+            assert absent not in queue
+    finally:
+        cfn.delete_stack(StackName="cfn-esm-def")
+        _wait_stack(cfn, "cfn-esm-def")
+        ddb.delete_table(TableName="cfn-esm-def-table")
+        sqs.delete_queue(QueueUrl=queue_url)
+        lam.delete_function(FunctionName="cfn-esm-def-fn")
+
+
 def test_cfn_esm_extra_props_round_trip_and_in_place_update(cfn, lam, ddb):
     """CFN-created EventSourceMappings must round-trip every optional prop (not just
     FilterCriteria), and a stack update must mutate the mapping in place (same UUID),

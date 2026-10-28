@@ -6169,24 +6169,28 @@ def _lambda_esm_create(logical_id, props, stack_name):
     esm_id = new_uuid()
     func_arn = resource_arn if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
 
+    source_arn = props.get("EventSourceArn", "")
+    is_sqs = source_arn.startswith("arn:") and source_arn.split(":")[2:3] == ["sqs"]
+    enabled = _cfn_bool(props.get("Enabled", True))
     esm = {
         "UUID": esm_id,
-        "EventSourceArn": props.get("EventSourceArn", ""),
+        "EventSourceArn": source_arn,
         # resource_arn from _lambda_function_for_cfn_ref already carries the
         # qualifier — do not re-append it (that double-suffixed ":live:live").
         "FunctionArn": func_arn,
         "FunctionName": func_name,
         "Qualifier": qualifier,
-        "State": "Enabled",
-        "StateTransitionReason": "USER_INITIATED",
-        "BatchSize": int(props.get("BatchSize", 10)),
+        "State": "Enabled" if enabled else "Disabled",
+        **_lambda_svc.esm_source_defaults(is_sqs),
         "MaximumBatchingWindowInSeconds": int(props.get("MaximumBatchingWindowInSeconds", 0)),
-        "LastModified": int(time.time()),
-        "LastProcessingResult": "No records processed",
-        "StartingPosition": props.get("StartingPosition", "LATEST"),
-        "Enabled": props.get("Enabled", True),
+        "LastModified": time.time(),
+        "Enabled": enabled,
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
+    if props.get("BatchSize") is not None:
+        esm["BatchSize"] = int(props["BatchSize"])
+    if not is_sqs:
+        esm["StartingPosition"] = props.get("StartingPosition", "LATEST")
     # Preserve every optional ESM property the API create/update path round-trips,
     # so a CloudFormation-created mapping reads back without drift. Previously only
     # FilterCriteria was kept; DestinationConfig, ParallelizationFactor, the retry/age
@@ -6201,13 +6205,15 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "MaximumRecordAgeInSeconds",
         "BisectBatchOnFunctionError",
         "ScalingConfig",
+        "TumblingWindowInSeconds",
     ):
         if props.get(_opt) is not None:
             esm[_opt] = props[_opt]
     _lambda_svc._esms[esm_id] = esm
     # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
     # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
-    _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
+    if not is_sqs:
+        _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
     _lambda_svc._ensure_poller()
     return esm_id, _lambda_esm_attrs(esm_id)
 
@@ -6241,19 +6247,20 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
         "DestinationConfig",
         "FilterCriteria",
         "ScalingConfig",
+        "TumblingWindowInSeconds",
     ):
         if key in new_props:
             esm[key] = new_props[key]
     if "Enabled" in new_props:
-        esm["Enabled"] = new_props["Enabled"]
-        esm["State"] = "Enabled" if new_props["Enabled"] else "Disabled"
+        esm["Enabled"] = _cfn_bool(new_props["Enabled"])
+        esm["State"] = "Enabled" if esm["Enabled"] else "Disabled"
     if "FunctionName" in new_props:
         func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(new_props["FunctionName"])
         func = _lambda_svc._functions.get(func_name)
         func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
         esm["FunctionName"] = func_name
         esm["FunctionArn"] = func_arn + (f":{qualifier}" if qualifier else "")
-    esm["LastModified"] = int(time.time())
+    esm["LastModified"] = time.time()
     return physical_id, _lambda_esm_attrs(physical_id)
 
 
