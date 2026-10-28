@@ -9664,7 +9664,7 @@ def _instance_xml(i):
         <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
         <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
         {_performance_insights_details_xml(i)}
-        <DatabaseInsightsMode>{i.get('DatabaseInsightsMode', 'standard')}</DatabaseInsightsMode>
+        {_database_insights_mode_xml(i)}
         <EnabledCloudwatchLogsExports/>
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
@@ -9689,6 +9689,13 @@ def _serverlessv2_xml(c):
         f"<MaxCapacity>{cfg.get('MaxCapacity', 1.0)}</MaxCapacity>"
         "</ServerlessV2ScalingConfiguration>"
     )
+
+
+def _database_insights_mode_xml(resource):
+    # Observed on Aurora only
+    if not str(resource.get("Engine", "")).startswith("aurora"):
+        return ""
+    return f"<DatabaseInsightsMode>{resource.get('DatabaseInsightsMode', 'standard')}</DatabaseInsightsMode>"
 
 
 def _performance_insights_details_xml(resource):
@@ -9786,7 +9793,7 @@ def _cluster_xml(c):
         <IAMDatabaseAuthenticationEnabled>{str(c.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
         <PerformanceInsightsEnabled>{str(c.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
         {_performance_insights_details_xml(c)}
-        <DatabaseInsightsMode>{c.get('DatabaseInsightsMode', 'standard')}</DatabaseInsightsMode>
+        {_database_insights_mode_xml(c)}
         <HttpEndpointEnabled>{str(c.get('HttpEndpointEnabled',False)).lower()}</HttpEndpointEnabled>
         <CopyTagsToSnapshot>{str(c.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
         <CrossAccountClone>{str(c.get('CrossAccountClone',False)).lower()}</CrossAccountClone>

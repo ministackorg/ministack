@@ -1804,10 +1804,7 @@ def _run_execution(exec_arn):
             "Id": execution["stateMachineArn"],
             "Name": sm["name"],
         },
-        # JSONata workflow variables — bound via state `Assign` fields and
-        # referenced as `$name` in subsequent JSONata expressions. Scope is
-        # the whole execution (per AWS); Map/Parallel sub-branches share
-        # this dict with the parent, matching AWS semantics.
+        # Workflow variables set by `Assign`; Map items and Parallel branches get a copy
         "variables": {},
     }
 
