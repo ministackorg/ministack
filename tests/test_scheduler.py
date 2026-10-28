@@ -882,3 +882,39 @@ def test_scheduler_tag_apis_reject_invalid_resource_arns_before_touching_tags(
     _assert_error(resp, expected_status, expected_code)
     assert scheduler_mod._tags.get(good_arn, {}) == baseline
     assert scheduler_mod._tags.get(arn) is None
+
+
+def test_scheduler_schedule_error_messages(scheduler):
+    """Real AWS (us-east-1, #2467 r2 q12/q13/q15/q16/q17): schedule messages do not name the group."""
+    import uuid as _uuid
+
+    group = f"msg-grp-{_uuid.uuid4().hex[:8]}"
+    name, missing = f"msg-{_uuid.uuid4().hex[:8]}", f"msg-missing-{_uuid.uuid4().hex[:8]}"
+    scheduler.create_schedule_group(Name=group)
+    common = {
+        "GroupName": group,
+        "ScheduleExpression": "at(2030-01-01T00:00:00)",
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {"Arn": "arn:aws:sqs:us-east-1:000000000000:q", "RoleArn": "arn:aws:iam::000000000000:role/r"},
+    }
+    try:
+        scheduler.create_schedule(Name=name, **common)
+        calls = [
+            (lambda: scheduler.get_schedule(Name=missing, GroupName=group), "ResourceNotFoundException",
+             f"Schedule {missing} does not exist."),
+            (lambda: scheduler.create_schedule(Name=name, **common), "ConflictException",
+             f"Schedule {name} already exists."),
+            (lambda: scheduler.update_schedule(Name=missing, **common), "ResourceNotFoundException",
+             f"Schedule {missing} does not exist."),
+            (lambda: scheduler.delete_schedule(Name=missing, GroupName=group), "ResourceNotFoundException",
+             f"Schedule {missing} does not exist."),
+            (lambda: scheduler.get_schedule(Name=name), "ResourceNotFoundException",
+             f"Schedule {name} does not exist."),
+        ]
+        for call, code, message in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == code
+            assert exc.value.response["Error"]["Message"] == message
+    finally:
+        scheduler.delete_schedule_group(Name=group)

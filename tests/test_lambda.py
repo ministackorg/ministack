@@ -947,7 +947,7 @@ def test_lambda_esm_sqs(lam, sqs):
         Enabled=True,
     )
     esm_uuid = resp["UUID"]
-    assert resp["State"] == "Enabled"
+    assert resp["State"] == "Creating"  # as AWS answers CreateEventSourceMapping
 
     # Send a message to SQS
     sqs.send_message(QueueUrl=q_url, MessageBody="trigger-lambda")
@@ -1427,7 +1427,8 @@ def test_lambda_esm_sqs_comprehensive(lam, sqs):
         Enabled=True,
     )
     esm_uuid = resp["UUID"]
-    assert resp["State"] == "Enabled"
+    assert resp["State"] == "Creating"  # as AWS answers CreateEventSourceMapping
+    assert lam.get_event_source_mapping(UUID=esm_uuid)["State"] == "Enabled"
     assert resp["BatchSize"] == 5
     assert resp["EventSourceArn"] == q_arn
 
@@ -15824,3 +15825,107 @@ def test_lambda_create_esm_kinesis_scope_messages_follow_aws(lam, event_source_a
         assert (err["Code"], err["Message"]) == ("InvalidParameterValueException", message)
     finally:
         lam.delete_function(FunctionName=name)
+
+
+# ---------------------------------------------------------------------------
+# Event source mapping responses, states and results as AWS answers them
+# (recorded against Lambda in us-east-1)
+# ---------------------------------------------------------------------------
+
+def _esm_function(lam, code):
+    name = f"esm-aws-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": buf.getvalue()})
+    return name
+
+
+def test_esm_stream_and_sqs_mappings_have_aws_shape(lam, kin, sqs):
+    fn = _esm_function(lam, "def handler(e, c):\n    return None\n")
+    stream = f"esm-aws-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    stream_arn = kin.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    queue_url = sqs.create_queue(QueueName=f"esm-aws-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    try:
+        created = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=stream_arn,
+                                                  StartingPosition="LATEST")
+        assert created["ResponseMetadata"]["HTTPStatusCode"] == 202
+        assert {k: created[k] for k in (
+            "State", "StateTransitionReason", "BatchSize", "MaximumRetryAttempts", "MaximumRecordAgeInSeconds",
+            "BisectBatchOnFunctionError", "ParallelizationFactor", "TumblingWindowInSeconds", "DestinationConfig",
+            "LastProcessingResult", "MaximumBatchingWindowInSeconds")} == {
+            "State": "Creating", "StateTransitionReason": "User action", "BatchSize": 100,
+            "MaximumRetryAttempts": -1, "MaximumRecordAgeInSeconds": -1, "BisectBatchOnFunctionError": False,
+            "ParallelizationFactor": 1, "TumblingWindowInSeconds": 0, "DestinationConfig": {"OnFailure": {}},
+            "LastProcessingResult": "No records processed", "MaximumBatchingWindowInSeconds": 0}
+        uuid = created["UUID"]
+        assert lam.get_event_source_mapping(UUID=uuid)["State"] == "Enabled"
+        assert lam.update_event_source_mapping(UUID=uuid, BatchSize=5)["State"] == "Updating"
+        assert lam.update_event_source_mapping(UUID=uuid, Enabled=False)["State"] == "Disabling"
+        assert lam.update_event_source_mapping(UUID=uuid, BatchSize=7)["State"] == "Updating"
+        assert lam.get_event_source_mapping(UUID=uuid)["State"] == "Disabled"
+        assert lam.update_event_source_mapping(UUID=uuid, Enabled=True)["State"] == "Enabling"
+        with pytest.raises(ClientError) as exc:
+            lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=stream_arn, StartingPosition="LATEST")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+        assert exc.value.response["Error"] == {
+            "Code": "ResourceConflictException",
+            "Message": f'The event source arn (" {stream_arn} ") and function (" {fn} ") provided mapping already '
+                       f"exists. Please update or delete the existing mapping with UUID {uuid}"}
+        assert lam.delete_event_source_mapping(UUID=uuid)["State"] == "Deleting"
+        with pytest.raises(ClientError) as exc:
+            lam.get_event_source_mapping(UUID=uuid)
+        assert exc.value.response["Error"] == {"Code": "ResourceNotFoundException",
+                                               "Message": "The resource you requested does not exist."}
+
+        created = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=queue_arn)
+        assert created["State"] == "Creating"
+        assert created["StateTransitionReason"] == "USER_INITIATED"
+        assert created["BatchSize"] == 10
+        for absent in ("LastProcessingResult", "MaximumRetryAttempts", "ParallelizationFactor", "StartingPosition"):
+            assert absent not in created
+        uuid = created["UUID"]
+        assert lam.update_event_source_mapping(UUID=uuid, Enabled=False)["State"] == "Disabling"
+        assert lam.update_event_source_mapping(UUID=uuid, BatchSize=5)["State"] == "Disabled"
+        with pytest.raises(ClientError) as exc:
+            lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=queue_arn)
+        assert exc.value.response["Error"]["Message"] == (
+            f'An event source mapping with SQS arn (" {queue_arn} ") and function (" {fn} ") already exists. '
+            f"Please update or delete the existing mapping with UUID {uuid}")
+        lam.delete_event_source_mapping(UUID=uuid)
+        created = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=queue_arn, Enabled=False)
+        assert created["State"] == "Disabled"
+        lam.delete_event_source_mapping(UUID=created["UUID"])
+    finally:
+        lam.delete_function(FunctionName=fn)
+        kin.delete_stream(StreamName=stream)
+        sqs.delete_queue(QueueUrl=queue_url)
+
+
+@pytest.mark.parametrize("code,result", [
+    ("def handler(e, c):\n    return None\n", "OK"),
+    ("def handler(e, c):\n    raise Exception('boom')\n", "PROBLEM: Function call failed"),
+])
+def test_esm_kinesis_last_processing_result_is_aws_wording(lam, kin, code, result):
+    fn = _esm_function(lam, code)
+    stream = f"esm-aws-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    kin.put_record(StreamName=stream, Data=b"x", PartitionKey="pk")
+    try:
+        uuid = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=arn, StartingPosition="TRIM_HORIZON",
+                                               MaximumRetryAttempts=0)["UUID"]
+        got, deadline = "", time.time() + 30
+        while time.time() < deadline:
+            got = lam.get_event_source_mapping(UUID=uuid)["LastProcessingResult"]
+            if got != "No records processed":
+                break
+            time.sleep(0.5)
+        assert got == result
+        lam.delete_event_source_mapping(UUID=uuid)
+    finally:
+        lam.delete_function(FunctionName=fn)
+        kin.delete_stream(StreamName=stream)

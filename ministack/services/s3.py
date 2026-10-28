@@ -2300,9 +2300,9 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     signature, or None when the request is not a SigV4 presigned URL (header-
     signed and anonymous requests are handled elsewhere / left lax).
 
-    MiniStack resolves root, IAM-user, and STS credentials before recomputing
-    the signature. Temporary credentials must include the exact session token
-    STS issued.
+    Expiry is checked in both AUTH modes. Under AUTH=true MiniStack resolves
+    root, IAM-user, and STS credentials before recomputing the signature, and
+    temporary credentials must include the exact session token STS issued.
     """
     signature = _qp(query_params, "X-Amz-Signature", "") or _qp(query_params, "x-amz-signature", "")
     if not signature:
@@ -2364,8 +2364,8 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
         query_params, "x-amz-security-token", ""
     )
-    # S3 presigned requests verify credentials even with AUTH disabled.
-    # Resolve their tenant here, without changing routing for other requests.
+    # Resolve the tenant of a presigned request here, without changing routing
+    # for other requests.
     try:
         owner = find_iam_access_key_account(_akid)
     except AmbiguousAccessKeyError:
@@ -2379,6 +2379,11 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         )
     if owner:
         set_request_account_id(owner)
+    from ministack.app import AUTH
+    if not AUTH:
+        # With AUTH off a presigned URL is trusted like a header-signed request:
+        # its key selects the tenant, and the credential and signature are not checked.
+        return None
     credential = resolve_credential(_akid, get_account_id(), session_token)
     if isinstance(credential, CredentialResolutionError):
         # S3's own error table: ExpiredToken and InvalidToken are 400, while

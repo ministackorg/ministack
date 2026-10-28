@@ -157,7 +157,7 @@ def _create_schedule(name, body):
 
     if key in _schedules:
         return _error(409, "ConflictException",
-                       f"Schedule {name} already exists in group {group}.")
+                       f"Schedule {name} already exists.")
 
     # Validate required fields
     if not body.get("ScheduleExpression"):
@@ -210,7 +210,7 @@ def _update_schedule(name, body):
 
     if key not in _schedules:
         return _error(404, "ResourceNotFoundException",
-                       f"Schedule {name} does not exist in group {group}.")
+                       f"Schedule {name} does not exist.")
 
     if not body.get("ScheduleExpression"):
         return _error(400, "ValidationException",
@@ -254,7 +254,7 @@ def _get_schedule(name, query):
     sched = _schedules.get(key)
     if not sched:
         return _error(404, "ResourceNotFoundException",
-                       f"Schedule {name} does not exist in group {group}.")
+                       f"Schedule {name} does not exist.")
 
     result = {k: v for k, v in sched.items() if v is not None}
     return _json_resp(200, result)
@@ -296,7 +296,7 @@ def _delete_schedule(name, query):
 
     if key not in _schedules:
         return _error(404, "ResourceNotFoundException",
-                       f"Schedule {name} does not exist in group {group}.")
+                       f"Schedule {name} does not exist.")
 
     arn = _schedules[key]["Arn"]
     del _schedules[key]
