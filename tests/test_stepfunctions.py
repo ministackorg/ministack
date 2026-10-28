@@ -1,8 +1,10 @@
 import base64
 import hashlib
 import io
+import datetime
 import json
 import os
+import re
 import time
 import uuid as _uuid_mod
 import zipfile
@@ -10303,3 +10305,295 @@ def test_sfn_jsonpath_undefined_variable_fails():
 
     with pytest.raises(m._ExecutionError):
         m._resolve_params_obj({"value.$": "$missing"}, {}, {"variables": {}})
+
+
+# ---------------------------------------------------------------------------
+# aws-sdk:scheduler tasks. Capture keys (rN pNN / qNN) are real AWS runs, us-east-1,
+# Standard state machines with one Task calling arn:aws:states:::aws-sdk:scheduler:<action>.
+# ---------------------------------------------------------------------------
+_SCHED_ROLE = "arn:aws:iam::000000000000:role/sfn-role"
+_SCHED_TARGET_ROLE = "arn:aws:iam::000000000000:role/scheduler-role"
+_SCHED_BUS = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+_SCHED_AT = "at(2030-01-01T00:00:00)"
+_SCHED_ISO_MILLIS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{3})?Z$")
+_SCHED_CAUSE_SUFFIX = re.compile(
+    r" \(Service: Scheduler, Status Code: (\d{3}), Request ID: "
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\) \(SDK Attempt Count: 1\)$"
+)
+_SCHED_TARGET = {
+    "Arn": _SCHED_BUS,
+    "RoleArn": _SCHED_TARGET_ROLE,
+    "EventBridgeParameters": {"DetailType": "delayed-event-publish", "Source": "ministack.verify"},
+    "Input": '{"run": "x"}',
+}
+
+
+@pytest.fixture
+def sched_run_task(sfn_sync):
+    machines = []
+
+    def run(action, parameters=None, arguments=None, sm_input=None):
+        state = {"Type": "Task", "Resource": f"arn:aws:states:::aws-sdk:scheduler:{action}", "End": True}
+        definition = {"StartAt": "Call", "States": {"Call": state}}
+        if arguments is not None:
+            definition["QueryLanguage"] = "JSONata"
+            state["Arguments"] = arguments
+        else:
+            state["Parameters"] = parameters
+        arn = sfn_sync.create_state_machine(
+            name=f"sdk-scheduler-{_uuid_mod.uuid4().hex[:8]}",
+            definition=json.dumps(definition),
+            roleArn=_SCHED_ROLE,
+        )["stateMachineArn"]
+        machines.append(arn)
+        return sfn_sync.start_sync_execution(stateMachineArn=arn, input=json.dumps(sm_input or {}))
+
+    yield run
+    for arn in machines:
+        sfn_sync.delete_state_machine(stateMachineArn=arn)
+
+
+@pytest.fixture
+def sched_group(scheduler):
+    name = f"sfn-sdk-grp-{_uuid_mod.uuid4().hex[:8]}"
+    scheduler.create_schedule_group(Name=name)
+    yield name
+    try:
+        scheduler.delete_schedule_group(Name=name)
+    except scheduler.exceptions.ResourceNotFoundException:
+        pass
+
+
+def _sched_output(resp):
+    assert resp["status"] == "SUCCEEDED", f"{resp.get('error')}: {resp.get('cause')}"
+    return json.loads(resp["output"])
+
+
+def _sched_failure(resp):
+    assert resp["status"] == "FAILED"
+    match = _SCHED_CAUSE_SUFFIX.search(resp["cause"])
+    assert match, resp["cause"]
+    return resp["error"], resp["cause"][:match.start()], int(match.group(1))
+
+
+def _sched_schedule(name, sched_group, **extra):
+    return {"Name": name, "GroupName": sched_group, "ScheduleExpression": _SCHED_AT,
+            "FlexibleTimeWindow": {"Mode": "OFF"}, "Target": _SCHED_TARGET, **extra}
+
+
+def test_sfn_scheduler_schedule_group_tasks(sched_run_task, scheduler):
+    """r1 p01 createScheduleGroup, p02 getScheduleGroup, p03 listScheduleGroups, p19 deleteScheduleGroup."""
+    name = f"sfn-sdk-grp-{_uuid_mod.uuid4().hex[:8]}"
+    created = _sched_output(sched_run_task("createScheduleGroup", {
+        "Name": name, "Tags": [{"Key": "Owner", "Value": "ministack"}]}))
+    assert created == {"ScheduleGroupArn": f"arn:aws:scheduler:us-east-1:000000000000:schedule-group/{name}"}
+
+    got = _sched_output(sched_run_task("getScheduleGroup", {"Name": name}))
+    assert set(got) == {"Arn", "CreationDate", "LastModificationDate", "Name", "State"}
+    assert got["Arn"] == created["ScheduleGroupArn"]
+    assert got["Name"] == name
+    assert got["State"] == "ACTIVE"
+    assert _SCHED_ISO_MILLIS.match(got["CreationDate"])
+    assert _SCHED_ISO_MILLIS.match(got["LastModificationDate"])
+
+    listed = _sched_output(sched_run_task("listScheduleGroups", {"NamePrefix": name}))
+    assert listed == {"ScheduleGroups": [got]}
+
+    assert _sched_output(sched_run_task("deleteScheduleGroup", {"Name": name})) == {}
+
+
+def test_sfn_scheduler_create_and_get_schedule_tasks(sched_run_task, scheduler, sched_group):
+    """r1 p04 createSchedule outputs ScheduleArn; p05 getSchedule outputs the Scheduler
+    members unchanged with ISO-8601 UTC timestamps."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    created = _sched_output(sched_run_task("createSchedule", _sched_schedule(name, sched_group, ActionAfterCompletion="DELETE")))
+    arn = f"arn:aws:scheduler:us-east-1:000000000000:schedule/{sched_group}/{name}"
+    assert created == {"ScheduleArn": arn}
+
+    got = _sched_output(sched_run_task("getSchedule", {"Name": name, "GroupName": sched_group}))
+    assert _SCHED_ISO_MILLIS.match(got.pop("CreationDate"))
+    assert _SCHED_ISO_MILLIS.match(got.pop("LastModificationDate"))
+    for key, value in {
+        "ActionAfterCompletion": "DELETE",
+        "Arn": arn,
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "GroupName": sched_group,
+        "Name": name,
+        "ScheduleExpression": _SCHED_AT,
+        "ScheduleExpressionTimezone": "UTC",
+        "State": "ENABLED",
+    }.items():
+        assert got[key] == value
+    assert {k: got["Target"][k] for k in _SCHED_TARGET} == _SCHED_TARGET
+
+    # r1 p16: the JSONata Arguments form sends the same request.
+    assert _sched_output(sched_run_task("getSchedule", arguments={"Name": name, "GroupName": sched_group}))["Arn"] == arn
+
+
+def test_sfn_scheduler_list_schedules_task(sched_run_task, scheduler, sched_group):
+    """r1 p07 listSchedules by GroupName and p08 by NamePrefix; r3 t01 by State."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", _sched_schedule(name, sched_group)))
+    for parameters in ({"GroupName": sched_group}, {"NamePrefix": name}):
+        listed = _sched_output(sched_run_task("listSchedules", parameters))
+        assert len(listed["Schedules"]) == 1
+        item = listed["Schedules"][0]
+        assert set(item) == {"Arn", "CreationDate", "GroupName", "LastModificationDate", "Name",
+                             "State", "Target"}
+        assert item["Name"] == name
+        assert item["GroupName"] == sched_group
+        assert item["State"] == "ENABLED"
+        assert item["Target"] == {"Arn": _SCHED_BUS}
+        assert _SCHED_ISO_MILLIS.match(item["CreationDate"])
+
+    disabled = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", _sched_schedule(disabled, sched_group, State="DISABLED")))
+    listed = _sched_output(sched_run_task("listSchedules", {"GroupName": sched_group, "State": "DISABLED"}))
+    assert [item["Name"] for item in listed["Schedules"]] == [disabled]
+
+
+def test_sfn_scheduler_update_and_delete_schedule_tasks(sched_run_task, scheduler, sched_group):
+    """r1 p14 updateSchedule outputs ScheduleArn and replaces the schedule; p17 deleteSchedule outputs {}."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", _sched_schedule(name, sched_group, ActionAfterCompletion="DELETE")))
+    updated = _sched_output(sched_run_task("updateSchedule", _sched_schedule(
+        name, sched_group, State="DISABLED",
+        FlexibleTimeWindow={"Mode": "FLEXIBLE", "MaximumWindowInMinutes": 5})))
+    assert updated == {"ScheduleArn": f"arn:aws:scheduler:us-east-1:000000000000:schedule/{sched_group}/{name}"}
+    got = scheduler.get_schedule(Name=name, GroupName=sched_group)
+    assert got["State"] == "DISABLED"
+    assert got["FlexibleTimeWindow"] == {"Mode": "FLEXIBLE", "MaximumWindowInMinutes": 5}
+    assert got["ActionAfterCompletion"] == "NONE"
+
+    assert _sched_output(sched_run_task("deleteSchedule", {"Name": name, "GroupName": sched_group})) == {}
+    with pytest.raises(scheduler.exceptions.ResourceNotFoundException):
+        scheduler.get_schedule(Name=name, GroupName=sched_group)
+
+
+def test_sfn_scheduler_schedule_timestamps_round_trip(sched_run_task, scheduler, sched_group):
+    """r2 q06/q07: StartDate and EndDate are ISO-8601 strings in Parameters and in the
+    getSchedule output (milliseconds only when non-zero); q08: an offset is read as that instant."""
+    name, other = f"s-{_uuid_mod.uuid4().hex[:8]}", f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", _sched_schedule(
+        name, sched_group, ScheduleExpression="rate(1 day)", Description="round2",
+        StartDate="2030-01-02T03:04:05Z", EndDate="2030-01-06T03:04:05.000Z")))
+    direct = scheduler.get_schedule(Name=name, GroupName=sched_group)
+    assert direct["StartDate"] == datetime.datetime(2030, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+    assert direct["EndDate"] == datetime.datetime(2030, 1, 6, 3, 4, 5, tzinfo=datetime.timezone.utc)
+
+    got = _sched_output(sched_run_task("getSchedule", {"Name": name, "GroupName": sched_group}))
+    assert got["StartDate"] == "2030-01-02T03:04:05Z"
+    assert got["EndDate"] == "2030-01-06T03:04:05Z"
+    assert got["Description"] == "round2"
+
+    _sched_output(sched_run_task("createSchedule", _sched_schedule(
+        other, sched_group, ScheduleExpression="rate(1 day)", StartDate="2030-01-02T05:04:05+02:00")))
+    direct = scheduler.get_schedule(Name=other, GroupName=sched_group)
+    assert direct["StartDate"] == datetime.datetime(2030, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+
+
+@pytest.mark.parametrize("start, millis", [
+    ("2030-01-02T03:04:05.500Z", 500),     # r3 t11
+    ("2030-01-02T03:04:05.5Z", 500),       # r3 t12 (and t08 from a .$ path)
+    ("2030-01-02T03:04:05.123456Z", 123),  # r3 t10: cut to milliseconds
+    ("2030-01-02T03:04:05.1239Z", 123),    # r4 u01: cut, not rounded (literal; same via path, t08)
+    ("2030-01-02T03:04:05.9999Z", 999),    # r4 u02 (literal; same via path, t08)
+])
+def test_sfn_scheduler_schedule_start_date_fractions(sched_run_task, scheduler, sched_group, start, millis):
+    """r3 t08/t10/t11/t12, r4 u01/u02: fractional seconds of any length are read and cut to milliseconds;
+    t14: getSchedule outputs all three digits (.500Z)."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", {**_sched_schedule(name, sched_group, ScheduleExpression="rate(1 day)"),
+                                        "StartDate.$": "$.start"}, sm_input={"start": start}))
+    direct = scheduler.get_schedule(Name=name, GroupName=sched_group)
+    assert direct["StartDate"] == datetime.datetime(
+        2030, 1, 2, 3, 4, 5, millis * 1000, tzinfo=datetime.timezone.utc)
+    got = _sched_output(sched_run_task("getSchedule", {"Name": name, "GroupName": sched_group}))
+    assert got["StartDate"] == f"2030-01-02T03:04:05.{millis:03d}Z"
+
+
+def test_sfn_scheduler_target_input_object_is_sent_as_compact_json(sched_run_task, scheduler, sched_group):
+    """r2 q11 (and r1 p13): Target.Input from a JSON object path is stored as compact JSON text."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", {
+        "Name": name, "GroupName": sched_group, "ScheduleExpression": _SCHED_AT,
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {"Arn": _SCHED_BUS, "RoleArn": _SCHED_TARGET_ROLE, "Input.$": "$.payload"},
+    }, sm_input={"payload": {"run": "x", "n": 1}}))
+    assert scheduler.get_schedule(Name=name, GroupName=sched_group)["Target"]["Input"] == '{"run":"x","n":1}'
+
+
+@pytest.mark.parametrize("value, stored", [
+    ([1, "a", {"b": 2}], '[1,"a",{"b":2}]'),     # r3 t02
+    ({"k": "zażółć €"}, '{"k":"zażółć €"}'),     # r3 t04: non-ASCII text is kept
+])
+def test_sfn_scheduler_target_input_array_and_unicode(sched_run_task, scheduler, sched_group, value, stored):
+    """r3 t02/t04: a JSON array or object as Target.Input is stored as compact JSON text."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", {
+        "Name": name, "GroupName": sched_group, "ScheduleExpression": _SCHED_AT,
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {"Arn": _SCHED_BUS, "RoleArn": _SCHED_TARGET_ROLE, "Input.$": "$.v"},
+    }, sm_input={"v": value}))
+    assert scheduler.get_schedule(Name=name, GroupName=sched_group)["Target"]["Input"] == stored
+
+
+def test_sfn_scheduler_schedule_task_errors(sched_run_task, scheduler, sched_group):
+    """Error name, message and cause suffix of failed scheduler tasks:
+    r1 p09 duplicate, p10 get missing, p06 get without GroupName, p15 update missing,
+    p18 delete missing; r2 q05 create in a missing sched_group."""
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    missing = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    nogroup = f"g-{_uuid_mod.uuid4().hex[:8]}"
+    _sched_output(sched_run_task("createSchedule", _sched_schedule(name, sched_group)))
+
+    cases = [
+        (sched_run_task("createSchedule", _sched_schedule(name, sched_group)),
+         ("Scheduler.ConflictException", f"Schedule {name} already exists.", 409)),
+        (sched_run_task("getSchedule", {"Name": missing, "GroupName": sched_group}),
+         ("Scheduler.ResourceNotFoundException", f"Schedule {missing} does not exist.", 404)),
+        (sched_run_task("getSchedule", {"Name": name}),
+         ("Scheduler.ResourceNotFoundException", f"Schedule {name} does not exist.", 404)),
+        (sched_run_task("updateSchedule", _sched_schedule(missing, sched_group)),
+         ("Scheduler.ResourceNotFoundException", f"Schedule {missing} does not exist.", 404)),
+        (sched_run_task("deleteSchedule", {"Name": missing, "GroupName": sched_group}),
+         ("Scheduler.ResourceNotFoundException", f"Schedule {missing} does not exist.", 404)),
+        (sched_run_task("createSchedule", _sched_schedule(missing, nogroup)),
+         ("Scheduler.ResourceNotFoundException", f"Schedule group {nogroup} does not exist.", 404)),
+    ]
+    for resp, expected in cases:
+        assert _sched_failure(resp) == expected
+
+
+def test_sfn_scheduler_schedule_group_task_errors(sched_run_task, sched_group):
+    """r2 q02 duplicate sched_group, q03 getScheduleGroup missing, q04 deleteScheduleGroup missing."""
+    nogroup = f"g-{_uuid_mod.uuid4().hex[:8]}"
+    assert _sched_failure(sched_run_task("createScheduleGroup", {"Name": sched_group})) == (
+        "Scheduler.ConflictException", f"Schedule group {sched_group} already exists.", 409)
+    for action in ("getScheduleGroup", "deleteScheduleGroup"):
+        assert _sched_failure(sched_run_task(action, {"Name": nogroup})) == (
+            "Scheduler.ResourceNotFoundException", f"Schedule group {nogroup} does not exist.", 404)
+
+
+def test_sfn_scheduler_scheduler_task_error_can_be_caught(sfn_sync, sched_group):
+    """The r1 p09 error name, Scheduler.ConflictException, matches a Catch on that name.
+
+    The Catch itself is generic Step Functions behaviour (inference; not captured for scheduler).
+    """
+    name = f"s-{_uuid_mod.uuid4().hex[:8]}"
+    create = {"Type": "Task", "Resource": "arn:aws:states:::aws-sdk:scheduler:createSchedule",
+              "Parameters": _sched_schedule(name, sched_group)}
+    definition = {"StartAt": "First", "States": {
+        "First": {**create, "ResultPath": None, "Next": "Again"},
+        "Again": {**create, "Catch": [{"ErrorEquals": ["Scheduler.ConflictException"],
+                                       "ResultPath": "$.error", "Next": "Caught"}], "End": True},
+        "Caught": {"Type": "Pass", "End": True},
+    }}
+    arn = sfn_sync.create_state_machine(name=f"sdk-scheduler-{_uuid_mod.uuid4().hex[:8]}",
+                                        definition=json.dumps(definition), roleArn=_SCHED_ROLE)["stateMachineArn"]
+    try:
+        resp = sfn_sync.start_sync_execution(stateMachineArn=arn, input="{}")
+        assert resp["status"] == "SUCCEEDED", resp.get("cause")
+        assert json.loads(resp["output"])["error"]["Error"] == "Scheduler.ConflictException"
+    finally:
+        sfn_sync.delete_state_machine(stateMachineArn=arn)
