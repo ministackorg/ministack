@@ -911,11 +911,58 @@ def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
     )
 
 
+def test_cloudfront_function_stage_defaults_and_etags_follow_aws(cloudfront):
+    """Captured on AWS (us-east-1, 2026-10-28): DescribeFunction and GetFunction
+    without Stage answer the DEVELOPMENT stage, a bad Stage is MalformedXML,
+    PublishFunction gives LIVE the DEVELOPMENT ETag, and GetFunction is
+    application/octet-stream."""
+    name = f"fn-stage-{_uuid_mod.uuid4().hex[:8]}"
+    v1 = b"function handler(event) { return event.request; }"
+    v2 = b"function handler(event) { var r = event.request; return r; }"
+    cr = cloudfront.create_function(Name=name, FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+                                    FunctionCode=v1)
+    etag = _cf_resp_etag(cr)
+    assert re.fullmatch(r"E[A-Z0-9]{12,13}", etag)
+    try:
+        d = cloudfront.describe_function(Name=name)
+        assert (d["FunctionSummary"]["FunctionMetadata"]["Stage"], d["FunctionSummary"]["Status"]) == (
+            "DEVELOPMENT", "UNPUBLISHED")
+        g = cloudfront.get_function(Name=name)
+        assert g["ContentType"] == "application/octet-stream"
+        assert g["FunctionCode"].read() == v1
+        for call in (cloudfront.describe_function, cloudfront.get_function):
+            with pytest.raises(ClientError) as exc:
+                call(Name=name, Stage="BOGUS")
+            assert exc.value.response["Error"]["Code"] == "MalformedXML"
+            assert exc.value.response["Error"]["Message"] == (
+                "1 validation error detected: Value 'BOGUS' at 'stage' failed to satisfy constraint: "
+                "Member must satisfy enum value set: [LIVE, DEVELOPMENT]")
+
+        cloudfront.publish_function(Name=name, IfMatch=etag)
+        live = cloudfront.describe_function(Name=name, Stage="LIVE")
+        assert _cf_resp_etag(live) == etag
+        assert live["FunctionSummary"]["Status"] == "UNASSOCIATED"
+        assert _cf_resp_etag(cloudfront.describe_function(Name=name)) == etag
+
+        upd = cloudfront.update_function(Name=name, IfMatch=etag,
+                                         FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+                                         FunctionCode=v2)
+        etag = _cf_resp_etag(upd)
+        assert _cf_resp_etag(cloudfront.describe_function(Name=name)) == etag
+        assert cloudfront.get_function(Name=name)["FunctionCode"].read() == v2
+        assert cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"].read() == v1
+        with pytest.raises(ClientError) as exc:
+            cloudfront.describe_function(Name=f"{name}-missing")
+        assert exc.value.response["Error"]["Code"] == "NoSuchFunctionExists"
+    finally:
+        cloudfront.delete_function(Name=name, IfMatch=etag)
+
+
 def test_cloudfront_function_development_status_follows_publish_and_association(cloudfront):
-    """The DEVELOPMENT stage reports UNPUBLISHED only while it holds changes that
-    were never published, then UNASSOCIATED, or DEPLOYED while a cache
-    behavior references the function. Terraform's aws_cloudfront_function.status
-    reads this stage."""
+    """UNPUBLISHED until the first publish, then UNASSOCIATED, or DEPLOYED while a
+    cache behavior references the function; an update does not go back to
+    UNPUBLISHED (AWS, us-east-1, 2026-10-28). Terraform's
+    aws_cloudfront_function.status reads the DEVELOPMENT stage."""
     name = f"fn-status-{_uuid_mod.uuid4().hex[:8]}"
 
     def dev_status():
@@ -943,9 +990,9 @@ def test_cloudfront_function_development_status_follows_publish_and_association(
         FunctionConfig={"Comment": "v2", "Runtime": "cloudfront-js-2.0"},
         FunctionCode=b"function handler(event) { return event.request; } // v2",
     )
-    assert upd["FunctionSummary"]["Status"] == "UNPUBLISHED"
-    assert dev_status() == "UNPUBLISHED"
-    assert listed_dev_status() == "UNPUBLISHED"
+    assert upd["FunctionSummary"]["Status"] == "UNASSOCIATED"
+    assert dev_status() == "UNASSOCIATED"
+    assert listed_dev_status() == "UNASSOCIATED"
 
     cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(upd))
     assert dev_status() == "UNASSOCIATED"
@@ -989,20 +1036,6 @@ def test_cloudfront_function_duplicate_name(cloudfront):
         )
     assert exc.value.response["Error"]["Code"] == "FunctionAlreadyExists"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
-
-
-def test_cloudfront_function_describe_requires_stage(cloudfront):
-    """DescribeFunction without Stage query param — AWS requires Stage; MiniStack returns InvalidArgument."""
-    name = f"fn-nostage-{_uuid_mod.uuid4().hex[:8]}"
-    cloudfront.create_function(
-        Name=name,
-        FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-1.0"},
-        FunctionCode=b"//",
-    )
-    with pytest.raises(ClientError) as exc:
-        cloudfront.describe_function(Name=name)
-    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
-    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_cloudfront_sdk_compat_injects_origin_groups():

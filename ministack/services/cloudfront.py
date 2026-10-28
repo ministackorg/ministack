@@ -71,6 +71,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import ssl
 import string
 import unicodedata
@@ -805,12 +806,15 @@ def _function_arns_in(dist):
     return {el.text for el in root.iter() if el.tag.split("}")[-1] == "FunctionARN" and el.text}
 
 
-def _function_dev_status(fn):
-    """DEVELOPMENT-stage Status: UNPUBLISHED until PublishFunction has copied
-    the current development version to LIVE (an UpdateFunction since then makes
-    it UNPUBLISHED again), then DEPLOYED while a distribution's cache behavior
-    references the function and UNASSOCIATED otherwise."""
-    if not fn.get("live_etag") or fn.get("published_dev_etag") != fn["dev_etag"]:
+def _function_etag():
+    return "E" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(13))
+
+
+def _function_status(fn):
+    """UNPUBLISHED until the first PublishFunction, then DEPLOYED while a
+    distribution's cache behavior references the function and UNASSOCIATED
+    otherwise, on both stages; an UpdateFunction does not go back to UNPUBLISHED."""
+    if not fn.get("live_etag"):
         return "UNPUBLISHED"
     if any(fn["arn"] in _function_arns_in(d) for d in _distributions.values()):
         return "DEPLOYED"
@@ -982,7 +986,7 @@ def _cf_create_function(headers, body):
         return _error("InvalidTagging", tagging_error, 400)
 
     now = _now_iso()
-    dev_etag = new_uuid()
+    dev_etag = _function_etag()
     fn = {
         "name": name,
         "arn": _func_arn(name),
@@ -995,8 +999,6 @@ def _cf_create_function(headers, body):
         "last_modified_live": None,
         "dev_etag": dev_etag,
         "live_etag": None,
-        # The dev_etag PublishFunction last copied to LIVE (see _function_dev_status).
-        "published_dev_etag": None,
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
@@ -1020,9 +1022,9 @@ def _cf_list_functions(query_params):
     summaries = []
     for fn in _functions.values():
         if stage_filter in ("", "DEVELOPMENT"):
-            summaries.append((fn, "DEVELOPMENT", _function_dev_status(fn), fn["last_modified_dev"]))
+            summaries.append((fn, "DEVELOPMENT", _function_status(fn), fn["last_modified_dev"]))
         if stage_filter in ("", "LIVE") and fn["live_etag"]:
-            summaries.append((fn, "LIVE", "DEPLOYED", fn["last_modified_live"] or fn["last_modified_dev"]))
+            summaries.append((fn, "LIVE", _function_status(fn), fn["last_modified_live"] or fn["last_modified_dev"]))
 
     def build(root):
         SubElement(root, "MaxItems").text = "100"
@@ -1038,6 +1040,19 @@ def _cf_list_functions(query_params):
     return _xml_response("FunctionList", build)
 
 
+def _function_stage(query_params):
+    """(stage, error): DEVELOPMENT when Stage is left out, as AWS answers."""
+    stage = _qval(query_params, "Stage", "") or "DEVELOPMENT"
+    if stage not in ("DEVELOPMENT", "LIVE"):
+        return None, _error(
+            "MalformedXML",
+            f"1 validation error detected: Value '{stage}' at 'stage' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [LIVE, DEVELOPMENT]",
+            400,
+        )
+    return stage, None
+
+
 def _cf_describe_function(name: str, stage: str):
     fn = _functions.get(name)
     if not fn:
@@ -1047,13 +1062,10 @@ def _cf_describe_function(name: str, stage: str):
             return _error("NoSuchFunctionExists", "The specified function does not exist.", 404)
         etag = fn["live_etag"]
         lm = fn["last_modified_live"] or fn["last_modified_dev"]
-        st = "DEPLOYED"
-    elif stage == "DEVELOPMENT":
+    else:
         etag = fn["dev_etag"]
         lm = fn["last_modified_dev"]
-        st = _function_dev_status(fn)
-    else:
-        return _error("InvalidArgument", "Invalid Stage value.", 400)
+    st = _function_status(fn)
 
     return _xml_response(
         "FunctionSummary",
@@ -1074,10 +1086,7 @@ def _cf_get_function(name: str, stage: str):
     elif stage == "DEVELOPMENT":
         etag = fn["dev_etag"]
         code = fn["code"]
-    else:
-        return _error("InvalidArgument", "Invalid Stage value.", 400)
-
-    return 200, {"Content-Type": "application/javascript", "ETag": etag}, code
+    return 200, {"Content-Type": "application/octet-stream", "ETag": etag}, code
 
 
 def _cf_publish_function(name: str, headers):
@@ -1095,9 +1104,8 @@ def _cf_publish_function(name: str, headers):
         )
 
     now = _now_iso()
-    fn["live_etag"] = new_uuid()
+    fn["live_etag"] = fn["dev_etag"]
     fn["last_modified_live"] = now
-    fn["published_dev_etag"] = fn["dev_etag"]
     # Publishing copies DEVELOPMENT to LIVE; later updates to the development
     # body must not reach the stage that is serving traffic.
     fn["live_body"] = {
@@ -1111,7 +1119,7 @@ def _cf_publish_function(name: str, headers):
     lm = fn["last_modified_live"]
     return _xml_response(
         "FunctionSummary",
-        _function_summary_builder(fn, "LIVE", "DEPLOYED", lm),
+        _function_summary_builder(fn, "LIVE", _function_status(fn), lm),
         extra_headers={"ETag": fn["live_etag"]},
     )
 
@@ -1147,14 +1155,14 @@ def _cf_update_function(name: str, headers, body):
     fn["kvs_arns"] = cfg["kvs_arns"]
     fn["code"] = code
     fn["last_modified_dev"] = now
-    fn["dev_etag"] = new_uuid()
+    fn["dev_etag"] = _function_etag()
     # LIVE is untouched: an update changes the DEVELOPMENT stage only, and the
     # published version keeps serving until PublishFunction copies this one.
     logger.info("UpdateFunction name=%s", name)
 
     return _xml_response(
         "FunctionSummary",
-        _function_summary_builder(fn, "DEVELOPMENT", "UNPUBLISHED", fn["last_modified_dev"]),
+        _function_summary_builder(fn, "DEVELOPMENT", _function_status(fn), fn["last_modified_dev"]),
         extra_headers={"ETag": fn["dev_etag"]},
     )
 
@@ -2802,10 +2810,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         name = m.group(1)
         if method == "GET":
-            stage = _qval(query_params, "Stage", "")
-            if not stage:
-                return _error("InvalidArgument", "The Stage query string parameter is required.", 400)
-            return _cf_describe_function(name, stage)
+            stage, err = _function_stage(query_params)
+            return err or _cf_describe_function(name, stage)
 
     m = _FUN_PUBLISH_RE.match(path)
     if m:
@@ -2817,10 +2823,8 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         name = m.group(1)
         if method == "GET":
-            stage = _qval(query_params, "Stage", "")
-            if not stage:
-                return _error("InvalidArgument", "Stage is required.", 400)
-            return _cf_get_function(name, stage)
+            stage, err = _function_stage(query_params)
+            return err or _cf_get_function(name, stage)
         if method == "PUT":
             return _cf_update_function(name, headers, body)
         if method == "DELETE":
