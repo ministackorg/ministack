@@ -949,6 +949,7 @@ def test_elbv2_dataplane_http2_connection_answers_every_request_before_goaway(el
                         goaway = event
                 sock.sendall(client.data_to_send())
         assert goaway is not None, f"no GOAWAY after {len(answered)} requests"
+        assert goaway.error_code == 0
         assert answered and answered[-1] == goaway.last_stream_id
     finally:
         sock.close()

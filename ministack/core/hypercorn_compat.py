@@ -60,14 +60,22 @@ def _held_at_max_requests(original_create_stream):
     return _patched_create_stream
 
 
+def _unsent(protocol) -> bool:
+    # A buffer is removed once its last DATA frame and END_STREAM are written (or sending fails); a GOAWAY before that
+    # moves h2 to CLOSED and the end of the response is dropped. A stream the client has reset is never written.
+    for stream_id in protocol.stream_buffers:
+        stream = protocol.connection.streams.get(stream_id)
+        if stream is not None and not stream.closed:
+            return True
+    return False
+
+
 async def _goaway_once_drained(protocol) -> None:
-    # A stream's buffer is removed only after its last DATA frame and END_STREAM are written; a GOAWAY before that
-    # moves h2 to CLOSED and the unsent end of the response is dropped.
     if (
         protocol.keep_alive_requests >= protocol.config.keep_alive_max_requests
         and not protocol.context.terminated.is_set()
         and not protocol.streams
-        and not protocol.stream_buffers
+        and not _unsent(protocol)
         and not getattr(protocol, "_ministack_goaway_sent", False)
     ):
         protocol._ministack_goaway_sent = True
