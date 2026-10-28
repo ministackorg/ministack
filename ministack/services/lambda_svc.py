@@ -7138,8 +7138,13 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 # ---------------------------------------------------------------------------
 
 
-def _esm_response(esm: dict) -> dict:
+def _esm_response(esm: dict, state: str | None = None, modified_now: bool = False) -> dict:
     """Return ESM dict without internal-only fields.
+
+    *state* is the transitional state a create, update or delete answers with
+    (``Creating``, ``Updating``, ``Enabling``, ``Disabling``, ``Deleting``); the
+    record keeps the settled one. AWS reports a stream mapping's LastModified in
+    whole seconds except in the answer to the call that changed it.
 
     EventSourceMappingArn is derived here rather than stored on the record so
     that mappings created before it existed — restored state included — report
@@ -7147,6 +7152,11 @@ def _esm_response(esm: dict) -> dict:
     on it, so omitting it leaves tags unreadable.
     """
     out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    if state:
+        out["State"] = state
+    if (not modified_now and isinstance(out.get("LastModified"), float)
+            and not str(esm.get("EventSourceArn", "")).startswith("arn:aws:sqs:")):
+        out["LastModified"] = int(out["LastModified"])
     esm_id = esm.get("UUID")
     if esm_id:
         out["EventSourceMappingArn"] = _esm_arn(esm_id)
@@ -7253,9 +7263,24 @@ def _create_esm(data: dict):
         if err:
             return err
 
+    is_sqs = event_source_spec.service == "sqs"
+    for other in _esms.values():
+        if other["EventSourceArn"] == event_source_arn and other["FunctionName"] == func_name:
+            message = (
+                f'An event source mapping with SQS arn (" {event_source_arn} ") and function (" {func_name} ") '
+                f'already exists. Please update or delete the existing mapping with UUID {other["UUID"]}'
+                if is_sqs else
+                f'The event source arn (" {event_source_arn} ") and function (" {func_name} ") provided mapping '
+                f'already exists. Please update or delete the existing mapping with UUID {other["UUID"]}'
+            )
+            return error_response_json("ResourceConflictException", message, 409)
+
     enabled = data.get("Enabled", True)
     if isinstance(enabled, str):
         enabled = enabled.lower() != "false"
+    # Defaults and fields as AWS answers them: a stream mapping reports its
+    # retry, age, batching and destination settings; an SQS one does not, and
+    # has no LastProcessingResult.
     esm = {
         "UUID": esm_id,
         "EventSourceArn": event_source_arn,
@@ -7263,20 +7288,29 @@ def _create_esm(data: dict):
         "FunctionName": func_name,
         "Qualifier": qualifier,
         "State": "Enabled" if enabled else "Disabled",
-        "StateTransitionReason": "USER_INITIATED",
-        "BatchSize": data.get("BatchSize", 10),
+        "StateTransitionReason": "USER_INITIATED" if is_sqs else "User action",
+        "BatchSize": data.get("BatchSize", 10 if is_sqs else 100),
         "MaximumBatchingWindowInSeconds": data.get("MaximumBatchingWindowInSeconds", 0),
-        "LastModified": int(time.time()),
-        "LastProcessingResult": "No records processed",
+        "LastModified": time.time(),
         "Enabled": enabled,
         "FunctionResponseTypes": data.get("FunctionResponseTypes", []),
     }
+    if not is_sqs:
+        esm.update({
+            "LastProcessingResult": "No records processed",
+            "MaximumRetryAttempts": -1,
+            "MaximumRecordAgeInSeconds": -1,
+            "BisectBatchOnFunctionError": False,
+            "ParallelizationFactor": 1,
+            "TumblingWindowInSeconds": 0,
+            "DestinationConfig": {"OnFailure": {}},
+        })
     # Optional stream/poll settings — stored on create (previously only picked
     # up on UpdateEventSourceMapping), so GetEventSourceMapping echoes them and
     # the poller can honor MaximumRecordAgeInSeconds + the OnFailure destination.
     for _opt in ("MaximumRetryAttempts", "MaximumRecordAgeInSeconds",
                  "BisectBatchOnFunctionError", "ParallelizationFactor",
-                 "DestinationConfig"):
+                 "DestinationConfig", "TumblingWindowInSeconds"):
         if _opt in data:
             esm[_opt] = data[_opt]
     if event_source_spec.service != "sqs":
@@ -7293,7 +7327,8 @@ def _create_esm(data: dict):
         esm["Tags"] = dict(tags)
     _esms[esm_id] = esm
     _ensure_poller()
-    return json_response(_esm_response(esm), 202)
+    creating = "Creating" if (enabled or not is_sqs) else "Disabled"
+    return json_response(_esm_response(esm, state=creating, modified_now=True), 202)
 
 
 def _get_esm(esm_id: str):
@@ -7301,7 +7336,7 @@ def _get_esm(esm_id: str):
     if not esm:
         return error_response_json(
             "ResourceNotFoundException",
-            f"The resource you requested does not exist. (Service: Lambda, Status Code: 404, Request ID: {new_uuid()})",
+            "The resource you requested does not exist.",
             404,
         )
     return json_response(_esm_response(esm))
@@ -7358,6 +7393,7 @@ def _update_esm(esm_id: str, data: dict):
     ):
         if key in data:
             esm[key] = data[key]
+    was_enabled = esm.get("State") == "Enabled"
     if "Enabled" in data:
         esm["Enabled"] = data["Enabled"]
         esm["State"] = "Enabled" if data["Enabled"] else "Disabled"
@@ -7368,8 +7404,15 @@ def _update_esm(esm_id: str, data: dict):
         esm["FunctionName"] = new_name
         esm["Qualifier"] = qualifier
         esm["FunctionArn"] = _func_arn(new_name) + (f":{qualifier}" if qualifier else "")
-    esm["LastModified"] = int(time.time())
-    return json_response(_esm_response(esm))
+    esm["LastModified"] = time.time()
+    now_enabled = esm.get("State") == "Enabled"
+    if now_enabled != was_enabled:
+        state = "Enabling" if now_enabled else "Disabling"
+    elif now_enabled or not str(esm.get("EventSourceArn", "")).startswith("arn:aws:sqs:"):
+        state = "Updating"
+    else:
+        state = "Disabled"  # an SQS mapping that stays disabled
+    return json_response(_esm_response(esm, state=state, modified_now=True), 202)
 
 
 def _delete_esm(esm_id: str):
@@ -7380,9 +7423,8 @@ def _delete_esm(esm_id: str):
             f"Event source mapping not found: {esm_id}",
             404,
         )
-    esm["State"] = "Deleting"
     _release_esm_poll_state(esm_id)
-    return json_response(_esm_response(esm), 202)
+    return json_response(_esm_response(esm, state="Deleting"), 202)
 
 
 def _release_esm_poll_state(esm_id: str) -> None:
@@ -7663,7 +7705,6 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
         err_body = result.get("body") or {}
         err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
         err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-        esm["LastProcessingResult"] = "FAILED"
         logger.warning(
             "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
             func_name, queue_name, err_type, err_msg, result.get("log", ""),
@@ -7701,11 +7742,9 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
 
     n_failed = len(batch) - len(succeeded)
     if n_failed:
-        esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
         logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
                     func_name, len(succeeded), queue_name, n_failed)
     else:
-        esm["LastProcessingResult"] = f"OK - {len(batch)} records"
         logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
     log_output = result.get("log", "")
     if log_output:
@@ -7834,7 +7873,7 @@ def _poll_kinesis():
                     err_body = result.get("body") or {}
                     err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
                     err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-                    esm["LastProcessingResult"] = "FAILED"
+                    esm["LastProcessingResult"] = "PROBLEM: Function call failed"
                     logger.warning(
                         "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
                         func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
@@ -7847,7 +7886,7 @@ def _poll_kinesis():
                     processed_any = True
                     _esm_backoff_until.pop(esm_id, None)
                     positions[shard_id] = pos + len(raw_records)
-                    esm["LastProcessingResult"] = f"OK - {len(raw_records)} records"
+                    esm["LastProcessingResult"] = "OK"
                     log_output = result.get("log", "")
                     if log_output:
                         logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
@@ -8014,7 +8053,7 @@ def _poll_dynamodb_streams():
                 err_body = result.get("body") or {}
                 err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
                 err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-                esm["LastProcessingResult"] = "FAILED"
+                esm["LastProcessingResult"] = "PROBLEM: Function call failed"
                 logger.warning(
                     "ESM: Lambda %s failed processing DynamoDB stream batch from %s (errorType=%s errorMessage=%s)\n%s",
                     func_name, table_name, err_type, err_msg, result.get("log", ""),
@@ -8046,7 +8085,7 @@ def _poll_dynamodb_streams():
                 _esm_backoff_until.pop(esm_id, None)
                 with _dynamodb_stream_positions_lock:
                     _dynamodb_stream_positions[esm_id] = pos + raw_len
-                esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+                esm["LastProcessingResult"] = "OK"
                 log_output = result.get("log", "")
                 if log_output:
                     logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
