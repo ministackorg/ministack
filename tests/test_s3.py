@@ -4469,11 +4469,13 @@ def test_s3_get_object_non_latest_version_last_modified_is_rfc7231_http_date(s3)
     )
 
 
-def test_s3_presigned_url_signature_is_verified():
-    """Presigned SigV4 URLs are verified against the server secret: a bogus-
-    credential signature, or a signed header (content-type / content-length)
-    tampered with after signing, is rejected with 403 SignatureDoesNotMatch —
-    matching real S3. A valid, untampered presigned URL still succeeds."""
+@pytest.mark.auth_contract
+def test_s3_presigned_url_signature_is_verified(auth_enabled):
+    """Under AUTH=true presigned SigV4 URLs are verified against the server
+    secret: a bogus-credential signature, or a signed header (content-type /
+    content-length) tampered with after signing, is rejected with 403 —
+    matching real S3. With AUTH off they are accepted, like header-signed
+    requests. A valid, untampered presigned URL succeeds in both modes."""
     import urllib.error
     import urllib.request
 
@@ -4504,27 +4506,29 @@ def test_s3_presigned_url_signature_is_verified():
         except urllib.error.HTTPError as exc:
             return exc.code
 
-    # Bogus-credential signature is rejected.
+    rejected = 403 if auth_enabled else 200
+
+    # Bogus-credential signature.
     u = bogus.generate_presigned_url(
         "get_object", Params={"Bucket": bucket, "Key": "hello.txt"}, ExpiresIn=300)
-    assert status(urllib.request.Request(u, method="GET")) == 403
+    assert status(urllib.request.Request(u, method="GET")) == rejected
 
-    # Signed content-type tampered after signing is rejected.
+    # Signed content-type tampered after signing.
     u = good.generate_presigned_url(
         "put_object",
         Params={"Bucket": bucket, "Key": "up.txt", "ContentType": "text/plain"},
         ExpiresIn=300)
     assert status(urllib.request.Request(
         u, data=b"x", method="PUT",
-        headers={"Content-Type": "application/octet-stream"})) == 403
+        headers={"Content-Type": "application/octet-stream"})) == rejected
 
-    # Signed content-length tampered after signing is rejected.
+    # Signed content-length tampered after signing.
     u = good.generate_presigned_url(
         "put_object",
         Params={"Bucket": bucket, "Key": "up2.txt", "ContentLength": 2},
         ExpiresIn=300)
     assert status(urllib.request.Request(
-        u, data=b"way more than two bytes", method="PUT")) == 403
+        u, data=b"way more than two bytes", method="PUT")) == rejected
 
     # A valid, untampered presigned URL still succeeds.
     u = good.generate_presigned_url(
@@ -4532,7 +4536,44 @@ def test_s3_presigned_url_signature_is_verified():
     assert status(urllib.request.Request(u, method="GET")) == 200
 
 
-def test_s3_presigned_url_uses_iam_access_key_secret_and_status():
+@pytest.mark.auth_contract
+def test_s3_presigned_put_and_get_with_unknown_key(s3, auth_enabled):
+    """A client that presigns with its own local pair (not a key MiniStack
+    knows) can upload and download with AUTH off, as its header-signed calls can."""
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    bucket = f"presign-unknown-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    client = boto3.client(
+        "s3", endpoint_url=ENDPOINT, region_name="us-east-1",
+        aws_access_key_id="accessKey1", aws_secret_access_key="verySecretKey1",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    params = {"Bucket": bucket, "Key": "probe.txt"}
+    put = urllib.request.Request(client.generate_presigned_url("put_object", Params=params, ExpiresIn=300),
+                                 data=b"hello", method="PUT")
+    get = client.generate_presigned_url("get_object", Params=params, ExpiresIn=300)
+
+    if auth_enabled:
+        for request in (put, get):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(request)
+            assert exc.value.code == 403
+            assert b"<Code>InvalidAccessKeyId</Code>" in exc.value.read()
+        return
+    assert urllib.request.urlopen(put).status == 200
+    with urllib.request.urlopen(get) as response:
+        assert (response.status, response.read()) == (200, b"hello")
+
+
+@pytest.mark.auth_contract
+def test_s3_presigned_url_uses_iam_access_key_secret_and_status(auth_enabled):
+    import json
     import urllib.error
     import urllib.request
     import uuid
@@ -4561,6 +4602,10 @@ def test_s3_presigned_url_uses_iam_access_key_secret_and_status():
         config=Config(s3={"addressing_style": "path"}),
     )
     tenant_iam.create_user(UserName=user_name)
+    tenant_iam.put_user_policy(UserName=user_name, PolicyName="read", PolicyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*"}],
+    }))
     access_key = tenant_iam.create_access_key(UserName=user_name)["AccessKey"]
     tenant_s3.create_bucket(Bucket=bucket)
     tenant_s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
@@ -4584,19 +4629,25 @@ def test_s3_presigned_url_uses_iam_access_key_secret_and_status():
             AccessKeyId=access_key["AccessKeyId"],
             Status="Inactive",
         )
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(url)
-        assert exc.value.code == 403
-        assert b"<Code>InvalidAccessKeyId</Code>" in exc.value.read()
+        if auth_enabled:
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(url)
+            assert exc.value.code == 403
+            assert b"<Code>InvalidAccessKeyId</Code>" in exc.value.read()
+        else:
+            # With AUTH off the key is not checked, as for a header-signed request.
+            assert urllib.request.urlopen(url).status == 200
     finally:
         tenant_iam.delete_access_key(
             UserName=user_name,
             AccessKeyId=access_key["AccessKeyId"],
         )
+        tenant_iam.delete_user_policy(UserName=user_name, PolicyName="read")
         tenant_iam.delete_user(UserName=user_name)
 
 
-def test_s3_presigned_url_requires_exact_sts_session_token(s3, sts):
+@pytest.mark.auth_contract
+def test_s3_presigned_url_requires_exact_sts_session_token(s3, sts, auth_enabled):
     import urllib.error
     import urllib.request
     import uuid
@@ -4628,6 +4679,10 @@ def test_s3_presigned_url_requires_exact_sts_session_token(s3, sts):
 
     assert urllib.request.urlopen(presign(credentials["SessionToken"])).status == 200
     for bad_token in (None, "wrong-session-token"):
+        if not auth_enabled:
+            # With AUTH off the session token is not checked, as for a header-signed request.
+            assert urllib.request.urlopen(presign(bad_token)).status == 200
+            continue
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(presign(bad_token))
         # S3's error table: InvalidToken is 400, not 403.
@@ -4673,7 +4728,7 @@ def test_s3_presigned_url_accepts_lenient_session_origin(s3):
 
 @pytest.mark.parametrize("auth_enabled", [False, True])
 @pytest.mark.parametrize("bad_token", [False, True])
-def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_token):
+def test_s3_presign_resolves_tenant_in_both_auth_modes(monkeypatch, auth_enabled, bad_token):
     from urllib.parse import parse_qs, urlsplit
 
     import boto3
@@ -4705,7 +4760,7 @@ def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_t
                 "GET", url.path, {"host": url.netloc}, parse_qs(url.query),
             )
             assert get_account_id() == owner
-            if bad_token:
+            if bad_token and auth_enabled:
                 assert error[0] == 400
             else:
                 assert error is None
@@ -4756,8 +4811,10 @@ def test_s3_presign_time_limits_under_auth(monkeypatch, auth_enabled, expires, s
 
     if auth_enabled and status:
         assert error[0] == status and code in error[2].decode()
-    elif change:
+    elif change and auth_enabled:
         assert error[0] == 403  # SignatureDoesNotMatch, or Request has expired for a negative X-Amz-Expires
+    elif change == ("X-Amz-Expires", "-1"):
+        assert error[0] == 403  # Request has expired: expiry is checked with AUTH off too
     else:
         assert error is None
 
@@ -4925,10 +4982,12 @@ def test_s3_presigned_put_query_checksum_is_not_verified(s3):
         "the hoisted algorithm selector was not honoured")
 
 
-def test_s3_presigned_put_query_checksum_still_covered_by_signature(s3):
+@pytest.mark.auth_contract
+def test_s3_presigned_put_query_checksum_still_covered_by_signature(s3, auth_enabled):
     """The other half of the AWS contract: the parameter is ignored as an
     integrity value but still signed, so rewriting it after the fact breaks the
-    signature. Ignoring it must not mean stripping it before verification."""
+    signature under AUTH=true. Ignoring it must not mean stripping it before
+    verification."""
     import urllib.error
     import urllib.request
 
@@ -4955,7 +5014,9 @@ def test_s3_presigned_put_query_checksum_still_covered_by_signature(s3):
             urllib.request.Request(tampered, data=b"123456", method="PUT")).status
     except urllib.error.HTTPError as exc:
         status = exc.code
-    assert status == 403, f"tampered checksum parameter accepted with {status}"
+    # With AUTH off the signature is not checked, and the query checksum is never verified.
+    expected = 403 if auth_enabled else 200
+    assert status == expected, f"tampered checksum parameter answered {status}"
 
 
 def test_s3_put_header_checksum_is_still_verified(s3):
@@ -12211,11 +12272,13 @@ def test_head_version_query_keeps_iam_path(head_bucket, iam_user, auth_enabled, 
 @pytest.mark.auth_contract
 @pytest.mark.parametrize("virtual", [False, True])
 @pytest.mark.parametrize("credential", ["valid", "wrong-secret"])
-def test_head_presigned_validation_is_preserved(head_bucket, head_client, s3, virtual, credential):
+def test_head_presigned_validation_is_preserved(head_bucket, head_client, s3, auth_enabled, virtual, credential):
     response = _head(head_bucket, head_client, virtual=virtual, credential=credential, presigned=True)
-    assert response[0] == (200 if credential == "valid" else 403)
+    # With AUTH off a presigned signature is not checked, as for a header-signed request.
+    accepted = credential == "valid" or not auth_enabled
+    assert response[0] == (200 if accepted else 403)
     assert response[2] == b""
-    if credential == "valid":
+    if accepted:
         assert response[1]["content-length"] == str(len(_HEAD_PAYLOAD))
         assert response[1]["content-type"] == "text/plain"
     with s3.get_object(Bucket=head_bucket, Key="probe.txt")["Body"] as body:
@@ -12517,7 +12580,7 @@ def test_delete_failed_precondition_preserves_object(delete_bucket, delete_clien
 @pytest.mark.auth_contract
 @pytest.mark.parametrize("virtual", [False, True])
 @pytest.mark.parametrize("invalid", [False, True], ids=["valid", "bad-signature"])
-def test_delete_presigned_validation_is_preserved(delete_bucket, iam_user, s3, virtual, invalid):
+def test_delete_presigned_validation_is_preserved(delete_bucket, iam_user, s3, auth_enabled, virtual, invalid):
     client = iam_user(policy={"Statement": [
         {"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": f"arn:aws:s3:::{delete_bucket}/*"},
     ]}).client("s3", region=HOME, config=Config(signature_version="s3v4", s3={"addressing_style": "virtual" if virtual else "path"}))
@@ -12527,8 +12590,10 @@ def test_delete_presigned_validation_is_preserved(delete_bucket, iam_user, s3, v
         signature = query["X-Amz-Signature"]
         query["X-Amz-Signature"] = ("0" if signature[0] != "0" else "1") + signature[1:]
     response = _send(target.netloc, target.path + "?" + urlencode(query), {})
-    assert response[0] == (403 if invalid else 204)
-    _assert_state(s3, delete_bucket, deleted=not invalid)
+    # With AUTH off a presigned signature is not checked, as for a header-signed request.
+    rejected = invalid and auth_enabled
+    assert response[0] == (403 if rejected else 204)
+    _assert_state(s3, delete_bucket, deleted=not rejected)
 
 
 def test_s3_missing_key_shapes_do_not_depend_on_auth(download_bucket, head_bucket, s3):
