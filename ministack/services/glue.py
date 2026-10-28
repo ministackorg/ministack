@@ -2055,6 +2055,10 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
         "--conf",
         "spark.hadoop.fs.s3a.connection.ssl.enabled=false",
+        # Glue 5's magicv2 committer completes only the uploads it tracks in memory. Without this, a write
+        # to the bucket that spark-submit fetched s3:// --py-files from is never completed.
+        "--conf",
+        "spark.hadoop.fs.s3a.committer.magic.track.commits.in.memory.enabled=true",
     ]
 
     # Iceberg GlueCatalog conf -- add when the user's job or --conf references
