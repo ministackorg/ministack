@@ -6275,3 +6275,30 @@ def test_apigwv1_execute_sqs_integration_without_integration_responses_is_500(ap
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_domain_name_status_and_private_id(apigw_v1):
+    """A domain reports domainNameStatus AVAILABLE; only a private one has a domainNameId, and its ARN carries
+    the account and id (AWS CLI reference, create-domain-name examples)."""
+    public = apigw_v1.create_domain_name(domainName=f"pub-{_uuid_mod.uuid4().hex[:6]}.example.com",
+                                         endpointConfiguration={"types": ["REGIONAL"]})
+    try:
+        assert public["domainNameStatus"] == "AVAILABLE"
+        assert "domainNameId" not in public and "domainNameArn" not in public
+        assert apigw_v1.get_domain_name(domainName=public["domainName"])["domainNameStatus"] == "AVAILABLE"
+        listed = {d["domainName"]: d for d in apigw_v1.get_domain_names()["items"]}
+        assert listed[public["domainName"]]["domainNameStatus"] == "AVAILABLE"
+
+        name = f"priv-{_uuid_mod.uuid4().hex[:6]}.example.com"
+        private = apigw_v1.create_domain_name(domainName=name, endpointConfiguration={"types": ["PRIVATE"]})
+        try:
+            assert len(private["domainNameId"]) == 8 and private["domainNameId"].isalnum()
+            account = make_client("sts").get_caller_identity()["Account"]
+            assert private["domainNameArn"] == (
+                f"arn:aws:apigateway:us-east-1:{account}:/domainnames/{name}+{private['domainNameId']}")
+            got = apigw_v1.get_domain_name(domainName=name)
+            assert (got["domainNameId"], got["domainNameArn"]) == (private["domainNameId"], private["domainNameArn"])
+        finally:
+            apigw_v1.delete_domain_name(domainName=name)
+    finally:
+        apigw_v1.delete_domain_name(domainName=public["domainName"])

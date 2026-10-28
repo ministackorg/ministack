@@ -5174,22 +5174,32 @@ def _create_domain_name(data):
         # new values (e.g. SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 in
         # 2026-03). Accept whatever the caller sends; default mirrors AWS.
         "securityPolicy": data.get("securityPolicy", "TLS_1_2"),
+        "domainNameStatus": "AVAILABLE",
         "tags": data.get("tags", {}),
     }
+    # Only a private custom domain name has an id, and its ARN carries the account and id.
+    if "PRIVATE" in (dn["endpointConfiguration"] or {}).get("types", []):
+        dn["domainNameId"] = new_uuid().replace("-", "")[:8]
+        dn["domainNameArn"] = (f"arn:aws:apigateway:{get_region()}:{get_account_id()}:"
+                               f"/domainnames/{domain_name}+{dn['domainNameId']}")
     _domain_names[domain_name] = dn
     _base_path_mappings[domain_name] = {}
     return _v1_response(dn, 201)
 
 
+def _domain_name_view(dn):
+    return {"domainNameStatus": "AVAILABLE", **dn}
+
+
 def _get_domain_names(query_params):
-    return _v1_paginated_response(list(_domain_names.values()), query_params)
+    return _v1_paginated_response([_domain_name_view(dn) for dn in _domain_names.values()], query_params)
 
 
 def _get_domain_name(domain_name):
     dn = _domain_names.get(domain_name)
     if not dn:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    return _v1_response(dn)
+    return _v1_response(_domain_name_view(dn))
 
 
 def _delete_domain_name(domain_name):

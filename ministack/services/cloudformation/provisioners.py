@@ -5971,7 +5971,7 @@ def _apigw_domain_name_create(logical_id, props, stack_name):
     attrs = {
         "DistributionDomainName": domain["distributionDomainName"],
         "DistributionHostedZoneId": domain["distributionHostedZoneId"],
-        "DomainNameArn": f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}",
+        "DomainNameArn": domain.get("domainNameArn") or f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}",
         "RegionalDomainName": domain["regionalDomainName"],
         "RegionalHostedZoneId": domain["regionalHostedZoneId"],
     }
