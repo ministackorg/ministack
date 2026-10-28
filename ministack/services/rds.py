@@ -56,6 +56,7 @@ import socket
 import tarfile
 import threading
 import time
+import uuid
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
@@ -5051,6 +5052,9 @@ def _create_db_instance_impl(p):
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
     }
+    _set_performance_insights(instance, p)
+    if parent and parent.get("_PerformanceInsightsManaged"):
+        _inherit_performance_insights(instance, parent)
     # Only a request that turns storage autoscaling on sets the threshold.
     if _p(p, "MaxAllocatedStorage"):
         instance["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
@@ -5895,6 +5899,46 @@ def _restore_from_snapshot(p):
 # DB Clusters
 # ---------------------------------------------------------------------------
 
+_PERFORMANCE_INSIGHTS_FIELDS = (
+    "PerformanceInsightsEnabled", "PerformanceInsightsRetentionPeriod",
+    "PerformanceInsightsKMSKeyId",
+)
+
+
+def _set_performance_insights(resource, params):
+    """Apply explicit PI policy; omission preserves legacy instance management."""
+    if not any(name in params for name in (
+        "EnablePerformanceInsights", "PerformanceInsightsRetentionPeriod",
+        "PerformanceInsightsKMSKeyId",
+    )):
+        return False
+    enabled = _p(params, "EnablePerformanceInsights")
+    if enabled:
+        resource["PerformanceInsightsEnabled"] = enabled == "true"
+    if not resource.get("PerformanceInsightsEnabled"):
+        resource.pop("PerformanceInsightsRetentionPeriod", None)
+        resource.pop("PerformanceInsightsKMSKeyId", None)
+        return True
+    resource["PerformanceInsightsRetentionPeriod"] = int(
+        _p(params, "PerformanceInsightsRetentionPeriod")
+        or resource.get("PerformanceInsightsRetentionPeriod", 7)
+    )
+    key = _p(params, "PerformanceInsightsKMSKeyId") or resource.get("PerformanceInsightsKMSKeyId")
+    if not key or key == "alias/aws/rds":
+        key_id = uuid.uuid5(uuid.NAMESPACE_URL, f"rds:{get_account_id()}:{get_region()}")
+        key = f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
+    resource["PerformanceInsightsKMSKeyId"] = key
+    return True
+
+
+def _inherit_performance_insights(instance, cluster):
+    for field in _PERFORMANCE_INSIGHTS_FIELDS:
+        if field in cluster:
+            instance[field] = cluster[field]
+        else:
+            instance.pop(field, None)
+
+
 def _serverlessv2_from_params(p):
     """Read ServerlessV2ScalingConfiguration.{Min,Max}Capacity from query params.
 
@@ -6142,6 +6186,9 @@ def _create_db_cluster_impl(p):
         "_shared_container_epoch": 0,
         "_shared_storage_initialized": False,
     }
+    if _set_performance_insights(cluster, p):
+        cluster["_PerformanceInsightsManaged"] = True
+        cluster["DatabaseInsightsMode"] = "standard"
     _prepare_mysql_gtid_history(cluster)
     _clusters[cluster_id] = cluster
     if global_cluster:
@@ -6520,6 +6567,13 @@ def _modify_db_cluster_impl(p):
         cluster["VpcSecurityGroups"] = [
             {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
         ]
+
+    if _set_performance_insights(cluster, p):
+        cluster["_PerformanceInsightsManaged"] = True
+        cluster.setdefault("DatabaseInsightsMode", "standard")
+        for instance in _instances.values():
+            if instance.get("DBClusterIdentifier") == cluster["DBClusterIdentifier"]:
+                _inherit_performance_insights(instance, cluster)
 
     return _xml(200, "ModifyDBClusterResponse",
         f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
@@ -9609,7 +9663,8 @@ def _instance_xml(i):
         <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
         <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
         <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
-        <PerformanceInsightsRetentionPeriod>{i.get('PerformanceInsightsRetentionPeriod',7)}</PerformanceInsightsRetentionPeriod>
+        {_performance_insights_details_xml(i)}
+        <DatabaseInsightsMode>{i.get('DatabaseInsightsMode', 'standard')}</DatabaseInsightsMode>
         <EnabledCloudwatchLogsExports/>
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
@@ -9633,6 +9688,15 @@ def _serverlessv2_xml(c):
         f"<MinCapacity>{cfg.get('MinCapacity', 0.5)}</MinCapacity>"
         f"<MaxCapacity>{cfg.get('MaxCapacity', 1.0)}</MaxCapacity>"
         "</ServerlessV2ScalingConfiguration>"
+    )
+
+
+def _performance_insights_details_xml(resource):
+    if not resource.get("PerformanceInsightsEnabled"):
+        return ""
+    return (
+        f"<PerformanceInsightsRetentionPeriod>{resource.get('PerformanceInsightsRetentionPeriod', 7)}</PerformanceInsightsRetentionPeriod>"
+        f"<PerformanceInsightsKMSKeyId>{_esc(resource.get('PerformanceInsightsKMSKeyId', ''))}</PerformanceInsightsKMSKeyId>"
     )
 
 
@@ -9720,6 +9784,9 @@ def _cluster_xml(c):
         <KmsKeyId>{c.get('KmsKeyId','')}</KmsKeyId>
         <DeletionProtection>{str(c.get('DeletionProtection',False)).lower()}</DeletionProtection>
         <IAMDatabaseAuthenticationEnabled>{str(c.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <PerformanceInsightsEnabled>{str(c.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
+        {_performance_insights_details_xml(c)}
+        <DatabaseInsightsMode>{c.get('DatabaseInsightsMode', 'standard')}</DatabaseInsightsMode>
         <HttpEndpointEnabled>{str(c.get('HttpEndpointEnabled',False)).lower()}</HttpEndpointEnabled>
         <CopyTagsToSnapshot>{str(c.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
         <CrossAccountClone>{str(c.get('CrossAccountClone',False)).lower()}</CrossAccountClone>

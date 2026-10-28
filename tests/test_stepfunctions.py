@@ -10154,3 +10154,73 @@ def test_sfn_distributed_map_runs_child_executions_of_a_map_run(sfn, s3):
     _, _, desc = run("dmap-list", {"ItemReader": list_reader}, {})
     assert [o["Key"] for o in json.loads(desc["output"])] == ["items.json", "rows.csv"]
     assert set(json.loads(desc["output"])[0]) == {"Etag", "Key", "LastModified", "Size", "StorageClass"}
+
+
+def _history(sfn, definition):
+    arn = sfn.create_state_machine(name=f"sfn-inner-events-{_uuid_mod.uuid4().hex[:8]}",
+                                   definition=json.dumps(definition),
+                                   roleArn="arn:aws:iam::000000000000:role/R")["stateMachineArn"]
+    execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"items": [1, 2, 3]}))["executionArn"]
+    assert _wait_sfn(sfn, execution, timeout=20)["status"] == "SUCCEEDED"
+    return execution, sfn.get_execution_history(executionArn=execution, maxResults=1000)["events"]
+
+
+def _inner_events(events, state_name):
+    return [e["type"] for e in events
+            if (e.get("stateEnteredEventDetails") or e.get("stateExitedEventDetails") or {}).get("name") == state_name]
+
+
+def test_sfn_inline_map_writes_inner_state_events_to_the_execution_history(sfn):
+    definition = {"StartAt": "Map", "States": {"Map": {
+        "Type": "Map", "ItemsPath": "$.items", "End": True,
+        "ItemProcessor": {"StartAt": "Inner", "States": {"Inner": {"Type": "Pass", "End": True}}},
+    }}}
+    _, events = _history(sfn, definition)
+    assert sorted(_inner_events(events, "Inner")) == ["PassStateEntered"] * 3 + ["PassStateExited"] * 3
+    entered = [e for e in events if e["type"] == "PassStateEntered"]
+    assert sorted(json.loads(e["stateEnteredEventDetails"]["input"]) for e in entered) == [1, 2, 3]
+
+
+def test_sfn_parallel_writes_inner_state_events_to_the_execution_history(sfn):
+    definition = {"StartAt": "Par", "States": {"Par": {"Type": "Parallel", "End": True, "Branches": [
+        {"StartAt": "Left", "States": {"Left": {"Type": "Pass", "End": True}}},
+        {"StartAt": "Right", "States": {"Right": {"Type": "Succeed"}}},
+    ]}}}
+    _, events = _history(sfn, definition)
+    assert _inner_events(events, "Left") == ["PassStateEntered", "PassStateExited"]
+    assert _inner_events(events, "Right") == ["SucceedStateEntered", "SucceedStateExited"]
+
+
+def test_sfn_distributed_map_writes_inner_state_events_to_the_child_executions(sfn):
+    definition = {"StartAt": "Map", "States": {"Map": {
+        "Type": "Map", "ItemsPath": "$.items", "End": True,
+        "ItemProcessor": {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                          "StartAt": "Inner", "States": {"Inner": {"Type": "Pass", "End": True}}},
+    }}}
+    execution, events = _history(sfn, definition)
+    assert _inner_events(events, "Inner") == []
+    (map_run,) = sfn.list_map_runs(executionArn=execution)["mapRuns"]
+    children = sfn.list_executions(mapRunArn=map_run["mapRunArn"])["executions"]
+    assert len(children) == 3
+    for child in children:
+        child_events = sfn.get_execution_history(executionArn=child["executionArn"])["events"]
+        assert _inner_events(child_events, "Inner") == ["PassStateEntered", "PassStateExited"]
+
+
+def test_sfn_concurrent_map_items_get_unique_sequential_event_ids(sfn):
+    definition = {"StartAt": "Map", "States": {"Map": {
+        "Type": "Map", "ItemsPath": "$.items", "End": True,
+        "ItemProcessor": {"StartAt": "A", "States": {
+            "A": {"Type": "Pass", "Next": "B"},
+            "B": {"Type": "Pass", "Next": "C"},
+            "C": {"Type": "Pass", "End": True},
+        }},
+    }}}
+    arn = sfn.create_state_machine(name=f"sfn-event-ids-{_uuid_mod.uuid4().hex[:8]}",
+                                   definition=json.dumps(definition),
+                                   roleArn="arn:aws:iam::000000000000:role/R")["stateMachineArn"]
+    execution = sfn.start_execution(stateMachineArn=arn,
+                                    input=json.dumps({"items": list(range(50))}))["executionArn"]
+    assert _wait_sfn(sfn, execution, timeout=20)["status"] == "SUCCEEDED"
+    events = sfn.get_execution_history(executionArn=execution, maxResults=1000)["events"]
+    assert [e["id"] for e in events] == list(range(1, len(events) + 1))
