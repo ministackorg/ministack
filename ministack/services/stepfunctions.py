@@ -4058,6 +4058,32 @@ def _poll_ecs_tasks(cluster, task_arns):
     raise _ExecutionError("States.Timeout", "ECS tasks did not complete in time")
 
 
+def _invoke_glue_start_job_run(resource, input_data):
+    """arn:aws:states:::glue:startJobRun[.sync]"""
+    result = _dispatch_aws_sdk_json(_AWS_SDK_SERVICE_MAP["glue"], "glue", "startJobRun", input_data)
+    if resource.rstrip("/").endswith(".sync"):
+        return _poll_glue_job_run(input_data["JobName"], result["JobRunId"])
+    # Step Functions adds the request's JobName to the StartJobRun response.
+    return {"JobName": input_data["JobName"], **result}
+
+
+def _poll_glue_job_run(job_name, run_id):
+    """Poll GetJobRun until the run ends. A run that does not succeed fails the task."""
+    while True:
+        # Not scaled: SFN_WAIT_SCALE=0 would turn the poll into a busy loop.
+        time.sleep(1)
+        job_run = _dispatch_aws_sdk_json(
+            _AWS_SDK_SERVICE_MAP["glue"], "glue", "getJobRun", {"JobName": job_name, "RunId": run_id})["JobRun"]
+        # The optimized integration gives timestamps as epoch milliseconds, not the aws-sdk ISO strings.
+        for field in ("StartedOn", "LastModifiedOn", "CompletedOn"):
+            if field in job_run:
+                job_run[field] = int(datetime.fromisoformat(job_run[field].replace("Z", "+00:00")).timestamp() * 1000)
+        if job_run["JobRunState"] == "SUCCEEDED":
+            return job_run
+        if job_run["JobRunState"] in ("FAILED", "ERROR", "TIMEOUT", "STOPPED"):
+            raise _ExecutionError("States.TaskFailed", json.dumps(job_run))
+
+
 def _pascal_to_camel(d):
     """Recursively convert PascalCase keys to camelCase for ECS internals."""
     if isinstance(d, list):
@@ -5740,6 +5766,7 @@ _SERVICE_DISPATCH = {
         "updateItem", d
     ),
     "arn:aws:states:::ecs:runTask": _invoke_ecs_run_task,
+    "arn:aws:states:::glue:startJobRun": _invoke_glue_start_job_run,
 }
 
 

@@ -3493,8 +3493,8 @@ def test_sfn_unimplemented_optimized_integration_fails_loudly(sfn_sync):
         "States": {
             "Unimplemented": {
                 "Type": "Task",
-                "Resource": "arn:aws:states:::glue:startJobRun",
-                "Parameters": {"JobName": "etl"},
+                "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+                "Parameters": {"QueryString": "SELECT 1"},
                 "End": True,
             },
         },
@@ -3508,8 +3508,95 @@ def test_sfn_unimplemented_optimized_integration_fails_loudly(sfn_sync):
     # Must not be the silent-success echo of the input.
     assert resp["status"] == "FAILED"
     blob = (resp.get("cause", "") + resp.get("error", "")).lower()
-    assert "not yet implemented" in blob or "glue:startjobrun" in blob
+    assert "not yet implemented" in blob or "athena:startqueryexecution" in blob
     sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def _sfn_glue_job(s3, glue, script):
+    """A pythonshell Glue job that runs `script` from S3. MiniStack runs it as a local Python subprocess."""
+    name = f"sfn-glue-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=name)
+    # A unique key, because MiniStack copies each script to a temp file named after the key.
+    s3.put_object(Bucket=name, Key=f"{name}.py", Body=script.encode())
+    glue.create_job(Name=name, Role="arn:aws:iam::000000000000:role/R",
+                    Command={"Name": "pythonshell", "ScriptLocation": f"s3://{name}/{name}.py"})
+    return name
+
+
+def _sfn_run_glue_task(sfn, task, extra_states=None, query_language="JSONata"):
+    sm = sfn.create_state_machine(
+        name=f"sfn-glue-{_uuid_mod.uuid4().hex[:8]}",
+        definition=json.dumps({
+            "QueryLanguage": query_language,
+            "StartAt": "Run",
+            "States": {"Run": {"Type": "Task", **task}, **(extra_states or {})},
+        }),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+    return _wait_sfn(sfn, ex["executionArn"], timeout=30)
+
+
+@pytest.mark.parametrize("query_language,params_field", [
+    ("JSONata", "Arguments"),
+    ("JSONPath", "Parameters"),
+], ids=["jsonata", "jsonpath"])
+def test_sfn_glue_start_job_run_sync_waits_for_the_run(sfn, s3, glue, query_language, params_field):
+    """glue:startJobRun.sync waits until the job run ends and returns the job run."""
+    job = _sfn_glue_job(s3, glue, "print('ok')\n")
+
+    desc = _sfn_run_glue_task(sfn, {
+        "Resource": "arn:aws:states:::glue:startJobRun.sync",
+        params_field: {"JobName": job},
+        "End": True,
+    }, query_language=query_language)
+
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    output = json.loads(desc["output"])
+    assert (output["JobName"], output["JobRunState"]) == (job, "SUCCEEDED")
+    # Epoch milliseconds, as AWS gives them.
+    assert isinstance(output["StartedOn"], int)
+
+
+def test_sfn_glue_start_job_run_sync_failed_run_fails_the_task(sfn, s3, glue):
+    """A job run that fails makes glue:startJobRun.sync fail with States.TaskFailed, which a Catch handles."""
+    job = _sfn_glue_job(s3, glue, "raise RuntimeError('boom')\n")
+
+    desc = _sfn_run_glue_task(sfn, {
+        "Resource": "arn:aws:states:::glue:startJobRun.sync",
+        "Arguments": {"JobName": job},
+        "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "Caught"}],
+        "End": True,
+    }, extra_states={"Caught": {"Type": "Pass", "End": True}})
+
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    output = json.loads(desc["output"])
+    assert output["Error"] == "States.TaskFailed"
+    assert json.loads(output["Cause"])["JobRunState"] == "FAILED"
+
+
+def test_sfn_glue_start_job_run_returns_without_waiting(sfn_sync, s3, glue):
+    """glue:startJobRun without .sync returns the JobName and JobRunId at once."""
+    job = _sfn_glue_job(s3, glue, "print('ok')\n")
+    sm_arn = sfn_sync.create_state_machine(
+        name=f"sfn-glue-{_uuid_mod.uuid4().hex[:8]}",
+        definition=json.dumps({
+            "QueryLanguage": "JSONata",
+            "StartAt": "Run",
+            "States": {"Run": {"Type": "Task", "Resource": "arn:aws:states:::glue:startJobRun",
+                               "Arguments": {"JobName": job}, "End": True}},
+        }),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )["stateMachineArn"]
+
+    resp = sfn_sync.start_sync_execution(stateMachineArn=sm_arn, input="{}")
+
+    assert resp["status"] == "SUCCEEDED", resp.get("cause")
+    output = json.loads(resp["output"])
+    assert output["JobName"] == job
+    assert output["JobRunId"]
+    # No JobRunState: the task does not wait for the run.
+    assert "JobRunState" not in output
 
 def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     """sqs:sendMessage.waitForTaskToken must actually deliver the message
