@@ -1919,10 +1919,11 @@ def _execute_pass(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
-    result = state_def.get("Result", effective)
-    result = _apply_result_selector(state_def, result)
+    assignment_result = state_def.get("Result", effective)
+    result = _apply_result_selector(state_def, assignment_result)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, effective, ctx, result=assignment_result)
     return output, _next_or_end(state_def)
 
 
@@ -1967,6 +1968,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                     result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, raw_input, result)
                     output = _apply_output_path(state_def, output, ctx)
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
                 return output, _next_or_end(state_def)
 
     if is_callback:
@@ -2028,6 +2030,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
                 output = _apply_output_path(state_def, output, ctx)
+                _apply_state_assign(state_def, raw_input, ctx, result=task_result)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -2307,11 +2310,15 @@ def _execute_choice(state_def, raw_input, ctx=None):
 
     for choice in state_def.get("Choices", []):
         if _evaluate_rule(choice, effective, ctx):
-            return _apply_output_path(state_def, effective, ctx), choice["Next"]
+            output = _apply_output_path(state_def, effective, ctx)
+            _apply_state_assign(choice, effective, ctx)
+            return output, choice["Next"]
 
     default = state_def.get("Default")
     if default:
-        return _apply_output_path(state_def, effective, ctx), default
+        output = _apply_output_path(state_def, effective, ctx)
+        _apply_state_assign(state_def, effective, ctx)
+        return output, default
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
@@ -2334,6 +2341,14 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
 def _resolve_path_or_ctx(path, data, ctx):
     if path.startswith("$$."):
         return _resolve_ctx_path(path, ctx or {})
+    if path.startswith("$") and len(path) > 1 and path[1] not in ".[":
+        match = re.match(r"^\$([^.[\s]+)(.*)$", path)
+        if match:
+            name, suffix = match.groups()
+            variables = (ctx or {}).get("variables", {})
+            if name not in variables:
+                raise _ExecutionError("States.Runtime", f"Undefined workflow variable: {name}")
+            return _resolve_path("$" + suffix, variables[name])
     return _resolve_path(path, data)
 
 
@@ -2458,6 +2473,7 @@ def _execute_wait(state_def, raw_input, ctx=None):
             _sleep_until(ts_str)
 
     output = _apply_output_path(state_def, effective, ctx)
+    _apply_state_assign(state_def, effective, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2577,7 +2593,7 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
             results[idx] = _run_sub_machine(
                 branch.get("States", {}),
                 branch.get("StartAt"),
-                effective, execution, ctx)
+                effective, execution, copy.deepcopy(ctx))
         except Exception as exc:
             errors[idx] = exc
 
@@ -2607,6 +2623,7 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -2690,6 +2707,7 @@ def _run_map_items(state_def, raw_input, execution, ctx):
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -2853,6 +2871,7 @@ def _run_distributed_map(state_def, raw_input, effective, iterator, execution, c
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -3005,7 +3024,7 @@ def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_out
 
 
 def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=None):
-    """Evaluate a state's `Assign` field (JSONata only) and merge results
+    """Evaluate a state's JSONPath or JSONata `Assign` field and merge results
     into ``ctx['variables']`` so later JSONata expressions can reference them
     as ``$name``. Variables are execution-scoped per AWS.
 
@@ -3014,17 +3033,23 @@ def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=Non
     """
     if ctx is None:
         return
-    if _state_query_language(state_def, ctx) != "JSONata":
-        return
     assign = state_def.get("Assign")
     if not isinstance(assign, dict):
         return
     variables = ctx.setdefault("variables", {})
-    for name, template in assign.items():
-        variables[name] = _apply_jsonata_template(
-            template, raw_input, ctx,
-            result=result, error_output=error_output,
-        )
+    if _state_query_language(state_def, ctx) == "JSONata":
+        assigned = {
+            name: _apply_jsonata_template(template, raw_input, ctx,
+                                          result=result, error_output=error_output)
+            for name, template in assign.items()
+        }
+    else:
+        data = result if state_def.get("Type") in ("Task", "Pass", "Map", "Parallel") else raw_input
+        if error_output is not None:
+            data = error_output
+        assigned = _resolve_params_obj(assign, data, ctx)
+    # All expressions see state-entry values, including assignments to peers.
+    variables.update(copy.deepcopy(assigned))
 
 
 def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
@@ -3487,7 +3512,7 @@ def _eval_intrinsic_arg(arg, data, ctx):
         path = arg[1]
         if path.startswith("$$."):
             return _resolve_ctx_path(path, ctx or {})
-        return _resolve_path(path, data)
+        return _resolve_path_or_ctx(path, data, ctx)
     elif kind == "call":
         return _exec_intrinsic(arg, data, ctx)
     return None
@@ -3626,7 +3651,7 @@ def _resolve_params_obj(template, data, ctx=None):
                 elif value.startswith("$$."):
                     result[real_key] = _resolve_ctx_path(value, ctx or {})
                 else:
-                    result[real_key] = _resolve_path(value, data)
+                    result[real_key] = _resolve_path_or_ctx(value, data, ctx)
             else:
                 result[real_key] = value
         elif isinstance(value, dict):
