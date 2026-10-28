@@ -40,7 +40,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import jsonata
@@ -4111,6 +4111,7 @@ _AWS_SDK_SERVICE_MAP = {
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
     "route53": {"protocol": "rest-xml", "service_key": "route53"},
     "lambda": {"protocol": "rest"},
+    "scheduler": {"protocol": "rest"},
 }
 
 # Map lowercase service names used in aws-sdk ARNs to the PascalCase prefix
@@ -4141,6 +4142,7 @@ _AWS_SDK_ERROR_PREFIX = {
     "rdsdata": "RdsData",
     "s3": "S3",
     "lambda": "Lambda",
+    "scheduler": "Scheduler",
 }
 
 _AWS_SDK_ERROR_CODE_OVERRIDES = {
@@ -5133,6 +5135,147 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     return output
 
 
+# EventBridge Scheduler REST routes: action -> (method, path, {member: querystring}).
+# The other members go in the JSON body for POST/PUT. Task output keeps the
+# Scheduler member names unchanged.
+_SCHEDULER_ROUTES = {
+    "CreateSchedule": ("POST", "/schedules/{Name}", {}),
+    "GetSchedule": ("GET", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "UpdateSchedule": ("PUT", "/schedules/{Name}", {}),
+    "DeleteSchedule": ("DELETE", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "ListSchedules": ("GET", "/schedules", {
+        "GroupName": "ScheduleGroup", "NamePrefix": "NamePrefix", "State": "State"}),
+    "CreateScheduleGroup": ("POST", "/schedule-groups/{Name}", {}),
+    "GetScheduleGroup": ("GET", "/schedule-groups/{Name}", {}),
+    "DeleteScheduleGroup": ("DELETE", "/schedule-groups/{Name}", {}),
+    "ListScheduleGroups": ("GET", "/schedule-groups", {"NamePrefix": "NamePrefix"}),
+}
+
+_SCHEDULER_TIMESTAMPS = ("CreationDate", "LastModificationDate", "StartDate", "EndDate")
+
+
+def _scheduler_timestamp_out(value):
+    """Epoch seconds as the ISO-8601 UTC string a task outputs (milliseconds only when non-zero)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    try:
+        millis = int(round(value * 1000))
+        text = datetime.fromtimestamp(millis // 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        # A number from Parameters outside the datetime range is shown as it was stored.
+        return value
+    if millis % 1000:
+        text += f".{millis % 1000:03d}"
+    return text + "Z"
+
+
+_SCHEDULER_TIMESTAMP_IN = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:[0-5]\d)")
+
+
+def _scheduler_timestamp_in(value):
+    """An ISO-8601 timestamp string from Parameters as epoch seconds, cut to milliseconds."""
+    match = _SCHEDULER_TIMESTAMP_IN.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        return value
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    offset = timedelta(0)
+    if zone != "Z":
+        offset = timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6])) * (1 if zone[0] == "+" else -1)
+    try:
+        # An impossible date, an offset of a day or more, or an instant outside
+        # years 1-9999 in UTC is left for Scheduler.
+        parsed = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second),
+                          tzinfo=timezone(offset)).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return value
+    millis = int((fraction or "").ljust(3, "0")[:3])
+    return int(parsed.timestamp()) + millis / 1000
+
+
+def _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data):
+    """Dispatch the EventBridge Scheduler REST aws-sdk calls."""
+    from urllib.parse import quote
+
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+    route = _SCHEDULER_ROUTES.get(pascal_action)
+    if route is None:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
+            "(scheduler dispatcher covers createSchedule, getSchedule, updateSchedule, "
+            "deleteSchedule, listSchedules, createScheduleGroup, getScheduleGroup, "
+            "deleteScheduleGroup, and listScheduleGroups)",
+        )
+    method, path, query_members = route
+
+    members = dict(input_data or {})
+    if "{Name}" in path:
+        path = path.replace("{Name}", quote(str(members.pop("Name", "")), safe=""))
+    query_params = {
+        wire: str(members.pop(member))
+        for member, wire in query_members.items()
+        if member in members
+    }
+    for member in ("StartDate", "EndDate"):
+        if member in members:
+            members[member] = _scheduler_timestamp_in(members[member])
+    target = members.get("Target")
+    if isinstance(target, dict) and isinstance(target.get("Input"), (dict, list)):
+        # Target.Input is a string member; a JSON object or array is sent as compact JSON text.
+        members["Target"] = {**target, "Input": json.dumps(
+            target["Input"], separators=(",", ":"), ensure_ascii=False)}
+    body = json.dumps(members).encode("utf-8") if method in ("POST", "PUT") else b""
+
+    # Same account and region as the execution; see _dispatch_aws_sdk_lambda_rest.
+    caller_account = get_account_id()
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential={caller_account}/20260101/"
+            f"{get_region()}/{service_key}/aws4_request"
+        ),
+    }
+
+    status, _resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_params)
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("__type") or "ServiceException"
+            msg = err_data.get("Message") or decoded
+        except Exception:
+            code, msg = "ServiceException", decoded
+        raise _ExecutionError(
+            _prefix_sdk_error(service_name, code),
+            f"{msg} (Service: Scheduler, Status Code: {status}, Request ID: {new_uuid()}) "
+            "(SDK Attempt Count: 1)",
+        )
+
+    result = json.loads(decoded) if decoded else {}
+    records = [result]
+    for list_key in ("Schedules", "ScheduleGroups"):
+        records.extend(result.get(list_key) or [])
+    for record in records:
+        for member in _SCHEDULER_TIMESTAMPS:
+            if member in record:
+                record[member] = _scheduler_timestamp_out(record[member])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # REST-XML aws-sdk dispatch (S3)
 # ---------------------------------------------------------------------------
@@ -5548,6 +5691,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data)
     elif protocol == "rest" and service_name == "lambda":
         return _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data)
+    elif protocol == "rest" and service_name == "scheduler":
+        return _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",
