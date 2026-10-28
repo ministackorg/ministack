@@ -908,6 +908,53 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
+@pytest.mark.serial
+def test_elbv2_dataplane_http2_connection_answers_every_request_before_goaway(elbv2):
+    """An HTTP/2 connection that reaches the server's request limit answers every stream its GOAWAY counts as
+    processed: none is left without its END_STREAM, so a client that keeps one connection loses no request."""
+    import socket
+
+    import h2.connection
+    import h2.events
+
+    lb_name = "dp-alb-h2"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", _SERVER_GATEWAY_PORT)
+    parsed = urlparse(_endpoint)
+    sock = socket.create_connection((parsed.hostname, parsed.port or 4566), timeout=10)
+    try:
+        client = h2.connection.H2Connection()
+        client.initiate_connection()
+        sock.sendall(client.data_to_send())
+        answered, goaway = [], None
+        while goaway is None and len(answered) < 1500:
+            stream_id = None
+            # At the limit the server allows no new stream; the client waits for its GOAWAY.
+            if client.remote_settings.max_concurrent_streams > 0:
+                stream_id = client.get_next_available_stream_id()
+                client.send_headers(stream_id, [(":method", "GET"), (":path", f"/_alb/{lb_name}/_ministack/health"),
+                                                (":authority", parsed.netloc), (":scheme", "http")], end_stream=True)
+                sock.sendall(client.data_to_send())
+            ended = False
+            while not ended and goaway is None:
+                data = sock.recv(65535)
+                if not data:
+                    pytest.fail(f"connection closed without a GOAWAY after {len(answered)} answered requests")
+                for event in client.receive_data(data):
+                    if isinstance(event, h2.events.DataReceived):
+                        client.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                    elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
+                        answered.append(stream_id)
+                        ended = True
+                    elif isinstance(event, h2.events.ConnectionTerminated):
+                        goaway = event
+                sock.sendall(client.data_to_send())
+        assert goaway is not None, f"no GOAWAY after {len(answered)} requests"
+        assert answered and answered[-1] == goaway.last_stream_id
+    finally:
+        sock.close()
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
 def _start_echo_server():
     """Answer every GET with the request target and headers the target received, as JSON."""
     import threading
