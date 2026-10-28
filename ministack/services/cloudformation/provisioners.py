@@ -12522,21 +12522,14 @@ def _asg_fields(props):
 
 
 def _asg_launch_template(spec):
-    """The launch template's id and name, whichever of the two the group was given."""
-    if not spec:
-        return {}
-    lt_id = spec.get("LaunchTemplateId", "")
-    lt_name = spec.get("LaunchTemplateName", "")
-    record = _ec2._launch_templates.get(lt_id) if lt_id else next(
-        (t for t in _ec2._launch_templates.values()
-         if t.get("LaunchTemplateName") == lt_name), None)
-    if record:
-        lt_id, lt_name = record["LaunchTemplateId"], record["LaunchTemplateName"]
-    return {
-        "LaunchTemplateId": lt_id or lt_name,
-        "LaunchTemplateName": lt_name,
-        "Version": spec.get("Version", "$Default"),
-    }
+    from ministack.services.autoscaling import resolve_launch_template
+
+    spec = spec or {}
+    resolved, error = resolve_launch_template(
+        spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"), spec.get("Version"))
+    if error:
+        raise ValueError(error)
+    return resolved
 
 
 def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):

@@ -1307,7 +1307,17 @@ def test_multiple_scheduled_actions(autoscaling):
 # ---------------------------------------------------------------------------
 
 
-def test_create_asg_with_launch_template(autoscaling):
+def _ensure_my_template(ec2):
+    try:
+        ec2.create_launch_template(LaunchTemplateName="my-template",
+                                   LaunchTemplateData={"InstanceType": "t3.micro", "ImageId": "ami-12345678"})
+    except ClientError as exc:
+        if "AlreadyExists" not in exc.response["Error"]["Code"]:
+            raise
+
+
+def test_create_asg_with_launch_template(autoscaling, ec2):
+    _ensure_my_template(ec2)
     asg = _uid("asg-lt")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg,
@@ -1329,12 +1339,80 @@ def test_create_asg_with_launch_template(autoscaling):
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
 
 
+def test_asg_launch_template_by_name_reports_its_id(autoscaling, ec2):
+    """A group given the template's name (or id) reports both, and UpdateAutoScalingGroup can switch it."""
+    first = ec2.create_launch_template(LaunchTemplateName=_uid("lt-a"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    second = ec2.create_launch_template(LaunchTemplateName=_uid("lt-b"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    asg = _uid("asg-lt-name")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=1, AvailabilityZones=["us-east-1a"],
+        LaunchTemplate={"LaunchTemplateName": first["LaunchTemplateName"], "Version": "$Default"})
+    try:
+        def group_lt():
+            return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[asg])["AutoScalingGroups"][0][
+                "LaunchTemplate"]
+
+        assert group_lt() == {"LaunchTemplateId": first["LaunchTemplateId"],
+                              "LaunchTemplateName": first["LaunchTemplateName"], "Version": "$Default"}
+        autoscaling.update_auto_scaling_group(
+            AutoScalingGroupName=asg, LaunchTemplate={"LaunchTemplateId": second["LaunchTemplateId"], "Version": "1"})
+        assert group_lt() == {"LaunchTemplateId": second["LaunchTemplateId"],
+                              "LaunchTemplateName": second["LaunchTemplateName"], "Version": "1"}
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        for lt in (first, second):
+            ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_asg_launch_template_errors_and_version_follow_aws(autoscaling, ec2):
+    """Captured on AWS (us-east-1, 2026-10-28): a missing template or version is a ValidationError, and a group
+    given no Version reports none."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-err"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    asg = _uid("asg-lt-err")
+    try:
+        cases = [
+            ({"LaunchTemplateName": "no-such-template", "Version": "$Default"},
+             "The specified launch template, with template name no-such-template, does not exist."),
+            ({"LaunchTemplateId": "lt-0123456789abcdef0", "Version": "$Default"},
+             "Malformed launch template Id: lt-0123456789abcdef0"),
+            ({"LaunchTemplateId": lt["LaunchTemplateId"], "Version": "99"},
+             f"Could not find the specified version 99 for the launch template with ID {lt['LaunchTemplateId']}."),
+        ]
+        for spec, message in cases:
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                                      AvailabilityZones=["us-east-1a"], LaunchTemplate=spec)
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == message
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                              AvailabilityZones=["us-east-1a"],
+                                              LaunchTemplate={"LaunchTemplateName": lt["LaunchTemplateName"]})
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[asg])["AutoScalingGroups"][0]
+        assert group["LaunchTemplate"] == {"LaunchTemplateId": lt["LaunchTemplateId"],
+                                           "LaunchTemplateName": lt["LaunchTemplateName"]}
+        with pytest.raises(ClientError) as exc:
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=asg,
+                                                  LaunchTemplate={"LaunchTemplateName": "no-such-template"})
+        assert exc.value.response["Error"]["Message"] == (
+            "The specified launch template, with template name no-such-template, does not exist.")
+    finally:
+        try:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        except ClientError:
+            pass
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
 # ---------------------------------------------------------------------------
 # Instance Refresh
 # ---------------------------------------------------------------------------
 
 
-def test_start_and_describe_instance_refresh(autoscaling):
+def test_start_and_describe_instance_refresh(autoscaling, ec2):
+    _ensure_my_template(ec2)
     asg = _uid("asg-refresh")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg,
@@ -1375,7 +1453,8 @@ def test_start_instance_refresh_unknown_asg_fails(autoscaling):
     assert "ValidationError" in str(exc.value)
 
 
-def test_cancel_instance_refresh_when_none_active(autoscaling):
+def test_cancel_instance_refresh_when_none_active(autoscaling, ec2):
+    _ensure_my_template(ec2)
     asg = _uid("asg-cancel")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg,
