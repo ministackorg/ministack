@@ -909,9 +909,9 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
 
 
 @pytest.mark.serial
-def test_elbv2_dataplane_http2_connection_answers_every_request_before_goaway(elbv2):
-    """An HTTP/2 connection that reaches the server's request limit answers every stream its GOAWAY counts as
-    processed: none is left without its END_STREAM, so a client that keeps one connection loses no request."""
+def test_elbv2_dataplane_http2_connection_answers_past_a_thousand_requests(elbv2):
+    """One HTTP/2 connection keeps answering past Hypercorn's default keep_alive_max_requests (1000): AWS closes a client
+    connection by keepalive duration, not by request count."""
     import socket
 
     import h2.connection
@@ -925,32 +925,22 @@ def test_elbv2_dataplane_http2_connection_answers_every_request_before_goaway(el
         client = h2.connection.H2Connection()
         client.initiate_connection()
         sock.sendall(client.data_to_send())
-        answered, goaway = [], None
-        while goaway is None and len(answered) < 1500:
-            stream_id = None
-            # At the limit the server allows no new stream; the client waits for its GOAWAY.
-            if client.remote_settings.max_concurrent_streams > 0:
-                stream_id = client.get_next_available_stream_id()
-                client.send_headers(stream_id, [(":method", "GET"), (":path", f"/_alb/{lb_name}/_ministack/health"),
-                                                (":authority", parsed.netloc), (":scheme", "http")], end_stream=True)
-                sock.sendall(client.data_to_send())
+        for _ in range(1100):
+            stream_id = client.get_next_available_stream_id()
+            client.send_headers(stream_id, [(":method", "GET"), (":path", f"/_alb/{lb_name}/_ministack/health"),
+                                            (":authority", parsed.netloc), (":scheme", "http")], end_stream=True)
+            sock.sendall(client.data_to_send())
             ended = False
-            while not ended and goaway is None:
+            while not ended:
                 data = sock.recv(65535)
-                if not data:
-                    pytest.fail(f"connection closed without a GOAWAY after {len(answered)} answered requests")
+                assert data, f"connection closed at stream {stream_id}"
                 for event in client.receive_data(data):
+                    assert not isinstance(event, h2.events.ConnectionTerminated), f"GOAWAY at stream {stream_id}"
                     if isinstance(event, h2.events.DataReceived):
                         client.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                     elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
-                        answered.append(stream_id)
                         ended = True
-                    elif isinstance(event, h2.events.ConnectionTerminated):
-                        goaway = event
                 sock.sendall(client.data_to_send())
-        assert goaway is not None, f"no GOAWAY after {len(answered)} requests"
-        assert goaway.error_code == 0
-        assert answered and answered[-1] == goaway.last_stream_id
     finally:
         sock.close()
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)

@@ -620,49 +620,6 @@ def test_unit_h11_response_has_reason_phrase():
     assert out.startswith(b"HTTP/1.1 404 Not Found\r\n"), f"expected canonical reason phrase, got: {out!r}"
 
 
-def test_unit_h2_stream_reset_at_keep_alive_max_requests_still_ends_the_connection():
-    """A client that resets its last stream at keep_alive_max_requests still gets the GOAWAY and the close."""
-    import asyncio
-    from unittest.mock import AsyncMock, MagicMock
-
-    from h2.connection import H2Connection
-    from h2.events import ConnectionTerminated
-    from hypercorn.asyncio.worker_context import WorkerContext
-    from hypercorn.config import Config
-    from hypercorn.events import Closed, RawData
-    from hypercorn.protocol.h2 import H2Protocol
-    from hypercorn.typing import ConnectionState
-
-    import ministack.app  # noqa: F401
-
-    async def scenario():
-        config = Config()
-        config.keep_alive_max_requests = 1
-        task_group = MagicMock()
-        task_group.spawn_app = AsyncMock(return_value=AsyncMock())
-        send = AsyncMock()
-        protocol = H2Protocol(AsyncMock(), config, WorkerContext(None), task_group, ConnectionState({}), False,
-                              None, None, send)
-        await protocol.initiate()
-        client = H2Connection()
-        client.initiate_connection()
-        client.send_headers(1, [(":method", "GET"), (":path", "/"), (":authority", "ministack"), (":scheme", "http")],
-                            end_stream=True)
-        await protocol.handle(RawData(client.data_to_send()))
-        client.reset_stream(1)
-        await protocol.handle(RawData(client.data_to_send()))
-        # The app saw http.disconnect and sends nothing more, as the ALB data plane does.
-        await protocol._send_data(1)
-        events = []
-        for sent in send.call_args_list:
-            if isinstance(sent.args[0], RawData):
-                events.extend(client.receive_data(sent.args[0].data))
-        assert any(isinstance(event, ConnectionTerminated) for event in events)
-        assert send.call_args_list[-1].args[0] == Closed()
-
-    asyncio.run(scenario())
-
-
 def test_wire_expect_100_continue_returns_canonical_status_line():
     """End-to-end: a raw PUT with Expect: 100-continue against ministack must
     receive a 100 Continue with the reason phrase intact (issue #389)."""
