@@ -138,6 +138,7 @@ _executions = AccountRegionScopedDict()
 _HISTORY_TOKEN_TTL_SECONDS = 24 * 60 * 60
 _history_page_tokens = {}
 _history_page_tokens_lock = threading.Lock()
+_events_lock = threading.Lock()
 _task_tokens = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _activities = AccountRegionScopedDict()
@@ -1432,14 +1433,16 @@ def _invalid_tag_resource_arn(arn):
 # ---------------------------------------------------------------------------
 
 def _add_event(execution, event_type, details=None):
-    event = {
-        "id": len(execution["events"]) + 1,
-        "type": event_type,
-        "timestamp": now_iso(),
-    }
-    if details:
-        event.update(details)
-    execution["events"].append(event)
+    # Map items and Parallel branches add events from several threads
+    with _events_lock:
+        event = {
+            "id": len(execution["events"]) + 1,
+            "type": event_type,
+            "timestamp": now_iso(),
+        }
+        if details:
+            event.update(details)
+        execution["events"].append(event)
     return event
 
 
@@ -2889,9 +2892,23 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
         state_type = state_def.get("Type")
         ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
+        _add_event(execution, f"{state_type}StateEntered", {
+            "stateEnteredEventDetails": {
+                "name": current_name,
+                "input": json.dumps(current_input),
+            },
+        })
+
         if state_type == "Succeed":
-            return _apply_output_path(state_def,
-                                      _apply_input_path(state_def, current_input, ctx), ctx)
+            current_input = _apply_input_path(state_def, current_input, ctx)
+            current_input = _apply_output_path(state_def, current_input, ctx)
+            _add_event(execution, "SucceedStateExited", {
+                "stateExitedEventDetails": {
+                    "name": current_name,
+                    "output": json.dumps(current_input),
+                },
+            })
+            return current_input
         if state_type == "Fail":
             raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
@@ -2909,11 +2926,19 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"Unknown state type: {state_type}")
 
         if state_type in ("Task", "Parallel", "Map"):
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, execution, ctx)
         else:
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, ctx)
+
+        _add_event(execution, f"{state_type}StateExited", {
+            "stateExitedEventDetails": {
+                "name": current_name,
+                "output": json.dumps(current_input),
+            },
+        })
+        current_name = next_name
 
     return current_input
 

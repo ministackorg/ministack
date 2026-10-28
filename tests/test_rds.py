@@ -17144,3 +17144,86 @@ def test_rds_settings_outside_pending_modified_values_apply_immediately(imm_stat
     assert status == 200
     assert instance[param] == stored
     assert instance["PendingModifiedValues"] == {}
+
+
+# AWS observations (2026-10-27, us-east-1, disposable Aurora MySQL 3.10.3 /
+# PostgreSQL 17.9): same-value ModifyDBCluster handoff preserves seven-day PI,
+# a new reader inherits the policy, and cluster disablement reaches both members.
+# CreateDBCluster explicit settings follow the documented cluster-level API;
+# tests deliberately leave omission as legacy instance-managed behavior.
+@pytest.mark.parametrize("engine", ["aurora-mysql", "aurora-postgresql"])
+def test_rds_cluster_performance_insights_handoff(imm_state, monkeypatch, engine):
+    monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+    client = _imm_sdk()
+    cluster_id = "pi-handoff"
+    key = f"arn:aws:kms:{_IMM_REGION}:{_IMM_ACCOUNT}:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    cluster = client.create_db_cluster(
+        DBClusterIdentifier=cluster_id, Engine=engine,
+        MasterUsername="admin", MasterUserPassword="password123",
+    )["DBCluster"]
+    assert cluster["PerformanceInsightsEnabled"] is False
+    writer = client.create_db_instance(
+        DBInstanceIdentifier="pi-writer", DBClusterIdentifier=cluster_id,
+        Engine=engine, DBInstanceClass="db.r6g.large",
+        EnablePerformanceInsights=True, PerformanceInsightsRetentionPeriod=7,
+        PerformanceInsightsKMSKeyId=key,
+    )["DBInstance"]
+    assert writer["PerformanceInsightsEnabled"] is True
+    assert writer["PerformanceInsightsKMSKeyId"] == key
+    assert writer["PerformanceInsightsRetentionPeriod"] == 7
+    migrated = client.modify_db_cluster(
+        DBClusterIdentifier=cluster_id, ApplyImmediately=True,
+        EnablePerformanceInsights=True, PerformanceInsightsRetentionPeriod=7,
+        PerformanceInsightsKMSKeyId=key,
+    )["DBCluster"]
+    assert migrated["PerformanceInsightsEnabled"] is True
+    assert migrated["PerformanceInsightsKMSKeyId"] == key
+    assert migrated["PerformanceInsightsRetentionPeriod"] == 7
+    assert migrated["DatabaseInsightsMode"] == "standard"
+    client.create_db_instance(
+        DBInstanceIdentifier="pi-reader", DBClusterIdentifier=cluster_id,
+        Engine=engine, DBInstanceClass="db.r6g.large",
+    )
+    for instance in client.describe_db_instances()["DBInstances"]:
+        assert instance["PerformanceInsightsEnabled"] is True
+        assert instance["PerformanceInsightsKMSKeyId"] == key
+        assert instance["PerformanceInsightsRetentionPeriod"] == 7
+        assert instance["DatabaseInsightsMode"] == "standard"
+    client.modify_db_cluster(DBClusterIdentifier=cluster_id, EnablePerformanceInsights=False)
+    for instance in client.describe_db_instances()["DBInstances"]:
+        assert instance["PerformanceInsightsEnabled"] is False
+        assert "PerformanceInsightsKMSKeyId" not in instance
+        assert "PerformanceInsightsRetentionPeriod" not in instance
+    # Disabling remains cluster-managed after the last member is removed.
+    for identifier in ("pi-writer", "pi-reader"):
+        client.delete_db_instance(DBInstanceIdentifier=identifier, SkipFinalSnapshot=True)
+    replacement = client.create_db_instance(
+        DBInstanceIdentifier="pi-replacement", DBClusterIdentifier=cluster_id,
+        Engine=engine, DBInstanceClass="db.r6g.large",
+    )["DBInstance"]
+    assert replacement["PerformanceInsightsEnabled"] is False
+    assert client.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["DatabaseInsightsMode"] == "standard"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_rds_cluster_performance_insights_explicit_create(imm_state, monkeypatch, enabled):
+    monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+    client = _imm_sdk()
+    cluster = client.create_db_cluster(
+        DBClusterIdentifier="pi-new", Engine="aurora-mysql",
+        MasterUsername="admin", MasterUserPassword="password123",
+        EnablePerformanceInsights=enabled,
+    )["DBCluster"]
+    member = client.create_db_instance(
+        DBInstanceIdentifier="pi-new-member", DBClusterIdentifier="pi-new",
+        Engine="aurora-mysql", DBInstanceClass="db.r6g.large",
+    )["DBInstance"]
+    assert cluster["PerformanceInsightsEnabled"] is enabled
+    assert member["PerformanceInsightsEnabled"] is enabled
+    if enabled:
+        assert member["PerformanceInsightsRetentionPeriod"] == 7
+        assert member["PerformanceInsightsKMSKeyId"] == cluster["PerformanceInsightsKMSKeyId"]
+        assert member["PerformanceInsightsKMSKeyId"].startswith(f"arn:aws:kms:{_IMM_REGION}:{_IMM_ACCOUNT}:key/")
+    else:
+        assert "PerformanceInsightsKMSKeyId" not in cluster
+        assert "PerformanceInsightsRetentionPeriod" not in member
