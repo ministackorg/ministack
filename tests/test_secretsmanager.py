@@ -883,6 +883,24 @@ def test_secretsmanager_get_by_partial_arn(sm):
     assert sm.get_secret_value(SecretId=partial_arn)["SecretString"] == "partial-arn-value"
 
 
+@pytest.mark.parametrize("longer_first", [True, False])
+def test_secretsmanager_partial_arn_ignores_longer_names(sm, longer_first):
+    """A partial ARN names one secret, not every secret whose name starts with it."""
+    base = f"sm-partial-prefix-{_uuid_mod.uuid4().hex[:8]}"
+    names = [f"{base}-admin", base] if longer_first else [base, f"{base}-admin"]
+    arns = {n: sm.create_secret(Name=n, SecretString=f"value-of-{n}")["ARN"] for n in names}
+
+    for name, arn in arns.items():
+        assert sm.get_secret_value(SecretId=arn.rsplit("-", 1)[0])["SecretString"] == f"value-of-{name}"
+
+    # Prefixes of existing names that are no secret's partial ARN.
+    arn_prefix = arns[base].rsplit(":", 1)[0]
+    for missing in (f"{base}-adm", base[:-1]):
+        with pytest.raises(ClientError) as exc:
+            sm.get_secret_value(SecretId=f"{arn_prefix}:{missing}")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_secretsmanager_arn_lookup_rejects_foreign_scope_without_name_fallback(sm):
     """SecretId ARNs must be parsed before matching same-named local secrets."""
     name = f"sm-arn-scope-{_uuid_mod.uuid4().hex[:8]}"

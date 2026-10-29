@@ -136,8 +136,15 @@ def _resolve(secret_id, *, use_arn_scope=False):
         for key, s in candidates:
             if s["ARN"] == secret_id:
                 return key, s
+        # A partial ARN is the full ARN minus the "-XXXXXX" suffix that
+        # CreateSecret appends, so it must match exactly that and nothing
+        # longer. A bare prefix test also matched "my-secret-admin-XXXXXX"
+        # for "my-secret" and returned whichever was stored first.
+        suffix_len = len("-") + 6
         for key, s in candidates:
-            if s["ARN"].startswith(secret_id):
+            arn = s["ARN"]
+            if (len(arn) == len(secret_id) + suffix_len
+                    and arn.startswith(secret_id + "-")):
                 return key, s
         return None, None
     if secret_id in _secrets:
