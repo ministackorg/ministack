@@ -2999,3 +2999,47 @@ def test_cross_account_secret_needs_its_resource_policy_under_auth(secret_target
         assert re.fullmatch(_access_denied(t, arn), exc.value.response["Error"]["Message"])
     else:
         assert t.profile(arn)
+
+
+def test_kms_key_version_description_and_deployment_tags_round_trip(appconfig_client, kms_client):
+    """#2449: KmsKeyIdentifier (with its KmsKeyArn), a hosted version's Description and a deployment's Tags
+    are stored and read back, so Terraform does not re-plan them."""
+    ac = appconfig_client
+    key = kms_client.create_key()["KeyMetadata"]
+    alias = f"alias/appconfig-{os.urandom(3).hex()}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=key["KeyId"])
+    app = ac.create_application(Name=f"kms-{os.urandom(3).hex()}")["Id"]
+    try:
+        env = ac.create_environment(ApplicationId=app, Name="e")["Id"]
+        profile = ac.create_configuration_profile(ApplicationId=app, Name="p", LocationUri="hosted",
+                                                  KmsKeyIdentifier=alias)
+        assert (profile["KmsKeyIdentifier"], profile["KmsKeyArn"]) == (alias, key["Arn"])
+        got = ac.get_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile["Id"])
+        assert (got["KmsKeyIdentifier"], got["KmsKeyArn"]) == (alias, key["Arn"])
+        updated = ac.update_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile["Id"],
+                                                  KmsKeyIdentifier=key["KeyId"])
+        assert (updated["KmsKeyIdentifier"], updated["KmsKeyArn"]) == (key["KeyId"], key["Arn"])
+
+        version = ac.create_hosted_configuration_version(
+            ApplicationId=app, ConfigurationProfileId=profile["Id"], Content=b"{}",
+            ContentType="application/json", Description="my version")
+        assert version["Description"] == "my version"
+        assert ac.get_hosted_configuration_version(
+            ApplicationId=app, ConfigurationProfileId=profile["Id"],
+            VersionNumber=version["VersionNumber"])["Description"] == "my version"
+        assert ac.list_hosted_configuration_versions(
+            ApplicationId=app, ConfigurationProfileId=profile["Id"])["Items"][0]["Description"] == "my version"
+
+        deployment = ac.start_deployment(
+            ApplicationId=app, EnvironmentId=env, ConfigurationProfileId=profile["Id"],
+            DeploymentStrategyId="AppConfig.AllAtOnce", ConfigurationVersion=str(version["VersionNumber"]),
+            KmsKeyIdentifier=key["Arn"], Tags={"Name": "x"})
+        assert (deployment["KmsKeyIdentifier"], deployment["KmsKeyArn"]) == (key["Arn"], key["Arn"])
+        got = ac.get_deployment(ApplicationId=app, EnvironmentId=env, DeploymentNumber=deployment["DeploymentNumber"])
+        assert got["KmsKeyArn"] == key["Arn"]
+        region, account = key["Arn"].split(":")[3:5]
+        arn = (f"arn:aws:appconfig:{region}:{account}:application/{app}/environment/{env}"
+               f"/deployment/{deployment['DeploymentNumber']}")
+        assert ac.list_tags_for_resource(ResourceArn=arn)["Tags"] == {"Name": "x"}
+    finally:
+        _delete_application(ac, app)

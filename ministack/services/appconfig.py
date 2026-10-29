@@ -415,6 +415,21 @@ def _cross_account_secret_error(secret_id, location_uri, role_arn):
     return None
 
 
+def _kms_key_fields(identifier):
+    """KmsKeyIdentifier as given and, when MiniStack's KMS holds the key, its KmsKeyArn."""
+    fields = {"KmsKeyIdentifier": identifier}
+    try:
+        spec = parse_arn(identifier)
+        scope = request_scope(spec.account_id, spec.region)
+    except ArnParseError:
+        scope = request_scope(get_account_id(), get_region())
+    with scope:
+        key = kms._resolve_key(identifier)
+    if key and key.get("Arn"):
+        fields["KmsKeyArn"] = key["Arn"]
+    return fields
+
+
 def _is_customer_managed_key(key_id):
     """True if *key_id* names a key in MiniStack's KMS, which holds only
     customer managed keys; a key ARN is looked up in its own account. A key it
@@ -533,6 +548,8 @@ def _create_configuration_profile(app_id, body):
         "Validators": body.get("Validators", []),
         "Type": body.get("Type", "AWS.Freeform"),
     }
+    if body.get("KmsKeyIdentifier"):
+        record.update(_kms_key_fields(body["KmsKeyIdentifier"]))
     _config_profiles[f"{app_id}/{profile_id}"] = record
     _apply_tags(_profile_arn(app_id, profile_id), body.get("Tags", {}))
     logger.info("CreateConfigurationProfile: %s/%s (%s)", app_id, name, profile_id)
@@ -561,6 +578,11 @@ def _update_configuration_profile(app_id, profile_id, body):
     for field in ("Name", "Description", "RetrievalRoleArn", "Validators"):
         if field in body:
             profile[field] = body[field]
+    if "KmsKeyIdentifier" in body:
+        profile.pop("KmsKeyIdentifier", None)
+        profile.pop("KmsKeyArn", None)
+        if body["KmsKeyIdentifier"]:
+            profile.update(_kms_key_fields(body["KmsKeyIdentifier"]))
     return _json(200, profile)
 
 
@@ -598,7 +620,8 @@ def _next_hosted_version_number(app_id, profile_id):
     return number
 
 
-def _create_hosted_configuration_version(app_id, profile_id, body, content_type, version_label=None):
+def _create_hosted_configuration_version(app_id, profile_id, body, content_type, version_label=None,
+                                         description=None):
     if f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
 
@@ -610,7 +633,7 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type,
         "VersionNumber": version_number,
         "ContentType": content_type,
         "Content": body,
-        "Description": "",
+        "Description": description or "",
     }
     if version_label:
         record["VersionLabel"] = version_label
@@ -625,6 +648,8 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type,
     }
     if version_label:
         resp_headers["VersionLabel"] = version_label
+    if description:
+        resp_headers["Description"] = description
     return 201, resp_headers, body if isinstance(body, bytes) else body.encode("utf-8")
 
 
@@ -643,6 +668,8 @@ def _get_hosted_configuration_version(app_id, profile_id, version_number):
     }
     if record.get("VersionLabel"):
         resp_headers["VersionLabel"] = record["VersionLabel"]
+    if record.get("Description"):
+        resp_headers["Description"] = record["Description"]
     return 200, resp_headers, content if isinstance(content, bytes) else content.encode("utf-8")
 
 
@@ -1223,6 +1250,9 @@ def _start_deployment(app_id, env_id, body):
     version_label = _hosted_versions.get(f"{app_id}/{profile_id}/{version}", {}).get("VersionLabel")
     if version_label:
         record["VersionLabel"] = version_label
+    if body.get("KmsKeyIdentifier"):
+        record.update(_kms_key_fields(body["KmsKeyIdentifier"]))
+    _apply_tags(_deployment_arn(app_id, env_id, deploy_num), body.get("Tags") or {})
     _add_deployment_event(record, "DEPLOYMENT_STARTED", "USER", "Deployment started", now)
     _deployments[f"{app_id}/{env_id}/{deploy_num}"] = record
     _refresh_environment(app_id, env_id)
@@ -1583,7 +1613,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         app_id, profile_id = m.group(1), m.group(2)
         ct = content_type or "application/octet-stream"
         return await _a(_create_hosted_configuration_version(app_id, profile_id, body_bytes, ct,
-                                                             headers.get("versionlabel")))
+                                                             headers.get("versionlabel"),
+                                                             headers.get("description")))
 
     m = re.fullmatch(
         r"/applications/([^/]+)/configurationprofiles/([^/]+)/hostedconfigurationversions/(\d+)",
