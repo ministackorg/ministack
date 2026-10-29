@@ -5104,6 +5104,89 @@ def test_routes_by_distribution_domain(cf_stack):
     assert json.loads(body)["path"] == "/hello"
 
 
+def _alias_distribution(cloudfront, origin_domain, aliases, origin_path):
+    # A minimal distribution; its OriginPath is echoed back, so the response names the distribution that served it.
+    suffix = _uuid_mod.uuid4().hex[:10]
+    config = {
+        "CallerReference": f"cf-alias-{suffix}",
+        "Comment": "alias routing",
+        "Enabled": True,
+        "Aliases": {"Quantity": len(aliases), "Items": aliases},
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "o", "DomainName": origin_domain, "OriginPath": origin_path,
+            "CustomOriginConfig": {
+                "HTTPPort": int(GATEWAY_PORT), "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
+                "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+            },
+        }]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
+        },
+    }
+    cloudfront.create_distribution(DistributionConfig=config)
+
+
+def test_routes_by_alternate_domain_name(cloudfront, cf_backend):
+    # Developer Guide, "Using custom URLs by adding alternate domain names (CNAMEs)".
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["alias-exact.example.test"], "/exact")
+    status, headers, body = _get("Alias-Exact.Example.Test", "/hello")
+    assert status == 200
+    assert "X-Cache" in headers
+    assert json.loads(body)["path"] == "/exact/hello"
+
+
+def _served_by(host):
+    return json.loads(_get(host, "/hello")[2])["path"]
+
+
+# Behaviours below recorded on AWS 2026-10-29: the Host header picks the distribution; an exact alias beats every
+# wildcard; `*.S` covers any depth below S but not S itself; the longest matching wildcard wins; creation order is moot.
+@pytest.mark.parametrize("exact_first", [True, False])
+def test_exact_alias_beats_wildcard_alias(cloudfront, cf_backend, exact_first):
+    o = cf_backend["origin_domain"]
+    dom = f"ex{int(exact_first)}.example.test"
+    pair = [([f"x.{dom}"], "/exact"), ([f"*.{dom}"], "/wild")]
+    for aliases, path in pair if exact_first else reversed(pair):
+        _alias_distribution(cloudfront, o, aliases, path)
+    assert _served_by(f"x.{dom}") == "/exact/hello"
+    assert _served_by(f"y.{dom}") == "/wild/hello"
+
+
+def test_wildcard_alias_covers_any_depth_but_not_its_suffix(cloudfront, cf_backend):
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["*.deep.example.test"], "/wild")
+    assert _served_by("a.deep.example.test") == "/wild/hello"
+    assert _served_by("a.b.deep.example.test") == "/wild/hello"
+    assert "X-Cache" not in _get("deep.example.test", "/hello")[1]
+
+
+@pytest.mark.parametrize("specific_first", [True, False])
+def test_longest_wildcard_alias_wins(cloudfront, cf_backend, specific_first):
+    o = cf_backend["origin_domain"]
+    dom = f"lw{int(specific_first)}.example.test"
+    pair = [([f"*.s.{dom}"], "/specific"), ([f"*.{dom}"], "/broad")]
+    for aliases, path in pair if specific_first else reversed(pair):
+        _alias_distribution(cloudfront, o, aliases, path)
+    assert _served_by(f"a.s.{dom}") == "/specific/hello"
+    assert _served_by(f"a.b.s.{dom}") == "/specific/hello"
+    assert _served_by(f"a.t.{dom}") == "/broad/hello"
+
+
+def test_alias_yields_to_an_api_gateway_custom_domain(cloudfront, apigw, cf_backend):
+    # On AWS DNS sends a registered custom domain to API Gateway; here the Host is the only signal.
+    name = "api.cdy.example.test"
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["*.cdy.example.test"], "/wild")
+    api_id = cf_backend["origin_domain"].split(".")[0]
+    apigw.create_domain_name(DomainName=name)
+    try:
+        apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="$default", ApiMappingKey="v1")
+        status, headers, body = _get(name, "/v1/hello")
+        assert status == 200 and "X-Cache" not in headers
+        assert json.loads(body)["path"] == "/hello"
+        assert _served_by("other.cdy.example.test") == "/wild/hello"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+
+
 def test_path_pattern_without_leading_slash_matches_as_if_it_had_one(cf_stack):
     # PathPattern "api/*" (no leading /) — CloudFront Developer Guide,
     # "Path pattern": "CloudFront treats the path the same with or without

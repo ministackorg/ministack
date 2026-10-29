@@ -5306,6 +5306,19 @@ def find_distribution_for_label(label: str):
     return None
 
 
+def find_distribution_for_alias(hostname: str):
+    """The distribution claiming ``hostname``: an exact alias, else the longest ``*.`` suffix the host ends with."""
+    hostname = hostname.lower()
+    best, best_len = None, -1
+    for dist in _distributions.values():
+        for alias in map(str.lower, _get_distribution_aliases(dist)):
+            if alias == hostname:
+                return dist
+            if alias.startswith("*.") and hostname.endswith(alias[1:]) and len(alias) > best_len:
+                best, best_len = dist, len(alias)
+    return best
+
+
 # S3 REST-endpoint domain shapes of an origin's DomainName (Developer Guide, "Amazon S3 origin").
 _S3_ORIGIN_DOMAIN_RE = re.compile(
     r"^(?P<bucket>[a-z0-9][a-z0-9.-]*[a-z0-9])\.s3(?:\.[a-z0-9-]+|-[a-z0-9-]+)?\.amazonaws\.com$"
