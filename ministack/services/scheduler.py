@@ -597,6 +597,12 @@ def _tick_schedules():
                 "Account": account_id,
                 "Region": get_region(),
             }
+            # A templated PutEvents target publishes with its own Source and DetailType.
+            eb_params = target.get("EventBridgeParameters") or {}
+            if eb_params.get("Source"):
+                event["Source"] = eb_params["Source"]
+            if eb_params.get("DetailType"):
+                event["DetailType"] = eb_params["DetailType"]
             try:
                 _eb._invoke_target(target, event, sched)
             except Exception:

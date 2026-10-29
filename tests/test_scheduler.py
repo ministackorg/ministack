@@ -918,3 +918,45 @@ def test_scheduler_schedule_error_messages(scheduler):
             assert exc.value.response["Error"]["Message"] == message
     finally:
         scheduler.delete_schedule_group(Name=group)
+
+
+def test_scheduler_event_bus_target_uses_eventbridge_parameters(scheduler):
+    """#2466: a schedule whose target is an event bus publishes with the Source and DetailType of
+    its EventBridgeParameters, and Input as the detail, so a rule matching them sees the event."""
+    import datetime as _dt
+    import json as _json
+
+    kw = dict(endpoint_url=ENDPOINT, aws_access_key_id="test", aws_secret_access_key="test", region_name=REGION)
+    sqs, events = boto3.client("sqs", **kw), boto3.client("events", **kw)
+    bus = f"sched-bus-{_uid()}"
+    bus_arn = events.create_event_bus(Name=bus)["EventBusArn"]
+    q_url = sqs.create_queue(QueueName=f"sched-bus-q-{_uid()}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    events.put_rule(Name="obs", EventBusName=bus,
+                    EventPattern=_json.dumps({"source": ["my.source"], "detail-type": ["delayed-event-publish"]}))
+    events.put_targets(Rule="obs", EventBusName=bus, Targets=[{"Id": "1", "Arn": q_arn}])
+    name = f"fire-bus-{_uid()}"
+    past = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    scheduler.create_schedule(
+        Name=name, ScheduleExpression=f"at({past})", FlexibleTimeWindow={"Mode": "OFF"},
+        Target={"Arn": bus_arn, "RoleArn": "arn:aws:iam::000000000000:role/r",
+                "EventBridgeParameters": {"DetailType": "delayed-event-publish", "Source": "my.source"},
+                "Input": _json.dumps({"run": "x"})})
+    try:
+        deadline, event = time.time() + 20, None
+        while time.time() < deadline and event is None:
+            msgs = sqs.receive_message(QueueUrl=q_url, WaitTimeSeconds=1, MaxNumberOfMessages=1).get("Messages", [])
+            if msgs:
+                event = _json.loads(msgs[0]["Body"])
+        assert event is not None, "the rule matching EventBridgeParameters never saw the event"
+        assert (event["source"], event["detail-type"], event["detail"]) == (
+            "my.source", "delayed-event-publish", {"run": "x"})
+    finally:
+        try:
+            scheduler.delete_schedule(Name=name)
+        except ClientError:
+            pass
+        events.remove_targets(Rule="obs", EventBusName=bus, Ids=["1"])
+        events.delete_rule(Name="obs", EventBusName=bus)
+        events.delete_event_bus(Name=bus)
+        sqs.delete_queue(QueueUrl=q_url)
