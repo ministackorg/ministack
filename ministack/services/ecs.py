@@ -1358,6 +1358,13 @@ _BOTH_LAUNCH_CHOICES = ("Specifying both a launch type and capacity provider str
 _FARGATE_PROVIDERS = ("FARGATE", "FARGATE_SPOT")
 
 
+def _service_strategy(strategy):
+    """A service's capacityProviderStrategy as AWS returns it: each item with its base, 0 when not given."""
+    if not strategy:
+        return None
+    return [{**item, "base": item.get("base", 0)} for item in strategy]
+
+
 def _launch_choice(data, cluster):
     """(launchType, capacityProviderStrategy, error): a strategy omits the launch type, and with
     neither the cluster's default strategy applies, else EC2."""
@@ -1366,7 +1373,7 @@ def _launch_choice(data, cluster):
     if strategy and launch_type:
         return None, None, error_response_json("InvalidParameterException", _BOTH_LAUNCH_CHOICES, 400)
     if strategy or launch_type:
-        return launch_type, strategy, None
+        return launch_type, _service_strategy(strategy), None
     default = (cluster or {}).get("defaultCapacityProviderStrategy") or None
     return (None, default, None) if default else ("EC2", None, None)
 
@@ -1614,7 +1621,7 @@ def _update_service(data):
         svc["loadBalancers"] = data["loadBalancers"]
     if "capacityProviderStrategy" in data:
         # An empty strategy moves the service back to a launch type.
-        strategy = data["capacityProviderStrategy"] or None
+        strategy = _service_strategy(data["capacityProviderStrategy"])
         svc["capacityProviderStrategy"] = strategy
         svc["launchType"] = None if strategy else (svc.get("launchType") or "EC2")
 

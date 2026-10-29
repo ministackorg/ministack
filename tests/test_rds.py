@@ -5,6 +5,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -47,6 +48,7 @@ EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "14.20": "aurora-postgresql14",
     "14.22": "aurora-postgresql14",
     "14.23": "aurora-postgresql14",
+    "14.24": "aurora-postgresql14",
     "15.10": "aurora-postgresql15",
     "15.12": "aurora-postgresql15",
     "15.13": "aurora-postgresql15",
@@ -54,6 +56,7 @@ EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "15.15": "aurora-postgresql15",
     "15.17": "aurora-postgresql15",
     "15.18": "aurora-postgresql15",
+    "15.19": "aurora-postgresql15",
     "16.4-limitless": "aurora-postgresql16",
     "16.6-limitless": "aurora-postgresql16",
     "16.8": "aurora-postgresql16",
@@ -67,14 +70,17 @@ EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "16.13": "aurora-postgresql16",
     "16.13-limitless": "aurora-postgresql16",
     "16.14": "aurora-postgresql16",
+    "16.15": "aurora-postgresql16",
     "17.4": "aurora-postgresql17",
     "17.5": "aurora-postgresql17",
     "17.6": "aurora-postgresql17",
     "17.7": "aurora-postgresql17",
     "17.9": "aurora-postgresql17",
     "17.10": "aurora-postgresql17",
+    "17.11": "aurora-postgresql17",
     "18.3": "aurora-postgresql18",
     "18.4": "aurora-postgresql18",
+    "18.6": "aurora-postgresql18",
 }
 EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS = {
     "5.7.mysql_aurora.2.11.1": "aurora-mysql5.7",
@@ -1374,7 +1380,7 @@ def test_rds_describe_aurora_postgresql_engine_versions_by_major(rds):
         Engine="aurora-postgresql",
         EngineVersion="16",
     )["DBEngineVersions"]
-    assert len(major_versions) == 13
+    assert len(major_versions) == 14
     assert {version["EngineVersion"] for version in major_versions} == expected_versions
     assert all(version["DBParameterGroupFamily"] == family for version in major_versions)
     assert all(version["Status"] == "available" for version in major_versions)
@@ -17227,3 +17233,24 @@ def test_rds_cluster_performance_insights_explicit_create(imm_state, monkeypatch
     else:
         assert "PerformanceInsightsKMSKeyId" not in cluster
         assert "PerformanceInsightsRetentionPeriod" not in member
+
+
+def test_rds_global_cluster_has_an_endpoint_without_members(rds):
+    """#2464, captured on AWS: an empty global cluster already has
+    <id>.global-<12 lowercase alphanumerics>.global.rds.amazonaws.com, stable across describes."""
+    gid = f"gc-endpoint-{_uuid_mod.uuid4().hex[:8]}"
+    created = rds.create_global_cluster(GlobalClusterIdentifier=gid, Engine="aurora-postgresql")["GlobalCluster"]
+    try:
+        assert re.fullmatch(rf"{gid}\.global-[a-z0-9]{{12}}\.global\.rds\.amazonaws\.com", created["Endpoint"])
+        described = rds.describe_global_clusters(GlobalClusterIdentifier=gid)["GlobalClusters"][0]
+        assert described["Endpoint"] == created["Endpoint"]
+    finally:
+        rds.delete_global_cluster(GlobalClusterIdentifier=gid)
+
+
+@pytest.mark.parametrize("version", ["14.24", "15.19", "16.15", "17.11", "18.6"])
+def test_rds_aurora_postgresql_lists_the_current_minors(rds, version):
+    """#2488, captured on AWS (us-east-1 and eu-west-1, 2026-10-29)."""
+    listed = rds.describe_db_engine_versions(Engine="aurora-postgresql", EngineVersion=version)["DBEngineVersions"]
+    assert [(v["EngineVersion"], v["DBParameterGroupFamily"]) for v in listed] == [
+        (version, f"aurora-postgresql{version.split('.')[0]}")]

@@ -4477,9 +4477,12 @@ def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
         created = ecs.create_service(cluster=cluster, serviceName="given", taskDefinition=cluster, desiredCount=0,
                                      capacityProviderStrategy=fargate, networkConfiguration=net)["service"]
         described = ecs.describe_services(cluster=cluster, services=["given"])["services"][0]
-        for svc in (created, described, created["deployments"][0]):
-            assert svc["capacityProviderStrategy"] == fargate
+        # #2455, captured on AWS: a strategy item without base is returned with base 0, in the service and its deployments.
+        for svc in (created, described, created["deployments"][0], described["deployments"][0]):
+            assert svc["capacityProviderStrategy"] == [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
             assert "launchType" not in svc
+        updated = ecs.update_service(cluster=cluster, service="given", capacityProviderStrategy=fargate)["service"]
+        assert updated["capacityProviderStrategy"] == [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
 
         default = ecs.create_service(cluster=cluster, serviceName="default", taskDefinition=cluster,
                                      desiredCount=0, networkConfiguration=net)["service"]

@@ -6393,6 +6393,90 @@ def _new_lt_id():
     return "lt-" + "".join(random.choices(string.hexdigits[:16], k=17))
 
 
+# InstanceRequirements members as botocore names them: (member, kind, query list name).
+# Ranges are Min/Max structures; lists are query "Name.N" and response "<nameSet><item>".
+_INSTANCE_REQUIREMENTS = (
+    ("VCpuCount", "int_range", None), ("MemoryMiB", "int_range", None),
+    ("CpuManufacturers", "list", "CpuManufacturer"), ("MemoryGiBPerVCpu", "float_range", None),
+    ("ExcludedInstanceTypes", "list", "ExcludedInstanceType"), ("InstanceGenerations", "list", "InstanceGeneration"),
+    ("SpotMaxPricePercentageOverLowestPrice", "int", None), ("OnDemandMaxPricePercentageOverLowestPrice", "int", None),
+    ("BareMetal", "str", None), ("BurstablePerformance", "str", None), ("RequireHibernateSupport", "bool", None),
+    ("NetworkInterfaceCount", "int_range", None), ("LocalStorage", "str", None),
+    ("LocalStorageTypes", "list", "LocalStorageType"), ("TotalLocalStorageGB", "float_range", None),
+    ("BaselineEbsBandwidthMbps", "int_range", None), ("AcceleratorTypes", "list", "AcceleratorType"),
+    ("AcceleratorCount", "int_range", None), ("AcceleratorManufacturers", "list", "AcceleratorManufacturer"),
+    ("AcceleratorNames", "list", "AcceleratorName"), ("AcceleratorTotalMemoryMiB", "int_range", None),
+    ("NetworkBandwidthGbps", "float_range", None), ("AllowedInstanceTypes", "list", "AllowedInstanceType"),
+    ("MaxSpotPriceAsPercentageOfOptimalOnDemandPrice", "int", None), ("BaselinePerformanceFactors", "bpf", None),
+    ("RequireEncryptionInTransit", "bool", None),
+)
+
+
+def _number(value, kind):
+    return float(value) if kind.startswith("float") else int(value)
+
+
+def _parse_instance_requirements(params, prefix):
+    base = f"{prefix}.InstanceRequirements"
+    out = {}
+    for member, kind, list_name in _INSTANCE_REQUIREMENTS:
+        if kind.endswith("_range"):
+            rng = {bound: _number(_p(params, f"{base}.{member}.{bound}"), kind)
+                   for bound in ("Min", "Max") if _p(params, f"{base}.{member}.{bound}")}
+            if rng or any(k.startswith(f"{base}.{member}") for k in params):
+                out[member] = rng
+        elif kind == "list":
+            items, i = [], 1
+            while _p(params, f"{base}.{list_name}.{i}"):
+                items.append(_p(params, f"{base}.{list_name}.{i}"))
+                i += 1
+            if items:
+                out[member] = items
+        elif kind == "bpf":
+            refs, i = [], 1
+            while _p(params, f"{base}.{member}.Cpu.Reference.{i}.InstanceFamily"):
+                refs.append({"InstanceFamily": _p(params, f"{base}.{member}.Cpu.Reference.{i}.InstanceFamily")})
+                i += 1
+            if refs:
+                out[member] = {"Cpu": {"References": refs}}
+        else:
+            value = _p(params, f"{base}.{member}")
+            if value:
+                out[member] = (value.lower() == "true" if kind == "bool"
+                               else int(value) if kind == "int" else value)
+    return out
+
+
+def _instance_requirements_xml(req):
+    xml = ""
+    for member, kind, list_name in _INSTANCE_REQUIREMENTS:
+        if member not in req:
+            continue
+        tag = member[0].lower() + member[1:]
+        value = req[member]
+        if kind.endswith("_range"):
+            inner = "".join(f"<{b.lower()}>{value[b]}</{b.lower()}>" for b in ("Min", "Max") if b in value)
+            xml += f"<{tag}>{inner}</{tag}>"
+        elif kind == "list":
+            inner = "".join(f"<item>{_esc(str(v))}</item>" for v in value)
+            set_tag = list_name[0].lower() + list_name[1:] + "Set"
+            xml += f"<{set_tag}>{inner}</{set_tag}>"
+        elif kind == "bpf":
+            refs = (value.get("Cpu") or {}).get("References") or []
+            inner = "".join(f"<item><instanceFamily>{_esc(r.get('InstanceFamily', ''))}</instanceFamily></item>"
+                            for r in refs)
+            xml += f"<{tag}><cpu><referenceSet>{inner}</referenceSet></cpu></{tag}>"
+        elif kind == "bool":
+            xml += f"<{tag}>{str(value).lower()}</{tag}>"
+        else:
+            xml += f"<{tag}>{_esc(str(value))}</{tag}>"
+    return xml
+
+
+_INSTANCE_TYPE_AND_REQUIREMENTS = ("Either the instance type or the instance requirements can be specified in "
+                                   "the request, but not both.")
+
+
 def _parse_lt_data(params, prefix="LaunchTemplateData"):
     """Extract LaunchTemplateData from EC2 Query API params."""
     data = {}
@@ -6559,6 +6643,9 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     shutdown = _p(params, f"{prefix}.InstanceInitiatedShutdownBehavior")
     if shutdown:
         data["InstanceInitiatedShutdownBehavior"] = shutdown
+    requirements = _parse_instance_requirements(params, prefix)
+    if requirements:
+        data["InstanceRequirements"] = requirements
     return data
 
 
@@ -6659,6 +6746,8 @@ def _lt_data_xml(data):
         xml += ("<instanceInitiatedShutdownBehavior>"
                 f"{_esc(data['InstanceInitiatedShutdownBehavior'])}"
                 "</instanceInitiatedShutdownBehavior>")
+    if data.get("InstanceRequirements"):
+        xml += f"<instanceRequirements>{_instance_requirements_xml(data['InstanceRequirements'])}</instanceRequirements>"
     return xml
 
 
@@ -6697,6 +6786,8 @@ def _create_launch_template(p):
                           f"Launch template name already in use: {name}", 400)
     lt_id = _new_lt_id()
     lt_data = _parse_lt_data(p)
+    if lt_data.get("InstanceType") and lt_data.get("InstanceRequirements"):
+        return _error("InvalidParameterCombination", _INSTANCE_TYPE_AND_REQUIREMENTS, 400)
     ver_desc = _p(p, "VersionDescription")
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     version = {
@@ -6765,6 +6856,8 @@ def _create_launch_template_version(p):
         return _error("InvalidLaunchTemplateId.NotFoundException",
                       "The specified launch template does not exist", 400)
     lt_data = _parse_lt_data(p)
+    if lt_data.get("InstanceType") and lt_data.get("InstanceRequirements"):
+        return _error("InvalidParameterCombination", _INSTANCE_TYPE_AND_REQUIREMENTS, 400)
     # Merge with source version if SourceVersion specified
     source_ver = _p(p, "SourceVersion")
     if source_ver:

@@ -933,3 +933,37 @@ def test_route53_list_hosted_zones_by_vpc_permission_contract(auth_enabled, iam_
         assert exc.value.response["Error"]["Code"] == "AccessDenied"
     else:
         assert "HostedZoneSummaries" in client.list_hosted_zones_by_vpc(**_VPC_A)
+
+
+def test_route53_invalid_change_batch_messages_follow_aws(r53):
+    """#2465, captured on AWS: duplicate CREATE and missing DELETE share the bracketed layout, the name always
+    carries its trailing dot, and a batch with a failing change applies nothing."""
+    from botocore.exceptions import ClientError
+
+    zone_name = f"r53-msg-{uuid.uuid4().hex[:8]}.example.test"
+    zone = r53.create_hosted_zone(Name=zone_name, CallerReference=uuid.uuid4().hex)["HostedZone"]["Id"]
+    a = {"Name": f"www.{zone_name}", "Type": "A", "TTL": 60, "ResourceRecords": [{"Value": "10.0.0.1"}]}
+    alias = {"Name": f"alias.{zone_name}", "Type": "A", "AliasTarget": {
+        "HostedZoneId": zone.split("/")[-1], "DNSName": f"www.{zone_name}", "EvaluateTargetHealth": False}}
+
+    def change(*changes):
+        return r53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={"Changes": list(changes)})
+
+    def refused(*changes):
+        with pytest.raises(ClientError) as exc:
+            change(*changes)
+        assert exc.value.response["Error"]["Code"] == "InvalidChangeBatch"
+        return exc.value.response["Error"]["Message"]
+
+    change({"Action": "CREATE", "ResourceRecordSet": a}, {"Action": "CREATE", "ResourceRecordSet": alias})
+    exists = f"[Tried to create resource record set [name='www.{zone_name}.', type='A'] but it already exists]"
+    assert refused({"Action": "CREATE", "ResourceRecordSet": a}) == exists
+    assert refused({"Action": "CREATE", "ResourceRecordSet": {**a, "Name": a["Name"] + "."}}) == exists
+    assert refused({"Action": "CREATE", "ResourceRecordSet": alias}) == (
+        f"[Tried to create resource record set [name='alias.{zone_name}.', type='A'] but it already exists]")
+    assert refused({"Action": "DELETE", "ResourceRecordSet": {**a, "Name": f"nope.{zone_name}"}}) == (
+        f"[Tried to delete resource record set [name='nope.{zone_name}.', type='A'] but it was not found]")
+    assert refused({"Action": "CREATE", "ResourceRecordSet": {**a, "Name": f"new.{zone_name}"}},
+                   {"Action": "CREATE", "ResourceRecordSet": a}) == exists
+    names = [r["Name"] for r in r53.list_resource_record_sets(HostedZoneId=zone)["ResourceRecordSets"]]
+    assert f"new.{zone_name}." not in names

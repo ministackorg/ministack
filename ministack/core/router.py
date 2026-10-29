@@ -1301,6 +1301,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         or path_lower.startswith("/apikeys")
         or path_lower.startswith("/usageplans")
         or path_lower.startswith("/domainnames")
+        or path_lower.startswith("/clientcertificates")
+        or path_lower.startswith("/domainnameaccessassociations")
+        or path_lower.startswith("/rejectdomainnameaccessassociations")
     ):
         return "apigateway"
     # Before the Lambda path check: both live on the Lambda endpoint, and an

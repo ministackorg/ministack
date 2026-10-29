@@ -690,7 +690,7 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
                 if existing:
                     return _error_response(
                         "InvalidChangeBatch",
-                        f"Tried to create resource record set {rs['Name']} type {rs['Type']} but it already exists.",
+                        f"[Tried to create resource record set [name='{rs['Name']}', type='{rs['Type']}'] but it already exists]",
                     )
                 current.append(rs)
 
@@ -698,8 +698,8 @@ def _change_resource_record_sets(zone_id: str, body: bytes):
                 if not existing:
                     return _error_response(
                         "InvalidChangeBatch",
-                        f"Tried to delete resource record set [name='{rs['Name']}', type='{rs['Type']}'] "
-                        "but it was not found",
+                        f"[Tried to delete resource record set [name='{rs['Name']}', type='{rs['Type']}'] "
+                        "but it was not found]",
                     )
                 if _rs_values(existing) != _rs_values(rs):
                     return _error_response(

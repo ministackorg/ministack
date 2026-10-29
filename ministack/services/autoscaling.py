@@ -21,6 +21,7 @@ Supports:
 import copy
 import logging
 import os
+import re
 import time
 from decimal import Decimal
 from xml.sax.saxutils import escape
@@ -183,7 +184,9 @@ def _reconcile_instances(asg):
         del instances[desired:]
         return
     azs = asg["AvailabilityZones"] or [f"{get_region()}a"]
-    launch_template = asg.get("LaunchTemplate") or {}
+    launch_template = (asg.get("LaunchTemplate")
+                       or ((asg.get("MixedInstancesPolicy") or {}).get("LaunchTemplate") or {}).get(
+                           "LaunchTemplateSpecification") or {})
     launch_config = asg.get("LaunchConfigurationName", "")
     while len(instances) < desired:
         instances.append({
@@ -198,17 +201,35 @@ def _reconcile_instances(asg):
         })
 
 
+def _missing_template_id_message(lt_id):
+    """AWS (captured) calls an unknown id malformed unless it is lt-<lowercase hex> shorter than 17 digits,
+    or one that exists in another region of the account, which are missing."""
+    from ministack.services import ec2
+
+    if re.fullmatch(r"lt-[0-9a-f]+", lt_id):
+        elsewhere = any(key[0] == get_account_id() and rec.get("LaunchTemplateId") == lt_id
+                        for key, rec in ec2._launch_templates.all_items())
+        if len(lt_id) - 3 < 17 or elsewhere:
+            return f"The specified launch template, with template ID {lt_id}, does not exist."
+    return f"Malformed launch template Id: {lt_id}"
+
+
 def resolve_launch_template(lt_id, lt_name, version=None):
     """(spec, error message): the group's LaunchTemplate with the EC2 template's id and name, and the version
-    as given (absent when not given), or AWS's ValidationError text (captured, us-east-1, 2026-10-28)."""
-    if not (lt_id or lt_name):
+    as given (absent when not given), or AWS's ValidationError text (captured, us-east-1, 2026-10-28/29)."""
+    if not (lt_id or lt_name or version):
         return {}, None
+    if bool(lt_id) == bool(lt_name):
+        return None, "Valid requests must contain either launchTemplateId or LaunchTemplateName"
+    if version and version not in ("$Default", "$Latest") and not version.isdigit():
+        return None, ("Invalid launch template version: either '$Default', '$Latest', or a numeric version "
+                      "are allowed.")
     from ministack.services import ec2
 
     if lt_id:
         record = ec2._launch_templates.get(lt_id)
         if not record:
-            return None, f"Malformed launch template Id: {lt_id}"
+            return None, _missing_template_id_message(lt_id)
     else:
         record = next((t for t in ec2._launch_templates.values() if t.get("LaunchTemplateName") == lt_name), None)
         if not record:
@@ -227,6 +248,97 @@ def _launch_template_spec(p):
     return resolve_launch_template(_p(p, "LaunchTemplate.LaunchTemplateId"),
                                    _p(p, "LaunchTemplate.LaunchTemplateName"),
                                    _p(p, "LaunchTemplate.Version"))
+
+
+_SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
+                 "MixedInstancesPolicy parameter.")
+_INSTANCES_DISTRIBUTION_DEFAULTS = {
+    "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+    "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 2,
+}
+
+
+def _model_shape(name):
+    import botocore.session
+
+    global _MODEL
+    if "_MODEL" not in globals():
+        _MODEL = botocore.session.get_session().get_service_model("autoscaling")
+    return _MODEL.shape_for(name)
+
+
+def _query_value(params, prefix, shape):
+    """A Query-protocol member under *prefix*, typed by its botocore shape, or None when absent."""
+    if shape.type_name == "structure":
+        out = {}
+        for member, member_shape in shape.members.items():
+            value = _query_value(params, f"{prefix}.{member}", member_shape)
+            if value is not None:
+                out[member] = value
+        return out or None
+    if shape.type_name == "list":
+        items, i = [], 1
+        while True:
+            value = _query_value(params, f"{prefix}.member.{i}", shape.member)
+            if value is None:
+                break
+            items.append(value)
+            i += 1
+        return items or None
+    if prefix not in params:
+        return None
+    raw = _p(params, prefix)
+    if shape.type_name == "integer":
+        return int(raw)
+    if shape.type_name in ("double", "float"):
+        return float(raw)
+    if shape.type_name == "boolean":
+        return raw.lower() == "true"
+    return raw
+
+
+def _shape_xml(value, shape):
+    if shape.type_name == "structure":
+        return "".join(f"<{k}>{_shape_xml(value[k], shape.members[k])}</{k}>" for k in shape.members if k in value)
+    if shape.type_name == "list":
+        return "".join(f"<member>{_shape_xml(v, shape.member)}</member>" for v in value)
+    if shape.type_name == "boolean":
+        return "true" if value else "false"
+    return escape(str(value))
+
+
+def resolve_mixed_instances_policy(policy):
+    """(policy, error message): the policy as AWS stores it, its launch templates resolved like a group's."""
+    lt = dict(policy.get("LaunchTemplate") or {})
+    spec = lt.get("LaunchTemplateSpecification") or {}
+    resolved, error = resolve_launch_template(spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"),
+                                              spec.get("Version"))
+    if error:
+        return None, error
+    lt["LaunchTemplateSpecification"] = resolved
+    overrides = []
+    for override in lt.get("Overrides") or []:
+        override = dict(override)
+        if override.get("LaunchTemplateSpecification"):
+            o_spec = override["LaunchTemplateSpecification"]
+            o_resolved, error = resolve_launch_template(o_spec.get("LaunchTemplateId"), o_spec.get("LaunchTemplateName"),
+                                                        o_spec.get("Version"))
+            if error:
+                return None, error
+            override["LaunchTemplateSpecification"] = o_resolved
+        overrides.append(override)
+    lt["Overrides"] = overrides
+    distribution = {**_INSTANCES_DISTRIBUTION_DEFAULTS, **(policy.get("InstancesDistribution") or {})}
+    return {"LaunchTemplate": lt, "InstancesDistribution": distribution}, None
+
+
+def _mixed_instances_policy(p):
+    policy = _query_value(p, "MixedInstancesPolicy", _model_shape("MixedInstancesPolicy"))
+    return resolve_mixed_instances_policy(policy) if policy else (None, None)
+
+
+def _has_member(p, name):
+    return any(k == name or k.startswith(name + ".") for k in p)
 
 
 def _launch_template_xml(lt):
@@ -267,9 +379,15 @@ def _create_asg(p):
         return _error("ValidationError", "AutoScalingGroupName is required")
     if name in _asgs:
         return _error("AlreadyExists", f"AutoScalingGroup {name} already exists")
+    sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")]
+    if all(sources) or not (any(sources) or _p(p, "LaunchConfigurationName") or _p(p, "InstanceId")):
+        return _error("ValidationError", _SOURCE_ERROR)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
+    mixed, mixed_error = _mixed_instances_policy(p)
+    if mixed_error:
+        return _error("ValidationError", mixed_error)
 
     arn = _asg_arn(name)
     _asgs[name] = {
@@ -296,6 +414,8 @@ def _create_asg(p):
 
     if launch_template:
         _asgs[name]["LaunchTemplate"] = launch_template
+    if mixed:
+        _asgs[name]["MixedInstancesPolicy"] = mixed
 
     # Parse tags
     i = 1
@@ -334,7 +454,10 @@ def _describe_asgs(p):
         )
         lt = asg.get("LaunchTemplate", {})
         lt_xml = ""
-        if lt:
+        if asg.get("MixedInstancesPolicy"):
+            lt_xml = (f"<MixedInstancesPolicy>{_shape_xml(asg['MixedInstancesPolicy'], _model_shape('MixedInstancesPolicy'))}"
+                      f"</MixedInstancesPolicy>")
+        elif lt:
             lt_xml = _launch_template_xml(lt)
         members += (f"<member>"
                     f"<AutoScalingGroupName>{name}</AutoScalingGroupName>"
@@ -364,9 +487,19 @@ def _update_asg(p):
     asg = _asgs.get(name)
     if not asg:
         return _error("ValidationError", f"AutoScalingGroup {name} not found")
+    if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
+        return _error("ValidationError", _SOURCE_ERROR)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
+    mixed, mixed_error = _mixed_instances_policy(p)
+    if mixed_error:
+        return _error("ValidationError", mixed_error)
+    if mixed:
+        asg["MixedInstancesPolicy"] = mixed
+        asg["LaunchTemplate"] = {}
+    elif launch_template:
+        asg.pop("MixedInstancesPolicy", None)
     for k, pk in [("MinSize", "MinSize"), ("MaxSize", "MaxSize"), ("DesiredCapacity", "DesiredCapacity"),
                    ("DefaultCooldown", "DefaultCooldown"), ("HealthCheckGracePeriod", "HealthCheckGracePeriod")]:
         v = _p(p, pk)

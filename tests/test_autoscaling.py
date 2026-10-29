@@ -88,6 +88,7 @@ def test_autoscaling_groups_and_tags_are_region_scoped():
         MinSize=1,
         MaxSize=3,
         AvailabilityZones=["us-east-1a"],
+        LaunchConfigurationName="dummy-lc",
         Tags=[{"Key": "region", "Value": "east", "PropagateAtLaunch": True}],
     )
     west.create_auto_scaling_group(
@@ -95,6 +96,7 @@ def test_autoscaling_groups_and_tags_are_region_scoped():
         MinSize=2,
         MaxSize=4,
         AvailabilityZones=["us-west-2a"],
+        LaunchConfigurationName="dummy-lc",
         Tags=[{"Key": "region", "Value": "west", "PropagateAtLaunch": True}],
     )
     try:
@@ -1406,6 +1408,54 @@ def test_asg_launch_template_errors_and_version_follow_aws(autoscaling, ec2):
         ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
 
 
+def test_asg_mixed_instances_policy_follows_aws(autoscaling, ec2):
+    """#2452, captured on AWS (us-east-1, 2026-10-29): a MixedInstancesPolicy is kept with its launch
+    template resolved, AWS's InstancesDistribution defaults and Overrides [] when none; the group has no
+    LaunchTemplate; both or no launch source is refused."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-mix"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    base = dict(MinSize=0, MaxSize=0, DesiredCapacity=0, AvailabilityZones=["us-east-1a"])
+    defaults = {"OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+                "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price",
+                "SpotInstancePools": 2}
+    groups = []
+    try:
+        for suffix, policy, expected in (
+                ("min", {"LaunchTemplate": {
+                    "LaunchTemplateSpecification": {"LaunchTemplateName": lt["LaunchTemplateName"], "Version": "$Default"},
+                    "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]}},
+                 {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                     "LaunchTemplateId": lt["LaunchTemplateId"], "LaunchTemplateName": lt["LaunchTemplateName"],
+                     "Version": "$Default"}, "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]},
+                  "InstancesDistribution": defaults}),
+                ("id", {"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt["LaunchTemplateId"]}},
+                        "InstancesDistribution": {"OnDemandPercentageAboveBaseCapacity": 50}},
+                 {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                     "LaunchTemplateId": lt["LaunchTemplateId"], "LaunchTemplateName": lt["LaunchTemplateName"]},
+                     "Overrides": []},
+                  "InstancesDistribution": {**defaults, "OnDemandPercentageAboveBaseCapacity": 50}})):
+            name = _uid(f"asg-mix-{suffix}")
+            autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy=policy, **base)
+            groups.append(name)
+            group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
+            assert group["MixedInstancesPolicy"] == expected
+            assert "LaunchTemplate" not in group
+
+        message = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
+                   "MixedInstancesPolicy parameter.")
+        for kwargs in ({"LaunchTemplate": {"LaunchTemplateId": lt["LaunchTemplateId"]},
+                        "MixedInstancesPolicy": {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                            "LaunchTemplateId": lt["LaunchTemplateId"]}}}}, {}):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-mix-bad"), **base, **kwargs)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "ValidationError", message)
+    finally:
+        for name in groups:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
 # ---------------------------------------------------------------------------
 # Instance Refresh
 # ---------------------------------------------------------------------------
@@ -1576,3 +1626,55 @@ def test_asg_instances_round_robin_azs(autoscaling):
         assert azs == ["us-east-1a", "us-east-1b", "us-east-1a", "us-east-1b"]
     finally:
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_asg_launch_template_request_validation_follows_aws(autoscaling, ec2):
+    """#2482, captured on AWS: both or neither of id and name, a non-numeric version, a short lt- id and
+    another region's id answer AWS's ValidationError messages; malformed ids keep theirs."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-2482"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    import boto3
+    from conftest import ENDPOINT
+
+    west = boto3.client("ec2", endpoint_url=ENDPOINT, region_name="us-west-2",
+                        aws_access_key_id="test", aws_secret_access_key="test")
+    west_lt = west.create_launch_template(LaunchTemplateName=_uid("lt-2482-west"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    asg = _uid("asg-2482")
+    either = "Valid requests must contain either launchTemplateId or LaunchTemplateName"
+    cases = [
+        ({"LaunchTemplateId": lt["LaunchTemplateId"], "LaunchTemplateName": lt["LaunchTemplateName"]}, either),
+        ({"Version": "1"}, either),
+        ({"LaunchTemplateId": lt["LaunchTemplateId"], "Version": "abc"},
+         "Invalid launch template version: either '$Default', '$Latest', or a numeric version are allowed."),
+        ({"LaunchTemplateId": "lt-0123"}, "The specified launch template, with template ID lt-0123, does not exist."),
+        ({"LaunchTemplateId": west_lt["LaunchTemplateId"]},
+         f"The specified launch template, with template ID {west_lt['LaunchTemplateId']}, does not exist."),
+        ({"LaunchTemplateId": lt["LaunchTemplateName"]}, f"Malformed launch template Id: {lt['LaunchTemplateName']}"),
+        ({"LaunchTemplateId": "bogus"}, "Malformed launch template Id: bogus"),
+        ({"LaunchTemplateId": "lt-0123456789abcdef0"}, "Malformed launch template Id: lt-0123456789abcdef0"),
+        # Captured 2026-10-29: 17 or more digits, or not lowercase hex, is malformed whatever the length.
+        ({"LaunchTemplateId": "lt-0fedcba98765432100"}, "Malformed launch template Id: lt-0fedcba98765432100"),
+        ({"LaunchTemplateId": "lt-0123456789abcdef0123"}, "Malformed launch template Id: lt-0123456789abcdef0123"),
+        ({"LaunchTemplateId": "LT-0123456789ABCDEF0"}, "Malformed launch template Id: LT-0123456789ABCDEF0"),
+    ]
+    try:
+        for spec, message in cases:
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                                      AvailabilityZones=["us-east-1a"], LaunchTemplate=spec)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "ValidationError", message), spec
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                              AvailabilityZones=["us-east-1a"],
+                                              LaunchTemplate={"LaunchTemplateId": lt["LaunchTemplateId"]})
+        with pytest.raises(ClientError) as exc:
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=asg, LaunchTemplate={"Version": "1"})
+        assert exc.value.response["Error"]["Message"] == either
+    finally:
+        try:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        except ClientError:
+            pass
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+        west.delete_launch_template(LaunchTemplateId=west_lt["LaunchTemplateId"])

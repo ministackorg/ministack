@@ -3215,3 +3215,43 @@ def test_elbv2_dataplane_applies_the_listeners_cors_response_headers(elbv2):
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _stop_server(server)
+
+
+def test_elbv2_listener_certificates_follow_aws(elbv2, tls_lb):
+    """#2459, captured on AWS: extra listener certificates are added one per call, listed before the default one,
+    and the default is never added twice or removed."""
+    from conftest import make_client
+
+    acm = make_client("acm")
+    c0, c1, c2 = (acm.request_certificate(DomainName=f"c{i}-{_uuid_mod.uuid4().hex[:6]}.example.com")["CertificateArn"]
+                  for i in range(3))
+    listener = elbv2.create_listener(
+        LoadBalancerArn=tls_lb(), Protocol="HTTPS", Port=443,
+        Certificates=[{"CertificateArn": c0}], DefaultActions=_TLS_ACTION)["Listeners"][0]["ListenerArn"]
+
+    def listed():
+        return elbv2.describe_listener_certificates(ListenerArn=listener)["Certificates"]
+
+    assert listed() == [{"CertificateArn": c0, "IsDefault": True}]
+    with pytest.raises(ClientError) as exc:
+        elbv2.add_listener_certificates(ListenerArn=listener,
+                                        Certificates=[{"CertificateArn": c1}, {"CertificateArn": c2}])
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "ValidationError", "Up to '1' certificate ARNs can be specified, but '2' were specified")
+    missing = c1.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ClientError) as exc:
+        elbv2.add_listener_certificates(ListenerArn=listener, Certificates=[{"CertificateArn": missing}])
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "CertificateNotFound", f"Certificate '{missing}' not found")
+
+    for cert in (c1, c1, c0, c2):
+        added = elbv2.add_listener_certificates(ListenerArn=listener, Certificates=[{"CertificateArn": cert}])
+        assert added["Certificates"] == [{"CertificateArn": cert, "IsDefault": False}]
+    assert listed() == [{"CertificateArn": c1, "IsDefault": False}, {"CertificateArn": c2, "IsDefault": False},
+                        {"CertificateArn": c0, "IsDefault": True}]
+
+    for cert in (c0, missing, c2):
+        elbv2.remove_listener_certificates(ListenerArn=listener, Certificates=[{"CertificateArn": cert}])
+    assert listed() == [{"CertificateArn": c1, "IsDefault": False}, {"CertificateArn": c0, "IsDefault": True}]
+    assert elbv2.describe_listeners(ListenerArns=[listener])["Listeners"][0]["Certificates"] == [
+        {"CertificateArn": c0}]

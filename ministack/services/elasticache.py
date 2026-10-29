@@ -568,6 +568,24 @@ def _record_auth(record):
     return tokens[-1] if tokens and not record.get("_auth_optional") else None
 
 
+_port_counter_lock = _threading.Lock()
+
+
+def _next_host_port():
+    """The next host port from the counter that no other process holds, so a docker run
+    does not fail with "port is already allocated"."""
+    from ministack.services.rds import _is_host_port_free
+
+    with _port_counter_lock:
+        port = _port_counter[0]
+        for _ in range(1000):
+            if _is_host_port_free(port):
+                break
+            port += 1
+        _port_counter[0] = port + 1
+        return port
+
+
 def _spawn_redis_container(name, engine, engine_version, labels, transit=False, auth_token=None):
     """Start a redis/valkey/memcached container.
 
@@ -581,8 +599,7 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
     if not docker_client:
         return REDIS_DEFAULT_HOST, default_port, None
 
-    host_port = _port_counter[0]
-    _port_counter[0] += 1
+    host_port = _next_host_port()
     endpoint_host = _MINISTACK_HOST
     endpoint_port = host_port
 
@@ -2529,8 +2546,7 @@ def _create_serverless_cache(p):
         return _error("InvalidParameterValue", "Invalid numeric parameter value.", 400)
 
     arn = _arn_serverless_cache(name)
-    host_port = _port_counter[0]
-    _port_counter[0] += 1
+    host_port = _next_host_port()
     record = {
         "ServerlessCacheName": name,
         "Description": _p(p, "Description"),
@@ -2775,6 +2791,37 @@ def _arn_user_group(group_id):
     return f"arn:aws:elasticache:{get_region()}:{get_account_id()}:usergroup:{group_id}"
 
 
+def _user_authentication(p, user_id, user_name, engine):
+    """(Authentication, error) from AuthenticationMode or the legacy Passwords / NoPasswordRequired."""
+    passwords = [v for k, v in sorted(p.items()) if v and (
+        k.startswith("Passwords.member.") or k.startswith("AuthenticationMode.Passwords.member."))]
+    mode = _p(p, "AuthenticationMode.Type")
+    if mode == "iam":
+        if user_name != user_id:
+            return None, _error("InvalidParameterCombination",
+                                "User Id and User name must be same for authentication type: iam", 400)
+        if passwords:
+            return None, _error("InvalidParameterCombination",
+                                "Password field is not allowed with authentication type: iam", 400)
+        return {"Type": "iam"}, None
+    if mode == "no-password-required" or _p(p, "NoPasswordRequired") == "true":
+        if engine == "valkey":
+            return None, _error("InvalidParameterCombination",
+                                "No-password-required is not allowed for a user with engine Valkey", 400)
+        return {"Type": "no-password", "PasswordCount": 0}, None
+    if passwords:
+        return {"Type": "password", "PasswordCount": len(passwords)}, None
+    return None, None
+
+
+def _minimum_engine_version(user):
+    if user.get("Engine") == "valkey":
+        return "7.2"
+    if user.get("Authentication", {}).get("Type") == "iam":
+        return "7.0"
+    return None
+
+
 def _create_user(p):
     user_id = _p(p, "UserId")
     if not user_id:
@@ -2782,15 +2829,20 @@ def _create_user(p):
     if user_id in _users:
         return _error("UserAlreadyExists", f"User {user_id} already exists", 400)
 
+    user_name = _p(p, "UserName") or user_id
+    engine = _p(p, "Engine") or "redis"
+    auth, err = _user_authentication(p, user_id, user_name, engine)
+    if err:
+        return err
     arn = _arn_user(user_id)
     user = {
         "UserId": user_id,
-        "UserName": _p(p, "UserName") or user_id,
-        "Engine": _p(p, "Engine") or "redis",
+        "UserName": user_name,
+        "Engine": engine,
         "Status": "active",
         "AccessString": _p(p, "AccessString") or "on ~* +@all",
         "UserGroupIds": [],
-        "Authentication": {"Type": "password", "PasswordCount": 1} if _p(p, "Passwords.member.1") else {"Type": "no-password", "PasswordCount": 0},
+        "Authentication": auth or {"Type": "no-password", "PasswordCount": 0},
         "ARN": arn,
     }
     _users[user_id] = user
@@ -2835,12 +2887,17 @@ def _modify_user(p):
     if not user:
         return _error("UserNotFound", f"User {user_id} not found", 404)
 
+    auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
+    if err:
+        return err
     if _p(p, "AccessString"):
         user["AccessString"] = _p(p, "AccessString")
-    if _p(p, "Passwords.member.1"):
-        user["Authentication"] = {"Type": "password", "PasswordCount": 1}
+    if auth:
+        user["Authentication"] = auth
 
-    return _xml(200, "ModifyUserResponse", f"<ModifyUserResult>{_user_xml(user)}</ModifyUserResult>")
+    # AWS answers a modify with the user still modifying; MiniStack settles at once.
+    return _xml(200, "ModifyUserResponse",
+                f"<ModifyUserResult>{_user_xml({**user, 'Status': 'modifying'})}</ModifyUserResult>")
 
 
 def _create_user_group(p):
@@ -2955,8 +3012,12 @@ def _user_xml(u):
         f"<Status>{u.get('Status', 'active')}</Status>"
         f"<AccessString>{u.get('AccessString', '')}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
-        f"<Authentication><Type>{auth.get('Type', 'no-password')}</Type>"
-        f"<PasswordCount>{auth.get('PasswordCount', 0)}</PasswordCount></Authentication>"
+        + (f"<MinimumEngineVersion>{_minimum_engine_version(u)}</MinimumEngineVersion>"
+           if _minimum_engine_version(u) else "")
+        + f"<Authentication><Type>{auth.get('Type', 'no-password')}</Type>"
+        + (f"<PasswordCount>{auth['PasswordCount']}</PasswordCount>" if "PasswordCount" in auth
+           else "" if auth.get("Type") == "iam" else "<PasswordCount>0</PasswordCount>")
+        + "</Authentication>"
         f"<ARN>{u.get('ARN', '')}</ARN>"
     )
 

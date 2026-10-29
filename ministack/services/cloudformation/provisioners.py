@@ -12502,12 +12502,34 @@ def _asg_create(logical_id, props, stack_name):
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
+def _asg_mixed_instances_policy(policy):
+    from ministack.services.autoscaling import resolve_mixed_instances_policy
+
+    if not policy:
+        return None
+    distribution = dict(policy.get("InstancesDistribution") or {})
+    for key in ("OnDemandBaseCapacity", "OnDemandPercentageAboveBaseCapacity", "SpotInstancePools"):
+        if key in distribution:
+            distribution[key] = int(distribution[key])
+    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution})
+    if error:
+        raise ValueError(error)
+    return resolved
+
+
 def _asg_fields(props):
     """The group members a template sets, for create and update alike."""
+    from ministack.services.autoscaling import _SOURCE_ERROR
+
+    has_lt, has_mixed = bool(props.get("LaunchTemplate")), bool(props.get("MixedInstancesPolicy"))
+    if (has_lt and has_mixed) or not (has_lt or has_mixed or props.get("LaunchConfigurationName")
+                                      or props.get("InstanceId")):
+        raise ValueError(_SOURCE_ERROR)
     zone_id = props.get("VPCZoneIdentifier", "")
     return {
         "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
         "LaunchTemplate": _asg_launch_template(props.get("LaunchTemplate")),
+        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy")),
         "MinSize": int(props.get("MinSize", 0)),
         "MaxSize": int(props.get("MaxSize", 0)),
         "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
@@ -12526,7 +12548,8 @@ def _asg_launch_template(spec):
 
     spec = spec or {}
     resolved, error = resolve_launch_template(
-        spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"), spec.get("Version"))
+        spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"),
+        None if spec.get("Version") is None else str(spec["Version"]))
     if error:
         raise ValueError(error)
     return resolved

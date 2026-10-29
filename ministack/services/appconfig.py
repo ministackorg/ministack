@@ -416,18 +416,13 @@ def _cross_account_secret_error(secret_id, location_uri, role_arn):
 
 
 def _kms_key_fields(identifier):
-    """KmsKeyIdentifier as given and, when MiniStack's KMS holds the key, its KmsKeyArn."""
-    fields = {"KmsKeyIdentifier": identifier}
-    try:
-        spec = parse_arn(identifier)
-        scope = request_scope(spec.account_id, spec.region)
-    except ArnParseError:
-        scope = request_scope(get_account_id(), get_region())
-    with scope:
-        key = kms._resolve_key(identifier)
-    if key and key.get("Arn"):
-        fields["KmsKeyArn"] = key["Arn"]
-    return fields
+    """KmsKeyIdentifier and the KmsKeyArn AWS derives from it as given, without looking the key up."""
+    if identifier.startswith("arn:"):
+        arn = identifier
+    else:
+        prefix = f"arn:aws:kms:{get_region()}:{get_account_id()}:"
+        arn = prefix + (identifier if identifier.startswith("alias/") else f"key/{identifier}")
+    return {"KmsKeyIdentifier": identifier, "KmsKeyArn": arn}
 
 
 def _is_customer_managed_key(key_id):
@@ -637,6 +632,9 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type,
     }
     if version_label:
         record["VersionLabel"] = version_label
+    kms_key_arn = _config_profiles[f"{app_id}/{profile_id}"].get("KmsKeyArn")
+    if kms_key_arn:
+        record["KmsKeyArn"] = kms_key_arn
     _hosted_versions[f"{app_id}/{profile_id}/{version_number}"] = record
     logger.info("CreateHostedConfigurationVersion: %s/%s v%d", app_id, profile_id, version_number)
 
@@ -650,6 +648,8 @@ def _create_hosted_configuration_version(app_id, profile_id, body, content_type,
         resp_headers["VersionLabel"] = version_label
     if description:
         resp_headers["Description"] = description
+    if kms_key_arn:
+        resp_headers["KmsKeyArn"] = kms_key_arn
     return 201, resp_headers, body if isinstance(body, bytes) else body.encode("utf-8")
 
 
@@ -670,6 +670,8 @@ def _get_hosted_configuration_version(app_id, profile_id, version_number):
         resp_headers["VersionLabel"] = record["VersionLabel"]
     if record.get("Description"):
         resp_headers["Description"] = record["Description"]
+    if record.get("KmsKeyArn"):
+        resp_headers["KmsKeyArn"] = record["KmsKeyArn"]
     return 200, resp_headers, content if isinstance(content, bytes) else content.encode("utf-8")
 
 
@@ -687,6 +689,7 @@ def _list_hosted_configuration_versions(app_id, profile_id, query):
                 "ContentType": v["ContentType"],
                 "Description": v.get("Description", ""),
                 **({"VersionLabel": v["VersionLabel"]} if v.get("VersionLabel") else {}),
+                **({"KmsKeyArn": v["KmsKeyArn"]} if v.get("KmsKeyArn") else {}),
             })
     return _json(200, {"Items": items[:max_results]})
 
@@ -1149,6 +1152,46 @@ def _deployed_secret_content(secret_id, location_uri, version, body, role_arn=""
 _DEPLOYMENT_STRATEGY_ID_PATTERN = r"(^[a-z0-9]{4,7}$|^AppConfig\.[A-Za-z0-9]{9,40}$)"
 
 
+def _kms_error(message, code):
+    return _error(400, "BadRequestException",
+                  f"{message} (Service: AWSKMS; Status Code: 400; Error Code: {code}; "
+                  f"Request ID: {uuid.uuid4()}; Proxy: null)")
+
+
+def _hosted_version_key_error(key_identifier, caller_arn):
+    """StartDeployment of a hosted version encrypted with a customer managed key (captured on AWS)."""
+    if not key_identifier:
+        return _error(400, "BadRequestException",
+                      "KmsKeyIdentifier required when deploying a hosted configuration version that is "
+                      "encrypted with a customer managed key (CMK)")
+    try:
+        spec = parse_arn(key_identifier)
+        scope = (spec.account_id, spec.region)
+    except ArnParseError:
+        scope = (get_account_id(), get_region())
+    if scope[0] != get_account_id():
+        return _kms_error(
+            f"User: {caller_arn} is not authorized to perform: kms:GenerateDataKey on this resource because the "
+            "resource does not exist in this Region, no resource-based policies allow access, or a resource-based "
+            "policy explicitly denies access", "AccessDeniedException")
+    with request_scope(*scope):
+        key = kms._resolve_key(key_identifier)
+    if key is None:
+        return _kms_error(f"Key '{key_identifier}' does not exist", "NotFoundException")
+    if key.get("KeyState") == "Disabled" or key.get("Enabled") is False:
+        return _kms_error(f"{key_identifier} is disabled.", "DisabledException")
+    return None
+
+
+def _caller_arn(headers):
+    from ministack.services import sts
+
+    identity = sts._caller_identity(headers or {})
+    if isinstance(identity, dict) and identity.get("userArn"):
+        return identity["userArn"]
+    return f"arn:aws:iam::{get_account_id()}:root"
+
+
 def _start_deployment_validation_errors(body):
     """StartDeployment's member constraints, listed in the order AWS reports them."""
     errors = []
@@ -1174,7 +1217,7 @@ def _start_deployment_validation_errors(body):
     return errors
 
 
-def _start_deployment(app_id, env_id, body):
+def _start_deployment(app_id, env_id, body, caller_arn=None):
     err = _string_member_type_error(body, ("ConfigurationVersion", "KmsKeyIdentifier", "ConfigurationProfileId",
                                            "DeploymentStrategyId", "Description"))
     if err:
@@ -1211,6 +1254,11 @@ def _start_deployment(app_id, env_id, body):
     if secret_id is not None:
         role_arn = _config_profiles[f"{app_id}/{profile_id}"].get("RetrievalRoleArn", "")
         secret_content, err = _deployed_secret_content(secret_id, location_uri, version, body, role_arn)
+        if err:
+            return err
+    elif _hosted_versions.get(f"{app_id}/{profile_id}/{version}", {}).get("KmsKeyArn"):
+        err = _hosted_version_key_error(body.get("KmsKeyIdentifier"),
+                                        caller_arn or f"arn:aws:iam::{get_account_id()}:root")
         if err:
             return err
 
@@ -1274,9 +1322,10 @@ def _list_deployments(app_id, env_id, query):
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
     max_results = int(query.get("max_results", 50))
     items = []
-    for v in _refresh_environment(app_id, env_id):
+    for v in reversed(_refresh_environment(app_id, env_id)):
         item = {
             "DeploymentNumber": v["DeploymentNumber"],
+            "ConfigurationProfileId": v.get("ConfigurationProfileId", ""),
             "ConfigurationName": v.get("ConfigurationName", ""),
             "ConfigurationVersion": v.get("ConfigurationVersion", ""),
             "DeploymentDurationInMinutes": v.get("DeploymentDurationInMinutes", 0),
@@ -1286,6 +1335,7 @@ def _list_deployments(app_id, env_id, query):
             "State": v.get("State", "COMPLETE"),
             "PercentageComplete": v.get("PercentageComplete", 100.0),
             "StartedAt": v.get("StartedAt", ""),
+            "Type": "USER",
         }
         for optional in ("CompletedAt", "VersionLabel"):
             if v.get(optional):
@@ -1403,6 +1453,9 @@ def _resolve_tag_resource_arn(resource_arn):
 
 
 def _tag_resource(resource_arn, body):
+    err = _tag_arn_account_error(resource_arn)
+    if err:
+        return err
     resource_arn, err = _resolve_tag_resource_arn(resource_arn)
     if err:
         return err
@@ -1412,6 +1465,9 @@ def _tag_resource(resource_arn, body):
 
 
 def _untag_resource(resource_arn, tag_keys):
+    err = _tag_arn_account_error(resource_arn)
+    if err:
+        return err
     resource_arn, err = _resolve_tag_resource_arn(resource_arn)
     if err:
         return err
@@ -1421,7 +1477,28 @@ def _untag_resource(resource_arn, tag_keys):
     return _json(204, {})
 
 
+def _tag_arn_account_error(resource_arn):
+    """The tag APIs' answer for an AppConfig ARN without this account (captured on AWS)."""
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None
+    if spec.service != "appconfig":
+        return None
+    if not spec.account_id:
+        return _error(400, "BadRequestException",
+                      f"ARN {resource_arn} is invalid due to not containing an account ID.")
+    if spec.account_id != get_account_id():
+        return _error(403, "AccessDeniedException",
+                      f"Cross-account resources are not permitted for this API. ARN {resource_arn} references "
+                      f"a resource outside of account {get_account_id()}.")
+    return None
+
+
 def _list_tags_for_resource(resource_arn):
+    err = _tag_arn_account_error(resource_arn)
+    if err:
+        return err
     resource_arn, err = _resolve_tag_resource_arn(resource_arn)
     if err:
         return err
@@ -1663,7 +1740,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if m:
         app_id, env_id = m.group(1), m.group(2)
         if method == "POST":
-            return await _a(_start_deployment(app_id, env_id, body))
+            return await _a(_start_deployment(app_id, env_id, body, _caller_arn(headers)))
         if method == "GET":
             return await _a(_list_deployments(app_id, env_id, query))
 

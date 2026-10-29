@@ -5801,3 +5801,54 @@ def test_eventbridge_api_destination_dynamic_http_parameters_use_original_event(
     finally:
         server.shutdown()
 
+
+
+def test_eventbridge_put_permission_policy_follows_aws(eb):
+    """#2461, captured on AWS (us-east-1, 2026-10-29): a Policy replaces the bus's policy and DescribeEventBus
+    returns it compact; malformed, foreign-resource and mixed requests are refused; the legacy form stores the
+    account as its root ARN."""
+    import json as _json
+    import uuid as _uuid
+
+    from botocore.exceptions import ClientError
+
+    bus = f"perm-policy-{_uuid.uuid4().hex[:8]}"
+    arn = eb.create_event_bus(Name=bus)["EventBusArn"]
+    account = arn.split(":")[4]
+
+    def stmt(sid):
+        return {"Sid": sid, "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:root"},
+                "Action": "events:PutEvents", "Resource": arn}
+
+    def policy(*statements):
+        return _json.dumps({"Version": "2012-10-17", "Statement": list(statements)}, indent=2)
+
+    def described():
+        return eb.describe_event_bus(Name=bus)["Policy"]
+
+    def refused(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            eb.put_permission(EventBusName=bus, **kwargs)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+        return exc.value.response["Error"]["Message"]
+
+    try:
+        eb.put_permission(EventBusName=bus, Policy=policy(stmt("A"), stmt("B")))
+        assert described() == _json.dumps({"Version": "2012-10-17", "Statement": [stmt("A"), stmt("B")]},
+                                          separators=(",", ":"))
+        eb.put_permission(EventBusName=bus, Policy=policy(stmt("C")))
+        assert _json.loads(described())["Statement"] == [stmt("C")]
+
+        assert refused(Policy="not json") == "This policy contains invalid Json"
+        other = arn + "-other"
+        assert refused(Policy=policy({**stmt("D"), "Resource": other})) == (
+            f'The relative-id "event-bus/{bus}-other" is invalid for ARN "{other}"')
+        assert refused(Policy=policy(stmt("E")), StatementId="E", Action="events:PutEvents", Principal=account) == (
+            "Action, Principal, StatementId and Condition could not be combined with Policy parameter.")
+
+        eb.remove_permission(EventBusName=bus, RemoveAllPermissions=True)
+        assert "Policy" not in eb.describe_event_bus(Name=bus)
+        eb.put_permission(EventBusName=bus, Action="events:PutEvents", Principal=account, StatementId="legacy")
+        assert _json.loads(described())["Statement"] == [stmt("legacy")]
+    finally:
+        eb.delete_event_bus(Name=bus)

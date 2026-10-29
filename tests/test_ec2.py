@@ -4754,3 +4754,43 @@ def test_ec2_describe_instances_validates_id_format_before_existence(ec2):
     with pytest.raises(ClientError) as exc:
         ec2.describe_instances(InstanceIds=["i-00000000000000000"])
     assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"
+
+
+def test_ec2_launch_template_keeps_instance_requirements(ec2):
+    """#2454, captured on AWS: InstanceRequirements come back exactly as given, and InstanceType with
+    InstanceRequirements is refused."""
+    import uuid as _uuid
+
+    req = {"VCpuCount": {"Min": 2}, "MemoryMiB": {"Min": 4096}, "AllowedInstanceTypes": ["m5.*", "c5.*"]}
+    name = f"lt-ir-{_uuid.uuid4().hex[:8]}"
+    lt = ec2.create_launch_template(LaunchTemplateName=name, LaunchTemplateData={
+        "ImageId": "ami-12345678", "InstanceRequirements": req})["LaunchTemplate"]
+    try:
+        data = ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"])[
+            "LaunchTemplateVersions"][0]["LaunchTemplateData"]
+        assert data == {"ImageId": "ami-12345678", "InstanceRequirements": req}
+        full = {"VCpuCount": {"Min": 1, "Max": 8}, "MemoryMiB": {"Min": 512, "Max": 16384},
+                "CpuManufacturers": ["intel"], "MemoryGiBPerVCpu": {"Min": 0.5, "Max": 4.0},
+                "ExcludedInstanceTypes": ["t2.*"], "InstanceGenerations": ["current"],
+                "SpotMaxPricePercentageOverLowestPrice": 50, "BareMetal": "excluded",
+                "BurstablePerformance": "included", "RequireHibernateSupport": False,
+                "NetworkInterfaceCount": {"Min": 1}, "LocalStorage": "required", "LocalStorageTypes": ["ssd"],
+                "TotalLocalStorageGB": {"Min": 10.0}, "AcceleratorCount": {"Max": 0},
+                "BaselinePerformanceFactors": {"Cpu": {"References": [{"InstanceFamily": "c6i"}]}}}
+        ec2.create_launch_template_version(LaunchTemplateId=lt["LaunchTemplateId"],
+                                           LaunchTemplateData={"ImageId": "ami-12345678", "InstanceRequirements": full})
+        v2 = ec2.describe_launch_template_versions(LaunchTemplateId=lt["LaunchTemplateId"], Versions=["2"])[
+            "LaunchTemplateVersions"][0]["LaunchTemplateData"]
+        assert v2["InstanceRequirements"] == full
+        for call in (lambda: ec2.create_launch_template(LaunchTemplateName=f"{name}-both", LaunchTemplateData={
+                         "ImageId": "ami-12345678", "InstanceType": "t3.micro", "InstanceRequirements": req}),
+                     lambda: ec2.create_launch_template_version(LaunchTemplateId=lt["LaunchTemplateId"],
+                                                                LaunchTemplateData={"InstanceType": "t3.micro",
+                                                                                    "InstanceRequirements": req})):
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+            assert exc.value.response["Error"]["Message"] == (
+                "Either the instance type or the instance requirements can be specified in the request, but not both.")
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])

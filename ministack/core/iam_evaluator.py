@@ -800,6 +800,9 @@ _RESOURCE_POLICY_LOOKUPS = {
 # A key policy must allow even the owner's own users and roles.
 _POLICY_REQUIRED = frozenset({"kms"})
 
+# What the bucket owner's root can still do when the bucket policy denies everyone.
+_ROOT_BUCKET_POLICY_ACTIONS = frozenset({"s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"})
+
 
 def _resource_policy(service: str, resource_arn: str) -> tuple | None:
     """The request resource's own policy and owner account, when its service keeps one."""
@@ -1687,13 +1690,28 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     if isinstance(principal, AuthError):
         return principal
 
-    # Root principal: allow everything
-    if principal.policies is None:
-        return None
-
     context = {key.lower(): value for key, value in (service_context or {}).items()}
     # A request that names no tags has no aws:TagKeys.
     context.setdefault("aws:tagkeys", None)
+
+    # Root principal: no identity policy limits it, but an explicit Deny in a bucket policy does,
+    # except on the bucket policy itself for the bucket owner's root (captured on AWS).
+    if principal.policies is None:
+        if service != "s3" or "s3:dataaccesspointarn" in context:
+            return None
+        found = _resource_policy(service, resource_arn)
+        if found is None or (iam_action in _ROOT_BUCKET_POLICY_ACTIONS and found[1] in (None, principal.account)):
+            return None
+        root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
+                               principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
+                               region=region, service_context=context, principal_keys=principal.keys)
+        denied = evaluate_resource_policy(found[0], root_ctx)
+        if denied.decision != "Deny":
+            return None
+        denied.resource_policy_arn = resource_arn
+        denied.principal_arn = principal.arn
+        return denied
+
     if _names_condition_key(principal.policies, "aws:resourcetag/"):
         from ministack.services.tagging import resource_tags
         for name, value in (resource_tags(resource_arn) or {}).items():
