@@ -810,6 +810,17 @@ def _function_etag():
     return "E" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(13))
 
 
+def _function_version_etag(fn, version):
+    """The ETag of a stage's version; each stage counts its own versions, so LIVE's first
+    published version has the same ETag as DEVELOPMENT's first."""
+    etags = fn.setdefault("version_etags", {})
+    return etags.setdefault(str(version), _function_etag())
+
+
+_FUNCTION_PRECONDITION_FAILED = ("The request failed because it didn't meet the preconditions in one or more "
+                                 "request-header fields.")
+
+
 def _function_status(fn):
     """UNPUBLISHED until the first PublishFunction, then DEPLOYED while a
     distribution's cache behavior references the function and UNASSOCIATED
@@ -998,7 +1009,10 @@ def _cf_create_function(headers, body):
         "last_modified_dev": now,
         "last_modified_live": None,
         "dev_etag": dev_etag,
+        "dev_version": 1,
         "live_etag": None,
+        "live_version": 0,
+        "version_etags": {"1": dev_etag},
         # The body PublishFunction froze; LIVE serves this, not the working copy.
         "live_body": None,
     }
@@ -1099,12 +1113,13 @@ def _cf_publish_function(name: str, headers):
     if if_match != fn["dev_etag"]:
         return _error(
             "PreconditionFailed",
-            "The precondition given in one or more of the request-header fields evaluated to false.",
+            _FUNCTION_PRECONDITION_FAILED,
             412,
         )
 
     now = _now_iso()
-    fn["live_etag"] = fn["dev_etag"]
+    fn["live_version"] = fn.get("live_version", 1 if fn.get("live_etag") else 0) + 1
+    fn["live_etag"] = _function_version_etag(fn, fn["live_version"])
     fn["last_modified_live"] = now
     # Publishing copies DEVELOPMENT to LIVE; later updates to the development
     # body must not reach the stage that is serving traffic.
@@ -1120,7 +1135,6 @@ def _cf_publish_function(name: str, headers):
     return _xml_response(
         "FunctionSummary",
         _function_summary_builder(fn, "LIVE", _function_status(fn), lm),
-        extra_headers={"ETag": fn["live_etag"]},
     )
 
 
@@ -1155,7 +1169,8 @@ def _cf_update_function(name: str, headers, body):
     fn["kvs_arns"] = cfg["kvs_arns"]
     fn["code"] = code
     fn["last_modified_dev"] = now
-    fn["dev_etag"] = _function_etag()
+    fn["dev_version"] = fn.get("dev_version", 1) + 1
+    fn["dev_etag"] = _function_version_etag(fn, fn["dev_version"])
     # LIVE is untouched: an update changes the DEVELOPMENT stage only, and the
     # published version keeps serving until PublishFunction copies this one.
     logger.info("UpdateFunction name=%s", name)
@@ -1163,7 +1178,8 @@ def _cf_update_function(name: str, headers, body):
     return _xml_response(
         "FunctionSummary",
         _function_summary_builder(fn, "DEVELOPMENT", _function_status(fn), fn["last_modified_dev"]),
-        extra_headers={"ETag": fn["dev_etag"]},
+        # AWS names this header ETtag, and the SDKs read it from there
+        extra_headers={"ETtag": fn["dev_etag"]},
     )
 
 
@@ -1177,10 +1193,13 @@ def _cf_delete_function(name: str, headers):
     if if_match != fn["dev_etag"]:
         return _error(
             "PreconditionFailed",
-            "The precondition given in one or more of the request-header fields evaluated to false.",
+            _FUNCTION_PRECONDITION_FAILED,
             412,
         )
 
+    in_use = sum(1 for d in _distributions.values() if fn["arn"] in _function_arns_in(d))
+    if in_use:
+        return _error("FunctionInUse", f"Cannot delete function {name}, it is in use by {in_use} distributions", 409)
     del _functions[name]
     _tags.pop(fn["arn"], None)
     logger.info("DeleteFunction name=%s", name)

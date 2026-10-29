@@ -366,7 +366,9 @@ async def handle_request(method, path, headers, body, query_params):
     """Route API Gateway v2 control plane requests."""
     # Dispatch v1 REST API requests first
     parts = [p for p in path.strip("/").split("/") if p]
-    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags", "account"):
+    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags", "account",
+                              "clientcertificates", "domainnameaccessassociations",
+                              "rejectdomainnameaccessassociations"):
         from ministack.services import apigateway_v1
         return await apigateway_v1.handle_request(method, path, headers, body, query_params)
 

@@ -37768,3 +37768,36 @@ def test_cfn_athena_workgroup_create_update_replace_delete(cfn):
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
     assert second not in {w["Name"] for w in athena.list_work_groups()["WorkGroups"]}
+
+
+def test_cfn_asg_mixed_instances_policy_and_launch_source(cfn, autoscaling, ec2):
+    """#2452: an AutoScalingGroup's MixedInstancesPolicy is kept as the API keeps it, and a group with no
+    launch template, launch configuration, instance id or mixed instances policy fails as on AWS."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(LaunchTemplateName=f"cfn-mix-{suffix}", LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    group = f"cfn-mix-{suffix}"
+    ok = json.dumps({"Resources": {"ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+        "AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "0", "AvailabilityZones": ["us-east-1a"],
+        "MixedInstancesPolicy": {"LaunchTemplate": {"LaunchTemplateSpecification": {
+            "LaunchTemplateName": lt["LaunchTemplateName"]}}, "InstancesDistribution": {
+            "OnDemandBaseCapacity": "1"}}}}}})
+    bad = json.dumps({"Resources": {"ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+        "MinSize": "0", "MaxSize": "0", "AvailabilityZones": ["us-east-1a"]}}}})
+    try:
+        cfn.create_stack(StackName=f"cfn-mix-{suffix}", TemplateBody=ok)
+        assert _wait_stack(cfn, f"cfn-mix-{suffix}")["StackStatus"] == "CREATE_COMPLETE"
+        policy = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])["AutoScalingGroups"][0][
+            "MixedInstancesPolicy"]
+        assert policy["LaunchTemplate"]["LaunchTemplateSpecification"]["LaunchTemplateId"] == lt["LaunchTemplateId"]
+        assert policy["InstancesDistribution"]["OnDemandBaseCapacity"] == 1
+        cfn.create_stack(StackName=f"cfn-mix-bad-{suffix}", TemplateBody=bad)
+        stack = _wait_stack(cfn, f"cfn-mix-bad-{suffix}")
+        assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE"), stack["StackStatus"]
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(
+            StackName=f"cfn-mix-bad-{suffix}")["StackEvents"]]
+        assert any("Valid requests must contain either LaunchTemplate" in r for r in reasons), reasons
+    finally:
+        for name in (f"cfn-mix-{suffix}", f"cfn-mix-bad-{suffix}"):
+            _delete_cfn_test_stack(cfn, name)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])

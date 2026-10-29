@@ -2417,3 +2417,70 @@ def test_replication_group_serves_tls_and_requires_auth_token(ec, tmp_path):
         assert _redis_session(endpoint, ca_file, ["AUTH", second])[0] == b"+OK\r\n"
     finally:
         ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_elasticache_host_port_skips_a_port_already_taken():
+    """#2456: a host port another process holds is skipped, so the container's docker run does not
+    fail with "port is already allocated"."""
+    import socket
+
+    from ministack.services import elasticache as ec_mod
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("0.0.0.0", 0))
+    holder.listen(1)
+    taken = holder.getsockname()[1]
+    saved = ec_mod._port_counter[0]
+    try:
+        ec_mod._port_counter[0] = taken
+        port = ec_mod._next_host_port()
+        assert port != taken
+        assert port > taken
+        assert ec_mod._port_counter[0] == port + 1
+    finally:
+        ec_mod._port_counter[0] = saved
+        holder.close()
+
+
+@pytest.mark.parametrize("engine,minimum", [("valkey", "7.2"), ("redis", "7.0")])
+def test_elasticache_iam_user_follows_aws(ec, engine, minimum):
+    """#2458, captured on AWS: an iam user keeps Type iam with no PasswordCount, its MinimumEngineVersion,
+    and AWS's InvalidParameterCombination errors."""
+    uid = f"iam-{engine}-{_uuid_mod.uuid4().hex[:6]}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine=engine, AccessString="on ~* +@all",
+                             AuthenticationMode={"Type": "iam"})
+    try:
+        assert created["Authentication"] == {"Type": "iam"}
+        assert created["MinimumEngineVersion"] == minimum
+        described = ec.describe_users(UserId=uid)["Users"][0]
+        assert (described["Authentication"], described["MinimumEngineVersion"]) == ({"Type": "iam"}, minimum)
+    finally:
+        ec.delete_user(UserId=uid)
+    for kwargs, message in (
+            ({"UserName": f"{uid}-other", "AuthenticationMode": {"Type": "iam"}},
+             "User Id and User name must be same for authentication type: iam"),
+            ({"UserName": uid, "AuthenticationMode": {"Type": "iam", "Passwords": ["a-long-enough-password-1"]}},
+             "Password field is not allowed with authentication type: iam")):
+        with pytest.raises(ClientError) as exc:
+            ec.create_user(UserId=uid, Engine=engine, AccessString="on ~* +@all", **kwargs)
+        err = exc.value.response["Error"]
+        assert (err["Code"], err["Message"]) == ("InvalidParameterCombination", message)
+
+
+def test_elasticache_user_modes_and_modify_follow_aws(ec):
+    """#2458: no-password-required is refused for Valkey, a password user reports its PasswordCount,
+    and ModifyUser to iam answers with the user modifying."""
+    with pytest.raises(ClientError) as exc:
+        ec.create_user(UserId=f"nopw-{_uuid_mod.uuid4().hex[:6]}", UserName="n", Engine="valkey",
+                       AccessString="on ~* +@all", AuthenticationMode={"Type": "no-password-required"})
+    assert exc.value.response["Error"]["Message"] == "No-password-required is not allowed for a user with engine Valkey"
+    uid = f"pw-{_uuid_mod.uuid4().hex[:6]}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all",
+                             AuthenticationMode={"Type": "password", "Passwords": ["a-long-enough-password-1"]})
+    try:
+        assert created["Authentication"] == {"Type": "password", "PasswordCount": 1}
+        modified = ec.modify_user(UserId=uid, AuthenticationMode={"Type": "iam"})
+        assert (modified["Status"], modified["Authentication"]) == ("modifying", {"Type": "iam"})
+        assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
+    finally:
+        ec.delete_user(UserId=uid)

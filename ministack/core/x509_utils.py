@@ -52,6 +52,35 @@ def _require_crypto() -> None:
         x509 = _x509
 
 
+def generate_self_signed(
+    country: str,
+    locality: str,
+    common_name: str,
+    not_before: _dt.datetime,
+    not_after: _dt.datetime,
+) -> str:
+    """A self-signed certificate PEM for subject C/L/CN, valid from *not_before* to *not_after*."""
+    _require_crypto()
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, country),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, locality),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+
 def generate_ca(
     org_name: str = "Ministack",
     common_name: str = "Ministack Local CA",

@@ -1370,6 +1370,63 @@ def test_bucket_policy_deny_beats_an_identity_allow(auth):
     assert routed_request(key, "s3", "PUT", f"/{bucket}/k2", b"y")[0] == 200
 
 
+def _root_request(method, path, body=b"", query=""):
+    """routed_request with a query string, signed with the root key."""
+    import asyncio
+
+    from botocore.auth import S3SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    import ministack.app as app_mod
+
+    url = f"http://localhost:4566{path}" + (f"?{query}" if query else "")
+    request = AWSRequest(method, url, data=body, headers={"host": "localhost:4566"})
+    S3SigV4Auth(Credentials("test", "test"), "s3", "us-east-1").add_auth(request)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app_mod.app({
+        "type": "http", "method": method, "path": path, "raw_path": path.encode(), "query_string": query.encode(),
+        "headers": [(k.lower().encode(), v.encode()) for k, v in request.headers.items()]}, receive, send))
+    return sent[0]["status"], b"".join(m.get("body", b"") for m in sent[1:])
+
+
+def test_bucket_policy_deny_applies_to_the_root_user(auth):
+    """#2462, captured on AWS as the root user: an explicit Deny in the bucket policy refuses root too, but the
+    bucket owner's root can still read, replace and delete that bucket policy."""
+    import xml.etree.ElementTree as ET
+
+    bucket = f"rp-root-{uuid.uuid4().hex[:8]}"
+    assert _root_request("PUT", f"/{bucket}")[0] == 200
+    deny_put = {"Version": "2012-10-17", "Statement": [{"Sid": "DenyPut", "Effect": "Deny", "Principal": "*",
+                                                         "Action": "s3:PutObject", "Resource": f"arn:aws:s3:::{bucket}/*"}]}
+    assert _root_request("PUT", f"/{bucket}", json.dumps(deny_put).encode(), "policy=")[0] == 204
+    status, body = _root_request("PUT", f"/{bucket}/k", b"x")
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+    assert ET.fromstring(body).findtext("Message") == (
+        'User: arn:aws:iam::000000000000:root is not authorized to perform: s3:PutObject on resource: '
+        f'"arn:aws:s3:::{bucket}/k" with an explicit deny in a resource-based policy')
+
+    deny_all = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Sid": "DenyAll", "Effect": "Deny", "Principal": "*", "Action": "s3:*",
+        "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"]}]}).encode()
+    assert _root_request("PUT", f"/{bucket}", deny_all, "policy=")[0] == 204
+    status, body = _root_request("GET", f"/{bucket}", query="list-type=2")
+    assert status == 403 and ET.fromstring(body).findtext("Message") == (
+        'User: arn:aws:iam::000000000000:root is not authorized to perform: s3:ListBucket on resource: '
+        f'"arn:aws:s3:::{bucket}" with an explicit deny in a resource-based policy')
+    assert _root_request("GET", f"/{bucket}", query="policy=")[0] == 200
+    assert _root_request("PUT", f"/{bucket}", deny_all, "policy=")[0] == 204
+    assert _root_request("DELETE", f"/{bucket}", query="policy=")[0] == 204
+    assert _root_request("PUT", f"/{bucket}/k", b"x")[0] == 200
+
+
 def test_s3_object_tagging(s3):
     bkt = "intg-s3-objtags"
     s3.create_bucket(Bucket=bkt)

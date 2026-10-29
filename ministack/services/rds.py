@@ -259,7 +259,7 @@ AURORA_MYSQL_ENGINE_VERSIONS = [
 AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
 # Aurora PostgreSQL versions are the creatable set returned by AWS RDS as of
-# 2026-08-06 (single source of truth for both the catalog and create-time
+# 2026-10-29 (single source of truth for both the catalog and create-time
 # validation). Refresh with:
 #   aws rds describe-db-engine-versions --engine aurora-postgresql \
 #     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
@@ -282,6 +282,7 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
     ("14.20", "aurora-postgresql14"),
     ("14.22", "aurora-postgresql14"),
     ("14.23", "aurora-postgresql14"),
+    ("14.24", "aurora-postgresql14"),
     ("15.10", "aurora-postgresql15"),
     ("15.12", "aurora-postgresql15"),
     ("15.13", "aurora-postgresql15"),
@@ -289,6 +290,7 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
     ("15.15", "aurora-postgresql15"),
     ("15.17", "aurora-postgresql15"),
     ("15.18", "aurora-postgresql15"),
+    ("15.19", "aurora-postgresql15"),
     ("16.4-limitless", "aurora-postgresql16"),
     ("16.6-limitless", "aurora-postgresql16"),
     ("16.8", "aurora-postgresql16"),
@@ -302,14 +304,17 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
     ("16.13", "aurora-postgresql16"),
     ("16.13-limitless", "aurora-postgresql16"),
     ("16.14", "aurora-postgresql16"),
+    ("16.15", "aurora-postgresql16"),
     ("17.4", "aurora-postgresql17"),
     ("17.5", "aurora-postgresql17"),
     ("17.6", "aurora-postgresql17"),
     ("17.7", "aurora-postgresql17"),
     ("17.9", "aurora-postgresql17"),
     ("17.10", "aurora-postgresql17"),
+    ("17.11", "aurora-postgresql17"),
     ("18.3", "aurora-postgresql18"),
     ("18.4", "aurora-postgresql18"),
+    ("18.6", "aurora-postgresql18"),
 ]
 AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
     version for version, _ in AURORA_POSTGRESQL_ENGINE_VERSIONS
@@ -8158,6 +8163,7 @@ def _create_global_cluster(p):
         "GlobalClusterMembers": [],
         "DatabaseName": _p(p, "DatabaseName") or "",
         "TagList": _parse_tags(p),
+        "_EndpointToken": _global_endpoint_token(),
     }
     if source_cluster:
         _attach_cluster_to_global(gc, source_cluster, is_writer=True)
@@ -9379,6 +9385,17 @@ def _disable_http_endpoint(p):
     return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
 
 
+def _global_endpoint_token():
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(stdlib_secrets.choice(alphabet) for _ in range(12))
+
+
+def _global_cluster_endpoint(gc):
+    """<id>.global-<12 lowercase alphanumerics>.global.rds.amazonaws.com, present with no members (AWS capture)."""
+    token = gc.setdefault("_EndpointToken", _global_endpoint_token())
+    return f"{gc['GlobalClusterIdentifier']}.global-{token}.global.rds.amazonaws.com"
+
+
 def _global_cluster_xml(gc):
     _refresh_global_cluster_readers(gc)
     tag_xml = "".join(
@@ -9415,6 +9432,7 @@ def _global_cluster_xml(gc):
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
         {failover_state_xml}
         <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>
+        <Endpoint>{_global_cluster_endpoint(gc)}</Endpoint>
         <TagList>{tag_xml}</TagList>"""
 
 

@@ -960,3 +960,296 @@ def test_scheduler_event_bus_target_uses_eventbridge_parameters(scheduler):
         events.delete_rule(Name="obs", EventBusName=bus)
         events.delete_event_bus(Name=bus)
         sqs.delete_queue(QueueUrl=q_url)
+
+
+_EB_PATTERN = r"(?=[/\.\-_A-Za-z0-9]+)((?!aws\.).*)|(\$(\.[\w_-]+(\[(\d+|\*)\])*)*)"
+_EB_SOURCE = "at 'target.eventBridgeParameters.source' failed to satisfy constraint"
+_EB_DETAIL_TYPE = "at 'target.eventBridgeParameters.detailType' failed to satisfy constraint"
+_EMOJI = "\U0001F600"  # one code point, two UTF-16 units
+
+
+@pytest.fixture(scope="module")
+def scheduler_raw():
+    from botocore.config import Config
+
+    return boto3.client("scheduler", endpoint_url=ENDPOINT, aws_access_key_id="test",
+                        aws_secret_access_key="test", region_name=REGION,
+                        config=Config(parameter_validation=False))
+
+
+def _eb_target(arn="arn:aws:events:us-east-1:000000000000:event-bus/default", **params):
+    return {"Arn": arn, "RoleArn": "arn:aws:iam::000000000000:role/r", "EventBridgeParameters": params}
+
+
+def _eb_schedule(client, name, target, **extra):
+    return client.create_schedule(Name=name, ScheduleExpression="at(2030-01-01T00:00:00)",
+                                  FlexibleTimeWindow={"Mode": "OFF"}, Target=target, **extra)
+
+
+@pytest.mark.parametrize("params, message", [
+    ({"DetailType": "dt", "Source": "aws.verify"},
+     f"1 validation error detected: Value 'aws.verify' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ({"DetailType": "dt", "Source": "aws."},
+     f"1 validation error detected: Value 'aws.' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ({"DetailType": "dt", "Source": "!bad"},
+     f"1 validation error detected: Value '!bad' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ({"DetailType": "dt", "Source": " x"},
+     f"1 validation error detected: Value ' x' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ({"DetailType": "dt", "Source": "$foo"},
+     f"1 validation error detected: Value '$foo' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ({"DetailType": "d" * 129, "Source": "ministack.verify"},
+     f"1 validation error detected: Value '{'d' * 129}' {_EB_DETAIL_TYPE}: "
+     "Member must have length less than or equal to 128"),
+    ({"DetailType": "dt", "Source": "a" * 257},
+     f"1 validation error detected: Value '{'a' * 257}' {_EB_SOURCE}: "
+     "Member must have length less than or equal to 256"),
+    ({"DetailType": "", "Source": "ministack.verify"},
+     f"1 validation error detected: Value '' {_EB_DETAIL_TYPE}: "
+     "Member must have length greater than or equal to 1"),
+    ({"DetailType": "dt", "Source": ""},
+     f"2 validation errors detected: Value '' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}; Value '' {_EB_SOURCE}: "
+     "Member must have length greater than or equal to 1"),
+    ({"DetailType": "", "Source": "aws.verify"},
+     f"2 validation errors detected: Value '' {_EB_DETAIL_TYPE}: "
+     f"Member must have length greater than or equal to 1; Value 'aws.verify' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ({"Source": "ministack.verify"},
+     f"1 validation error detected: Value null {_EB_DETAIL_TYPE}: Member must not be null"),
+    ({"DetailType": "dt"},
+     f"1 validation error detected: Value null {_EB_SOURCE}: Member must not be null"),
+    ({"DetailType": _EMOJI * 129, "Source": "ministack.verify"},
+     f"1 validation error detected: Value '{_EMOJI * 129}' {_EB_DETAIL_TYPE}: "
+     "Member must have length less than or equal to 128"),
+], ids=["aws-prefix", "aws-dot", "bang", "leading-space", "dollar-no-path", "detail-type-129",
+        "source-257", "detail-type-empty", "source-empty", "detail-type-empty-and-aws",
+        "detail-type-null", "source-null", "detail-type-129-emoji"])
+def test_scheduler_eventbridge_parameters_validation(scheduler_raw, params, message):
+    """Real AWS (us-east-1, #2466 r1 v1, r2 v4/v7/v8, r3 w5..w10/w12/w13, r7 d2): CreateSchedule checks
+    Target.EventBridgeParameters and aggregates the errors."""
+    name = f"ebp-bad-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        _eb_schedule(scheduler_raw, name, _eb_target(**params))
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"] == message
+
+
+@pytest.mark.parametrize("source, detail_type", [
+    ("$.detail.src", "dt"), ("AWS.verify", "dt"), ("aws", "dt"), ("a!b", "dt"), ("d" * 256, "d" * 128),
+    ("ministack.verify", _EMOJI * 128),
+], ids=["json-path", "upper-aws", "aws-no-dot", "bang-inside", "max-lengths", "detail-type-128-emoji"])
+def test_scheduler_eventbridge_parameters_accepted(scheduler, source, detail_type):
+    """Real AWS (us-east-1, #2466 r1 v3, r2 v5/v6, r3 w4/w11, r7 d1): these EventBridgeParameters are accepted;
+    DetailType length counts code points."""
+    name = f"ebp-ok-{_uid()}"
+    _eb_schedule(scheduler, name, _eb_target(DetailType=detail_type, Source=source))
+    try:
+        got = scheduler.get_schedule(Name=name)["Target"]["EventBridgeParameters"]
+        assert got == {"DetailType": detail_type, "Source": source}
+    finally:
+        scheduler.delete_schedule(Name=name)
+
+
+def test_scheduler_eventbridge_parameters_checked_before_lookups(scheduler, scheduler_raw):
+    """Real AWS (us-east-1, #2466 r2 u1, r3 w1/w2/w3/w14): an aws. Source is refused before the
+    conflict, missing schedule and missing group checks, for any target, and an update leaves
+    the schedule unchanged."""
+    message = (f"1 validation error detected: Value 'aws.verify' {_EB_SOURCE}: "
+               f"Member must satisfy regular expression pattern: {_EB_PATTERN}")
+    bad = _eb_target(DetailType="dt", Source="aws.verify")
+    name = f"ebp-order-{_uid()}"
+    _eb_schedule(scheduler, name, _eb_target(DetailType="dt", Source="ministack.verify"))
+    common = {"ScheduleExpression": "at(2030-01-01T00:00:00)", "FlexibleTimeWindow": {"Mode": "OFF"}}
+    calls = [
+        lambda: _eb_schedule(scheduler_raw, name, bad),
+        lambda: scheduler_raw.update_schedule(Name=name, Target=bad, **common),
+        lambda: scheduler_raw.update_schedule(Name=f"ebp-missing-{_uid()}", Target=bad, **common),
+        lambda: _eb_schedule(scheduler_raw, f"ebp-g-{_uid()}", bad, GroupName=f"ebp-nogroup-{_uid()}"),
+        lambda: _eb_schedule(scheduler_raw, f"ebp-q-{_uid()}",
+                             {**bad, "Arn": "arn:aws:sqs:us-east-1:000000000000:q"}),
+    ]
+    try:
+        for call in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == "ValidationException"
+            assert exc.value.response["Error"]["Message"] == message
+        got = scheduler.get_schedule(Name=name)["Target"]["EventBridgeParameters"]
+        assert got == {"DetailType": "dt", "Source": "ministack.verify"}
+    finally:
+        scheduler.delete_schedule(Name=name)
+
+
+def test_scheduler_event_bus_target_envelope(scheduler):
+    """Real AWS (us-east-1, #2466 r1 f1/f2, r2 f3/f4): an event bus target publishes with no
+    resources, Input as the detail or {} without it, and publishes nothing without
+    EventBridgeParameters."""
+    import datetime as _dt
+    import json as _json
+
+    kw = dict(endpoint_url=ENDPOINT, aws_access_key_id="test", aws_secret_access_key="test", region_name=REGION)
+    sqs, events = boto3.client("sqs", **kw), boto3.client("events", **kw)
+    account = boto3.client("sts", **kw).get_caller_identity()["Account"]
+    bus = f"sched-env-{_uid()}"
+    bus_arn = events.create_event_bus(Name=bus)["EventBusArn"]
+    q_url = sqs.create_queue(QueueName=f"sched-env-q-{_uid()}")["QueueUrl"]
+    q_arn = sqs.get_queue_attributes(QueueUrl=q_url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    events.put_rule(Name="all", EventBusName=bus, EventPattern=_json.dumps({"account": [account]}))
+    events.put_targets(Rule="all", EventBusName=bus, Targets=[{"Id": "q", "Arn": q_arn}])
+    past = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    role = "arn:aws:iam::000000000000:role/r"
+    ebp = {"EventBridgeParameters": {"DetailType": "verify-detail-type", "Source": "ministack.verify"}}
+    targets = {
+        "f1": {"Arn": bus_arn, "RoleArn": role, **ebp, "Input": _json.dumps({"run": "f1", "n": 1})},
+        "f2": {"Arn": bus_arn, "RoleArn": role, **ebp},
+        "f3": {"Arn": bus_arn, "RoleArn": role, "Input": _json.dumps({"run": "f3"})},
+        "f4": {"Arn": bus_arn, "RoleArn": role},
+    }
+    names = {k: f"env-{k}-{_uid()}" for k in targets}
+    for k, target in targets.items():
+        scheduler.create_schedule(Name=names[k], ScheduleExpression=f"at({past})",
+                                  FlexibleTimeWindow={"Mode": "OFF"}, Target=target)
+    try:
+        received, deadline = [], time.time() + 25
+        while time.time() < deadline and len(received) < 2:
+            msgs = sqs.receive_message(QueueUrl=q_url, WaitTimeSeconds=1, MaxNumberOfMessages=10).get("Messages", [])
+            received += [_json.loads(m["Body"]) for m in msgs]
+        # f1..f4 fire in the same sweep; give it a moment for anything extra to land.
+        received += [_json.loads(m["Body"]) for m in
+                     sqs.receive_message(QueueUrl=q_url, WaitTimeSeconds=2, MaxNumberOfMessages=10).get("Messages", [])]
+        got = sorted(((e["source"], e["detail-type"], _json.dumps(e["detail"], sort_keys=True), e["resources"])
+                      for e in received), key=lambda t: t[2])
+        assert got == [
+            ("ministack.verify", "verify-detail-type", '{"n": 1, "run": "f1"}', []),
+            ("ministack.verify", "verify-detail-type", "{}", []),
+        ]
+    finally:
+        for name in names.values():
+            try:
+                scheduler.delete_schedule(Name=name)
+            except ClientError:
+                pass
+        events.remove_targets(Rule="all", EventBusName=bus, Ids=["q"])
+        events.delete_rule(Name="all", EventBusName=bus)
+        events.delete_event_bus(Name=bus)
+        sqs.delete_queue(QueueUrl=q_url)
+
+
+def _create_raw_eb(client, name, eb_params_json, op="CreateSchedule"):
+    """CreateSchedule (or UpdateSchedule) whose Target.EventBridgeParameters is the raw JSON text given."""
+    import uuid as _uuid
+
+    body = ('{"ScheduleExpression": "at(2030-01-01T00:00:00)", "FlexibleTimeWindow": {"Mode": "OFF"}, '
+            f'"ClientToken": "{_uuid.uuid4().hex}", "Target": {{"Arn": '
+            '"arn:aws:events:us-east-1:000000000000:event-bus/default", '
+            f'"RoleArn": "arn:aws:iam::000000000000:role/r", "EventBridgeParameters": {eb_params_json}}}}}')
+
+    def override(params, **_):
+        params["body"] = body.encode("utf-8")
+
+    event = f"before-call.scheduler.{op}"
+    call = client.create_schedule if op == "CreateSchedule" else client.update_schedule
+    client.meta.events.register(event, override)
+    try:
+        return call(Name=name, ScheduleExpression="at(2030-01-01T00:00:00)",
+                    FlexibleTimeWindow={"Mode": "OFF"}, Target={"Arn": "x", "RoleArn": "x"})
+    finally:
+        client.meta.events.unregister(event, override)
+
+
+_SRC = '"Source": "ministack.verify"'
+
+
+@pytest.mark.parametrize("eb_json, code, message", [
+    ('{"DetailType": 5, %s}' % _SRC, "SerializationException", "NUMBER_VALUE can not be converted to a String"),
+    ('{"DetailType": 1.5, %s}' % _SRC, "SerializationException", "NUMBER_VALUE can not be converted to a String"),
+    ('{"DetailType": "dt", "Source": true}', "SerializationException", "TRUE_VALUE can not be converted to a String"),
+    ('{"DetailType": false, %s}' % _SRC, "SerializationException", "FALSE_VALUE can not be converted to a String"),
+    ('{"DetailType": {}, %s}' % _SRC, "SerializationException", "Start of structure or map found where not expected."),
+    ('{"DetailType": [], %s}' % _SRC, "SerializationException", "Start of list found where not expected"),
+    ('{"DetailType": "", "Source": 7}', "SerializationException", "NUMBER_VALUE can not be converted to a String"),
+    ('{"Source": true, "DetailType": 5}', "SerializationException", "NUMBER_VALUE can not be converted to a String"),
+    ('"str"', "SerializationException", "Expected null"),
+    ("5", "SerializationException", "Expected null"),
+    ("1.5", "SerializationException", "Expected null"),
+    ("true", "SerializationException", "Expected null"),
+    ("false", "SerializationException", "Expected null"),
+    ("[]", "SerializationException", "Start of list found where not expected"),
+    ("{}", "ValidationException",
+     f"2 validation errors detected: Value null {_EB_DETAIL_TYPE}: Member must not be null; "
+     f"Value null {_EB_SOURCE}: Member must not be null"),
+    ('{"DetailType": null, %s}' % _SRC, "ValidationException",
+     f"1 validation error detected: Value null {_EB_DETAIL_TYPE}: Member must not be null"),
+    ('{"DetailType": "dt", "Source": "aws.%s"}' % ("a" * 253), "ValidationException",
+     f"2 validation errors detected: Value 'aws.{'a' * 253}' {_EB_SOURCE}: Member must satisfy regular "
+     f"expression pattern: {_EB_PATTERN}; Value 'aws.{'a' * 253}' {_EB_SOURCE}: "
+     "Member must have length less than or equal to 256"),
+    ('{"DetailType": "dt", "Source": "$.\\u00e9"}', "ValidationException",
+     f"1 validation error detected: Value '$.é' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+    ('{"DetailType": "dt", "Source": "%s"}' % ("\\u00e9" * 129 + "a"), "ValidationException",
+     f"1 validation error detected: Value '{chr(0xe9) * 129}a' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}"),
+] + [
+    ('{"DetailType": "dt", "Source": "a%sb"}' % esc, "ValidationException",
+     f"1 validation error detected: Value 'a{char}b' {_EB_SOURCE}: "
+     f"Member must satisfy regular expression pattern: {_EB_PATTERN}")
+    for esc, char in (("\\r", "\r"), ("\\n", "\n"), ("\\r\\n", "\r\n"), ("\\u0085", "\u0085"), ("\\u2028", "\u2028"),
+                      ("\\u2029", "\u2029"))
+], ids=["detail-type-int", "detail-type-float", "source-true", "detail-type-false", "detail-type-object",
+        "detail-type-list", "type-before-validation", "detail-type-reported-first", "params-string",
+        "params-number", "params-float", "params-true", "params-false", "params-list", "params-empty", "detail-type-explicit-null",
+        "pattern-before-length", "json-path-non-ascii", "non-ascii-first",
+        "cr", "lf", "crlf", "nel", "line-separator", "paragraph-separator"])
+def test_scheduler_eventbridge_parameters_raw_json(scheduler_raw, eb_json, code, message):
+    """Real AWS (us-east-1, #2466 r4 x1..x7/x9..x13, r5 y3..y10/y12..y14, r6 z6/z8): a member of the wrong JSON
+    type is a SerializationException before validation; Source's "." stops at Java line terminators."""
+    with pytest.raises(ClientError) as exc:
+        _create_raw_eb(scheduler_raw, f"ebp-raw-{_uid()}", eb_json)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["Error"]["Message"] == message
+
+
+@pytest.mark.parametrize("eb_json", [
+    "null",
+    '{"DetailType": "dt", "Source": "a\\u00e9"}',
+    '{"DetailType": "dt", "Source": "a\\u000bb"}',
+    '{"DetailType": "dt", "Source": "a%s"}' % ("\\ud83d\\ude00" * 128),
+    '{"DetailType": "dt", "Source": "$"}',
+], ids=["params-null", "non-ascii-after-first", "vertical-tab", "257-utf16-units", "dollar-alone"])
+def test_scheduler_eventbridge_parameters_raw_json_accepted(scheduler, scheduler_raw, eb_json):
+    """Real AWS (us-east-1, #2466 r5 y1/y2/y11/y15, r6 z7): these are accepted; Source length counts code points."""
+    name = f"ebp-raw-ok-{_uid()}"
+    _create_raw_eb(scheduler_raw, name, eb_json)
+    scheduler.delete_schedule(Name=name)
+
+
+@pytest.mark.parametrize("eb_json, code, message", [
+    ('{"DetailType": 5, %s}' % _SRC, "SerializationException", "NUMBER_VALUE can not be converted to a String"),
+    ("[]", "SerializationException", "Start of list found where not expected"),
+    ('"str"', "SerializationException", "Expected null"),
+    ("{}", "ValidationException",
+     f"2 validation errors detected: Value null {_EB_DETAIL_TYPE}: Member must not be null; "
+     f"Value null {_EB_SOURCE}: Member must not be null"),
+], ids=["detail-type-int", "params-list", "params-string", "params-empty"])
+def test_scheduler_update_eventbridge_parameters_raw_json(scheduler, scheduler_raw, eb_json, code, message):
+    """Real AWS (us-east-1, #2466 r6 z1..z4): UpdateSchedule answers the same errors and keeps the schedule."""
+    name = f"ebp-upd-{_uid()}"
+    _create_raw_eb(scheduler_raw, name, '{"DetailType": "dt", %s}' % _SRC)
+    try:
+        with pytest.raises(ClientError) as exc:
+            _create_raw_eb(scheduler_raw, name, eb_json, op="UpdateSchedule")
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+        got = scheduler.get_schedule(Name=name)["Target"]["EventBridgeParameters"]
+        assert got == {"DetailType": "dt", "Source": "ministack.verify"}
+    finally:
+        scheduler.delete_schedule(Name=name)

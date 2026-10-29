@@ -774,14 +774,18 @@ def test_appconfig_tag_resource_rejects_invalid_arns_before_mutating_tags(appcon
     ]
 
     for resource_arn in invalid_arns:
-        for response in (
-            appconfig_service._tag_resource(resource_arn, {"Tags": {"bad": "tag"}}),
-            appconfig_service._untag_resource(resource_arn, ["seed"]),
-            appconfig_service._list_tags_for_resource(resource_arn),
+        for call, response in (
+            ("tag", appconfig_service._tag_resource(resource_arn, {"Tags": {"bad": "tag"}})),
+            ("untag", appconfig_service._untag_resource(resource_arn, ["seed"])),
+            ("list", appconfig_service._list_tags_for_resource(resource_arn)),
         ):
             status, body = _status_and_body(response)
-            assert status == 400
-            assert body["Code"] == "BadRequestException"
+            # #2484: the tag APIs answer another account's ARN with 403, as AWS does.
+            if ":111111111111:" in resource_arn:
+                assert (status, body["Code"]) == (403, "AccessDeniedException")
+            else:
+                assert status == 400
+                assert body["Code"] == "BadRequestException"
             assert _tag_snapshot() == before
 
 
@@ -3013,9 +3017,11 @@ def test_kms_key_version_description_and_deployment_tags_round_trip(appconfig_cl
         env = ac.create_environment(ApplicationId=app, Name="e")["Id"]
         profile = ac.create_configuration_profile(ApplicationId=app, Name="p", LocationUri="hosted",
                                                   KmsKeyIdentifier=alias)
-        assert (profile["KmsKeyIdentifier"], profile["KmsKeyArn"]) == (alias, key["Arn"])
+        # #2483: KmsKeyArn is derived from the identifier as given, so an alias stays an alias ARN.
+        alias_arn = key["Arn"].split(":key/")[0] + ":" + alias
+        assert (profile["KmsKeyIdentifier"], profile["KmsKeyArn"]) == (alias, alias_arn)
         got = ac.get_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile["Id"])
-        assert (got["KmsKeyIdentifier"], got["KmsKeyArn"]) == (alias, key["Arn"])
+        assert (got["KmsKeyIdentifier"], got["KmsKeyArn"]) == (alias, alias_arn)
         updated = ac.update_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile["Id"],
                                                   KmsKeyIdentifier=key["KeyId"])
         assert (updated["KmsKeyIdentifier"], updated["KmsKeyArn"]) == (key["KeyId"], key["Arn"])
@@ -3041,5 +3047,154 @@ def test_kms_key_version_description_and_deployment_tags_round_trip(appconfig_cl
         arn = (f"arn:aws:appconfig:{region}:{account}:application/{app}/environment/{env}"
                f"/deployment/{deployment['DeploymentNumber']}")
         assert ac.list_tags_for_resource(ResourceArn=arn)["Tags"] == {"Name": "x"}
+    finally:
+        _delete_application(ac, app)
+
+
+
+def test_kms_key_arn_is_derived_from_the_identifier_as_given(appconfig_client, kms_client):
+    """#2483, captured on AWS: KmsKeyArn is the identifier as an ARN (alias ARNs stay aliases, anything else is
+    key/<value>), with no lookup, so a key that does not exist is accepted at CreateConfigurationProfile."""
+    ac = appconfig_client
+    key = kms_client.create_key()["KeyMetadata"]
+    prefix = key["Arn"].split(":key/")[0]
+    app = ac.create_application(Name=f"kmsarn-{os.urandom(3).hex()}")["Id"]
+    try:
+        for identifier, arn in ((key["Arn"], key["Arn"]), (key["KeyId"], key["Arn"]),
+                                ("alias/my-key", f"{prefix}:alias/my-key"),
+                                (f"{prefix}:alias/my-key", f"{prefix}:alias/my-key"),
+                                ("alias/does-not-exist", f"{prefix}:alias/does-not-exist"),
+                                ("not-a-key", f"{prefix}:key/not-a-key")):
+            profile = ac.create_configuration_profile(ApplicationId=app, Name=f"p-{os.urandom(3).hex()}",
+                                                      LocationUri="hosted", KmsKeyIdentifier=identifier)
+            assert profile["KmsKeyArn"] == arn, identifier
+    finally:
+        _delete_application(ac, app)
+
+
+def test_hosted_version_carries_the_profile_key_and_deployment_checks_it(appconfig_client, kms_client):
+    """#2483, captured on AWS: a hosted version under a profile with a key carries the profile's KmsKeyArn
+    (headers and list), and StartDeployment of it needs a KmsKeyIdentifier that KMS holds."""
+    ac = appconfig_client
+    key = kms_client.create_key()["KeyMetadata"]
+    app = ac.create_application(Name=f"kmsver-{os.urandom(3).hex()}")["Id"]
+    try:
+        env = ac.create_environment(ApplicationId=app, Name="e")["Id"]
+        profile = ac.create_configuration_profile(ApplicationId=app, Name="p", LocationUri="hosted")["Id"]
+        ac.update_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile,
+                                        KmsKeyIdentifier=key["Arn"])
+        version = ac.create_hosted_configuration_version(ApplicationId=app, ConfigurationProfileId=profile,
+                                                         Content=b"{}", ContentType="application/json")
+        assert version["KmsKeyArn"] == key["Arn"]
+        assert ac.get_hosted_configuration_version(ApplicationId=app, ConfigurationProfileId=profile,
+                                                   VersionNumber=version["VersionNumber"])["KmsKeyArn"] == key["Arn"]
+        listed = ac.list_hosted_configuration_versions(ApplicationId=app, ConfigurationProfileId=profile)["Items"]
+        assert listed[0]["KmsKeyArn"] == key["Arn"]
+
+        deploy = dict(ApplicationId=app, EnvironmentId=env, ConfigurationProfileId=profile,
+                      DeploymentStrategyId="AppConfig.AllAtOnce", ConfigurationVersion=str(version["VersionNumber"]))
+        with pytest.raises(ClientError) as exc:
+            ac.start_deployment(**deploy)
+        assert exc.value.response["Error"]["Message"] == (
+            "KmsKeyIdentifier required when deploying a hosted configuration version that is encrypted with a "
+            "customer managed key (CMK)")
+        missing = key["Arn"].split(":key/")[0] + ":key/00000000-0000-0000-0000-000000000000"
+        with pytest.raises(ClientError) as exc:
+            ac.start_deployment(**deploy, KmsKeyIdentifier=missing)
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert re.fullmatch(
+            re.escape(f"Key '{missing}' does not exist (Service: AWSKMS; Status Code: 400; Error Code: "
+                      "NotFoundException; Request ID: ") + r"[0-9a-f-]{36}; Proxy: null\)",
+            exc.value.response["Error"]["Message"])
+        other = key["Arn"].replace(key["Arn"].split(":")[4], "111111111111")
+        with pytest.raises(ClientError) as exc:
+            ac.start_deployment(**deploy, KmsKeyIdentifier=other)
+        assert re.fullmatch(
+            r"User: arn:aws:iam::\d{12}:\S+ is not authorized to perform: kms:GenerateDataKey on this resource "
+            r"because the resource does not exist in this Region, no resource-based policies allow access, or a "
+            r"resource-based policy explicitly denies access \(Service: AWSKMS; Status Code: 400; Error Code: "
+            r"AccessDeniedException; Request ID: [0-9a-f-]{36}; Proxy: null\)",
+            exc.value.response["Error"]["Message"])
+        kms_client.disable_key(KeyId=key["KeyId"])
+        with pytest.raises(ClientError) as exc:
+            ac.start_deployment(**deploy, KmsKeyIdentifier=key["Arn"])
+        assert re.fullmatch(
+            re.escape(f"{key['Arn']} is disabled. (Service: AWSKMS; Status Code: 400; Error Code: "
+                      "DisabledException; Request ID: ") + r"[0-9a-f-]{36}; Proxy: null\)",
+            exc.value.response["Error"]["Message"])
+        kms_client.enable_key(KeyId=key["KeyId"])
+        assert ac.start_deployment(**deploy, KmsKeyIdentifier=key["Arn"])["KmsKeyArn"] == key["Arn"]
+    finally:
+        _delete_application(ac, app)
+
+
+def test_version_created_before_the_key_is_not_encrypted(appconfig_client, kms_client):
+    """Captured on AWS: a version created before its profile got a key has no KmsKeyArn, and deploys
+    without a KmsKeyIdentifier."""
+    ac = appconfig_client
+    key = kms_client.create_key()["KeyMetadata"]
+    app = ac.create_application(Name=f"kmsold-{os.urandom(3).hex()}")["Id"]
+    try:
+        env = ac.create_environment(ApplicationId=app, Name="e")["Id"]
+        profile = ac.create_configuration_profile(ApplicationId=app, Name="p", LocationUri="hosted")["Id"]
+        version = ac.create_hosted_configuration_version(ApplicationId=app, ConfigurationProfileId=profile,
+                                                         Content=b"{}", ContentType="application/json")
+        ac.update_configuration_profile(ApplicationId=app, ConfigurationProfileId=profile, KmsKeyIdentifier=key["Arn"])
+        got = ac.get_hosted_configuration_version(ApplicationId=app, ConfigurationProfileId=profile,
+                                                  VersionNumber=version["VersionNumber"])
+        assert "KmsKeyArn" not in got
+        assert ac.start_deployment(ApplicationId=app, EnvironmentId=env, ConfigurationProfileId=profile,
+                                   DeploymentStrategyId="AppConfig.AllAtOnce",
+                                   ConfigurationVersion=str(version["VersionNumber"]))["DeploymentNumber"] == 1
+    finally:
+        _delete_application(ac, app)
+
+
+def test_list_deployments_newest_first_with_profile_and_type(appconfig_client):
+    """#2484, captured on AWS: ListDeployments lists newest first, each with ConfigurationProfileId and Type USER."""
+    ac = appconfig_client
+    app = ac.create_application(Name=f"listdep-{os.urandom(3).hex()}")["Id"]
+    try:
+        env = ac.create_environment(ApplicationId=app, Name="e")["Id"]
+        profile = ac.create_configuration_profile(ApplicationId=app, Name="p", LocationUri="hosted")["Id"]
+        ac.create_hosted_configuration_version(ApplicationId=app, ConfigurationProfileId=profile,
+                                               Content=b"{}", ContentType="application/json")
+        strategy = ac.create_deployment_strategy(Name=f"now-{os.urandom(3).hex()}", DeploymentDurationInMinutes=0,
+                                                 FinalBakeTimeInMinutes=0, GrowthFactor=100, GrowthType="LINEAR",
+                                                 ReplicateTo="NONE")["Id"]
+        for _ in range(2):
+            ac.start_deployment(ApplicationId=app, EnvironmentId=env, ConfigurationProfileId=profile,
+                                DeploymentStrategyId=strategy, ConfigurationVersion="1")
+        items = ac.list_deployments(ApplicationId=app, EnvironmentId=env)["Items"]
+        assert [i["DeploymentNumber"] for i in items] == [2, 1]
+        assert all((i["ConfigurationProfileId"], i["Type"]) == (profile, "USER") for i in items)
+    finally:
+        _delete_application(ac, app)
+
+
+def test_list_tags_for_an_arn_without_this_account(appconfig_client):
+    """#2484, captured on AWS: an AppConfig ARN with no account answers 400, another account's answers 403."""
+    ac = appconfig_client
+    app = ac.create_application(Name=f"tagarn-{os.urandom(3).hex()}")["Id"]
+    try:
+        region = ac.meta.region_name
+        caller = boto3.client("sts", endpoint_url=ENDPOINT, region_name=region, aws_access_key_id="test",
+                              aws_secret_access_key="test").get_caller_identity()["Account"]
+        for arn in (f"arn:aws:appconfig:{region}::application/{app}",
+                    f"arn:aws:appconfig:{region}::deploymentstrategy/AppConfig.AllAtOnce"):
+            with pytest.raises(ClientError) as exc:
+                ac.list_tags_for_resource(ResourceArn=arn)
+            err = exc.value.response
+            assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+                400, "BadRequestException", f"ARN {arn} is invalid due to not containing an account ID.")
+        other = "444455556666" if caller != "444455556666" else "111122223333"
+        arn = f"arn:aws:appconfig:{region}:{other}:application/{app}"
+        with pytest.raises(ClientError) as exc:
+            ac.list_tags_for_resource(ResourceArn=arn)
+        err = exc.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            403, "AccessDeniedException",
+            f"Cross-account resources are not permitted for this API. ARN {arn} references a resource outside "
+            f"of account {caller}.")
     finally:
         _delete_application(ac, app)

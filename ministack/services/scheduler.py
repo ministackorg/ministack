@@ -99,6 +99,62 @@ def _error(status, code, message):
     return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "Message": message}).encode()
 
 
+# EventBridgeParameters.Source pattern, as AWS names it in its validation message.
+_EB_SOURCE_PATTERN = r"(?=[/\.\-_A-Za-z0-9]+)((?!aws\.).*)|(\$(\.[\w_-]+(\[(\d+|\*)\])*)*)"
+# The same pattern for Python: AWS's "." stops at every Java line terminator.
+_EB_SOURCE_RE = re.compile(
+    r"(?=[/\.\-_A-Za-z0-9]+)((?!aws\.)[^\n\r\u0085\u2028\u2029]*)|(\$(\.[\w_-]+(\[(\d+|\*)\])*)*)",
+    re.ASCII,
+)
+
+
+def _not_a_string_message(value):
+    """AWS's SerializationException message for a string member sent as another JSON type."""
+    if isinstance(value, bool):
+        return f"{'TRUE' if value else 'FALSE'}_VALUE can not be converted to a String"
+    if isinstance(value, (int, float)):
+        return "NUMBER_VALUE can not be converted to a String"
+    if isinstance(value, dict):
+        return "Start of structure or map found where not expected."
+    return "Start of list found where not expected"
+
+
+def _eventbridge_parameters_error(target):
+    """AWS's error for a CreateSchedule or UpdateSchedule Target.EventBridgeParameters, or None.
+    AWS reports a member of the wrong JSON type first, then aggregates validation errors,
+    before any schedule or group lookup and for every target type."""
+    params = target.get("EventBridgeParameters") if isinstance(target, dict) else None
+    if params is None:
+        return None
+    if isinstance(params, list):
+        return _error(400, "SerializationException", "Start of list found where not expected")
+    if not isinstance(params, dict):
+        return _error(400, "SerializationException", "Expected null")
+    members = (("DetailType", "detailType", 128), ("Source", "source", 256))
+    for member, _path, _max_len in members:
+        value = params.get(member)
+        if value is not None and not isinstance(value, str):
+            return _error(400, "SerializationException", _not_a_string_message(value))
+    errors = []
+    for member, path, max_len in members:
+        value = params.get(member)
+        where = f"at 'target.eventBridgeParameters.{path}' failed to satisfy constraint"
+        if value is None:
+            errors.append(f"Value null {where}: Member must not be null")
+            continue
+        if member == "Source" and not _EB_SOURCE_RE.fullmatch(value):
+            errors.append(f"Value '{value}' {where}: Member must satisfy regular expression pattern: "
+                          f"{_EB_SOURCE_PATTERN}")
+        if len(value) < 1:
+            errors.append(f"Value '{value}' {where}: Member must have length greater than or equal to 1")
+        elif len(value) > max_len:
+            errors.append(f"Value '{value}' {where}: Member must have length less than or equal to {max_len}")
+    if not errors:
+        return None
+    count = "1 validation error" if len(errors) == 1 else f"{len(errors)} validation errors"
+    return _error(400, "ValidationException", f"{count} detected: " + "; ".join(errors))
+
+
 def _ensure_default_group():
     """Ensure the 'default' group exists."""
     key = "default"
@@ -442,6 +498,10 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     m = re.fullmatch(r"/schedules/([A-Za-z0-9_.@-]+)", path)
     if m:
         name = m.group(1)
+        if method in ("POST", "PUT"):
+            invalid = _eventbridge_parameters_error(body.get("Target"))
+            if invalid:
+                return invalid
         if method == "POST":
             return _create_schedule(name, body)
         if method == "GET":
@@ -524,6 +584,14 @@ def _at_time_epoch(expr: str):
     return dt.timestamp()
 
 
+def _is_event_bus_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return False
+    return spec.service == "events" and spec.resource.startswith("event-bus/")
+
+
 def _tick_schedules():
     """Fire every ENABLED schedule that is due, honoring State, Start/EndDate,
     at()/rate()/cron() expressions and ActionAfterCompletion one-shot delete."""
@@ -597,14 +665,20 @@ def _tick_schedules():
                 "Account": account_id,
                 "Region": get_region(),
             }
-            # A templated PutEvents target publishes with its own Source and DetailType.
+            # A templated PutEvents target publishes with its own Source and DetailType
+            # and no resources; without EventBridgeParameters AWS publishes nothing.
             eb_params = target.get("EventBridgeParameters") or {}
+            publish = True
+            if _is_event_bus_arn(target["Arn"]):
+                publish = bool(eb_params)
+                event["Resources"] = []
             if eb_params.get("Source"):
                 event["Source"] = eb_params["Source"]
             if eb_params.get("DetailType"):
                 event["DetailType"] = eb_params["DetailType"]
             try:
-                _eb._invoke_target(target, event, sched)
+                if publish:
+                    _eb._invoke_target(target, event, sched)
             except Exception:
                 logger.exception(
                     "Scheduler dispatch error for %s (account %s, region %s)",

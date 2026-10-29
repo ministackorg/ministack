@@ -1161,6 +1161,58 @@ def _delete_listener(params):
     return _empty("DeleteListener")
 
 
+def _listener_certificate_members(entries):
+    return "".join(
+        f"<member><CertificateArn>{_esc(arn)}</CertificateArn><IsDefault>{'true' if default else 'false'}</IsDefault></member>"
+        for arn, default in entries
+    )
+
+
+def _add_listener_certificates(params):
+    arn = _p(params, "ListenerArn")
+    listener = _listeners.get(arn)
+    if not listener:
+        return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    certs = _parse_certificate_arns(params)
+    if len(certs) > 1:
+        return _error("ValidationError",
+                      f"Up to '1' certificate ARNs can be specified, but '{len(certs)}' were specified")
+    from ministack.services import acm
+
+    for cert in certs:
+        if cert not in acm._certificates:
+            return _error("CertificateNotFound", f"Certificate '{cert}' not found")
+    extra = listener.setdefault("ExtraCertificates", [])
+    for cert in certs:
+        if cert not in extra and cert not in listener.get("Certificates", []):
+            extra.append(cert)
+    members = _listener_certificate_members((cert, False) for cert in certs)
+    return _xml(200, "AddListenerCertificates", f"<Certificates>{members}</Certificates>")
+
+
+def _describe_listener_certificates(params):
+    arn = _p(params, "ListenerArn")
+    listener = _listeners.get(arn)
+    if not listener:
+        return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    # Added certificates first, in the order added, then the default one.
+    entries = [(cert, False) for cert in listener.get("ExtraCertificates", [])]
+    entries += [(cert, True) for cert in listener.get("Certificates", [])]
+    return _xml(200, "DescribeListenerCertificates",
+                f"<Certificates>{_listener_certificate_members(entries)}</Certificates>")
+
+
+def _remove_listener_certificates(params):
+    arn = _p(params, "ListenerArn")
+    listener = _listeners.get(arn)
+    if not listener:
+        return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    removed = set(_parse_certificate_arns(params))
+    if listener.get("ExtraCertificates"):
+        listener["ExtraCertificates"] = [c for c in listener["ExtraCertificates"] if c not in removed]
+    return _empty("RemoveListenerCertificates")
+
+
 def _describe_listener_attrs(params):
     arn = _p(params, "ListenerArn")
     if arn not in _listeners:
@@ -1510,6 +1562,9 @@ _ACTION_MAP = {
     "ModifyTargetGroupAttributes": _modify_tg_attrs,
     "CreateListener": _create_listener,
     "DescribeListeners": _describe_listeners,
+    "AddListenerCertificates": _add_listener_certificates,
+    "DescribeListenerCertificates": _describe_listener_certificates,
+    "RemoveListenerCertificates": _remove_listener_certificates,
     "DescribeListenerAttributes": _describe_listener_attrs,
     "ModifyListenerAttributes": _modify_listener_attrs,
     "ModifyListener": _modify_listener,

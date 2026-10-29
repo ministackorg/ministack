@@ -846,7 +846,7 @@ def test_cloudfront_function_create_publish_describe_get_delete(cloudfront):
 
     pub = cloudfront.publish_function(Name=name, IfMatch=dev_etag)
     assert pub["FunctionSummary"]["FunctionMetadata"]["Stage"] == "LIVE"
-    live_etag = _cf_resp_etag(pub)
+    live_etag = _cf_resp_etag(cloudfront.describe_function(Name=name, Stage="LIVE"))
     assert live_etag
 
     d_dev = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")
@@ -947,7 +947,10 @@ def test_cloudfront_function_stage_defaults_and_etags_follow_aws(cloudfront):
         upd = cloudfront.update_function(Name=name, IfMatch=etag,
                                          FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
                                          FunctionCode=v2)
-        etag = _cf_resp_etag(upd)
+        # AWS sends UpdateFunction's ETag in a header named ETtag, which is where botocore reads it.
+        headers = upd["ResponseMetadata"]["HTTPHeaders"]
+        assert upd["ETag"] == headers["ettag"] and "etag" not in headers
+        etag = upd["ETag"]
         assert _cf_resp_etag(cloudfront.describe_function(Name=name)) == etag
         assert cloudfront.get_function(Name=name)["FunctionCode"].read() == v2
         assert cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"].read() == v1
@@ -956,6 +959,61 @@ def test_cloudfront_function_stage_defaults_and_etags_follow_aws(cloudfront):
         assert exc.value.response["Error"]["Code"] == "NoSuchFunctionExists"
     finally:
         cloudfront.delete_function(Name=name, IfMatch=etag)
+
+
+def test_cloudfront_function_live_stage_counts_its_own_versions(cloudfront):
+    """#2481, captured on AWS: each stage counts its own versions, so LIVE's ETag follows its publish count;
+    PublishFunction has no ETag header, a stale If-Match is AWS's PreconditionFailed message, and a function a
+    distribution uses can't be deleted."""
+    name = f"fn-live-ver-{_uuid_mod.uuid4().hex[:8]}"
+    cfg = {"Comment": "", "Runtime": "cloudfront-js-2.0"}
+
+    def code(i):
+        return f"function handler(event) {{ var v{i} = 1; return event.request; }}".encode()
+
+    def etag(stage):
+        return _cf_resp_etag(cloudfront.describe_function(Name=name, Stage=stage))
+
+    v1 = _cf_resp_etag(cloudfront.create_function(Name=name, FunctionConfig=cfg, FunctionCode=code(0)))
+    v2 = cloudfront.update_function(Name=name, IfMatch=v1, FunctionConfig=cfg, FunctionCode=code(1))["ETag"]
+    published = cloudfront.publish_function(Name=name, IfMatch=v2)
+    assert "etag" not in published["ResponseMetadata"]["HTTPHeaders"]
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v2, v1)
+    v3 = cloudfront.update_function(Name=name, IfMatch=v2, FunctionConfig=cfg, FunctionCode=code(2))["ETag"]
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v3, v1)
+    cloudfront.publish_function(Name=name, IfMatch=v3)
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v3, v2)
+    cloudfront.publish_function(Name=name, IfMatch=v3)
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v3, v3)
+
+    for call in (lambda: cloudfront.publish_function(Name=name, IfMatch=v1),
+                 lambda: cloudfront.delete_function(Name=name, IfMatch=v1)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+        assert exc.value.response["Error"]["Message"] == (
+            "The request failed because it didn't meet the preconditions in one or more request-header fields.")
+
+    fn_arn = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+    dist_cfg = copy.deepcopy(_CF_DIST_CONFIG)
+    dist_cfg["CallerReference"] = f"cf-fn-inuse-{_uuid_mod.uuid4().hex[:12]}"
+    dist_cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {
+        "Quantity": 1, "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}]}
+    dist = cloudfront.create_distribution(DistributionConfig=dist_cfg)
+    try:
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_function(Name=name, IfMatch=v3)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+        err = exc.value.response["Error"]
+        assert (err["Code"], err["Message"]) == (
+            "FunctionInUse", f"Cannot delete function {name}, it is in use by 1 distributions")
+    finally:
+        dist_cfg["Enabled"] = False
+        dist_cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {"Quantity": 0}
+        disabled = cloudfront.update_distribution(Id=dist["Distribution"]["Id"], IfMatch=dist["ETag"],
+                                                  DistributionConfig=dist_cfg)
+        cloudfront.delete_distribution(Id=dist["Distribution"]["Id"], IfMatch=disabled["ETag"])
+    cloudfront.delete_function(Name=name, IfMatch=v3)
 
 
 def test_cloudfront_function_development_status_follows_publish_and_association(cloudfront):

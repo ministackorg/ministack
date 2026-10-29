@@ -407,7 +407,7 @@ def _list_event_buses(data):
             # than returning an empty string (Java SDK v2 sees a stray empty).
             policy = _event_bus_policies.get(n)
             if policy:
-                entry["Policy"] = json.dumps(policy)
+                entry["Policy"] = json.dumps(policy, separators=(",", ":"))
             buses.append(entry)
     return json_response({"EventBuses": buses})
 
@@ -427,7 +427,7 @@ def _describe_event_bus(data):
     # AWS spec: Policy is optional; omit when no policy is set.
     policy = _event_bus_policies.get(name)
     if policy:
-        out["Policy"] = json.dumps(policy)
+        out["Policy"] = json.dumps(policy, separators=(",", ":"))
     for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
         if k in bus:
             out[k] = bus[k]
@@ -3461,8 +3461,40 @@ def _put_partner_events(data):
 # Permissions (resource policies)
 # ---------------------------------------------------------------------------
 
+def _policy_statement_error(document, bus_arn):
+    """The ValidationException message for a Policy document AWS refuses, or None."""
+    statements = document.get("Statement") if isinstance(document, dict) else None
+    for statement in statements if isinstance(statements, list) else [statements]:
+        resources = statement.get("Resource") if isinstance(statement, dict) else None
+        for resource in resources if isinstance(resources, list) else [resources]:
+            if isinstance(resource, str) and resource != bus_arn and resource.startswith("arn:"):
+                relative = resource.split(":", 5)[5] if resource.count(":") >= 5 else resource
+                return f'The relative-id "{relative}" is invalid for ARN "{resource}"'
+    return None
+
+
 def _put_permission(data):
     bus_name = data.get("EventBusName", "default")
+    bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
+    if "Policy" in data:
+        if any(data.get(k) is not None for k in ("Action", "Principal", "StatementId", "Condition")):
+            return error_response_json(
+                "ValidationException",
+                "Action, Principal, StatementId and Condition could not be combined with Policy parameter.", 400)
+        try:
+            document = json.loads(data["Policy"]) if isinstance(data["Policy"], str) else None
+        except ValueError:
+            document = None
+        if not isinstance(document, dict):
+            return error_response_json("ValidationException", "This policy contains invalid Json", 400)
+        message = _policy_statement_error(document, bus_arn)
+        if message:
+            return error_response_json("ValidationException", message, 400)
+        # A Policy replaces the bus's whole policy.
+        _event_bus_policies[bus_name] = document
+        _touch_bus(bus_name)
+        return json_response({})
+
     statement_id = data.get("StatementId") or new_uuid()
 
     if bus_name not in _event_bus_policies:
@@ -3471,19 +3503,29 @@ def _put_permission(data):
     policy = _event_bus_policies[bus_name]
     policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != statement_id]
 
+    principal = data.get("Principal", "*")
+    if isinstance(principal, str) and re.fullmatch(r"\d{12}", principal):
+        principal = {"AWS": f"arn:aws:iam::{principal}:root"}
     statement = {
         "Sid": statement_id,
         "Effect": "Allow",
-        "Principal": data.get("Principal", "*"),
+        "Principal": principal,
         "Action": data.get("Action", "events:PutEvents"),
-        "Resource": f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}",
+        "Resource": bus_arn,
     }
     condition = data.get("Condition")
     if condition:
         statement["Condition"] = condition
     policy["Statement"].append(statement)
+    _touch_bus(bus_name)
 
     return json_response({})
+
+
+def _touch_bus(bus_name):
+    bus = _event_buses.get(bus_name)
+    if bus:
+        bus["LastModifiedTime"] = _now_ts()
 
 
 def _remove_permission(data):
