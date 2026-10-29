@@ -6747,6 +6747,19 @@ def _describe_instance_attribute(p):
                 f"<instanceId>{_esc(str(instance_id))}</instanceId>{value_xml}")
 
 
+# Virtualized families that run on Xen; every other current family is built on the
+# Nitro System (EC2 instance types guide, "Instances built on the AWS Nitro System").
+_XEN_INSTANCE_FAMILIES = {
+    "t1", "t2", "m1", "m2", "m3", "m4", "c1", "c3", "c4", "r3", "r4",
+    "i2", "i3", "d2", "x1", "x1e", "g2", "g3", "p2", "p3", "f1", "h1",
+}
+
+
+def _is_graviton_family(family):
+    """Graviton families carry a "g" after the generation ("t4g", "c7gn", "r8gd", "x2gd", "is4gen"); A1 predates the convention."""
+    return family == "a1" or re.match(r"^[a-z]+[0-9]+[a-z]*g[a-z]*$", family) is not None
+
+
 def _describe_instance_types(p):
     # Collect requested types
     requested = _parse_member_list(p, "InstanceType")
@@ -6759,6 +6772,8 @@ def _describe_instance_types(p):
     items = []
     for itype in all_types:
         family = itype.split(".")[0]
+        hypervisor = "xen" if family in _XEN_INSTANCE_FAMILIES else "nitro"
+        architecture = "arm64" if _is_graviton_family(family) else "x86_64"
         vcpus = 2 if "micro" in itype else 4 if "small" in itype else 8
         mem_mib = 1024 if "micro" in itype else 2048 if "small" in itype else 4096
         items.append(f"""<item>
@@ -6769,9 +6784,9 @@ def _describe_instance_types(p):
             <supportedRootDeviceTypes><item>ebs</item></supportedRootDeviceTypes>
             <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>
             <bareMetal>false</bareMetal>
-            <hypervisor>xen</hypervisor>
+            <hypervisor>{hypervisor}</hypervisor>
             <processorInfo>
-                <supportedArchitectures><item>x86_64</item></supportedArchitectures>
+                <supportedArchitectures><item>{architecture}</item></supportedArchitectures>
                 <sustainedClockSpeedInGhz>2.5</sustainedClockSpeedInGhz>
             </processorInfo>
             <vCpuInfo>
