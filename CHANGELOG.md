@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **IAM — service-specific credentials and server certificates** — clients that call `ListServiceSpecificCredentials` or `ListServerCertificates` got `InvalidAction`. `CreateServiceSpecificCredential`, `ListServiceSpecificCredentials`, `UpdateServiceSpecificCredential`, `ResetServiceSpecificCredential` and `DeleteServiceSpecificCredential`, and `UploadServerCertificate`, `ListServerCertificates`, `GetServerCertificate`, `UpdateServerCertificate`, `DeleteServerCertificate` and `ListServerCertificateTags` now answer as AWS does: the secret is returned only on create and reset, a reset issues a new secret and keeps the status, `UserName` may be omitted by an IAM-user caller (it is read from the caller's access key) while a non-user caller without it gets `InvalidInput`, and a certificate's `Expiration` is parsed from the PEM while a body that does not parse gets `MalformedCertificate`. Responses and errors verified against a real AWS account.
+
 ## [1.5.34] — 2026-10-29
 
 ### Added
