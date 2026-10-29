@@ -2982,3 +2982,20 @@ def test_secret_profile_aws_iso_partitions(secret_target, partition, supported):
         assert (status, code) == (404, "ResourceNotFoundException")
     else:
         assert (status, code, message) == (400, "BadRequestException", f"The Uri: {uri} is of an unsupported type")
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("label", ["nopolicy", "shared"])
+def test_cross_account_secret_needs_its_resource_policy_under_auth(secret_target, account_b_secrets,
+                                                                   auth_enabled, label):
+    """Under AUTH=true another account's secret is read only when its resource policy lets the retrieval
+    role call GetSecretValue (r12 X4); with AUTH off MiniStack does not evaluate the policy."""
+    t = secret_target
+    arn = account_b_secrets[label]["arn"]
+    if auth_enabled and label == "nopolicy":
+        with pytest.raises(ClientError) as exc:
+            t.profile(arn)
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert re.fullmatch(_access_denied(t, arn), exc.value.response["Error"]["Message"])
+    else:
+        assert t.profile(arn)

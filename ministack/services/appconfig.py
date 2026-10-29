@@ -371,21 +371,43 @@ def _secret_account(secret_id):
         return get_account_id()
 
 
+def _retrieval_session(role_arn):
+    role = parse_arn(role_arn)
+    return (f"arn:{role.partition}:sts::{role.account_id}:assumed-role/"
+            f"{role.resource.rsplit('/', 1)[-1]}/AwsAppConfig-ConfigurationRetriever")
+
+
+def _retrieval_denied(secret_id, role_arn):
+    return _secrets_manager_error(
+        f"User: {_retrieval_session(role_arn)} is not authorized to perform: secretsmanager:GetSecretValue "
+        f"on resource: {secret_id} because no resource-based policy allows the secretsmanager:GetSecretValue action",
+        "AccessDeniedException")
+
+
+def _secret_policy_denies(secret, role_arn):
+    """Under AUTH=true another account's secret is read only if its resource policy lets the
+    retrieval role call GetSecretValue. Called in the secret's own account scope."""
+    from ministack.app import AUTH
+
+    if not AUTH:
+        return False
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    policy = secretsmanager._resource_policies.get(secret["ARN"])
+    ctx = EvalContext(principal_arn=_retrieval_session(role_arn), principal_type="AssumedRole",
+                      principal_account=parse_arn(role_arn).account_id, action="secretsmanager:GetSecretValue",
+                      resource_arn=secret["ARN"], region=get_region())
+    return not policy or evaluate_resource_policy(policy, ctx).decision != "Allow"
+
+
 def _cross_account_secret_error(secret_id, location_uri, role_arn):
     """AWS reads another account's secret as the retrieval role. A secret
     that isn't named by its exact ARN can't be shared, so it is refused; one
     that can't be read (scheduled for deletion, without a value, under that
-    account's AWS managed key) is not found. Whether a resource
-    policy allows the role is IAM's to decide; MiniStack allows it."""
+    account's AWS managed key) is not found."""
     secret = secretsmanager.find_secret(secret_id)
-    if not secret or secret["ARN"] != secret_id:
-        role = parse_arn(role_arn)
-        return _secrets_manager_error(
-            f"User: arn:{role.partition}:sts::{role.account_id}:assumed-role/"
-            f"{role.resource.rsplit('/', 1)[-1]}/AwsAppConfig-ConfigurationRetriever is not authorized "
-            f"to perform: secretsmanager:GetSecretValue on resource: {secret_id} because no "
-            f"resource-based policy allows the secretsmanager:GetSecretValue action",
-            "AccessDeniedException")
+    if not secret or secret["ARN"] != secret_id or _secret_policy_denies(secret, role_arn):
+        return _retrieval_denied(secret_id, role_arn)
     # Scheduled for deletion, without a value, or under that account's AWS
     # managed key, it is not found.
     if not secretsmanager.secret_exists(secret_id) or not _is_customer_managed_key(secret.get("KmsKeyId")):
@@ -1058,16 +1080,21 @@ def _is_json(text):
                 return False
 
 
-def _deployed_secret_content(secret_id, location_uri, version, body):
+def _deployed_secret_content(secret_id, location_uri, version, body, role_arn=""):
     """Returns ((content, content_type), None) for the secret version a
     deployment names, or (None, error)."""
     err = _secret_version_length_error(version)
     if err:
         return None, err
     # Another account's secret, and its key, are read in that account.
-    with request_scope(_secret_account(secret_id), get_region()):
+    caller, owner = get_account_id(), _secret_account(secret_id)
+    with request_scope(owner, get_region()):
         secret, secret_version = secretsmanager.resolve_secret_version(secret_id, version)
         customer_key = secret is not None and _is_customer_managed_key(secret.get("KmsKeyId"))
+        denied = (secret is not None and owner != caller and role_arn
+                  and _secret_policy_denies(secret, role_arn))
+    if denied:
+        return None, _retrieval_denied(secret_id, role_arn)
     # A version without a value (MiniStack's Secrets Manager makes one for a
     # secret created without a value) doesn't exist on AWS; the version is
     # checked before the key.
@@ -1155,7 +1182,8 @@ def _start_deployment(app_id, env_id, body):
     secret_id = _secret_id_for_location(location_uri) if isinstance(location_uri, str) else None
     secret_content = None
     if secret_id is not None:
-        secret_content, err = _deployed_secret_content(secret_id, location_uri, version, body)
+        role_arn = _config_profiles[f"{app_id}/{profile_id}"].get("RetrievalRoleArn", "")
+        secret_content, err = _deployed_secret_content(secret_id, location_uri, version, body, role_arn)
         if err:
             return err
 

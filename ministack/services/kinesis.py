@@ -1712,7 +1712,9 @@ def _policy_resource(resource_arn, action, headers, policy=None):
         if any(isinstance(v, list) and not v for s in statements for v in s["Principal"].values()):
             return None, error_response_json("InvalidArgumentException", _NO_PRINCIPALS, 400), None
         principals = [n for s in statements for v in s["Principal"].values() for n in _as_list(v)]
-        if not all(_principal_exists(p) for p in principals):
+        from ministack.app import AUTH
+        # With AUTH off a principal need not exist in MiniStack, as elsewhere (Lambda takes any role ARN).
+        if AUTH and not all(_principal_exists(p) for p in principals):
             return None, error_response_json("InvalidArgumentException", "Invalid principal in policy document.", 400), None
         stored = _stored_policy(document, statements)
     stream_name, _, consumer = spec.resource.split("/", 1)[1].partition("/consumer/")

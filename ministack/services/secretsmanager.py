@@ -186,27 +186,15 @@ def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None
 
 
 def _resolve_for_reader(secret_id):
-    """``_resolve`` as Secrets Manager reads a SecretId for another service: a
-    partial ARN must be the secret's ARN without its random suffix, not just
-    a prefix of it, and one whose name ends in a hyphen and six letters,
-    digits or underscores is read as a full ARN."""
-    if not secret_id or not secret_id.startswith("arn:"):
-        return _resolve(secret_id)
-    scope = _secret_scope_from_arn(secret_id)
-    if not scope:
-        return None, None
-    spec, name = scope
-    if spec.account_id != get_account_id() or spec.region != get_region():
-        return None, None
-    for key, secret in _secrets.items():
-        if secret["ARN"] == secret_id:
-            return key, secret
-    if re.search(r"-[A-Za-z0-9_]{6}\Z", name):
-        return None, None
-    for key, secret in _secrets.items():
-        if secret["ARN"][:-7] == secret_id:
-            return key, secret
-    return None, None
+    """``_resolve`` as Secrets Manager reads a SecretId for another service: an
+    ARN whose name ends in a hyphen and six letters, digits or underscores is
+    read as a full ARN, so it never matches as a partial one."""
+    key, secret = _resolve(secret_id)
+    if secret and secret_id.startswith("arn:") and secret["ARN"] != secret_id:
+        scope = _secret_scope_from_arn(secret_id)
+        if not scope or re.search(r"-[A-Za-z0-9_]{6}\Z", scope[1]):
+            return None, None
+    return key, secret
 
 
 def resolve_secret_version(secret_id, version_id):
