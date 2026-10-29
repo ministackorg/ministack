@@ -4023,6 +4023,9 @@ def main():
         config = HypercornConfig()
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
+        # AWS closes client connections by keepalive duration, not request count; Hypercorn's default of 1000 drops the
+        # HTTP/2 request that passes it. 10M is more than one connection can send here in AWS's default hour.
+        config.keep_alive_max_requests = 10_000_000
         config.loglevel = LOG_LEVEL.upper()
 
         # USE_SSL=1 enables HTTPS — matches the behaviour previously provided

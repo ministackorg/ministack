@@ -908,6 +908,44 @@ def test_elbv2_dataplane_forward_ip_target(elbv2):
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
+@pytest.mark.serial
+def test_elbv2_dataplane_http2_connection_answers_past_a_thousand_requests(elbv2):
+    """One HTTP/2 connection keeps answering past Hypercorn's default keep_alive_max_requests (1000): AWS closes a client
+    connection by keepalive duration, not by request count."""
+    import socket
+
+    import h2.connection
+    import h2.events
+
+    lb_name = "dp-alb-h2"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", _SERVER_GATEWAY_PORT)
+    parsed = urlparse(_endpoint)
+    sock = socket.create_connection((parsed.hostname, parsed.port or 4566), timeout=10)
+    try:
+        client = h2.connection.H2Connection()
+        client.initiate_connection()
+        sock.sendall(client.data_to_send())
+        for _ in range(1100):
+            stream_id = client.get_next_available_stream_id()
+            client.send_headers(stream_id, [(":method", "GET"), (":path", f"/_alb/{lb_name}/_ministack/health"),
+                                            (":authority", parsed.netloc), (":scheme", "http")], end_stream=True)
+            sock.sendall(client.data_to_send())
+            ended = False
+            while not ended:
+                data = sock.recv(65535)
+                assert data, f"connection closed at stream {stream_id}"
+                for event in client.receive_data(data):
+                    assert not isinstance(event, h2.events.ConnectionTerminated), f"GOAWAY at stream {stream_id}"
+                    if isinstance(event, h2.events.DataReceived):
+                        client.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                    elif isinstance(event, h2.events.StreamEnded) and event.stream_id == stream_id:
+                        ended = True
+                sock.sendall(client.data_to_send())
+    finally:
+        sock.close()
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+
+
 def _start_echo_server():
     """Answer every GET with the request target and headers the target received, as JSON."""
     import threading
