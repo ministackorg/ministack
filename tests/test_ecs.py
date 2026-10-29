@@ -4467,8 +4467,12 @@ def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
     fargate = [{"capacityProvider": "FARGATE", "weight": 1}]
     ecs.create_cluster(clusterName=cluster)
     ecs.create_cluster(clusterName=bare)
-    ecs.put_cluster_capacity_providers(cluster=cluster, capacityProviders=["FARGATE", "FARGATE_SPOT"],
-                                       defaultCapacityProviderStrategy=fargate)
+    put = ecs.put_cluster_capacity_providers(cluster=cluster, capacityProviders=["FARGATE", "FARGATE_SPOT"],
+                                             defaultCapacityProviderStrategy=fargate)["cluster"]
+    # #2455, captured on AWS: the cluster's default strategy also comes back with base 0.
+    with_base = [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+    assert put["defaultCapacityProviderStrategy"] == with_base
+    assert ecs.describe_clusters(clusters=[cluster])["clusters"][0]["defaultCapacityProviderStrategy"] == with_base
     ecs.register_task_definition(family=cluster, requiresCompatibilities=["FARGATE"], networkMode="awsvpc",
                                  cpu="256", memory="512",
                                  containerDefinitions=[{"name": "app", "image": "nginx:alpine", "essential": True}])
@@ -4486,7 +4490,7 @@ def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
 
         default = ecs.create_service(cluster=cluster, serviceName="default", taskDefinition=cluster,
                                      desiredCount=0, networkConfiguration=net)["service"]
-        assert default["capacityProviderStrategy"] == fargate and "launchType" not in default
+        assert default["capacityProviderStrategy"] == with_base and "launchType" not in default
         plain = ecs.create_service(cluster=bare, serviceName="plain", taskDefinition=cluster, desiredCount=0)["service"]
         assert plain["launchType"] == "EC2" and "capacityProviderStrategy" not in plain
 

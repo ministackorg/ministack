@@ -526,7 +526,7 @@ def _put_cluster(data):
             {"name": "containerInsights", "value": "disabled"},
         ],
         "capacityProviders": data.get("capacityProviders", []),
-        "defaultCapacityProviderStrategy": data.get("defaultCapacityProviderStrategy", []),
+        "defaultCapacityProviderStrategy": _service_strategy(data.get("defaultCapacityProviderStrategy")) or [],
         "statistics": [],
         "attachments": [],
         "attachmentsStatus": "",
@@ -1359,7 +1359,7 @@ _FARGATE_PROVIDERS = ("FARGATE", "FARGATE_SPOT")
 
 
 def _service_strategy(strategy):
-    """A service's capacityProviderStrategy as AWS returns it: each item with its base, 0 when not given."""
+    """A capacityProviderStrategy as AWS returns it (service or cluster default): each item with its base, 0 when not given."""
     if not strategy:
         return None
     return [{**item, "base": item.get("base", 0)} for item in strategy]
@@ -3115,7 +3115,7 @@ def _put_cluster_capacity_providers(data):
         return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
 
     cluster["capacityProviders"] = data.get("capacityProviders", [])
-    cluster["defaultCapacityProviderStrategy"] = data.get("defaultCapacityProviderStrategy", [])
+    cluster["defaultCapacityProviderStrategy"] = _service_strategy(data.get("defaultCapacityProviderStrategy")) or []
 
     return json_response({"cluster": cluster})
 

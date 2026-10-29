@@ -30,6 +30,7 @@ endpoint; its certificate chains to the CA served at
 
 import contextvars
 import copy
+import hashlib
 import io
 import ipaddress
 import logging
@@ -2363,7 +2364,7 @@ def _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce):
     return archive.getvalue()
 
 
-def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True):
+def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl_commands=()):
     """Start a TLS-only Valkey/Redis container and return ``(address, port, id)``.
 
     Raises on any failure, after removing what it started: a serverless cache
@@ -2409,8 +2410,12 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
         announce = _serverless_announce_flags(address, port)
         if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce)):
             raise RuntimeError("Docker rejected the TLS material")
-        if wait and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+        if (wait or acl_commands) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
             raise RuntimeError(f"{engine} in {name} never reported cluster_state:ok over TLS")
+        for command in acl_commands:
+            result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", str(container_port), *command])
+            if result.exit_code != 0 or result.output.strip() != b"OK":
+                raise RuntimeError(f"{name}: {command[:3]} answered {result.output[:200]!r}")
     except Exception:
         _teardown_containers(docker_client, [container.id])
         raise
@@ -2419,10 +2424,35 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
     return address, port, container.id
 
 
+def _acl_setuser(user):
+    """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
+    An iam user's token is not checked, as with AUTH=false elsewhere."""
+    rules = ["reset", *user.get("AccessString", "").split()]
+    if user.get("Authentication", {}).get("Type") == "password" and user.get("_PasswordHashes"):
+        rules += [f"#{h}" for h in user["_PasswordHashes"]]
+    else:
+        rules.append("nopass")
+    return ["ACL", "SETUSER", user.get("UserName") or user["UserId"], *rules]
+
+
+def _user_group_acl_commands(account_id, region, group_id):
+    """The engine ACL for a cache with a user group: the group's users, then `default` last. A group
+    without a user named default turns it off (AWS RBAC docs: attaching a Valkey user group disables it)."""
+    group = _user_groups.get_scoped(account_id, region, group_id) if group_id else None
+    if not group:
+        return []
+    users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in group.get("UserIds", [])) if u]
+    default = next((u for u in users if u.get("UserName") == "default"), None)
+    commands = [_acl_setuser(u) for u in users if u.get("UserName") != "default"]
+    commands.append(_acl_setuser(default) if default else ["ACL", "SETUSER", "default", "reset"])
+    return commands
+
+
 def _start_serverless_container(record, account_id, region, wait=True):
     """Start ``record``'s container and publish its endpoint, unless the cache
     was deleted meanwhile — then the container is removed instead."""
     name = record["ServerlessCacheName"]
+    acl_commands = _user_group_acl_commands(account_id, region, record.get("UserGroupId"))
     address, port, cid = _spawn_serverless_container(
         name=_serverless_container_name(account_id, region, name),
         engine=record["Engine"],
@@ -2435,6 +2465,7 @@ def _start_serverless_container(record, account_id, region, wait=True):
             "region": region,
         },
         wait=wait,
+        **({"acl_commands": acl_commands} if acl_commands else {}),
     )
     with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
         orphaned = _serverless_caches.get_scoped(account_id, region, name) is not record
@@ -2814,6 +2845,11 @@ def _user_authentication(p, user_id, user_name, engine):
     return None, None
 
 
+def _password_hashes(p):
+    keys = [k for k in sorted(p) if k.startswith(("Passwords.member.", "AuthenticationMode.Passwords.member."))]
+    return [hashlib.sha256(_p(p, k).encode()).hexdigest() for k in keys if _p(p, k)]
+
+
 def _minimum_engine_version(user):
     if user.get("Engine") == "valkey":
         return "7.2"
@@ -2844,6 +2880,7 @@ def _create_user(p):
         "UserGroupIds": [],
         "Authentication": auth or {"Type": "no-password", "PasswordCount": 0},
         "ARN": arn,
+        "_PasswordHashes": _password_hashes(p),
     }
     _users[user_id] = user
 
@@ -2894,6 +2931,7 @@ def _modify_user(p):
         user["AccessString"] = _p(p, "AccessString")
     if auth:
         user["Authentication"] = auth
+        user["_PasswordHashes"] = _password_hashes(p)
 
     # AWS answers a modify with the user still modifying; MiniStack settles at once.
     return _xml(200, "ModifyUserResponse",

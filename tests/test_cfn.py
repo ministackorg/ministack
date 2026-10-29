@@ -16186,22 +16186,20 @@ def test_cfn_apigateway_domain_name_lifecycle(cfn, apigw_v1):
 
     outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
     assert outputs["RegionalRef"] == regional_name
-    assert outputs["RegionalDomainName"] == (
-        f"{regional_name}.execute-api.us-east-1.amazonaws.com"
-    )
+    assert re.fullmatch(r"d-[a-z0-9]{10}\.execute-api\.us-east-1\.amazonaws\.com", outputs["RegionalDomainName"])
     assert outputs["RegionalHostedZoneId"] == "Z1UJRXOUMOOFQ8"
     assert outputs["RegionalDomainNameArn"] == (
         f"arn:aws:apigateway:us-east-1::/domainnames/{regional_name}"
     )
-    assert outputs["DistributionDomainName"] == f"{edge_name}.cloudfront.net"
+    assert re.fullmatch(r"d[a-z0-9]{13}\.cloudfront\.net", outputs["DistributionDomainName"])
     assert outputs["DistributionHostedZoneId"] == "Z2FDTNDATAQYW2"
 
     regional = apigw_v1.get_domain_name(domainName=regional_name)
-    assert regional["endpointConfiguration"] == {"types": ["REGIONAL"]}
+    assert regional["endpointConfiguration"] == {"types": ["REGIONAL"], "ipAddressType": "ipv4"}
     assert regional["regionalCertificateArn"] == regional_certificate_arn
     assert _template_tags(regional["tags"]) == {"created-by": "cloudformation"}
     edge = apigw_v1.get_domain_name(domainName=edge_name)
-    assert edge["endpointConfiguration"] == {"types": ["EDGE"]}
+    assert edge["endpointConfiguration"] == {"types": ["EDGE"], "ipAddressType": "ipv4"}
     assert edge["certificateArn"] == edge_certificate_arn
 
     cfn.delete_stack(StackName=stack_name)

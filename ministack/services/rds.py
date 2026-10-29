@@ -325,7 +325,7 @@ AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
 #     --engine-version <major> --default-only
 AURORA_POSTGRESQL_DEFAULT_ENGINE_VERSIONS = {
     "16": "16.11",
-    "17": "17.7",
+    "17": "17.9",
 }
 
 AURORA_MYSQL_IMAGE_MAP = {
@@ -8108,7 +8108,7 @@ def _create_global_cluster(p):
     deletion_protection = _p(p, "DeletionProtection") == "true"
 
     arn = f"arn:aws:rds::{get_account_id()}:global-cluster:{gc_id}"
-    resource_id = f"cluster-{new_uuid().replace('-', '')[:20].lower()}"
+    resource_id = f"cluster-{new_uuid().replace('-', '')[:16].lower()}"
 
     source_cluster = None
     if source_cluster_id:
@@ -8162,6 +8162,7 @@ def _create_global_cluster(p):
         "DeletionProtection": deletion_protection,
         "GlobalClusterMembers": [],
         "DatabaseName": _p(p, "DatabaseName") or "",
+        "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
         "TagList": _parse_tags(p),
         "_EndpointToken": _global_endpoint_token(),
     }
@@ -9427,8 +9428,10 @@ def _global_cluster_xml(gc):
         <Engine>{gc['Engine']}</Engine>
         <EngineVersion>{gc['EngineVersion']}</EngineVersion>
         <Status>{gc['Status']}</Status>
-        <DatabaseName>{gc.get('DatabaseName', '')}</DatabaseName>
+        {f"<EngineLifecycleSupport>{gc['EngineLifecycleSupport']}</EngineLifecycleSupport>" if gc.get('EngineLifecycleSupport') else ""}
+        {f"<DatabaseName>{_esc(gc['DatabaseName'])}</DatabaseName>" if gc.get('DatabaseName') else ""}
         <StorageEncrypted>{str(gc.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
+        <StorageEncryptionType>{"sse-kms" if gc.get('StorageEncrypted') else "sse-rds"}</StorageEncryptionType>
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
         {failover_state_xml}
         <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>
@@ -10133,7 +10136,7 @@ def _format_time(ts):
 def _default_engine_version(engine):
     defaults = {
         "postgres": "15.3", "mysql": "8.0.33", "mariadb": "10.6.14",
-        "aurora-postgresql": "17.7", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
+        "aurora-postgresql": "17.9", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
     }
     return defaults.get(engine, "15.3")
 
