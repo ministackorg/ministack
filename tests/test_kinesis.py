@@ -947,6 +947,10 @@ def _kin_error(exc):
     return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
 
 
+def _unused_account():
+    return "9" + str(_uuid_mod.uuid4().int)[:11]
+
+
 def test_kinesis_resource_policy_follows_aws(kin):
     """Captured on AWS (us-east-1, 2026-10-26): codes, messages and check order of the resource-policy calls."""
     name = f"rp-{_uuid_mod.uuid4().hex[:8]}"
@@ -981,7 +985,9 @@ def test_kinesis_resource_policy_follows_aws(kin):
 
         stream_policy = policy(arn, ["kinesis:GetRecords", "kinesis:GetShardIterator"])
         kin.put_resource_policy(ResourceARN=arn, Policy=stream_policy)
-        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == stream_policy
+        # AWS stores the document compact (separators without spaces).
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == json.dumps(
+            json.loads(stream_policy), separators=(",", ":"))
         kin.put_resource_policy(ResourceARN=consumer, Policy=policy(consumer, ["kinesis:SubscribeToShard"]))
         kin.delete_resource_policy(ResourceARN=arn)
         assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
@@ -991,7 +997,8 @@ def test_kinesis_resource_policy_follows_aws(kin):
             kin.get_resource_policy(ResourceARN=missing)
         assert _kin_error(exc) == (400, "ResourceNotFoundException", f"Stream no-such-stream under account {account} not found.")
         with pytest.raises(ClientError) as exc:
-            kin.get_resource_policy(ResourceARN=arn.replace(f":{account}:", ":111111111111:"))
+            # An account no request has used does not exist.
+            kin.get_resource_policy(ResourceARN=arn.replace(f":{account}:", f":{_unused_account()}:"))
         assert _kin_error(exc) == (400, "UnrecognizedClientException", "No account found for the given parameters")
         west = arn.replace(":us-east-1:", ":us-west-2:")
         with pytest.raises(ClientError) as exc:
@@ -1152,3 +1159,245 @@ def test_kinesis_mapping_read_needs_every_read_in_the_stream_policy():
         with request_scope(owner, "us-east-1"):
             kmod._resource_policies.pop(arn, None)
             kmod._streams.pop(name, None)
+
+
+# ---------------------------------------------------------------------------
+# Resource policies as AWS validates and stores them (recorded in us-east-1)
+# ---------------------------------------------------------------------------
+
+_CONSUMER = "222222222222"
+
+
+def _read_policy(stream_arn, principal, actions=("kinesis:DescribeStream", "kinesis:DescribeStreamSummary",
+                                                 "kinesis:GetRecords", "kinesis:GetShardIterator",
+                                                 "kinesis:ListShards")):
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": {"AWS": principal},
+                       "Action": list(actions) if isinstance(actions, tuple) else actions, "Resource": stream_arn}],
+    })
+
+
+def _use_account(account_id):
+    """MiniStack knows an account once it holds an IAM identity or a stream; give it a role."""
+    _consumer_role(account=account_id)
+
+
+def _consumer_role(name="consumer-role", account=_CONSUMER):
+    iam = _account_client("iam", account)
+    try:
+        iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                           "Action": "sts:AssumeRole"}],
+        }))
+    except iam.exceptions.EntityAlreadyExistsException:
+        pass
+    return f"arn:aws:iam::{account}:role/{name}"
+
+
+def _new_stream(kin, prefix):
+    name = f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    return name, kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+
+
+def test_kinesis_resource_policy_put_get_delete(kin):
+    name, arn = _new_stream(kin, "kin-rp")
+    role = _consumer_role()
+    # Sent pretty, with one-element lists and a bare account id: AWS stores it
+    # compact, in its own key order, with lists of one collapsed and the
+    # account id as its root ARN, principals sorted as written.
+    policy = json.dumps({
+        "Statement": [{"Resource": [arn], "Action": ["kinesis:GetRecords"],
+                       "Principal": {"AWS": [_CONSUMER, role]}, "Effect": "Allow", "Sid": "Read"}],
+        "Version": "2012-10-17",
+    }, indent=2)
+
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == (
+        '{"Version":"2012-10-17","Statement":[{"Sid":"Read","Effect":"Allow",'
+        f'"Principal":{{"AWS":["arn:aws:iam::{_CONSUMER}:root","{role}"]}},'
+        f'"Action":"kinesis:GetRecords","Resource":"{arn}"}}]}}'
+    )
+
+    kin.delete_resource_policy(ResourceARN=arn)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    with pytest.raises(ClientError) as exc:
+        kin.delete_resource_policy(ResourceARN=arn)
+    assert exc.value.response["Error"] == {
+        "Code": "ResourceNotFoundException",
+        "Message": f"No resource policy found for resource ARN {arn}.",
+    }
+
+
+# Recorded against Kinesis (us-east-1): what PutResourcePolicy answers for each
+# document, given the stream ARN. "{arn}" is the stream's ARN.
+_POLICY_CASES = {
+    "not json": ("not json", "Policy validation error: This policy contains invalid Json"),
+    "array": ("[]", "Policy validation error: This policy contains invalid Json"),
+    "empty": ("", "Policy validation error: Resource policy size should be greater than 0 and less than 20000 bytes"),
+    "too big": ("x" * 20001,
+                "Policy validation error: Resource policy size should be greater than 0 and less than 20000 bytes"),
+    "no version": ('{"Statement": []}', "Policy validation error: Missing required field Version"),
+    "bad version": ('{"Version": "bogus", "Statement": []}',
+                    "Policy validation error: The policy must contain a valid version string"),
+    "no statement": ('{"Version": "2012-10-17"}', "Policy validation error: Missing required field Statement"),
+    "empty statement": ('{"Version": "2012-10-17", "Statement": []}',
+                        "Policy validation error: Could not parse the policy: Statement is empty!"),
+    "unknown field": ('{"Version": "2012-10-17", "Statement": [], "Foo": 1}',
+                      "Policy validation error: Unknown field Foo"),
+    "not-action": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                   '"NotAction": "kinesis:PutRecord", "Resource": "{arn}"}]}',
+                   "Policy validation error: Has prohibited field NotAction"),
+    "no effect": ('{"Version": "2012-10-17", "Statement": [{"Principal": {"AWS": "%(acct)s"}, '
+                  '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                  "Policy validation error: Missing required field Effect"),
+    "sid not a string": ('{"Version": "2012-10-17", "Statement": [{"Sid": 5, "Effect": "Allow", '
+                         '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                         "Policy validation error: Syntax error at position (1,50)"),
+    "invalid sid": ('{"Version": "2012-10-17", "Statement": [{"Sid": "a b", "Effect": "Allow", '
+                    '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                    "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                    "The following Statement Ids are invalid: a b, "),
+    "invalid action": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                       '"Action": ["kinesis:CreateStream", "kinesis:Nope"], "Resource": "{arn}"}]}',
+                       "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                       'The following action names are invalid: "kinesis:CreateStream", "kinesis:Nope"'),
+    "wildcard action": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                        '"Action": "kinesis:*", "Resource": "{arn}"}]}',
+                        "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                        "The resource policy cannot contain invalid actions: [kinesis:*]."),
+    "wildcard principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*", '
+                           '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                           "Policy validation error: Resource policy contains invalid statement at line 1, "
+                           "column 41: The resource policy cannot contain the wildcard principal."),
+    "service principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
+                          '"Principal": {"Service": "lambda.amazonaws.com"}, "Action": "kinesis:GetRecords", '
+                          '"Resource": "{arn}"}]}',
+                          "Policy validation error: Resource policy contains invalid statement at line 1, "
+                          "column 41: The resource policy cannot contain Service principals."),
+    "other resource": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                       '"Action": "kinesis:GetRecords", "Resource": "*"}]}',
+                       "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                       "The resource policy's resource must be the same as the resource ARN."),
+    "second statement, pretty": ('{\n  "Version": "2012-10-17",\n  "Statement": [\n    {"Sid": "a", "Effect": "Allow", '
+                                 '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", '
+                                 '"Resource": "{arn}"},\n    {"Sid": "a", "Effect": "Allow", '
+                                 '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", '
+                                 '"Resource": "{arn}"}\n  ]\n}',
+                                 "Policy validation error: Resource policy contains invalid statement at line 4, "
+                                 "column {col}: The Statement Ids in the policy are not unique"),
+    "unknown account principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
+                                  '"Principal": {"AWS": "arn:aws:iam::%(unused)s:root"}, '
+                                  '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                                  "Invalid principal in policy document."),
+    "missing role principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
+                               '"Principal": {"AWS": "arn:aws:iam::%(acct)s:role/no-such-role"}, '
+                               '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                               "Invalid principal in policy document."),
+}
+
+
+@pytest.mark.parametrize("case", list(_POLICY_CASES))
+def test_kinesis_resource_policy_validation_matches_aws(kin, case):
+    _name, arn = _new_stream(kin, "kin-rp-val")
+    _use_account(_CONSUMER)
+    unused = _unused_account()
+    document, message = _POLICY_CASES[case]
+    document = (document % {"acct": _CONSUMER, "unused": unused} if "%(" in document else document)
+    document = document.replace("{arn}", arn)
+    if "{col}" in message:
+        # Reported just past the token before the offending statement: the
+        # first statement's closing brace, on line 4.
+        message = message.replace("{col}", str(document.splitlines()[3].rindex("},") + 2))
+    with pytest.raises(ClientError) as exc:
+        kin.put_resource_policy(ResourceARN=arn, Policy=document)
+    assert exc.value.response["Error"] == {"Code": "InvalidArgumentException", "Message": message}
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+
+def test_kinesis_resource_policy_resource_errors(kin):
+    name, arn = _new_stream(kin, "kin-rp-err")
+    _use_account(_CONSUMER)
+    missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+    other_region = arn.replace(":us-east-1:", ":us-west-2:")
+    unused = arn.replace(f":{arn.split(':')[4]}:", f":{_unused_account()}:")
+
+    def error(call):
+        with pytest.raises(ClientError) as exc:
+            call()
+        return exc.value.response["Error"]
+
+    # The policy is checked before the stream: a policy for a missing stream
+    # naming the stream it was sent for is refused for its resource.
+    assert error(lambda: kin.get_resource_policy(ResourceARN=missing)) == {
+        "Code": "ResourceNotFoundException",
+        "Message": f"Stream no-such-stream under account {arn.split(':')[4]} not found."}
+    assert error(lambda: kin.put_resource_policy(ResourceARN=missing, Policy=_read_policy(missing, _CONSUMER))) == {
+        "Code": "ResourceNotFoundException",
+        "Message": f"Stream no-such-stream under account {arn.split(':')[4]} not found."}
+    assert error(lambda: kin.put_resource_policy(ResourceARN=missing, Policy=_read_policy(arn, _CONSUMER)))[
+        "Message"].endswith("The resource policy's resource must be the same as the resource ARN.")
+    assert error(lambda: kin.get_resource_policy(ResourceARN=other_region)) == {
+        "Code": "InvalidArgumentException",
+        "Message": f"The region specified in the ARN '{other_region}' does not match the endpoint region"}
+    assert error(lambda: kin.delete_resource_policy(ResourceARN=unused)) == {
+        "Code": "UnrecognizedClientException", "Message": "No account found for the given parameters"}
+
+    # Only the owner's account manages the policy.
+    other = _account_client("kinesis", _CONSUMER)
+    assert error(lambda: other.put_resource_policy(ResourceARN=arn, Policy=_read_policy(arn, _CONSUMER))) == {
+        "Code": "AccessDeniedException",
+        "Message": f"User: arn:aws:iam::{_CONSUMER}:root is not authorized to perform: kinesis:PutResourcePolicy "
+                   f"on resource: {arn} because no resource-based policy allows the kinesis:PutResourcePolicy action"}
+
+
+def test_kinesis_resource_policy_follows_stream_and_consumer_lifecycle(kin):
+    _use_account(_CONSUMER)
+    name, arn = _new_stream(kin, "kin-rp-life")
+    consumer_arn = kin.register_stream_consumer(StreamARN=arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    consumer_policy = _read_policy(consumer_arn, _CONSUMER, ["kinesis:SubscribeToShard"])
+
+    with pytest.raises(ClientError) as exc:  # a stream action on a consumer
+        kin.put_resource_policy(ResourceARN=consumer_arn, Policy=_read_policy(consumer_arn, _CONSUMER))
+    assert 'The following action names are invalid: "kinesis:DescribeStream"' in exc.value.response["Error"]["Message"]
+    kin.put_resource_policy(ResourceARN=consumer_arn, Policy=consumer_policy)
+    assert json.loads(kin.get_resource_policy(ResourceARN=consumer_arn)["Policy"])["Statement"][0]["Action"] == (
+        "kinesis:SubscribeToShard")
+    kin.deregister_stream_consumer(ConsumerARN=consumer_arn)
+    consumer_arn = kin.register_stream_consumer(StreamARN=arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    assert kin.get_resource_policy(ResourceARN=consumer_arn)["Policy"] == "{}"
+
+    kin.put_resource_policy(ResourceARN=arn, Policy=_read_policy(arn, _CONSUMER))
+    kin.delete_stream(StreamName=name)
+    kin.create_stream(StreamName=name, ShardCount=1)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+
+@pytest.mark.auth_contract
+def test_kinesis_stream_policy_grants_a_named_user_contract(auth_enabled, iam_user, kin):
+    """In the owner's account, a stream policy naming a user allows that user
+    even without an identity policy."""
+    name = f"kin-rp-auth-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    user = iam_user()
+    client = user.client("kinesis")
+    try:
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                client.describe_stream_summary(StreamARN=arn)
+            assert exc.value.response["Error"] == {
+                "Code": "AccessDeniedException",
+                "Message": f"User: {user.arn} is not authorized to perform: kinesis:DescribeStreamSummary on resource: "
+                           f"{arn} because no identity-based policy allows the kinesis:DescribeStreamSummary action"}
+        else:
+            client.describe_stream_summary(StreamARN=arn)
+
+        kin.put_resource_policy(ResourceARN=arn, Policy=_read_policy(
+            arn, user.arn, "kinesis:DescribeStreamSummary"))
+        assert client.describe_stream_summary(StreamARN=arn)["StreamDescriptionSummary"]["StreamARN"] == arn
+    finally:
+        kin.delete_stream(StreamName=name)

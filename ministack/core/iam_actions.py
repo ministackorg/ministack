@@ -2353,9 +2353,9 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service in {"ssm", "logs"} and not error_code:
-        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
-        # capitalized Message naming the resource, as observed on live AWS.
+    if service in {"ssm", "logs", "kinesis"} and not error_code:
+        # SSM, Logs and Kinesis authorization denials are HTTP 400, JSON 1.1,
+        # with a capitalized Message naming the resource, as observed on live AWS.
         message = identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
