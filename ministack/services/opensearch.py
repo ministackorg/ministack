@@ -986,16 +986,31 @@ def update_domain_from_cloudformation(name, payload, compatibility_properties):
 
     if changed_properties:
         rec["_UpdatedTime"] = _now()
-        _change_progress[name] = {
-            "ChangeId": new_uuid(),
-            "StartTime": _now(),
-            "Status": "COMPLETED",
-            "PendingProperties": [],
-            "CompletedProperties": changed_properties,
-            "TotalNumberOfStages": 0,
-            "ConfigChangeStatus": "Completed",
-        }
+        _record_change(name, rec, changed_properties)
     return rec
+
+
+def _record_change(name, rec, completed_properties):
+    """Record a completed configuration change, reported by DescribeDomainChangeProgress and
+    summarized on the domain's ChangeProgressDetails under the same ChangeId."""
+    now = _now()
+    change_id = new_uuid()
+    _change_progress[name] = {
+        "ChangeId": change_id,
+        "StartTime": now,
+        "Status": "COMPLETED",
+        "PendingProperties": [],
+        "CompletedProperties": completed_properties,
+        "TotalNumberOfStages": 0,
+        "ConfigChangeStatus": "Completed",
+    }
+    rec["ChangeProgressDetails"] = {
+        "ChangeId": change_id,
+        "ConfigChangeStatus": "Completed",
+        "InitiatedBy": "CUSTOMER",
+        "StartTime": now,
+        "LastUpdatedTime": now,
+    }
 
 
 def delete_domain_record(name, missing_ok=False):
@@ -1066,6 +1081,7 @@ def _create_domain(payload):
         rec = create_domain_record(payload)
     except OpenSearchServiceError as exc:
         return _error(exc.status, exc.code, exc.message)
+    _record_change(rec["DomainName"], rec, [])
     return _json(200, {"DomainStatus": _public(rec)})
 
 
@@ -1132,15 +1148,7 @@ def _update_domain_config(name, payload):
     # Real AWS marks the domain Processing while config rollout happens; we
     # complete immediately because the data plane (if any) doesn't actually
     # re-provision.
-    _change_progress[name] = {
-        "ChangeId": new_uuid(),
-        "StartTime": _now(),
-        "Status": "COMPLETED",
-        "PendingProperties": [],
-        "CompletedProperties": list(payload.keys()),
-        "TotalNumberOfStages": 0,
-        "ConfigChangeStatus": "Completed",
-    }
+    _record_change(name, rec, list(payload.keys()))
     return _json(200, {"DomainConfig": _domain_config(rec)})
 
 
