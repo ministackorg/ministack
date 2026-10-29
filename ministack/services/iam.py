@@ -40,6 +40,7 @@ IAM actions:
 """
 
 import base64
+import binascii
 import copy
 import json
 import logging
@@ -430,8 +431,8 @@ async def handle_request(method, path, headers, body, query_params):
     # UserName, which AWS then takes from the caller. The caller's access key
     # resolves it here; non-user callers get AWS's InvalidInput at the op.
     access_key = extract_access_key_id(headers, query_params)
-    if access_key:
-        params["_caller_user"] = _access_keys.get(access_key, {}).get("UserName", "")
+    # Always set, so a request cannot supply its own _caller_user.
+    params["_caller_user"] = _access_keys.get(access_key, {}).get("UserName", "") if access_key else ""
 
     action = _p(params, "Action")
     handler = _IAM_HANDLERS.get(action)
@@ -2856,6 +2857,20 @@ def _delete_saml_provider(p):
 # and delete alike). ``_caller_user`` is injected by handle_request.
 
 
+# CreateServiceSpecificCredential API reference and "API keys for AWS services": a user name and
+# password for CodeCommit and Keyspaces, an alias and secret (long-term API key) for the others.
+_PASSWORD_CREDENTIAL_SERVICES = frozenset({"codecommit.amazonaws.com", "cassandra.amazonaws.com"})
+_API_KEY_CREDENTIAL_SERVICES = frozenset({"bedrock.amazonaws.com", "aws-external-anthropic.amazonaws.com",
+                                          "cloudwatch.amazonaws.com", "logs.amazonaws.com"})
+
+
+def _unsupported_service(service):
+    if service in _PASSWORD_CREDENTIAL_SERVICES or service in _API_KEY_CREDENTIAL_SERVICES:
+        return None
+    return _error(404, "NotSupportedService",
+                  "The specified service does not support service-specific credentials.", ns="iam")
+
+
 def _credential_user(p):
     user = _p(p, "UserName") or _p(p, "_caller_user")
     if not user:
@@ -2873,6 +2888,8 @@ def _service_credential_fields(c, with_secret=False):
     """The member fields AWS returns; ``ServiceCredentialSecret`` only ever
     appears on create and reset responses (AWS 2026-10-29)."""
     inner = ""
+    if with_secret and c.get("ServicePassword"):
+        inner += f"<ServicePassword>{_xml_escape(c['ServicePassword'])}</ServicePassword>"
     if c.get("ServiceUserName"):
         inner += f"<ServiceUserName>{_xml_escape(c['ServiceUserName'])}</ServiceUserName>"
     if c.get("ServiceCredentialAlias"):
@@ -2880,7 +2897,7 @@ def _service_credential_fields(c, with_secret=False):
     inner += f"<CreateDate>{c['CreateDate']}</CreateDate>"
     if c.get("ExpirationDate"):
         inner += f"<ExpirationDate>{c['ExpirationDate']}</ExpirationDate>"
-    if with_secret:
+    if with_secret and c.get("ServiceCredentialSecret"):
         inner += (f"<ServiceCredentialSecret>{c['ServiceCredentialSecret']}"
                   f"</ServiceCredentialSecret>")
     return (inner +
@@ -2897,24 +2914,39 @@ def _gen_service_credential():
     return cred_id, secret
 
 
+def _new_service_secret(cred):
+    """A new secret of the credential's kind: a password (44 characters, as the API reference's
+    example) for a user-name credential, else the API key secret."""
+    if cred.get("ServiceUserName"):
+        cred["ServicePassword"] = base64.b64encode(os.urandom(32)).decode()
+    else:
+        _, cred["ServiceCredentialSecret"] = _gen_service_credential()
+
+
 def _create_service_specific_credential(p):
     user, err = _credential_user(p)
     if err:
         return err
     service = _p(p, "ServiceName")
-    cred_id, secret = _gen_service_credential()
+    unsupported = _unsupported_service(service)
+    if unsupported:
+        return unsupported
+    cred_id, _secret = _gen_service_credential()
     cred = {
         "Id": cred_id,
         "UserName": user,
         "ServiceName": service,
-        "ServiceCredentialAlias": f"{user}-at-{get_account_id()}",
-        "ServiceCredentialSecret": secret,
         "Status": "Active",
         "CreateDate": _now(),
     }
-    age_days = _p(p, "CredentialAgeDays")
-    if age_days.isdigit() and int(age_days) > 0:
-        cred["ExpirationDate"] = _future(int(age_days) * 86400)
+    if service in _PASSWORD_CREDENTIAL_SERVICES:
+        cred["ServiceUserName"] = f"{user}-at-{get_account_id()}"
+    else:
+        cred["ServiceCredentialAlias"] = f"{user}-at-{get_account_id()}"
+        age_days = _p(p, "CredentialAgeDays")
+        if age_days.isdigit() and int(age_days) > 0:
+            cred["ExpirationDate"] = _future(int(age_days) * 86400)
+    _new_service_secret(cred)
     _service_specific_credentials[cred_id] = cred
     return _xml(200, "CreateServiceSpecificCredentialResponse",
                 f"<CreateServiceSpecificCredentialResult>"
@@ -2930,6 +2962,9 @@ def _list_service_specific_credentials(p):
     if err:
         return err
     service = _p(p, "ServiceName")
+    unsupported = service and _unsupported_service(service)
+    if unsupported:
+        return unsupported
     members = "".join(
         f"<member>{_service_credential_fields(c)}</member>"
         for c in _service_specific_credentials.values()
@@ -2971,7 +3006,7 @@ def _reset_service_specific_credential(p):
     cred, err = _lookup_service_credential(p)
     if err:
         return err
-    _, cred["ServiceCredentialSecret"] = _gen_service_credential()
+    _new_service_secret(cred)
     return _xml(200, "ResetServiceSpecificCredentialResponse",
                 f"<ResetServiceSpecificCredentialResult>"
                 f"<ServiceSpecificCredential>"
@@ -2993,8 +3028,15 @@ def _delete_service_specific_credential(p):
 
 
 def _cert_expiration(pem: str) -> str | None:
-    """notAfter of a PEM cert, like AWS parses it on upload. None when the
-    body is not a readable certificate."""
+    """notAfter of a PEM cert, like AWS parses it on upload; "" when it can't be read without the
+    optional cryptography package; None when the body is not a certificate."""
+    import importlib.util
+    if importlib.util.find_spec("cryptography") is None:
+        match = re.fullmatch(r"\s*-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----\s*", pem or "")
+        try:
+            return "" if match and base64.b64decode("".join(match.group(1).split()), validate=True) else None
+        except (binascii.Error, ValueError):
+            return None
     try:
         from cryptography import x509
         cert = x509.load_pem_x509_certificate(pem.encode())
@@ -3036,13 +3078,13 @@ def _upload_server_certificate(p):
     name = _p(p, "ServerCertificateName")
     path = _normalize_iam_path(_p(p, "Path"))
     arn = _server_cert_arn(path, name)
-    if arn in _server_certificates:
+    if any(c["Name"] == name for c in _server_certificates.values()):
         return _error(409, "EntityAlreadyExists",
                       f"The Server Certificate with name {name} already exists.",
                       ns="iam")
     body_pem = _p(p, "CertificateBody")
     expiration = _cert_expiration(body_pem)
-    if not expiration:
+    if expiration is None:
         return _error(400, "MalformedCertificate",
                       "Unable to parse certificate.", ns="iam")
     cert = {
@@ -3111,7 +3153,9 @@ def _get_server_certificate(p):
                 f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
                 f"</ServerCertificateMetadata>"
                 f"<CertificateBody>{_xml_escape(cert['Body'])}</CertificateBody>"
-                f"<Tags>{_tags_xml(cert.get('Tags', []))}</Tags>"
+                + (f"<CertificateChain>{_xml_escape(cert['CertificateChain'])}</CertificateChain>"
+                   if cert.get("CertificateChain") else "")
+                + f"<Tags>{_tags_xml(cert.get('Tags', []))}</Tags>"
                 f"</ServerCertificate></GetServerCertificateResult>",
                 ns="iam")
 
@@ -3123,7 +3167,7 @@ def _update_server_certificate(p):
     new_name = _p(p, "NewServerCertificateName")
     new_path = _normalize_iam_path(_p(p, "NewPath") or cert["Path"])
     new_arn = _server_cert_arn(new_path, new_name or cert["Name"])
-    if new_arn != cert["Arn"] and new_arn in _server_certificates:
+    if new_name and new_name != cert["Name"] and any(c["Name"] == new_name for c in _server_certificates.values()):
         return _error(409, "EntityAlreadyExists",
                       "The Server Certificate with name "
                       f"{new_name or cert['Name']} already exists.", ns="iam")

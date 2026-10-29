@@ -1644,13 +1644,37 @@ def test_iam_service_specific_credential_lifecycle(iam):
 
 def test_iam_service_specific_credential_service_name_filter(iam):
     iam.create_user(UserName="ssc-filter-user")
-    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="a.amazonaws.com")
-    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="b.amazonaws.com")
+    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="bedrock.amazonaws.com")
+    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="logs.amazonaws.com")
     filtered = iam.list_service_specific_credentials(
-        UserName="ssc-filter-user", ServiceName="a.amazonaws.com"
+        UserName="ssc-filter-user", ServiceName="bedrock.amazonaws.com"
     )["ServiceSpecificCredentials"]
     assert len(filtered) == 1
-    assert filtered[0]["ServiceName"] == "a.amazonaws.com"
+    assert filtered[0]["ServiceName"] == "bedrock.amazonaws.com"
+    # API reference: NotSupportedService (404) for a service without service-specific credentials.
+    for call in (lambda: iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="a.amazonaws.com"),
+                 lambda: iam.list_service_specific_credentials(UserName="ssc-filter-user", ServiceName="a.amazonaws.com")):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert (exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "NotSupportedService", 404)
+
+
+def test_iam_service_specific_credential_codecommit_user_name_and_password(iam):
+    """API reference example: a CodeCommit credential is a ServiceUserName (<user>-at-<account>) and a
+    ServicePassword, the password only on create and reset."""
+    iam.create_user(UserName="ssc-git-user")
+    created = iam.create_service_specific_credential(
+        UserName="ssc-git-user", ServiceName="codecommit.amazonaws.com")["ServiceSpecificCredential"]
+    account = iam.get_user(UserName="ssc-git-user")["User"]["Arn"].split(":")[4]
+    assert created["ServiceUserName"] == f"ssc-git-user-at-{account}"
+    assert len(created["ServicePassword"]) == 44
+    assert "ServiceCredentialSecret" not in created and "ServiceCredentialAlias" not in created
+    listed = iam.list_service_specific_credentials(UserName="ssc-git-user")["ServiceSpecificCredentials"]
+    assert listed[0]["ServiceUserName"] == created["ServiceUserName"] and "ServicePassword" not in listed[0]
+    reset = iam.reset_service_specific_credential(
+        UserName="ssc-git-user", ServiceSpecificCredentialId=created["ServiceSpecificCredentialId"])
+    assert reset["ServiceSpecificCredential"]["ServicePassword"] != created["ServicePassword"]
 
 
 def test_iam_service_specific_credential_age_days(iam):
@@ -1767,6 +1791,21 @@ def test_iam_server_certificate_lifecycle(iam):
 
     iam.delete_server_certificate(ServerCertificateName="svc-cert-2")
     assert iam.list_server_certificates()["ServerCertificateMetadataList"] == []
+
+
+def test_iam_server_certificate_name_is_unique_and_chain_is_returned(iam):
+    cert_pem, key_pem = _self_signed_pem()
+    iam.upload_server_certificate(ServerCertificateName="uniq-cert", Path="/a/", CertificateBody=cert_pem,
+                                  PrivateKey=key_pem, CertificateChain=cert_pem)
+    try:
+        with pytest.raises(ClientError) as exc:
+            iam.upload_server_certificate(ServerCertificateName="uniq-cert", Path="/b/", CertificateBody=cert_pem,
+                                          PrivateKey=key_pem)
+        assert exc.value.response["Error"]["Code"] == "EntityAlreadyExists"
+        got = iam.get_server_certificate(ServerCertificateName="uniq-cert")["ServerCertificate"]
+        assert got["CertificateChain"] == cert_pem and "PrivateKey" not in got
+    finally:
+        iam.delete_server_certificate(ServerCertificateName="uniq-cert")
 
 
 def test_iam_server_certificate_path_normalized(iam):
