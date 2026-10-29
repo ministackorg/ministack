@@ -1140,7 +1140,24 @@ def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
             entry.mode = 0o600
             entry.size = len(data)
             bundle.addfile(entry, io.BytesIO(data))
+        # Runs once, when the image initializes a fresh data directory.
+        data = _PG_RDS_INIT.encode()
+        entry = tarfile.TarInfo("docker-entrypoint-initdb.d/ministack-rds.sh")
+        entry.mode = 0o755
+        entry.size = len(data)
+        bundle.addfile(entry, io.BytesIO(data))
     return archive.getvalue()
+
+
+# The roles RDS and Aurora PostgreSQL provide, with the master user in rds_superuser as AWS documents.
+_PG_RDS_INIT = """#!/bin/sh
+set -e
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+CREATE ROLE rds_iam NOLOGIN;
+CREATE ROLE rds_superuser NOLOGIN;
+SQL
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "GRANT rds_superuser TO \"$POSTGRES_USER\""
+"""
 
 
 def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tls_ips=()):
