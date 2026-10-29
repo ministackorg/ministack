@@ -330,6 +330,40 @@ def _key_ref_from_arn(key_id_or_arn):
     return None
 
 
+# Operations a principal in another account can call on a key it names by key ARN
+# (KMS developer guide, "Allowing users in other accounts to use a KMS key").
+_CROSS_ACCOUNT_ACTIONS = frozenset({
+    "Encrypt", "Decrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext", "GenerateDataKeyPair",
+    "GenerateDataKeyPairWithoutPlaintext", "GenerateMac", "VerifyMac", "Sign", "Verify",
+    "DescribeKey", "GetPublicKey", "CreateGrant", "GetKeyRotationStatus", "ListGrants", "RetireGrant", "RevokeGrant",
+})
+
+
+def _foreign_key(key_arn):
+    """``(owner account, key record or None)`` for a key ARN of another account in this Region, else ``(None, None)``."""
+    if not isinstance(key_arn, str) or not key_arn.startswith("arn:"):
+        return None, None
+    try:
+        spec = parse_arn(key_arn)
+    except ArnParseError:
+        return None, None
+    if (spec.partition != "aws" or spec.service != "kms" or spec.region != get_region()
+            or not spec.account_id or spec.account_id == get_account_id() or not spec.resource.startswith("key/")):
+        return None, None
+    rec = _keys.get_scoped(spec.account_id, spec.region, spec.resource[len("key/"):])
+    return spec.account_id, (rec if rec and rec.get("Arn") == key_arn else None)
+
+
+def _cross_account_denied(action):
+    """AWS's answer when the key is not visible to the caller (captured through AppConfig, us-east-1)."""
+    from ministack.core.iam_evaluator import caller_arn
+    return error_response_json(
+        "AccessDeniedException",
+        f"User: {caller_arn()} is not authorized to perform: kms:{action} on this resource because the resource "
+        "does not exist in this Region, no resource-based policies allow access, or a resource-based policy "
+        "explicitly denies access", 400)
+
+
 def _resolve_key(key_id_or_arn):
     if not key_id_or_arn:
         return None
@@ -1789,6 +1823,9 @@ def _get_key_rotation_status(data):
 
 def key_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     """The key policy and owner account, for the identity check."""
+    owner, rec = _foreign_key(resource_arn)
+    if owner:
+        return (rec.get("Policy") or "", owner) if rec else None
     rec = _resolve_key(resource_arn)
     if not rec:
         return None
@@ -2352,6 +2389,13 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json(
             "InvalidAction", f"Unknown action: {action}", 400
         )
+    if action in _CROSS_ACCOUNT_ACTIONS:
+        owner, rec = _foreign_key(data.get("KeyId"))
+        if owner:
+            if rec is None:
+                return _cross_account_denied(action)
+            with request_scope(owner, get_region()):
+                return handler(data)
     return handler(data)
 
 
