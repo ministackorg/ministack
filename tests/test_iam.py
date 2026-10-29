@@ -1605,3 +1605,189 @@ def test_iam_account_alias_crud(iam):
     iam.delete_account_alias(AccountAlias=alias)
     aliases_after = iam.list_account_aliases()["AccountAliases"]
     assert alias not in aliases_after
+
+
+# -------------------- Service-specific credentials --------------------
+
+def test_iam_service_specific_credential_lifecycle(iam):
+    iam.create_user(UserName="ssc-user")
+    created = iam.create_service_specific_credential(
+        UserName="ssc-user", ServiceName="bedrock.amazonaws.com"
+    )["ServiceSpecificCredential"]
+    assert created["ServiceSpecificCredentialId"].startswith("ACCA")
+    assert created["ServiceName"] == "bedrock.amazonaws.com"
+    assert created["Status"] == "Active"
+    assert created["ServiceCredentialSecret"]
+    cred_id = created["ServiceSpecificCredentialId"]
+
+    listed = iam.list_service_specific_credentials(UserName="ssc-user")["ServiceSpecificCredentials"]
+    assert len(listed) == 1
+    assert listed[0]["ServiceSpecificCredentialId"] == cred_id
+    # AWS only exposes the secret on create/reset, never on list
+    assert "ServiceCredentialSecret" not in listed[0]
+
+    iam.update_service_specific_credential(
+        UserName="ssc-user", ServiceSpecificCredentialId=cred_id, Status="Inactive"
+    )
+    listed = iam.list_service_specific_credentials(UserName="ssc-user")["ServiceSpecificCredentials"]
+    assert listed[0]["Status"] == "Inactive"
+
+    reset = iam.reset_service_specific_credential(
+        UserName="ssc-user", ServiceSpecificCredentialId=cred_id
+    )["ServiceSpecificCredential"]
+    assert reset["ServiceCredentialSecret"] != created["ServiceCredentialSecret"]
+    assert reset["Status"] == "Inactive"
+
+    iam.delete_service_specific_credential(UserName="ssc-user", ServiceSpecificCredentialId=cred_id)
+    assert iam.list_service_specific_credentials(UserName="ssc-user")["ServiceSpecificCredentials"] == []
+
+
+def test_iam_service_specific_credential_service_name_filter(iam):
+    iam.create_user(UserName="ssc-filter-user")
+    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="a.amazonaws.com")
+    iam.create_service_specific_credential(UserName="ssc-filter-user", ServiceName="b.amazonaws.com")
+    filtered = iam.list_service_specific_credentials(
+        UserName="ssc-filter-user", ServiceName="a.amazonaws.com"
+    )["ServiceSpecificCredentials"]
+    assert len(filtered) == 1
+    assert filtered[0]["ServiceName"] == "a.amazonaws.com"
+
+
+def test_iam_service_specific_credential_age_days(iam):
+    iam.create_user(UserName="ssc-age-user")
+    cred = iam.create_service_specific_credential(
+        UserName="ssc-age-user", ServiceName="bedrock.amazonaws.com", CredentialAgeDays=30
+    )["ServiceSpecificCredential"]
+    assert "ExpirationDate" in cred
+
+
+def test_iam_service_specific_credential_unknown_user(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.list_service_specific_credentials(UserName="ghost-user-xyz")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_service_specific_credential_username_required_for_non_user(iam):
+    # The default test credentials do not resolve to an IAM user, so AWS
+    # requires UserName explicitly (real AWS: InvalidInput, 400).
+    with pytest.raises(ClientError) as exc:
+        iam.list_service_specific_credentials()
+    assert exc.value.response["Error"]["Code"] == "InvalidInput"
+
+
+def test_iam_service_specific_credential_unknown_id(iam):
+    iam.create_user(UserName="ssc-noid-user")
+    with pytest.raises(ClientError) as exc:
+        iam.update_service_specific_credential(
+            UserName="ssc-noid-user", ServiceSpecificCredentialId="ACCAZZZZZZZZZZZZZZZZZ",
+            Status="Inactive"
+        )
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_service_specific_credential_caller_user_inferred(iam):
+    # An IAM user calling with its own access key may omit UserName; AWS takes
+    # it from the caller identity (real AWS observation).
+    import boto3
+    from conftest import ENDPOINT, REGION
+
+    iam.create_user(UserName="ssc-caller")
+    key = iam.create_access_key(UserName="ssc-caller")["AccessKey"]
+    caller_iam = boto3.client(
+        "iam",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=key["AccessKeyId"],
+        aws_secret_access_key=key["SecretAccessKey"],
+        region_name=REGION,
+    )
+    # botocore requires UserName on create client-side; list sends it bare.
+    iam.create_service_specific_credential(UserName="ssc-caller", ServiceName="bedrock.amazonaws.com")
+    listed = caller_iam.list_service_specific_credentials()["ServiceSpecificCredentials"]
+    assert len(listed) == 1
+    assert listed[0]["UserName"] == "ssc-caller"
+
+
+# -------------------- Server certificates --------------------
+
+def _self_signed_pem():
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ministack-test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    return (
+        cert.public_bytes(serialization.Encoding.PEM).decode(),
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ).decode(),
+    )
+
+
+def test_iam_server_certificate_lifecycle(iam):
+    cert_pem, key_pem = _self_signed_pem()
+    md = iam.upload_server_certificate(
+        ServerCertificateName="svc-cert", Path="/cloudfront/prod/",
+        CertificateBody=cert_pem, PrivateKey=key_pem,
+        Tags=[{"Key": "env", "Value": "test"}],
+    )["ServerCertificateMetadata"]
+    assert md["ServerCertificateId"].startswith("ASCA")
+    assert md["Path"] == "/cloudfront/prod/"
+    assert md["Arn"].endswith(":server-certificate/cloudfront/prod/svc-cert")
+    assert "Expiration" in md
+
+    listed = iam.list_server_certificates()["ServerCertificateMetadataList"]
+    assert [m["ServerCertificateName"] for m in listed] == ["svc-cert"]
+
+    got = iam.get_server_certificate(ServerCertificateName="svc-cert")["ServerCertificate"]
+    assert "BEGIN CERTIFICATE" in got["CertificateBody"]
+
+    tags = iam.list_server_certificate_tags(ServerCertificateName="svc-cert")["Tags"]
+    assert {"Key": "env", "Value": "test"} in tags
+
+    iam.update_server_certificate(
+        ServerCertificateName="svc-cert", NewPath="/cdn/", NewServerCertificateName="svc-cert-2"
+    )
+    listed = iam.list_server_certificates()["ServerCertificateMetadataList"]
+    assert [(m["ServerCertificateName"], m["Path"]) for m in listed] == [("svc-cert-2", "/cdn/")]
+
+    iam.delete_server_certificate(ServerCertificateName="svc-cert-2")
+    assert iam.list_server_certificates()["ServerCertificateMetadataList"] == []
+
+
+def test_iam_server_certificate_path_normalized(iam):
+    cert_pem, key_pem = _self_signed_pem()
+    md = iam.upload_server_certificate(
+        ServerCertificateName="bare-cert", CertificateBody=cert_pem, PrivateKey=key_pem
+    )["ServerCertificateMetadata"]
+    assert md["Path"] == "/"
+
+
+def test_iam_server_certificate_malformed(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.upload_server_certificate(
+            ServerCertificateName="bad-cert",
+            CertificateBody="-----BEGIN CERTIFICATE-----\nnot-a-cert\n-----END CERTIFICATE-----",
+            PrivateKey="-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+        )
+    assert exc.value.response["Error"]["Code"] == "MalformedCertificate"
+
+
+def test_iam_server_certificate_unknown(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.get_server_certificate(ServerCertificateName="ghost-cert-xyz")
+    assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
