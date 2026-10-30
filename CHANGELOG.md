@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — a PreTokenGeneration Lambda that throws fails the request** — a trigger that ran and returned an error, including running past its own timeout, was logged and the token issued without its claims (or a 500 `InternalError` with `MINISTACK_COGNITO_PRETOKEN_STRICT=1`); as on AWS, `InitiateAuth`, the refresh flows and the other token-issuing operations now answer 400 `UserLambdaValidationException` with `PreTokenGenerationV2_0 failed with error <errorMessage>.` (the trigger name carries the `LambdaVersion`, and is `PreTokenGeneration` for the legacy `LambdaConfig.PreTokenGeneration`), and `/oauth2/token` answers 400 with that text and the error code in `error`. A trigger that cannot be invoked still fails open by default (#533); with `MINISTACK_COGNITO_PRETOKEN_STRICT=1` it answers 400 `UnexpectedLambdaException` (`PreTokenGenerationV2_0 invocation failed due to error AccessDeniedException.` for a missing function) instead of 500. Contributed by @ryuzo-hayashi.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added

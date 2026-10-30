@@ -6629,27 +6629,19 @@ def test_cognito_pretoken_v2_id_token_section(cognito_idp, lam):
     assert "access_only_marker" not in id_tok
 
 
-def test_cognito_pretoken_lambda_failure_fail_open(cognito_idp, lam):
-    """A broken PreTokenGeneration Lambda fails open: token issued without overrides (#533)."""
-    handler = "def handler(event, ctx):\n    raise RuntimeError('boom')\n"
-    fn_name = "ministack-pretoken-broken"
-    lam.create_function(
-        FunctionName=fn_name, Runtime="python3.12",
-        Role="arn:aws:iam::000000000000:role/test-role",
-        Handler="index.handler",
-        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
-    )
-    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+def _pretoken_lambda_config(fn_arn: str, version: str = "V2_0") -> dict:
+    if version == "legacy":
+        return {"PreTokenGeneration": fn_arn}
+    return {"PreTokenGenerationConfig": {"LambdaArn": fn_arn, "LambdaVersion": version}}
 
+
+def _pretoken_password_pool(cognito_idp, pool_name: str, fn_arn: str, version: str = "V2_0"):
     pid = cognito_idp.create_user_pool(
-        PoolName="pretoken-broken",
-        LambdaConfig={"PreTokenGenerationConfig": {
-            "LambdaArn": fn_arn, "LambdaVersion": "V2_0",
-        }},
+        PoolName=pool_name, LambdaConfig=_pretoken_lambda_config(fn_arn, version),
     )["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
         UserPoolId=pid, ClientName="app",
-        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
     )["UserPoolClient"]["ClientId"]
     cognito_idp.admin_create_user(
         UserPoolId=pid, Username="u",
@@ -6658,12 +6650,145 @@ def test_cognito_pretoken_lambda_failure_fail_open(cognito_idp, lam):
     cognito_idp.admin_set_user_password(
         UserPoolId=pid, Username="u", Password="Pwd1234!", Permanent=True,
     )
+    return pid, cid
+
+
+def _pretoken_lambda(lam, fn_name: str, handler: str) -> str:
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+    )
+    return lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+
+
+@pytest.mark.parametrize("version,trigger_name", [
+    ("V2_0", "PreTokenGenerationV2_0"),
+    ("V3_0", "PreTokenGenerationV3_0"),
+    ("legacy", "PreTokenGeneration"),
+])
+def test_cognito_pretoken_lambda_error_fails_closed(cognito_idp, lam, version, trigger_name):
+    """A PreTokenGeneration Lambda that throws fails sign-in with UserLambdaValidationException, as on AWS."""
+    fn_arn = _pretoken_lambda(lam, f"ministack-pretoken-broken-{version}",
+                              "def handler(event, ctx):\n    raise RuntimeError('boom')\n")
+    _, cid = _pretoken_password_pool(cognito_idp, f"pretoken-broken-{version}", fn_arn, version)
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    assert exc.value.response["Error"]["Message"] == f"{trigger_name} failed with error boom."
+
+
+def test_cognito_pretoken_lambda_timeout_fails_closed(cognito_idp, lam):
+    """A PreTokenGeneration Lambda that runs past its own timeout fails sign-in like any other function error."""
+    lam.create_function(
+        FunctionName="ministack-pretoken-timeout", Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Timeout=1,
+        Code={"ZipFile": _make_pretoken_lambda_zip(
+            "import time\ndef handler(event, ctx):\n    time.sleep(3)\n    return event\n")},
+    )
+    fn_arn = lam.get_function(FunctionName="ministack-pretoken-timeout")["Configuration"]["FunctionArn"]
+    _, cid = _pretoken_password_pool(cognito_idp, "pretoken-timeout", fn_arn)
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    assert exc.value.response["Error"]["Message"].startswith("PreTokenGenerationV2_0 failed with error ")
+    assert "Task timed out after 1.00 seconds" in exc.value.response["Error"]["Message"]
+
+
+def test_cognito_pretoken_lambda_error_fails_refresh(cognito_idp, lam):
+    """Refreshing tokens fails the same way when the PreTokenGeneration Lambda throws."""
+    allow_arn = _pretoken_lambda(lam, "ministack-pretoken-refresh-allow", "def handler(event, ctx):\n    return event\n")
+    reject_arn = _pretoken_lambda(lam, "ministack-pretoken-refresh-reject",
+                                  "def handler(event, ctx):\n    raise RuntimeError('boom')\n")
+    pid, cid = _pretoken_password_pool(cognito_idp, "pretoken-refresh", allow_arn)
+    refresh_token = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+    )["AuthenticationResult"]["RefreshToken"]
+    cognito_idp.update_user_pool(UserPoolId=pid, LambdaConfig=_pretoken_lambda_config(reject_arn))
+
+    for refresh in (
+        lambda: cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                                          AuthParameters={"REFRESH_TOKEN": refresh_token}),
+        lambda: cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken=refresh_token),
+    ):
+        with pytest.raises(ClientError) as exc:
+            refresh()
+        assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+        assert exc.value.response["Error"]["Message"] == "PreTokenGenerationV2_0 failed with error boom."
+
+
+def test_cognito_pretoken_missing_lambda_fails_open(cognito_idp):
+    """A PreTokenGeneration Lambda that cannot be invoked fails open: token issued without overrides (#533)."""
+    _, cid = _pretoken_password_pool(
+        cognito_idp, "pretoken-missing", "arn:aws:lambda:us-east-1:000000000000:function:ministack-pretoken-missing")
     tok = cognito_idp.initiate_auth(
         ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
         AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
     )["AuthenticationResult"]
     access = _decode_jwt_claims(tok["AccessToken"])
     assert access["client_id"] == cid  # token still issued
+
+
+def test_cognito_pretoken_missing_lambda_strict_fails_closed(cognito_idp, monkeypatch):
+    """MINISTACK_COGNITO_PRETOKEN_STRICT=1 answers UnexpectedLambdaException for a Lambda that cannot be invoked."""
+    mod = _cognito_module()
+    monkeypatch.setenv("MINISTACK_COGNITO_PRETOKEN_STRICT", "1")
+    pid = json.loads(mod._create_user_pool({
+        "PoolName": "pretoken-missing-strict",
+        "LambdaConfig": {"PreTokenGenerationConfig": {
+            "LambdaArn": "arn:aws:lambda:us-east-1:000000000000:function:ministack-pretoken-missing",
+            "LambdaVersion": "V2_0",
+        }},
+    })[2])["UserPool"]["Id"]
+    cid = json.loads(mod._create_user_pool_client({
+        "UserPoolId": pid, "ClientName": "app", "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH"],
+    })[2])["UserPoolClient"]["ClientId"]
+    mod._admin_create_user({
+        "UserPoolId": pid, "Username": "u", "TemporaryPassword": "Temp1234!", "MessageAction": "SUPPRESS",
+    })
+    mod._admin_set_user_password({"UserPoolId": pid, "Username": "u", "Password": "Pwd1234!", "Permanent": True})
+
+    status, _, body = mod._run_idp_handler(mod._initiate_auth, "InitiateAuth", {
+        "ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH",
+        "AuthParameters": {"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+    })
+    error = json.loads(body)
+    assert status == 400
+    assert error["__type"] == "UnexpectedLambdaException"
+    assert error["message"] == "PreTokenGenerationV2_0 invocation failed due to error AccessDeniedException."
+
+
+def test_cognito_pretoken_lambda_error_fails_client_credentials_grant(cognito_idp, lam):
+    """/oauth2/token answers Cognito's internal exception as the error text when a V3_0 PreTokenGeneration Lambda throws."""
+    fn_arn = _pretoken_lambda(lam, "ministack-pretoken-broken-client-credentials",
+                              "def handler(event, ctx):\n    raise RuntimeError('boom')\n")
+    pool_id, client = _client_credentials_client(cognito_idp)
+    cognito_idp.update_user_pool(UserPoolId=pool_id, LambdaConfig=_pretoken_lambda_config(fn_arn, "V3_0"))
+
+    status, _, body = _post_form(f"{ENDPOINT}/oauth2/token", {
+        "grant_type": "client_credentials", "client_id": client["ClientId"],
+        "client_secret": client["ClientSecret"], "scope": "api/read",
+    })
+
+    assert status == 400, body
+    error = json.loads(body)["error"]
+    assert error.startswith(
+        "PreTokenGenerationV3_0 failed with error boom. (Service: AWSCognitoIdentityProviderInternalService; "
+        "Status Code: 400; Error Code: UserLambdaValidationException; Request ID: "
+    )
+    assert error.endswith("; Proxy: null)")
 
 
 @pytest.mark.parametrize("version", ["V1_0", "V2_0", "V3_0"])
