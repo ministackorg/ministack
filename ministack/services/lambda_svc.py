@@ -7244,7 +7244,8 @@ def _validate_scaling_config(data: dict, source_arn: str = ""):
 
 def _cross_account_stream_read_error(stream_arn: str, func_name: str, qualifier: str | None):
     """Why a mapping cannot read another account's stream, as AWS answers CreateEventSourceMapping, or
-    None. AWS checks the stream's policy whether or not MiniStack enforces IAM, so both modes do."""
+    None. A missing stream is refused in both modes; the stream's policy only under AUTH=true."""
+    from ministack.app import AUTH
     from ministack.services import kinesis as _kin
 
     spec = parse_arn(stream_arn)
@@ -7256,7 +7257,7 @@ def _cross_account_stream_read_error(stream_arn: str, func_name: str, qualifier:
     func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
     role = ((func_rec or {}).get("config") or {}).get("Role", "")
     if (not stream or stream.get("StreamARN") != stream_arn
-            or _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id())):
+            or (AUTH and _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id()))):
         return _invalid_parameter_value(
             f"Cannot access stream {stream_arn}. Please ensure the role can perform the GetRecords, "
             "GetShardIterator, DescribeStream, DescribeStreamSummary, ListShards, and ListStreams Actions "
@@ -7762,9 +7763,12 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
 
 
 def _cross_account_read_problem(stream_arn, func_rec):
-    """LastProcessingResult while a running mapping cannot read another account's stream, or None."""
+    """LastProcessingResult while a running mapping cannot read another account's stream (AUTH=true), or None."""
+    from ministack.app import AUTH
     from ministack.services import kinesis as _kin
 
+    if not AUTH:
+        return None
     role = (func_rec.get("config") or {}).get("Role", "")
     return _kin.running_mapping_read_problem(stream_arn, role, get_account_id())
 

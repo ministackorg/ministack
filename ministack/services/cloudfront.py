@@ -5612,6 +5612,10 @@ def _merge_function_headers(original_headers_obj: dict, returned_headers_obj: di
 def _build_function_event(event_type: str, dist_id: str, dist_domain: str, request_id: str,
                            method: str, uri: str, query_params: dict, headers: dict, client_ip: str) -> dict:
     request_headers = {k: v for k, v in headers.items() if k != "cookie"}
+    if isinstance(request_headers.get("host"), str):
+        # Captured on AWS: the function sees the Host lower-cased and without its port.
+        host = request_headers["host"].lower()
+        request_headers["host"] = host if host.endswith("]") or ":" not in host else host.rsplit(":", 1)[0]
     return {
         "version": "1.0",
         "context": {

@@ -5123,7 +5123,21 @@ def _alias_distribution(cloudfront, origin_domain, aliases, origin_path):
             "TargetOriginId": "o", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
         },
     }
-    cloudfront.create_distribution(DistributionConfig=config)
+    _ALIAS_DISTRIBUTIONS.append(cloudfront.create_distribution(DistributionConfig=config)["Distribution"]["Id"])
+
+
+_ALIAS_DISTRIBUTIONS = []
+
+
+@pytest.fixture(autouse=True)
+def _delete_alias_distributions(cloudfront):
+    yield
+    while _ALIAS_DISTRIBUTIONS:
+        dist_id = _ALIAS_DISTRIBUTIONS.pop()
+        cfg = cloudfront.get_distribution_config(Id=dist_id)
+        etag = cloudfront.update_distribution(Id=dist_id, IfMatch=cfg["ETag"],
+                                              DistributionConfig={**cfg["DistributionConfig"], "Enabled": False})["ETag"]
+        cloudfront.delete_distribution(Id=dist_id, IfMatch=etag)
 
 
 def test_routes_by_alternate_domain_name(cloudfront, cf_backend):
@@ -5169,6 +5183,25 @@ def test_longest_wildcard_alias_wins(cloudfront, cf_backend, specific_first):
     assert _served_by(f"a.s.{dom}") == "/specific/hello"
     assert _served_by(f"a.b.s.{dom}") == "/specific/hello"
     assert _served_by(f"a.t.{dom}") == "/broad/hello"
+
+
+def test_signed_api_call_is_not_alias_viewer_traffic(cloudfront, cf_backend):
+    # An alias covering the host SDKs reach MiniStack by must not swallow their (SigV4-signed) API calls.
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["*.sig.example.test"], "/wild")
+    assert "X-Cache" in _get("api.sig.example.test", "/hello")[1]
+    signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20261030/us-east-1/s3/aws4_request, "
+                               "SignedHeaders=host, Signature=00"}
+    assert "X-Cache" not in _get("api.sig.example.test", "/hello", extra_headers=signed)[1]
+
+
+def test_function_event_host_is_lower_cased_without_port():
+    # Captured on AWS (cases 3, 9a, 9b): X.D and x.D:443 reach the viewer function as x.D.
+    from ministack.services.cloudfront import _build_function_event
+
+    for sent in ("X.Example.Test", "x.example.test:443", "x.example.test:80"):
+        event = _build_function_event("viewer-request", "E1", "d1.cloudfront.net", "r", "GET", "/", {},
+                                      {"host": sent}, "127.0.0.1")
+        assert event["request"]["headers"]["host"] == {"value": "x.example.test"}
 
 
 def test_alias_yields_to_an_api_gateway_custom_domain(cloudfront, apigw, cf_backend):

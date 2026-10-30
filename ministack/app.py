@@ -2046,6 +2046,10 @@ async def _handle_cloudfront_alias_request(
 ):
     """Serve a request whose Host is a distribution's alternate domain name. Runs after every other Host-claiming
     handler: on AWS DNS sends those hosts to their own service, here the Host is the only signal."""
+    # A signed AWS API call is never viewer traffic, even when an alias covers the host clients reach MiniStack by.
+    if (headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            or any(k.lower() == "x-amz-credential" for k in (query_params or {}))):
+        return None
     dist = _resolve_cloudfront_alias_request(host)
     if dist is None:
         return None
