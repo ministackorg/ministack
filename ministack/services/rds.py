@@ -1153,10 +1153,15 @@ def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
 _PG_RDS_INIT = """#!/bin/sh
 set -e
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
-CREATE ROLE rds_iam NOLOGIN;
-CREATE ROLE rds_superuser NOLOGIN;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_iam') THEN CREATE ROLE rds_iam NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_superuser') THEN CREATE ROLE rds_superuser NOLOGIN; END IF;
+END
+$$;
 SQL
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "GRANT rds_superuser TO \"$POSTGRES_USER\""
+# A master user named rds_superuser already is that role; GRANT would make it a member of itself.
+[ "$POSTGRES_USER" = rds_superuser ] || psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "GRANT rds_superuser TO \"$POSTGRES_USER\""
 """
 
 
