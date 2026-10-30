@@ -49,6 +49,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    request_scope,
     set_request_account_id,
     set_request_region,
 )
@@ -978,6 +979,141 @@ def _resolve_taggable_events_arn(arn):
     return arn, None
 
 
+def _foreign_event_bus(ref):
+    """``(owner account, bus name)`` when ``ref`` is the ARN of an event bus
+    another account owns in this region, else None. PutEvents delivers to it."""
+    if not ref or not ref.startswith("arn:"):
+        return None
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return None
+    name = spec.resource.split("/", 1)[1] if spec.resource.startswith("event-bus/") else ""
+    # Patterns from the PutEvents model. AWS refuses anything else with a
+    # ValidationException; MiniStack keeps its existing per-entry answer for it.
+    if (spec.partition != "aws" or spec.service != "events" or not re.fullmatch(r"[.\-_A-Za-z0-9]+", name)
+            or spec.region != get_region() or not re.fullmatch(r"[0-9]{12}", spec.account_id or "")
+            or spec.account_id == get_account_id()):
+        return None
+    return spec.account_id, name
+
+
+def _strings(value):
+    """Whether ``value`` is a string or a non-empty list of strings."""
+    return isinstance(value, str) or (isinstance(value, list) and bool(value)
+                                      and all(isinstance(item, str) for item in value))
+
+
+# An AWS principal a bus policy can name: everyone, an account, or an IAM or STS ARN without wildcards.
+_AWS_PRINCIPAL = re.compile(r"\*|[0-9]{12}|arn:aws[a-z-]*:(iam|sts)::[0-9]{12}:[^*?]+")
+
+
+def _known_operator(operator):
+    """Whether the IAM evaluator implements condition ``operator``."""
+    from ministack.core.iam_evaluator import _CONDITION_OPS
+
+    op = operator.lower()
+    if op == "null":
+        return True
+    op = op[:-len("ifexists")] if op.endswith("ifexists") else op
+    op = op.split(":", 1)[1] if op.startswith(("forallvalues:", "foranyvalue:")) else op
+    return op in _CONDITION_OPS
+
+
+def _readable_statement(stmt):
+    """``stmt`` in the form AWS evaluates it, or None when it cannot be read.
+
+    A ``Policy`` document is stored as given; a PutPermission grant keeps its
+    ``Condition`` as the request's Type/Key/Value, which AWS accepts only as
+    StringEquals on aws:PrincipalOrgID with Principal ``*``."""
+    if not isinstance(stmt, dict) or not _strings(stmt.get("Action", stmt.get("NotAction"))):
+        return None
+    if not _strings(stmt.get("Resource", stmt.get("NotResource"))) or "NotPrincipal" in stmt:
+        return None
+    principal, condition = stmt.get("Principal"), stmt.get("Condition")
+    if not (principal == "*" or (isinstance(principal, dict) and principal
+                                 and all(_strings(value) for value in principal.values()))):
+        return None
+    aws = principal.get("AWS", []) if isinstance(principal, dict) else []
+    if not all(_AWS_PRINCIPAL.fullmatch(p) for p in ([aws] if isinstance(aws, str) else aws)):
+        return None
+    stmt = dict(stmt)
+    if isinstance(condition, dict) and {"Type", "Key", "Value"} & set(condition):
+        if not (principal == "*" and condition.get("Type") == "StringEquals"
+                and condition.get("Key") == "aws:PrincipalOrgID" and isinstance(condition.get("Value"), str)):
+            return None
+        stmt["Condition"] = {"StringEquals": {"aws:PrincipalOrgID": condition["Value"]}}
+    elif condition is not None and not (
+            isinstance(condition, dict) and all(
+                _known_operator(operator) and isinstance(keys, dict)
+                and all(_strings(value) for value in keys.values())
+                for operator, keys in condition.items())):
+        return None
+    return stmt
+
+
+def _bus_policy_document(policy):
+    """The bus policy as AWS evaluates it, or None when it holds a Deny this
+    emulator cannot evaluate (unreadable, with ``NotPrincipal``, or with an
+    operator it does not implement), which then refuses every caller. A
+    statement that cannot be read grants nothing."""
+    statements = policy.get("Statement") if isinstance(policy, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    evaluable = []
+    for stmt in statements if isinstance(statements, list) else []:
+        readable = _readable_statement(stmt)
+        if isinstance(stmt, dict) and stmt.get("Effect") == "Deny" and readable is None:
+            return None
+        if readable is not None:
+            evaluable.append(readable)
+    return {"Version": "2012-10-17", "Statement": evaluable}
+
+
+def _foreign_bus_denial(entries):
+    """The AccessDeniedException that refuses a whole PutEvents request when an
+    entry names another account's bus whose policy does not allow the caller.
+    Only under AUTH=true, like the other resource-policy checks."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _principal_type, caller_arn, evaluate_resource_policy
+
+    principal = caller_arn()
+    for entry in entries:
+        bus_ref = entry.get("EventBusName", "default")
+        foreign = _foreign_event_bus(bus_ref)
+        if foreign is None:
+            continue
+        owner, name = foreign
+        with request_scope(owner, get_region()):
+            # A missing bus has no policy, even if a deleted one left its statements behind.
+            policy = _event_bus_policies.get(name) if name in _event_buses else None
+        ctx = EvalContext(
+            principal_arn=principal,
+            principal_type=_principal_type(principal, ""),
+            principal_account=get_account_id(),
+            action="events:PutEvents",
+            resource_arn=bus_ref,
+            region=get_region(),
+            # Conditions on the event are checked per entry; a direct publish is
+            # not an event bus invoking another.
+            service_context={"events:source": entry.get("Source"), "events:detail-type": entry.get("DetailType"),
+                             "events:eventbusinvocation": "false"},
+        )
+        document = _bus_policy_document(policy) if policy else {"Statement": []}
+        decision = "Deny" if document is None else evaluate_resource_policy(document, ctx).decision
+        if decision != "Allow":
+            reason = ("with an explicit deny in a resource-based policy" if decision == "Deny"
+                      else "because no resource-based policy allows the events:PutEvents action")
+            return error_response_json(
+                "AccessDeniedException",
+                f"User: {principal} is not authorized to perform: events:PutEvents on resource: {bus_ref} {reason}",
+                400,
+            )
+    return None
+
+
 def _put_events(data, allow_aws_source=False):
     """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
     entries = data.get("Entries", [])
@@ -990,16 +1126,22 @@ def _put_events(data, allow_aws_source=False):
             "Member must have length less than or equal to 10" % len(entries),
             400,
         )
+    denial = _foreign_bus_denial(entries)
+    if denial:
+        return denial
     results = []
     failed = 0
     for entry in entries:
         event_id = new_uuid()
-        bus_name, bus_error = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
-        if bus_error:
-            code, message = bus_error
-            results.append({"ErrorCode": code, "ErrorMessage": message})
-            failed += 1
-            continue
+        bus_ref = entry.get("EventBusName", "default")
+        owner, bus_name = _foreign_event_bus(bus_ref) or (get_account_id(), None)
+        if bus_name is None:
+            bus_name, bus_error = _event_bus_name_from_ref(bus_ref)
+            if bus_error:
+                code, message = bus_error
+                results.append({"ErrorCode": code, "ErrorMessage": message})
+                failed += 1
+                continue
         source = entry.get("Source")
         if not allow_aws_source and isinstance(source, str) and source.startswith("aws."):
             results.append({
@@ -1024,14 +1166,16 @@ def _put_events(data, allow_aws_source=False):
             "Account": get_account_id(),
             "Region": get_region(),
         }
-        _events_log_list().append(event_record)
         results.append({"EventId": event_id})
         logger.debug("EventBridge event: %s / %s", entry.get('Source'), entry.get('DetailType'))
 
-        # One view for both walks; rebuilding it re-parses ``Detail``.
-        view = _pattern_event_view(event_record)
-        _dispatch_event(event_record, view)
-        _archive_event(event_record, view)
+        # The event keeps the publisher's account and lands on the owner's bus.
+        with request_scope(owner, get_region()):
+            _events_log_list().append(event_record)
+            # One view for both walks; rebuilding it re-parses ``Detail``.
+            view = _pattern_event_view(event_record)
+            _dispatch_event(event_record, view)
+            _archive_event(event_record, view)
 
     return json_response({"FailedEntryCount": failed, "Entries": results})
 

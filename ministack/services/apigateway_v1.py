@@ -3918,6 +3918,8 @@ def _put_rest_api(api_id, body, query_params):
         api["description"] = info["description"]
     else:
         api.pop("description", None)
+    if info.get("version"):
+        api["version"] = str(info["version"])
     return _v1_response(_rest_api_view(api))
 
 
@@ -5258,15 +5260,17 @@ def _create_domain_name(data):
     domain_name = data.get("domainName", "")
     if not domain_name:
         return _v1_error("BadRequestException", "Domain name is required", 400)
+    token = new_uuid().replace("-", "")
     dn = {
         "domainName": domain_name,
         "certificateName": data.get("certificateName", ""),
         "certificateArn": data.get("certificateArn", ""),
+        "certificateUploadDate": _now_unix(),
         "regionalCertificateName": data.get("regionalCertificateName", ""),
         "regionalCertificateArn": data.get("regionalCertificateArn", ""),
-        "distributionDomainName": f"{domain_name}.cloudfront.net",
+        "distributionDomainName": f"d{token[:13]}.cloudfront.net",
         "distributionHostedZoneId": "Z2FDTNDATAQYW2",
-        "regionalDomainName": f"{domain_name}.execute-api.{get_region()}.amazonaws.com",
+        "regionalDomainName": f"d-{token[13:23]}.execute-api.{get_region()}.amazonaws.com",
         "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
         "endpointConfiguration": data.get("endpointConfiguration", {"types": ["REGIONAL"]}),
         "endpointAccessMode": data.get("endpointAccessMode", ""),
@@ -5290,7 +5294,7 @@ def _create_domain_name(data):
             dn["policy"] = _private_domain_policy(data["policy"], domain_name, dn["domainNameId"])
     _domain_names[domain_name] = dn
     _base_path_mappings[domain_name] = {}
-    return _v1_response(dn, 201)
+    return _v1_response(_domain_name_view(dn, with_tags=bool(dn["tags"])), 201)
 
 
 def _private_domain_policy(policy, domain_name, domain_name_id):
@@ -5306,12 +5310,44 @@ def _private_domain_policy(policy, domain_name, domain_name_id):
     return json.dumps(doc, separators=(",", ":"))
 
 
-def _domain_name_view(dn):
-    return {"domainNameStatus": "AVAILABLE", **dn}
+def _domain_name_view(dn, with_tags=True):
+    """The fields AWS returns for the domain's endpoint type, none empty (AWS capture, REGIONAL and PRIVATE)."""
+    endpoint = dict(dn.get("endpointConfiguration") or {"types": ["REGIONAL"]})
+    types = endpoint.get("types") or ["REGIONAL"]
+    endpoint.setdefault("ipAddressType", "ipv4")
+    name = dn["domainName"]
+    arn = dn.get("domainNameArn") or f"arn:aws:apigateway:{get_region()}::/domainnames/{name}"
+    view = {"domainName": name}
+    if dn.get("domainNameId"):
+        view["domainNameId"] = dn["domainNameId"]
+    view["domainNameArn"] = arn
+    for key in ("certificateName", "certificateArn", "certificateUploadDate"):
+        if dn.get(key):
+            view[key] = dn[key]
+    if "REGIONAL" in types:
+        for key in ("regionalDomainName", "regionalHostedZoneId", "regionalCertificateName", "regionalCertificateArn"):
+            if dn.get(key):
+                view[key] = dn[key]
+    if "EDGE" in types:
+        for key in ("distributionDomainName", "distributionHostedZoneId"):
+            if dn.get(key):
+                view[key] = dn[key]
+    view["endpointConfiguration"] = endpoint
+    view["domainNameStatus"] = "AVAILABLE"
+    view["securityPolicy"] = dn.get("securityPolicy") or "TLS_1_2"
+    for key in ("endpointAccessMode", "mutualTlsAuthentication", "ownershipVerificationCertificateArn", "policy"):
+        if dn.get(key):
+            view[key] = dn[key]
+    tags = dict(_v1_tags.get(arn) or dn.get("tags") or {})
+    if with_tags or tags:
+        view["tags"] = tags
+    view["routingMode"] = dn.get("routingMode") or "BASE_PATH_MAPPING_ONLY"
+    return view
 
 
 def _get_domain_names(query_params):
-    return _v1_paginated_response([_domain_name_view(dn) for dn in _domain_names.values()], query_params)
+    return _v1_paginated_response([_domain_name_view(dn, with_tags=False) for dn in _domain_names.values()],
+                                  query_params)
 
 
 def _get_domain_name(domain_name):
@@ -5405,6 +5441,11 @@ def _private_domain_by_arn(domain_name_arn):
     return None, None
 
 
+def _vpc_endpoint_exists(vpce_id):
+    from ministack.services import ec2
+    return vpce_id in ec2._vpc_endpoints
+
+
 def _access_association_view(association):
     arn = association["domainNameAccessAssociationArn"]
     return {**association, "tags": dict(_v1_tags.get(arn, {}))}
@@ -5416,14 +5457,17 @@ def _create_access_association(data):
     source = data.get("accessAssociationSource", "")
     if source_type != "VPCE":
         return _v1_error("BadRequestException", f"Invalid accessAssociationSourceType: {source_type}", 400)
-    name, _dn = _private_domain_by_arn(domain_name_arn)
+    name, dn = _private_domain_by_arn(domain_name_arn)
     if name is None:
-        return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    # arn:<partition>:apigateway:<region>:<account>:/domainnameaccessassociations/domainname/<name>/vpcesource/<id>
+        return _v1_error("BadRequestException", "Domain not found", 400)
+    if not _vpc_endpoint_exists(source):
+        return _v1_error("BadRequestException", f"{source} is not a valid VPC endpoint id", 400)
     arn = (f"arn:aws:apigateway:{get_region()}:{get_account_id()}:/domainnameaccessassociations/"
-           f"domainname/{name}/vpcesource/{source}")
+           f"domainname/{name}+{dn['domainNameId']}/vpcesource/{source}")
     if arn in _access_associations:
-        return _v1_error("ConflictException", "Domain name access association already exists", 409)
+        return _v1_error("BadRequestException",
+                         "The domain name access association between this VPC endpoint and domain name already exists.",
+                         400)
     association = {"domainNameAccessAssociationArn": arn, "domainNameArn": domain_name_arn,
                    "accessAssociationSourceType": source_type, "accessAssociationSource": source}
     _access_associations[arn] = association
@@ -5454,8 +5498,10 @@ def _delete_access_association(association_arn):
 
 def _reject_access_association(association_arn, domain_name_arn):
     association = _access_associations.get(association_arn)
+    # The owner's own associations are not rejectable: AWS answers 404 and keeps them.
     if (not association or association.get("domainNameArn") != domain_name_arn
-            or _private_domain_by_arn(domain_name_arn)[0] is None):
+            or _private_domain_by_arn(domain_name_arn)[0] is None
+            or association_arn.split(":")[4] == get_account_id()):
         return _v1_error("NotFoundException", _NO_ACCESS_ASSOCIATIONS, 404)
     _access_associations.pop(association_arn, None)
     _v1_tags.pop(association_arn, None)

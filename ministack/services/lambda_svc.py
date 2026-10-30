@@ -1162,6 +1162,12 @@ def _validate_event_source_arn(event_source_arn: str):
     scope_err = _require_same_account_region_arn(spec, event_source_arn, "event source")
     if scope_err:
         return None, scope_err
+    if spec.service == "kinesis" and _kinesis_stream_name_from_arn_spec(spec):
+        from ministack.services import kinesis as _kin
+
+        stream = _kin._streams.get(_kinesis_stream_name_from_arn_spec(spec))
+        if not stream or stream.get("StreamARN") != event_source_arn:
+            return None, _invalid_parameter_value(f"Stream not found: {event_source_arn}")
     if spec.service == "sqs" and not _sqs_queue_name_from_arn_spec(spec):
         return None, _invalid_parameter_value(f"Invalid event source ARN: {event_source_arn}")
     if spec.service == "kinesis" and not _kinesis_stream_name_from_arn_spec(spec):
@@ -7237,27 +7243,24 @@ def _validate_scaling_config(data: dict, source_arn: str = ""):
 
 
 def _cross_account_stream_read_error(stream_arn: str, func_name: str, qualifier: str | None):
-    """Why a mapping cannot read another account's stream, as AWS answers when it tries, or None."""
-    from ministack.app import AUTH
+    """Why a mapping cannot read another account's stream, as AWS answers CreateEventSourceMapping, or
+    None. AWS checks the stream's policy whether or not MiniStack enforces IAM, so both modes do."""
     from ministack.services import kinesis as _kin
 
     spec = parse_arn(stream_arn)
-    prefix = "Received Exception while reading from provided stream. "
-    if not any(account == spec.account_id for (account, _region, _name), _s in _kin._streams.all_items()):
-        return _invalid_parameter_value(prefix + "No account found for the given parameters")
+    if not _kin._account_exists(spec.account_id):
+        return _invalid_parameter_value(
+            "Received Exception while reading from provided stream. No account found for the given parameters")
     name = _kinesis_stream_name_from_arn_spec(spec)
     stream = _kin._streams.get_scoped(spec.account_id, spec.region, name)
-    if not stream or stream.get("StreamARN") != stream_arn:
-        return _invalid_parameter_value(prefix + f"Stream {name} under account {spec.account_id} not found.")
-    if AUTH:
-        func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
-        role = ((func_rec or {}).get("config") or {}).get("Role", "")
-        denied = _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id())
-        if denied:
-            session, action = denied
-            return _invalid_parameter_value(
-                prefix + f"User: {session} is not authorized to perform: {action} on resource: {stream_arn} "
-                f"because no resource-based policy allows the {action} action")
+    func_rec, _cfg = _get_func_record_for_qualifier(func_name, qualifier)
+    role = ((func_rec or {}).get("config") or {}).get("Role", "")
+    if (not stream or stream.get("StreamARN") != stream_arn
+            or _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id())):
+        return _invalid_parameter_value(
+            f"Cannot access stream {stream_arn}. Please ensure the role can perform the GetRecords, "
+            "GetShardIterator, DescribeStream, DescribeStreamSummary, ListShards, and ListStreams Actions "
+            "on your stream.")
     return None
 
 
@@ -7758,15 +7761,12 @@ def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
         logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
-def _cross_account_read_blocked(stream_arn, func_rec, func_name) -> bool:
-    """Under AUTH=true the stream's policy must still allow the function's role on every pass."""
-    from ministack.app import AUTH
+def _cross_account_read_problem(stream_arn, func_rec):
+    """LastProcessingResult while a running mapping cannot read another account's stream, or None."""
     from ministack.services import kinesis as _kin
 
-    if not AUTH:
-        return False
     role = (func_rec.get("config") or {}).get("Role", "")
-    return _kin.mapping_read_denied(stream_arn, role, func_name, get_account_id()) is not None
+    return _kin.running_mapping_read_problem(stream_arn, role, get_account_id())
 
 
 def _poll_kinesis():
@@ -7803,8 +7803,11 @@ def _poll_kinesis():
             stream = _kin._streams.get_scoped(source_spec.account_id, source_spec.region, stream_name)
             if not stream or stream.get("StreamARN") != source_arn or stream["StreamStatus"] != "ACTIVE":
                 continue
-            if source_spec.account_id != get_account_id() and _cross_account_read_blocked(source_arn, func_rec, func_name):
-                continue
+            if source_spec.account_id != get_account_id():
+                problem = _cross_account_read_problem(source_arn, func_rec)
+                if problem:
+                    esm["LastProcessingResult"] = problem
+                    continue
 
             esm_id = esm["UUID"]
             if _esm_backoff_until.get(esm_id, 0) > time.time():

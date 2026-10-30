@@ -1697,6 +1697,19 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     # Root principal: no identity policy limits it, but an explicit Deny in a bucket policy does,
     # except on the bucket policy itself for the bucket owner's root (captured on AWS).
     if principal.policies is None:
+        if service == "kms":
+            # A key in another account needs its key policy to allow the caller, root or not.
+            found = _resource_policy(service, resource_arn)
+            if found is None or found[1] in (None, principal.account):
+                return None
+            root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
+                                   principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
+                                   region=region, service_context=context, principal_keys=principal.keys)
+            result = evaluate_resource_policy(found[0], root_ctx)
+            if result.decision == "Allow":
+                return None
+            result.principal_arn = principal.arn
+            return result
         if service != "s3" or "s3:dataaccesspointarn" in context:
             return None
         found = _resource_policy(service, resource_arn)

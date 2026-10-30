@@ -17,6 +17,11 @@ IAM actions:
   AttachUserPolicy, DetachUserPolicy, ListAttachedUserPolicies,
   PutUserPolicy, GetUserPolicy, DeleteUserPolicy, ListUserPolicies,
   CreateAccessKey, ListAccessKeys, DeleteAccessKey, UpdateAccessKey, GetAccessKeyLastUsed,
+  CreateServiceSpecificCredential, ListServiceSpecificCredentials,
+  UpdateServiceSpecificCredential, ResetServiceSpecificCredential,
+  DeleteServiceSpecificCredential,
+  UploadServerCertificate, ListServerCertificates, GetServerCertificate,
+  UpdateServerCertificate, DeleteServerCertificate, ListServerCertificateTags,
   CreateInstanceProfile, DeleteInstanceProfile, GetInstanceProfile,
   AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile,
   ListInstanceProfiles, ListInstanceProfilesForRole,
@@ -47,6 +52,7 @@ from xml.sax.saxutils import escape as _xml_escape
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.router import extract_access_key_id
 
 logger = logging.getLogger("iam")
 
@@ -73,6 +79,8 @@ _login_profiles = AccountScopedDict()
 _credential_reports = AccountScopedDict()
 _account_password_policy = AccountScopedDict()
 _account_aliases = AccountScopedDict()
+_service_specific_credentials = AccountScopedDict()
+_server_certificates = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -360,6 +368,8 @@ def get_state():
         "credential_reports": copy.deepcopy(_credential_reports),
         "account_password_policy": copy.deepcopy(_account_password_policy),
         "account_aliases": copy.deepcopy(_account_aliases),
+        "service_specific_credentials": copy.deepcopy(_service_specific_credentials),
+        "server_certificates": copy.deepcopy(_server_certificates),
     }
 
 
@@ -387,6 +397,8 @@ def _restore_state(data):
         _credential_reports.update(data.get("credential_reports", {}))
         _account_password_policy.update(data.get("account_password_policy", {}))
         _account_aliases.update(data.get("account_aliases", {}))
+        _service_specific_credentials.update(data.get("service_specific_credentials", {}))
+        _server_certificates.update(data.get("server_certificates", {}))
 
 
 
@@ -413,6 +425,13 @@ async def handle_request(method, path, headers, body, query_params):
     elif method == "POST" and body:
         for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
             params[k] = v
+
+    # Some ops (the ServiceSpecificCredential family) let an IAM user omit
+    # UserName, which AWS then takes from the caller. The caller's access key
+    # resolves it here; non-user callers get AWS's InvalidInput at the op.
+    access_key = extract_access_key_id(headers, query_params)
+    if access_key:
+        params["_caller_user"] = _access_keys.get(access_key, {}).get("UserName", "")
 
     action = _p(params, "Action")
     handler = _IAM_HANDLERS.get(action)
@@ -2829,6 +2848,313 @@ def _delete_saml_provider(p):
     return _xml(200, "DeleteSAMLProviderResponse", "", ns="iam")
 
 
+# -------------------- Service-specific credentials --------------------
+#
+# UserName on this whole family is optional only for IAM-user callers —
+# every other principal gets "UserName must be specified when calling with
+# a non-user principal" (observed on AWS 2026-10-29 for list, update, reset
+# and delete alike). ``_caller_user`` is injected by handle_request.
+
+
+def _credential_user(p):
+    user = _p(p, "UserName") or _p(p, "_caller_user")
+    if not user:
+        return None, _error(
+            400, "InvalidInput",
+            "UserName must be specified when calling with a non-user principal",
+            ns="iam")
+    if user != "default" and user not in _users:
+        return None, _error(404, "NoSuchEntity",
+                            f"The user with name {user} cannot be found.", ns="iam")
+    return user, None
+
+
+def _service_credential_fields(c, with_secret=False):
+    """The member fields AWS returns; ``ServiceCredentialSecret`` only ever
+    appears on create and reset responses (AWS 2026-10-29)."""
+    inner = ""
+    if c.get("ServiceUserName"):
+        inner += f"<ServiceUserName>{_xml_escape(c['ServiceUserName'])}</ServiceUserName>"
+    if c.get("ServiceCredentialAlias"):
+        inner += f"<ServiceCredentialAlias>{_xml_escape(c['ServiceCredentialAlias'])}</ServiceCredentialAlias>"
+    inner += f"<CreateDate>{c['CreateDate']}</CreateDate>"
+    if c.get("ExpirationDate"):
+        inner += f"<ExpirationDate>{c['ExpirationDate']}</ExpirationDate>"
+    if with_secret:
+        inner += (f"<ServiceCredentialSecret>{c['ServiceCredentialSecret']}"
+                  f"</ServiceCredentialSecret>")
+    return (inner +
+            f"<ServiceSpecificCredentialId>{c['Id']}</ServiceSpecificCredentialId>"
+            f"<ServiceName>{_xml_escape(c['ServiceName'])}</ServiceName>"
+            f"<UserName>{_xml_escape(c['UserName'])}</UserName>"
+            f"<Status>{c['Status']}</Status>")
+
+
+def _gen_service_credential():
+    """id ``ACCA`` + 17 chars and an opaque base64 secret, AWS's shapes."""
+    cred_id = "ACCA" + new_uuid().replace("-", "")[:17].upper()
+    secret = base64.b64encode(os.urandom(72)).decode()
+    return cred_id, secret
+
+
+def _create_service_specific_credential(p):
+    user, err = _credential_user(p)
+    if err:
+        return err
+    service = _p(p, "ServiceName")
+    cred_id, secret = _gen_service_credential()
+    cred = {
+        "Id": cred_id,
+        "UserName": user,
+        "ServiceName": service,
+        "ServiceCredentialAlias": f"{user}-at-{get_account_id()}",
+        "ServiceCredentialSecret": secret,
+        "Status": "Active",
+        "CreateDate": _now(),
+    }
+    age_days = _p(p, "CredentialAgeDays")
+    if age_days.isdigit() and int(age_days) > 0:
+        cred["ExpirationDate"] = _future(int(age_days) * 86400)
+    _service_specific_credentials[cred_id] = cred
+    return _xml(200, "CreateServiceSpecificCredentialResponse",
+                f"<CreateServiceSpecificCredentialResult>"
+                f"<ServiceSpecificCredential>"
+                f"{_service_credential_fields(cred, with_secret=True)}"
+                f"</ServiceSpecificCredential>"
+                f"</CreateServiceSpecificCredentialResult>",
+                ns="iam")
+
+
+def _list_service_specific_credentials(p):
+    user, err = _credential_user(p)
+    if err:
+        return err
+    service = _p(p, "ServiceName")
+    members = "".join(
+        f"<member>{_service_credential_fields(c)}</member>"
+        for c in _service_specific_credentials.values()
+        if c["UserName"] == user and (not service or c["ServiceName"] == service)
+    )
+    return _xml(200, "ListServiceSpecificCredentialsResponse",
+                f"<ListServiceSpecificCredentialsResult>"
+                f"<ServiceSpecificCredentials>{members}</ServiceSpecificCredentials>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListServiceSpecificCredentialsResult>",
+                ns="iam")
+
+
+def _lookup_service_credential(p):
+    user, err = _credential_user(p)
+    if err:
+        return None, err
+    cred_id = _p(p, "ServiceSpecificCredentialId")
+    cred = _service_specific_credentials.get(cred_id)
+    if not cred or cred["UserName"] != user:
+        return None, _error(
+            404, "NoSuchEntity",
+            f"The service specific credential with credential id {cred_id} "
+            f"cannot be found.", ns="iam")
+    return cred, None
+
+
+def _update_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    status = _p(p, "Status")
+    if status in ("Active", "Inactive"):
+        cred["Status"] = status
+    return _xml(200, "UpdateServiceSpecificCredentialResponse", "", ns="iam")
+
+
+def _reset_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    _, cred["ServiceCredentialSecret"] = _gen_service_credential()
+    return _xml(200, "ResetServiceSpecificCredentialResponse",
+                f"<ResetServiceSpecificCredentialResult>"
+                f"<ServiceSpecificCredential>"
+                f"{_service_credential_fields(cred, with_secret=True)}"
+                f"</ServiceSpecificCredential>"
+                f"</ResetServiceSpecificCredentialResult>",
+                ns="iam")
+
+
+def _delete_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    del _service_specific_credentials[cred["Id"]]
+    return _xml(200, "DeleteServiceSpecificCredentialResponse", "", ns="iam")
+
+
+# -------------------- Server certificates --------------------
+
+
+def _cert_expiration(pem: str) -> str | None:
+    """notAfter of a PEM cert, like AWS parses it on upload. None when the
+    body is not a readable certificate."""
+    try:
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(pem.encode())
+        return cert.not_valid_after_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _gen_server_cert_id():
+    return "ASCA" + new_uuid().replace("-", "")[:17].upper()
+
+
+def _server_cert_metadata(c):
+    inner = (f"<Path>{_xml_escape(c['Path'])}</Path>"
+             f"<ServerCertificateName>{_xml_escape(c['Name'])}</ServerCertificateName>"
+             f"<ServerCertificateId>{c['Id']}</ServerCertificateId>"
+             f"<Arn>{c['Arn']}</Arn>"
+             f"<UploadDate>{c['UploadDate']}</UploadDate>")
+    if c.get("Expiration"):
+        inner += f"<Expiration>{c['Expiration']}</Expiration>"
+    return inner
+
+
+def _server_cert_arn(path: str, name: str) -> str:
+    return (f"arn:aws:iam::{get_account_id()}:server-certificate"
+            f"{path}{name}")
+
+
+def _normalize_iam_path(path: str) -> str:
+    path = path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.endswith("/"):
+        path += "/"
+    return path
+
+
+def _upload_server_certificate(p):
+    name = _p(p, "ServerCertificateName")
+    path = _normalize_iam_path(_p(p, "Path"))
+    arn = _server_cert_arn(path, name)
+    if arn in _server_certificates:
+        return _error(409, "EntityAlreadyExists",
+                      f"The Server Certificate with name {name} already exists.",
+                      ns="iam")
+    body_pem = _p(p, "CertificateBody")
+    expiration = _cert_expiration(body_pem)
+    if not expiration:
+        return _error(400, "MalformedCertificate",
+                      "Unable to parse certificate.", ns="iam")
+    cert = {
+        "Name": name,
+        "Path": path,
+        "Id": _gen_server_cert_id(),
+        "Arn": arn,
+        "Body": body_pem,
+        "PrivateKey": _p(p, "PrivateKey"),
+        "CertificateChain": _p(p, "CertificateChain"),
+        "UploadDate": _now(),
+        "Expiration": expiration,
+        "Tags": _extract_tags(p),
+    }
+    _server_certificates[arn] = cert
+    return _xml(200, "UploadServerCertificateResponse",
+                f"<UploadServerCertificateResult>"
+                f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
+                f"</ServerCertificateMetadata>"
+                f"</UploadServerCertificateResult>",
+                ns="iam")
+
+
+def _list_server_certificates(p):
+    prefix = _p(p, "PathPrefix")
+    members = "".join(
+        f"<member>{_server_cert_metadata(c)}</member>"
+        for c in _server_certificates.values()
+        if not prefix or c["Path"].startswith(prefix)
+    )
+    return _xml(200, "ListServerCertificatesResponse",
+                f"<ListServerCertificatesResult>"
+                f"<ServerCertificateMetadataList>{members}"
+                f"</ServerCertificateMetadataList>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListServerCertificatesResult>",
+                ns="iam")
+
+
+def _lookup_server_certificate(p):
+    name = _p(p, "ServerCertificateName")
+    cert = next((c for c in _server_certificates.values()
+                 if c["Name"] == name), None)
+    if not cert:
+        return None, _error(
+            404, "NoSuchEntity",
+            f"The Server Certificate with name {name} cannot be found.",
+            ns="iam")
+    return cert, None
+
+
+def _tags_xml(tags):
+    return "".join(
+        f"<member><Key>{_xml_escape(t['Key'])}</Key>"
+        f"<Value>{_xml_escape(t['Value'])}</Value></member>"
+        for t in tags
+    )
+
+
+def _get_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    return _xml(200, "GetServerCertificateResponse",
+                f"<GetServerCertificateResult><ServerCertificate>"
+                f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
+                f"</ServerCertificateMetadata>"
+                f"<CertificateBody>{_xml_escape(cert['Body'])}</CertificateBody>"
+                f"<Tags>{_tags_xml(cert.get('Tags', []))}</Tags>"
+                f"</ServerCertificate></GetServerCertificateResult>",
+                ns="iam")
+
+
+def _update_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    new_name = _p(p, "NewServerCertificateName")
+    new_path = _normalize_iam_path(_p(p, "NewPath") or cert["Path"])
+    new_arn = _server_cert_arn(new_path, new_name or cert["Name"])
+    if new_arn != cert["Arn"] and new_arn in _server_certificates:
+        return _error(409, "EntityAlreadyExists",
+                      "The Server Certificate with name "
+                      f"{new_name or cert['Name']} already exists.", ns="iam")
+    del _server_certificates[cert["Arn"]]
+    cert["Name"] = new_name or cert["Name"]
+    cert["Path"] = new_path
+    cert["Arn"] = new_arn
+    _server_certificates[new_arn] = cert
+    return _xml(200, "UpdateServerCertificateResponse", "", ns="iam")
+
+
+def _delete_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    del _server_certificates[cert["Arn"]]
+    return _xml(200, "DeleteServerCertificateResponse", "", ns="iam")
+
+
+def _list_server_certificate_tags(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    return _xml(200, "ListServerCertificateTagsResponse",
+                f"<ListServerCertificateTagsResult>"
+                f"<Tags>{_tags_xml(cert.get('Tags', []))}</Tags>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</ListServerCertificateTagsResult>",
+                ns="iam")
+
+
 # -------------------- Account summary / password policy / aliases --------------------
 
 
@@ -3322,6 +3648,17 @@ _IAM_HANDLERS = {
     "ListSAMLProviders": _list_saml_providers,
     "UpdateSAMLProvider": _update_saml_provider,
     "DeleteSAMLProvider": _delete_saml_provider,
+    "CreateServiceSpecificCredential": _create_service_specific_credential,
+    "ListServiceSpecificCredentials": _list_service_specific_credentials,
+    "UpdateServiceSpecificCredential": _update_service_specific_credential,
+    "ResetServiceSpecificCredential": _reset_service_specific_credential,
+    "DeleteServiceSpecificCredential": _delete_service_specific_credential,
+    "UploadServerCertificate": _upload_server_certificate,
+    "ListServerCertificates": _list_server_certificates,
+    "GetServerCertificate": _get_server_certificate,
+    "UpdateServerCertificate": _update_server_certificate,
+    "DeleteServerCertificate": _delete_server_certificate,
+    "ListServerCertificateTags": _list_server_certificate_tags,
     "ListOpenIDConnectProviders": _list_oidc_providers,
     "GetAccountAuthorizationDetails": _get_account_authorization_details,
     "CreateVirtualMFADevice": _create_virtual_mfa_device,
@@ -3368,6 +3705,8 @@ def reset():
     _credential_reports.clear()
     _account_password_policy.clear()
     _account_aliases.clear()
+    _service_specific_credentials.clear()
+    _server_certificates.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state

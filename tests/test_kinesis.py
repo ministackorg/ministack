@@ -1088,8 +1088,8 @@ def _account_client(service, account):
 
 
 def test_kinesis_esm_reads_a_stream_in_another_account(lam, logs, auth_enabled):
-    """A function in one account maps a stream in another (same region); records reach it. Under AUTH=true
-    the stream's resource policy must allow the function's execution role."""
+    """A function in one account maps a stream in another (same region) that the stream's policy shares;
+    records reach it."""
     if auth_enabled:
         pytest.skip("account selection by access key needs AUTH unset")
     owner = _account_client("kinesis", "111111111111")
@@ -1110,8 +1110,15 @@ def test_kinesis_esm_reads_a_stream_in_another_account(lam, logs, auth_enabled):
         with pytest.raises(ClientError) as exc:
             lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=missing, StartingPosition="LATEST")
         assert exc.value.response["Error"]["Message"] == (
-            "Received Exception while reading from provided stream. "
-            "Stream no-such-stream under account 111111111111 not found.")
+            f"Cannot access stream {missing}. Please ensure the role can perform the GetRecords, "
+            "GetShardIterator, DescribeStream, DescribeStreamSummary, ListShards, and ListStreams Actions "
+            "on your stream.")
+        # As on AWS, the stream's policy must grant the function's account the reads first.
+        function_account = lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"].split(":")[4]
+        owner.put_resource_policy(ResourceARN=arn, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{function_account}:root"},
+            "Action": ["kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
+                       "kinesis:GetShardIterator", "kinesis:ListShards"], "Resource": arn}]}))
         esm = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=arn,
                                               StartingPosition="TRIM_HORIZON")["UUID"]
         received, deadline = [], time.time() + 30

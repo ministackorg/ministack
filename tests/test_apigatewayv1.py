@@ -6284,11 +6284,21 @@ def test_apigwv1_domain_name_status_and_private_id(apigw_v1):
     public = apigw_v1.create_domain_name(domainName=f"pub-{_uuid_mod.uuid4().hex[:6]}.example.com",
                                          endpointConfiguration={"types": ["REGIONAL"]})
     try:
-        assert public["domainNameStatus"] == "AVAILABLE"
-        assert "domainNameId" not in public and "domainNameArn" not in public
-        assert apigw_v1.get_domain_name(domainName=public["domainName"])["domainNameStatus"] == "AVAILABLE"
+        # Captured on AWS: a REGIONAL domain has an ARN with no account, and only the fields below;
+        # GetDomainName adds tags.
+        regional_keys = {"domainName", "domainNameArn", "certificateUploadDate", "regionalDomainName",
+                         "regionalHostedZoneId", "endpointConfiguration", "domainNameStatus", "securityPolicy",
+                         "routingMode"}
+        assert set(public) - {"ResponseMetadata"} == regional_keys
+        assert public["domainNameArn"] == f"arn:aws:apigateway:us-east-1::/domainnames/{public['domainName']}"
+        assert re.fullmatch(r"d-[a-z0-9]{10}\.execute-api\.us-east-1\.amazonaws\.com", public["regionalDomainName"])
+        assert public["endpointConfiguration"] == {"types": ["REGIONAL"], "ipAddressType": "ipv4"}
+        assert (public["domainNameStatus"], public["securityPolicy"], public["routingMode"]) == (
+            "AVAILABLE", "TLS_1_2", "BASE_PATH_MAPPING_ONLY")
+        got = apigw_v1.get_domain_name(domainName=public["domainName"])
+        assert set(got) - {"ResponseMetadata"} == regional_keys | {"tags"} and got["tags"] == {}
         listed = {d["domainName"]: d for d in apigw_v1.get_domain_names()["items"]}
-        assert listed[public["domainName"]]["domainNameStatus"] == "AVAILABLE"
+        assert set(listed[public["domainName"]]) == regional_keys
 
         name = f"priv-{_uuid_mod.uuid4().hex[:6]}.example.com"
         private = apigw_v1.create_domain_name(domainName=name, endpointConfiguration={"types": ["PRIVATE"]})
@@ -6328,7 +6338,7 @@ def test_apigwv1_put_rest_api_names_the_api_from_the_definition(apigw_v1):
                                                  "arn:aws:lambda:us-east-1:000000000000:function:none/invocations")
         spec = {**_PUT_REST_API_SPEC, "info": {"title": "renamed", "description": "from the definition", "version": "1"}}
         api = apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=json.dumps(spec))
-        assert (api["name"], api["description"]) == ("renamed", "from the definition")
+        assert (api["name"], api["description"], api["version"]) == ("renamed", "from the definition", "1")
         assert apigw_v1.get_authorizers(restApiId=api_id)["items"] == []
         api = apigw_v1.put_rest_api(restApiId=api_id, body=b"openapi: 3.0.1\ninfo: {title: y, version: '1'}\npaths: {}\n")
         assert api["name"] == "y" and "description" not in api
@@ -6473,47 +6483,58 @@ def test_apigwv1_client_certificate_lifecycle(apigw_v1):
             "NotFoundException", "Invalid client certificate id specified")
 
 
-def test_apigwv1_domain_name_access_association_lifecycle(apigw_v1):
+def test_apigwv1_domain_name_access_association_lifecycle(apigw_v1, ec2):
     """#2487: a VPC endpoint is associated with a private custom domain name by its domainNameArn,
     listed, tagged, rejected and deleted."""
     name = f"assoc-{_uuid_mod.uuid4().hex[:6]}.example.internal"
     domain = apigw_v1.create_domain_name(domainName=name, endpointConfiguration={"types": ["PRIVATE"]})
+    vpc = ec2.describe_vpcs()["Vpcs"][0]["VpcId"]
+    vpce, vpce2 = (ec2.create_vpc_endpoint(VpcId=vpc, ServiceName="com.amazonaws.us-east-1.execute-api",
+                                           VpcEndpointType="Interface")["VpcEndpoint"]["VpcEndpointId"]
+                   for _ in range(2))
     try:
         created = apigw_v1.create_domain_name_access_association(
             domainNameArn=domain["domainNameArn"], accessAssociationSourceType="VPCE",
-            accessAssociationSource="vpce-0123456789abcdef0", tags={"k": "v"})
+            accessAssociationSource=vpce, tags={"k": "v"})
         arn = created["domainNameAccessAssociationArn"]
         region, account = domain["domainNameArn"].split(":")[3:5]
         assert arn == (f"arn:aws:apigateway:{region}:{account}:/domainnameaccessassociations/"
-                       f"domainname/{name}/vpcesource/vpce-0123456789abcdef0")
+                       f"domainname/{name}+{domain['domainNameId']}/vpcesource/{vpce}")
         assert (created["domainNameArn"], created["tags"]) == (domain["domainNameArn"], {"k": "v"})
         listed = apigw_v1.get_domain_name_access_associations(resourceOwner="SELF")["items"]
         assert arn in [a["domainNameAccessAssociationArn"] for a in listed]
         assert apigw_v1.get_domain_name_access_associations(resourceOwner="OTHER_ACCOUNTS")["items"] == []
         assert apigw_v1.get_tags(resourceArn=arn)["tags"] == {"k": "v"}
+
+        # Captured on AWS: all three are 400 BadRequestException.
+        for domain_arn, source, message in (
+                (domain["domainNameArn"], vpce,
+                 "The domain name access association between this VPC endpoint and domain name already exists."),
+                (domain["domainNameArn"] + "x", vpce, "Domain not found"),
+                (domain["domainNameArn"], "vpce-0123456789abcdef0",
+                 "vpce-0123456789abcdef0 is not a valid VPC endpoint id")):
+            with pytest.raises(ClientError) as exc:
+                apigw_v1.create_domain_name_access_association(
+                    domainNameArn=domain_arn, accessAssociationSourceType="VPCE", accessAssociationSource=source)
+            assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], exc.value.response["Error"]["Code"],
+                    exc.value.response["Error"]["Message"]) == (400, "BadRequestException", message)
+
+        # Captured on AWS: rejecting an association of your own answers 404 and keeps it.
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.reject_domain_name_access_association(domainNameAccessAssociationArn=arn,
+                                                          domainNameArn=domain["domainNameArn"])
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+        assert arn in [a["domainNameAccessAssociationArn"]
+                       for a in apigw_v1.get_domain_name_access_associations()["items"]]
         apigw_v1.delete_domain_name_access_association(domainNameAccessAssociationArn=arn)
         assert arn not in [a["domainNameAccessAssociationArn"]
                            for a in apigw_v1.get_domain_name_access_associations()["items"]]
-
-        again = apigw_v1.create_domain_name_access_association(
-            domainNameArn=domain["domainNameArn"], accessAssociationSourceType="VPCE",
-            accessAssociationSource="vpce-0123456789abcdef0")["domainNameAccessAssociationArn"]
-        apigw_v1.reject_domain_name_access_association(domainNameAccessAssociationArn=again,
-                                                      domainNameArn=domain["domainNameArn"])
-        assert apigw_v1.get_domain_name_access_associations()["items"] == [] or again not in [
-            a["domainNameAccessAssociationArn"] for a in apigw_v1.get_domain_name_access_associations()["items"]]
-
-        with pytest.raises(ClientError) as exc:
-            apigw_v1.create_domain_name_access_association(
-                domainNameArn=domain["domainNameArn"] + "x", accessAssociationSourceType="VPCE",
-                accessAssociationSource="vpce-0123456789abcdef0")
-        assert exc.value.response["Error"]["Code"] == "NotFoundException"
 
         # Captured on AWS (us-east-1, 2026-10-29): a domain with associations can be deleted; afterwards
         # reject answers 404, delete still answers 202 once, then 404.
         last = apigw_v1.create_domain_name_access_association(
             domainNameArn=domain["domainNameArn"], accessAssociationSourceType="VPCE",
-            accessAssociationSource="vpce-0fedcba9876543210")["domainNameAccessAssociationArn"]
+            accessAssociationSource=vpce2)["domainNameAccessAssociationArn"]
         apigw_v1.delete_domain_name(domainName=name)
         no_associations = "This private custom domain name doesn't have any domain name access associations."
         with pytest.raises(ClientError) as exc:
@@ -6530,3 +6551,4 @@ def test_apigwv1_domain_name_access_association_lifecycle(apigw_v1):
             apigw_v1.delete_domain_name(domainName=name)
         except ClientError:
             pass
+        ec2.delete_vpc_endpoints(VpcEndpointIds=[vpce, vpce2])

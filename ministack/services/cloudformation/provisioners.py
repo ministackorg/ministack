@@ -5968,12 +5968,13 @@ def _apigw_domain_name_create(logical_id, props, stack_name):
         raise ValueError(f"AWS::ApiGateway::DomainName create failed: {body!r}")
     domain = json.loads(body)
     domain_name = domain["domainName"]
+    record = _apigw_v1._domain_names[domain_name]
     attrs = {
-        "DistributionDomainName": domain["distributionDomainName"],
-        "DistributionHostedZoneId": domain["distributionHostedZoneId"],
-        "DomainNameArn": domain.get("domainNameArn") or f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}",
-        "RegionalDomainName": domain["regionalDomainName"],
-        "RegionalHostedZoneId": domain["regionalHostedZoneId"],
+        "DistributionDomainName": record["distributionDomainName"],
+        "DistributionHostedZoneId": record["distributionHostedZoneId"],
+        "DomainNameArn": domain["domainNameArn"],
+        "RegionalDomainName": record["regionalDomainName"],
+        "RegionalHostedZoneId": record["regionalHostedZoneId"],
     }
     return domain_name, attrs
 
@@ -8545,8 +8546,8 @@ def _ecs_cluster_create(logical_id, props, stack_name):
         "tags": tags,
         "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
         "capacityProviders": props.get("CapacityProviders", []),
-        "defaultCapacityProviderStrategy": _pascal_to_camel(
-            props.get("DefaultCapacityProviderStrategy") or []),
+        "defaultCapacityProviderStrategy": _ecs._service_strategy(_pascal_to_camel(
+            props.get("DefaultCapacityProviderStrategy") or [])) or [],
         "configuration": _pascal_to_camel(props.get("Configuration") or {}),
     })
     if old:
@@ -8566,8 +8567,8 @@ def _ecs_cluster_update(physical_id, old_props, new_props, stack_name, logical_i
     if replaced is not None:
         return replaced
     cluster["capacityProviders"] = new_props.get("CapacityProviders", [])
-    cluster["defaultCapacityProviderStrategy"] = _pascal_to_camel(
-        new_props.get("DefaultCapacityProviderStrategy") or [])
+    cluster["defaultCapacityProviderStrategy"] = _ecs._service_strategy(_pascal_to_camel(
+        new_props.get("DefaultCapacityProviderStrategy") or [])) or []
     # Settings or configuration dropped from the template stay on the cluster.
     if new_props.get("ClusterSettings"):
         cluster["settings"] = _pascal_to_camel(new_props["ClusterSettings"])

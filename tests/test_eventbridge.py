@@ -5852,3 +5852,410 @@ def test_eventbridge_put_permission_policy_follows_aws(eb):
         assert _json.loads(described())["Statement"] == [stmt("legacy")]
     finally:
         eb.delete_event_bus(Name=bus)
+# ---------------------------------------------------------------------------
+# PutEvents to another account's bus (#2460). Capture keys name steps of
+# capture_2460_round1..round5 (us-east-1; rounds 1, 2 and 5 used two real
+# accounts, rounds 3 and 4 the bus owner alone).
+# ---------------------------------------------------------------------------
+
+_XA_OWNER = "111122223333"
+_XA_PUBLISHER = "444455556666"
+
+
+def _xa_client(service, account):
+    return boto3.client(service, endpoint_url=_ENDPOINT, region_name="us-east-1",
+                        aws_access_key_id=account, aws_secret_access_key="test")
+
+
+def _xa_denied(bus_arn, explicit=False):
+    reason = ("with an explicit deny in a resource-based policy" if explicit
+              else "because no resource-based policy allows the events:PutEvents action")
+    return {"Code": "AccessDeniedException",
+            "Message": f"User: arn:aws:iam::{_XA_PUBLISHER}:root is not authorized to perform: events:PutEvents "
+                       f"on resource: {bus_arn} {reason}"}
+
+
+def _xa_entry(marker, bus, source="xa.test"):
+    return {"EventBusName": bus, "Source": source, "DetailType": "xa", "Detail": json.dumps({"marker": marker})}
+
+
+@pytest.fixture
+def xa():
+    """A bus in the owner account with a rule that forwards every ``xa`` event to a queue."""
+    owner_eb, owner_sqs = _xa_client("events", _XA_OWNER), _xa_client("sqs", _XA_OWNER)
+    publisher = _xa_client("events", _XA_PUBLISHER)
+    slug = _uuid_mod.uuid4().hex[:8]
+    created = []
+
+    def bus(label, grant=False):
+        name = f"xa-{label}-{slug}"
+        arn = owner_eb.create_event_bus(Name=name)["EventBusArn"]
+        created.append(name)
+        if grant:
+            owner_eb.put_permission(EventBusName=name, StatementId="AllowPublisher",
+                                    Principal=_XA_PUBLISHER, Action="events:PutEvents")
+        return name, arn
+
+    url = owner_sqs.create_queue(QueueName=f"xa-q-{slug}")["QueueUrl"]
+    queue_arn = owner_sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    def route(name):
+        owner_eb.put_rule(Name=f"{name}-rule", EventBusName=name, EventPattern=json.dumps({"detail-type": ["xa"]}))
+        owner_eb.put_targets(Rule=f"{name}-rule", EventBusName=name, Targets=[{"Id": "q", "Arn": queue_arn}])
+
+    def delivered():
+        msgs = owner_sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
+        return {json.loads(m["Body"])["detail"]["marker"]: json.loads(m["Body"]) for m in msgs}
+
+    class Ctx:
+        pass
+
+    ctx = Ctx()
+    ctx.owner, ctx.publisher, ctx.bus, ctx.route, ctx.delivered = owner_eb, publisher, bus, route, delivered
+    try:
+        yield ctx
+    finally:
+        for name in created:
+            owner_eb.delete_event_bus(Name=name)
+        owner_sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_granted_bus_delivers(xa, auth_enabled):
+    """round1 G1 + P1.allowed: a PutPermission grant to the publisher's account
+    delivers to the owner's rules; the event's account is the publisher's."""
+    name, arn = xa.bus("granted", grant=True)
+    xa.route(name)
+    resp = xa.publisher.put_events(Entries=[_xa_entry("p1", arn)])
+    assert resp["FailedEntryCount"] == 0
+    assert set(resp["Entries"][0]) == {"EventId"}
+    event = xa.delivered()["p1"]
+    assert event["id"] == resp["Entries"][0]["EventId"]
+    assert event["account"] == _XA_PUBLISHER
+    assert event["region"] == "us-east-1"
+    assert event["source"] == "xa.test"
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_without_policy(xa, auth_enabled):
+    """round1 P0.no-policy: under AUTH=true a bus with no policy refuses the whole
+    request with AccessDeniedException (HTTP 400). AUTH=false stays permissive."""
+    name, arn = xa.bus("nopolicy")
+    xa.route(name)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            xa.publisher.put_events(Entries=[_xa_entry("p0", arn)])
+        assert exc.value.response["Error"] == _xa_denied(arn)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert xa.delivered() == {}
+    else:
+        assert xa.publisher.put_events(Entries=[_xa_entry("p0", arn)])["FailedEntryCount"] == 0
+        assert xa.delivered()["p0"]["account"] == _XA_PUBLISHER
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_missing_bus(xa, auth_enabled):
+    """round1 P0.missing-bus, P1.missing-bus: a bus the owner does not have is
+    refused like one without a policy. The deleted bus is a MiniStack contract:
+    MiniStack's DeleteEventBus keeps the bus policy, and it must not grant
+    anything once the bus is gone. AUTH=false accepts both, as a same-account
+    missing bus name is (P0.by-name)."""
+    name, arn = xa.bus("deleted", grant=True)
+    xa.owner.delete_event_bus(Name=name)
+    missing = arn.replace(name, f"{name}-missing")
+    for ref in (missing, arn):
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                xa.publisher.put_events(Entries=[_xa_entry("m", ref)])
+            assert exc.value.response["Error"] == _xa_denied(ref)
+        else:
+            assert xa.publisher.put_events(Entries=[_xa_entry("m", ref)])["FailedEntryCount"] == 0
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_denial_covers_the_whole_request(xa, auth_enabled):
+    """round2 Q1, Q2, Q3, Q3r: one entry for a bus that does not allow the caller
+    refuses every entry, naming the first such bus in request order."""
+    granted, granted_arn = xa.bus("granted", grant=True)
+    _, nopolicy_arn = xa.bus("nopolicy")
+    org, org_arn = xa.bus("org")
+    xa.owner.put_permission(EventBusName=org, StatementId="AllowOrg", Principal="*", Action="events:PutEvents",
+                            Condition={"Type": "StringEquals", "Key": "aws:PrincipalOrgID", "Value": "o-aaaaaaaaaa"})
+    xa.route(granted)
+    cases = (([granted_arn, nopolicy_arn], nopolicy_arn), ([nopolicy_arn, granted_arn], nopolicy_arn),
+             ([nopolicy_arn, org_arn], nopolicy_arn), ([org_arn, nopolicy_arn], org_arn))
+    for buses, named in cases:
+        entries = [_xa_entry(f"q-{i}", bus) for i, bus in enumerate(buses)]
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                xa.publisher.put_events(Entries=entries)
+            assert exc.value.response["Error"] == _xa_denied(named)
+        else:
+            assert xa.publisher.put_events(Entries=entries)["FailedEntryCount"] == 0
+    if auth_enabled:
+        assert xa.delivered() == {}
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_org_condition_mismatch(xa, auth_enabled):
+    """round2 setup.a.org.permission + Q4.org-mismatch: a ``*`` grant conditioned on
+    an organization the publisher is not in does not allow it."""
+    name, arn = xa.bus("org")
+    xa.owner.put_permission(EventBusName=name, StatementId="AllowOrg", Principal="*", Action="events:PutEvents",
+                            Condition={"Type": "StringEquals", "Key": "aws:PrincipalOrgID", "Value": "o-aaaaaaaaaa"})
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            xa.publisher.put_events(Entries=[_xa_entry("q4", arn)])
+        assert exc.value.response["Error"] == _xa_denied(arn)
+    else:
+        assert xa.publisher.put_events(Entries=[_xa_entry("q4", arn)])["FailedEntryCount"] == 0
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_removed_grant(xa, auth_enabled):
+    """round2 R0.remove + R1.retry-1: once the grant is gone the publisher is
+    refused again. AWS took about 30 s to apply the removal (R1.retry-0 still
+    delivered); MiniStack applies it at once. The RemoveAllPermissions half is
+    inferred from round1 G4.describe (no Policy left) and P0.no-policy; round1
+    P6 was still delivered within the propagation window."""
+    name, arn = xa.bus("granted", grant=True)
+    assert xa.publisher.put_events(Entries=[_xa_entry("before", arn)])["FailedEntryCount"] == 0
+    for removal in ({"StatementId": "AllowPublisher"}, {"RemoveAllPermissions": True}):
+        xa.owner.put_permission(EventBusName=name, StatementId="AllowPublisher",
+                                Principal=_XA_PUBLISHER, Action="events:PutEvents")
+        xa.owner.remove_permission(EventBusName=name, **removal)
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                xa.publisher.put_events(Entries=[_xa_entry("after", arn)])
+            assert exc.value.response["Error"] == _xa_denied(arn)
+        else:
+            assert xa.publisher.put_events(Entries=[_xa_entry("after", arn)])["FailedEntryCount"] == 0
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_check_order(xa, auth_enabled):
+    """round2 Q5, Q6, Q7: more than 10 entries fail validation before the bus
+    policy is read; the policy refusal comes before the per-entry ``aws.`` source
+    check, which a granted bus still applies."""
+    granted, granted_arn = xa.bus("granted", grant=True)
+    _, nopolicy_arn = xa.bus("nopolicy")
+    with pytest.raises(ClientError) as exc:
+        xa.publisher.put_events(Entries=[_xa_entry(f"q5-{i}", nopolicy_arn) for i in range(11)])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    aws_source = [_xa_entry("q6", nopolicy_arn, "aws.ministack")]
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            xa.publisher.put_events(Entries=aws_source)
+        assert exc.value.response["Error"] == _xa_denied(nopolicy_arn)
+    else:
+        assert xa.publisher.put_events(Entries=aws_source)["Entries"] == [{
+            "ErrorCode": "NotAuthorizedForSourceException", "ErrorMessage": "Not authorized for the source."}]
+    resp = xa.publisher.put_events(Entries=[_xa_entry("q7", granted_arn, "aws.ministack")])
+    assert resp["FailedEntryCount"] == 1
+    assert resp["Entries"] == [{"ErrorCode": "NotAuthorizedForSourceException",
+                                "ErrorMessage": "Not authorized for the source."}]
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_with_own_missing_bus_name(xa, auth_enabled):
+    """round1 P2.mixed: an entry for a granted foreign bus and one for a bus name
+    the publisher does not have both get an EventId; only the first is delivered."""
+    name, arn = xa.bus("granted", grant=True)
+    xa.route(name)
+    resp = xa.publisher.put_events(Entries=[_xa_entry("p2", arn), _xa_entry("p2x", f"xa-absent-{name}")])
+    assert resp["FailedEntryCount"] == 0
+    assert [set(e) for e in resp["Entries"]] == [{"EventId"}, {"EventId"}]
+    assert set(xa.delivered()) == {"p2"}
+
+
+@pytest.mark.auth_contract
+def test_put_events_owner_publishing_through_its_own_bus_arn(xa, auth_enabled):
+    """round1 P3.owner-arn: the owner needs no grant for its own bus ARN, and the
+    event carries the owner's account."""
+    name, arn = xa.bus("own")
+    xa.route(name)
+    assert xa.owner.put_events(Entries=[_xa_entry("p3", arn)])["FailedEntryCount"] == 0
+    assert xa.delivered()["p3"]["account"] == _XA_OWNER
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("field,value", [
+    ("Principal", ""), ("Principal", "4*"), ("Principal", "11112222333"), ("Principal", {"AWS": 4}),
+    ("Action", "events:PutRule"), ("Action", 5),
+    ("Condition", {"Type": "Null", "Key": "aws:PrincipalOrgID", "Value": "true"}),
+    ("Condition", {"Type": "StringEquals", "Key": "aws:PrincipalAccount", "Value": _XA_PUBLISHER}),
+    ("Condition", {"Type": "StringEquals"}), ("Condition", "StringEquals"),
+    ("Condition", {"Key": "aws:PrincipalOrgID", "Value": "o-aaaaaaaaaa"}),
+    ("Principal+Condition", {"Type": "StringEquals", "Key": "aws:PrincipalOrgID", "Value": None}),
+])
+def test_put_events_cross_account_malformed_stored_statement_grants_nothing(xa, auth_enabled, field, value):
+    """round3 M1, M2, M5-M12, round4 G2: AWS's PutPermission refuses each of these, so no
+    AWS bus policy holds them. MiniStack's PutPermission stores them unchecked;
+    such a statement neither crashes later PutEvents nor allows the caller.
+    Condition cases name ``*``, as AWS requires (round4 G2); the last names the
+    publisher's account with a condition on the publisher's own organization,
+    which would allow it if AWS had stored it."""
+    import urllib.request
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    name, arn = xa.bus("badcond")
+    statement = {"EventBusName": name, "StatementId": "Odd", "Principal": _XA_PUBLISHER,
+                 "Action": "events:PutEvents"}
+    if field == "Condition":
+        statement.update(Principal="*", Condition=value)
+    elif field == "Principal+Condition":
+        org_id = _xa_client("organizations", _XA_PUBLISHER).describe_organization()["Organization"]["Id"]
+        statement.update(Condition={**value, "Value": org_id})
+    else:
+        statement[field] = value
+    body = json.dumps(statement)
+    request = AWSRequest(method="POST", url=f"{_ENDPOINT}/", data=body, headers={
+        "Content-Type": "application/x-amz-json-1.1", "X-Amz-Target": "AWSEvents.PutPermission"})
+    SigV4Auth(Credentials(_XA_OWNER, "test"), "events", "us-east-1").add_auth(request)
+    raw = urllib.request.Request(request.url, data=body.encode(), headers=dict(request.headers), method="POST")
+    with urllib.request.urlopen(raw, timeout=10) as response:
+        assert response.status == 200
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            xa.publisher.put_events(Entries=[_xa_entry("bad", arn)])
+        assert exc.value.response["Error"] == _xa_denied(arn)
+    else:
+        assert xa.publisher.put_events(Entries=[_xa_entry("bad", arn)])["FailedEntryCount"] == 0
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_star_grant_delivers(xa, auth_enabled):
+    """round4 G1 + round5 T1: AWS stores a ``*`` grant without a condition, and
+    another account publishing under it is delivered with its own account."""
+    name, arn = xa.bus("star")
+    xa.owner.put_permission(EventBusName=name, StatementId="AllowAll", Principal="*", Action="events:PutEvents")
+    xa.route(name)
+    assert xa.publisher.put_events(Entries=[_xa_entry("t1", arn)])["FailedEntryCount"] == 0
+    assert xa.delivered()["t1"]["account"] == _XA_PUBLISHER
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_star_grant_for_the_publishers_org_delivers(xa, auth_enabled):
+    """round5 T2: a ``*`` grant conditioned on the publisher's own organization
+    delivers its event, with the publisher's account."""
+    # MiniStack makes every account the master of its own organization on its first Organizations call.
+    org_id = _xa_client("organizations", _XA_PUBLISHER).describe_organization()["Organization"]["Id"]
+    name, arn = xa.bus("star-org")
+    xa.owner.put_permission(EventBusName=name, StatementId="AllowOrg", Principal="*", Action="events:PutEvents",
+                            Condition={"Type": "StringEquals", "Key": "aws:PrincipalOrgID", "Value": org_id})
+    xa.route(name)
+    assert xa.publisher.put_events(Entries=[_xa_entry("t2", arn)])["FailedEntryCount"] == 0
+    assert xa.delivered()["t2"]["account"] == _XA_PUBLISHER
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_iam_user_caller(xa, iam_user, auth_enabled):
+    """round1 P0.no-policy, G1 + P1.allowed with an IAM user as the caller: the
+    refusal names the user, and a grant to the user's account delivers its event
+    with that account."""
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "events:PutEvents", "Resource": "*"}]})
+    account = user.arn.split(":")[4]
+    client = user.client("events")
+    name, arn = xa.bus("user")
+    xa.route(name)
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.put_events(Entries=[_xa_entry("u0", arn)])
+        assert exc.value.response["Error"] == {
+            "Code": "AccessDeniedException",
+            "Message": f"User: {user.arn} is not authorized to perform: events:PutEvents on resource: {arn} "
+                       "because no resource-based policy allows the events:PutEvents action"}
+    else:
+        assert client.put_events(Entries=[_xa_entry("u0", arn)])["FailedEntryCount"] == 0
+        assert xa.delivered()["u0"]["account"] == account
+    xa.owner.put_permission(EventBusName=name, StatementId="AllowUserAccount", Principal=account,
+                            Action="events:PutEvents")
+    assert client.put_events(Entries=[_xa_entry("u1", arn)])["FailedEntryCount"] == 0
+    assert xa.delivered()["u1"]["account"] == account
+
+
+@pytest.mark.auth_contract
+def test_put_events_cross_account_policy_source_condition_per_entry(xa, auth_enabled):
+    """round2 setup.a.source.policy, S1, S2, S3: a Policy granting the publisher
+    only for one source allows an entry with that source, refuses one with
+    another source, and refuses a request mixing both."""
+    name, arn = xa.bus("source")
+    xa.owner.put_permission(EventBusName=name, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Sid": "AllowBSource", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{_XA_PUBLISHER}:root"},
+        "Action": "events:PutEvents", "Resource": arn,
+        "Condition": {"StringEquals": {"events:source": "xa.allowed"}}}]}))
+    xa.route(name)
+    assert xa.publisher.put_events(Entries=[_xa_entry("s1", arn, "xa.allowed")])["FailedEntryCount"] == 0
+    for entries in ([_xa_entry("s2", arn, "xa.other")],
+                    [_xa_entry("s3a", arn, "xa.allowed"), _xa_entry("s3b", arn, "xa.other")]):
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                xa.publisher.put_events(Entries=entries)
+            assert exc.value.response["Error"] == _xa_denied(arn)
+        else:
+            assert xa.publisher.put_events(Entries=entries)["FailedEntryCount"] == 0
+    delivered = set(xa.delivered())
+    assert delivered == ({"s1"} if auth_enabled else {"s1", "s2", "s3a", "s3b"})
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("statements", [
+    [{"Effect": "Allow", "Principal": "*", "Action": "events:PutEvents", "Condition": {"StringEquals": "x"}}],
+    [{"Effect": "Allow", "Principal": "*", "Action": "events:PutEvents", "Resource": 5}],
+    [{"Effect": "Allow", "Principal": "*", "Action": "events:PutEvents"},
+     {"Effect": "Deny", "NotPrincipal": {"AWS": f"arn:aws:iam::{_XA_OWNER}:root"}, "Action": "events:PutEvents"}],
+    [{"Effect": "Allow", "Principal": "*", "Action": "events:PutEvents"},
+     {"Effect": "Deny", "Principal": "*", "Action": [5]}],
+    [{"Effect": "Allow", "Principal": {"AWS": "a:root"}, "Action": "events:PutEvents"}],
+    [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::*:root"}, "Action": "events:PutEvents"}],
+    [{"Effect": "Allow", "Principal": "*", "Action": "events:PutEvents"},
+     {"Effect": "Deny", "Principal": "*", "Action": "events:PutEvents", "Condition": {"StringEqualz": {"aws:x": "y"}}}],
+    [{"Effect": "Allow", "Principal": "*", "Action": "events:PutEvents", "Resource": None}],
+])
+def test_put_events_cross_account_unreadable_policy_refuses(xa, auth_enabled, statements):
+    """MiniStack contract: a stored Policy statement this emulator cannot read
+    grants nothing, and a Deny it cannot evaluate (unreadable, or with
+    NotPrincipal) refuses every caller, so neither lets the publisher in where
+    AWS might not. Not captured; refused like round1 P0.no-policy, and a Deny
+    with round6's explicit-deny wording."""
+    name, arn = xa.bus("unreadable")
+    explicit = any(statement.get("Effect") == "Deny" for statement in statements)
+    statements = [{"Resource": arn, **statement} for statement in statements]
+    statements = [{k: v for k, v in statement.items() if v is not None} for statement in statements]
+    xa.owner.put_permission(EventBusName=name, Policy=json.dumps({"Version": "2012-10-17", "Statement": statements}))
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            xa.publisher.put_events(Entries=[_xa_entry("x", arn)])
+        assert exc.value.response["Error"] == _xa_denied(arn, explicit)
+    else:
+        assert xa.publisher.put_events(Entries=[_xa_entry("x", arn)])["FailedEntryCount"] == 0
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("key,value,denied,allowed", [
+    ("events:detail-type", "xa-denied", {"DetailType": "xa-denied"}, {"DetailType": "xa"}),
+    ("events:eventBusInvocation", "false", {}, None),
+])
+def test_put_events_cross_account_explicit_deny_on_event_keys(xa, auth_enabled, key, value, denied, allowed):
+    """round6 D1, D2, I1: PutEvents supplies events:detail-type for each entry
+    and events:eventBusInvocation "false" for a direct publish, and a Deny on
+    them refuses with the explicit-deny wording."""
+    name, arn = xa.bus("deny-key")
+    xa.owner.put_permission(EventBusName=name, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Sid": "AllowPublisher", "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{_XA_PUBLISHER}:root"},
+         "Action": "events:PutEvents", "Resource": arn},
+        {"Sid": "DenyKey", "Effect": "Deny", "Principal": "*", "Action": "events:PutEvents", "Resource": arn,
+         "Condition": {"StringEquals": {key: value}}}]}))
+    entry = {**_xa_entry("d1", arn), **denied}
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            xa.publisher.put_events(Entries=[entry])
+        assert exc.value.response["Error"] == _xa_denied(arn, explicit=True)
+    else:
+        assert xa.publisher.put_events(Entries=[entry])["FailedEntryCount"] == 0
+    if allowed is not None:
+        assert xa.publisher.put_events(Entries=[{**_xa_entry("d2", arn), **allowed}])["FailedEntryCount"] == 0

@@ -124,8 +124,11 @@ def test_kms_describe_key_by_arn(kms_client):
 def test_kms_key_arn_resolution_rejects_wrong_scope(kms_client):
     created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
     arn = created["KeyMetadata"]["Arn"]
+    # Another account's key ARN is refused without saying whether the key exists (#2463, captured).
+    with pytest.raises(ClientError) as exc:
+        kms_client.describe_key(KeyId=arn.replace(":000000000000:", ":111111111111:"))
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
     invalid_cases = [
-        arn.replace(":000000000000:", ":111111111111:"),
         arn.replace(":us-east-1:", ":us-west-2:"),
         arn.replace(":kms:", ":sqs:"),
         arn.replace(":key/", ":alias/"),
@@ -2951,3 +2954,42 @@ def test_kms_rsa_decrypt_without_algorithm_is_invalid_ciphertext(kms_client):
         kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
     assert exc.value.response["Error"] == {
         "Code": "InvalidKeyUsageException", "Message": "Algorithm SYMMETRIC_DEFAULT is incompatible with key spec RSA_2048."}
+
+
+@pytest.mark.auth_contract
+def test_kms_key_arn_from_another_account(auth_enabled):
+    """#2463: a key ARN of another account resolves in the owner's account; with AUTH=true the key policy
+    must allow the caller. A refusal is AWS's AccessDeniedException, which does not say whether the key
+    exists (captured through AppConfig)."""
+    def kms(account):
+        return boto3.client("kms", endpoint_url=ENDPOINT, region_name="us-east-1",
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    owner, other = kms("111122223333"), kms("444455556666")
+    closed = owner.create_key()["KeyMetadata"]
+    shared = owner.create_key(Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"}, "Action": "kms:*", "Resource": "*"},
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::444455556666:root"},
+         "Action": ["kms:Encrypt", "kms:Decrypt"], "Resource": "*"}]}))["KeyMetadata"]
+    denied = ("User: arn:aws:iam::444455556666:root is not authorized to perform: kms:{} on this resource because "
+              "the resource does not exist in this Region, no resource-based policies allow access, or a "
+              "resource-based policy explicitly denies access")
+
+    def refused(call, action):
+        with pytest.raises(ClientError) as exc:
+            call()
+        err = exc.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "AccessDeniedException", denied.format(action))
+
+    blob = other.encrypt(KeyId=shared["Arn"], Plaintext=b"x")["CiphertextBlob"]
+    assert other.decrypt(KeyId=shared["Arn"], CiphertextBlob=blob)["Plaintext"] == b"x"
+    refused(lambda: other.encrypt(KeyId=closed["Arn"][:-4] + "0000", Plaintext=b"x"), "Encrypt")
+    if auth_enabled:
+        refused(lambda: other.encrypt(KeyId=closed["Arn"], Plaintext=b"x"), "Encrypt")
+        refused(lambda: other.generate_data_key(KeyId=shared["Arn"], KeySpec="AES_256"), "GenerateDataKey")
+    else:
+        other.encrypt(KeyId=closed["Arn"], Plaintext=b"x")
+    with pytest.raises(ClientError) as exc:
+        other.encrypt(KeyId=closed["KeyId"], Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"

@@ -1456,6 +1456,67 @@ def _tls_command(endpoint, ca_file, command):
             return conn.recv(65536)
 
 
+def _tls_session(endpoint, ca_file, *commands):
+    """Replies to ``commands`` sent in order on one TLS connection."""
+    import socket
+    import ssl
+    ctx = ssl.create_default_context(cafile=ca_file)
+    replies = []
+    with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname=endpoint["Address"]) as conn:
+            for parts in commands:
+                conn.sendall(f"*{len(parts)}\r\n".encode()
+                             + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                time.sleep(0.2)
+                replies.append(conn.recv(65536))
+    return replies
+
+
+def _docker_reachable():
+    try:
+        import docker
+        return docker.from_env().ping()
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
+    """#2457: with a Valkey user group the engine's default user is off (AWS RBAC docs), the group's users
+    exist with their access strings and passwords, and an iam user logs in with its token."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    pw_user, iam_user, ro_user, group, name = (f"u-pw-{uid}", f"u-iam-{uid}", f"u-ro-{uid}", f"g-{uid}", f"sls-acl-{uid}")
+    ec.create_user(UserId=pw_user, UserName=pw_user, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    ec.create_user(UserId=iam_user, UserName=iam_user, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    ec.create_user(UserId=ro_user, UserName=ro_user, Engine="valkey", AccessString="on ~app:* -@all +get",
+                   AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[pw_user, iam_user, ro_user])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="8", UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        noauth, wrongpass = b"-NOAUTH Authentication required.\r\n", \
+            b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        assert _tls_session(ep, ca, ("PING",), ("SET", "k", "v")) == [noauth, noauth]
+        assert _tls_session(ep, ca, ("AUTH", pw_user, "wrong-password-123456"), ("PING",)) == [wrongpass, noauth]
+        assert _tls_session(ep, ca, ("AUTH", "default", pw), ("AUTH", pw)) == [wrongpass, wrongpass]
+        assert _tls_session(ep, ca, ("AUTH", pw_user, pw), ("ACL", "WHOAMI"), ("SET", "k", "v")) == [
+            b"+OK\r\n", f"${len(pw_user)}\r\n{pw_user}\r\n".encode(), b"+OK\r\n"]
+        assert _tls_session(ep, ca, ("AUTH", iam_user, f"{name}/?Action=connect&User={iam_user}"), ("PING",)) == [
+            b"+OK\r\n", b"+PONG\r\n"]
+        ro = _tls_session(ep, ca, ("AUTH", ro_user, pw), ("GET", "app:1"), ("SET", "app:1", "x"))
+        assert ro[:2] == [b"+OK\r\n", b"$-1\r\n"] and ro[2].startswith(b"-NOPERM")
+        assert _tls_session(ep, ca, ("HELLO", "3", "AUTH", pw_user, "nope-nope-nope-nope")) == [wrongpass]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (pw_user, iam_user, ro_user):
+            ec.delete_user(UserId=user)
+
+
 def test_serverless_cache_create_describe_delete(ec):
     name = f"sls-{_uid()}"
     created = ec.create_serverless_cache(

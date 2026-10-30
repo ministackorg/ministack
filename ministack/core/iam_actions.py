@@ -2361,6 +2361,16 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
+    if (service == "kms" and not error_code and resource_arn.startswith("arn:")
+            and resource_arn.split(":")[4] != principal_arn.split(":")[4]):
+        # A key in another account: KMS does not say whether it exists (captured through AppConfig).
+        message = (f"User: {principal_arn} is not authorized to perform: {action} on this resource because the "
+                   "resource does not exist in this Region, no resource-based policies allow access, or a "
+                   "resource-based policy explicitly denies access")
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
+        )
     if service == "iot-data":
         # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
         # for a failed authentication, no message for a policy denial.

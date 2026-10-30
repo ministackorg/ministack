@@ -31,7 +31,7 @@ from ministack.services import rds as _imm_rds
 
 DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
-DEFAULT_AURORA_POSTGRESQL_ENGINE_VERSION = "17.7"
+DEFAULT_AURORA_POSTGRESQL_ENGINE_VERSION = "17.9"
 DEFAULT_AURORA_POSTGRESQL_16_ENGINE_VERSION = "16.11"
 UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION = "16.99"
 EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
@@ -925,6 +925,27 @@ def test_rds_global_cluster_lifecycle(rds):
     with pytest.raises(ClientError) as exc:
         rds.describe_global_clusters(GlobalClusterIdentifier="test-global-1")
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
+
+def test_rds_global_cluster_shape_matches_aws(rds):
+    """#2464, captured on AWS (us-east-1): defaults, lifecycle support, encryption type and DatabaseName."""
+    plain = rds.create_global_cluster(GlobalClusterIdentifier="gc-shape-plain", Engine="aurora-postgresql")["GlobalCluster"]
+    enc = rds.create_global_cluster(GlobalClusterIdentifier="gc-shape-enc", Engine="aurora-postgresql",
+                                    StorageEncrypted=True, DatabaseName="appdb")["GlobalCluster"]
+    mysql = rds.create_global_cluster(GlobalClusterIdentifier="gc-shape-my", Engine="aurora-mysql")["GlobalCluster"]
+    try:
+        assert list(plain) == ["GlobalClusterIdentifier", "GlobalClusterResourceId", "GlobalClusterArn", "Status",
+                               "Engine", "EngineVersion", "EngineLifecycleSupport", "StorageEncrypted",
+                               "StorageEncryptionType", "DeletionProtection", "GlobalClusterMembers", "Endpoint",
+                               "TagList"]
+        assert re.fullmatch(r"cluster-[0-9a-f]{16}", plain["GlobalClusterResourceId"])
+        assert (plain["EngineVersion"], plain["EngineLifecycleSupport"], plain["StorageEncryptionType"]) == (
+            "17.9", "open-source-rds-extended-support", "sse-rds")
+        assert (enc["DatabaseName"], enc["StorageEncrypted"], enc["StorageEncryptionType"]) == ("appdb", True, "sse-kms")
+        assert (mysql["EngineVersion"], mysql["StorageEncryptionType"]) == ("8.0.mysql_aurora.3.10.3", "sse-rds")
+    finally:
+        for gc_id in ("gc-shape-plain", "gc-shape-enc", "gc-shape-my"):
+            rds.delete_global_cluster(GlobalClusterIdentifier=gc_id)
+
 
 @pytest.mark.parametrize("engine", ["aurora-postgresql", "aurora-mysql"])
 def test_rds_global_cluster_tags_lifecycle(rds, engine):

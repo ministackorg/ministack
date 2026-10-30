@@ -21,9 +21,11 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import zlib
+from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import esm_wake
@@ -1746,21 +1748,52 @@ _MAPPING_READ_ACTIONS = ("kinesis:DescribeStream", "kinesis:DescribeStreamSummar
                          "kinesis:GetShardIterator", "kinesis:ListShards")
 
 
-def mapping_read_denied(stream_arn, role_arn, function_name, mapping_account):
-    """The first read a cross-account mapping's execution role may not make on the stream, or None.
-    Only the stream's resource policy can grant another account."""
+def _lambda_session(role_arn, mapping_account):
+    """The session Lambda reads a stream as: the execution role under a session name shaped like
+    AWS's ``awslambda_<n>_<timestamp>``, or None without a role."""
+    role_name = role_arn.rsplit("/", 1)[-1] if ":role/" in (role_arn or "") else ""
+    if not role_name:
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")[:17]
+    return f"arn:aws:sts::{mapping_account}:assumed-role/{role_name}/awslambda_{100 + secrets.randbelow(900)}_{stamp}"
+
+
+def _denied_reads(stream_arn, session, mapping_account, actions):
     from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
 
     found = stream_policy_for_arn(stream_arn)
     policy = found[0] if found else ""
-    role_name = role_arn.rsplit("/", 1)[-1] if ":role/" in role_arn else ""
-    session = f"arn:aws:sts::{mapping_account}:assumed-role/{role_name}/{function_name}"
-    for action in _MAPPING_READ_ACTIONS:
+    region = _kinesis_arn_scope(stream_arn)[1]
+    denied = []
+    for action in actions:
         ctx = EvalContext(principal_arn=session, principal_type="AssumedRole", principal_account=mapping_account,
-                          action=action, resource_arn=stream_arn, region=_kinesis_arn_scope(stream_arn)[1])
+                          action=action, resource_arn=stream_arn, region=region)
         if not policy or evaluate_resource_policy(policy, ctx).decision != "Allow":
-            return session, action
-    return None
+            denied.append(action)
+    return denied
+
+
+def mapping_read_denied(stream_arn, role_arn, function_name, mapping_account):
+    """(session, action) for the first read a new cross-account mapping's execution role may not make
+    on the stream, or None. AWS requires all of them to create the mapping."""
+    session = _lambda_session(role_arn, mapping_account) or f"arn:aws:sts::{mapping_account}:assumed-role//{function_name}"
+    denied = _denied_reads(stream_arn, session, mapping_account, _MAPPING_READ_ACTIONS)
+    return (session, denied[0]) if denied else None
+
+
+def running_mapping_read_problem(stream_arn, role_arn, mapping_account):
+    """LastProcessingResult for a running cross-account mapping that cannot read the stream, or None.
+    Recorded on AWS: a running mapping needs only GetRecords; without it, Lambda names DescribeStream
+    when that is refused too, else GetRecords."""
+    session = _lambda_session(role_arn, mapping_account)
+    if session is None:
+        return None
+    denied = _denied_reads(stream_arn, session, mapping_account, ("kinesis:DescribeStream", "kinesis:GetRecords"))
+    if "kinesis:GetRecords" not in denied:
+        return None
+    action = denied[0]
+    return (f"PROBLEM: User: {session} is not authorized to perform: {action} on resource: {stream_arn} "
+            f"because no resource-based policy allows the {action} action")
 
 
 def _put_resource_policy(data, headers):
