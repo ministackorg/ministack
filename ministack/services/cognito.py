@@ -1015,6 +1015,45 @@ def _signed_jwt(claims: dict, pool_id: str = "", use: str = "") -> str:
     return f"{header}.{payload}.{sig}"
 
 
+class _PreTokenRejected(Exception):
+    """Raised when a PreTokenGeneration Lambda runs and returns an error."""
+
+
+class _PreTokenUnavailable(Exception):
+    """Raised in strict mode when a PreTokenGeneration Lambda cannot be invoked."""
+
+
+def _pretoken_error_code(exc) -> str:
+    return ("UserLambdaValidationException" if isinstance(exc, _PreTokenRejected)
+            else "UnexpectedLambdaException")
+
+
+def _pretoken_error(exc):
+    return error_response_json(_pretoken_error_code(exc), str(exc), 400)
+
+
+def _pretoken_oauth2_error(exc):
+    # The token endpoint passes Cognito's internal service exception through
+    # as the "error" text instead of an OAuth error code
+    error = (f"{exc} (Service: AWSCognitoIdentityProviderInternalService; Status Code: 400; "
+             f"Error Code: {_pretoken_error_code(exc)}; Request ID: {new_uuid()}; Proxy: null)")
+    return 400, {"Content-Type": "application/json;charset=UTF-8"}, json.dumps({"error": error}).encode()
+
+
+def _lambda_error_message(body) -> str:
+    """The ``errorMessage`` of a Lambda error result, else the body as text."""
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError):
+            return body
+    if isinstance(body, dict) and body.get("errorMessage") is not None:
+        return str(body["errorMessage"])
+    return str(body)
+
+
 def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
                              trigger_source: str, client_id: str,
                              username: str, user_attrs: dict,
@@ -1028,9 +1067,12 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     (``LambdaConfig.PreTokenGenerationConfig`` — id + access tokens,
     ``claimsAndScopeOverrideDetails`` shape).
 
-    By default a Lambda failure is logged and ignored — the unmodified token
-    is still issued. Set ``MINISTACK_COGNITO_PRETOKEN_STRICT=1`` to fail-closed
-    (raise to the caller) the way real AWS does.
+    A Lambda that runs and returns an error raises ``_PreTokenRejected``, as
+    AWS answers ``UserLambdaValidationException``. A Lambda that cannot be
+    invoked is logged and ignored by default — the unmodified token is still
+    issued. Set ``MINISTACK_COGNITO_PRETOKEN_STRICT=1`` to raise
+    ``_PreTokenUnavailable`` instead, as AWS answers
+    ``UnexpectedLambdaException``.
     """
     pool = _user_pools.get(pool_id)
     if not pool:
@@ -1065,28 +1107,37 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         scope=scope,
     )
 
+    # AWS names the trigger with its LambdaVersion in these messages, e.g.
+    # "PreTokenGenerationV2_0 failed with error ..."
+    trigger_name = f"PreTokenGeneration{v2_version}" if use_v2 else "PreTokenGeneration"
     strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
     try:
         # Lazy import to avoid a circular dependency between cognito and lambda_svc.
         from ministack.services import lambda_svc
         record, config, _name = lambda_svc._get_func_record_for_ref(arn)
         if record is None or config is None:
-            raise RuntimeError(f"PreTokenGeneration Lambda not found: {arn}")
+            # AWS reports a missing function as the invoke being denied
+            raise _PreTokenUnavailable(
+                f"{trigger_name} invocation failed due to error AccessDeniedException.")
         exec_record = lambda_svc._execution_record_for_config(record, config)
         result = lambda_svc._execute_function_with_config_scope(exec_record, event)
     except Exception as e:
         logger.warning("PreTokenGeneration Lambda invocation failed for pool %s: %s",
                        pool_id, e)
-        if strict:
+        # Fails open by default so a Lambda that cannot run locally does not
+        # block sign-in (#533)
+        if not strict:
+            return claims
+        if isinstance(e, _PreTokenUnavailable):
             raise
-        return claims
+        raise _PreTokenUnavailable(
+            f"{trigger_name} invocation failed due to error {type(e).__name__}.") from e
 
     if isinstance(result, dict) and result.get("error"):
-        logger.warning("PreTokenGeneration Lambda returned an error for pool %s: %s",
-                       pool_id, result.get("body"))
-        if strict:
-            raise RuntimeError(f"PreTokenGeneration error: {result.get('body')}")
-        return claims
+        reason = _lambda_error_message(result.get("body"))
+        logger.info("PreTokenGeneration Lambda rejected the token for pool %s: %s",
+                    pool_id, reason)
+        raise _PreTokenRejected(f"{trigger_name} failed with error {reason}.")
     payload = result.get("body") if isinstance(result, dict) else result
     response = _extract_trigger_response(payload)
     if not response:
@@ -1211,11 +1262,11 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
 
     Emulates AWS's ``PreSignUp_ExternalProvider`` trigger, which fires
     immediately before Cognito persists a user provisioned through IdP
-    federation. Unlike ``_apply_pretoken_trigger``, this is fail-closed: on
-    real AWS a Lambda that throws blocks the sign-up outright
-    (``UserLambdaValidationException``), so any invocation failure or
-    Lambda-reported error raises ``_PreSignUpRejected`` instead of being
-    swallowed.
+    federation. Unlike ``_apply_pretoken_trigger``, this is fail-closed even
+    when the Lambda cannot be invoked: on real AWS a Lambda that throws blocks
+    the sign-up outright (``UserLambdaValidationException``), so any
+    invocation failure or Lambda-reported error raises ``_PreSignUpRejected``
+    instead of being swallowed.
 
     Returns the trigger's ``autoConfirmUser``/``autoVerifyEmail``/
     ``autoVerifyPhone`` overrides (all ``False`` if the pool has no
@@ -2530,7 +2581,7 @@ async def handle_request(method, path, headers, body, query_params):
         return await run_reentrant(_oauth2_idp_response, method, body, query_params,
                                    thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/token"):
-        return await run_reentrant(_oauth2_token, {}, query_params, body, headers,
+        return await run_reentrant(_run_oauth2_token, {}, query_params, body, headers,
                                    thread_name="ministack-cognito-trigger")
 
     try:
@@ -2762,7 +2813,10 @@ def _run_idp_handler(handler, action: str, data: dict):
              or _access_token_error(data) or _confirmation_code_error(action, data)) if AUTH else None
     if error:
         return error
-    return handler(data)
+    try:
+        return handler(data)
+    except (_PreTokenRejected, _PreTokenUnavailable) as e:
+        return _pretoken_error(e)
 
 
 def _run_identity_handler(handler, action: str, data: dict):
@@ -7731,9 +7785,16 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
     return 400, {"Content-Type": "application/json"}, json.dumps({"error": "unsupported_grant_type"}).encode()
 
 
+def _run_oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | None = None):
+    try:
+        return _oauth2_token(data, query_params, raw_body, headers)
+    except (_PreTokenRejected, _PreTokenUnavailable) as e:
+        return _pretoken_oauth2_error(e)
+
+
 async def handle_oauth2_token(method, path, headers, body, query_params):
     """Public entry point called from app.py for POST /oauth2/token."""
-    return await run_reentrant(_oauth2_token, {}, query_params, body, headers,
+    return await run_reentrant(_run_oauth2_token, {}, query_params, body, headers,
                                thread_name="ministack-cognito-trigger")
 
 
