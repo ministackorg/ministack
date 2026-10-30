@@ -2060,7 +2060,7 @@ def test_ec2_describe_instance_types_filter(ec2):
     assert types == {"t2.micro", "m5.large"}
 
 def test_ec2_describe_instance_types_hypervisor_and_architecture(ec2):
-    types = ["t2.micro", "m4.large", "m5.large", "r7g.large", "t4g.small", "c7gn.large", "a1.large", "g4dn.xlarge"]
+    types = ["t2.micro", "m4.large", "m5.large", "r7g.large", "t4g.small", "c7gn.large", "a1.large", "g4dn.xlarge", "g3s.xlarge", "i3en.large", "p3dn.24xlarge"]
     resp = ec2.describe_instance_types(InstanceTypes=types)
     got = {t["InstanceType"]: (t["Hypervisor"], t["ProcessorInfo"]["SupportedArchitectures"]) for t in resp["InstanceTypes"]}
     assert got == {
@@ -2072,6 +2072,9 @@ def test_ec2_describe_instance_types_hypervisor_and_architecture(ec2):
         "c7gn.large": ("nitro", ["arm64"]),
         "a1.large": ("nitro", ["arm64"]),
         "g4dn.xlarge": ("nitro", ["x86_64"]),
+        "g3s.xlarge": ("xen", ["x86_64"]),
+        "i3en.large": ("nitro", ["x86_64"]),
+        "p3dn.24xlarge": ("nitro", ["x86_64"]),
     }
 
 def test_ec2_describe_vpc_attribute(ec2):

@@ -6751,7 +6751,7 @@ def _describe_instance_attribute(p):
 # Nitro System (EC2 instance types guide, "Instances built on the AWS Nitro System").
 _XEN_INSTANCE_FAMILIES = {
     "t1", "t2", "m1", "m2", "m3", "m4", "c1", "c3", "c4", "r3", "r4",
-    "i2", "i3", "d2", "x1", "x1e", "g2", "g3", "p2", "p3", "f1", "h1",
+    "i2", "i3", "d2", "x1", "x1e", "g2", "g3", "g3s", "p2", "p3", "f1", "h1",
 }
 
 
