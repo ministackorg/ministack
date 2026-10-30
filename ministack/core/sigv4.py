@@ -60,6 +60,9 @@ def build_canonical_headers(headers: Mapping[str, Any], signed_headers: str) -> 
     canonical = ""
     for name in (name for name in signed_headers.split(";") if name):
         raw = headers.get(name, headers.get(name.lower(), ""))
+        if name.lower() == ":authority" and ":authority" not in headers:
+            # An HTTP/2 client signs :authority; Hypercorn passes it to the app as host (ASGI spec).
+            raw = headers.get("host", "")
         canonical += f"{name.lower()}:{' '.join(str(raw).split())}\n"
     return canonical
 

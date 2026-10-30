@@ -56,6 +56,18 @@ def test_build_canonical_query_string_accepts_custom_exclusions():
     assert build_canonical_query_string(query_params, exclude=("nonce",)) == "Action=connect&DBUser=alice"
 
 
+def test_build_canonical_headers_reads_a_signed_authority_from_host():
+    # #2496: Hypercorn passes an HTTP/2 request's :authority to the app as host, per the ASGI spec.
+    headers = {"host": "localhost:4566", "x-amz-date": "20261030T000000Z"}
+
+    assert build_canonical_headers(headers, ":authority;x-amz-date") == (
+        ":authority:localhost:4566\n"
+        "x-amz-date:20261030T000000Z\n"
+    )
+    assert build_canonical_headers({**headers, ":authority": "other:1"}, ":authority") == ":authority:other:1\n"
+    assert build_canonical_headers(headers, "host") == "host:localhost:4566\n"
+
+
 def test_build_canonical_headers_normalizes_names_and_values():
     headers = {
         "host": "examplebucket.s3.amazonaws.com",
