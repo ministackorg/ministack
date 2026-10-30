@@ -1183,6 +1183,47 @@ def _arn_prefix(arn):
     return urllib.parse.quote(arn, safe="")
 
 
+
+def test_s3tables_iceberg_rest_drops_tables_and_namespaces(s3tables):
+    """#2502, recorded on AWS (us-east-1): dropTable needs purgeRequested=true, dropNamespace needs an
+    empty namespace, and HEAD answers 204."""
+    arn = s3tables.create_table_bucket(name=f"drop-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    base = f"/iceberg/v1/{_arn_prefix(arn)}/namespaces"
+    schema = {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "long", "required": False}]}
+
+    def head(path):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"{_ENDPOINT}{path}", method="HEAD")) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def error(status, kind, message):
+        return status, {"error": {"code": status, "message": message, "type": kind}}
+
+    try:
+        assert _iceberg_call(base, "POST", {"namespace": ["ns"]})[0] == 200
+        assert _iceberg_call(f"{base}/ns/tables", "POST", {"name": "t", "schema": schema})[0] == 200
+        assert (head(f"{base}/ns"), head(f"{base}/nope"), head(f"{base}/ns/tables/t")) == (204, 404, 204)
+        assert _iceberg_call(f"{base}/ns", "DELETE") == error(
+            400, "namespace_not_empty", "The namespace that you tried to delete is not empty.")
+        purge_required = error(
+            400, "purge_enabled", "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.")
+        for query in ("", "?purgeRequested=false"):
+            assert _iceberg_call(f"{base}/ns/tables/t{query}", "DELETE") == purge_required
+        assert _iceberg_call(f"{base}/ns/tables/absent", "DELETE") == purge_required
+        assert _iceberg_call(f"{base}/ns/tables/t?purgeRequested=true", "DELETE") == (200, {})
+        assert head(f"{base}/ns/tables/t") == 404
+        assert _iceberg_call(f"{base}/ns/tables/t?purgeRequested=true", "DELETE") == error(
+            404, "no_such_table", "The specified table does not exist.")
+        assert _iceberg_call(f"{base}/nope/tables/t?purgeRequested=true", "DELETE") == error(
+            404, "no_such_namespace", "The specified namespace does not exist.")
+        assert _iceberg_call(f"{base}/ns", "DELETE") == (200, {})
+        assert _iceberg_call(f"{base}/ns", "DELETE") == error(
+            404, "no_such_namespace", "The specified namespace does not exist.")
+    finally:
+        s3tables.delete_table_bucket(tableBucketARN=arn)
+
 def test_s3tables_iceberg_rest_scopes_each_catalog_to_its_warehouse_arn(s3tables):
     """Two catalogs, each with its table-bucket ARN as warehouse; the REST
     {prefix} "is always your url-encoded table bucket ARN"."""
@@ -1389,7 +1430,7 @@ _S3TABLES_ICEBERG_ROUTES = {
     "create-namespace": ("POST", "{prefix}/namespaces", None, {"namespace": ["{new}"]},
                          [("CreateNamespace", "{bucket}")], 200),
     "load-namespace": ("GET", "{prefix}/namespaces/ns", None, None, [("GetNamespace", "{bucket}")], 200),
-    "drop-namespace": ("DELETE", "{prefix}/namespaces/ns", None, None, [("DeleteNamespace", "{bucket}")], 404),
+    "drop-namespace": ("DELETE", "{prefix}/namespaces/ns", None, None, [("DeleteNamespace", "{bucket}")], 400),
     "list-tables": ("GET", "{prefix}/namespaces/ns/tables", None, None, [("ListTables", "{bucket}")], 200),
     "create-table": ("POST", "{prefix}/namespaces/ns/tables", None, {"name": "{new}"},
                      [("CreateTable", "{bucket}"), ("PutTableData", "{bucket}/table/*")], 200),
@@ -1397,8 +1438,8 @@ _S3TABLES_ICEBERG_ROUTES = {
                    [("GetTableMetadataLocation", "{t}"), ("GetTableData", "{t}")], 200),
     "update-table": ("POST", "{prefix}/namespaces/ns/tables/t", None, {"requirements": [], "updates": []},
                      _UPDATE_TABLE_T, 200),
-    "drop-table": ("DELETE", "{prefix}/namespaces/ns/tables/t", None, None, [("DeleteTable", "{t}")], 404),
-    "table-exists": ("HEAD", "{prefix}/namespaces/ns/tables/t", None, None, [("GetTable", "{t}")], 200),
+    "drop-table": ("DELETE", "{prefix}/namespaces/ns/tables/t", None, None, [("DeleteTable", "{t}")], 400),
+    "table-exists": ("HEAD", "{prefix}/namespaces/ns/tables/t", None, None, [("GetTable", "{t}")], 204),
     "rename-table": ("POST", "{prefix}/tables/rename", None, {"source": {"namespace": ["ns"], "name": "t"},
                                                                "destination": {"namespace": ["ns"], "name": "{new}"}},
                      [("RenameTable", "{t}")], 404),

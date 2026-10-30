@@ -748,6 +748,59 @@ def _iceberg_get_namespace(namespace, allow_cross_region, bucket_filter=None):
     return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
 
+
+def _iceberg_head_namespace(namespace, allow_cross_region, bucket_filter=None):
+    found = _iceberg_values(
+        _namespaces,
+        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+        allow_cross_region)
+    return (204 if found else 404), {}, b""
+
+
+def _iceberg_drop_namespace(namespace, allow_cross_region, bucket_filter=None):
+    """DELETE .../namespaces/{ns}, Iceberg REST dropNamespace. AWS refuses a namespace that still holds
+    tables (recorded in us-east-1)."""
+    matches = _iceberg_values(
+        _namespaces,
+        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+        allow_cross_region)
+    if not matches:
+        return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
+    bucket_arn = matches[0]["tableBucketARN"]
+    if _iceberg_values(
+            _tables,
+            lambda table: _namespace_name(table) == namespace and table.get("tableBucketARN") == bucket_arn,
+            allow_cross_region):
+        return _iceberg_error("The namespace that you tried to delete is not empty.", "namespace_not_empty", 400)
+    spec = parse_arn(bucket_arn)
+    _namespaces.pop_scoped(spec.account_id, spec.region, _ns_key(bucket_arn, namespace), None)
+    return 204, {}, b""
+
+
+def _iceberg_drop_table(namespace, table_name, purge, allow_cross_region, bucket_filter=None):
+    """DELETE .../namespaces/{ns}/tables/{table}, Iceberg REST dropTable. S3 Tables only drops a table
+    when the client asks for a purge, and says so before it looks the table up (recorded in us-east-1)."""
+    if str(purge).lower() != "true":
+        return _iceberg_error(
+            "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.",
+            "purge_enabled", 400)
+    if not _iceberg_values(
+            _namespaces,
+            lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+            allow_cross_region):
+        return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
+    matches = _iceberg_values(
+        _tables,
+        lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
+                       and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
+        allow_cross_region)
+    if not matches:
+        return _iceberg_error("The specified table does not exist.", "no_such_table", 404)
+    bucket_arn = matches[0]["tableBucketARN"]
+    spec = parse_arn(bucket_arn)
+    _tables.pop_scoped(spec.account_id, spec.region, _table_key(bucket_arn, namespace, table_name), None)
+    return 204, {}, b""
+
 def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
     def _pred(table):
         if _namespace_name(table) != namespace:
@@ -1278,6 +1331,10 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         return _iceberg_create_namespace(data, allow_cross_region, bucket_filter)
     if len(rest) == 1 and method == "GET":
         return _iceberg_get_namespace(rest[0], allow_cross_region, bucket_filter)
+    if len(rest) == 1 and method == "HEAD":
+        return _iceberg_head_namespace(rest[0], allow_cross_region, bucket_filter)
+    if len(rest) == 1 and method == "DELETE":
+        return _iceberg_drop_namespace(rest[0], allow_cross_region, bucket_filter)
     if len(rest) >= 2 and rest[1] == "tables":
         namespace = rest[0]
         table_rest = rest[2:]
@@ -1301,8 +1358,13 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
                                    and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
                     allow_cross_region,
                 ):
-                    return 200, {}, b""
+                    return 204, {}, b""
                 return 404, {}, b""
+            if method == "DELETE":
+                purge = (query_params or {}).get("purgeRequested", "")
+                if isinstance(purge, list):
+                    purge = purge[0] if purge else ""
+                return _iceberg_drop_table(namespace, table_name, purge, allow_cross_region, bucket_filter)
     return None
 
 
