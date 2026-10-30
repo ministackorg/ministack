@@ -1330,6 +1330,7 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         or _parse_lambda_url(host, path) is not None
         or _resolve_custom_domain_request(host, path) is not None
         or _parse_cloudfront_dataplane_host(host) is not None
+        or _resolve_cloudfront_alias_request(host) is not None
         or _is_potential_alb_request(host, path)
     )
     for response in (
@@ -2005,17 +2006,18 @@ def _parse_cloudfront_dataplane_host(host: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def _handle_cloudfront_dataplane_request(
-    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+def _resolve_cloudfront_alias_request(host: str):
+    """The distribution that claims ``host`` as an alternate domain name, or None."""
+    hostname = host.split(":")[0].lower()
+    if not hostname or "." not in hostname:
+        return None
+    return _get_module("cloudfront").find_distribution_for_alias(hostname)
+
+
+async def _serve_cloudfront_distribution(
+    dist, path: str, raw_path: str, raw_query_string: str, method: str,
     headers: dict, body: bytes, query_params: dict, client_ip: str,
 ):
-    """Serve a CloudFront distribution's viewer traffic, matched by Host."""
-    label = _parse_cloudfront_dataplane_host(host)
-    if label is None:
-        return None
-    dist = _get_module("cloudfront").find_distribution_for_label(label)
-    if dist is None:
-        return None
     try:
         return await _get_module("cloudfront").handle_viewer_request(
             dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
@@ -2023,6 +2025,32 @@ async def _handle_cloudfront_dataplane_request(
     except Exception as e:
         logger.exception("Error in CloudFront data-plane dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
+async def _handle_cloudfront_dataplane_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str,
+):
+    """Serve a CloudFront distribution's viewer traffic, matched by its ``<label>.cloudfront.net`` Host."""
+    label = _parse_cloudfront_dataplane_host(host)
+    dist = _get_module("cloudfront").find_distribution_for_label(label) if label is not None else None
+    if dist is None:
+        return None
+    return await _serve_cloudfront_distribution(
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+
+
+async def _handle_cloudfront_alias_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str,
+):
+    """Serve a request whose Host is a distribution's alternate domain name. Runs after every other Host-claiming
+    handler: on AWS DNS sends those hosts to their own service, here the Host is the only signal."""
+    dist = _resolve_cloudfront_alias_request(host)
+    if dist is None:
+        return None
+    return await _serve_cloudfront_distribution(
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
 
 
 async def _handle_execute_api_request(
@@ -2707,7 +2735,11 @@ async def _handle_special_data_plane_request(
     if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string, raw_path):
         # A load balancer passes its target's headers through; CORS and request ids are the application's.
         return response
-    return None
+    # A distribution's alternate domain name yields to every service that claims the Host.
+    return await _handle_cloudfront_alias_request(
+        host, path, raw_path if raw_path is not None else path, raw_query_string, method,
+        headers, body, query_params, client_ip,
+    )
 
 
 # ---------------------------------------------------------------------------
