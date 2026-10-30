@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **S3 Control — account-level public access block** — `PutPublicAccessBlock`, `GetPublicAccessBlock` and `DeletePublicAccessBlock` on `/v20180820/configuration/publicAccessBlock`, which answered `InvalidURI`. The configuration is held per account and region; an unset `GetPublicAccessBlock` answers 404 `NoSuchPublicAccessBlockConfiguration` carrying `<AccountId>` inside `<Error>`, and an unsupported method 405 `MethodNotAllowed` with `ResourceType` `ACCOUNT_PUBLIC_ACCESS_BLOCK`. Responses and errors verified against a real AWS account.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
