@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 Tables — Iceberg REST `createTable` with `"location": null`** — the table kept a `null` `location`, so Trino, which sends `"location": null` for a table without a location property, failed with `Cannot parse to a string value: location: null`; a `null` location is now treated as an absent one and the table gets `s3://<table bucket>/<namespace>/<table>`. Reported by @Wazabit.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added

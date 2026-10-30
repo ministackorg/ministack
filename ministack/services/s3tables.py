@@ -1061,7 +1061,9 @@ def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=Non
     ]
 
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
-    location = data.get("location", f"s3://{bucket_name}/{namespace}/{table_name}")
+    # "location" is optional in CreateTableRequest; clients such as Trino send an
+    # explicit null, which must fall back to the default like an absent key.
+    location = data.get("location") or f"s3://{bucket_name}/{namespace}/{table_name}"
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
     # Honor a format-version from the client's request or properties.
     fmt_ver = data.get("format-version") or data.get("properties", {}).get("format-version")

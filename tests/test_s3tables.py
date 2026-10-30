@@ -944,6 +944,48 @@ def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables)
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
+def test_s3tables_iceberg_create_table_null_location_uses_default(s3tables):
+    """Trino's Iceberg REST connector sends ``"location": null`` when the table has
+    no location property. A null location is an absent one: the table gets the
+    default ``s3://<bucket>/<namespace>/<table>`` instead of a null that clients
+    cannot parse."""
+    bucket_name = f"tb-nullloc-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+
+        created = _iceberg_json(
+            f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
+            method="POST",
+            payload={
+                "name": table,
+                "location": None,
+                "schema": {
+                    "type": "struct", "schema-id": 0,
+                    "fields": [{"id": 1, "name": "a", "required": False, "type": "long"}],
+                },
+            },
+        )
+        expected = f"s3://{bucket_name}/{ns}/{table}"
+        assert created["metadata"]["location"] == expected
+
+        loaded = _iceberg_json(f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["location"] == expected
+        assert s3tables.get_table(tableBucketARN=bucket_arn, namespace=ns, name=table)["warehouseLocation"] == expected
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def test_s3tables_iceberg_add_schema_is_idempotent_by_schema_id(s3tables):
     """A resent add-schema commit for an already-registered schema-id (Spark
     re-declares its current schema on every write) must not append a second
