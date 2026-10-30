@@ -1315,3 +1315,209 @@ def test_ssm_service_setting_matches_botocore_model(service_settings):
     assert _error_code(ssm.get_service_setting, SettingId="/ssm/nope")["Code"] in modelled
     # ValidationException is not modelled for UpdateServiceSetting; observed on AWS (us-east-1, 2026-10-10).
     assert "ValidationException" not in modelled
+
+
+# ── Documents + Automation (wire shapes captured on real AWS, us-east-2) ──
+
+def _unique_name(prefix):
+    return f"{prefix}-{_uuid_mod.uuid4().hex[:10]}"
+
+
+def _err(fn, **kw):
+    try:
+        fn(**kw)
+    except ClientError as e:
+        return e.response["Error"]
+    raise AssertionError("expected ClientError")
+
+
+_SLEEP_DOC = """schemaVersion: '0.3'
+description: test sleep doc
+mainSteps:
+- name: snooze
+  action: aws:sleep
+  inputs:
+    Duration: PT1S
+"""
+
+_PARAM_DOC = """schemaVersion: '0.3'
+description: param doc
+parameters:
+  WaitTime:
+    type: String
+    default: PT1S
+mainSteps:
+- name: snooze
+  action: aws:sleep
+  inputs:
+    Duration: "{{ WaitTime }}"
+"""
+
+
+def test_ssm_document_lifecycle(ssm):
+    import hashlib
+    name = _unique_name("doc")
+    desc = ssm.create_document(Name=name, DocumentType="Automation",
+                               DocumentFormat="YAML", Content=_SLEEP_DOC)["DocumentDescription"]
+    assert desc["Hash"] == hashlib.sha256(_SLEEP_DOC.encode()).hexdigest()
+    assert desc["HashType"] == "Sha256"
+    assert desc["Status"] == "Creating"
+    assert desc["PlatformTypes"] == ["Windows", "Linux", "MacOS"]
+    assert desc["LatestVersion"] == "1" and desc["DefaultVersion"] == "1"
+    assert desc["Description"] == "test sleep doc"
+    assert desc["Owner"]
+    captured = []
+    handler = lambda **kw: captured.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.DescribeDocument", handler)
+    try:
+        full = ssm.describe_document(Name=name)["Document"]
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.DescribeDocument", handler)
+    # DocumentId is on the wire but not in the botocore DocumentDescription shape.
+    assert captured[0]["Document"]["DocumentId"]
+    assert full["Category"] == [] and full["CategoryEnum"] == []
+    getd = []
+    handler2 = lambda **kw: getd.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.GetDocument", handler2)
+    try:
+        got = ssm.get_document(Name=name, DocumentFormat="YAML")
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.GetDocument", handler2)
+    assert got["Content"] == _SLEEP_DOC and got["DocumentFormat"] == "YAML"
+    assert getd[0]["AllowInvalidContent"] is False
+    got_json = ssm.get_document(Name=name)
+    assert got_json["DocumentFormat"] == "JSON"
+    assert json.loads(got_json["Content"])["schemaVersion"] == "0.3"
+    listed = ssm.list_documents(Filters=[{"Key": "Owner", "Values": ["Self"]}])["DocumentIdentifiers"]
+    assert any(d["Name"] == name for d in listed)
+    ssm.delete_document(Name=name)
+    assert _err(ssm.describe_document, Name=name)["Code"] == "InvalidDocument"
+
+
+def test_ssm_document_timestamps_are_epoch_on_the_wire(ssm):
+    name = _unique_name("doc-ts")
+    captured = []
+    handler = lambda **kw: captured.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.DescribeDocument", handler)
+    try:
+        ssm.create_document(Name=name, DocumentType="Automation",
+                            DocumentFormat="YAML", Content=_SLEEP_DOC)
+        ssm.describe_document(Name=name)
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.DescribeDocument", handler)
+        ssm.delete_document(Name=name)
+    created = captured[0]["Document"]["CreatedDate"]
+    assert isinstance(created, (int, float)) and not isinstance(created, bool)
+
+
+def test_ssm_document_errors(ssm):
+    name = _unique_name("err")
+    e = _err(ssm.describe_document, Name=name)
+    assert e["Code"] == "InvalidDocument" and "does not exist" in e["Message"]
+    e = _err(ssm.delete_document, Name=name)
+    assert e["Code"] == "InvalidDocument" and "does not exist in your account" in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="BogusType",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "ValidationException"
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", Content=_SLEEP_DOC)
+    assert e["Code"] == "InvalidDocumentContent" and "JSON not well-formed" in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", DocumentFormat="YAML",
+             Content="schemaVersion: '0.3'\nmainSteps: []\n")
+    assert e["Code"] == "InvalidDocumentContent" and 'Missing steps in "mainSteps"' in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", DocumentFormat="YAML",
+             Content="schemaVersion: '0.3'\nmainSteps:\n- name: s\n  action: aws:notARealAction\n")
+    assert e["Code"] == "InvalidDocumentContent" and "Unknown action" in e["Message"]
+    e = _err(ssm.create_document, Name="AWS-Reserved", DocumentType="Automation",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "ValidationException" and "Invalid document name" in e["Message"]
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_SLEEP_DOC)
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "DocumentAlreadyExists" and "with same name" in e["Message"]
+    e = _err(ssm.get_document, Name=name, DocumentVersion="99")
+    assert e["Code"] == "InvalidDocumentVersion" and "latest version is 1" in e["Message"]
+    ssm.delete_document(Name=name)
+
+
+def _wait_terminal(ssm, eid, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        d = ssm.get_automation_execution(AutomationExecutionId=eid)["AutomationExecution"]
+        if d["AutomationExecutionStatus"] not in ("Pending", "InProgress"):
+            return d
+        time.sleep(0.4)
+    return d
+
+
+def test_ssm_automation_sleep_success(ssm):
+    name = _unique_name("auto")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_SLEEP_DOC)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Success"
+    assert d["DocumentVersion"] == "1"
+    assert d["ExecutedBy"]
+    assert d["ResolvedTargets"] == {"ParameterValues": [], "Truncated": False}
+    assert "ExecutionEndTime" in d and "CurrentStepName" not in d
+    st = d["StepExecutions"][0]
+    assert st["StepName"] == "snooze" and st["Action"] == "aws:sleep"
+    assert st["StepStatus"] == "Success" and st["StepExecutionId"] != eid
+    assert st["Inputs"]["Duration"] == '"PT1S"'
+    meta = ssm.describe_automation_executions(
+        Filters=[{"Key": "ExecutionId", "Values": [eid]}])["AutomationExecutionMetadataList"]
+    assert len(meta) == 1 and meta[0]["AutomationType"] == "Local"
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_param_resolution(ssm):
+    name = _unique_name("auto-param")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_PARAM_DOC)
+    e = _err(ssm.start_automation_execution, DocumentName=name,
+             Parameters={"Undeclared": ["x"]})
+    assert e["Code"] == "InvalidAutomationExecutionParametersException"
+    assert "Undefined execution inputs" in e["Message"]
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Success"
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_cancel_and_errors(ssm):
+    name = _unique_name("auto-stop")
+    doc = _SLEEP_DOC.replace("PT1S", "PT60S")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    time.sleep(0.5)
+    ssm.stop_automation_execution(AutomationExecutionId=eid)
+    d = ssm.get_automation_execution(AutomationExecutionId=eid)["AutomationExecution"]
+    assert d["AutomationExecutionStatus"] == "Cancelled"
+    assert d["StepExecutions"][0]["StepStatus"] == "Cancelled"
+    e = _err(ssm.start_automation_execution, DocumentName="no-such-doc")
+    assert e["Code"] == "AutomationDefinitionNotFoundException"
+    assert "expected valid document in account" in e["Message"]
+    e = _err(ssm.get_automation_execution, AutomationExecutionId="00000000-0000-0000-0000-000000000000")
+    assert e["Code"] == "AutomationExecutionNotFoundException"
+    assert "does not exist" in e["Message"]
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_unemulated_step_fails(ssm):
+    name = _unique_name("auto-fail")
+    doc = """schemaVersion: '0.3'
+description: calls a missing parameter
+mainSteps:
+- name: read
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: GetParameter
+    Name: /definitely/missing
+"""
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Failed"
+    assert "ParameterNotFound" in d["FailureMessage"]
+    st = d["StepExecutions"][0]
+    assert st["StepStatus"] == "Failed" and st["FailureDetails"]["FailureStage"] == "Invocation"
+    ssm.delete_document(Name=name)

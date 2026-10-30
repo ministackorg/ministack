@@ -8,15 +8,29 @@ Supports: PutParameter, GetParameter, GetParameters, GetParametersByPath,
           GetParameterHistory, LabelParameterVersion,
           AddTagsToResource, RemoveTagsFromResource, ListTagsForResource,
           SendCommand, GetCommandInvocation, ListCommands,
-          DescribeInstanceInformation.
+          DescribeInstanceInformation,
+          CreateDocument, DeleteDocument, DescribeDocument, GetDocument,
+          ListDocuments,
+          StartAutomationExecution, GetAutomationExecution,
+          DescribeAutomationExecutions, StopAutomationExecution.
+
+Automation executions run the document's steps on a background thread:
+aws:sleep waits its real duration and aws:executeAwsApi/aws:runCommand
+dispatch into the emulated service; a step whose action MiniStack cannot
+execute fails the execution rather than reporting a fabricated Success.
 """
 
 import base64
 import copy
+import hashlib
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime, timezone
+
+import yaml
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import spawn_background
@@ -42,6 +56,8 @@ _parameter_history = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _commands = AccountRegionScopedDict()
 _service_settings = AccountRegionScopedDict()
+_documents = AccountRegionScopedDict()
+_automation_executions = AccountRegionScopedDict()
 
 # The botocore model's SettingIds with the (value, LastModifiedDate) AWS reports before any update.
 _SERVICE_SETTING_DEFAULTS = {
@@ -77,6 +93,8 @@ def get_state():
         "tags": copy.deepcopy(_tags),
         "commands": copy.deepcopy(_commands),
         "service_settings": copy.deepcopy(_service_settings),
+        "documents": copy.deepcopy(_documents),
+        "automation_executions": copy.deepcopy(_automation_executions),
     }
 
 
@@ -134,6 +152,8 @@ def _restore_state(data):
         _tags.update(data.get("tags", {}))
         _commands.update(data.get("commands", {}))
         _service_settings.update(data.get("service_settings", {}))
+        _documents.update(data.get("documents", {}))
+        _automation_executions.update(data.get("automation_executions", {}))
 
 
 def _now_iso() -> str:
@@ -279,6 +299,15 @@ async def handle_request(method, path, headers, body, query_params):
         "GetServiceSetting": _get_service_setting,
         "UpdateServiceSetting": lambda d: _update_service_setting(d, request_caller_arn(headers, query_params)),
         "ResetServiceSetting": _reset_service_setting,
+        "CreateDocument": _create_document,
+        "DeleteDocument": _delete_document,
+        "DescribeDocument": _describe_document,
+        "GetDocument": _get_document,
+        "ListDocuments": _list_documents,
+        "StartAutomationExecution": lambda d: _start_automation_execution(d, request_caller_arn(headers, query_params)),
+        "GetAutomationExecution": _get_automation_execution,
+        "DescribeAutomationExecutions": _describe_automation_executions,
+        "StopAutomationExecution": _stop_automation_execution,
     }
 
     handler = handlers.get(action)
@@ -1181,9 +1210,551 @@ def _reset_service_setting(data):
     return json_response({"ServiceSetting": _service_setting_out(setting_id)})
 
 
+# ── Documents ─────────────────────────────────────────────
+
+_DOCUMENT_TYPES = {
+    "Command", "Policy", "Automation", "Session", "Package",
+    "ApplicationConfiguration", "ApplicationConfigurationSchema",
+    "DeploymentStrategy", "ChangeCalendar", "Automation.ChangeTemplate",
+    "ProblemAnalysis", "ProblemAnalysisTemplate", "CloudFormation",
+    "ConformancePackTemplate", "QuickSetup",
+}
+
+_AUTOMATION_STEP_ACTIONS = {
+    "aws:approve", "aws:assertAwsResourceProperty", "aws:branch",
+    "aws:changeInstanceState", "aws:copyImage", "aws:createImage",
+    "aws:createStack", "aws:createTags", "aws:deleteImage", "aws:deleteStack",
+    "aws:executeAutomation", "aws:executeAwsApi", "aws:executeScript",
+    "aws:executeStateMachine", "aws:invokeLambdaFunction", "aws:invokeWebhook",
+    "aws:pause", "aws:runCommand", "aws:runInstances", "aws:sleep",
+    "aws:updateServiceSetting", "aws:waitForAwsResourceProperty",
+}
+
+_PARAM_FIELD_OUT = {
+    "name": "Name", "type": "Type", "description": "Description",
+    "default": "DefaultValue", "allowedValues": "AllowedValues",
+    "allowedPattern": "AllowedPattern", "displayType": "DisplayType",
+}
+
+_PARAM_REF = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
+
+
+def _parse_document_content(content, fmt):
+    if fmt == "JSON":
+        try:
+            return json.loads(content), None
+        except json.JSONDecodeError as e:
+            return None, error_response_json(
+                "InvalidDocumentContent",
+                f"JSON not well-formed. at Line: {e.lineno}, Column: {e.colno}", 400)
+    try:
+        return yaml.safe_load(content), None
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        line = mark.line + 1 if mark else 1
+        col = mark.column + 1 if mark else 1
+        return None, error_response_json(
+            "InvalidDocumentContent",
+            f"YAML not well-formed. at Line: {line}, Column: {col}", 400)
+
+
+def _canonical_json(value, depth=1):
+    """JSON in the pretty layout AWS serves in GetDocument Content."""
+    if isinstance(value, dict):
+        if not value:
+            return "{ }"
+        inner = ",\n".join(
+            f'{"  " * depth}{json.dumps(k)} : {_canonical_json(v, depth + 1)}'
+            for k, v in value.items())
+        return "{\n" + inner + "\n" + "  " * (depth - 1) + "}"
+    if isinstance(value, list):
+        if not value:
+            return "[ ]"
+        return "[ " + ", ".join(_canonical_json(v, depth) for v in value) + " ]"
+    return json.dumps(value)
+
+
+def _document_description(doc, for_describe=False):
+    desc = {
+        "Hash": doc["Hash"],
+        "HashType": "Sha256",
+        "Name": doc["Name"],
+        "Owner": doc["Owner"],
+        "CreatedDate": doc["CreatedDate"],
+        "Status": doc["Status"],
+        "DocumentVersion": doc["DocumentVersion"],
+        "PlatformTypes": doc["PlatformTypes"],
+        "DocumentType": doc["DocumentType"],
+        "SchemaVersion": doc["SchemaVersion"],
+        "LatestVersion": doc["DocumentVersion"],
+        "DefaultVersion": doc["DocumentVersion"],
+        "DocumentFormat": doc["DocumentFormat"],
+        "Tags": doc["Tags"],
+    }
+    if doc.get("Description"):
+        desc["Description"] = doc["Description"]
+    if doc.get("Parameters"):
+        desc["Parameters"] = doc["Parameters"]
+    if doc.get("AssumeRole"):
+        desc["AssumeRole"] = doc["AssumeRole"]
+    if for_describe:
+        desc["DocumentId"] = doc["DocumentId"]
+        desc["Category"] = []
+        desc["CategoryEnum"] = []
+    return desc
+
+
+def _doc_missing(name):
+    return error_response_json(
+        "InvalidDocument", f"Document with name {name} does not exist.", 400)
+
+
+def _activate_document(name):
+    time.sleep(1.5)
+    doc = _documents.get(name)
+    if doc and doc["Status"] == "Creating":
+        doc["Status"] = "Active"
+
+
+def _create_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    if name.lower().startswith("aws-"):
+        return error_response_json(
+            "ValidationException", f"Invalid document name {name}", 400)
+    content = data.get("Content")
+    if not content:
+        return error_response_json("ValidationException", "Content is required", 400)
+    doc_type = data.get("DocumentType", "Command")
+    if doc_type not in _DOCUMENT_TYPES:
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'documentType' failed to satisfy "
+            "constraint: Member is not a valid documentType", 400)
+    fmt = data.get("DocumentFormat", "JSON")
+    parsed, err = _parse_document_content(content, fmt)
+    if err:
+        return err
+    parsed = parsed if isinstance(parsed, dict) else {}
+    parsed = json.loads(json.dumps(parsed, default=str))
+    if doc_type == "Automation":
+        steps = parsed.get("mainSteps")
+        if not steps:
+            return error_response_json(
+                "InvalidDocumentContent", 'Missing steps in "mainSteps".', 400)
+        for step in steps:
+            action = step.get("action", "") if isinstance(step, dict) else ""
+            if action not in _AUTOMATION_STEP_ACTIONS:
+                return error_response_json(
+                    "InvalidDocumentContent", f"Unknown action: {action}", 400)
+    if _documents.get(name) is not None:
+        return error_response_json(
+            "DocumentAlreadyExists",
+            f"Document with same name {name} already exists", 400)
+    parameters = [
+        {"Name": pname, **{_PARAM_FIELD_OUT[k]: v for k, v in p.items() if k in _PARAM_FIELD_OUT}}
+        for pname, p in (parsed.get("parameters") or {}).items()
+        if isinstance(p, dict)
+    ]
+    doc = {
+        "Name": name,
+        "Content": content,
+        "ParsedContent": parsed,
+        "DocumentType": doc_type,
+        "DocumentFormat": fmt,
+        "DocumentVersion": "1",
+        "Status": "Creating",
+        "CreatedDate": _now_epoch(),
+        "Owner": get_account_id(),
+        "Hash": hashlib.sha256(content.encode()).hexdigest(),
+        "DocumentId": new_uuid(),
+        "Description": parsed.get("description", ""),
+        "SchemaVersion": str(parsed.get("schemaVersion", "0.3")),
+        "Parameters": parameters,
+        "PlatformTypes": parsed.get("platformTypes") or ["Windows", "Linux", "MacOS"],
+        "AssumeRole": parsed.get("assumeRole", ""),
+        "Tags": data.get("Tags", []),
+    }
+    _documents[name] = doc
+    spawn_background(_activate_document, name)
+    return json_response({"DocumentDescription": _document_description(doc)})
+
+
+def _delete_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    if _documents.pop(name, None) is None:
+        return error_response_json(
+            "InvalidDocument", f"Document {name} does not exist in your account", 400)
+    return json_response({})
+
+
+def _describe_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    doc = _documents.get(name)
+    if doc is None:
+        return _doc_missing(name)
+    return json_response({"Document": _document_description(doc, for_describe=True)})
+
+
+def _get_document(data):
+    name = data.get("Name")
+    if not name:
+        return error_response_json("ValidationException", "Name is required", 400)
+    doc = _documents.get(name)
+    if doc is None:
+        return _doc_missing(name)
+    version = data.get("DocumentVersion")
+    if version and version != doc["DocumentVersion"]:
+        return error_response_json(
+            "InvalidDocumentVersion",
+            f"Document version: {version} is invalid, latest version is "
+            f"{doc['DocumentVersion']}", 400)
+    fmt = data.get("DocumentFormat", "JSON")
+    if fmt not in ("YAML", "JSON", "TEXT"):
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'documentFormat' failed to "
+            "satisfy constraint: Member must satisfy enum value set: "
+            "[YAML, JSON, TEXT]", 400)
+    return json_response({
+        "AllowInvalidContent": False,
+        "Content": doc["Content"] if fmt in ("YAML", "TEXT")
+                   else _canonical_json(doc["ParsedContent"]),
+        "CreatedDate": doc["CreatedDate"],
+        "DocumentFormat": fmt,
+        "DocumentType": doc["DocumentType"],
+        "DocumentVersion": doc["DocumentVersion"],
+        "Name": name,
+        "Status": doc["Status"],
+    })
+
+
+def _list_documents(data):
+    names = None
+    owner_self = True
+    filters = list(data.get("Filters", []))
+    filters += [{"Key": f.get("Key"), "Values": [f.get("Value")]}
+                for f in data.get("DocumentFilterList", [])]
+    for flt in filters:
+        if flt.get("Key") == "Name":
+            names = set(flt.get("Values", []))
+        elif flt.get("Key") == "Owner":
+            owner_self = "Self" in flt.get("Values", [])
+    items = [
+        {
+            "Name": d["Name"],
+            "Owner": d["Owner"],
+            "DocumentVersion": d["DocumentVersion"],
+            "DocumentType": d["DocumentType"],
+            "SchemaVersion": d["SchemaVersion"],
+            "DocumentFormat": d["DocumentFormat"],
+            "PlatformTypes": d["PlatformTypes"],
+            "CreatedDate": d["CreatedDate"],
+            "Tags": d["Tags"],
+        }
+        for d in _documents.values()
+        if owner_self and (names is None or d["Name"] in names)
+    ]
+    return json_response({"DocumentIdentifiers": items})
+
+
+# ── Automation executions ─────────────────────────────────
+
+# Ops an aws:executeAwsApi step may dispatch to, keyed by model Api name.
+_AUTOMATION_SSM_APIS = {
+    "GetParameter": _get_parameter,
+    "GetParameters": _get_parameters,
+    "GetParametersByPath": _get_parameters_by_path,
+    "PutParameter": _put_parameter,
+    "DeleteParameter": _delete_parameter,
+    "GetServiceSetting": _get_service_setting,
+}
+
+_ISO8601_DURATION = re.compile(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$")
+
+
+def _step_failure_message(inner):
+    return (f"Step fails when it is Execute/Cancelling action. {inner}. "
+            "Please refer to Automation Service Troubleshooting Guide for "
+            "more diagnosis details.")
+
+
+def _sleep_seconds(duration):
+    m = _ISO8601_DURATION.match(duration or "")
+    if not m:
+        return 0.0
+    hours, minutes, seconds = m.groups()
+    return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds or 0)
+
+
+def _execute_step(step, record):
+    action = step["Action"]
+    inputs = {k: json.loads(v) for k, v in step["Inputs"].items()}
+    if action == "aws:sleep":
+        time.sleep(_sleep_seconds(inputs.get("Duration")))
+        return None
+    if action == "aws:executeAwsApi":
+        if inputs.get("Service") != "ssm":
+            return "aws:executeAwsApi is emulated for Service ssm only"
+        api = inputs.get("Api", "")
+        fn = _AUTOMATION_SSM_APIS.get(api)
+        if fn is None:
+            return f"MiniStack does not emulate ssm:{api} in aws:executeAwsApi"
+        status, _headers, body = fn(
+            {k: v for k, v in inputs.items() if k not in ("Service", "Api")})
+        payload = json.loads(body)
+        if status >= 400 or "__type" in payload:
+            return (f"An error occurred ({payload.get('__type')}) when calling "
+                    f"the {api} operation: {payload.get('message', '')}")
+        return None
+    if action == "aws:runCommand":
+        status, _headers, body = _send_command({
+            "DocumentName": inputs.get("DocumentName", "AWS-RunShellScript"),
+            "InstanceIds": inputs.get("InstanceIds", []),
+            "Parameters": inputs.get("Parameters", {}),
+        })
+        payload = json.loads(body)
+        if status >= 400 or "__type" in payload:
+            return (f"An error occurred ({payload.get('__type')}) when calling "
+                    f"the SendCommand operation: {payload.get('message', '')}")
+        command = _commands.get(payload["Command"]["CommandId"])
+        while (command and command["Status"] in ("Pending", "InProgress")
+               and record["Status"] == "InProgress"):
+            time.sleep(0.2)
+            _refresh_command_status(command)
+        if command and command["Status"] != "Success" and record["Status"] == "InProgress":
+            return (f"Command {command['CommandId']} finished with status "
+                    f"{command['Status']}")
+        return None
+    return f"{action} is not emulated"
+
+
+def _run_automation(execution_id):
+    record = _automation_executions.get(execution_id)
+    if record is None:
+        return
+    record["Status"] = "InProgress"
+    failure = None
+    for step in record["StepExecutions"]:
+        if record["Status"] != "InProgress":
+            break
+        step["StepStatus"] = "InProgress"
+        step["Inputs"] = step.pop("PendingInputs", {})
+        step["Outputs"] = {}
+        step["ExecutionStartTime"] = _now_epoch()
+        if step["Action"] in ("aws:executeAwsApi", "aws:runCommand"):
+            step["ThrottlingDetected"] = False
+        record["CurrentStepName"] = step["StepName"]
+        record["CurrentAction"] = step["Action"]
+        failure = _execute_step(step, record)
+        step["ExecutionEndTime"] = _now_epoch()
+        if record["Status"] != "InProgress":
+            step["StepStatus"] = "Cancelled"
+            break
+        if failure:
+            step["StepStatus"] = "Failed"
+            step["FailureMessage"] = _step_failure_message(failure)
+            step["FailureDetails"] = {
+                "FailureStage": "Invocation",
+                "FailureType": "Verification",
+                "Details": {"VerificationErrorMessage": [failure]},
+            }
+            break
+        step["StepStatus"] = "Success"
+        failure = None
+    record.pop("CurrentStepName", None)
+    record.pop("CurrentAction", None)
+    if record["Status"] == "InProgress":
+        record["ExecutionEndTime"] = _now_epoch()
+        if failure:
+            record["Status"] = "Failed"
+            record["FailureMessage"] = _step_failure_message(failure)
+        else:
+            record["Status"] = "Success"
+
+
+def _step_out(step):
+    return {k: v for k, v in step.items() if k != "PendingInputs"}
+
+
+def _automation_execution_out(record):
+    out = {
+        "AutomationExecutionId": record["AutomationExecutionId"],
+        "AutomationExecutionStatus": record["Status"],
+        "DocumentName": record["DocumentName"],
+        "DocumentVersion": record["DocumentVersion"],
+        "ExecutedBy": record["ExecutedBy"],
+        "ExecutionStartTime": record["ExecutionStartTime"],
+        "Mode": record["Mode"],
+        "Outputs": {},
+        "Parameters": record["Parameters"],
+        "ResolvedTargets": {"ParameterValues": [], "Truncated": False},
+        "StepExecutions": [_step_out(s) for s in record["StepExecutions"]],
+        "StepExecutionsTruncated": False,
+        "Targets": record["Targets"],
+    }
+    if record["Status"] == "InProgress":
+        out["CurrentAction"] = record.get("CurrentAction", "")
+        out["CurrentStepName"] = record.get("CurrentStepName", "")
+    if record.get("ExecutionEndTime") is not None:
+        out["ExecutionEndTime"] = record["ExecutionEndTime"]
+    if record.get("FailureMessage"):
+        out["FailureMessage"] = record["FailureMessage"]
+    return out
+
+
+def _render_param_refs(value, resolved):
+    if isinstance(value, str):
+        return _PARAM_REF.sub(
+            lambda m: str(resolved.get(m.group(1), m.group(0))), value)
+    if isinstance(value, list):
+        return [_render_param_refs(v, resolved) for v in value]
+    if isinstance(value, dict):
+        return {k: _render_param_refs(v, resolved) for k, v in value.items()}
+    return value
+
+
+def _start_automation_execution(data, caller):
+    doc_name = data.get("DocumentName") or ""
+    if not doc_name:
+        return error_response_json("ValidationException", "DocumentName is required", 400)
+    doc = _documents.get(doc_name)
+    if doc is None:
+        return error_response_json(
+            "AutomationDefinitionNotFoundException",
+            "Invalid input for field document name, expected valid document "
+            "in account.", 400)
+    declared = {p["Name"]: p for p in doc.get("Parameters", [])}
+    passed = data.get("Parameters") or {}
+    unknown = sorted(set(passed) - set(declared))
+    if unknown:
+        return error_response_json(
+            "InvalidAutomationExecutionParametersException",
+            f"Undefined execution inputs: [{', '.join(unknown)}].", 400)
+    resolved = {}
+    for pname, pdef in declared.items():
+        if pname in passed:
+            v = passed[pname]
+            resolved[pname] = v[0] if isinstance(v, list) and len(v) == 1 else v
+        elif "DefaultValue" in pdef:
+            resolved[pname] = pdef["DefaultValue"]
+    steps = [
+        {
+            "StepName": s.get("name", ""),
+            "Action": s.get("action", ""),
+            "StepExecutionId": new_uuid(),
+            "StepStatus": "Pending",
+            "Inputs": {},
+            "PendingInputs": {
+                k: json.dumps(_render_param_refs(v, resolved))
+                for k, v in (s.get("inputs") or {}).items()
+            },
+            "IsStepBlocked": False,
+            "OverriddenParameters": {},
+        }
+        for s in (doc["ParsedContent"].get("mainSteps") or [])
+        if isinstance(s, dict)
+    ]
+    execution_id = new_uuid()
+    _automation_executions[execution_id] = {
+        "AutomationExecutionId": execution_id,
+        "DocumentName": doc_name,
+        "DocumentVersion": doc["DocumentVersion"],
+        "Status": "Pending",
+        "ExecutionStartTime": _now_epoch(),
+        "ExecutedBy": caller,
+        "Parameters": passed,
+        "Mode": data.get("Mode", "Auto"),
+        "Targets": data.get("Targets", []),
+        "StepExecutions": steps,
+    }
+    spawn_background(_run_automation, execution_id)
+    return json_response({"AutomationExecutionId": execution_id})
+
+
+def _get_automation_execution(data):
+    execution_id = data.get("AutomationExecutionId") or ""
+    if not execution_id:
+        return error_response_json(
+            "ValidationException", "AutomationExecutionId is required", 400)
+    record = _automation_executions.get(execution_id)
+    if record is None:
+        return error_response_json(
+            "AutomationExecutionNotFoundException",
+            "The input automation execution does not exist.", 400)
+    return json_response({"AutomationExecution": _automation_execution_out(record)})
+
+
+def _describe_automation_executions(data):
+    exec_ids = statuses = name_prefix = None
+    for flt in data.get("Filters", []):
+        key, values = flt.get("Key"), flt.get("Values", [])
+        if key == "ExecutionId":
+            exec_ids = set(values)
+        elif key == "ExecutionStatus":
+            statuses = set(values)
+        elif key == "DocumentNamePrefix":
+            name_prefix = values[0] if values else ""
+    items = []
+    for r in _automation_executions.values():
+        if exec_ids is not None and r["AutomationExecutionId"] not in exec_ids:
+            continue
+        if statuses is not None and r["Status"] not in statuses:
+            continue
+        if name_prefix is not None and not r["DocumentName"].startswith(name_prefix):
+            continue
+        meta = {
+            "AutomationExecutionId": r["AutomationExecutionId"],
+            "AutomationExecutionStatus": r["Status"],
+            "AutomationType": "Local",
+            "DocumentName": r["DocumentName"],
+            "DocumentVersion": r["DocumentVersion"],
+            "ExecutedBy": r["ExecutedBy"],
+            "ExecutionStartTime": r["ExecutionStartTime"],
+            "LogFile": "",
+            "Mode": r["Mode"],
+            "Outputs": {},
+            "ResolvedTargets": {"ParameterValues": [], "Truncated": False},
+            "Targets": r["Targets"],
+        }
+        if r.get("ExecutionEndTime") is not None:
+            meta["ExecutionEndTime"] = r["ExecutionEndTime"]
+        if r.get("FailureMessage"):
+            meta["FailureMessage"] = r["FailureMessage"]
+        items.append(meta)
+    return json_response({"AutomationExecutionMetadataList": items})
+
+
+def _stop_automation_execution(data):
+    execution_id = data.get("AutomationExecutionId") or ""
+    if not execution_id:
+        return error_response_json(
+            "ValidationException", "AutomationExecutionId is required", 400)
+    record = _automation_executions.get(execution_id)
+    if record is None:
+        return error_response_json(
+            "AutomationExecutionNotFoundException",
+            "The input automation execution does not exist.", 400)
+    if record["Status"] in ("Pending", "InProgress"):
+        record["Status"] = "Cancelled"
+        record["ExecutionEndTime"] = _now_epoch()
+        for step in record["StepExecutions"]:
+            if step["StepStatus"] == "InProgress":
+                step["StepStatus"] = "Cancelled"
+                step["ExecutionEndTime"] = _now_epoch()
+    return json_response({})
+
+
 def reset():
     _service_settings.clear()
     _parameters.clear()
     _parameter_history.clear()
     _tags.clear()
     _commands.clear()
+    _documents.clear()
+    _automation_executions.clear()
