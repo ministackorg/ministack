@@ -1570,6 +1570,8 @@ def test_eventbridge_put_events_rejects_bad_bus_arn_without_local_fallback(eb, s
 
 
 def test_eventbridge_put_events_rejects_foreign_region_bus_arn_without_local_fallback(eb, sqs):
+    """A bus ARN in another region fails the whole request (capture E2: 400 ValidationException
+    "Cross-region api call is not allowed."), and nothing reaches the local bus of the same name."""
     bus_name = f"qa-eb-region-bus-{_uuid_mod.uuid4().hex[:8]}"
     eb.create_event_bus(Name=bus_name)
     q_url = sqs.create_queue(QueueName=f"qa-eb-region-bus-q-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
@@ -1586,19 +1588,20 @@ def test_eventbridge_put_events_rejects_foreign_region_bus_arn_without_local_fal
         Targets=[{"Id": "t1", "Arn": q_arn}],
     )
 
-    response = eb.put_events(
-        Entries=[
-            {
-                "Source": "myapp",
-                "DetailType": "test",
-                "Detail": json.dumps({"key": "value"}),
-                "EventBusName": f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}",
-            }
-        ]
-    )
+    with pytest.raises(ClientError) as exc:
+        eb.put_events(
+            Entries=[
+                {
+                    "Source": "myapp",
+                    "DetailType": "test",
+                    "Detail": json.dumps({"key": "value"}),
+                    "EventBusName": f"arn:aws:events:us-west-2:000000000000:event-bus/{bus_name}",
+                }
+            ]
+        )
 
-    assert response["FailedEntryCount"] == 1
-    assert response["Entries"][0]["ErrorCode"] == "ResourceNotFoundException"
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"] == "Cross-region api call is not allowed."
     msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
     assert msgs.get("Messages", []) == []
 

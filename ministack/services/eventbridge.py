@@ -979,6 +979,17 @@ def _resolve_taggable_events_arn(arn):
     return arn, None
 
 
+def _event_bus_in_other_region(ref):
+    """Whether ``ref`` is an event bus ARN naming a region other than the request's."""
+    if not isinstance(ref, str) or not ref.startswith("arn:"):
+        return False
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return False
+    return spec.service == "events" and spec.resource.startswith("event-bus/") and spec.region != get_region()
+
+
 def _foreign_event_bus(ref):
     """``(owner account, bus name)`` when ``ref`` is the ARN of an event bus
     another account owns in this region, else None. PutEvents delivers to it."""
@@ -1126,6 +1137,9 @@ def _put_events(data, allow_aws_source=False):
             "Member must have length less than or equal to 10" % len(entries),
             400,
         )
+    if any(_event_bus_in_other_region(entry.get("EventBusName")) for entry in entries):
+        # Captured on AWS: a bus ARN in another region fails the whole request.
+        return error_response_json("ValidationException", "Cross-region api call is not allowed.", 400)
     denial = _foreign_bus_denial(entries)
     if denial:
         return denial
