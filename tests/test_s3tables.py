@@ -1185,44 +1185,72 @@ def _arn_prefix(arn):
 
 
 def test_s3tables_iceberg_rest_drops_tables_and_namespaces(s3tables):
-    """#2502, recorded on AWS (us-east-1): dropTable needs purgeRequested=true, dropNamespace needs an
-    empty namespace, and HEAD answers 204."""
+    """#2502, recorded on AWS (us-east-1, an Organizations member account): dropTable needs
+    purgeRequested=true, dropNamespace needs an empty namespace, and both answer 204, as HEAD does."""
     arn = s3tables.create_table_bucket(name=f"drop-{_uuid_mod.uuid4().hex[:8]}")["arn"]
     base = f"/iceberg/v1/{_arn_prefix(arn)}/namespaces"
     schema = {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "long", "required": False}]}
 
-    def head(path):
+    def call(method, path):
         try:
-            with urllib.request.urlopen(urllib.request.Request(f"{_ENDPOINT}{path}", method="HEAD")) as resp:
-                return resp.status
+            with urllib.request.urlopen(urllib.request.Request(f"{_ENDPOINT}{path}", method=method)) as resp:
+                return resp.status, json.loads(resp.read() or b"null")
         except urllib.error.HTTPError as exc:
-            return exc.code
+            return exc.code, json.loads(exc.read() or b"null")
 
     def error(status, kind, message):
         return status, {"error": {"code": status, "message": message, "type": kind}}
 
+    no_table = error(404, "no_such_table", "The specified table does not exist.")
+    no_namespace = error(404, "no_such_namespace", "The specified namespace does not exist.")
+    purge_required = error(
+        400, "purge_enabled", "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.")
     try:
         assert _iceberg_call(base, "POST", {"namespace": ["ns"]})[0] == 200
         assert _iceberg_call(f"{base}/ns/tables", "POST", {"name": "t", "schema": schema})[0] == 200
-        assert (head(f"{base}/ns"), head(f"{base}/nope"), head(f"{base}/ns/tables/t")) == (204, 404, 204)
-        assert _iceberg_call(f"{base}/ns", "DELETE") == error(
+        assert [call("HEAD", f"{base}/{path}")[0] for path in ("ns", "nope", "ns/tables/t")] == [204, 404, 204]
+        assert call("DELETE", f"{base}/ns") == error(
             400, "namespace_not_empty", "The namespace that you tried to delete is not empty.")
-        purge_required = error(
-            400, "purge_enabled", "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.")
-        for query in ("", "?purgeRequested=false"):
-            assert _iceberg_call(f"{base}/ns/tables/t{query}", "DELETE") == purge_required
-        assert _iceberg_call(f"{base}/ns/tables/absent", "DELETE") == purge_required
-        assert _iceberg_call(f"{base}/ns/tables/t?purgeRequested=true", "DELETE") == (200, {})
-        assert head(f"{base}/ns/tables/t") == 404
-        assert _iceberg_call(f"{base}/ns/tables/t?purgeRequested=true", "DELETE") == error(
-            404, "no_such_table", "The specified table does not exist.")
-        assert _iceberg_call(f"{base}/nope/tables/t?purgeRequested=true", "DELETE") == error(
-            404, "no_such_namespace", "The specified namespace does not exist.")
-        assert _iceberg_call(f"{base}/ns", "DELETE") == (200, {})
-        assert _iceberg_call(f"{base}/ns", "DELETE") == error(
-            404, "no_such_namespace", "The specified namespace does not exist.")
+        for path in ("ns/tables/t", "ns/tables/t?purgeRequested=false", "ns/tables/absent"):
+            assert call("DELETE", f"{base}/{path}") == purge_required
+        assert call("DELETE", f"{base}/ns/tables/t?purgeRequested=true") == (204, None)
+        assert call("HEAD", f"{base}/ns/tables/t")[0] == 404
+        assert call("DELETE", f"{base}/ns/tables/t?purgeRequested=true") == no_table
+        assert call("DELETE", f"{base}/nope/tables/t?purgeRequested=true") == no_namespace
+        assert call("DELETE", f"{base}/ns") == (204, None)
+        assert call("DELETE", f"{base}/ns") == no_namespace
     finally:
         s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_s3tables_iceberg_rest_recreated_table_starts_empty(s3tables):
+    """Recorded on AWS (us-east-1): after a purge drop, a table created under the same name has a new
+    table-uuid and metadata location and none of the old table's properties."""
+    arn = s3tables.create_table_bucket(name=f"recreate-{_uuid_mod.uuid4().hex[:8]}")["arn"]
+    base = f"/iceberg/v1/{_arn_prefix(arn)}/namespaces"
+    schema = {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "long", "required": False}]}
+    try:
+        _iceberg_call(base, "POST", {"namespace": ["ns"]})
+        _iceberg_call(f"{base}/ns/tables", "POST", {"name": "r", "schema": schema})
+        assert _iceberg_call(f"{base}/ns/tables/r", "POST", {"requirements": [], "updates": [
+            {"action": "set-properties", "updates": {"old": "yes"}}]})[0] == 200
+        first = _iceberg_call(f"{base}/ns/tables/r")[1]
+        assert first["metadata"]["properties"]["old"] == "yes"
+        req = urllib.request.Request(f"{_ENDPOINT}{base}/ns/tables/r?purgeRequested=true", method="DELETE")
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 204
+        assert _iceberg_call(f"{base}/ns/tables/r")[0] == 404
+        _iceberg_call(f"{base}/ns/tables", "POST", {"name": "r", "schema": schema})
+        second = _iceberg_call(f"{base}/ns/tables/r")[1]
+        assert "old" not in second["metadata"].get("properties", {})
+        assert second["metadata"]["table-uuid"] != first["metadata"]["table-uuid"]
+        assert second["metadata-location"] != first["metadata-location"]
+    finally:
+        for table in s3tables.list_tables(tableBucketARN=arn).get("tables", []):
+            s3tables.delete_table(tableBucketARN=arn, namespace=table["namespace"][0], name=table["name"])
+        s3tables.delete_namespace(tableBucketARN=arn, namespace="ns")
+        s3tables.delete_table_bucket(tableBucketARN=arn)
+
 
 def test_s3tables_iceberg_rest_scopes_each_catalog_to_its_warehouse_arn(s3tables):
     """Two catalogs, each with its table-bucket ARN as warehouse; the REST
@@ -1431,6 +1459,7 @@ _S3TABLES_ICEBERG_ROUTES = {
                          [("CreateNamespace", "{bucket}")], 200),
     "load-namespace": ("GET", "{prefix}/namespaces/ns", None, None, [("GetNamespace", "{bucket}")], 200),
     "drop-namespace": ("DELETE", "{prefix}/namespaces/ns", None, None, [("DeleteNamespace", "{bucket}")], 400),
+    "namespace-exists": ("HEAD", "{prefix}/namespaces/ns", None, None, [("GetNamespace", "{bucket}")], 204),
     "list-tables": ("GET", "{prefix}/namespaces/ns/tables", None, None, [("ListTables", "{bucket}")], 200),
     "create-table": ("POST", "{prefix}/namespaces/ns/tables", None, {"name": "{new}"},
                      [("CreateTable", "{bucket}"), ("PutTableData", "{bucket}/table/*")], 200),

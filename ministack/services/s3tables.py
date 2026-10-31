@@ -186,6 +186,11 @@ def _set_bucket_region_value(store, bucket_arn, key, value):
     store.set_scoped(spec.account_id, spec.region, key, value)
 
 
+def _pop_bucket_region_value(store, bucket_arn, key):
+    spec = parse_arn(bucket_arn)
+    store.pop_scoped(spec.account_id, spec.region, key, None)
+
+
 _ICEBERG_V2_PRIMITIVES = {
     "boolean", "int", "long", "float", "double", "date", "time", "timestamp", "timestamptz", "string", "uuid", "binary",
 }
@@ -739,31 +744,36 @@ def _iceberg_create_namespace(data, allow_cross_region, bucket_filter=None):
     return json_response({"namespace": [ns_name], "properties": data.get("properties", {})})
 
 
+def _iceberg_namespaces(namespace, allow_cross_region, bucket_filter=None):
+    return _iceberg_values(
+        _namespaces,
+        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+        allow_cross_region)
+
+
+def _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter=None):
+    return _iceberg_values(
+        _tables,
+        lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
+                       and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
+        allow_cross_region)
+
+
 def _iceberg_get_namespace(namespace, allow_cross_region, bucket_filter=None):
-    if _iceberg_values(
-            _namespaces,
-            lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
-            allow_cross_region):
+    if _iceberg_namespaces(namespace, allow_cross_region, bucket_filter):
         return json_response({"namespace": [namespace], "properties": {}})
     return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
 
-
+# dropTable, dropNamespace and HEAD below follow responses recorded on AWS (us-east-1, an
+# Organizations member account, 2026-10-30).
 def _iceberg_head_namespace(namespace, allow_cross_region, bucket_filter=None):
-    found = _iceberg_values(
-        _namespaces,
-        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
-        allow_cross_region)
-    return (204 if found else 404), {}, b""
+    return (204 if _iceberg_namespaces(namespace, allow_cross_region, bucket_filter) else 404), {}, b""
 
 
 def _iceberg_drop_namespace(namespace, allow_cross_region, bucket_filter=None):
-    """DELETE .../namespaces/{ns}, Iceberg REST dropNamespace. AWS refuses a namespace that still holds
-    tables (recorded in us-east-1)."""
-    matches = _iceberg_values(
-        _namespaces,
-        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
-        allow_cross_region)
+    """DELETE .../namespaces/{ns}: AWS refuses a namespace that still holds tables."""
+    matches = _iceberg_namespaces(namespace, allow_cross_region, bucket_filter)
     if not matches:
         return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
     bucket_arn = matches[0]["tableBucketARN"]
@@ -772,34 +782,36 @@ def _iceberg_drop_namespace(namespace, allow_cross_region, bucket_filter=None):
             lambda table: _namespace_name(table) == namespace and table.get("tableBucketARN") == bucket_arn,
             allow_cross_region):
         return _iceberg_error("The namespace that you tried to delete is not empty.", "namespace_not_empty", 400)
-    spec = parse_arn(bucket_arn)
-    _namespaces.pop_scoped(spec.account_id, spec.region, _ns_key(bucket_arn, namespace), None)
+    _pop_bucket_region_value(_namespaces, bucket_arn, _ns_key(bucket_arn, namespace))
     return 204, {}, b""
 
 
 def _iceberg_drop_table(namespace, table_name, purge, allow_cross_region, bucket_filter=None):
-    """DELETE .../namespaces/{ns}/tables/{table}, Iceberg REST dropTable. S3 Tables only drops a table
-    when the client asks for a purge, and says so before it looks the table up (recorded in us-east-1)."""
-    if str(purge).lower() != "true":
+    """DELETE .../namespaces/{ns}/tables/{table}: S3 Tables only drops a table with a purge, and says so
+    before it looks the table up. A purge removes the table's files, so a table created again under the
+    same name starts empty."""
+    if not purge:
         return _iceberg_error(
             "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.",
             "purge_enabled", 400)
-    if not _iceberg_values(
-            _namespaces,
-            lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
-            allow_cross_region):
+    if not _iceberg_namespaces(namespace, allow_cross_region, bucket_filter):
         return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
-    matches = _iceberg_values(
-        _tables,
-        lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
-                       and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
-        allow_cross_region)
+    matches = _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter)
     if not matches:
         return _iceberg_error("The specified table does not exist.", "no_such_table", 404)
     bucket_arn = matches[0]["tableBucketARN"]
-    spec = parse_arn(bucket_arn)
-    _tables.pop_scoped(spec.account_id, spec.region, _table_key(bucket_arn, namespace, table_name), None)
+    _pop_bucket_region_value(_tables, bucket_arn, _table_key(bucket_arn, namespace, table_name))
+    # The metadata and data files live under the table's prefix in the bucket that commits write to.
+    import ministack.services.s3 as _s3
+
+    bucket_name = bucket_arn.rsplit("/", 1)[-1]
+    bucket = _s3._ensure_bucket(bucket_name)
+    if bucket:
+        prefix = f"{namespace}/{table_name}/"
+        for key in [k for k in bucket.get("objects", {}) if k.startswith(prefix)]:
+            _s3._delete_object(bucket_name, key)
     return 204, {}, b""
+
 
 def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
     def _pred(table):
@@ -1352,18 +1364,11 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
                 data = json.loads(body) if body else {}
                 return _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter)
             if method == "HEAD":
-                if _iceberg_values(
-                    _tables,
-                    lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
-                                   and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
-                    allow_cross_region,
-                ):
-                    return 204, {}, b""
-                return 404, {}, b""
+                found = _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter)
+                return (204 if found else 404), {}, b""
             if method == "DELETE":
-                purge = (query_params or {}).get("purgeRequested", "")
-                if isinstance(purge, list):
-                    purge = purge[0] if purge else ""
+                purge = (query_params or {}).get("purgeRequested") or [""]
+                purge = (purge[0] if isinstance(purge, list) else purge).lower() == "true"
                 return _iceberg_drop_table(namespace, table_name, purge, allow_cross_region, bucket_filter)
     return None
 
