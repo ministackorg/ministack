@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudWatch Logs — every stored event has an `eventId`** — events written by a Lambda, a CodeBuild build or a DynamoDB import came back from `FilterLogEvents` without the `eventId` AWS always returns, so `aws logs tail --follow` stopped with `KeyError: 'eventId'` on a Lambda's log group. Contributed by @chandra-purbia.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
