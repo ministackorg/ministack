@@ -749,7 +749,13 @@ def _client_id() -> str:
 
 
 def _client_secret() -> str:
-    return base64.b64encode(secrets.token_bytes(48)).decode()
+    # Like AWS's: a random 256-bit number in base 32, so usually 51 or 52 characters.
+    value, digits = secrets.randbits(256), ""
+    while True:
+        value, digit = divmod(value, 32)
+        digits = "0123456789abcdefghijklmnopqrstuv"[digit] + digits
+        if not value:
+            return digits
 
 
 def _identity_pool_id() -> str:
@@ -2694,7 +2700,8 @@ def _validate_client_secret_hash(action: str, data: dict):
         )
 
     supplied = params.get("SECRET_HASH" if parameter else "SecretHash")
-    if not client.get("ClientSecret"):
+    client_secrets = _client_secret_values(client)
+    if not client_secrets:
         # AWS ignores an extra hash on refresh and challenge responses, but
         # rejects it on initial authentication and the self-service APIs.
         if refreshing or parameter == "ChallengeResponses":
@@ -2711,14 +2718,14 @@ def _validate_client_secret_hash(action: str, data: dict):
             f"Client {cid} is configured with secret but SECRET_HASH was not received", 400,
         )
     if isinstance(username, str) and isinstance(supplied, str) and supplied.isascii():
-        try:
-            expected = base64.b64encode(hmac.new(
-                client["ClientSecret"].encode("utf-8"),
-                (username + cid).encode("utf-8"), hashlib.sha256,
-            ).digest())
-        except UnicodeEncodeError:
-            pass
-        else:
+        for secret in client_secrets:
+            try:
+                expected = base64.b64encode(hmac.new(
+                    secret.encode("utf-8"),
+                    (username + cid).encode("utf-8"), hashlib.sha256,
+                ).digest())
+            except UnicodeEncodeError:
+                break
             if hmac.compare_digest(expected, supplied.encode("ascii")):
                 return None
     return error_response_json(
@@ -2787,6 +2794,9 @@ async def _dispatch_idp(action: str, data: dict):
         "DescribeUserPoolClient": _describe_user_pool_client,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
+        "ListUserPoolClientSecrets": _list_user_pool_client_secrets,
+        "AddUserPoolClientSecret": _add_user_pool_client_secret,
+        "DeleteUserPoolClientSecret": _delete_user_pool_client_secret,
         "GetUICustomization": _get_ui_customization,
         "SetUICustomization": _set_ui_customization,
         # Resource Servers
@@ -3186,14 +3196,27 @@ def _pool_out(pool: dict) -> dict:
 # ===========================================================================
 
 def _create_user_pool_client(data):
+    custom_secret = data.get("ClientSecret")
+    err = _json_string_error(data, ("ClientSecret",)) or _validation_error(_client_secret_constraint_errors(custom_secret))
+    if err:
+        return err
+    custom_secret = _given_client_secret(custom_secret)
+    generate_secret = data.get("GenerateSecret", False)
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    if custom_secret and generate_secret:
+        return error_response_json(
+            "InvalidParameterException",
+            "Cannot both set a client secret and generate a secret. "
+            "Remove either ClientSecret or GenerateSecret from your request and try again.", 400)
+    err = _client_secret_value_error(custom_secret)
+    if err:
+        return err
 
     cid = _client_id()
-    now = _now_epoch()
-    generate_secret = data.get("GenerateSecret", False)
+    now = round(_now_epoch(), 3)
     client = {
         "UserPoolId": pid,
         "ClientName": data.get("ClientName", ""),
@@ -3221,9 +3244,10 @@ def _create_user_pool_client(data):
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),
     }
+    if custom_secret:
+        client["_other_secrets"] = [_client_secret_entry(client, custom_secret, now)]
     pool["_clients"][cid] = client
-    out = {k: v for k, v in client.items() if v is not None}
-    return json_response({"UserPoolClient": out})
+    return json_response({"UserPoolClient": _client_out(client)})
 
 
 def _delete_user_pool_client(data):
@@ -3247,7 +3271,7 @@ def _describe_user_pool_client(data):
     client = pool["_clients"].get(cid)
     if not client:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+    return json_response({"UserPoolClient": _client_out(client)})
 
 
 def _list_user_pool_clients(data):
@@ -3291,8 +3315,212 @@ def _update_user_pool_client(data):
     for k in updatable:
         if k in data:
             client[k] = data[k]
-    client["LastModifiedDate"] = _now_epoch()
-    return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+    client["LastModifiedDate"] = round(_now_epoch(), 3)
+    return json_response({"UserPoolClient": _client_out(client)})
+
+
+def _client_out(client: dict) -> dict:
+    return {k: v for k, v in client.items() if v is not None and not k.startswith("_")}
+
+
+_MAX_CLIENT_SECRETS = 2
+
+
+def _client_secrets(client: dict) -> list:
+    """Return active secrets, oldest first: the initial generated `ClientSecret`
+    (if any) followed by `_other_secrets` (hidden from DescribeUserPoolClient)."""
+    original = client.get("ClientSecret")
+    first = [_client_secret_entry(client, original, client["CreationDate"])] if original else []
+    return first + client.get("_other_secrets", [])
+
+
+def _client_secret_entry(client: dict, value: str, created: float, taken=()) -> dict:
+    # The ID ends in the creation time in milliseconds, the precision of the date;
+    # a secret added within the same millisecond as another takes the next one.
+    millis = start = round(created * 1000)
+    while f"{client['ClientId']}--{millis}" in taken:
+        millis += 1
+    return {"ClientSecretId": f"{client['ClientId']}--{millis}", "ClientSecretValue": value,
+            "ClientSecretCreateDate": round(created + (millis - start) / 1000, 3)}
+
+
+def _client_secret_values(client: dict) -> list:
+    return [s["ClientSecretValue"] for s in _client_secrets(client)]
+
+
+def _client_secret_rejected(client: dict, supplied) -> bool:
+    """True when the app client has secrets and *supplied* is none of them."""
+    values = _client_secret_values(client)
+    return bool(values) and supplied not in values
+
+
+def _json_string_error(data, keys):
+    """SerializationException for the first of *keys* sent as a JSON value that is not a string."""
+    for key in keys:
+        value = data.get(key)
+        if value is None or isinstance(value, str):
+            continue
+        if isinstance(value, bool):
+            message = f"{str(value).upper()}_VALUE can not be converted to a String"
+        elif isinstance(value, (int, float)):
+            message = "NUMBER_VALUE can not be converted to a String"
+        else:
+            message = _JSON_INTEGER_ERRORS[type(value)]
+        return error_response_json("SerializationException", message, 400, message_key="Message")
+    return None
+
+
+def _given_client_secret(value):
+    """A ClientSecret that is blank counts as not given, as on AWS."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _client_secret_constraint_errors(value) -> list:
+    # Only the maximum, in code points, is a constraint error; a short secret is refused later.
+    if isinstance(value, str) and len(value) > 64:
+        return ["Value at 'clientSecret' failed to satisfy constraint: Member must have length less than or equal to 64"]
+    return []
+
+
+def _client_secret_value_error(value):
+    """The minimum length, then the encoding, of a given ClientSecret. Unlike the
+    maximum, the minimum counts UTF-16 code units, so an emoji counts twice; a
+    lone surrogate (sent as a JSON escape) counts once and is not valid UTF-8."""
+    if not value:
+        return None
+    if len(value.encode("utf-16-le", "surrogatepass")) // 2 < 24:
+        return error_response_json("InvalidParameterException", "Client secret must be at least 24 characters long.", 400)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return error_response_json("InvalidParameterException", "Client secret must be valid UTF-8.", 400)
+    return None
+
+
+def _validation_error(errors: list):
+    if not errors:
+        return None
+    count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''}"
+    return error_response_json("InvalidParameterException", f"{count} detected: {'; '.join(errors)}", 400)
+
+
+def _secret_rotation_validation(data, secret_id: bool = False):
+    """AWS's checks of the parameters of the client secret operations, in its order.
+    A UserPoolId is only checked for being given or empty."""
+    err = _json_string_error(data, ("UserPoolId", "ClientId", "ClientSecret", "ClientSecretId", "NextToken"))
+    if err:
+        return err
+    if data.get("UserPoolId") is None:
+        return error_response_json("InvalidParameterException", "UserPoolId must not be null", 400)
+    errors = []
+    fields = [("UserPoolId", "userPoolId", r"[\w-]+_[0-9a-zA-Z]+"), ("ClientId", "clientId", r"[\w+]+")]
+    if secret_id:
+        fields.append(("ClientSecretId", "clientSecretId", None))
+    for key, name, pattern in fields:
+        value = data.get(key)
+        if value is None:
+            if key != "UserPoolId":
+                errors.append(f"Value null at '{name}' failed to satisfy constraint: Member must not be null")
+            continue
+        if key == "UserPoolId" and value != "":
+            continue
+        prefix = f"Value '{value}' at '{name}' failed to satisfy constraint: Member must"
+        if pattern and not re.fullmatch(pattern, value, re.ASCII):
+            errors.append(f"{prefix} satisfy regular expression pattern: {pattern}")
+        if len(value) < 1:
+            errors.append(f"{prefix} have length greater than or equal to 1")
+        elif len(value) > 128:
+            errors.append(f"{prefix} have length less than or equal to 128")
+    if not secret_id:
+        errors += _client_secret_constraint_errors(data.get("ClientSecret"))
+    return _validation_error(errors)
+
+
+def _client_of_other_pool_error(data):
+    """ResourceNotFoundException for a ClientId of another pool, whether or not
+    UserPoolId exists. AWS answers it before checking ClientSecret or NextToken,
+    unlike a client that does not exist at all."""
+    pid, cid = data.get("UserPoolId"), data.get("ClientId")
+    if cid in _user_pools.get(pid, {}).get("_clients", {}):
+        return None
+    if any(cid in p["_clients"] for p in _user_pools.values()):
+        return error_response_json(
+            "ResourceNotFoundException", f"User pool client {cid} does not exist in user pool {pid}.", 400)
+    return None
+
+
+def _secret_rotation_client(data):
+    pid, cid = data.get("UserPoolId"), data.get("ClientId")
+    pool = _user_pools.get(pid)
+    client = (pool or {}).get("_clients", {}).get(cid)
+    if client:
+        return client, None
+    err = _client_of_other_pool_error(data)
+    if err:
+        return None, err
+    message = f"User pool client {cid} does not exist." if pool else f"User pool {pid} does not exist."
+    return None, error_response_json("ResourceNotFoundException", message, 400)
+
+
+def _list_user_pool_client_secrets(data):
+    err = _secret_rotation_validation(data) or _client_of_other_pool_error(data)
+    if err:
+        return err
+    if data.get("NextToken"):
+        return error_response_json("InvalidParameterException", "NextToken is not supported.", 400)
+    client, err = _secret_rotation_client(data)
+    if err:
+        return err
+    secrets_out = [{k: v for k, v in s.items() if k != "ClientSecretValue"} for s in _client_secrets(client)]
+    return json_response({"ClientSecrets": secrets_out})
+
+
+def _add_user_pool_client_secret(data):
+    value = _given_client_secret(data.get("ClientSecret"))
+    err = (_secret_rotation_validation(data) or _client_of_other_pool_error(data)
+           or _client_secret_value_error(value))
+    if err:
+        return err
+    client, err = _secret_rotation_client(data)
+    if err:
+        return err
+    active = _client_secrets(client)
+    if not active:
+        return error_response_json(
+            "InvalidParameterException", "User pool client secret not enabled. Cannot create new secret.", 400)
+    if len(active) >= _MAX_CLIENT_SECRETS:
+        return error_response_json(
+            "LimitExceededException", f"Client secrets cannot exceed limit of {_MAX_CLIENT_SECRETS} secrets.", 400)
+    now = round(_now_epoch(), 3)
+    secret = _client_secret_entry(client, value or _client_secret(), now, {s["ClientSecretId"] for s in active})
+    client.setdefault("_other_secrets", []).append(secret)
+    client["LastModifiedDate"] = secret["ClientSecretCreateDate"]
+    # A secret passed in ClientSecret is not echoed back.
+    descriptor = secret if value is None else {k: v for k, v in secret.items() if k != "ClientSecretValue"}
+    return json_response({"ClientSecretDescriptor": descriptor})
+
+
+def _delete_user_pool_client_secret(data):
+    err = _secret_rotation_validation(data, secret_id=True)
+    if err:
+        return err
+    sid = data["ClientSecretId"]
+    client, err = _secret_rotation_client(data)
+    if err:
+        return err
+    active = _client_secrets(client)
+    if not active:
+        return error_response_json("ResourceNotFoundException", "User pool client secret does not exist.", 400)
+    if sid not in {s["ClientSecretId"] for s in active}:
+        return error_response_json("ResourceNotFoundException", "Client secret does not exist", 400)
+    if len(active) == 1:
+        return error_response_json("InvalidParameterException", "Cannot delete the only client secret.", 400)
+    if client.get("ClientSecret") and sid == active[0]["ClientSecretId"]:
+        client["ClientSecret"] = None
+    else:
+        client["_other_secrets"] = [s for s in client["_other_secrets"] if s["ClientSecretId"] != sid]
+    client["LastModifiedDate"] = round(_now_epoch(), 3)
+    return json_response({})
 
 
 def _ui_customization_target(data):
@@ -7483,7 +7711,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         return _oauth2_error("invalid_grant", "Invalid refresh token.")
     client_id = cid or str(claims.get("client_id", ""))
     _, _, client = _find_pool_by_client_id(client_id)
-    if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
+    if not client or _client_secret_rejected(client, csec):
         return _oauth2_error("invalid_client", "Invalid client credentials.")
     result, err = _refresh_auth_result(pool, pid, client_id, refresh_val)
     if err:
@@ -7546,7 +7774,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             # on the retry. Consuming the code first turned that retry into
             # invalid_grant "Invalid or expired authorization code" (#932).
             _, _, client = _find_pool_by_client_id(cid)
-            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
+            if client and _client_secret_rejected(client, csec):
                 return _oauth2_error("invalid_client", "Invalid client credentials.")
 
             # Consume code (one-time use). This handler runs off the loop
@@ -7664,7 +7892,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
         # Validate client secret if client has one
         _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
-        if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
+        if client and csec and _client_secret_rejected(client, csec):
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         client_id = cid or entry["client_id"]
@@ -7693,13 +7921,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         pool_id, pool, client = _find_pool_by_client_id(cid)
         if not pool or not client:
             return _oauth2_error("invalid_client", "Client not found.")
-        if csec != (client.get("ClientSecret") or ""):
+        client_secrets = _client_secret_values(client)
+        if csec not in (client_secrets or [""]):
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         scope_error = _client_credentials_scope_error(pool, client, form.get("scope"))
         if scope_error:
             return scope_error
-        if not client.get("ClientSecret"):
+        if not client_secrets:
             return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
 
         # M2M's own client-metadata channel — a JSON object, urlencoded, in

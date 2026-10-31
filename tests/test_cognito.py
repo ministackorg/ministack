@@ -2183,6 +2183,8 @@ def test_cognito_update_user_pool_client(cognito_idp):
     )["UserPoolClient"]
     assert updated["ClientName"] == "UpdatedName"
     assert updated["RefreshTokenValidity"] == 14
+    # Dates have millisecond precision, like AWS's.
+    assert updated["LastModifiedDate"].microsecond % 1000 == 0
     # Verify persisted
     desc = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
     assert desc["ClientName"] == "UpdatedName"
@@ -2751,7 +2753,180 @@ def test_cognito_client_secret_generated(cognito_idp):
         "UserPoolClient"
     ]
     assert "ClientSecret" in client
-    assert len(client["ClientSecret"]) > 20
+    # A random 256-bit number in base 32, like AWS's.
+    assert set(client["ClientSecret"]) <= set("0123456789abcdefghijklmnopqrstuv")
+    assert int(client["ClientSecret"], 32) < 2 ** 256
+
+def test_cognito_client_secret_rotation(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="qa-secret-rotation")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="app", GenerateSecret=True)["UserPoolClient"]
+    cid, original = client["ClientId"], client["ClientSecret"]
+
+    def ids():
+        listed = cognito_idp.list_user_pool_client_secrets(UserPoolId=pid, ClientId=cid)["ClientSecrets"]
+        assert all("ClientSecretValue" not in s for s in listed)
+        return [s["ClientSecretId"] for s in listed]
+
+    def last_modified():
+        return cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]["LastModifiedDate"]
+
+    [original_id] = ids()
+    assert original_id == f"{cid}--{round(client['CreationDate'].timestamp() * 1000)}"
+    before = last_modified()
+    time.sleep(0.01)
+    added = cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid)["ClientSecretDescriptor"]
+    assert int(added["ClientSecretValue"], 32) < 2 ** 256
+    # The ID ends in the creation date in milliseconds.
+    assert added["ClientSecretId"] == f"{cid}--{round(added['ClientSecretCreateDate'].timestamp() * 1000)}"
+    assert ids() == [original_id, added["ClientSecretId"]]
+    assert last_modified() > before
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid)
+    assert exc.value.response["Error"]["Code"] == "LimitExceededException"
+    assert cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]["ClientSecret"] == original
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId="missing")
+    assert exc.value.response["Error"]["Message"] == "Client secret does not exist"
+    before = last_modified()
+    time.sleep(0.01)
+    cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=original_id)
+    assert last_modified() > before
+    assert "ClientSecret" not in cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    assert ids() == [added["ClientSecretId"]]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=added["ClientSecretId"])
+    assert exc.value.response["Error"]["Message"] == "Cannot delete the only client secret."
+
+    # A secret passed in ClientSecret is not echoed back.
+    custom = cognito_idp.add_user_pool_client_secret(
+        UserPoolId=pid, ClientId=cid, ClientSecret="a-secret-chosen-by-the-caller")["ClientSecretDescriptor"]
+    assert "ClientSecretValue" not in custom
+    assert len(ids()) == 2
+    cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=custom["ClientSecretId"])
+
+    # A blank ClientSecret counts as not given: the secret is generated.
+    blank = cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecret=" " * 30)["ClientSecretDescriptor"]
+    assert int(blank["ClientSecretValue"], 32) < 2 ** 256
+
+def test_cognito_client_secret_on_create(cognito_idp):
+    unchecked = make_client("cognito-idp", {"parameter_validation": False})
+    pid = cognito_idp.create_user_pool(PoolName="qa-secret-on-create")["UserPool"]["Id"]
+    value = "a-secret-chosen-by-the-caller"
+    created = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="custom", ClientSecret=value)["UserPoolClient"]
+    cid = created["ClientId"]
+    # The secret is never shown, but the client has it.
+    assert "ClientSecret" not in created
+    assert "ClientSecret" not in cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    [listed] = cognito_idp.list_user_pool_client_secrets(UserPoolId=pid, ClientId=cid)["ClientSecrets"]
+    assert listed["ClientSecretCreateDate"] == created["CreationDate"]
+    added = cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid)["ClientSecretDescriptor"]
+    cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=listed["ClientSecretId"])
+    assert [s["ClientSecretId"] for s in cognito_idp.list_user_pool_client_secrets(
+        UserPoolId=pid, ClientId=cid)["ClientSecrets"]] == [added["ClientSecretId"]]
+
+    def secrets_of(**params):
+        client = unchecked.create_user_pool_client(UserPoolId=pid, ClientName="x", **params)["UserPoolClient"]
+        return len(cognito_idp.list_user_pool_client_secrets(UserPoolId=pid, ClientId=client["ClientId"])["ClientSecrets"])
+
+    assert secrets_of(ClientSecret=value, GenerateSecret=False) == 1
+    assert secrets_of(ClientSecret=" " * 30) == 0
+    assert secrets_of(ClientSecret="", GenerateSecret=True) == 1
+    # The minimum counts UTF-16 code units: twelve emoji are long enough.
+    assert secrets_of(ClientSecret="\U0001f600" * 12) == 1
+
+    def error(**params):
+        with pytest.raises(ClientError) as exc:
+            unchecked.create_user_pool_client(**{"UserPoolId": pid, "ClientName": "x", **params})
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    assert error(ClientSecret=value, GenerateSecret=True) == (
+        "InvalidParameterException",
+        "Cannot both set a client secret and generate a secret. "
+        "Remove either ClientSecret or GenerateSecret from your request and try again.")
+    assert error(ClientSecret="a" * 10, GenerateSecret=True)[1].startswith("Cannot both set a client secret")
+    assert error(ClientSecret="a" * 23) ==("InvalidParameterException", "Client secret must be at least 24 characters long.")
+    assert error(ClientSecret="\U0001f600" * 11 + "a")[1] == "Client secret must be at least 24 characters long."
+    # A lone surrogate, sent as a JSON escape, is not valid UTF-8; the minimum length comes first.
+    assert error(ClientSecret="\ud800" + "a" * 30) == ("InvalidParameterException", "Client secret must be valid UTF-8.")
+    assert error(ClientSecret="\ud800" + "a" * 9)[1] == "Client secret must be at least 24 characters long."
+    # The maximum is checked before anything else, then the pool, then the other checks.
+    assert error(ClientSecret="a" * 65, GenerateSecret=True, UserPoolId="us-east-1_missing")[1] == (
+        "1 validation error detected: Value at 'clientSecret' failed to satisfy constraint: "
+        "Member must have length less than or equal to 64")
+    assert error(ClientSecret=value, GenerateSecret=True, UserPoolId="us-east-1_missing")[0] == "ResourceNotFoundException"
+
+def test_cognito_client_secret_id_in_same_millisecond():
+    """A secret added within the same millisecond as another takes the next
+    millisecond, so its ID still ends in its creation date."""
+    from ministack.services.cognito import _client_secret_entry
+
+    client = {"ClientId": "abc"}
+    first = _client_secret_entry(client, "one", 1700000000.123)
+    second = _client_secret_entry(client, "two", 1700000000.123, {first["ClientSecretId"]})
+    assert first["ClientSecretId"] == "abc--1700000000123"
+    assert first["ClientSecretCreateDate"] == 1700000000.123
+    assert second["ClientSecretId"] == "abc--1700000000124"
+    assert second["ClientSecretCreateDate"] == 1700000000.124
+
+def test_cognito_client_secret_rotation_errors(cognito_idp):
+    unchecked = make_client("cognito-idp", {"parameter_validation": False})
+    pid = cognito_idp.create_user_pool(PoolName="qa-secret-rotation-errors")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="app", GenerateSecret=True)["UserPoolClient"]["ClientId"]
+    public = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="public")["UserPoolClient"]["ClientId"]
+    assert cognito_idp.list_user_pool_client_secrets(UserPoolId=pid, ClientId=public)["ClientSecrets"] == []
+
+    def error(call, **params):
+        with pytest.raises(ClientError) as exc:
+            call(**{"UserPoolId": pid, "ClientId": cid, **params})
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    add, delete, list_ = (unchecked.add_user_pool_client_secret, unchecked.delete_user_pool_client_secret,
+                          unchecked.list_user_pool_client_secrets)
+    assert error(add, ClientId=public) == (
+        "InvalidParameterException", "User pool client secret not enabled. Cannot create new secret.")
+    assert error(delete, ClientId=public, ClientSecretId="missing") == (
+        "ResourceNotFoundException", "User pool client secret does not exist.")
+    assert error(add, ClientSecret="a" * 23) == (
+        "InvalidParameterException", "Client secret must be at least 24 characters long.")
+    assert error(add, ClientSecret="a" * 65)[1].endswith("Member must have length less than or equal to 64")
+    assert error(delete, ClientSecretId="")[1].endswith("Member must have length greater than or equal to 1")
+    assert error(list_, NextToken="x") == ("InvalidParameterException", "NextToken is not supported.")
+    assert error(list_, ClientId="nosuchclient") == (
+        "ResourceNotFoundException", "User pool client nosuchclient does not exist.")
+    assert error(list_, UserPoolId="us-east-1_missing") == (
+        "ResourceNotFoundException", f"User pool client {cid} does not exist in user pool us-east-1_missing.")
+    assert error(list_, UserPoolId="us-east-1_missing", ClientId="nosuchclient") == (
+        "ResourceNotFoundException", "User pool us-east-1_missing does not exist.")
+
+    # A client of another pool is refused before ClientSecret or NextToken is checked, unlike one that does not exist.
+    other_pid = cognito_idp.create_user_pool(PoolName="qa-secret-rotation-errors-other")["UserPool"]["Id"]
+    foreign = cognito_idp.create_user_pool_client(
+        UserPoolId=other_pid, ClientName="foreign", GenerateSecret=True)["UserPoolClient"]["ClientId"]
+    not_in_pool = ("ResourceNotFoundException", f"User pool client {foreign} does not exist in user pool {pid}.")
+    assert error(list_, ClientId=foreign) == not_in_pool
+    assert error(list_, ClientId=foreign, NextToken="x") == not_in_pool
+    assert error(list_, ClientId="nosuchclient", NextToken="x")[1] == "NextToken is not supported."
+    assert error(add, ClientId=foreign, ClientSecret="a" * 10) == not_in_pool
+    not_utf8 = ("InvalidParameterException", "Client secret must be valid UTF-8.")
+    assert error(add, ClientSecret="\ud800" + "a" * 30) == not_utf8
+    assert error(add, ClientId="nosuchclient", ClientSecret="\ud800" + "a" * 30) == not_utf8
+    assert error(add, ClientId=public, ClientSecret="\ud800" + "a" * 30) == not_utf8
+
+    # Parameter checks, before the resources are looked up; a UserPoolId is only checked for being given.
+    assert error(list_, UserPoolId=None, ClientId="bad!") == ("InvalidParameterException", "UserPoolId must not be null")
+    assert error(list_, ClientId="bad!", NextToken="x") == (
+        "InvalidParameterException",
+        "1 validation error detected: Value 'bad!' at 'clientId' failed to satisfy constraint: "
+        "Member must satisfy regular expression pattern: [\\w+]+")
+    assert error(list_, ClientId=None)[1] == (
+        "1 validation error detected: Value null at 'clientId' failed to satisfy constraint: Member must not be null")
+    assert error(delete, ClientId="bad!", ClientSecretId="x" * 129)[1] == (
+        "2 validation errors detected: Value 'bad!' at 'clientId' failed to satisfy constraint: "
+        "Member must satisfy regular expression pattern: [\\w+]+; Value '" + "x" * 129 + "' at 'clientSecretId' "
+        "failed to satisfy constraint: Member must have length less than or equal to 128")
+    assert error(add, ClientId="bad!", ClientSecret="a" * 10)[1].startswith("1 validation error detected: Value 'bad!'")
+    assert error(add, ClientSecret=12345) == ("SerializationException", "NUMBER_VALUE can not be converted to a String")
 
 def test_cognito_force_change_password_challenge(cognito_idp):
     """AdminCreateUser with TemporaryPassword triggers NEW_PASSWORD_REQUIRED challenge."""
@@ -5629,6 +5804,27 @@ def test_oauth2_token_client_credentials():
     # client_credentials should NOT return id_token or refresh_token
     assert 'id_token' not in resp
     assert 'refresh_token' not in resp
+
+
+def test_oauth2_token_client_credentials_rotated_secret():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _client_credentials_client(cognito_idp)
+    client_id, original = client['ClientId'], client['ClientSecret']
+
+    def token_status(secret):
+        return _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'client_credentials', 'client_id': client_id,
+            'client_secret': secret, 'scope': 'api/read',
+        })[0]
+
+    added = cognito_idp.add_user_pool_client_secret(UserPoolId=pool_id, ClientId=client_id)['ClientSecretDescriptor']
+    assert token_status(original) == 200
+    assert token_status(added['ClientSecretValue']) == 200
+    original_id = cognito_idp.list_user_pool_client_secrets(
+        UserPoolId=pool_id, ClientId=client_id)['ClientSecrets'][0]['ClientSecretId']
+    cognito_idp.delete_user_pool_client_secret(UserPoolId=pool_id, ClientId=client_id, ClientSecretId=original_id)
+    assert token_status(original) == 400
+    assert token_status(added['ClientSecretValue']) == 200
 
 
 def test_oauth2_token_client_credentials_expires_with_the_client():
@@ -12123,6 +12319,31 @@ def test_cognito_secret_hash_self_service(cognito_idp):
                         "SECRET_HASH": params["SecretHash"]},
     )
     assert cognito_idp.get_user(AccessToken=auth["AuthenticationResult"]["AccessToken"])["Username"] == "signup-user"
+
+
+@_requires_auth
+def test_cognito_secret_hash_rotated_secret(cognito_idp):
+    pid, client = _secret_hash_pool(cognito_idp)
+    _secret_hash_user(cognito_idp, pid)
+    cid = client["ClientId"]
+    added = cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid)["ClientSecretDescriptor"]
+    added_client = {"ClientId": cid, "ClientSecret": added["ClientSecretValue"]}
+
+    def sign_in(secret_client):
+        return cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "canonical-user", "PASSWORD": "Correct1!",
+                            "SECRET_HASH": _cognito_secret_hash(secret_client, "canonical-user")},
+        )
+
+    assert "AuthenticationResult" in sign_in(client)
+    assert "AuthenticationResult" in sign_in(added_client)
+    original_id = cognito_idp.list_user_pool_client_secrets(UserPoolId=pid, ClientId=cid)["ClientSecrets"][0]["ClientSecretId"]
+    cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=original_id)
+    with pytest.raises(ClientError) as exc:
+        sign_in(client)
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    assert "AuthenticationResult" in sign_in(added_client)
 
 
 @_requires_auth
