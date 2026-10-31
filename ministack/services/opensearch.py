@@ -992,18 +992,22 @@ def update_domain_from_cloudformation(name, payload, compatibility_properties):
 
 def _record_change(name, rec, completed_properties):
     """Record a completed configuration change, reported by DescribeDomainChangeProgress and
-    summarized on the domain's ChangeProgressDetails under the same ChangeId."""
+    summarized on the domain's ChangeProgressDetails under the same ChangeId. Earlier changes
+    stay readable by their ChangeId (real AWS, us-west-2)."""
     now = _now()
     change_id = new_uuid()
     _change_progress[name] = {
         "ChangeId": change_id,
         "StartTime": now,
+        "LastUpdatedTime": now,
         "Status": "COMPLETED",
         "PendingProperties": [],
         "CompletedProperties": completed_properties,
         "TotalNumberOfStages": 0,
         "ConfigChangeStatus": "Completed",
+        "InitiatedBy": "CUSTOMER",
     }
+    rec.setdefault("_Changes", {})[change_id] = _change_progress[name]
     rec["ChangeProgressDetails"] = {
         "ChangeId": change_id,
         "ConfigChangeStatus": "Completed",
@@ -1163,7 +1167,7 @@ def _describe_domain_change_progress(name, query_params):
     rec = _domains.get(name)
     if not rec:
         return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
-    progress = _change_progress.get(name) or {
+    progress = (rec.get("_Changes") or {}).get(_qp(query_params, "changeid")) or _change_progress.get(name) or {
         "ChangeId": "",
         "StartTime": rec.get("_CreatedTime", _now()),
         "Status": "COMPLETED",
