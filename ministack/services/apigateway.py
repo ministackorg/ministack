@@ -1810,6 +1810,18 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 
 # ---- Control plane: APIs ----
 
+def find_api_owner(api_id):
+    """The account owning HTTP or WebSocket API ``api_id``, whatever the ambient account, or None.
+
+    Only for invoking an API: on AWS an execute-api URL reaches its API from any
+    caller, signed by another account or not signed at all.
+    """
+    for (stored_account, _region, stored_api_id), _api in _apis.all_items():
+        if stored_api_id == api_id:
+            return stored_account
+    return None
+
+
 def find_api_scope(api_id):
     """Return (account_id, region) owning api_id within the ambient account."""
     account_id = get_account_id()

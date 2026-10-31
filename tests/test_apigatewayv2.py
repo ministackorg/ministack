@@ -5278,3 +5278,33 @@ def test_apigwv2_domain_names_and_api_mappings_paginate(apigw):
         for name in names:
             apigw.delete_domain_name(DomainName=name)
         apigw.delete_api(ApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv2_route_without_authorization_answers_any_caller_account_contract(auth_enabled):
+    """An HTTP API in another account answers an unsigned call and one carrying another account's
+    Authorization header, as a REST API does: an execute-api URL reaches its API from any caller."""
+    owner = boto3.client("apigatewayv2", endpoint_url=_endpoint, aws_access_key_id="111122223333",
+                         aws_secret_access_key="test", region_name="us-east-1")
+    server, _thread, captured = _start_echo_server()
+    api_id = owner.create_api(Name=f"any-caller-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    other_account = ("AWS4-HMAC-SHA256 Credential=444455556666/20260101/us-east-1/execute-api/aws4_request, "
+                     "SignedHeaders=host, Signature=0")
+    try:
+        integration_id = owner.create_integration(
+            ApiId=api_id, IntegrationType="HTTP_PROXY", IntegrationMethod="GET",
+            IntegrationUri=f"http://127.0.0.1:{server.server_address[1]}", PayloadFormatVersion="1.0",
+        )["IntegrationId"]
+        owner.create_route(ApiId=api_id, RouteKey="GET /ping", Target=f"integrations/{integration_id}")
+        owner.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        for headers in ({}, {"Authorization": other_account}):
+            captured["path"] = None
+            request = urllib.request.Request(f"http://{host}/ping", headers={"Host": host, **headers})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status == 200, headers
+            assert captured["path"] is not None, headers  # reached the integration
+    finally:
+        owner.delete_api(ApiId=api_id)
+        server.shutdown()

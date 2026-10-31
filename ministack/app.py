@@ -2071,17 +2071,18 @@ async def _handle_cloudfront_alias_request(
         dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
 
 
-def _invoke_as_rest_api_owner(api_id: str) -> str | None:
-    """Serve a REST API owned by another account as its owner, as AWS does.
+def _invoke_as_api_owner(api_id: str) -> str | None:
+    """Serve a REST, HTTP or WebSocket API owned by another account as its owner, as AWS does.
 
     Returns the caller's account when the request now runs as the owner, else
     None (the caller owns the API, or no account does). The caller is still
     authenticated in its own account: see ``_enforce_execute_api``.
     """
     apigw_v1 = _get_module("apigateway_v1")
-    if apigw_v1.find_api_scope(api_id) is not None:
+    apigw_v2 = _get_module("apigateway")
+    if apigw_v1.find_api_scope(api_id) is not None or apigw_v2.find_api_scope(api_id) is not None:
         return None
-    owner = apigw_v1.find_api_owner(api_id)
+    owner = apigw_v1.find_api_owner(api_id) or apigw_v2.find_api_owner(api_id)
     if not owner:
         return None
     caller_account = _request_account_id.get()
@@ -2113,7 +2114,7 @@ async def _handle_execute_api_request(
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
-    caller_account = _invoke_as_rest_api_owner(api_id)
+    caller_account = _invoke_as_api_owner(api_id)
 
     # WebSocket @connections management API — /{stage}/@connections/{id}.
     # The @connections prefix is authoritative; skip $default resolution.
