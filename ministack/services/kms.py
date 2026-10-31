@@ -250,6 +250,24 @@ def _arn(key_id):
     return f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
 
 
+def _key_not_found(key_ref):
+    """NotFoundException for a key id, key ARN, alias name or alias ARN, in AWS's words."""
+    key_ref = key_ref or ""
+    if key_ref.startswith("alias/") or ":alias/" in key_ref:
+        arn = key_ref if key_ref.startswith("arn:") else _alias_arn(key_ref)
+        return error_response_json("NotFoundException", f"Alias {arn} is not found.", 400)
+    arn = key_ref if key_ref.startswith("arn:") else _arn(key_ref)
+    return error_response_json("NotFoundException", f"Key '{arn}' does not exist", 400)
+
+
+def _default_key_policy():
+    """The key policy a key gets without one, in the layout GetKeyPolicy returns it on AWS."""
+    return ('{\n  "Version" : "2012-10-17",\n  "Id" : "key-default-1",\n  "Statement" : [ {\n'
+            '    "Sid" : "Enable IAM User Permissions",\n    "Effect" : "Allow",\n    "Principal" : {\n'
+            f'      "AWS" : "arn:aws:iam::{get_account_id()}:root"\n    }},\n    "Action" : "kms:*",\n'
+            '    "Resource" : "*"\n  } ]\n}')
+
+
 def _key_material_id(rec):
     """Stable for a key's symmetric material; changes when the material does."""
     return hmac.new(
@@ -261,6 +279,7 @@ def _key_material_id(rec):
 
 def _key_metadata(rec):
     metadata = {
+        "AWSAccountId": rec["Arn"].split(":")[4],
         "KeyId": rec["KeyId"],
         "Arn": rec["Arn"],
         "CreationDate": rec["CreationDate"],
@@ -339,8 +358,18 @@ _CROSS_ACCOUNT_ACTIONS = frozenset({
 })
 
 
+# Operations that refuse an alias as KeyId, whether or not it exists (recorded on AWS, us-east-1).
+_NO_ALIAS_ACTIONS = frozenset({
+    "GetKeyPolicy", "PutKeyPolicy", "ListKeyPolicies", "GetKeyRotationStatus", "EnableKeyRotation",
+    "DisableKeyRotation", "EnableKey", "DisableKey", "UpdateKeyDescription", "ScheduleKeyDeletion",
+    "CancelKeyDeletion", "TagResource", "UntagResource", "ListResourceTags", "CreateGrant", "ListGrants",
+    "RevokeGrant", "GetParametersForImport", "DeleteImportedKeyMaterial", "ReplicateKey",
+})
+
+
 def _foreign_key(key_arn):
-    """``(owner account, key record or None)`` for a key ARN of another account in this Region, else ``(None, None)``."""
+    """``(owner account, key record or None)`` for a key ARN or alias ARN of another account in this Region,
+    else ``(None, None)``."""
     if not isinstance(key_arn, str) or not key_arn.startswith("arn:"):
         return None, None
     try:
@@ -348,20 +377,84 @@ def _foreign_key(key_arn):
     except ArnParseError:
         return None, None
     if (spec.partition != "aws" or spec.service != "kms" or spec.region != get_region()
-            or not spec.account_id or spec.account_id == get_account_id() or not spec.resource.startswith("key/")):
+            or not spec.account_id or spec.account_id == get_account_id()):
+        return None, None
+    if spec.resource.startswith("alias/"):
+        key_id = _aliases.get_scoped(spec.account_id, spec.region, key_arn)
+        return spec.account_id, (_keys.get_scoped(spec.account_id, spec.region, key_id) if key_id else None)
+    if not spec.resource.startswith("key/"):
         return None, None
     rec = _keys.get_scoped(spec.account_id, spec.region, spec.resource[len("key/"):])
     return spec.account_id, (rec if rec and rec.get("Arn") == key_arn else None)
 
 
-def _cross_account_denied(action):
-    """AWS's answer when the key is not visible to the caller (captured through AppConfig, us-east-1)."""
+def _ciphertext_key(data):
+    """``(owner account, key record)`` of another account's key that a symmetric ciphertext names, else
+    ``(None, None)``."""
+    blob = data.get("CiphertextBlob", "")
+    try:
+        ciphertext = base64.b64decode(blob) if isinstance(blob, str) else (blob or b"")
+    except (binascii.Error, ValueError):
+        return None, None
+    if len(ciphertext) <= 68:
+        return None, None
+    key_id = ciphertext[:36].decode("utf-8", errors="ignore")
+    if key_id in _keys:
+        return None, None
+    return _ciphertext_owner_by_id(key_id)
+
+
+def _cross_account_denied(action, rec):
+    """AWS's refusal of a call on another account's key: the key is named when it exists (recorded with
+    two accounts in us-east-1, once new keys had settled)."""
     from ministack.core.iam_evaluator import caller_arn
+    if rec is None:
+        return error_response_json(
+            "AccessDeniedException",
+            f"User: {caller_arn()} is not authorized to perform: kms:{action} on this resource because the resource "
+            "does not exist in this Region, no resource-based policies allow access, or a resource-based policy "
+            "explicitly denies access", 400)
     return error_response_json(
         "AccessDeniedException",
-        f"User: {caller_arn()} is not authorized to perform: kms:{action} on this resource because the resource "
-        "does not exist in this Region, no resource-based policies allow access, or a resource-based policy "
-        "explicitly denies access", 400)
+        f"User: {caller_arn()} is not authorized to perform: kms:{action} on resource: {rec['Arn']} "
+        f"because no resource-based policy allows the kms:{action} action", 400)
+
+
+def ciphertext_key_arn(key_id):
+    """The ARN of the key a symmetric ciphertext names: the caller's own, else another account's in this Region."""
+    if key_id in _keys:
+        return _keys[key_id]["Arn"]
+    owner, rec = _ciphertext_owner_by_id(key_id)
+    return rec["Arn"] if rec else _arn(key_id)
+
+
+def _ciphertext_owner_by_id(key_id):
+    for (account, region, kid), rec in list(_keys._data.items()):
+        if kid == key_id and region == get_region() and account != get_account_id():
+            return account, rec
+    return None, None
+
+
+def key_arn_for_request(resource_arn):
+    """The key ARN an authorization check is about: an alias resolved to its key."""
+    owner, rec = _foreign_key(resource_arn)
+    if rec:
+        return rec["Arn"]
+    rec = _resolve_key(resource_arn)
+    if rec:
+        return rec["Arn"]
+    return resource_arn
+
+
+def key_policy_allows_caller(rec, action, caller=None):
+    """Whether *rec*'s key policy allows *caller* (the calling principal by default) *action* (``Encrypt``, ...)."""
+    from ministack.core.iam_evaluator import EvalContext, caller_arn, evaluate_resource_policy
+    caller = caller or caller_arn()
+    principal_type = ("Root" if caller.endswith(":root") else "AssumedRole" if ":assumed-role/" in caller
+                      else "User")
+    ctx = EvalContext(principal_arn=caller, principal_type=principal_type, principal_account=caller.split(":")[4],
+                      action=f"kms:{action}", resource_arn=rec["Arn"], region=get_region())
+    return evaluate_resource_policy(rec.get("Policy") or "", ctx).decision == "Allow"
 
 
 def _resolve_key(key_id_or_arn):
@@ -492,17 +585,7 @@ def _create_key(data):
         return error_response_json(
             "UnsupportedOperationException",
             f"Origin {origin} is not supported.", 400)
-    policy = data.get("Policy", json.dumps({
-        "Version": "2012-10-17",
-        "Id": "key-default-1",
-        "Statement": [{
-            "Sid": "Enable IAM User Permissions",
-            "Effect": "Allow",
-            "Principal": {"AWS": f"arn:aws:iam::{get_account_id()}:root"},
-            "Action": "kms:*",
-            "Resource": "*",
-        }],
-    }))
+    policy = data.get("Policy", _default_key_policy())
 
     rec = {
         "KeyId": key_id,
@@ -634,7 +717,7 @@ def _describe_key(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     return json_response({"KeyMetadata": _key_metadata(rec)})
 
 
@@ -642,7 +725,7 @@ def _get_public_key(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     err = _reject_hmac_key(rec, "GetPublicKey")
     if err:
         return err
@@ -671,7 +754,7 @@ def _sign(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     err = _check_key_state(rec) or _reject_hmac_key(rec, "Sign")
     if err:
         return err
@@ -772,7 +855,7 @@ def _verify(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     err = _check_key_state(rec) or _reject_hmac_key(rec, "Verify")
     if err:
         return err
@@ -1027,9 +1110,7 @@ def _mac_params(data, operation):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return None, None, None, error_response_json(
-            "NotFoundException", f"Key {key_id} not found", 400
-        )
+        return None, None, None, _key_not_found(key_id)
     err = _check_key_state(rec)
     if err:
         return None, None, None, err
@@ -1119,7 +1200,7 @@ def _encrypt(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     err = _reject_hmac_key(rec, "Encrypt") or _check_key_state(rec)
     if err:
         return err
@@ -1184,24 +1265,24 @@ def _decrypt(data):
     key_id_from_data = data.get("KeyId", "")
     rec = None
 
+    embedded = (_resolve_key(ciphertext[:36].decode("utf-8", errors="ignore"))
+                if len(ciphertext) > 68 else None)
     if key_id_from_data:
         rec = _resolve_key(key_id_from_data)
+        if not rec and not embedded:
+            # AWS reads the ciphertext before it looks up the KeyId (recorded in us-east-1).
+            return error_response_json("InvalidCiphertextException", "", 400)
 
     # Try extracting key ID from ciphertext prefix (symmetric)
-    if not rec and len(ciphertext) > 68:
-        embedded_id = ciphertext[:36].decode("utf-8", errors="ignore")
-        rec = _resolve_key(embedded_id)
+    if not rec:
+        rec = embedded
 
     if not rec:
         # AWS rule: NotFoundException only when the caller named a specific
         # KeyId that doesn't exist. A short/garbage ciphertext with no
         # explicit KeyId can't be parsed → InvalidCiphertextException.
         if key_id_from_data:
-            return error_response_json(
-                "NotFoundException",
-                f"Key {key_id_from_data} not found",
-                400,
-            )
+            return _key_not_found(key_id_from_data)
         return error_response_json(
             "InvalidCiphertextException",
             "",
@@ -1277,9 +1358,7 @@ def _generate_data_key_common(data, action="GenerateDataKey"):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return None, None, error_response_json(
-            "NotFoundException", f"Key {key_id} not found", 400
-        )
+        return None, None, _key_not_found(key_id)
     err = _check_key_state(rec) or _reject_hmac_key(rec, action)
     if err:
         return None, None, err
@@ -1350,9 +1429,7 @@ def _generate_data_key_pair_common(data, action):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return None, None, error_response_json(
-            "NotFoundException", f"Key {key_id} not found", 400
-        )
+        return None, None, _key_not_found(key_id)
     err = _check_key_state(rec) or _reject_hmac_key(rec, action)
     if err:
         return None, None, err
@@ -1644,7 +1721,7 @@ def _create_grant(data):
     key_id = data.get("KeyId", "")
     rec = _grant_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     state_error = _check_key_state(rec)
     if state_error:
         return state_error
@@ -1695,7 +1772,7 @@ def _list_grants(data):
     key_id = data.get("KeyId", "")
     rec = _grant_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     limit = data.get("Limit", _GRANTS_DEFAULT_LIMIT)
     if not isinstance(limit, int) or not 1 <= limit <= _GRANTS_MAX_LIMIT:
         return error_response_json(
@@ -1732,7 +1809,7 @@ def _revoke_grant(data):
     key_id = data.get("KeyId", "")
     rec = _grant_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     grant_id = data.get("GrantId", "")
     grant = _find_grant(rec, grant_id)
     if not grant:
@@ -1759,12 +1836,16 @@ def _retire_grant(data):
                 "Specify a GrantToken, or both a KeyId and a GrantId.",
                 400,
             )
+        # Recorded on AWS (us-east-1): KeyId must be a key ARN, and an unknown key or grant is refused
+        # without saying which.
+        if not key_id.startswith("arn:"):
+            return error_response_json("NotFoundException", f"Invalid arn {key_id}", 400)
+        if ":alias/" in key_id:
+            return error_response_json("InvalidArnException", "Key Aliases are not supported for this operation.", 400)
         rec = _grant_key(key_id)
-        if not rec:
-            return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-        grant = _find_grant(rec, grant_id)
+        grant = _find_grant(rec, grant_id) if rec else None
         if not grant:
-            return error_response_json("NotFoundException", f"Grant does not exist: {grant_id}", 400)
+            return _cross_account_denied("RetireGrant", None)
     if data.get("DryRun"):
         return _dry_run_error("RetireGrant")
     del _grants[grant["GrantId"]]
@@ -1788,7 +1869,7 @@ def _reject_rotation_for_hmac(rec, operation):
 def _enable_key_rotation(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     err = _reject_rotation_for_hmac(rec, "EnableKeyRotation")
     if err:
         return err
@@ -1800,7 +1881,7 @@ def _enable_key_rotation(data):
 def _disable_key_rotation(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     err = _reject_rotation_for_hmac(rec, "DisableKeyRotation")
     if err:
         return err
@@ -1811,11 +1892,12 @@ def _disable_key_rotation(data):
 def _get_key_rotation_status(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
-    return json_response({
-        "KeyRotationEnabled": rec.get("KeyRotationEnabled", False),
-        "RotationPeriodInDays": rec.get("RotationPeriodInDays", 365),
-    })
+        return _key_not_found(data.get('KeyId', ''))
+    out = {"KeyId": rec["Arn"], "KeyRotationEnabled": rec.get("KeyRotationEnabled", False)}
+    if out["KeyRotationEnabled"]:
+        # Without rotation AWS answers no period (recorded in us-east-1).
+        out["RotationPeriodInDays"] = rec.get("RotationPeriodInDays", 365)
+    return json_response(out)
 
 
 # ---- Key Policy ----
@@ -1835,7 +1917,7 @@ def key_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
 def _get_key_policy(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     policy = rec.get("Policy")
     return json_response({"Policy": policy, "PolicyName": "default"})
 
@@ -1843,7 +1925,7 @@ def _get_key_policy(data):
 def _put_key_policy(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["Policy"] = data.get("Policy", "")
     return json_response({})
 
@@ -1851,7 +1933,7 @@ def _put_key_policy(data):
 def _list_key_policies(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     return json_response({"PolicyNames": ["default"], "Truncated": False})
 
 
@@ -1861,7 +1943,7 @@ def _list_key_policies(data):
 def _enable_key(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["Enabled"] = True
     rec["KeyState"] = "Enabled"
     return json_response({})
@@ -1870,7 +1952,7 @@ def _enable_key(data):
 def _disable_key(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["Enabled"] = False
     rec["KeyState"] = "Disabled"
     return json_response({})
@@ -1879,7 +1961,7 @@ def _disable_key(data):
 def _update_key_description(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     # An explicit empty string clears the description, which is how AWS removes it.
     rec["Description"] = data.get("Description", "")
     return json_response({})
@@ -1908,8 +1990,7 @@ def _replicate_key(data):
     guarantees."""
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json(
-            "NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     if not rec.get("MultiRegion"):
         return error_response_json(
             "UnsupportedOperationException",
@@ -1997,7 +2078,7 @@ def _schedule_key_deletion(data):
         return error_response_json("ValidationException", "PendingWindowInDays must be between 7 and 30", 400)
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     state = "PendingDeletion"
     if rec.get("MultiRegion"):
         others = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]
@@ -2030,7 +2111,7 @@ def _schedule_key_deletion(data):
 def _cancel_key_deletion(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["KeyState"] = "Disabled"
     rec.pop("DeletionDate", None)
     return json_response({"KeyId": rec["Arn"]})
@@ -2077,7 +2158,7 @@ def _get_parameters_for_import(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     algorithm = data.get("WrappingAlgorithm", "")
     key_spec = data.get("WrappingKeySpec", "")
     if algorithm not in _WRAPPING_ALGORITHMS:
@@ -2160,7 +2241,7 @@ def _import_key_material(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     if rec.get("Origin") != "EXTERNAL":
         return error_response_json(
             "UnsupportedOperationException",
@@ -2230,7 +2311,7 @@ def _delete_imported_key_material(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     if rec.get("Origin") != "EXTERNAL":
         return error_response_json(
             "UnsupportedOperationException",
@@ -2253,7 +2334,7 @@ def _delete_imported_key_material(data):
 def _tag_resource(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     tags = rec.setdefault("Tags", [])
     for tag in data.get("Tags", []):
         existing = next((t for t in tags if t["TagKey"] == tag["TagKey"]), None)
@@ -2267,7 +2348,7 @@ def _tag_resource(data):
 def _untag_resource(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     remove_keys = set(data.get("TagKeys", []))
     rec["Tags"] = [t for t in rec.get("Tags", []) if t["TagKey"] not in remove_keys]
     return json_response({})
@@ -2276,7 +2357,7 @@ def _untag_resource(data):
 def _list_resource_tags(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     return json_response({"Tags": rec.get("Tags", []), "Truncated": False})
 
 
@@ -2389,13 +2470,27 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json(
             "InvalidAction", f"Unknown action: {action}", 400
         )
-    if action in _CROSS_ACCOUNT_ACTIONS:
-        owner, rec = _foreign_key(data.get("KeyId"))
-        if owner:
-            if rec is None:
-                return _cross_account_denied(action)
-            with request_scope(owner, get_region()):
-                return handler(data)
+    key_ref = data.get("KeyId")
+    if (action in _NO_ALIAS_ACTIONS and isinstance(key_ref, str)
+            and (key_ref.startswith("alias/") or ":alias/" in key_ref)):
+        return error_response_json("InvalidArnException", "Key Aliases are not supported for this operation.", 400)
+    if (isinstance(key_ref, str) and key_ref.startswith("arn:aws:kms:") and key_ref.split(":")[3] != get_region()
+            and key_ref.split(":")[4] != get_account_id()):
+        return error_response_json("NotFoundException", f"Invalid arn {key_ref.split(':')[3]}", 400)
+    owner, rec = _foreign_key(key_ref)
+    if owner is None and action == "Decrypt" and not key_ref:
+        owner, rec = _ciphertext_key(data)
+    if owner:
+        # Another account's key: its key policy decides, in both auth modes, as on AWS.
+        if rec is None or not key_policy_allows_caller(rec, action):
+            return _cross_account_denied(action, rec)
+        if action not in _CROSS_ACCOUNT_ACTIONS:
+            return error_response_json("AccessDeniedException", "This operation cannot be called cross account", 400)
+        if key_ref:
+            # RetireGrant only takes a key ARN; the others resolve the bare id in the owner's account.
+            data = {**data, "KeyId": rec["Arn"] if action == "RetireGrant" else rec["KeyId"]}
+        with request_scope(owner, get_region()):
+            return handler(data)
     return handler(data)
 
 

@@ -1696,20 +1696,22 @@ def enforce(access_key_id: str, iam_action: str, service: str,
 
     # Root principal: no identity policy limits it, but an explicit Deny in a bucket policy does,
     # except on the bucket policy itself for the bucket owner's root (captured on AWS).
+    if service == "kms" and resource_arn.startswith("arn:aws:kms:"):
+        # KMS answers these itself, as on AWS: a key that does not exist is NotFoundException before any
+        # permission check, and a key policy in another account that does not allow the caller is refused
+        # in KMS's own words. What is left is the usual identity check, for a key in another account too.
+        from ministack.services import kms
+
+        resource_arn = kms.key_arn_for_request(resource_arn)
+        found = _resource_policy(service, resource_arn)
+        if found is None:
+            return None
+        owner, rec = kms._foreign_key(resource_arn)
+        if owner and not kms.key_policy_allows_caller(rec, iam_action.split(":", 1)[1], principal.arn):
+            return None
+        if principal.policies is None:
+            return None
     if principal.policies is None:
-        if service == "kms":
-            # A key in another account needs its key policy to allow the caller, root or not.
-            found = _resource_policy(service, resource_arn)
-            if found is None or found[1] in (None, principal.account):
-                return None
-            root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
-                                   principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
-                                   region=region, service_context=context, principal_keys=principal.keys)
-            result = evaluate_resource_policy(found[0], root_ctx)
-            if result.decision == "Allow":
-                return None
-            result.principal_arn = principal.arn
-            return result
         if service != "s3" or "s3:dataaccesspointarn" in context:
             return None
         found = _resource_policy(service, resource_arn)
