@@ -8475,6 +8475,15 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     if csum_err:
         return csum_err
 
+    # x-amz-tagging is validated here, as PutObject does, and stored on the
+    # upload until CompleteMultipartUpload cuts the object's version.
+    tags = None
+    tagging_header = headers.get("x-amz-tagging", "")
+    if tagging_header:
+        tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
+        if len(tags) > 10:
+            return _error("BadRequest", "Object tags cannot be greater than 10", 400)
+
     upload_id = new_uuid()
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
@@ -8497,6 +8506,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "requested_sse": headers.get("x-amz-server-side-encryption"),
         "storage_class": storage_class,
         "checksum_algorithm": checksum_algorithm,
+        "tags": tags,
         "created": now_iso(),
     }
 
@@ -8864,7 +8874,8 @@ def _complete_multipart_upload(
 
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
-    _maybe_replicate(bucket_name, key, obj, combined)
+    tags = upload.get("tags")
+    _maybe_replicate(bucket_name, key, obj, combined, tags)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -8877,8 +8888,19 @@ def _complete_multipart_upload(
         version_id=version_id,
     )
 
+    # The tags given at create time replace any the overwritten object had.
+    if tags:
+        _object_tags[(bucket_name, key, obj.get("version_id"))] = dict(tags)
+        if obj.get("_replica"):
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
+
     # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
+    # carry the version_id assigned above (#1058), and the tags.
     if S3_PERSIST:
         _persist_object(bucket_name, key, obj)
 
