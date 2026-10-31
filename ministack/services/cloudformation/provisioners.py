@@ -692,6 +692,7 @@ _CUSTOM_NAME_REPLACEMENT = {
     # Domain is required, so a pool move under the same Domain fails on the
     # name, as the replacement's CreateUserPoolDomain does.
     "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
+    "AWS::Events::Archive": {"name": "ArchiveName"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -4399,6 +4400,186 @@ def _eb_event_bus_delete(physical_id, props):
         return
     _eb._delete_event_bus({"Name": physical_id})
 
+
+
+# --- EventBridge Archive ---
+
+_EB_ARCHIVE_SETTINGS = ("Description", "EventPattern", "RetentionDays")
+
+
+def _java_hash_map_order(value):
+    """``value`` with every object's keys in the order a java.util.HashMap built
+    from them iterates: by bucket, then by insertion. CloudFormation hands
+    EventBridge an EventPattern in that order, so DescribeArchive returns it so
+    (measured: twelve patterns of 2 to 20 keys, nested objects included)."""
+    if isinstance(value, list):
+        return [_java_hash_map_order(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    capacity = 16
+    while len(value) > capacity * 3 // 4:
+        capacity *= 2
+
+    def bucket(key):
+        h = 0
+        units = key.encode("utf-16-be")
+        for i in range(0, len(units), 2):
+            h = (31 * h + int.from_bytes(units[i:i + 2], "big")) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (capacity - 1)
+
+    ordered = sorted(enumerate(value), key=lambda item: (bucket(item[1]), item[0]))
+    return {key: _java_hash_map_order(value[key]) for _, key in ordered}
+
+
+def _eb_archive_settings(props):
+    """The archive settings the template sets, in the API's shapes. A setting
+    left out of the template keeps the archive's value, KmsKeyIdentifier too;
+    an empty KmsKeyIdentifier clears the key (measured)."""
+    data = {}
+    if "Description" in props:
+        data["Description"] = _template_string(props["Description"])
+    if "EventPattern" in props:
+        # Compact, with non-ASCII characters as written, as DescribeArchive returns it.
+        data["EventPattern"] = json.dumps(_java_hash_map_order(props["EventPattern"]),
+                                          separators=(",", ":"), ensure_ascii=False)
+    if "RetentionDays" in props:
+        data["RetentionDays"] = int(props["RetentionDays"])
+    if "KmsKeyIdentifier" in props:
+        data["KmsKeyIdentifier"] = _template_string(props["KmsKeyIdentifier"])
+    return data
+
+
+# The resource schema's properties, as CloudFormation's validation checks them:
+# (JSON type, minLength, maxLength, pattern). Its "pattern" is unanchored there.
+_EB_ARCHIVE_SCHEMA = {
+    "ArchiveName": ("string", 1, 48, r"[\.\-_A-Za-z0-9]+"),
+    "SourceArn": ("string", None, None, None),
+    "Description": ("string", None, None, None),
+    "EventPattern": ("object", None, None, None),
+    "RetentionDays": ("integer", None, None, None),
+    "KmsKeyIdentifier": ("string", 0, 2048, None),
+}
+_EB_ARCHIVE_SOURCE_ARN_PATTERN = r"^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:.+\/.+$"
+
+
+def eb_archive_schema_errors(props):
+    """(path under Properties, reason) for each way ``props`` breaks the
+    AWS::Events::Archive resource schema, in the order Early Validation reports
+    them: unsupported properties, the required one, then each property as the
+    template lists it (measured). A property that is None resolves only at
+    deploy time and is not checked."""
+    errors = [(key, f"Unsupported property [{key}]") for key in props if key not in _EB_ARCHIVE_SCHEMA]
+    if "SourceArn" not in props:
+        errors.append(("", "Required property [SourceArn] not found"))
+    for key, value in props.items():
+        if key not in _EB_ARCHIVE_SCHEMA or value is None:
+            continue
+        kind, min_length, max_length, pattern = _EB_ARCHIVE_SCHEMA[key]
+        if kind == "object":
+            if not isinstance(value, dict):
+                errors.append((key, f"Property [{key}] expected type: JSONObject, found: {_schema_type(value)}"))
+        elif kind == "integer":
+            found = _schema_integer_type(value)
+            if found:
+                errors.append((key, f"Property [{key}] expected type: Integer, found: {found}"))
+        elif isinstance(value, (dict, list)):
+            errors.append((key, f"Property [{key}] expected type: String, found: {_schema_type(value)}"))
+        else:
+            text = _template_string(value)
+            if min_length is not None and len(text) < min_length:
+                errors.append((key, f"#/{key}: expected minLength: {min_length}, actual: {len(text)}"))
+            if max_length is not None and len(text) > max_length:
+                errors.append((key, f"#/{key}: expected maxLength: {max_length}, actual: {len(text)}"))
+            if pattern and not re.search(pattern, text):
+                errors.append((key, f"Property value [{text}] does not match pattern: {pattern}"))
+    return errors
+
+
+def eb_archive_name_conflict(name):
+    """The NAME_CONFLICT_VALIDATION message for an archive name that already exists, or None."""
+    if name not in _eb._archives:
+        return None
+    return f"Resource of type 'AWS::Events::Archive' with identifier '{name}' already exists."
+
+
+def _eb_archive_handler_error(message, code="InvalidRequest"):
+    return ValueError(f'Resource handler returned message: "{message}" '
+                      f"(RequestToken: {new_uuid()}, HandlerErrorCode: {code})")
+
+
+# The handler's codes for the EventBridge errors it relays (measured); any other is InvalidRequest.
+_EB_ARCHIVE_HANDLER_CODES = {"ResourceAlreadyExistsException": "AlreadyExists",
+                             "ResourceNotFoundException": "NotFound"}
+
+
+def _eb_archive_service_error(resp):
+    """The handler's message for an EventBridge error response: the service's
+    message with the SDK's suffix."""
+    body = json.loads(resp[2])
+    code = _EB_ARCHIVE_HANDLER_CODES.get(body.get("__type"), "InvalidRequest")
+    return _eb_archive_handler_error(_sdk_error(body.get("message", ""), "EventBridge", resp[0]), code)
+
+
+def _eb_archive_check_request(props, creating):
+    """The checks the handler makes before it calls EventBridge, with its
+    messages and in its order (measured). The name and source are checked on
+    create only: an update cannot change them."""
+    violations = []
+    retention = props.get("RetentionDays")
+    if _schema_integer_type(retention) is None and int(retention) < 0:
+        violations.append(f"Value '{int(retention)}' at 'retentionDays' failed to satisfy "
+                          f"constraint: Member must have value greater than or equal to 0")
+    source = _template_string(props.get("SourceArn", ""))
+    if creating and not re.fullmatch(_EB_ARCHIVE_SOURCE_ARN_PATTERN, source):
+        violations.append(f"Value '{source}' at 'eventSourceArn' failed to satisfy constraint: Member must "
+                          f"satisfy regular expression pattern: {_EB_ARCHIVE_SOURCE_ARN_PATTERN}")
+    name = _template_string(props.get("ArchiveName", ""))
+    if creating and not re.fullmatch(_EB_ARCHIVE_SCHEMA["ArchiveName"][3], name):
+        violations.append(f"Value '{name}' at 'archiveName' failed to satisfy constraint: Member must satisfy "
+                          f"regular expression pattern: {_EB_ARCHIVE_SCHEMA['ArchiveName'][3]}")
+    if violations:
+        count = f"{len(violations)} validation error{'s' if len(violations) > 1 else ''} detected"
+        raise _eb_archive_handler_error(f"Invalid request provided: {count}: {'; '.join(violations)}")
+    if props.get("KmsKeyIdentifier") and _kms._resolve_key(_template_string(props["KmsKeyIdentifier"])) is None:
+        raise _eb_archive_handler_error(
+            "Invalid request provided: The provided KMS key does not exist. Please ensure that the key "
+            "identifier is correct and your key exists in the same region as the event source.")
+
+
+def _eb_archive_attrs(name):
+    return {"Arn": _eb._archives[name]["ArchiveArn"]}
+
+
+def _eb_archive_create(logical_id, props, stack_name):
+    """Ref is the archive name. A generated name is the logical id, cut to 35
+    characters, then - and 12 random letters and digits: 48, the API's limit."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    name = _template_string(props.get("ArchiveName") or f"{logical_id[:35]}-{suffix}")
+    _eb_archive_check_request({**props, "ArchiveName": name}, creating=True)
+    resp = _eb._create_archive({
+        "ArchiveName": name,
+        "EventSourceArn": _template_string(props.get("SourceArn", "")),
+        **_eb_archive_settings(props),
+    })
+    if resp[0] >= 400:
+        raise _eb_archive_service_error(resp)
+    return name, _eb_archive_attrs(name)
+
+
+def _eb_archive_update(physical_id, old_props, new_props, stack_name):
+    if not any(key in new_props for key in _EB_ARCHIVE_SETTINGS):
+        raise _eb_archive_handler_error(
+            "Invalid request provided: At least one of EventPattern, RetentionDays or Description must be provided.")
+    _eb_archive_check_request(new_props, creating=False)
+    resp = _eb._update_archive({"ArchiveName": physical_id, **_eb_archive_settings(new_props)})
+    if resp[0] >= 400:
+        raise _eb_archive_service_error(resp)
+    return physical_id, _eb_archive_attrs(physical_id)
+
+
+def _eb_archive_delete(physical_id, props):
+    if physical_id in _eb._archives:
+        _eb._delete_archive({"ArchiveName": physical_id})
 
 
 # --- Kinesis Stream ---
@@ -9768,6 +9949,20 @@ def _schema_type(value):
     return "JSONArray" if isinstance(value, list) else "JSONObject" if isinstance(value, dict) else "String"
 
 
+def _schema_integer_type(value):
+    """The type CloudFormation's schema check reports for a value that is not
+    an integer, or None. A string of digits passes, as a template scalar."""
+    if isinstance(value, bool):
+        return "Boolean"
+    if isinstance(value, int):
+        return None
+    if isinstance(value, float):
+        return "Float"
+    if isinstance(value, str):
+        return None if re.fullmatch(r"-?\d+", value) else "String"
+    return _schema_type(value)
+
+
 def _schema_string_errors(obj, keys, path):
     """String members holding an object or a list; numbers and booleans reach
     the schema check as strings."""
@@ -15006,6 +15201,7 @@ def _location_tracker_delete(physical_id, props):
 
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::Events::Archive": ("ArchiveName", "SourceArn"),
     "AWS::DocDB::DBCluster": ("AvailabilityZones", "DBClusterIdentifier", "DBSubnetGroupName", "KmsKeyId",
                               "MasterUsername", "SnapshotIdentifier", "SourceDBClusterIdentifier",
                               "StorageEncrypted"),
@@ -15431,6 +15627,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cwlogs_metric_filter_delete,
     },
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
+    "AWS::Events::Archive": {"create": _eb_archive_create, "update": _eb_archive_update, "delete": _eb_archive_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},
     "AWS::Events::Rule": {
         "create": _eb_rule_create,

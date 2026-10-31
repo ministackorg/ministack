@@ -619,48 +619,85 @@ def _static_property(raw, resources_defs, param_values, conditions, mappings, st
 
 
 def _validation_errors(resources_defs, ordered, param_values, conditions, mappings, stack_name, stack_id,
-                       owned_buckets=frozenset()):
+                       previous_stack=None):
     """Pre-deployment validation errors as ``(logical_id, type, validation name,
     path, reason)``: properties outside their schema enum, ListenerRule
-    Transforms that break the resource schema, and AWS::S3::Bucket names the
-    stack can't take (NAME_CONFLICT_VALIDATION, observed on AWS); a bucket the
-    stack already owns is not a conflict for its update."""
+    Transforms and AWS::Events::Archive properties that break the resource
+    schema, and AWS::S3::Bucket and AWS::Events::Archive names the stack can't
+    take (NAME_CONFLICT_VALIDATION, observed on AWS). A bucket the stack already
+    owns is not a conflict for its update, and an archive name is only checked
+    for an archive new to the stack: AWS lets a replacement onto a taken name
+    through to the handler, which refuses it."""
     from ministack.services.cloudformation.provisioners import (
+        eb_archive_name_conflict,
+        eb_archive_schema_errors,
         listener_rule_transforms_schema_errors,
         s3_bucket_name_conflict,
     )
 
+    previous = (previous_stack or {}).get("_resources", {})
+    owned_buckets = {r.get("PhysicalResourceId") for r in previous.values()
+                     if r.get("ResourceType") == "AWS::S3::Bucket"}
+
+    def static(raw):
+        # A value that does not resolve yet, such as a missing export, is left to deploy time.
+        try:
+            return _static_property(raw, resources_defs, param_values, conditions, mappings, stack_name, stack_id)
+        except ValueError:
+            return None
+
+    def property_path(logical_id, path):
+        return f"/Resources/{logical_id}/Properties" + (f"/{path}" if path else "")
+
     errors = []
-    for logical_id in ordered:
+    # In logical id order, whatever the template's (measured); an archive's
+    # name conflict comes before its property errors.
+    for logical_id in sorted(ordered):
         res_def = resources_defs[logical_id]
         cond = res_def.get("Condition")
         if cond and not conditions.get(cond, True):
             continue
         rtype = res_def.get("Type", "")
-        raw_props = res_def.get("Properties") or {}
+        raw_props = res_def.get("Properties") if isinstance(res_def.get("Properties"), dict) else {}
         props = {}
         for prop in _PROPERTY_ENUMS.get(rtype, {}):
             if any(name in resources_defs for name, _ in _intrinsic_references(raw_props.get(prop))):
                 continue
-            props[prop] = _static_property(raw_props.get(prop), resources_defs, param_values, conditions,
-                                           mappings, stack_name, stack_id)
+            props[prop] = static(raw_props.get(prop))
         # The enum check's validation name is not observed; PROPERTY_VALIDATION is inferred.
-        errors += [(logical_id, rtype, "PROPERTY_VALIDATION", f"/Resources/{logical_id}/Properties/{prop}", reason)
+        errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, prop), reason)
                    for prop, reason in _property_enum_errors(rtype, props)]
         if (rtype == "AWS::ElasticLoadBalancingV2::ListenerRule" and "Transforms" in raw_props
                 and not any(name in resources_defs for name, _ in _intrinsic_references(raw_props["Transforms"]))):
-            transforms = _static_property(raw_props["Transforms"], resources_defs, param_values, conditions,
-                                          mappings, stack_name, stack_id)
-            errors += [(logical_id, rtype, "PROPERTY_VALIDATION", f"/Resources/{logical_id}/Properties/{path}", reason)
+            transforms = static(raw_props["Transforms"])
+            errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, path), reason)
                        for path, reason in listener_rule_transforms_schema_errors(transforms)]
+        if rtype == "AWS::Events::Archive":
+            archive_props = {key: static(value) for key, value in raw_props.items()}
+            archive_props = {key: value for key, value in archive_props.items() if value is not _NO_VALUE}
+            name = archive_props.get("ArchiveName")
+            conflict = (eb_archive_name_conflict(name)
+                        if isinstance(name, str) and logical_id not in previous else None)
+            if conflict:
+                errors.append((logical_id, rtype, "NAME_CONFLICT_VALIDATION", f"/Resources/{logical_id}", conflict))
+            errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, path), reason)
+                       for path, reason in eb_archive_schema_errors(archive_props)]
         if rtype == "AWS::S3::Bucket" and raw_props.get("BucketName"):
-            name = _static_property(raw_props["BucketName"], resources_defs, param_values, conditions,
-                                    mappings, stack_name, stack_id)
+            name = static(raw_props["BucketName"])
             conflict = (s3_bucket_name_conflict(name)
                         if isinstance(name, str) and name not in owned_buckets else None)
             if conflict:
                 errors.append((logical_id, rtype, "NAME_CONFLICT_VALIDATION", f"/Resources/{logical_id}", conflict))
     return errors
+
+
+def change_set_validation_errors(template, param_values, stack_name, stack_id, logical_ids, previous_stack=None):
+    """``_validation_errors`` for the resources a change set adds or modifies;
+    ``previous_stack`` is the stack an UPDATE change set changes."""
+    conditions = _evaluate_conditions(template, param_values)
+    resources_defs = template.get("Resources", {})
+    return _validation_errors(resources_defs, [r for r in resources_defs if r in logical_ids], param_values,
+                              conditions, template.get("Mappings", {}), stack_name, stack_id, previous_stack)
 
 
 def _operation_event(stack_id, operation_id, event_type, operation_type="CREATE_STACK", **fields):
@@ -677,10 +714,8 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
     for DescribeEvents, which the stack event points the caller to. A failed
     update rolls back to ``previous_stack`` (observed on AWS 2026-10-16)."""
     is_update = previous_stack is not None
-    owned = {r.get("PhysicalResourceId") for r in (previous_stack or {}).get("_resources", {}).values()
-             if r.get("ResourceType") == "AWS::S3::Bucket"}
     errors = _validation_errors(resources_defs, ordered, param_values, conditions, mappings,
-                                stack_name, stack_id, frozenset(owned))
+                                stack_name, stack_id, previous_stack)
     if not errors:
         return False
     operation_id = new_uuid()
@@ -689,7 +724,7 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
     for logical_id, rtype, validation_name, path, reason in errors:
         logger.warning("Stack %s validation: %s: %s", stack_name, path, reason)
         operation_events.append(_operation_event(
-            stack_id, operation_id, "VALIDATION_ERROR", operation_type,
+            stack_id, operation_id, "VALIDATION_ERROR", operation_type, OperationStatus=None,
             LogicalResourceId=logical_id, ResourceType=rtype,
             ValidationFailureMode="FAIL", ValidationName=validation_name, ValidationStatus="FAILED",
             ValidationStatusReason=reason, ValidationPath=path))
@@ -698,7 +733,8 @@ def _fail_property_validation(stack, stack_id, stack_name, resources_defs, order
         _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack", status, reason, stack_id,
                    detailed_status=detailed_status)
         operation_events.append(_operation_event(
-            stack_id, operation_id, "PROVISIONING_ERROR", operation_type, LogicalResourceId=stack_name,
+            stack_id, operation_id, "PROVISIONING_ERROR", operation_type, OperationStatus=None,
+            LogicalResourceId=stack_name,
             PhysicalResourceId=stack_id, ResourceType="AWS::CloudFormation::Stack", ResourceStatus=status,
             ResourceStatusReason=reason, **({"DetailedStatus": detailed_status} if detailed_status else {})))
 
@@ -746,6 +782,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
     stack.pop("_failed_operation", None)
+    validation_scope = stack.pop("_validation_scope", None)
 
     mappings = template.get("Mappings", {})
     conditions = _evaluate_conditions(template, param_values)
@@ -767,8 +804,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                    str(exc), stack_id)
         return
 
+    validated = [r for r in ordered if r not in imports and (validation_scope is None or r in validation_scope)]
     if not stack.get("_disable_validation") and _fail_property_validation(
-            stack, stack_id, stack_name, resources_defs, ordered, param_values,
+            stack, stack_id, stack_name, resources_defs, validated, param_values,
             conditions, mappings, disable_rollback,
             previous_stack=(previous_stack or {}) if is_update else None):
         return

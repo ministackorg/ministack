@@ -607,31 +607,37 @@ _OPERATION_EVENT_FIELDS = (
     "EventId", "StackId", "OperationId", "OperationType", "OperationStatus", "EventType",
     "LogicalResourceId", "PhysicalResourceId", "ResourceType", "Timestamp", "ResourceStatus",
     "ResourceStatusReason", "DetailedStatus", "ValidationFailureMode", "ValidationName",
-    "ValidationStatus", "ValidationStatusReason", "ValidationPath",
+    "ValidationStatus", "ValidationStatusReason", "ValidationPath", "StartTime", "EndTime",
 )
 
 
 def _describe_events(params):
-    """The operation events of a stack. MiniStack records them for a create
-    that fails pre-deployment validation, the case the stack event tells the
-    caller to call DescribeEvents for; change-set events are not recorded."""
+    """The operation events of a stack or a change set. MiniStack records the
+    validation errors of a create, update or change set that fails
+    pre-deployment validation, the case the stack event or the change set's
+    StatusReason tells the caller to call DescribeEvents for. A change set's
+    events are its own: the stack's do not include them (measured)."""
     stack_name = _p(params, "StackName")
-    if stack_name:
-        stack = _resolve_stack(stack_name)
+    stack = _resolve_stack(stack_name) if stack_name else None
+    if _p(params, "ChangeSetName"):
+        from ministack.services.cloudformation.changesets import _find_change_set
+        _, change_set = _find_change_set(_p(params, "ChangeSetName"), (stack or {}).get("StackName", stack_name))
+        events = list((change_set or {}).get("_operation_events") or [])
+    elif stack_name:
         if not stack:
             return _error("ValidationError", f"Stack [{stack_name}] does not exist")
         events = list(stack.get("_operation_events") or [])
-    elif _p(params, "ChangeSetName"):
-        events = []
     else:
-        # Every member is optional; an OperationId alone names its stack's events.
-        from ministack.services.cloudformation import _stacks
-        events = [e for s in _stacks.values() for e in s.get("_operation_events") or []]
+        # Every member is optional; an OperationId alone names its stack's or change set's events.
+        from ministack.services.cloudformation import _change_sets, _stacks
+        events = [e for s in (*_stacks.values(), *_change_sets.values()) for e in s.get("_operation_events") or []]
     operation_id = _p(params, "OperationId")
     if operation_id:
         events = [e for e in events if e.get("OperationId") == operation_id]
     if _p(params, "Filters.FailedEvents").lower() == "true":
-        events = [e for e in events if e.get("OperationStatus") == "FAILED"]
+        # Validation and provisioning errors carry no OperationStatus (measured).
+        events = [e for e in events if e.get("OperationStatus") == "FAILED"
+                  or e.get("EventType") in ("VALIDATION_ERROR", "PROVISIONING_ERROR")]
     events, next_token_xml, err = _page(events, params, "DescribeEvents")
     if err:
         return err
