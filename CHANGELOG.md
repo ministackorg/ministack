@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **S3 — `Tagging` on `CreateMultipartUpload`** — the `x-amz-tagging` header was ignored, so an object uploaded in parts had no tags, including S3-to-S3 copies by `aws s3 cp` of objects large enough to copy in parts. The tags now land on the completed object's version, decide tag-filtered replication rules and carry to the replica, as with PutObject; more than 10 answer 400 `BadRequest` "Object tags cannot be greater than 10" at create time, and an untagged multipart upload that overwrites a tagged object leaves it without tags, as on AWS.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
