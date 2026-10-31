@@ -2060,11 +2060,23 @@ def test_ec2_describe_instance_types_filter(ec2):
     assert types == {"t2.micro", "m5.large"}
 
 def test_ec2_describe_instance_types_hypervisor_and_architecture(ec2):
-    types = ["t2.micro", "m4.large", "m5.large", "r7g.large", "t4g.small", "c7gn.large", "a1.large", "g4dn.xlarge", "g3s.xlarge", "i3en.large", "p3dn.24xlarge"]
+    """Real AWS (us-west-2, describe-instance-types)."""
+    types = ["t2.micro", "t2.large", "m4.large", "m5.large", "r7g.large", "t4g.small", "c7gn.large", "a1.large",
+             "g4dn.xlarge", "g3s.xlarge", "i3en.large", "p3dn.24xlarge", "m5.metal", "m7i.metal-24xl", "c6g.metal",
+             "mac1.metal", "mac2.metal"]
     resp = ec2.describe_instance_types(InstanceTypes=types)
-    got = {t["InstanceType"]: (t["Hypervisor"], t["ProcessorInfo"]["SupportedArchitectures"]) for t in resp["InstanceTypes"]}
-    assert got == {
-        "t2.micro": ("xen", ["x86_64"]),
+    got = {t["InstanceType"]: (t.get("Hypervisor"), t["ProcessorInfo"]["SupportedArchitectures"], t["BareMetal"])
+           for t in resp["InstanceTypes"]}
+    assert {k: v[2] for k, v in got.items() if v[2]} == {
+        "m5.metal": True, "m7i.metal-24xl": True, "c6g.metal": True, "mac1.metal": True, "mac2.metal": True}
+    assert {k: v[:2] for k, v in got.items()} == {
+        "m5.metal": (None, ["x86_64"]),
+        "m7i.metal-24xl": (None, ["x86_64"]),
+        "c6g.metal": (None, ["arm64"]),
+        "mac1.metal": (None, ["x86_64_mac"]),
+        "mac2.metal": (None, ["arm64_mac"]),
+        "t2.micro": ("xen", ["i386", "x86_64"]),
+        "t2.large": ("xen", ["x86_64"]),
         "m4.large": ("xen", ["x86_64"]),
         "m5.large": ("nitro", ["x86_64"]),
         "r7g.large": ("nitro", ["arm64"]),

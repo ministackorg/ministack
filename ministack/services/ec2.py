@@ -6753,6 +6753,10 @@ _XEN_INSTANCE_FAMILIES = {
     "t1", "t2", "m1", "m2", "m3", "m4", "c1", "c3", "c4", "r3", "r4",
     "i2", "i3", "d2", "x1", "x1e", "g2", "g3", "g3s", "p2", "p3", "f1", "h1",
 }
+# The sizes that also run 32-bit AMIs (real AWS, us-west-2).
+_I386_INSTANCE_TYPES = {
+    "t1.micro", "t2.nano", "t2.micro", "t2.small", "t2.medium", "m1.small", "m1.medium", "c1.medium", "c3.large",
+}
 
 
 def _is_graviton_family(family):
@@ -6772,8 +6776,15 @@ def _describe_instance_types(p):
     items = []
     for itype in all_types:
         family = itype.split(".")[0]
-        hypervisor = "xen" if family in _XEN_INSTANCE_FAMILIES else "nitro"
-        architecture = "arm64" if _is_graviton_family(family) else "x86_64"
+        # Bare metal reports no hypervisor; Mac architectures carry a _mac suffix (real AWS, us-west-2).
+        bare_metal = itype.split(".")[-1].startswith("metal")
+        hypervisor = "" if bare_metal else "xen" if family in _XEN_INSTANCE_FAMILIES else "nitro"
+        if family.startswith("mac"):
+            architectures = ["x86_64_mac" if family == "mac1" else "arm64_mac"]
+        else:
+            architectures = ["arm64" if _is_graviton_family(family) else "x86_64"]
+        if itype in _I386_INSTANCE_TYPES:
+            architectures.insert(0, "i386")
         vcpus = 2 if "micro" in itype else 4 if "small" in itype else 8
         mem_mib = 1024 if "micro" in itype else 2048 if "small" in itype else 4096
         items.append(f"""<item>
@@ -6783,10 +6794,10 @@ def _describe_instance_types(p):
             <supportedUsageClasses><item>on-demand</item><item>spot</item></supportedUsageClasses>
             <supportedRootDeviceTypes><item>ebs</item></supportedRootDeviceTypes>
             <supportedVirtualizationTypes><item>hvm</item></supportedVirtualizationTypes>
-            <bareMetal>false</bareMetal>
-            <hypervisor>{hypervisor}</hypervisor>
+            <bareMetal>{str(bare_metal).lower()}</bareMetal>
+            {f"<hypervisor>{hypervisor}</hypervisor>" if hypervisor else ""}
             <processorInfo>
-                <supportedArchitectures><item>{architecture}</item></supportedArchitectures>
+                <supportedArchitectures>{"".join(f"<item>{a}</item>" for a in architectures)}</supportedArchitectures>
                 <sustainedClockSpeedInGhz>2.5</sustainedClockSpeedInGhz>
             </processorInfo>
             <vCpuInfo>
