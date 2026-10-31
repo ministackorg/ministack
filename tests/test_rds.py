@@ -18469,6 +18469,9 @@ def test_rds_aurora_postgresql_has_builtin_roles(rds):
             cur = conn.cursor()
             cur.execute("SELECT pg_has_role('admin', 'rds_superuser', 'member')")
             assert cur.fetchone() == (True,)
+            cur.execute("SELECT r.rolname, a.admin_option FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid "
+                        "JOIN pg_roles m ON m.oid = a.member WHERE m.rolname = 'rds_superuser' ORDER BY 1")
+            assert cur.fetchall() == [("rds_password", True), ("rds_replication", True)]
             cur.execute("CREATE USER app_user; GRANT rds_iam TO app_user")
             cur.execute("SELECT pg_has_role('app_user', 'rds_iam', 'member')")
             assert cur.fetchone() == (True,)

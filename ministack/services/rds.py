@@ -1149,7 +1149,8 @@ def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
     return archive.getvalue()
 
 
-# The roles RDS and Aurora PostgreSQL provide, with the master user in rds_superuser as AWS documents.
+# The roles RDS and Aurora PostgreSQL provide, with the master user in rds_superuser (real AWS, Aurora
+# PostgreSQL 16.15, us-west-2: rds_superuser holds rds_replication and rds_password with admin option).
 _PG_RDS_INIT = """#!/bin/sh
 set -e
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
@@ -1157,8 +1158,11 @@ DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_iam') THEN CREATE ROLE rds_iam NOLOGIN; END IF;
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_superuser') THEN CREATE ROLE rds_superuser NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_replication') THEN CREATE ROLE rds_replication NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_password') THEN CREATE ROLE rds_password NOLOGIN; END IF;
 END
 $$;
+GRANT rds_replication, rds_password TO rds_superuser WITH ADMIN OPTION;
 SQL
 # A master user named rds_superuser already is that role; GRANT would make it a member of itself.
 [ "$POSTGRES_USER" = rds_superuser ] || psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "GRANT rds_superuser TO \"$POSTGRES_USER\""
