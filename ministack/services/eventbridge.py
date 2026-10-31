@@ -703,6 +703,10 @@ def _validate_target_arn(target):
     ):
         return error_response_json("ValidationException", "RoleArn is required", 400)
 
+    # AWS parity: any other target in another account needs an execution role, in any region.
+    if spec.service != "events" and spec.account_id and spec.account_id != get_account_id() and not target.get("RoleArn"):
+        return error_response_json("ValidationException", f"RoleArn is required for target {arn}.", 400)
+
     return None
 
 
@@ -2421,7 +2425,7 @@ def _invoke_target(target, event, rule, view=None):
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
-        elif not _target_matches_request_scope(spec):
+        elif not _target_matches_request_scope(spec, target):
             # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
             # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
             # that metric or DLQs, so the faithful observable outcome is to accept the target and drop
@@ -2444,9 +2448,15 @@ def _invoke_target(target, event, rule, view=None):
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
 
-def _target_matches_request_scope(spec) -> bool:
+def _target_matches_request_scope(spec, target=None) -> bool:
     # Cross-region targets are accepted at PutTargets but fail delivery here for AWS parity.
-    return spec.account_id == get_account_id() and spec.region == get_region()
+    if spec.region != get_region():
+        return False
+    if spec.account_id == get_account_id():
+        return True
+    # AWS delivers to a target in another account of the same region through the target's execution
+    # role. Modelled for SQS, whose queues are looked up by the account in their ARN.
+    return spec.service == "sqs" and bool((target or {}).get("RoleArn"))
 
 
 def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):

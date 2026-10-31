@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EventBridge — rule targets in another account** — `PutTargets` accepted an SQS (or other) target in another account without a `RoleArn`, and the events were then silently dropped. As on AWS, it now answers `ValidationException` "RoleArn is required for target <arn>." for such a target in any region, and with an execution role an SQS target in another account of the same region receives the events, as AWS's cross-account targets do. A target in another region is still accepted and not reached. Contributed by @chandra-purbia.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
