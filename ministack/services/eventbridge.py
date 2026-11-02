@@ -703,6 +703,10 @@ def _validate_target_arn(target):
     ):
         return error_response_json("ValidationException", "RoleArn is required", 400)
 
+    # AWS parity: any other target in another account needs an execution role, in any region.
+    if spec.service != "events" and spec.account_id and spec.account_id != get_account_id() and not target.get("RoleArn"):
+        return error_response_json("ValidationException", f"RoleArn is required for target {arn}.", 400)
+
     return None
 
 
@@ -979,6 +983,17 @@ def _resolve_taggable_events_arn(arn):
     return arn, None
 
 
+def _event_bus_in_other_region(ref):
+    """Whether ``ref`` is an event bus ARN naming a region other than the request's."""
+    if not isinstance(ref, str) or not ref.startswith("arn:"):
+        return False
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return False
+    return spec.service == "events" and spec.resource.startswith("event-bus/") and spec.region != get_region()
+
+
 def _foreign_event_bus(ref):
     """``(owner account, bus name)`` when ``ref`` is the ARN of an event bus
     another account owns in this region, else None. PutEvents delivers to it."""
@@ -1126,6 +1141,9 @@ def _put_events(data, allow_aws_source=False):
             "Member must have length less than or equal to 10" % len(entries),
             400,
         )
+    if any(_event_bus_in_other_region(entry.get("EventBusName")) for entry in entries):
+        # Captured on AWS: a bus ARN in another region fails the whole request.
+        return error_response_json("ValidationException", "Cross-region api call is not allowed.", 400)
     denial = _foreign_bus_denial(entries)
     if denial:
         return denial
@@ -2421,7 +2439,7 @@ def _invoke_target(target, event, rule, view=None):
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
-        elif not _target_matches_request_scope(spec):
+        elif not _target_matches_request_scope(spec, target):
             # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
             # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
             # that metric or DLQs, so the faithful observable outcome is to accept the target and drop
@@ -2435,7 +2453,11 @@ def _invoke_target(target, event, rule, view=None):
         elif spec.service == "lambda":
             _dispatch_to_lambda(arn, event_payload)
         elif spec.service == "sqs":
-            _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            if _foreign_queue_allows_role(spec, target.get("RoleArn", "")):
+                _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            else:
+                logger.warning("EventBridge: target %s not delivered: its queue policy does not allow %s",
+                               arn, target.get("RoleArn"))
         elif spec.service == "sns":
             _dispatch_to_sns(arn, event_payload)
         else:
@@ -2444,9 +2466,37 @@ def _invoke_target(target, event, rule, view=None):
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
 
-def _target_matches_request_scope(spec) -> bool:
+def _foreign_queue_allows_role(spec, role_arn: str) -> bool:
+    """Under AUTH=true, another account's queue takes the event only when its policy allows the target's role."""
+    from ministack.app import AUTH
+    if not AUTH or spec.account_id == get_account_id():
+        return True
+    from ministack.core.iam_evaluator import EvalContext, resource_policy_allows
+    from ministack.services import sqs as _sqs
+
+    found = _sqs.queue_policy_for_arn(str(spec))
+    if found is None:
+        return False
+    ctx = EvalContext(
+        principal_arn=role_arn,
+        principal_type="AssumedRole",
+        principal_account=role_arn.split(":")[4] if role_arn.count(":") >= 5 else "",
+        action="sqs:SendMessage",
+        resource_arn=str(spec),
+        region=spec.region,
+    )
+    return resource_policy_allows(found[0], ctx, same_account=False)
+
+
+def _target_matches_request_scope(spec, target=None) -> bool:
     # Cross-region targets are accepted at PutTargets but fail delivery here for AWS parity.
-    return spec.account_id == get_account_id() and spec.region == get_region()
+    if spec.region != get_region():
+        return False
+    if spec.account_id == get_account_id():
+        return True
+    # AWS delivers to a target in another account of the same region through the target's execution
+    # role. Modelled for SQS, whose queues are looked up by the account in their ARN.
+    return spec.service == "sqs" and bool((target or {}).get("RoleArn"))
 
 
 def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
