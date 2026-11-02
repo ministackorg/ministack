@@ -463,6 +463,7 @@ subnet = ec2.create_subnet(
 |---------|---------|
 | **Stack Operations** | CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks, DescribeStackEvents, DescribeStackResource, DescribeStackResources, GetTemplate, ValidateTemplate, GetTemplateSummary, RollbackStack |
 | **Change Sets** | CreateChangeSet, DescribeChangeSet, ExecuteChangeSet, DeleteChangeSet, ListChangeSets |
+| **StackSets** | DescribeStackSet, ListStackInstances — for StackSets created by an `AWS::CloudFormation::StackSet` resource |
 | **Exports** | ListExports — cross-stack references via `Fn::ImportValue` |
 | **Template Formats** | JSON and YAML (including `!Ref`, `!Sub`, `!GetAtt` shorthand tags) |
 | **Intrinsic Functions** | Ref, Fn::GetAtt, Fn::Join, Fn::Sub (both forms), Fn::Select, Fn::Split, Fn::If, Fn::Equals, Fn::And, Fn::Or, Fn::Not, Fn::Base64, Fn::FindInMap, Fn::ImportValue, Fn::GetAZs, Fn::Cidr |
@@ -623,6 +624,7 @@ subnet = ec2.create_subnet(
 | `AWS::CloudFormation::WaitCondition` | Condition ID | Data, Id |
 | `AWS::CloudFormation::WaitConditionHandle` | Signal URL | Id |
 | `AWS::CloudFormation::Stack` (nested) | Child stack ARN | `Outputs.<Name>` — each child stack Output |
+| `AWS::CloudFormation::StackSet` | StackSetId | — (SELF_MANAGED, one instance in the stack's own account and Region, deployed as a nested stack) |
 
 Unsupported resource types fail with `CREATE_FAILED` (or `ROLLBACK_COMPLETE` if rollback is enabled), so templates with unsupported types won't silently succeed.
 
