@@ -3959,6 +3959,9 @@ def _eb_rule_create(logical_id, props, stack_name):
     key = _eb._rule_key(name, bus)
     # The service's own ARN shape: a default-bus rule has no bus segment.
     arn = _eb._rule_arn(name, bus)
+    resp = _eb._validate_event_bus_targets(bus, props.get("Targets", []) or [])
+    if resp:
+        raise ValueError(f"AWS::Events::Rule PutTargets failed: {resp[2]!r}")
 
     _eb._rules[key] = {
         "Name": name,

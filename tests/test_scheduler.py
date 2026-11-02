@@ -757,7 +757,7 @@ def test_scheduler_ticker_dispatches_in_schedule_region_and_restores_context(mon
 
     calls = []
 
-    def _capture_target(target, event, schedule):
+    def _capture_target(target, event, schedule, from_rule=True):
         calls.append((get_account_id(), get_region(), target, event, schedule))
 
     monkeypatch.setattr(eventbridge, "_invoke_target", _capture_target)

@@ -38345,6 +38345,25 @@ def test_cfn_events_rule_invalid_bus_arn_is_rejected(cfn, eb, bus_ref):
         _delete_cfn_test_stack(cfn, name)
 
 
+def test_cfn_events_rule_event_bus_target_needs_role(cfn, eb):
+    """The create runs PutTargets' event bus checks, as the update already did."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-rule-bus-target-{uid}"
+    bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{name}"
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps({"Resources": {
+        "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": name}},
+        "Rule": {"Type": "AWS::Events::Rule", "DependsOn": "Bus", "Properties": {
+            "Name": name, "EventPattern": {"source": ["cfn.test"]},
+            "Targets": [{"Id": "bus", "Arn": bus_arn}]}}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert f"RoleArn is required for target {bus_arn}." in _stack_event_reasons(cfn, name)
+        assert not any(rule["Name"] == name for rule in eb.list_rules(EventBusName="default")["Rules"])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 _IDENTITY_TAG_TRUST = {"Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
                                  "Action": "sts:AssumeRole"}]}
 
