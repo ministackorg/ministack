@@ -6297,8 +6297,8 @@ def test_put_events_cross_account_explicit_deny_on_event_keys(xa, auth_enabled, 
 
 # ---------------------------------------------------------------------------
 # Rule targets that are event buses in another account or region (#2526).
-# Capture keys name probes of capture_2526_round1..round3 (eu-west-2, us-east-1
-# and us-west-2; three real accounts, the rule's in eu-west-2).
+# Probe ids name captures of rounds 1 to 5 (eu-west-2, us-east-1 and us-west-2;
+# three real accounts, the rules in eu-west-2).
 # ---------------------------------------------------------------------------
 
 _FWD_RULES = "444455556666"
@@ -6417,6 +6417,8 @@ _FWD_ROLE = f"arn:aws:iam::{_FWD_RULES}:role/fwd"
 _THEIR_ROLE = f"arn:aws:iam::{_FWD_BUSES}:role/fwd"
 _RETRY_REFUSED = ("ValidationException", "Retry policy is not supported for Event bus targets.")
 _OWN_BUS_REFUSED = ("ValidationException", "Source EventBus and Target EventBus must not be the same.")
+_PASS_ROLE_REFUSED = ("AccessDeniedException",
+                      f"Access to the resource {_THEIR_ROLE} is denied. Reason: Cross-account pass role is not allowed.")
 
 
 def _role_required(arn):
@@ -6450,10 +6452,12 @@ def _role_required(arn):
     ([{"Arn": f"arn:aws:sqs:us-east-1:{_FWD_RULES}:fwd-q"}, {"Arn": _OTHER_ACCOUNT_BUS}],
      _role_required(_OTHER_ACCOUNT_BUS)),
     ([{"Arn": _OTHER_ACCOUNT_BUS}, {"Arn": _OTHER_REGION_BUS}], _role_required(_OTHER_ACCOUNT_BUS)),
-    # round4 P8: a role in another account cannot be passed.
-    ([{"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}],
-     ("AccessDeniedException",
-      f"Access to the resource {_THEIR_ROLE} is denied. Reason: Cross-account pass role is not allowed.")),
+    # round4 P8, round5 X1..X5: a role in another account cannot be passed, which is
+    # checked before anything else.
+    ([{"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
+    ([{"Arn": _OWN_BUS}, {"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
+    ([{"Arn": _OWN_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY},
+      {"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
 ])
 def test_put_targets_event_bus_target_checks(fwd, targets, error):
     events = fwd.client("events", _FWD_RULES)
@@ -6470,8 +6474,8 @@ def test_put_targets_event_bus_target_checks(fwd, targets, error):
 
 
 def test_put_targets_event_bus_target_with_role_and_dead_letter_queue_is_accepted(fwd):
-    """round1 V10, V11, round4 P11, P12: a role of the rule's account makes any bus a
-    valid target, even one that does not exist, whatever the role ARN's path or region."""
+    """round1 V10, V11, round4 P11, P12: a role of the rule's account makes any other
+    bus a valid target, even one that does not exist, whatever the role ARN's path or region."""
     events = fwd.client("events", _FWD_RULES)
     rule = f"fwd-ok-{_uuid_mod.uuid4().hex[:8]}"
     events.put_rule(Name=rule, EventPattern=json.dumps({"detail-type": ["fwd"]}))
@@ -6578,6 +6582,7 @@ def test_rule_forwarding_refused_without_permission(fwd, auth_enabled, case, acc
     ("source-condition", _FWD_BUSES, "us-east-1"),      # round4 P3a
     ("own-bus-allows-another-account", _FWD_RULES, "us-east-1"),  # round4 P7
     ("trust-names-the-rule", _FWD_RULES, "us-east-1"),  # round4 P10: aws:SourceArn is the rule's ARN
+    ("trust-names-the-account", _FWD_RULES, "us-east-1"),  # round5 R2: aws:SourceAccount is the rule's account
     ("role-allowed-the-bus-region", _FWD_RULES, "us-west-2"),  # round4 P13a
 ])
 def test_rule_forwarding_allowed(fwd, auth_enabled, case, account, region):
@@ -6586,6 +6591,8 @@ def test_rule_forwarding_allowed(fwd, auth_enabled, case, account, region):
     if case == "trust-names-the-rule":
         role = fwd.role(trust_condition={"StringEquals": {
             "aws:SourceArn": f"arn:aws:events:us-east-1:{_FWD_RULES}:rule/{src}/{rule}"}})
+    elif case == "trust-names-the-account":
+        role = fwd.role(trust_condition={"StringEquals": {"aws:SourceAccount": _FWD_RULES}})
     elif case == "role-allowed-the-bus-region":
         role = fwd.role(policy_condition={"StringEquals": {"aws:RequestedRegion": region}})
     else:
@@ -6604,8 +6611,8 @@ def test_rule_forwarding_allowed(fwd, auth_enabled, case, account, region):
 
 
 def test_rule_forwarding_reaches_a_bus_target_in_the_same_region_once(fwd):
-    """round1 H1, H4: an event a rule forwarded may not reach another bus in the same
-    region, in any account (AWS records THIRD_ACCOUNT_HOP_DETECTED), but may still
+    """round1 H1, H4: an event a rule forwarded within its region may not reach another
+    bus in that region, in any account (AWS records THIRD_ACCOUNT_HOP_DETECTED), but may still
     cross into another region with a new id. round2 Q3: that crossing may then
     reach another account. round4 P1: and the crossed event may make one more
     same-region hop."""
@@ -6632,9 +6639,9 @@ def test_rule_forwarding_reaches_a_bus_target_in_the_same_region_once(fwd):
 
 
 def test_rule_forwarding_crosses_regions_once(fwd):
-    """round1 H3, round2 Q2: after crossing into another region an event may make
-    one more same-region hop, in any account, but crosses no further region, its
-    own included (AWS records THIRD_REGION_HOP_DETECTED)."""
+    """round1 H3, round2 Q2, round5 R1: after crossing into another region an event
+    may make one more same-region hop, in any account, but crosses no further region,
+    its own included, not even after that hop (AWS records THIRD_REGION_HOP_DETECTED)."""
     role = fwd.role()
     src, _, _ = fwd.bus(_FWD_RULES, "us-east-1", "src")
     _, back, back_received = fwd.bus(_FWD_RULES, "us-east-1", "back")
@@ -6643,11 +6650,13 @@ def test_rule_forwarding_crosses_regions_once(fwd):
     _, other_account, other_account_received = fwd.bus(_FWD_BUSES, "us-west-2", "theirs", _allow(_FWD_RULES))
     _, after_hop2, after_hop2_received = fwd.bus(_FWD_RULES, "us-west-2", "after")
     _, third_region, third_region_received = fwd.bus(_FWD_RULES, "eu-west-2", "third")
+    _, after_hop2_crossed, after_hop2_crossed_received = fwd.bus(_FWD_RULES, "eu-west-2", "after-crossed")
     fwd.forward(_FWD_RULES, "us-east-1", src, [{"Arn": hop_arn, "RoleArn": role}])
     fwd.forward(_FWD_RULES, "us-west-2", hop, [
         {"Arn": back, "RoleArn": role}, {"Arn": third_region, "RoleArn": role},
         {"Arn": hop2_arn, "RoleArn": role}, {"Arn": other_account, "RoleArn": role}])
-    fwd.forward(_FWD_RULES, "us-west-2", hop2, [{"Arn": after_hop2, "RoleArn": role}])
+    fwd.forward(_FWD_RULES, "us-west-2", hop2, [
+        {"Arn": after_hop2, "RoleArn": role}, {"Arn": after_hop2_crossed, "RoleArn": role}])
     event_id = fwd.publish(_FWD_RULES, "us-east-1", src, "x")
     [crossed] = hop_received()
     assert crossed["id"] != event_id
@@ -6656,13 +6665,14 @@ def test_rule_forwarding_crosses_regions_once(fwd):
     assert back_received() == []
     assert third_region_received() == []
     assert after_hop2_received() == []
+    assert after_hop2_crossed_received() == []
 
 
 @pytest.mark.auth_contract
 def test_schedule_publishing_to_a_bus_is_not_a_rules_forward(fwd, auth_enabled):
-    """A schedule whose target is an event bus publishes to it as before: its role
-    trusts EventBridge Scheduler, not EventBridge, and a rule on that bus may still
-    forward the event to another bus in the region."""
+    """MiniStack's existing behaviour, not a capture: a schedule whose target is an
+    event bus publishes to it without the checks a rule's target gets (its role
+    trusts EventBridge Scheduler), and a rule on that bus may forward the event on."""
     scheduler = fwd.client("scheduler", _FWD_RULES)
     role = fwd.role(service="scheduler.amazonaws.com")
     bus, bus_arn, bus_received = fwd.bus(_FWD_RULES, "us-east-1", "scheduled")

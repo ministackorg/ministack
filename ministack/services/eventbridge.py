@@ -138,6 +138,12 @@ def _ensure_default_bus():
         }
 
 
+def _event_bus_exists(name):
+    """Whether the current tenant has bus ``name``. Every account has a default
+    bus, whether or not this emulator has written its record yet."""
+    return name == "default" or name in _event_buses
+
+
 def _events_log_list() -> list:
     entries = _events_log.get("entries")
     if entries is None:
@@ -711,13 +717,24 @@ def _event_bus_spec(arn):
 
 
 def _validate_event_bus_targets(rule_bus, targets):
-    """AWS's checks on a rule's event bus targets. Target by target, in order:
-    the rule's own bus, then any ``RetryPolicy`` (even an empty one). Then,
+    """AWS's checks on a rule's event bus targets. First, across every target, a
+    role in another account, which cannot be passed. Then target by target, in
+    order: the rule's own bus, then any ``RetryPolicy`` (even an empty one). Then,
     across every target, a missing ``RoleArn``, which every event bus target
-    needs, the rule's own account and region included. Then a role in another
-    account, which cannot be passed."""
+    needs, the rule's own account and region included."""
     buses = [(target, spec) for target in targets
              if (spec := _event_bus_spec(target.get("Arn", ""))) is not None]
+    for target, _ in buses:
+        try:
+            role_account = parse_arn(target.get("RoleArn", "")).account_id
+        except ArnParseError:
+            continue
+        if role_account != get_account_id():
+            return error_response_json(
+                "AccessDeniedException",
+                f"Access to the resource {target['RoleArn']} is denied. Reason: Cross-account pass role is not allowed.",
+                400,
+            )
     for target, spec in buses:
         if (spec.account_id == get_account_id() and spec.region == get_region()
                 and spec.resource == f"event-bus/{rule_bus}"):
@@ -729,17 +746,6 @@ def _validate_event_bus_targets(rule_bus, targets):
     for target, _ in buses:
         if not target.get("RoleArn"):
             return error_response_json("ValidationException", f"RoleArn is required for target {target['Arn']}.", 400)
-    for target, _ in buses:
-        try:
-            role_account = parse_arn(target["RoleArn"]).account_id
-        except ArnParseError:
-            continue
-        if role_account != get_account_id():
-            return error_response_json(
-                "AccessDeniedException",
-                f"Access to the resource {target['RoleArn']} is denied. Reason: Cross-account pass role is not allowed.",
-                400,
-            )
     return None
 
 
@@ -2534,8 +2540,9 @@ def _events_may_assume(role, rule):
             applies = not _service_principal_matches(stmt["NotPrincipal"], "events.amazonaws.com")
         else:
             principal = stmt.get("Principal")
+            aws = principal.get("AWS", []) if isinstance(principal, dict) else []
             applies = (principal == "*" or _service_principal_matches(principal, "events.amazonaws.com")
-                       or (isinstance(principal, dict) and principal.get("AWS") in ("*", ["*"])))
+                       or "*" in ([aws] if isinstance(aws, str) else aws))
         actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
         if not applies or not _action_matches(
                 "sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
@@ -2591,8 +2598,7 @@ def _event_bus_target_denial(spec, event, rule, target):
         return "NO_PERMISSIONS"
     name = spec.resource.split("/", 1)[1]
     with request_scope(spec.account_id, spec.region):
-        _ensure_default_bus()
-        policy = _event_bus_policies.get(name) if name in _event_buses else None
+        policy = _event_bus_policies.get(name) if _event_bus_exists(name) else None
     same_account = spec.account_id == account
     if policy is None:
         return None if same_account else "NO_PERMISSIONS"
@@ -2620,7 +2626,8 @@ def _dispatch_to_event_bus(spec, event, rule, target, target_input_payload=None,
     if from_rule:
         if (spec.account_id == get_account_id() and same_region
                 and bus_name == event.get("EventBusName", "default")):
-            # Only state saved before PutTargets refused a rule's own bus holds such a target.
+            # PutTargets refuses such a target; state saved before it did, or a
+            # CloudFormation update moving a rule onto the bus, can still hold one.
             logger.warning("EventBridge -> Event bus %s: not delivered: the rule's own bus", target["Arn"])
             return
         code = _event_bus_hop_refusal(event, same_region) or _event_bus_target_denial(spec, event, rule, target)
@@ -2640,8 +2647,7 @@ def _dispatch_to_event_bus(spec, event, rule, target, target_input_payload=None,
     if target_input_payload is not None:
         forwarded["Detail"] = target_input_payload
     with request_scope(spec.account_id, spec.region):
-        _ensure_default_bus()
-        if bus_name not in _event_buses:
+        if not _event_bus_exists(bus_name):
             logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
             return
         forwarded["EventBusName"] = bus_name

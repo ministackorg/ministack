@@ -38346,7 +38346,8 @@ def test_cfn_events_rule_invalid_bus_arn_is_rejected(cfn, eb, bus_ref):
 
 
 def test_cfn_events_rule_event_bus_target_needs_role(cfn, eb):
-    """The create runs PutTargets' event bus checks, as the update already did."""
+    """round5 of #2526: on AWS the rule fails to create with "RoleArn is required for
+    target <arn>." and the stack rolls back; MiniStack's update already refused it."""
     uid = _uuid_mod.uuid4().hex[:8]
     name = f"cfn-rule-bus-target-{uid}"
     bus_arn = f"arn:aws:events:us-east-1:000000000000:event-bus/{name}"
