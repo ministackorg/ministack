@@ -18911,6 +18911,50 @@ def test_cfn_sam_globals_architectures_reach_the_lambda_function():
     assert "Architectures" not in emitted(base)
 
 
+@pytest.mark.data_plane
+def test_cfn_lambda_function_runs_on_the_architecture_it_declares(cfn, lam):
+    """A template's function runs as the architecture it declares where the
+    host can run it, and on the host's own architecture where it cannot (no
+    qemu/Rosetta), never failing the invoke; a function that declares none
+    runs on the host's. On AWS (eu-west-1, 2026-11-02) [x86_64] ran x86_64,
+    [arm64] aarch64, and none x86_64."""
+    import platform as _platform
+    import sys as _sys
+
+    native = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64",
+              "aarch64": "aarch64"}.get(_platform.machine().lower())
+
+    def emulated(machine):
+        return machine == native or _sys.platform == "darwin" or os.path.exists(
+            f"/proc/sys/fs/binfmt_misc/qemu-{machine}")
+
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"cfn-arch-run-{s}"
+    code = "import platform\ndef handler(event, context):\n    return {'machine': platform.machine()}\n"
+    declared = {"X86": ["x86_64"], "Arm": ["arm64"], "None": None}
+    resources = {}
+    for logical, arch in declared.items():
+        props = {"FunctionName": f"cfn-arch-{logical.lower()}-{s}", "Runtime": "python3.12",
+                 "Handler": "index.handler", "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                 "Timeout": 30, "Code": {"ZipFile": code}}
+        if arch:
+            props["Architectures"] = arch
+        resources[logical] = {"Type": "AWS::Lambda::Function", "Properties": props}
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": resources}))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        expected = {"X86": "x86_64", "Arm": "aarch64", "None": native}
+        for logical, machine in expected.items():
+            for _ in range(2):
+                resp = lam.invoke(FunctionName=f"cfn-arch-{logical.lower()}-{s}", Payload=b"{}")
+                payload = json.loads(resp["Payload"].read())
+                assert resp.get("FunctionError") is None, (logical, payload)
+                ran = payload["machine"]
+                assert ran == (machine if emulated(machine) else native), (logical, ran)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+
+
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
     """A layer plus the permission resource that grants another account access
     to it — the shape serverless-python-requirements emits for a layer with
