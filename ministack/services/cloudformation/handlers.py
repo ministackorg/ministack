@@ -612,11 +612,7 @@ _OPERATION_EVENT_FIELDS = (
 
 
 def _describe_events(params):
-    """The operation events of a stack or a change set. MiniStack records the
-    validation errors of a create, update or change set that fails
-    pre-deployment validation, the case the stack event or the change set's
-    StatusReason tells the caller to call DescribeEvents for. A change set's
-    events are its own: the stack's do not include them (measured)."""
+    """The operation events of a stack or a change set (a change set's are its own, not the stack's)."""
     stack_name = _p(params, "StackName")
     stack = _resolve_stack(stack_name) if stack_name else None
     if _p(params, "ChangeSetName"):
@@ -1768,7 +1764,7 @@ def _stack_set_query(params, action):
 
     if action == "ListStackInstances":
         if any(k.startswith("Filters.") for k in params):
-            return _error("ValidationError", "MiniStack does not support Filters on ListStackInstances")
+            return _error("ValidationError", "MiniStack does not emulate Filters on ListStackInstances")
         status = stack.get("StackStatus", "")
         state, detail = (("CURRENT", "SUCCEEDED") if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE")
                          else ("OUTDATED", "RUNNING") if status.endswith("_IN_PROGRESS") else ("OUTDATED", "FAILED"))

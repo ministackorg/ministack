@@ -4283,6 +4283,40 @@ def test_sfn_ecs_sync_poll_waits_for_stopped_and_preserves_result(monkeypatch):
     assert result["tasks"][0]["containers"][0]["exitCode"] == 17
 
 
+@pytest.mark.parametrize("containers,essentials,fails", [
+    ([{"name": "main", "exitCode": 0}], [True], False),
+    ([{"name": "main", "exitCode": 1}], [True], True),
+    ([{"name": "main"}], [True], True),  # never started (TaskFailedToStart): no exit code
+    ([{"name": "main", "exitCode": 0}, {"name": "side", "exitCode": 3}], [True, False], False),
+])
+def test_sfn_ecs_sync_result_is_the_stopped_task(monkeypatch, containers, essentials, fails):
+    """Captured on AWS (#2525): runTask.sync fails with States.TaskFailed when an essential container exits
+    non-zero or the task never starts, with the stopped task in PascalCase as the cause; otherwise that
+    task is the result."""
+    from ministack.services import ecs as ecs_service
+    from ministack.services import stepfunctions as sfn_service
+
+    task = {"taskArn": "arn:aws:ecs:us-east-1:000000000000:task/c/t1", "lastStatus": "STOPPED",
+            "stopCode": "EssentialContainerExited", "createdAt": "2026-10-31T10:00:00Z", "containers": containers}
+    monkeypatch.setattr(ecs_service, "_run_task", lambda data: (200, {}, json.dumps({"tasks": [task], "failures": []})))
+    monkeypatch.setattr(sfn_service, "_poll_ecs_tasks", lambda cluster, arns: {"tasks": [task], "failures": []})
+    monkeypatch.setattr(ecs_service, "_resolve_task", lambda ref, cluster="default": {"_container_essentials": essentials})
+    monkeypatch.setattr(ecs_service, "_resolve_cluster_name", lambda ref: ref)
+
+    expected = {"TaskArn": task["taskArn"], "LastStatus": "STOPPED", "StopCode": "EssentialContainerExited",
+                "CreatedAt": 1793440800000, "Containers": [{k[:1].upper() + k[1:]: v for k, v in c.items()}
+                                                           for c in containers]}
+    run = lambda: sfn_service._invoke_ecs_run_task("arn:aws:states:::ecs:runTask.sync",  # noqa: E731
+                                                   {"Cluster": "c", "TaskDefinition": "td"})
+    if fails:
+        with pytest.raises(sfn_service._ExecutionError) as exc:
+            run()
+        assert exc.value.error == "States.TaskFailed"
+        assert json.loads(exc.value.cause) == expected
+    else:
+        assert run() == expected
+
+
 def test_sfn_integration_ecs_run_task_sync_success(sfn, ecs):
     """ecs:runTask.sync waits for task STOPPED, then returns task result."""
     import threading
@@ -4346,13 +4380,13 @@ def test_sfn_integration_ecs_run_task_sync_success(sfn, ecs):
     desc = _wait_sfn(sfn, ex["executionArn"], timeout=20)
     stopper.join(timeout=5)
     assert desc["status"] == "SUCCEEDED"
-    output = json.loads(desc["output"])
-    assert "tasks" in output
-    task_out = output["tasks"][0]
-    assert task_out["lastStatus"] == "STOPPED"
+    # As on AWS, the output is the stopped task itself, in PascalCase.
+    task_out = json.loads(desc["output"])
+    assert task_out["LastStatus"] == "STOPPED"
+    assert isinstance(task_out["CreatedAt"], int)
     # Containers should have exitCode 0 (stop_task sets this)
-    for c in task_out.get("containers", []):
-        assert c.get("exitCode") == 0
+    for c in task_out.get("Containers", []):
+        assert c.get("ExitCode") == 0
 
 def test_sfn_integration_ecs_run_task_output_contains_status(sfn, ecs):
     """Fire-and-forget ecs:runTask output contains task status and container info."""

@@ -1382,20 +1382,40 @@ def test_rds_pending_upgrade_does_not_leak_to_a_recreated_cluster_and_survives_s
     assert "_major_upgrade_pending" not in restored
 
 
-def test_rds_default_cluster_parameter_groups_are_immutable(rds):
-    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.aurora-mysql8.0")
-    for call in (
-        lambda: rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName="default.aurora-mysql8.0"),
-        lambda: rds.modify_db_cluster_parameter_group(
-            DBClusterParameterGroupName="default.aurora-mysql8.0",
-            Parameters=[{"ParameterName": "max_connections", "ParameterValue": "10", "ApplyMethod": "immediate"}]),
-        lambda: rds.reset_db_cluster_parameter_group(
-            DBClusterParameterGroupName="default.aurora-mysql8.0", ResetAllParameters=True),
-    ):
+def test_rds_major_upgrade_needs_allow_major_version_upgrade(rds):
+    """AWS (Aurora in-place upgrade tutorial): a major version change without the flag is refused."""
+    rds.create_db_cluster(DBClusterIdentifier="amvu", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    try:
         with pytest.raises(ClientError) as exc:
-            call()
-        assert exc.value.response["Error"]["Code"] == "InvalidDBParameterGroupState"
-    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.aurora-mysql8.0")
+            rds.modify_db_cluster(DBClusterIdentifier="amvu", EngineVersion="16.8", ApplyImmediately=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert exc.value.response["Error"]["Message"] == (
+            "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.")
+        assert rds.describe_db_clusters(DBClusterIdentifier="amvu")["DBClusters"][0]["EngineVersion"] == "15.13"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier="amvu", SkipFinalSnapshot=True)
+
+
+def test_rds_default_cluster_parameter_groups_are_immutable(rds):
+    """Captured on AWS (us-east-1): a default group cannot be modified or deleted; a reset succeeds."""
+    name = "default.aurora-mysql8.0"
+    with pytest.raises(ClientError) as exc:
+        rds.modify_db_cluster_parameter_group(DBClusterParameterGroupName=name, Parameters=[
+            {"ParameterName": "long_query_time", "ParameterValue": "100", "ApplyMethod": "immediate"}])
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == "Cannot modify a default parameter group."
+    with pytest.raises(ClientError) as exc:
+        rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName=name)
+    assert exc.value.response["Error"]["Code"] == "InvalidDBParameterGroupState"
+    assert exc.value.response["Error"]["Message"] == f"Default DBClusterParameterGroup cannot be deleted: {name}"
+    resp = rds.reset_db_cluster_parameter_group(DBClusterParameterGroupName=name, ResetAllParameters=True)
+    assert resp["DBClusterParameterGroupName"] == name
+    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName=name)
+    with pytest.raises(ClientError) as exc:
+        rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName="never-created-cpg")
+    assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
+    assert exc.value.response["Error"]["Message"] == "DBClusterParameterGroup not found: never-created-cpg"
 
 
 def test_rds_global_upgrade_materializes_default_group_in_each_members_region():

@@ -1588,6 +1588,125 @@ def test_api_policy_signed_call_on_a_method_without_authorization_contract(auth_
         apigw_v1.delete_rest_api(restApiId=api_id)
 
 
+def _account_client(service, account):
+    """A client whose 12-digit access key selects the MiniStack account."""
+    return boto3.client(service, endpoint_url=_endpoint, aws_access_key_id=account,
+                        aws_secret_access_key="test", region_name="us-east-1")
+
+
+def _mock_ping_api(apigw, authorization):
+    """A REST API deployed to stage ``s`` whose GET /ping answers 200 {"pong": true} from a MOCK."""
+    api_id = apigw.create_rest_api(name=f"any-caller-{_uuid_mod.uuid4().hex[:8]}")["id"]
+    root_id = next(r["id"] for r in apigw.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw.create_resource(restApiId=api_id, parentId=root_id, pathPart="ping")["id"]
+    method = {"restApiId": api_id, "resourceId": resource_id, "httpMethod": "GET"}
+    apigw.put_method(**method, authorizationType=authorization)
+    apigw.put_integration(**method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+    apigw.put_method_response(**method, statusCode="200")
+    apigw.put_integration_response(**method, statusCode="200",
+                                   responseTemplates={"application/json": '{"pong": true}'})
+    apigw.create_deployment(restApiId=api_id, stageName="s")
+    return api_id
+
+
+def _http_get(api_id, path, headers):
+    """GET /s/<path> of a deployed API over HTTP with *headers*, unsigned."""
+    import urllib.error
+    import urllib.request
+
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    request = urllib.request.Request(f"http://{host}/s/{path}", headers={"Host": host, **headers}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_method_without_authorization_answers_any_caller_account_contract(auth_enabled):
+    """A REST API in another account answers an unsigned call (capture A1) and one carrying another
+    account's Authorization header (capture A2): AWS answered 200 {"pong": true} to both."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "NONE")
+    other_account = ("AWS4-HMAC-SHA256 Credential=444455556666/20260101/us-east-1/execute-api/aws4_request, "
+                     "SignedHeaders=host, Signature=0")
+    try:
+        for headers in ({}, {"Authorization": other_account}):
+            status, body = _http_get(api_id, "ping", headers)
+            assert (status, json.loads(body)) == (200, {"pong": True}), (headers, body)
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@contextlib.contextmanager
+def _other_account_user(account):
+    """``(credentials, ARN)`` of an IAM user in *account* allowed to invoke any API; deleted on exit."""
+    from botocore.credentials import Credentials
+
+    iam = _account_client("iam", account)
+    name = f"other-account-{_uuid_mod.uuid4().hex[:8]}"
+    arn = iam.create_user(UserName=name)["User"]["Arn"]
+    iam.put_user_policy(UserName=name, PolicyName="invoke", PolicyDocument=json.dumps(_ALLOW_INVOKE))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    try:
+        yield Credentials(key["AccessKeyId"], key["SecretAccessKey"]), arn
+    finally:
+        iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user_policy(UserName=name, PolicyName="invoke")
+        iam.delete_user(UserName=name)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_method_without_authorization_answers_another_accounts_user_contract(auth_enabled):
+    """A call signed by an IAM user of another account reaches a method without authorization
+    (capture A3: AWS answered 200 {"pong": true}); its valid key is checked in its own account."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "NONE")
+    try:
+        with _other_account_user("444455556666") as (credentials, _arn):
+            status, _headers, body = _contract_invoke(api_id, "ping", credentials)
+        assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_of_another_account_contract(auth_enabled):
+    """An AWS_IAM method of another account with no REST API policy refuses the caller under AUTH=true
+    (capture A4: 403 AccessDeniedException {"Message": "User: <caller> is not authorized to access this resource"})."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "AWS_IAM")
+    try:
+        with _other_account_user("444455556666") as (credentials, arn):
+            status, headers, body = _contract_invoke(api_id, "ping", credentials)
+        if auth_enabled:
+            assert (status, headers.get("x-amzn-ErrorType")) == (403, "AccessDeniedException"), body
+            assert json.loads(body) == {"Message": f"User: {arn} is not authorized to access this resource"}
+        else:
+            assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_allowed_to_another_account_by_api_policy_contract(auth_enabled):
+    """A REST API policy allowing another account lets its user call an AWS_IAM method
+    (capture A5: AWS answered 200 {"pong": true})."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "AWS_IAM")
+    owner.update_rest_api(restApiId=api_id, patchOperations=[{
+        "op": "replace", "path": "/policy",
+        "value": json.dumps(_api_policy(("Allow", {"AWS": "arn:aws:iam::444455556666:root"})))}])
+    owner.create_deployment(restApiId=api_id, stageName="s")
+    try:
+        with _other_account_user("444455556666") as (credentials, _arn):
+            status, _headers, body = _contract_invoke(api_id, "ping", credentials)
+        assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
 def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):
     """Payload format 1.0 `multiValueHeaders` yields one header line per value.
 

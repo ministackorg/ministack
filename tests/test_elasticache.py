@@ -1985,6 +1985,34 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     assert ("000000000000", "us-east-1", "rg-1") not in _ec._pending_rg_respawn
 
 
+def test_elasticache_restore_state_reports_the_respawned_replication_group_address(monkeypatch):
+    """A respawned node group container has a new address; the group's endpoints report it (#2521)."""
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                        lambda name, engine, engine_version, labels, **_: ("172.18.0.9", 6379, f"cid-{name}"))
+    old = {"Address": "172.18.0.4", "Port": 6379}
+    _ec.load_persisted_state({
+        "replication_groups": {
+            "rg-ep": {
+                "ReplicationGroupId": "rg-ep", "Engine": "valkey", "EngineVersion": "8.1",
+                "ConfigurationEndpoint": dict(old),
+                "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                                "NodeGroupMembers": [{"CacheClusterId": "rg-ep-0001-001", "ReadEndpoint": dict(old)}]}],
+                "_docker_container_ids": ["dead-cid"],
+            },
+        },
+    })
+    _ec._ensure_live_containers()
+    rg = _ec._replication_groups["rg-ep"]
+    new = {"Address": "172.18.0.9", "Port": 6379}
+    ng = rg["NodeGroups"][0]
+    assert ng["PrimaryEndpoint"] == ng["ReaderEndpoint"] == ng["NodeGroupMembers"][0]["ReadEndpoint"] == new
+    assert rg["ConfigurationEndpoint"] == new
+
+
 def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
     from ministack.services import elasticache as _ec

@@ -6283,16 +6283,8 @@ def _delete_db_cluster(p):
 
 
 def _password_reset_view(c, advance):
-    """Return *c* as AWS shows it during a master password reset.
-
-    Real AWS (captured, us-west-2): after the change, the ModifyDBCluster
-    response and the next DescribeDBClusters show an available cluster with
-    PendingModifiedValues {MasterUserPassword: ****}, the one after reports
-    resetting-master-credentials, and later ones available with nothing
-    pending. ``_password_reset_describes`` counts the describes answered;
-    once set it is only reassigned (3 = settled), so describe and stop never
-    change the cluster dict's size under a concurrent get_state() deepcopy.
-    """
+    """*c* as AWS shows it during a master password reset: pending, then resetting, then settled, one describe each.
+    ``_password_reset_describes`` is only reassigned (3 = settled), never popped, for concurrent get_state()."""
     seen = c.get("_password_reset_describes")
     if seen is None or seen > 2:
         return c
@@ -6304,6 +6296,16 @@ def _password_reset_view(c, advance):
     if advance and seen == 1 and c.get("Status") == "available":
         view["Status"] = "resetting-master-credentials"
     return view
+
+
+def _cluster_view(c, advance):
+    """*c* with both a pending password reset and a pending major upgrade shown. Each view
+    advances the stored cluster, so both run on it and their changes are merged."""
+    upgrade, reset = _upgrade_view(c, advance), _password_reset_view(c, advance)
+    if reset is c:
+        return upgrade
+    return {**upgrade, "Status": reset["Status"] if reset["Status"] != c.get("Status") else upgrade["Status"],
+            "PendingModifiedValues": {**(upgrade.get("PendingModifiedValues") or {}), **reset["PendingModifiedValues"]}}
 
 
 def _describe_db_clusters(p):
@@ -6325,7 +6327,7 @@ def _describe_db_clusters(p):
         from ministack.services import documentdb
         docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(_upgrade_view(c, True))}</DBCluster>" for c in clusters) + docdb_members
+    members = "".join(f"<DBCluster>{_cluster_xml(_cluster_view(c, True))}</DBCluster>" for c in clusters) + docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
@@ -6518,6 +6520,13 @@ def _modify_db_cluster_impl(p):
     )
     if global_version_conflict:
         return global_version_conflict
+    old_family = _aurora_cluster_family(cluster.get("Engine"), cluster.get("EngineVersion"))
+    new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
+    if (old_family and new_family and old_family != new_family
+            and _p(p, "AllowMajorVersionUpgrade").lower() != "true"):
+        # AWS Aurora user guide, in-place upgrade tutorial.
+        return _error("InvalidParameterCombination",
+                      "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.", 400)
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(
@@ -6619,7 +6628,7 @@ def _modify_db_cluster_impl(p):
                 _inherit_performance_insights(instance, cluster)
 
     return _xml(200, "ModifyDBClusterResponse",
-        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_upgrade_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
+        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_cluster_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6998,14 +7007,7 @@ def _create_db_cluster_param_group(p):
 
 
 def _upgrade_view(c, advance):
-    """Return *c* as AWS shows it while a major upgrade is in progress.
-
-    Real AWS (captured, us-west-2, Aurora PostgreSQL 15.19 -> 16.15): ModifyDBCluster
-    answers status available, the old version and group, and PendingModifiedValues
-    {EngineVersion: new}; the next describe shows status upgrading (stored, so the
-    state checks of other operations see it); the one after shows the new version
-    and default group, nothing pending. The stored cluster already holds the end state.
-    """
+    """*c* as AWS shows it during a major upgrade: old version pending, then upgrading (stored), then settled."""
     pending = c.get("_major_upgrade_pending")
     if pending is None:
         return c
@@ -7036,12 +7038,7 @@ def _aurora_cluster_family(engine, engine_version):
 
 
 def _set_cluster_engine_version(cluster, engine_version):
-    """Set a cluster's engine version.
-
-    A major upgrade (the parameter group family changes) is reported as AWS does
-    while it runs, and a cluster or member instance on the old family's default
-    group moves to the new family's default; custom groups stay.
-    """
+    """Set a cluster's engine version; a major upgrade moves default groups to the new family's."""
     old_version, old_group = cluster.get("EngineVersion"), cluster.get("DBClusterParameterGroup")
     engine = cluster.get("Engine")
     old_family = _aurora_cluster_family(engine, old_version)
@@ -7093,10 +7090,13 @@ def _is_default_cluster_param_group(name):
         f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}
 
 
-def _default_cluster_param_group_immutable(name, verb):
-    if _is_default_cluster_param_group(name):
-        return _error("InvalidDBParameterGroupState",
-            f"You cannot {verb} the default DB cluster parameter group {name}.", 400)
+def _default_cluster_param_group_refusal(name, action):
+    """AWS refuses to modify or delete a default cluster parameter group (captured); a reset succeeds."""
+    if not _is_default_cluster_param_group(name):
+        return None
+    if action == "modify":
+        return _error("InvalidParameterValue", "Cannot modify a default parameter group.", 400)
+    return _error("InvalidDBParameterGroupState", f"Default DBClusterParameterGroup cannot be deleted: {name}", 400)
 
 
 def _describe_db_cluster_param_groups(p):
@@ -7122,12 +7122,11 @@ def _describe_db_cluster_param_groups(p):
 
 def _delete_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
-    if immutable := _default_cluster_param_group_immutable(name, "delete"):
-        return immutable
+    if refusal := _default_cluster_param_group_refusal(name, "delete"):
+        return refusal
     pg = _db_cluster_param_groups.pop(name, None)
     if not pg:
-        return _error("DBParameterGroupNotFound",
-            f"DB cluster parameter group {name} not found.", 404)
+        return _error("DBParameterGroupNotFound", f"DBClusterParameterGroup not found: {name}", 404)
     _tags.pop(pg.get("DBClusterParameterGroupArn", ""), None)
     return _xml(200, "DeleteDBClusterParameterGroupResponse", "")
 
@@ -7146,8 +7145,8 @@ def _describe_db_cluster_parameters(p):
 
 def _modify_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
-    if immutable := _default_cluster_param_group_immutable(name, "modify"):
-        return immutable
+    if refusal := _default_cluster_param_group_refusal(name, "modify"):
+        return refusal
     pg = _db_cluster_param_groups.get(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
@@ -7169,9 +7168,7 @@ def _modify_db_cluster_param_group(p):
 
 def _reset_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
-    if immutable := _default_cluster_param_group_immutable(name, "reset"):
-        return immutable
-    pg = _db_cluster_param_groups.get(name)
+    pg = _cluster_param_group(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)

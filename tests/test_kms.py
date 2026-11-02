@@ -2160,17 +2160,17 @@ def test_kms_generate_random_validation(kms_client):
     CustomKeyStoreId a CustomKeyStoreNotFoundException — botocore validates the
     range client-side, so the raw-request path is exercised via the wire."""
     import requests as _requests
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
 
     def _raw(payload):
-        return _requests.post(
-            ENDPOINT,
-            json=payload,
-            headers={
-                "x-amz-target": "TrentService.GenerateRandom",
-                "content-type": "application/x-amz-json-1.1",
-            },
-            timeout=10,
-        )
+        # Signed with the client's credentials, so it also passes authentication under AUTH=true.
+        request = AWSRequest("POST", ENDPOINT, data=json.dumps(payload), headers={
+            "x-amz-target": "TrentService.GenerateRandom",
+            "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(kms_client._get_credentials(), "kms", kms_client.meta.region_name).add_auth(request)
+        return _requests.post(ENDPOINT, data=request.body, headers=dict(request.headers), timeout=10)
 
     resp = _raw({})
     assert resp.status_code == 400

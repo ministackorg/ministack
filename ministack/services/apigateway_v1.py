@@ -909,6 +909,14 @@ def _restore_child_store(store, restored, parent_regions, parent_name_from_key=l
         store.set_scoped(account_id, region, key, value)
 
 
+def find_api_owner(api_id):
+    """The account owning REST API ``api_id``, or None. Only for invoking it."""
+    for (stored_account, _region, stored_api_id), _api in _rest_apis.all_items():
+        if stored_api_id == api_id:
+            return stored_account
+    return None
+
+
 def find_api_scope(api_id):
     """Return (account_id, region) owning api_id within the ambient account."""
     account_id = get_account_id()
@@ -1641,6 +1649,22 @@ def authentication_error_response(api_id, stage_name, error, headers, query_para
     }
     with request_scope(*scope):
         return _gateway_error_response(_GatewayError(response_type, error.message, error_type), request)
+
+
+def cross_account_denial_response(api_id, stage_name, denied, headers, query_params, owner_scope):
+    """AWS's 403 for another account's call no policy allows; None (an explicit Deny) keeps the default."""
+    if denied.decision == "Deny":
+        return None
+    with request_scope(*owner_scope):
+        stage = stages_for_api(api_id).get(stage_name)
+        if stage is None:
+            return None
+        request = {
+            "api_id": api_id, "stage_name": stage_name, "stage": stage, "headers": headers or {},
+            "query_params": query_params or {}, "path_params": {}, "resource_path": "", "request_id": new_uuid(),
+        }
+        message = f"User: {denied.principal_arn} is not authorized to access this resource"
+        return _gateway_error_response(_GatewayError("ACCESS_DENIED", message), request)
 
 
 def method_authorization_type(api_id, stage_name, method, path):

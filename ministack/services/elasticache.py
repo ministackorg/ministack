@@ -331,7 +331,7 @@ def _ensure_live_containers_locked():
             node_groups = rg.get("NodeGroups") or []
             for ng in node_groups:
                 ng_id = ng.get("NodeGroupId", "0001")
-                _, _, cid = _spawn_redis_container(
+                host, port, cid = _spawn_redis_container(
                     name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                     engine=engine, engine_version=engine_version,
                     transit=rg.get("TransitEncryptionEnabled", False), auth_token=_record_auth(rg),
@@ -343,6 +343,13 @@ def _ensure_live_containers_locked():
                 )
                 if cid:
                     rg["_docker_container_ids"].append(cid)
+                    # The new container has a new address; report it, as the cache cluster respawn above does.
+                    old, new = dict(ng.get("PrimaryEndpoint") or {}), {"Address": host, "Port": port}
+                    ng["PrimaryEndpoint"], ng["ReaderEndpoint"] = dict(new), dict(new)
+                    for member in ng.get("NodeGroupMembers") or []:
+                        member["ReadEndpoint"] = dict(new)
+                    if rg.get("ConfigurationEndpoint") == old:
+                        rg["ConfigurationEndpoint"] = dict(new)
             log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
         except Exception:
             log.warning(

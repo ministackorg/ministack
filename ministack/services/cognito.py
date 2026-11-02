@@ -1020,7 +1020,7 @@ class _PreTokenRejected(Exception):
 
 
 class _PreTokenUnavailable(Exception):
-    """Raised in strict mode when a PreTokenGeneration Lambda cannot be invoked."""
+    """Raised when a PreTokenGeneration Lambda cannot be invoked."""
 
 
 def _pretoken_error_code(exc) -> str:
@@ -1067,12 +1067,9 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     (``LambdaConfig.PreTokenGenerationConfig`` — id + access tokens,
     ``claimsAndScopeOverrideDetails`` shape).
 
-    A Lambda that runs and returns an error raises ``_PreTokenRejected``, as
-    AWS answers ``UserLambdaValidationException``. A Lambda that cannot be
-    invoked is logged and ignored by default — the unmodified token is still
-    issued. Set ``MINISTACK_COGNITO_PRETOKEN_STRICT=1`` to raise
-    ``_PreTokenUnavailable`` instead, as AWS answers
-    ``UnexpectedLambdaException``.
+    A Lambda that returns an error raises ``_PreTokenRejected`` (AWS's
+    ``UserLambdaValidationException``); one that cannot be invoked raises
+    ``_PreTokenUnavailable`` (``UnexpectedLambdaException``).
     """
     pool = _user_pools.get(pool_id)
     if not pool:
@@ -1107,10 +1104,7 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         scope=scope,
     )
 
-    # AWS names the trigger with its LambdaVersion in these messages, e.g.
-    # "PreTokenGenerationV2_0 failed with error ..."
     trigger_name = f"PreTokenGeneration{v2_version}" if use_v2 else "PreTokenGeneration"
-    strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
     try:
         # Lazy import to avoid a circular dependency between cognito and lambda_svc.
         from ministack.services import lambda_svc
@@ -1124,10 +1118,6 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     except Exception as e:
         logger.warning("PreTokenGeneration Lambda invocation failed for pool %s: %s",
                        pool_id, e)
-        # Fails open by default so a Lambda that cannot run locally does not
-        # block sign-in (#533)
-        if not strict:
-            return claims
         if isinstance(e, _PreTokenUnavailable):
             raise
         raise _PreTokenUnavailable(
@@ -1299,10 +1289,11 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
         raise _PreSignUpRejected(str(e)) from e
 
     if isinstance(result, dict) and result.get("error"):
-        reason = result.get("body") or "PreSignUp Lambda rejected the request."
+        reason = _lambda_error_message(result.get("body"))
         logger.info("PreSignUp Lambda rejected sign-up for pool %s user %s: %s",
                     pool_id, username, reason)
-        raise _PreSignUpRejected(str(reason))
+        # AWS's format for every trigger error: "[trigger] failed with error [error text]".
+        raise _PreSignUpRejected(f"PreSignUp failed with error {reason}.")
 
     payload = result.get("body") if isinstance(result, dict) else result
     response = _extract_trigger_response(payload) or {}
@@ -3747,8 +3738,7 @@ def _apply_custom_message_trigger(pool: dict, trigger_source: str, username: str
         raise _CustomMessageRejected(str(e)) from e
 
     if isinstance(result, dict) and result.get("error"):
-        raise _CustomMessageRejected(
-            str(result.get("body") or "CustomMessage Lambda rejected the request."))
+        raise _CustomMessageRejected(f"CustomMessage failed with error {_lambda_error_message(result.get('body'))}.")
     payload = result.get("body") if isinstance(result, dict) else result
     return _extract_trigger_response(payload) or {}
 

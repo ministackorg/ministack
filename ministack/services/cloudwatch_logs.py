@@ -590,8 +590,7 @@ def _append_log_events(stream, events):
     if not events:
         return
     ordered = sorted(events, key=_event_timestamp)
-    # Every event AWS stores has an eventId (FilterLogEvents returns it; `aws logs tail --follow`
-    # needs it). PutLogEvents sets one; Lambda, CodeBuild and DynamoDB import logs come without.
+    # Every stored event has an eventId, as on AWS; internal writers come without one.
     for event in ordered:
         event.setdefault("eventId", new_uuid())
     first, last = ordered[0]["timestamp"], ordered[-1]["timestamp"]

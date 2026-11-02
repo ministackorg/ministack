@@ -408,7 +408,7 @@ def test_s3tables_iceberg_catalog_spans_control_plane_regions():
             f"/iceberg/v1/catalog/namespaces/{ns}/tables",
             method="POST",
             payload={
-                "name": iceberg_table,
+                "name": iceberg_table, "stage-create": False,
                 "schema": {"type": "struct", "fields": [{"id": 1, "name": "id", "type": "long"}]},
             },
         )
@@ -499,16 +499,13 @@ def test_s3tables_iceberg_catalog_prefers_signed_region_for_duplicate_names():
 def test_iceberg_rest_error_uses_spec_envelope():
     """The /iceberg REST surface must return the Iceberg REST OpenAPI ErrorModel
     ({"error": {message, type, code}}), not the AWS {"__type"} shape. A LoadTable
-    on a missing table must be a proper NoSuchTableException so spec-compliant
-    writers (DuckDB, Spark) proceed to create it instead of aborting."""
+    on a missing table is a 404 with AWS's type and message."""
     with pytest.raises(urllib.error.HTTPError) as exc:
         _iceberg_json("/iceberg/v1/catalog/namespaces/nope/tables/missing")
     assert exc.value.code == 404
     body = json.loads(exc.value.read().decode("utf-8"))
     assert "__type" not in body
-    assert body["error"]["type"] == "NoSuchTableException"
-    assert body["error"]["code"] == 404
-    assert body["error"]["message"]
+    assert body["error"] == {"code": 404, "message": "The specified table does not exist.", "type": "no_such_table"}
 
 
 def test_s3tables_iceberg_routes_without_prefix_are_unknown(s3tables):
@@ -726,7 +723,7 @@ def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3t
         _iceberg_json(
             f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
             method="POST",
-            payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
+            payload={"name": table, "stage-create": False, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
         )
         # Commit a snapshot so there's real state a resent create could destroy.
         snapshot_id = 42
@@ -756,7 +753,7 @@ def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3t
             _iceberg_json(
                 f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
                 method="POST",
-                payload={"name": table, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
+                payload={"name": table, "stage-create": False, "schema": {"type": "struct", "schema-id": 0, "fields": []}},
             )
             assert False, "expected a 409 conflict on resent CreateTable"
         except urllib.error.HTTPError as e:
@@ -917,7 +914,7 @@ def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables)
             f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables",
             method="POST",
             payload={
-                "name": table,
+                "name": table, "stage-create": False,
                 "schema": {
                     "type": "struct", "schema-id": 0,
                     "fields": [{"id": 1, "name": "ts", "required": False, "type": "timestamp"}],
@@ -941,6 +938,86 @@ def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables)
             s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
         except Exception:
             pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_create_table_location_and_stage_create(s3tables):
+    """Captured on AWS (us-east-1): S3 Tables assigns the location whatever the client sends,
+    a null one included, and refuses a create whose stage-create is missing or null."""
+    bucket_name = f"tb-loc-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    tables = f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables"
+    schema = {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "a", "required": False, "type": "long"}]}
+    s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+    try:
+        for name, extra in (("t_null", {"location": None}), ("t_absent", {}),
+                            ("t_client", {"location": "s3://elsewhere/ns/t"})):
+            created = _iceberg_json(tables, method="POST",
+                                    payload={"name": name, "schema": schema, "stage-create": False, **extra})
+            expected = f"s3://{bucket_name}/{ns}/{name}"
+            assert created["metadata"]["location"] == expected
+            assert _iceberg_json(f"{tables}/{name}")["metadata"]["location"] == expected
+            assert s3tables.get_table(tableBucketARN=bucket_arn, namespace=ns, name=name)["warehouseLocation"] == expected
+
+        for extra in ({}, {"stage-create": None}):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _iceberg_json(tables, method="POST", payload={"name": "t_refused", "schema": schema, **extra})
+            assert exc.value.code == 400
+            assert json.loads(exc.value.read()) == {"error": {
+                "code": 400, "message": "stage-create is a required field and cannot be null",
+                "type": "required_field_is_null"}}
+    finally:
+        for t in s3tables.list_tables(tableBucketARN=bucket_arn)["tables"]:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=t["name"])
+        s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_create_table_renumbers_field_ids(s3tables):
+    """Captured on AWS (us-east-1): createTable renumbers field ids from 1, a struct's fields
+    before their nested types, and the partition spec and sort order follow the new ids."""
+    bucket_arn = s3tables.create_table_bucket(name=f"tb-ids-{_uuid_mod.uuid4().hex[:6]}")["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    tables = f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables"
+
+    def col(field_id, name, kind):
+        return {"id": field_id, "name": name, "required": False, "type": kind}
+
+    def create(name, fields, **extra):
+        schema = {"type": "struct", "schema-id": 0, "fields": fields}
+        return _iceberg_json(tables, method="POST",
+                             payload={"name": name, "schema": schema, "stage-create": False, **extra})["metadata"]
+
+    s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+    try:
+        lst = {"type": "list", "element-id": 30, "element": "int", "element-required": False}
+        meta = create("gapped", [col(10, "a", "long"), col(20, "xs", lst)])
+        assert meta["schemas"][0]["fields"] == [col(1, "a", "long"), col(2, "xs", {**lst, "element-id": 3})]
+        assert meta["last-column-id"] == 3
+
+        kv = {"type": "map", "key-id": 3, "key": "string", "value-id": 4, "value": "long", "value-required": False}
+        meta = create("depth_first", [col(1, "s", {"type": "struct", "fields": [col(2, "m", kv)]}), col(5, "b", "string")])
+        assert meta["schemas"][0]["fields"] == [
+            col(1, "s", {"type": "struct", "fields": [col(3, "m", {**kv, "key-id": 4, "value-id": 5})]}),
+            col(2, "b", "string")]
+        assert meta["last-column-id"] == 5
+
+        meta = create(
+            "specs", [col(10, "a", "long"), col(20, "d", "date"), col(30, "c", "string")],
+            **{"partition-spec": {"spec-id": 0, "fields": [
+                   {"source-id": 20, "field-id": 1000, "name": "d_day", "transform": "day"}]},
+               "write-order": {"order-id": 1, "fields": [
+                   {"source-id": 30, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}]}})
+        assert meta["partition-specs"] == [{"spec-id": 0, "fields": [
+            {"source-id": 2, "field-id": 1000, "name": "d_day", "transform": "day"}]}]
+        assert meta["last-partition-id"] == 1000
+        assert meta["sort-orders"] == [{"order-id": 1, "fields": [
+            {"source-id": 3, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}]}]
+    finally:
+        for t in s3tables.list_tables(tableBucketARN=bucket_arn)["tables"]:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=t["name"])
+        s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
@@ -1261,7 +1338,7 @@ def test_s3tables_iceberg_rest_drops_tables_and_namespaces(s3tables):
         400, "purge_enabled", "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.")
     try:
         assert _iceberg_call(base, "POST", {"namespace": ["ns"]})[0] == 200
-        assert _iceberg_call(f"{base}/ns/tables", "POST", {"name": "t", "schema": schema})[0] == 200
+        assert _iceberg_call(f"{base}/ns/tables", "POST", {"name": "t", "stage-create": False, "schema": schema})[0] == 200
         assert [call("HEAD", f"{base}/{path}")[0] for path in ("ns", "nope", "ns/tables/t")] == [204, 404, 204]
         assert call("DELETE", f"{base}/ns") == error(
             400, "namespace_not_empty", "The namespace that you tried to delete is not empty.")
@@ -1285,7 +1362,7 @@ def test_s3tables_iceberg_rest_recreated_table_starts_empty(s3tables):
     schema = {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "long", "required": False}]}
     try:
         _iceberg_call(base, "POST", {"namespace": ["ns"]})
-        _iceberg_call(f"{base}/ns/tables", "POST", {"name": "r", "schema": schema})
+        _iceberg_call(f"{base}/ns/tables", "POST", {"name": "r", "stage-create": False, "schema": schema})
         assert _iceberg_call(f"{base}/ns/tables/r", "POST", {"requirements": [], "updates": [
             {"action": "set-properties", "updates": {"old": "yes"}}]})[0] == 200
         first = _iceberg_call(f"{base}/ns/tables/r")[1]
@@ -1294,7 +1371,7 @@ def test_s3tables_iceberg_rest_recreated_table_starts_empty(s3tables):
         with urllib.request.urlopen(req) as resp:
             assert resp.status == 204
         assert _iceberg_call(f"{base}/ns/tables/r")[0] == 404
-        _iceberg_call(f"{base}/ns/tables", "POST", {"name": "r", "schema": schema})
+        _iceberg_call(f"{base}/ns/tables", "POST", {"name": "r", "stage-create": False, "schema": schema})
         second = _iceberg_call(f"{base}/ns/tables/r")[1]
         assert "old" not in second["metadata"].get("properties", {})
         assert second["metadata"]["table-uuid"] != first["metadata"]["table-uuid"]
@@ -1316,7 +1393,7 @@ def test_s3tables_iceberg_rest_scopes_each_catalog_to_its_warehouse_arn(s3tables
             p = _arn_prefix(arn)
             assert _iceberg_call(f"/iceberg/v1/{p}/namespaces", "POST", {"namespace": ["ns"]})[0] == 200
             status, created = _iceberg_call(f"/iceberg/v1/{p}/namespaces/ns/tables", "POST", {
-                "name": "t", "schema": {"type": "struct", "schema-id": 0,
+                "name": "t", "stage-create": False, "schema": {"type": "struct", "schema-id": 0,
                                         "fields": [{"id": 1, "name": "id", "type": "long", "required": False}]}})
             assert status == 200, created
         for arn in arns:
@@ -1342,7 +1419,7 @@ def test_s3tables_iceberg_rest_sequence_numbers_and_requirements(s3tables):
     try:
         _iceberg_call(f"/iceberg/v1/{p}/namespaces", "POST", {"namespace": ["ns"]})
         _iceberg_call(f"/iceberg/v1/{p}/namespaces/ns/tables", "POST", {
-            "name": "t", "format-version": 2, "schema": {"type": "struct", "schema-id": 0, "fields": [
+            "name": "t", "stage-create": False, "format-version": 2, "schema": {"type": "struct", "schema-id": 0, "fields": [
                 {"id": 1, "name": "id", "type": "long", "required": False}]}})
 
         def append(seq, snap_id, parent, expected_ref):
@@ -1515,7 +1592,7 @@ _S3TABLES_ICEBERG_ROUTES = {
     "drop-namespace": ("DELETE", "{prefix}/namespaces/ns", None, None, [("DeleteNamespace", "{bucket}")], 400),
     "namespace-exists": ("HEAD", "{prefix}/namespaces/ns", None, None, [("GetNamespace", "{bucket}")], 204),
     "list-tables": ("GET", "{prefix}/namespaces/ns/tables", None, None, [("ListTables", "{bucket}")], 200),
-    "create-table": ("POST", "{prefix}/namespaces/ns/tables", None, {"name": "{new}"},
+    "create-table": ("POST", "{prefix}/namespaces/ns/tables", None, {"name": "{new}", "stage-create": False},
                      [("CreateTable", "{bucket}"), ("PutTableData", "{bucket}/table/*")], 200),
     "load-table": ("GET", "{prefix}/namespaces/ns/tables/t", None, None,
                    [("GetTableMetadataLocation", "{t}"), ("GetTableData", "{t}")], 200),

@@ -233,6 +233,7 @@ from ministack.core.iam_evaluator import (
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
+    _request_account_id,
     fix_error_content_type,
     fix_success_content_type,
     set_request_account_id,
@@ -1923,7 +1924,8 @@ def _execute_api_authorization_type(api_id: str, stage: str, method: str, execut
 
 def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
                          headers: dict, query_params: dict,
-                         iam_action: str = "execute-api:Invoke"):
+                         iam_action: str = "execute-api:Invoke",
+                         caller_account: str | None = None):
     """Authorize an execute-api call against its own ARN.
 
     ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
@@ -1956,15 +1958,26 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
         refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
         if refused:
             return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
-    return _enforce_data_plane(
-        "apigateway", iam_action, headers, query_params, "",
-        resource_arn=execute_api_arn(
-            extract_region(headers, query_params), get_account_id(),
-            api_id, stage, method, execute_path,
-        ),
-        auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
-            api_id, stage, error, headers, query_params),
+    # The ARN names the API's owner; the caller is authenticated in its own account.
+    resource_arn = execute_api_arn(
+        extract_region(headers, query_params), get_account_id(),
+        api_id, stage, method, execute_path,
     )
+    owner_scope = _get_module("apigateway_v1").find_api_scope(api_id) if caller_account else None
+    token = _request_account_id.set(caller_account) if caller_account else None
+    try:
+        return _enforce_data_plane(
+            "apigateway", iam_action, headers, query_params, "",
+            resource_arn=resource_arn,
+            auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+                api_id, stage, error, headers, query_params),
+            denied_response=(lambda denied: _get_module("apigateway_v1").cross_account_denial_response(
+                api_id, stage, denied, headers, query_params, owner_scope))
+            if owner_scope else None,
+        )
+    finally:
+        if token is not None:
+            _request_account_id.reset(token)
 
 
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
@@ -2074,6 +2087,20 @@ async def _handle_cloudfront_alias_request(
         dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
 
 
+def _invoke_as_api_owner(api_id: str) -> str | None:
+    """Run an API another account owns as its owner; returns the caller's account, or None."""
+    apigw_v1 = _get_module("apigateway_v1")
+    apigw_v2 = _get_module("apigateway")
+    if apigw_v1.find_api_scope(api_id) is not None or apigw_v2.find_api_scope(api_id) is not None:
+        return None
+    owner = apigw_v1.find_api_owner(api_id) or apigw_v2.find_api_owner(api_id)
+    if not owner:
+        return None
+    caller_account = _request_account_id.get()
+    _request_account_id.set(owner)
+    return caller_account
+
+
 async def _handle_execute_api_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
     raw_path: str | None = None, raw_query_string: str | None = None,
@@ -2098,6 +2125,7 @@ async def _handle_execute_api_request(
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
+    caller_account = _invoke_as_api_owner(api_id)
 
     # WebSocket @connections management API — /{stage}/@connections/{id}.
     # The @connections prefix is authoritative; skip $default resolution.
@@ -2123,6 +2151,7 @@ async def _handle_execute_api_request(
     denied = _enforce_execute_api(
         api_id, stage, method, execute_path, headers, query_params,
         iam_action="execute-api:ManageConnections" if connections else "execute-api:Invoke",
+        caller_account=caller_account,
     )
     if denied:
         return denied
@@ -2558,6 +2587,7 @@ def _authenticate_only(service: str, headers: dict, query_params: dict, request_
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
     service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
+    denied_response=None,
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
@@ -2566,6 +2596,7 @@ def _enforce_data_plane(
     handler has to pass them, because it knows the resource the router does not.
     ``named_resource`` is the resource an identity-policy denial names, in the
     error Content-Type of the service, for the services that word it so.
+    ``denied_response(result)`` may word a policy denial; None keeps the default.
     """
     if not AUTH:
         return None
@@ -2579,6 +2610,9 @@ def _enforce_data_plane(
         if isinstance(denied, AuthError):
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
+        response = denied_response(denied) if denied_response else None
+        if response:
+            return response
         explicit = denied.decision == "Deny"
         message = ""
         if named_resource and not (explicit and denied.resource_policy_arn):

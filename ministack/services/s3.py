@@ -126,8 +126,8 @@ _olap_requests: dict[tuple[str, str], dict] = {}
 _olap_requests_lock = threading.Lock()
 _OBJECT_LAMBDA_ALIAS_SUFFIX = "--ol-s3"
 
-# Account-level public access block, per account and region: {"config": {flags}}.
-_account_public_access_block = AccountRegionScopedDict()
+# Account-level public access block, per account (it applies in every region): {"config": {flags}}.
+_account_public_access_block = AccountScopedDict()
 
 
 def object_lambda_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
@@ -1049,7 +1049,9 @@ def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str,
 
 
 def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
-    """Whether the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    """Whether the account's, the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    if (_account_public_access_block.get_scoped(owner_account, None, "config") or {}).get(setting):
+        return True
     access_point = _request_access_point.get()
     # An access point's BlockPublicPolicy does not cover the bucket's policy.
     if access_point and access_point["Bucket"] == bucket_name and setting != "BlockPublicPolicy" and \
@@ -4875,12 +4877,17 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        # A new object: an overwritten one's tags do not carry over.
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
     elif grant_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
+    else:
+        _object_acl.pop((bucket_name, key, obj.get("version_id")), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -5281,8 +5288,12 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, version_id), None)
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    else:
+        _object_acl.pop((bucket_name, key, version_id), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -10177,7 +10188,7 @@ _ACCOUNT_PAB_PATH = "/v20180820/configuration/publicAccessBlock"
 _ACCOUNT_PAB_ACTIONS = {
     "PUT": "s3:PutAccountPublicAccessBlock",
     "GET": "s3:GetAccountPublicAccessBlock",
-    "DELETE": "s3:DeleteAccountPublicAccessBlock",
+    "DELETE": "s3:PutAccountPublicAccessBlock",
 }
 
 _ACCOUNT_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
@@ -10188,7 +10199,7 @@ def is_account_public_access_block_path(path: str) -> bool:
 
 
 def handle_account_public_access_block(method: str, path: str, body: bytes) -> tuple:
-    """The account's public access block in the request's account and region."""
+    """The request account's public access block."""
     if method == "PUT":
         root = None
         if body:
