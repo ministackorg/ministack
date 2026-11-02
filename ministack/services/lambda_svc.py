@@ -4469,6 +4469,16 @@ async function load() {
 exports.handler = async (event, context) => {
   if (ARN) { try { context.invokedFunctionArn = ARN; } catch (e) {} }
   const fn = await load();
+  // The runtime refuses this itself, but the shim's own signature hides the handler's.
+  const major = /^AWS_Lambda_nodejs(\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
+  if (major && Number(major[1]) >= 24 && fn.length >= 3
+      && !fn[Symbol.for("aws.lambda.runtime.handler.streaming")]) {
+    const err = new Error("ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
+      + "Node.js 24. You need to modify this function to use a supported handler signature to use Node.js 24 or "
+      + "later. For more information see https://docs.aws.amazon.com/lambda/latest/dg/nodejs-handler.html.");
+    err.name = "Runtime.CallbackHandlerDeprecated";
+    throw err;
+  }
   if (fn.length >= 3) {
     return await new Promise((resolve, reject) =>
       fn(event, context, (err, res) => (err ? reject(err) : resolve(res))));
@@ -5457,7 +5467,7 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
         worker = None  # invalidate_worker already dropped it from the pool
         return {
-            "body": {"errorMessage": str(e), "errorType": type(e).__name__},
+            "body": {"errorMessage": str(e), "errorType": getattr(e, "error_type", "") or type(e).__name__},
             "error": True,
             "log": "",
         }

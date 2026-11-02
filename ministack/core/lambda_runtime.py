@@ -45,6 +45,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "_LAMBDA_FUNCTION_ARN",
     "_LAMBDA_TIMEOUT",
     "LAMBDA_TASK_ROOT",
+    "AWS_EXECUTION_ENV",
 }
 
 
@@ -995,6 +996,18 @@ rl.on("line", async (line) => {
           }) + "\n");
           return;
         }
+        // AWS's Node.js 24+ runtime refuses a callback-based handler at init.
+        const major = /^AWS_Lambda_nodejs(\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
+        if (major && Number(major[1]) >= 24 && handlerFn.length >= 3
+            && !handlerFn[Symbol.for("aws.lambda.runtime.handler.streaming")]) {
+          _realStdoutWrite(JSON.stringify({
+            status: "error", errorType: "Runtime.CallbackHandlerDeprecated",
+            error: "ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
+              + "Node.js 24. You need to modify this function to use a supported handler signature to use Node.js 24 or "
+              + "later. For more information see https://docs.aws.amazon.com/lambda/latest/dg/nodejs-handler.html."
+          }) + "\n");
+          return;
+        }
         _realStdoutWrite(JSON.stringify({ status: "ready", cold: true }) + "\n");
       } catch (e) {
         _realStdoutWrite(JSON.stringify({
@@ -1258,6 +1271,7 @@ class Worker:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault(HOST_PREFIX_ENV, "true")
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
+        spawn_env["AWS_EXECUTION_ENV"] = f"AWS_Lambda_{runtime}"
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_VERSION", self.config.get("Version", "$LATEST"))
@@ -1344,6 +1358,8 @@ class Worker:
         if response is None:
             raise RuntimeError("No JSON init response from worker")
         if response.get("status") != "ready":
+            if response.get("errorType"):
+                raise ProvidedRuntimeError(response.get("error", ""), response["errorType"])
             raise RuntimeError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
@@ -1786,7 +1802,7 @@ class ProvidedInitTimeout(RuntimeError):
 
 
 class ProvidedRuntimeError(RuntimeError):
-    """A provided-runtime failure that carries the error type AWS reports."""
+    """A runtime failure that carries the error type AWS reports."""
 
     def __init__(self, message: str, error_type: str):
         super().__init__(message)
