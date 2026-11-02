@@ -12804,6 +12804,14 @@ def test_lambda_runs_on_the_architecture_it_declares(lam, declared, expected_mac
         payload = json.loads(resp["Payload"].read())
         if resp.get("FunctionError") and "exec format" in str(payload).lower():
             pytest.skip(f"host cannot run linux/{declared} — no binfmt handler registered")
+        # With no emulation for a foreign architecture, MiniStack falls back to the host's.
+        import platform as _platform
+        import sys as _sys
+        native = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(
+            _platform.machine().lower())
+        emulated = _sys.platform == "darwin" or os.path.exists(f"/proc/sys/fs/binfmt_misc/qemu-{expected_machine}")
+        if expected_machine != native and not emulated and payload.get("machine") == native:
+            pytest.skip(f"host cannot run linux/{declared} — MiniStack fell back to the host architecture")
         assert resp.get("FunctionError") is None, payload
         assert payload.get("machine") == expected_machine, payload
     finally:
