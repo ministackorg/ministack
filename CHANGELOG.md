@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFormation — a Lambda's `Architectures` pins its container platform** — an `AWS::Lambda::Function` created from a template, including one the SAM transform emits from `Globals: Function: Architectures`, ran on the host's platform whatever its `Architectures` said, because only `CreateFunction` recorded the choice; since 1.5.36 a function built for `x86_64` therefore ran arm64 on an arm64 host and could fail to load. A template's `Architectures` now pins the Docker executor's platform as `CreateFunction`'s does, and a stack update declares what a create of the same template would: adding `Architectures` pins the platform, and removing it reverts the reported architecture to `x86_64`, as on AWS, and stops pinning, so the function runs on the host's platform like any function that declares none (AWS runs it on x86_64). The AWS behaviour (the reported and running architecture for `x86_64`, `arm64`, none, `Globals`, and an in-place update adding or removing it) was measured against a real account in eu-west-1. A function that CloudFormation created before this release and saved to persisted state stays unpinned until a stack update changes it. Contributed by @toby6578.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added

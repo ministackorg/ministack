@@ -18841,6 +18841,76 @@ def test_cfn_lambda_function_unheld_foreign_layer_attaches_empty():
         _wait_stack(cfn, stack_name)
 
 
+def test_cfn_lambda_function_architectures_pin_the_docker_platform(monkeypatch):
+    """A template's Architectures pins the container platform the way
+    CreateFunction's does, and an update declares what a create of the same
+    template would. Observed on AWS (eu-west-1, 2026-11-02, a stack of inline
+    python3.12 functions returning platform.machine()): [x86_64] runs x86_64,
+    [arm64] runs aarch64, none reports and runs x86_64; an in-place update that
+    removes [arm64] reports and runs x86_64, and one that adds [arm64] runs
+    aarch64. The reported Architectures follow AWS; a function that declares
+    none is deliberately left unpinned (None, the host's platform) rather than
+    pinned to x86_64, as for CreateFunction."""
+    from ministack.services import lambda_svc as _lam
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setattr(_lam, "_functions", _lam.AccountRegionScopedDict())
+    stack = "cfn-arch-stack"
+
+    def props(name, arch):
+        p = {"FunctionName": name, "Runtime": "python3.12", "Handler": "index.handler",
+             "Code": {"ZipFile": "def handler(event, context):\n    return 1\n"}}
+        if arch:
+            p["Architectures"] = [arch]
+        return p
+
+    def platform(name):
+        return _lam._declared_docker_platform(_lam._functions[name]["config"])
+
+    before = {"arch-x86": "x86_64", "arch-arm": "arm64", "arch-none": None}
+    for name, arch in before.items():
+        provisioners._lambda_create(name, props(name, arch), stack)
+    assert platform("arch-x86") == "linux/amd64"
+    assert platform("arch-arm") == "linux/arm64"
+    assert platform("arch-none") is None
+    assert _lam._functions["arch-none"]["config"]["Architectures"] == ["x86_64"]
+
+    after = {"arch-x86": None, "arch-arm": None, "arch-none": "arm64"}
+    for name, arch in after.items():
+        physical_id, _ = provisioners._lambda_update(
+            name, props(name, before[name]), props(name, arch), stack, name)
+        assert physical_id == name
+    for name in ("arch-x86", "arch-arm"):
+        assert _lam._functions[name]["config"]["Architectures"] == ["x86_64"]
+        assert platform(name) is None
+    assert _lam._functions["arch-none"]["config"]["Architectures"] == ["arm64"]
+    assert platform("arch-none") == "linux/arm64"
+
+
+def test_cfn_sam_globals_architectures_reach_the_lambda_function():
+    """SAM's Globals.Function.Architectures lands on the AWS::Lambda::Function
+    the transform emits, so _lambda_create sees it declared. Observed on AWS
+    (eu-west-1, 2026-11-02): an AWS::Serverless::Function under Globals
+    Architectures [arm64] has [arm64] in the processed template and runs
+    aarch64. That the translator emits no Architectures when neither Globals
+    nor the function names one is samtranslator's own behaviour, which keeps
+    such a function undeclared."""
+    pytest.importorskip("samtranslator")
+    from ministack.services.cloudformation.engine import _apply_transforms
+
+    def emitted(template):
+        out = _apply_transforms(json.loads(json.dumps(template)))
+        return out["Resources"]["Fn"]["Properties"]
+
+    fn = {"Type": "AWS::Serverless::Function", "Properties": {
+        "Runtime": "python3.12", "Handler": "index.handler", "CodeUri": "s3://b/k"}}
+    base = {"AWSTemplateFormatVersion": "2010-09-09",
+            "Transform": "AWS::Serverless-2016-10-31", "Resources": {"Fn": fn}}
+    assert emitted({**base, "Globals": {"Function": {"Architectures": ["arm64"]}}})[
+        "Architectures"] == ["arm64"]
+    assert "Architectures" not in emitted(base)
+
+
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
     """A layer plus the permission resource that grants another account access
     to it — the shape serverless-python-requirements emits for a layer with
