@@ -139,8 +139,7 @@ def _ensure_default_bus():
 
 
 def _event_bus_exists(name):
-    """Whether the current tenant has bus ``name``. Every account has a default
-    bus, whether or not this emulator has written its record yet."""
+    """Whether the current tenant has bus ``name``; every account has a default bus."""
     return name == "default" or name in _event_buses
 
 
@@ -704,12 +703,12 @@ def _validate_target_arn(target):
             400,
         )
 
-    return None
-
-
     # Any other target in another account needs an execution role, in any region.
     if spec.service != "events" and spec.account_id and spec.account_id != get_account_id() and not target.get("RoleArn"):
         return error_response_json("ValidationException", f"RoleArn is required for target {arn}.", 400)
+
+    return None
+
 
 def _event_bus_spec(arn):
     """The parsed ARN when ``arn`` names an event bus, else None."""
@@ -721,12 +720,7 @@ def _event_bus_spec(arn):
 
 
 def _validate_event_bus_targets(rule_bus, targets):
-    """AWS's checks on a rule's event bus targets, after every target's ARN is
-    checked. First, across every target, a role in another account, which cannot
-    be passed. Then target by target, in
-    order: the rule's own bus, then any ``RetryPolicy`` (even an empty one). Then,
-    across every target, a missing ``RoleArn``, which every event bus target
-    needs, the rule's own account and region included."""
+    """AWS's checks on event bus targets, in its order: a cross-account role, then per target the rule's own bus and a RetryPolicy, then a missing RoleArn."""
     buses = [(target, spec) for target in targets
              if (spec := _event_bus_spec(target.get("Arn", ""))) is not None]
     for target, _ in buses:
@@ -2437,8 +2431,7 @@ def _matches_content_filter(value, filter_rule):
 
 
 def _invoke_target(target, event, rule, view=None, from_rule=True):
-    """Deliver ``event`` to ``target``. A schedule's target passes ``from_rule``
-    False and its schedule as ``rule``."""
+    """Deliver ``event`` to ``target``; a schedule passes ``from_rule`` False and itself as ``rule``."""
     arn = target.get("Arn", "")
 
     # The tree the rule matched on, so a rule cannot fire on a field whose
@@ -2539,10 +2532,7 @@ def _target_matches_request_scope(spec, target=None) -> bool:
     return spec.service == "sqs" and bool((target or {}).get("RoleArn"))
 
 
-# Set on an event a rule has forwarded to another bus. AWS lets an event reach a
-# bus target in the same region once and cross into another region once; the
-# crossing gives the event a new id and time, and it may then make one more
-# same-region hop.
+# Hop markers: one same-region bus hop, one region crossing (new id and time), then one more same-region hop.
 _SAME_REGION_HOP = "_SameRegionBusHop"
 _CROSSED_REGION = "_CrossedRegion"
 
@@ -2557,11 +2547,7 @@ def _event_bus_hop_refusal(event, same_region):
 
 
 def _events_may_assume(role, rule):
-    """Whether ``role``'s trust policy lets EventBridge assume it for ``rule``.
-
-    Conditions see ``aws:SourceAccount`` and ``aws:SourceArn`` as the rule's
-    account and ARN. A Deny applies to EventBridge unless its ``NotPrincipal``
-    names it."""
+    """Whether ``role``'s trust policy lets EventBridge assume it for ``rule`` (aws:SourceAccount/SourceArn are the rule's)."""
     from ministack.core.iam_evaluator import (
         EvalContext,
         _action_matches,
@@ -2607,14 +2593,7 @@ def _events_may_assume(role, rule):
 
 
 def _event_bus_target_denial(spec, event, rule, target):
-    """Under AUTH=true, the ``ERROR_CODE`` AWS records (``NO_PERMISSIONS``) when
-    the target's role cannot put the event on the bus, or None.
-
-    EventBridge assumes the role, so it must be the rule account's role that the
-    ``RoleArn`` names exactly, trust EventBridge for this rule, and be allowed
-    ``events:PutEvents`` on the bus, with ``aws:RequestedRegion`` the bus's
-    region. The bus's policy may refuse it with a Deny; a bus in another account
-    must also allow it, and one that does not exist is refused the same way."""
+    """Under AUTH=true, ``NO_PERMISSIONS`` when the target's role cannot put the event on the bus, or None."""
     from ministack.app import AUTH
     if not AUTH:
         return None
@@ -2660,14 +2639,7 @@ def _event_bus_target_denial(spec, event, rule, target):
 
 
 def _dispatch_to_event_bus(spec, event, rule, target, target_input_payload=None, from_rule=True):
-    """Forward ``event`` to the bus ``spec`` names, in its owner's account and region.
-
-    The event keeps its ``account`` and ``region``; crossing into another region
-    gives it a new id and time. MiniStack does not model target dead-letter
-    queues, so a refusal is logged with the ``ERROR_CODE`` AWS would record.
-
-    A schedule's target (``from_rule`` False) publishes to a bus of its own
-    account and region, as an ingestion rather than a rule's hop."""
+    """Forward ``event`` to the bus ``spec`` names, in its owner's account and region; a refusal is logged with AWS's ERROR_CODE."""
     if not spec.resource.startswith("event-bus/"):
         logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
         return

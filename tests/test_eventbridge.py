@@ -6313,6 +6313,86 @@ def xt():
     owner_eb.put_rule(Name=rule, EventBusName=bus, EventPattern=json.dumps({"detail-type": ["xt"]}))
     url = target_sqs.create_queue(QueueName=f"xt-q-{slug}")["QueueUrl"]
     queue_arn = target_sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+    class Ctx:
+        pass
+
+    ctx = Ctx()
+    ctx.owner, ctx.target_sqs, ctx.bus, ctx.rule, ctx.url, ctx.queue_arn = owner_eb, target_sqs, bus, rule, url, queue_arn
+    ctx.role = f"arn:aws:iam::{_XA_OWNER}:role/eventbridge-delivery"
+
+    def received():
+        msgs = target_sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
+        return [json.loads(m["Body"]) for m in msgs]
+
+    ctx.received = received
+    try:
+        yield ctx
+    finally:
+        owner_eb.remove_targets(Rule=rule, EventBusName=bus, Ids=["q"])
+        owner_eb.delete_rule(Name=rule, EventBusName=bus)
+        owner_eb.delete_event_bus(Name=bus)
+        target_sqs.delete_queue(QueueUrl=url)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("region", ["us-east-1", "us-west-2"])
+def test_put_targets_queue_in_another_account_requires_role_arn(xt, auth_enabled, region):
+    """Captured on AWS: a queue in another account without RoleArn is refused, in the same or another region."""
+    arn = f"arn:aws:sqs:{region}:{_XA_PUBLISHER}:xt-somewhere"
+    with pytest.raises(ClientError) as exc:
+        xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": arn}])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"] == f"RoleArn is required for target {arn}."
+
+
+@pytest.mark.auth_contract
+def test_rule_delivers_to_queue_in_another_account_with_role_arn(xt, auth_enabled):
+    """AWS cross-account targets: with an execution role the queue's policy allows, the event reaches the other account's queue."""
+    xt.target_sqs.set_queue_attributes(QueueUrl=xt.url, Attributes={"Policy": json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": xt.role},
+                                                "Action": "sqs:SendMessage", "Resource": xt.queue_arn}]})})
+    xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": xt.queue_arn, "RoleArn": xt.role}])
+    resp = xt.owner.put_events(Entries=[{"EventBusName": xt.bus, "Source": "xt.test", "DetailType": "xt",
+                                         "Detail": json.dumps({"marker": "x1"})}])
+    assert resp["FailedEntryCount"] == 0
+    [event] = xt.received()
+    assert event["detail"] == {"marker": "x1"}
+    assert event["account"] == _XA_OWNER
+
+
+@pytest.mark.auth_contract
+def test_rule_to_queue_in_another_account_needs_its_policy_under_auth(xt, auth_enabled):
+    """Under AUTH=true a queue in another account whose policy does not allow the role takes nothing."""
+    xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": xt.queue_arn, "RoleArn": xt.role}])
+    xt.owner.put_events(Entries=[{"EventBusName": xt.bus, "Source": "xt.test", "DetailType": "xt",
+                                  "Detail": json.dumps({"marker": "x3"})}])
+    received = xt.received()
+    if auth_enabled:
+        assert received == []
+    else:
+        assert [e["detail"] for e in received] == [{"marker": "x3"}]
+
+
+@pytest.mark.auth_contract
+def test_rule_does_not_deliver_to_queue_in_another_account_and_region(xt, auth_enabled):
+    """Rule and target must share a region; a target in another account and region is accepted but not reached."""
+    other = _xa_client("sqs", _XA_PUBLISHER)
+    other_region = boto3.client("sqs", endpoint_url=_ENDPOINT, region_name="us-west-2",
+                                aws_access_key_id=_XA_PUBLISHER, aws_secret_access_key="test")
+    url = other_region.create_queue(QueueName=f"xt-west-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    arn = other_region.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    try:
+        xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": arn, "RoleArn": xt.role}])
+        xt.owner.put_events(Entries=[{"EventBusName": xt.bus, "Source": "xt.test", "DetailType": "xt",
+                                      "Detail": json.dumps({"marker": "x2"})}])
+        assert other_region.receive_message(QueueUrl=url, WaitTimeSeconds=1).get("Messages", []) == []
+        assert other.receive_message(QueueUrl=xt.url, WaitTimeSeconds=1).get("Messages", []) == []
+    finally:
+        other_region.delete_queue(QueueUrl=url)
+
+
+# ---------------------------------------------------------------------------
 # Rule targets that are event buses in another account or region (#2526).
 # Probe ids name captures of rounds 1 to 5 (eu-west-2, us-east-1 and us-west-2;
 # three real accounts, the rules in eu-west-2).
@@ -6397,78 +6477,6 @@ def fwd():
         pass
 
     ctx = Ctx()
-    ctx.owner, ctx.target_sqs, ctx.bus, ctx.rule, ctx.url, ctx.queue_arn = owner_eb, target_sqs, bus, rule, url, queue_arn
-    ctx.role = f"arn:aws:iam::{_XA_OWNER}:role/eventbridge-delivery"
-
-    def received():
-        msgs = target_sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
-        return [json.loads(m["Body"]) for m in msgs]
-
-    ctx.received = received
-    try:
-        yield ctx
-    finally:
-        owner_eb.remove_targets(Rule=rule, EventBusName=bus, Ids=["q"])
-        owner_eb.delete_rule(Name=rule, EventBusName=bus)
-        owner_eb.delete_event_bus(Name=bus)
-        target_sqs.delete_queue(QueueUrl=url)
-
-
-@pytest.mark.auth_contract
-@pytest.mark.parametrize("region", ["us-east-1", "us-west-2"])
-def test_put_targets_queue_in_another_account_requires_role_arn(xt, auth_enabled, region):
-    """Captured on AWS: a queue in another account without RoleArn is refused, in the same or another region."""
-    arn = f"arn:aws:sqs:{region}:{_XA_PUBLISHER}:xt-somewhere"
-    with pytest.raises(ClientError) as exc:
-        xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": arn}])
-    assert exc.value.response["Error"]["Code"] == "ValidationException"
-    assert exc.value.response["Error"]["Message"] == f"RoleArn is required for target {arn}."
-
-
-@pytest.mark.auth_contract
-def test_rule_delivers_to_queue_in_another_account_with_role_arn(xt, auth_enabled):
-    """AWS cross-account targets: with an execution role the queue's policy allows, the event reaches the other account's queue."""
-    xt.target_sqs.set_queue_attributes(QueueUrl=xt.url, Attributes={"Policy": json.dumps({
-        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": xt.role},
-                                                "Action": "sqs:SendMessage", "Resource": xt.queue_arn}]})})
-    xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": xt.queue_arn, "RoleArn": xt.role}])
-    resp = xt.owner.put_events(Entries=[{"EventBusName": xt.bus, "Source": "xt.test", "DetailType": "xt",
-                                         "Detail": json.dumps({"marker": "x1"})}])
-    assert resp["FailedEntryCount"] == 0
-    [event] = xt.received()
-    assert event["detail"] == {"marker": "x1"}
-    assert event["account"] == _XA_OWNER
-
-
-@pytest.mark.auth_contract
-def test_rule_to_queue_in_another_account_needs_its_policy_under_auth(xt, auth_enabled):
-    """Under AUTH=true a queue in another account whose policy does not allow the role takes nothing."""
-    xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": xt.queue_arn, "RoleArn": xt.role}])
-    xt.owner.put_events(Entries=[{"EventBusName": xt.bus, "Source": "xt.test", "DetailType": "xt",
-                                  "Detail": json.dumps({"marker": "x3"})}])
-    received = xt.received()
-    if auth_enabled:
-        assert received == []
-    else:
-        assert [e["detail"] for e in received] == [{"marker": "x3"}]
-
-
-@pytest.mark.auth_contract
-def test_rule_does_not_deliver_to_queue_in_another_account_and_region(xt, auth_enabled):
-    """Rule and target must share a region; a target in another account and region is accepted but not reached."""
-    other = _xa_client("sqs", _XA_PUBLISHER)
-    other_region = boto3.client("sqs", endpoint_url=_ENDPOINT, region_name="us-west-2",
-                                aws_access_key_id=_XA_PUBLISHER, aws_secret_access_key="test")
-    url = other_region.create_queue(QueueName=f"xt-west-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
-    arn = other_region.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
-    try:
-        xt.owner.put_targets(Rule=xt.rule, EventBusName=xt.bus, Targets=[{"Id": "q", "Arn": arn, "RoleArn": xt.role}])
-        xt.owner.put_events(Entries=[{"EventBusName": xt.bus, "Source": "xt.test", "DetailType": "xt",
-                                      "Detail": json.dumps({"marker": "x2"})}])
-        assert other_region.receive_message(QueueUrl=url, WaitTimeSeconds=1).get("Messages", []) == []
-        assert other.receive_message(QueueUrl=xt.url, WaitTimeSeconds=1).get("Messages", []) == []
-    finally:
-        other_region.delete_queue(QueueUrl=url)
     ctx.client, ctx.role, ctx.bus, ctx.forward, ctx.publish = client, role, bus, forward, publish
     try:
         yield ctx
