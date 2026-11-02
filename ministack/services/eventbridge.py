@@ -717,8 +717,9 @@ def _event_bus_spec(arn):
 
 
 def _validate_event_bus_targets(rule_bus, targets):
-    """AWS's checks on a rule's event bus targets. First, across every target, a
-    role in another account, which cannot be passed. Then target by target, in
+    """AWS's checks on a rule's event bus targets, after every target's ARN is
+    checked. First, across every target, a role in another account, which cannot
+    be passed. Then target by target, in
     order: the rule's own bus, then any ``RetryPolicy`` (even an empty one). Then,
     across every target, a missing ``RoleArn``, which every event bus target
     needs, the rule's own account and region included."""
@@ -2540,9 +2541,9 @@ def _events_may_assume(role, rule):
             applies = not _service_principal_matches(stmt["NotPrincipal"], "events.amazonaws.com")
         else:
             principal = stmt.get("Principal")
-            aws = principal.get("AWS", []) if isinstance(principal, dict) else []
+            aws = principal.get("AWS") if isinstance(principal, dict) else None
             applies = (principal == "*" or _service_principal_matches(principal, "events.amazonaws.com")
-                       or "*" in ([aws] if isinstance(aws, str) else aws))
+                       or aws == "*" or (isinstance(aws, list) and "*" in aws))
         actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
         if not applies or not _action_matches(
                 "sts:AssumeRole", [actions] if isinstance(actions, str) else actions,

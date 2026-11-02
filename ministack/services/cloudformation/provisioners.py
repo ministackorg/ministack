@@ -3975,7 +3975,6 @@ def _eb_rule_create(logical_id, props, stack_name):
         "RoleArn": props.get("RoleArn", ""),
     }
 
-    targets = props.get("Targets", [])
     _eb._targets[key] = []
     for t in targets:
         _eb._targets[key].append(t)

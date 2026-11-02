@@ -6453,7 +6453,7 @@ def _role_required(arn):
      _role_required(_OTHER_ACCOUNT_BUS)),
     ([{"Arn": _OTHER_ACCOUNT_BUS}, {"Arn": _OTHER_REGION_BUS}], _role_required(_OTHER_ACCOUNT_BUS)),
     # round4 P8, round5 X1..X5: a role in another account cannot be passed, which is
-    # checked before anything else.
+    # checked before a retry policy or a missing role.
     ([{"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
     ([{"Arn": _OWN_BUS}, {"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
     ([{"Arn": _OWN_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY},
