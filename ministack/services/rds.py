@@ -6278,6 +6278,30 @@ def _delete_db_cluster(p):
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
 
+def _password_reset_view(c, advance):
+    """Return *c* as AWS shows it during a master password reset.
+
+    Real AWS (captured, us-west-2): after the change, the ModifyDBCluster
+    response and the next DescribeDBClusters show an available cluster with
+    PendingModifiedValues {MasterUserPassword: ****}, the one after reports
+    resetting-master-credentials, and later ones available with nothing
+    pending. ``_password_reset_describes`` counts the describes answered;
+    once set it is only reassigned (3 = settled), so describe and stop never
+    change the cluster dict's size under a concurrent get_state() deepcopy.
+    """
+    seen = c.get("_password_reset_describes")
+    if seen is None or seen > 2:
+        return c
+    if advance:
+        c["_password_reset_describes"] = seen + 1
+        if seen == 2:
+            return c
+    view = {**c, "PendingModifiedValues": {"MasterUserPassword": "****"}}
+    if advance and seen == 1 and c.get("Status") == "available":
+        view["Status"] = "resetting-master-credentials"
+    return view
+
+
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
@@ -6297,7 +6321,9 @@ def _describe_db_clusters(p):
         from ministack.services import documentdb
         docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters) + docdb_members
+    members = "".join(
+        f"<DBCluster>{_cluster_xml(_password_reset_view(c, True))}</DBCluster>" for c in clusters
+    ) + docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
@@ -6504,7 +6530,16 @@ def _modify_db_cluster_impl(p):
                 "MasterUserPassword must be changed on the global writer.",
                 400,
             )
+        if cluster.get("Status") == "stopped":
+            # Verbatim from real AWS (captured, us-west-2).
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"Db cluster {cluster_id} cannot be in the stopped state.",
+                400,
+            )
         _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
+        if cluster.get("Status") == "available":
+            cluster["_password_reset_describes"] = 0
     if _p(p, "RotateMasterUserPassword") == "true":
         master_user_secret = cluster.get("MasterUserSecret")
         if not master_user_secret:
@@ -6581,7 +6616,7 @@ def _modify_db_cluster_impl(p):
                 _inherit_performance_insights(instance, cluster)
 
     return _xml(200, "ModifyDBClusterResponse",
-        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
+        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_password_reset_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -7596,6 +7631,8 @@ def _stop_db_cluster(p):
     # Publish the transitional status before touching compute so concurrent
     # reader bootstrap workers can tell a stop-in-progress from a genuinely
     # dead container and park instead of destroying preserved compute.
+    if "_password_reset_describes" in cluster:
+        cluster["_password_reset_describes"] = 3  # settled; reassigned, not popped (see _password_reset_view)
     cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
@@ -9763,6 +9800,13 @@ def _cluster_xml(c):
         f"<GlobalClusterIdentifier>{global_cluster_id}</GlobalClusterIdentifier>"
         if global_cluster_id else ""
     )
+    pending = c.get("PendingModifiedValues")
+    pending_xml = (
+        "<PendingModifiedValues>"
+        + "".join(f"<{k}>{v}</{k}>" for k, v in pending.items())
+        + "</PendingModifiedValues>"
+        if pending else ""
+    )
     global_write_forwarding = c.get("GlobalWriteForwardingStatus")
     global_write_forwarding_xml = (
         f"<GlobalWriteForwardingStatus>{global_write_forwarding}</GlobalWriteForwardingStatus>"
@@ -9791,6 +9835,7 @@ def _cluster_xml(c):
         <EngineMode>{c.get('EngineMode','provisioned')}</EngineMode>
         {_serverlessv2_xml(c)}
         <Status>{c['Status']}</Status>
+        {pending_xml}
         <MasterUsername>{c.get('MasterUsername','admin')}</MasterUsername>
         {db_name_xml}
         <Endpoint>{c.get('Endpoint','')}</Endpoint>
