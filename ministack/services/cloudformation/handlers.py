@@ -607,31 +607,37 @@ _OPERATION_EVENT_FIELDS = (
     "EventId", "StackId", "OperationId", "OperationType", "OperationStatus", "EventType",
     "LogicalResourceId", "PhysicalResourceId", "ResourceType", "Timestamp", "ResourceStatus",
     "ResourceStatusReason", "DetailedStatus", "ValidationFailureMode", "ValidationName",
-    "ValidationStatus", "ValidationStatusReason", "ValidationPath",
+    "ValidationStatus", "ValidationStatusReason", "ValidationPath", "StartTime", "EndTime",
 )
 
 
 def _describe_events(params):
-    """The operation events of a stack. MiniStack records them for a create
-    that fails pre-deployment validation, the case the stack event tells the
-    caller to call DescribeEvents for; change-set events are not recorded."""
+    """The operation events of a stack or a change set. MiniStack records the
+    validation errors of a create, update or change set that fails
+    pre-deployment validation, the case the stack event or the change set's
+    StatusReason tells the caller to call DescribeEvents for. A change set's
+    events are its own: the stack's do not include them (measured)."""
     stack_name = _p(params, "StackName")
-    if stack_name:
-        stack = _resolve_stack(stack_name)
+    stack = _resolve_stack(stack_name) if stack_name else None
+    if _p(params, "ChangeSetName"):
+        from ministack.services.cloudformation.changesets import _find_change_set
+        _, change_set = _find_change_set(_p(params, "ChangeSetName"), (stack or {}).get("StackName", stack_name))
+        events = list((change_set or {}).get("_operation_events") or [])
+    elif stack_name:
         if not stack:
             return _error("ValidationError", f"Stack [{stack_name}] does not exist")
         events = list(stack.get("_operation_events") or [])
-    elif _p(params, "ChangeSetName"):
-        events = []
     else:
-        # Every member is optional; an OperationId alone names its stack's events.
-        from ministack.services.cloudformation import _stacks
-        events = [e for s in _stacks.values() for e in s.get("_operation_events") or []]
+        # Every member is optional; an OperationId alone names its stack's or change set's events.
+        from ministack.services.cloudformation import _change_sets, _stacks
+        events = [e for s in (*_stacks.values(), *_change_sets.values()) for e in s.get("_operation_events") or []]
     operation_id = _p(params, "OperationId")
     if operation_id:
         events = [e for e in events if e.get("OperationId") == operation_id]
     if _p(params, "Filters.FailedEvents").lower() == "true":
-        events = [e for e in events if e.get("OperationStatus") == "FAILED"]
+        # Validation and provisioning errors carry no OperationStatus (measured).
+        events = [e for e in events if e.get("OperationStatus") == "FAILED"
+                  or e.get("EventType") in ("VALIDATION_ERROR", "PROVISIONING_ERROR")]
     events, next_token_xml, err = _page(events, params, "DescribeEvents")
     if err:
         return err
@@ -1744,11 +1750,74 @@ def _signal_resource(params):
     return _xml(200, "SignalResourceResponse", "")
 
 
+# --- StackSet reads, for AWS::CloudFormation::StackSet resources (shapes from a real-AWS capture) ---
+
+def _stack_set_query(params, action):
+    from ministack.services.cloudformation import _stack_sets, _stacks
+    name, region, account = _p(params, "StackSetName"), get_region(), get_account_id()
+    # By name the active StackSet; by StackSetId also a deleted one.
+    rec = next((r for r in _stack_sets.values() if r["StackSetId"] == name
+                or (r["StackSetName"] == name and r["Status"] == "ACTIVE")), None)
+    if not rec:
+        return _error("StackSetNotFoundException", f"StackSet {name} not found", 404)
+    props, stack = rec["Properties"], _stacks.get(rec["InstanceStack"], {})
+    live = rec["Status"] == "ACTIVE" and stack.get("StackStatus", "DELETE_COMPLETE") != "DELETE_COMPLETE"
+
+    def members(items):
+        return "".join(f"<member>{i}</member>" for i in items)
+
+    if action == "ListStackInstances":
+        if any(k.startswith("Filters.") for k in params):
+            return _error("ValidationError", "MiniStack does not support Filters on ListStackInstances")
+        status = stack.get("StackStatus", "")
+        state, detail = (("CURRENT", "SUCCEEDED") if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE")
+                         else ("OUTDATED", "RUNNING") if status.endswith("_IN_PROGRESS") else ("OUTDATED", "FAILED"))
+        reason = stack.get("StackStatusReason") if detail == "FAILED" else ""
+        wanted = (_p(params, "StackInstanceAccount", account) == account
+                  and _p(params, "StackInstanceRegion", region) == region)
+        result = "<Summaries>" + ((
+            f"<member><StackSetId>{_esc(rec['StackSetId'])}</StackSetId><Region>{region}</Region>"
+            f"<Account>{account}</Account><StackId>{_esc(stack['StackId'])}</StackId><Status>{state}</Status>"
+            + (f"<StatusReason>{_esc(reason)}</StatusReason>" if reason else "")
+            + f"<StackInstanceStatus><DetailedStatus>{detail}</DetailedStatus></StackInstanceStatus>"
+            "<OrganizationalUnitId></OrganizationalUnitId><DriftStatus>NOT_CHECKED</DriftStatus></member>")
+            if live and wanted else "") + "</Summaries>"
+    else:
+        # The input value: an SSM-typed parameter's is the parameter name, not what it resolved to.
+        params_xml = members(
+            f"<ParameterKey>{_esc(k)}</ParameterKey>"
+            f"<ParameterValue>{_esc('****' if v.get('NoEcho') else v.get('SsmName', v['Value']))}</ParameterValue>"
+            "<UsePreviousValue>false</UsePreviousValue>" for k, v in stack.get("_resolved_params", {}).items())
+        tags = members(f"<Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value>"
+                       for t in (props.get("Tags") or [] if rec["Status"] == "ACTIVE" else []))
+        counts = "".join(f"<{k}StackInstancesCount>0</{k}StackInstancesCount>"
+                         for k in ("Total", "Drifted", "InSync", "InProgress", "Failed"))
+        active = str((props.get("ManagedExecution") or {}).get("Active", False)).lower()
+        admin = (props.get("AdministrationRoleARN")
+                 or f"arn:aws:iam::{account}:role/AWSCloudFormationStackSetAdministrationRole")
+        result = (
+            f"<StackSet><StackSetName>{_esc(rec['StackSetName'])}</StackSetName>"
+            f"<StackSetId>{_esc(rec['StackSetId'])}</StackSetId>"
+            + (f"<Description>{_esc(props['Description'])}</Description>" if props.get("Description") else "")
+            + f"<Status>{rec['Status']}</Status><TemplateBody>{_esc(props['TemplateBody'])}</TemplateBody>"
+            f"<Parameters>{params_xml}</Parameters>"
+            f"<Capabilities>{members(_esc(c) for c in props.get('Capabilities') or [])}</Capabilities>"
+            f"<Tags>{tags}</Tags><StackSetARN>arn:aws:cloudformation:{region}:{account}:stackset/"
+            f"{_esc(rec['StackSetId'])}</StackSetARN><AdministrationRoleARN>{_esc(admin)}</AdministrationRoleARN>"
+            "<ExecutionRoleName>" + _esc(props.get("ExecutionRoleName") or "AWSCloudFormationStackSetExecutionRole")
+            + f"</ExecutionRoleName><StackSetDriftDetectionDetails><DriftStatus>NOT_CHECKED</DriftStatus>{counts}"
+            f"</StackSetDriftDetectionDetails><OrganizationalUnitIds/><ManagedExecution><Active>{active}</Active>"
+            f"</ManagedExecution><Regions>{members([region] if live else [])}</Regions></StackSet>")
+    return _xml(200, f"{action}Response", f"<{action}Result>{result}</{action}Result>")
+
+
 # ===========================================================================
 # Action Handler Registry
 # ===========================================================================
 
 _ACTION_HANDLERS = {
+    "DescribeStackSet": lambda params: _stack_set_query(params, "DescribeStackSet"),
+    "ListStackInstances": lambda params: _stack_set_query(params, "ListStackInstances"),
     "CreateStack": _create_stack,
     "DescribeStacks": _describe_stacks,
     "ListStacks": _list_stacks,
