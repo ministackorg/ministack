@@ -4500,7 +4500,13 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
     if runtime.startswith("python"):
         name, shim_handler, source = "_msctx_shim.py", "_msctx_shim.handler", _PY_CTX_ARN_SHIM
     elif runtime.startswith("nodejs"):
-        name, shim_handler, source = "_msctx_shim.js", "_msctx_shim.handler", _JS_CTX_ARN_SHIM
+        # .cjs: Node loads it as CommonJS even when the package's package.json
+        # says "type": "module", where a .js shim would fail on `require`.
+        name, shim_handler, source = "_msctx_shim.cjs", "_msctx_shim.handler", _JS_CTX_ARN_SHIM
+        # The runtime tries .js and .mjs before .cjs, so a user's module of
+        # either name would be loaded in place of the shim.
+        if any(os.path.exists(os.path.join(code_dir, "_msctx_shim" + ext)) for ext in (".js", ".mjs")):
+            return None
     else:
         return None
     shim_path = os.path.join(code_dir, name)
