@@ -499,6 +499,7 @@ subnet = ec2.create_subnet(
 | `AWS::Logs::MetricFilter` | Filter name | — |
 | `AWS::Logs::LogStream` | Log stream name | — |
 | `AWS::Events::EventBus` | EventBus name | Arn, Name |
+| `AWS::Events::Archive` | Archive name | Arn |
 | `AWS::Events::Rule` | Rule name | Arn |
 | `AWS::Kinesis::Stream` | Stream name | Arn, StreamId |
 | `AWS::KinesisAnalyticsV2::Application` | Application name | — |
