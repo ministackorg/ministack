@@ -227,6 +227,31 @@ def _iceberg_field_type(kind):
     raise ValueError(kind)
 
 
+def _highest_field_id(fields):
+    """Highest Iceberg field id in a list of struct fields, nested ids included:
+    a struct's fields, a list's element-id, a map's key-id and value-id."""
+    highest = 0
+
+    def visit(kind):
+        nonlocal highest
+        if not isinstance(kind, dict):
+            return
+        if kind.get("type") == "struct":
+            for f in kind.get("fields", []):
+                highest = max(highest, f.get("id", 0))
+                visit(f.get("type"))
+        elif kind.get("type") == "list":
+            highest = max(highest, kind.get("element-id", 0))
+            visit(kind.get("element"))
+        elif kind.get("type") == "map":
+            highest = max(highest, kind.get("key-id", 0), kind.get("value-id", 0))
+            visit(kind.get("key"))
+            visit(kind.get("value"))
+
+    visit({"type": "struct", "fields": fields})
+    return highest
+
+
 def _initial_iceberg_metadata(table_name, schema_fields, location):
     table_uuid = new_uuid()
     fields = []
@@ -987,11 +1012,11 @@ def _apply_iceberg_updates(metadata, updates):
             if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
                 existing.append(new_schema)
             # Advance last-column-id to the highest field ID in the new
-            # schema, so a client allocating the next column's ID (e.g.
-            # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
-            field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
-            if field_ids:
-                metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
+            # schema, nested ids included, so a client allocating the next
+            # column's ID (e.g. DuckDB or Trino ADD COLUMN) doesn't collide.
+            metadata["last-column-id"] = max(
+                metadata.get("last-column-id", 0), _highest_field_id(new_schema.get("fields", []))
+            )
         elif action == "set-current-schema":
             schema_id = update.get("schema-id", 0)
             if schema_id == -1:
@@ -1134,6 +1159,7 @@ def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=Non
         iceberg_metadata["format-version"] = int(fmt_ver)
     if schema:
         iceberg_metadata["schemas"] = [schema]
+        iceberg_metadata["last-column-id"] = _highest_field_id(schema.get("fields", []))
     partition_spec = data.get("partition-spec")
     if partition_spec:
         # Echo back the client's requested partition spec as the default, so a

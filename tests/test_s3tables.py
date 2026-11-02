@@ -944,6 +944,60 @@ def test_s3tables_iceberg_create_table_honors_requested_partition_spec(s3tables)
         s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
 
 
+def test_s3tables_iceberg_last_column_id_counts_nested_fields(s3tables):
+    """last-column-id is the highest field id anywhere in the schema: a struct's
+    fields, a list's element-id, a map's key-id and value-id (#2501). The ids
+    and values below were recorded on AWS."""
+    bucket_arn = s3tables.create_table_bucket(name=f"tb-nest-{_uuid_mod.uuid4().hex[:6]}")["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    tables = f"/iceberg/v1/{_arn_prefix(bucket_arn)}/namespaces/{ns}/tables"
+
+    def lst(element_id, element="int"):
+        return {"type": "list", "element-id": element_id, "element": element, "element-required": False}
+
+    def col(field_id, name, kind):
+        return {"id": field_id, "name": name, "required": False, "type": kind}
+
+    def create(name, fields):
+        schema = {"type": "struct", "schema-id": 0, "fields": fields}
+        return _iceberg_json(tables, method="POST", payload={"name": name, "schema": schema, "stage-create": False})
+
+    s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+    try:
+        created = create("with_list", [col(1, "a", "long"), col(2, "xs", lst(3))])
+        assert created["metadata"]["last-column-id"] == 3
+        assert _iceberg_json(f"{tables}/with_list")["metadata"]["last-column-id"] == 3
+
+        nested = {"type": "struct", "fields": [col(4, "x", "int"), col(5, "y", lst(6, "string"))]}
+        kv = {"type": "map", "key-id": 7, "key": "string", "value-id": 8, "value": "long", "value-required": False}
+        created = create("with_struct_map", [col(1, "a", "long"), col(2, "s", nested), col(3, "m", kv)])
+        assert created["metadata"]["last-column-id"] == 8
+
+        # A column added with nested fields moves last-column-id past all of them.
+        current = _iceberg_json(f"{tables}/with_list")["metadata"]["schemas"][-1]
+        added = col(4, "p", {"type": "struct", "fields": [col(5, "q", "int"), col(6, "r", lst(7))]})
+        _iceberg_json(
+            f"{tables}/with_list",
+            method="POST",
+            payload={
+                "requirements": [],
+                "updates": [
+                    {"action": "add-schema", "schema": {"type": "struct", "schema-id": 1, "fields": current["fields"] + [added]}},
+                    {"action": "set-current-schema", "schema-id": -1},
+                ],
+            },
+        )
+        assert _iceberg_json(f"{tables}/with_list")["metadata"]["last-column-id"] == 7
+    finally:
+        for name in ("with_list", "with_struct_map"):
+            try:
+                s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=name)
+            except Exception:
+                pass
+        s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def test_s3tables_iceberg_add_schema_is_idempotent_by_schema_id(s3tables):
     """A resent add-schema commit for an already-registered schema-id (Spark
     re-declares its current schema on every write) must not append a second
