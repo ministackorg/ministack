@@ -35,6 +35,7 @@ import io
 import ipaddress
 import logging
 import os
+import re
 import tarfile
 import time
 from urllib.parse import parse_qs
@@ -2541,7 +2542,30 @@ def _engine_acl(rg, account_id, region):
         tokens = [] if rg.get("_auth_optional") else rg.get("_auth_tokens") or []
         commands = [["ACL", "SETUSER", "default", "reset", "on", "~*", "&*", "+@all",
                      *([f"#{hashlib.sha256(t.encode()).hexdigest()}" for t in tokens] or ["nopass"])]]
-    return "".join(f"user {' '.join(command[2:])}\n" for command in commands)
+    version = tuple(int(n) for n in re.findall(r"\d+", rg.get("EngineVersion") or "7")[:2] + ["0"])[:2]
+    lacking = _ACL_MODULE_NAMES | {c for since, names in _ACL_COMMANDS_SINCE if version < since for c in names.split()}
+    return "".join(f"user {' '.join(_engine_rules(command[2:], lacking))}\n" for command in commands)
+
+
+def _engine_rules(rules, lacking):
+    """The rules without the commands and categories the engine lacks (the JSON and Bloom modules
+    MiniStack's images do not load, commands newer than the engine), which it would refuse; a
+    (selector) they open or close is kept."""
+    kept, opening = [], ""
+    for rule in rules:
+        core = rule.strip("()")
+        if core[:1] in ("+", "-") and core[1:].lstrip("@").split("|")[0].lower() in lacking:
+            opening += rule[:len(rule) - len(rule.lstrip("("))]
+            closing = rule[len(rule.rstrip(")")):]
+            if closing and opening:
+                kept.append(opening + closing)
+                opening = ""
+            elif closing:
+                kept[-1] += closing
+            continue
+        kept.append(opening + rule)
+        opening = ""
+    return kept
 
 
 def _apply_user_groups(rg, account_id, region):
@@ -2985,6 +3009,72 @@ def _password_hashes(p):
     return [hashlib.sha256(_p(p, k).encode()).hexdigest() for k in keys if _p(p, k)]
 
 
+# What an access string may name: the commands of the valkey/valkey:8.1 image's `COMMAND LIST`
+# with valkey/valkey-bundle:8.1's JSON and Bloom commands and the ones valkey/valkey:9.0 adds, and the categories of the engine's
+# `ACL CAT` on AWS (real AWS, us-west-2, Valkey 8.1). `all` is no category but is accepted.
+_ACL_COMMANDS = frozenset((
+    "acl append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.load bf.madd bf.mexists "
+    "bf.reserve bgrewriteaof bgsave bitcount bitfield bitfield_ro bitop bitpos blmove blmpop blpop brpop "
+    "brpoplpush bzmpop bzpopmax bzpopmin client cluster command commandlog config copy dbsize debug decr "
+    "decrby del discard dump echo eval eval_ro evalsha evalsha_ro exec exists expire expireat expiretime "
+    "failover fcall fcall_ro flushall flushdb function geoadd geodist geohash geopos georadius "
+    "georadius_ro georadiusbymember georadiusbymember_ro geosearch geosearchstore get getbit getdel getex "
+    "getrange getset hdel hello hexists hget hgetall hincrby hincrbyfloat hkeys hlen hmget hmset "
+    "hrandfield hscan hset hsetnx hstrlen hvals incr incrby incrbyfloat info json.arrappend json.arrindex "
+    "json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.debug json.del json.forget "
+    "json.get json.mget json.mset json.numincrby json.nummultby json.objkeys json.objlen json.resp "
+    "json.set json.strappend json.strlen json.toggle json.type keys lastsave latency lcs lindex linsert "
+    "llen lmove lmpop lolwut lpop lpos lpush lpushx lrange lrem lset ltrim memory mget migrate module "
+    "monitor move mset msetnx multi object persist pexpire pexpireat pexpiretime pfadd pfcount pfdebug "
+    "pfmerge pfselftest ping psetex psubscribe psync pttl publish pubsub punsubscribe quit randomkey "
+    "readonly readwrite rename renamenx replconf replicaof reset restore restore-asking role rpop "
+    "rpoplpush rpush rpushx sadd save scan scard script sdiff sdiffstore select set setbit setex setnx "
+    "setrange shutdown sinter sintercard sinterstore sismember slaveof slowlog smembers smismember smove "
+    "sort sort_ro spop spublish srandmember srem sscan ssubscribe strlen subscribe substr sunion "
+    "sunionstore sunsubscribe swapdb sync time touch ttl type unlink unsubscribe unwatch wait waitaof "
+    "watch xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup xrevrange "
+    "xsetid xtrim zadd zcard zcount zdiff zdiffstore zincrby zinter zintercard zinterstore zlexcount "
+    "zmpop zmscore zpopmax zpopmin zrandmember zrange zrangebylex zrangebyscore zrangestore zrank zrem "
+    "zremrangebylex zremrangebyrank zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore zrevrank "
+    "zscan zscore zunion zunionstore "
+).split())
+# Commands an older engine lacks, by the version that added them (the redis:6, redis:7 and
+# valkey/valkey:7.2-9.0 images' command lists); they are left out of its ACL, where they couldn't run.
+_ACL_COMMANDS_SINCE = (
+    ((7, 0), "blmpop bzmpop eval_ro evalsha_ro expiretime fcall fcall_ro function lcs lmpop pexpiretime quit "
+             "sintercard sort_ro spublish ssubscribe sunsubscribe waitaof zintercard zmpop"),
+    ((8, 1), "commandlog"),
+    ((9, 0), "delifeq hexpire hexpireat hexpiretime hgetex hpersist hpexpire hpexpireat hpexpiretime hpttl "
+             "hsetex httl"),
+)
+_ACL_COMMANDS |= {c for _since, names in _ACL_COMMANDS_SINCE for c in names.split()}
+_ACL_CATEGORIES = frozenset((
+    "all keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast "
+    "slow blocking dangerous connection transaction scripting json bloom").split())
+_ACL_MODULE_NAMES = frozenset({"json", "bloom"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
+_ACL_KEYWORDS = frozenset((
+    "on off nopass resetpass reset allkeys allchannels resetkeys resetchannels allcommands nocommands "
+    "clearselectors").split())
+
+
+def _access_string_error(access):
+    """AWS's refusal of an access string naming an unknown command or category, or of its syntax
+    (real AWS, us-west-2); a subcommand is not checked (`+get|nosub` is accepted)."""
+    for token in access.split():
+        rule = token.strip("()")  # (selector) rules too
+        if rule[:2] in ("+@", "-@"):
+            if rule[2:].lower() not in _ACL_CATEGORIES:
+                return _error("InvalidParameterValue", "Access string contains invalid category(s). "
+                              "Please verify the list of available category in user-api.", 400)
+        elif rule[:1] in ("+", "-"):
+            if rule[1:].split("|")[0].lower() not in _ACL_COMMANDS:
+                return _error("InvalidParameterValue", "Access string contains invalid command(s). "
+                              "Please verify the list of available commands in user-api.", 400)
+        elif rule and rule[0] not in "~%&><#!" and rule.lower() not in _ACL_KEYWORDS:
+            return _error("InvalidParameterValue", "The access-string is invalid.", 400)
+    return None
+
+
 def _reported_access_string(access):
     """The access string as AWS reports it, with the `-@all` its command rules build on (real AWS,
     us-west-2: `on ~app:* +@read` is reported as `on ~app:* -@all +@read`)."""
@@ -3013,6 +3103,7 @@ def _create_user(p):
     user_name = _p(p, "UserName") or user_id
     engine = _p(p, "Engine") or "redis"
     auth, err = _user_authentication(p, user_id, user_name, engine)
+    err = err or _access_string_error(_p(p, "AccessString"))
     if err:
         return err
     arn = _arn_user(user_id)
@@ -3076,6 +3167,7 @@ def _modify_user(p):
         return _error("UserNotFound", f"User {user_id} not found", 404)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
+    err = err or _access_string_error(_p(p, "AccessString"))
     if err:
         return err
     if _p(p, "AccessString"):
@@ -3142,8 +3234,13 @@ def _describe_user_groups(p):
 
 def _delete_user_group(p):
     group_id = _p(p, "UserGroupId")
-    group = _user_groups.pop(group_id, None)
+    group = _user_groups.get(group_id)
     if not group:
+        return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
+    if group.get("ReplicationGroups") or any(c.get("UserGroupId") == group_id for c in _serverless_caches.values()):
+        return _error("InvalidUserGroupState", f"User group {group_id} can't be deleted because it is still "
+                      "associated with at least 1 replication group or serverless cache.", 400)  # real AWS, us-west-2
+    if _user_groups.pop(group_id, None) is None:  # deleted meanwhile by a concurrent request
         return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
     _tags.pop(group.get("ARN", ""), None)
 
