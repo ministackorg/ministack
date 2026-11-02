@@ -1975,7 +1975,8 @@ def test_s3_untagged_put_object_clears_overwritten_tags_and_acl(s3):
     """An overwrite is a new object: the old one's tags and ACL do not carry over (as #2511 captured for multipart)."""
     bkt = f"intg-s3-put-overwrite-{_uuid_mod.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bkt)
-    s3.put_object(Bucket=bkt, Key="k", Body=b"1", Tagging="old=1", ACL="public-read")
+    s3.put_bucket_ownership_controls(Bucket=bkt, OwnershipControls={"Rules": [{"ObjectOwnership": "ObjectWriter"}]})
+    s3.put_object(Bucket=bkt, Key="k", Body=b"1", Tagging="old=1", ACL="authenticated-read")
     s3.put_object(Bucket=bkt, Key="k", Body=b"2")
     assert s3.get_object_tagging(Bucket=bkt, Key="k")["TagSet"] == []
     grants = s3.get_object_acl(Bucket=bkt, Key="k")["Grants"]
