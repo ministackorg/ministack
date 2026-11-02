@@ -1958,8 +1958,7 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
         refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
         if refused:
             return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
-    # The ARN names the API's owner; the caller is authenticated in its own account
-    # (``caller_account``, set when the request runs as another account's API).
+    # The ARN names the API's owner; the caller is authenticated in its own account.
     resource_arn = execute_api_arn(
         extract_region(headers, query_params), get_account_id(),
         api_id, stage, method, execute_path,
@@ -2089,12 +2088,7 @@ async def _handle_cloudfront_alias_request(
 
 
 def _invoke_as_api_owner(api_id: str) -> str | None:
-    """Serve a REST, HTTP or WebSocket API owned by another account as its owner, as AWS does.
-
-    Returns the caller's account when the request now runs as the owner, else
-    None (the caller owns the API, or no account does). The caller is still
-    authenticated in its own account: see ``_enforce_execute_api``.
-    """
+    """Run an API another account owns as its owner; returns the caller's account, or None."""
     apigw_v1 = _get_module("apigateway_v1")
     apigw_v2 = _get_module("apigateway")
     if apigw_v1.find_api_scope(api_id) is not None or apigw_v2.find_api_scope(api_id) is not None:
@@ -2602,8 +2596,7 @@ def _enforce_data_plane(
     handler has to pass them, because it knows the resource the router does not.
     ``named_resource`` is the resource an identity-policy denial names, in the
     error Content-Type of the service, for the services that word it so.
-    ``denied_response`` may answer a policy denial in the service's own words;
-    it gets the evaluation result and returns None to keep the default.
+    ``denied_response(result)`` may word a policy denial; None keeps the default.
     """
     if not AUTH:
         return None

@@ -910,11 +910,7 @@ def _restore_child_store(store, restored, parent_regions, parent_name_from_key=l
 
 
 def find_api_owner(api_id):
-    """The account owning REST API ``api_id``, whatever the ambient account, or None.
-
-    Only for invoking an API: on AWS an execute-api URL reaches its API from any
-    caller, signed by another account or not signed at all.
-    """
+    """The account owning REST API ``api_id``, or None. Only for invoking it."""
     for (stored_account, _region, stored_api_id), _api in _rest_apis.all_items():
         if stored_api_id == api_id:
             return stored_account
@@ -1656,12 +1652,7 @@ def authentication_error_response(api_id, stage_name, error, headers, query_para
 
 
 def cross_account_denial_response(api_id, stage_name, denied, headers, query_params, owner_scope):
-    """403 for a call from another account that no policy allows, or None to keep the default.
-
-    Captured on AWS: an AWS_IAM method called by another account with no REST API
-    policy granting it answers ``{"Message": "User: <caller> is not authorized to
-    access this resource"}``. An explicit Deny keeps the default wording.
-    """
+    """AWS's 403 for another account's call no policy allows; None (an explicit Deny) keeps the default."""
     if denied.decision == "Deny":
         return None
     with request_scope(*owner_scope):

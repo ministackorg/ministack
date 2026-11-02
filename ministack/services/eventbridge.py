@@ -703,7 +703,7 @@ def _validate_target_arn(target):
     ):
         return error_response_json("ValidationException", "RoleArn is required", 400)
 
-    # AWS parity: any other target in another account needs an execution role, in any region.
+    # Any other target in another account needs an execution role, in any region.
     if spec.service != "events" and spec.account_id and spec.account_id != get_account_id() and not target.get("RoleArn"):
         return error_response_json("ValidationException", f"RoleArn is required for target {arn}.", 400)
 
@@ -2494,8 +2494,7 @@ def _target_matches_request_scope(spec, target=None) -> bool:
         return False
     if spec.account_id == get_account_id():
         return True
-    # AWS delivers to a target in another account of the same region through the target's execution
-    # role. Modelled for SQS, whose queues are looked up by the account in their ARN.
+    # Another account's target in the same region is reached through its execution role; modelled for SQS.
     return spec.service == "sqs" and bool((target or {}).get("RoleArn"))
 
 
