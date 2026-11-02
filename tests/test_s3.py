@@ -1917,6 +1917,60 @@ def test_s3_put_object_with_tagging_header_no_value(s3):
     resp = s3.get_object_tagging(Bucket=bkt, Key="tagged-without-value.txt")
     assert resp["TagSet"] == [{"Key": "tagging-hdr-no-value", "Value": ""}]
 
+def _complete_one_part_upload(s3, bkt, key, **create_kwargs):
+    upload_id = s3.create_multipart_upload(Bucket=bkt, Key=key, **create_kwargs)["UploadId"]
+    part = s3.upload_part(Bucket=bkt, Key=key, UploadId=upload_id, PartNumber=1, Body=b"x" * 10)
+    return s3.complete_multipart_upload(
+        Bucket=bkt, Key=key, UploadId=upload_id,
+        MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]},
+    )
+
+def test_s3_multipart_upload_with_tagging_header(s3):
+    """Tagging on CreateMultipartUpload lands on the completed object, as on
+    real S3 (us-east-1): GetObjectTagging returns the set and GetObject reports
+    TagCount."""
+    bkt = "intg-s3-mpu-tag-hdr"
+    s3.create_bucket(Bucket=bkt)
+    _complete_one_part_upload(s3, bkt, "mpu", Tagging="env=prod&empty=")
+    resp = s3.get_object_tagging(Bucket=bkt, Key="mpu")
+    assert sorted(resp["TagSet"], key=lambda t: t["Key"]) == [
+        {"Key": "empty", "Value": ""},
+        {"Key": "env", "Value": "prod"},
+    ]
+    assert s3.get_object(Bucket=bkt, Key="mpu")["TagCount"] == 2
+
+def test_s3_multipart_upload_rejects_more_than_ten_tags(s3):
+    """Real S3 (us-east-1) refuses 11 tags at CreateMultipartUpload with 400
+    BadRequest, the same error PutObject returns."""
+    bkt = "intg-s3-mpu-tag-limit"
+    s3.create_bucket(Bucket=bkt)
+    with pytest.raises(ClientError) as exc:
+        s3.create_multipart_upload(Bucket=bkt, Key="k", Tagging="&".join(f"k{i}=v{i}" for i in range(11)))
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "BadRequest"
+    assert exc.value.response["Error"]["Message"] == "Object tags cannot be greater than 10"
+    assert s3.list_multipart_uploads(Bucket=bkt).get("Uploads", []) == []
+
+def test_s3_untagged_multipart_upload_clears_overwritten_tags(s3):
+    """On real S3 (us-east-1) an untagged multipart upload that overwrites a
+    tagged object leaves the key with no tags."""
+    bkt = "intg-s3-mpu-tag-overwrite"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="k", Body=b"x", Tagging="old=1")
+    _complete_one_part_upload(s3, bkt, "k")
+    assert s3.get_object_tagging(Bucket=bkt, Key="k")["TagSet"] == []
+
+def test_s3_multipart_upload_tags_are_per_version(s3):
+    """On real S3 (us-east-1) each multipart upload to a versioned key tags only
+    the version it creates."""
+    bkt = "intg-s3-mpu-tag-versions"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    v1 = _complete_one_part_upload(s3, bkt, "k", Tagging="gen=1")["VersionId"]
+    v2 = _complete_one_part_upload(s3, bkt, "k", Tagging="gen=2")["VersionId"]
+    assert s3.get_object_tagging(Bucket=bkt, Key="k", VersionId=v1)["TagSet"] == [{"Key": "gen", "Value": "1"}]
+    assert s3.get_object_tagging(Bucket=bkt, Key="k", VersionId=v2)["TagSet"] == [{"Key": "gen", "Value": "2"}]
+
 def test_s3_default_retention_applied(s3):
     bkt = "intg-s3-default-ret"
     s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
@@ -10028,6 +10082,21 @@ def test_s3_replication_tag_filter_and(crr_pair):
     use1.put_object(Bucket=src, Key="logs/one", Body=b"x", Tagging="a=1")
     use1.put_object(Bucket=src, Key="data/both", Body=b"x", Tagging="a=1&b=2")
     assert _replicated_keys(euw1, dst) == ["logs/both"]
+
+
+def test_s3_replication_tag_filter_multipart_upload(crr_pair):
+    """Tags given at CreateMultipartUpload decide a tag-filtered rule, as
+    PutObject's do, and the replica carries them: on real S3 (us-east-1
+    same-region replication) only the tagged upload replicated, with its tags."""
+    use1, src, euw1, dst = crr_pair
+    _replicate(use1, src, dst, Filter={"Tag": {"Key": "replicate", "Value": "yes"}},
+               DeleteMarkerReplication={"Status": "Disabled"})
+    _complete_one_part_upload(use1, src, "mpu-tagged", Tagging="replicate=yes")
+    _complete_one_part_upload(use1, src, "mpu-untagged")
+    assert _replicated_keys(euw1, dst) == ["mpu-tagged"]
+    assert euw1.get_object_tagging(Bucket=dst, Key="mpu-tagged")["TagSet"] == [
+        {"Key": "replicate", "Value": "yes"}
+    ]
 
 
 def test_s3_two_way_replication_has_no_loop():
