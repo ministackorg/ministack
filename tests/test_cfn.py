@@ -37799,3 +37799,179 @@ def test_cfn_asg_mixed_instances_policy_and_launch_source(cfn, autoscaling, ec2)
         for name in (f"cfn-mix-{suffix}", f"cfn-mix-bad-{suffix}"):
             _delete_cfn_test_stack(cfn, name)
         ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def _stack_set_template(set_name, queue_name, **overrides):
+    """A parent stack with one SELF_MANAGED StackSet deploying an SQS queue to its own account and Region
+    (the template of the real-AWS capture, with the retention passed through the parent)."""
+    instance = {
+        "Parameters": {"Retention": {"Type": "Number", "Default": "345600"}},
+        "Resources": {"Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+            "QueueName": queue_name, "MessageRetentionPeriod": {"Ref": "Retention"}}}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Queue"}}},
+    }
+    props = {
+        "StackSetName": set_name,
+        "PermissionModel": "SELF_MANAGED",
+        "StackInstancesGroup": [{"DeploymentTargets": {"Accounts": [{"Ref": "AWS::AccountId"}]},
+                                 "Regions": [{"Ref": "AWS::Region"}]}],
+        "TemplateBody": json.dumps(instance),
+        "Parameters": [{"ParameterKey": "Retention", "ParameterValue": {"Ref": "Retention"}}],
+        "Tags": [{"Key": "owner", "Value": "ministack"}],
+        **overrides,
+    }
+    return json.dumps({
+        "Parameters": {"Retention": {"Type": "String", "Default": "345600"}},
+        "Resources": {"Set": {"Type": "AWS::CloudFormation::StackSet", "Properties": props}},
+        "Outputs": {"SetId": {"Value": {"Ref": "Set"}}},
+    })
+
+
+def test_cfn_stackset_deploys_its_one_local_instance_and_deletes_it(cfn, sqs):
+    """A self-managed StackSet in a template deploys its TemplateBody as one stack instance in the stack's own
+    account and Region, and answers DescribeStackSet and ListStackInstances with the shapes of a real-AWS capture."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name, queue = f"cfn-ss-{suffix}", f"ss-{suffix}", f"ss-q-{suffix}"
+    cfn.create_stack(StackName=name, TemplateBody=_stack_set_template(set_name, queue))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        set_id = stack["Outputs"][0]["OutputValue"]
+        assert re.fullmatch(rf"{set_name}:[0-9a-f-]{{36}}", set_id)
+        region = cfn.meta.region_name
+
+        by_name = cfn.describe_stack_set(StackSetName=set_name)["StackSet"]
+        assert cfn.describe_stack_set(StackSetName=set_id)["StackSet"] == by_name
+        assert by_name["StackSetId"] == set_id and by_name["Status"] == "ACTIVE"
+        assert by_name["Parameters"] == [
+            {"ParameterKey": "Retention", "ParameterValue": "345600", "UsePreviousValue": False}]
+        assert by_name["Capabilities"] == [] and by_name["OrganizationalUnitIds"] == []
+        assert by_name["Tags"] == [{"Key": "owner", "Value": "ministack"}]
+        assert by_name["StackSetARN"].endswith(f":stackset/{set_id}")
+        assert by_name["StackSetDriftDetectionDetails"]["DriftStatus"] == "NOT_CHECKED"
+        assert by_name["StackSetDriftDetectionDetails"]["TotalStackInstancesCount"] == 0
+        assert by_name["ManagedExecution"] == {"Active": False}
+        assert by_name["Regions"] == [region]
+
+        [summary] = cfn.list_stack_instances(StackSetName=set_name)["Summaries"]
+        assert summary["Status"] == "CURRENT" and summary["StackInstanceStatus"] == {"DetailedStatus": "SUCCEEDED"}
+        assert summary["OrganizationalUnitId"] == "" and summary["DriftStatus"] == "NOT_CHECKED"
+        assert f":stack/StackSet-{set_name}-" in summary["StackId"]
+        assert "StatusReason" not in summary
+        [instance_stack] = cfn.describe_stacks(StackName=summary["StackId"])["Stacks"]
+        assert instance_stack["Tags"] == [{"Key": "owner", "Value": "ministack"}]
+        assert instance_stack["Outputs"][0]["OutputValue"].endswith(f"/{queue}")
+        sqs.get_queue_url(QueueName=queue)
+
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+        with pytest.raises(ClientError) as exc:
+            cfn.describe_stack_set(StackSetName=set_name)
+        assert exc.value.response["Error"]["Code"] == "StackSetNotFoundException"
+        assert exc.value.response["Error"]["Message"] == f"StackSet {set_name} not found"
+        deleted = cfn.describe_stack_set(StackSetName=set_id)["StackSet"]
+        assert deleted["Status"] == "DELETED" and deleted["Tags"] == [] and deleted["Regions"] == []
+        assert cfn.list_stack_instances(StackSetName=set_id)["Summaries"] == []
+        with pytest.raises(ClientError) as exc:
+            sqs.get_queue_url(QueueName=queue)
+        assert "NonExistentQueue" in exc.value.response["Error"]["Code"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stackset_failed_instance_update_rolls_back(cfn, sqs):
+    """An update whose instance fails (MessageRetentionPeriod below SQS's minimum, as in the real-AWS capture)
+    fails the StackSet and the stack's rollback returns the instance, its parameters and the queue to before."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name, queue = f"cfn-ss-up-{suffix}", f"ss-up-{suffix}", f"ss-up-q-{suffix}"
+    template = _stack_set_template(set_name, queue)
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=name, TemplateBody=template,
+                         Parameters=[{"ParameterKey": "Retention", "ParameterValue": "30"}])
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        failed = [e for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Set" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert failed and "MessageRetentionPeriod" in failed[0]["ResourceStatusReason"]
+
+        [summary] = cfn.list_stack_instances(StackSetName=set_name)["Summaries"]
+        assert summary["Status"] == "CURRENT"
+        [instance_stack] = cfn.describe_stacks(StackName=summary["StackId"])["Stacks"]
+        assert instance_stack["Parameters"] == [{"ParameterKey": "Retention", "ParameterValue": "345600"}]
+        assert instance_stack["Outputs"][0]["OutputKey"] == "QueueUrl"
+        assert cfn.describe_stack_set(StackSetName=set_name)["StackSet"]["Parameters"][0]["ParameterValue"] == "345600"
+        url = sqs.get_queue_url(QueueName=queue)["QueueUrl"]
+        attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["MessageRetentionPeriod"])["Attributes"]
+        assert attrs["MessageRetentionPeriod"] == "345600"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stackset_refuses_what_it_does_not_deploy(cfn):
+    """A SERVICE_MANAGED StackSet, one targeting another Region, or one with TemplateURL fails its stack with an
+    error naming what MiniStack deploys, and leaves no StackSet behind."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    for i, overrides in enumerate([
+        {"PermissionModel": "SERVICE_MANAGED"},
+        {"StackInstancesGroup": [{"DeploymentTargets": {"Accounts": [{"Ref": "AWS::AccountId"}]},
+                                  "Regions": ["eu-west-3"]}]},
+        {"TemplateURL": "https://example.com/t.json"},
+    ]):
+        name, set_name = f"cfn-ss-no-{i}-{suffix}", f"ss-no-{i}-{suffix}"
+        cfn.create_stack(StackName=name, TemplateBody=_stack_set_template(set_name, f"q-{i}-{suffix}", **overrides))
+        try:
+            assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+            [reason] = [e["ResourceStatusReason"] for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                        if e["LogicalResourceId"] == "Set" and e["ResourceStatus"] == "CREATE_FAILED"]
+            assert "PermissionModel SELF_MANAGED, an inline TemplateBody and one StackInstancesGroup" in reason
+            with pytest.raises(ClientError) as exc:
+                cfn.describe_stack_set(StackSetName=set_name)
+            assert exc.value.response["Error"]["Code"] == "StackSetNotFoundException"
+        finally:
+            _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.auth_contract
+def test_cfn_stackset_capabilities_and_reads_contract(auth_enabled, cfn, iam_user):
+    """The StackSet's own Capabilities acknowledge its instance's IAM resources, and DescribeStackSet and
+    ListStackInstances are authorized against the StackSet's ARN (ending in its StackSetId) under AUTH=true."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name = f"cfn-ss-auth-{suffix}", f"ss-auth-{suffix}"
+    instance = {"Resources": {"Role": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}}}}}
+    template = json.loads(_stack_set_template(set_name, f"q-auth-{suffix}", TemplateBody=json.dumps(instance),
+                                              Capabilities=["CAPABILITY_IAM"]))
+    del template["Resources"]["Set"]["Properties"]["Parameters"]
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = cfn.describe_stack_set(StackSetName=set_name)["StackSet"]["StackSetARN"]
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "cloudformation:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": ["cloudformation:DescribeStackSet", "cloudformation:ListStackInstances"],
+             "Resource": arn}]}).client("cloudformation")
+        for call in (user.describe_stack_set, user.list_stack_instances):
+            for ref in (set_name, arn.split("stackset/")[1]):
+                if auth_enabled:
+                    with pytest.raises(ClientError) as exc:
+                        call(StackSetName=ref)
+                    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+                else:
+                    call(StackSetName=ref)
+        # A StackSetName on another action does not change what that action is authorized against.
+        stack_arn = cfn.describe_stacks(StackName=name)["Stacks"][0]["StackId"].rsplit("/", 1)[0] + "/*"
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "cloudformation:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "cloudformation:DescribeStacks", "Resource": stack_arn}]}).client("cloudformation")
+        user.meta.events.register("before-sign.cloudformation.DescribeStacks",
+                                  lambda request, **_: request.data.update({"StackSetName": set_name}))
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                user.describe_stacks(StackName=name)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        else:
+            user.describe_stacks(StackName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)

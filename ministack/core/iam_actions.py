@@ -1411,6 +1411,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudformation":
+        set_name = _query_param(query_params, "StackSetName")
+        if set_name and _query_param(query_params, "Action") in ("DescribeStackSet", "ListStackInstances"):
+            # A StackSet's ARN ends in its StackSetId, whether named by name or by ID.
+            from ministack.services.cloudformation import _stack_sets
+            rec = next((r for r in _stack_sets.values_scoped(account_id, region) if r["StackSetId"] == set_name
+                        or (r["StackSetName"] == set_name and r["Status"] == "ACTIVE")), None)
+            return f"arn:aws:cloudformation:{region}:{account_id}:stackset/{rec['StackSetId'] if rec else set_name}"
         name = _query_param(query_params, "StackName")
         if name:
             if name.startswith("arn:"):
