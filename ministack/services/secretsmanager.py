@@ -759,8 +759,8 @@ def _list_secrets(data):
         }
         if s.get("DeletedDate"):
             entry["DeletedDate"] = s["DeletedDate"]
-        if s.get("_PrimaryRegion"):
-            entry["PrimaryRegion"] = s["_PrimaryRegion"]
+        if _primary_region(s):
+            entry["PrimaryRegion"] = _primary_region(s)
         secret_list.append(entry)
 
     resp: dict = {"SecretList": secret_list}
@@ -896,6 +896,18 @@ def _update_secret(data):
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "VersionId": vid})
 
 
+def _primary_region(secret):
+    """The Region AWS reports as a secret's PrimaryRegion: a replica's source Region, the secret's own
+    Region when it has replicas, and nothing for a secret that is not replicated."""
+    if secret.get("_PrimaryRegion"):
+        return secret["_PrimaryRegion"]
+    region = secret["ARN"].split(":")[3]
+    # Only replicas elsewhere count: a legacy status naming the secret's own Region is not a replica.
+    if any(r.get("Region") != region for r in secret.get("ReplicationStatus") or []):
+        return region
+    return None
+
+
 def _describe_secret(data):
     secret_id = data.get("SecretId")
     _, secret = _resolve(secret_id)
@@ -918,8 +930,8 @@ def _describe_secret(data):
     }
     if secret.get("DeletedDate"):
         result["DeletedDate"] = secret["DeletedDate"]
-    if secret.get("_PrimaryRegion"):
-        result["PrimaryRegion"] = secret["_PrimaryRegion"]
+    if _primary_region(secret):
+        result["PrimaryRegion"] = _primary_region(secret)
     if secret.get("KmsKeyId"):
         result["KmsKeyId"] = secret["KmsKeyId"]
     if secret.get("RotationLambdaARN"):
