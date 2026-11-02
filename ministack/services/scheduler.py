@@ -678,7 +678,7 @@ def _tick_schedules():
                 event["DetailType"] = eb_params["DetailType"]
             try:
                 if publish:
-                    _eb._invoke_target(target, event, sched)
+                    _eb._invoke_target(target, event, sched, from_rule=False)
             except Exception:
                 logger.exception(
                     "Scheduler dispatch error for %s (account %s, region %s)",

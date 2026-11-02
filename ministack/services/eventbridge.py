@@ -138,6 +138,12 @@ def _ensure_default_bus():
         }
 
 
+def _event_bus_exists(name):
+    """Whether the current tenant has bus ``name``. Every account has a default
+    bus, whether or not this emulator has written its record yet."""
+    return name == "default" or name in _event_buses
+
+
 def _events_log_list() -> list:
     entries = _events_log.get("entries")
     if entries is None:
@@ -666,6 +672,9 @@ def _put_targets(data):
         error = _validate_target_arn(target)
         if error:
             return error
+    error = _validate_event_bus_targets(bus, targets)
+    if error:
+        return error
 
     if key not in _targets:
         _targets[key] = []
@@ -695,14 +704,49 @@ def _validate_target_arn(target):
             400,
         )
 
-    if (
-        spec.service == "events"
-        and spec.resource.startswith("event-bus/")
-        and (spec.account_id != get_account_id() or spec.region != get_region())
-        and not target.get("RoleArn")
-    ):
-        return error_response_json("ValidationException", "RoleArn is required", 400)
+    return None
 
+
+def _event_bus_spec(arn):
+    """The parsed ARN when ``arn`` names an event bus, else None."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    return spec if spec.service == "events" and spec.resource.startswith("event-bus/") else None
+
+
+def _validate_event_bus_targets(rule_bus, targets):
+    """AWS's checks on a rule's event bus targets, after every target's ARN is
+    checked. First, across every target, a role in another account, which cannot
+    be passed. Then target by target, in
+    order: the rule's own bus, then any ``RetryPolicy`` (even an empty one). Then,
+    across every target, a missing ``RoleArn``, which every event bus target
+    needs, the rule's own account and region included."""
+    buses = [(target, spec) for target in targets
+             if (spec := _event_bus_spec(target.get("Arn", ""))) is not None]
+    for target, _ in buses:
+        try:
+            role_account = parse_arn(target.get("RoleArn", "")).account_id
+        except ArnParseError:
+            continue
+        if role_account != get_account_id():
+            return error_response_json(
+                "AccessDeniedException",
+                f"Access to the resource {target['RoleArn']} is denied. Reason: Cross-account pass role is not allowed.",
+                400,
+            )
+    for target, spec in buses:
+        if (spec.account_id == get_account_id() and spec.region == get_region()
+                and spec.resource == f"event-bus/{rule_bus}"):
+            return error_response_json(
+                "ValidationException", "Source EventBus and Target EventBus must not be the same.", 400)
+        if "RetryPolicy" in target:
+            return error_response_json(
+                "ValidationException", "Retry policy is not supported for Event bus targets.", 400)
+    for target, _ in buses:
+        if not target.get("RoleArn"):
+            return error_response_json("ValidationException", f"RoleArn is required for target {target['Arn']}.", 400)
     return None
 
 
@@ -1198,14 +1242,10 @@ def _archive_event(event, view=None):
 
 def _dispatch_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
-    event_path = set(event.get("_DispatchPath") or [])
     view = view or _pattern_event_view(event)
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
-            continue
-        if key in event_path:
-            logger.warning("EventBridge: recursive rule dispatch skipped for %s", key)
             continue
         if rule.get("State") != "ENABLED":
             continue
@@ -2378,9 +2418,10 @@ def _matches_content_filter(value, filter_rule):
     return False
 
 
-def _invoke_target(target, event, rule, view=None):
+def _invoke_target(target, event, rule, view=None, from_rule=True):
+    """Deliver ``event`` to ``target``. A schedule's target passes ``from_rule``
+    False and its schedule as ``rule``."""
     arn = target.get("Arn", "")
-    event_path = set(event.get("_DispatchPath") or [])
 
     # The tree the rule matched on, so a rule cannot fire on a field whose
     # delivered value differs. Decoded once for the whole event.
@@ -2418,7 +2459,7 @@ def _invoke_target(target, event, rule, view=None):
             )
             _dispatch_to_api_destination(spec, event_payload, {**target, "HttpParameters": http_parameters})
         elif spec.service == "events":
-            _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
+            _dispatch_to_event_bus(spec, event, rule, target, target_input_payload, from_rule)
         elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
         elif not _target_matches_request_scope(spec):
@@ -2449,34 +2490,171 @@ def _target_matches_request_scope(spec) -> bool:
     return spec.account_id == get_account_id() and spec.region == get_region()
 
 
-def _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload=None):
-    if spec.service != "events" or not spec.resource.startswith("event-bus/"):
+# Set on an event a rule has forwarded to another bus. AWS lets an event reach a
+# bus target in the same region once and cross into another region once; the
+# crossing gives the event a new id and time, and it may then make one more
+# same-region hop.
+_SAME_REGION_HOP = "_SameRegionBusHop"
+_CROSSED_REGION = "_CrossedRegion"
+
+
+def _event_bus_hop_refusal(event, same_region):
+    """The ``ERROR_CODE`` AWS records when a forwarded event may not hop again, or None."""
+    if same_region and event.get(_SAME_REGION_HOP):
+        return "THIRD_ACCOUNT_HOP_DETECTED"
+    if not same_region and event.get(_CROSSED_REGION):
+        return "THIRD_REGION_HOP_DETECTED"
+    return None
+
+
+def _events_may_assume(role, rule):
+    """Whether ``role``'s trust policy lets EventBridge assume it for ``rule``.
+
+    Conditions see ``aws:SourceAccount`` and ``aws:SourceArn`` as the rule's
+    account and ARN. A Deny applies to EventBridge unless its ``NotPrincipal``
+    names it."""
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _action_matches,
+        _conditions_met,
+        _service_principal_matches,
+    )
+
+    try:
+        statements = json.loads(role.get("AssumeRolePolicyDocument") or "{}").get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    ctx = EvalContext(
+        principal_arn="events.amazonaws.com",
+        principal_type="Service",
+        principal_account="",
+        action="sts:AssumeRole",
+        resource_arn=role.get("Arn", ""),
+        region=get_region(),
+        service_context={"aws:sourceaccount": get_account_id(), "aws:sourcearn": rule.get("Arn", "")},
+    )
+    allowed = False
+    for stmt in statements if isinstance(statements, list) else [statements]:
+        if not isinstance(stmt, dict):
+            continue
+        if "NotPrincipal" in stmt:
+            applies = not _service_principal_matches(stmt["NotPrincipal"], "events.amazonaws.com")
+        else:
+            principal = stmt.get("Principal")
+            aws = principal.get("AWS") if isinstance(principal, dict) else None
+            applies = (principal == "*" or _service_principal_matches(principal, "events.amazonaws.com")
+                       or aws == "*" or (isinstance(aws, list) and "*" in aws))
+        actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
+        if not applies or not _action_matches(
+                "sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
+                [not_actions] if isinstance(not_actions, str) else not_actions):
+            continue
+        if not _conditions_met(stmt.get("Condition") or {}, ctx):
+            continue
+        if stmt.get("Effect") == "Deny":
+            return False
+        allowed = allowed or stmt.get("Effect") == "Allow"
+    return allowed
+
+
+def _event_bus_target_denial(spec, event, rule, target):
+    """Under AUTH=true, the ``ERROR_CODE`` AWS records (``NO_PERMISSIONS``) when
+    the target's role cannot put the event on the bus, or None.
+
+    EventBridge assumes the role, so it must be the rule account's role that the
+    ``RoleArn`` names exactly, trust EventBridge for this rule, and be allowed
+    ``events:PutEvents`` on the bus, with ``aws:RequestedRegion`` the bus's
+    region. The bus's policy may refuse it with a Deny; a bus in another account
+    must also allow it, and one that does not exist is refused the same way."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _permissions_boundary,
+        evaluate,
+        evaluate_resource_policy,
+    )
+    from ministack.services import iam as _iam
+
+    role_arn = target.get("RoleArn", "")
+    role_name = role_arn.rsplit("/", 1)[-1]
+    role = _iam._roles.get_scoped(get_account_id(), None, role_name)
+    if role is None or role.get("Arn") != role_arn or not _events_may_assume(role, rule):
+        return "NO_PERMISSIONS"
+    account = get_account_id()
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:sts::{account}:assumed-role/{role_name}/{new_uuid().replace('-', '')}",
+        principal_type="AssumedRole",
+        principal_account=account,
+        action="events:PutEvents",
+        resource_arn=target["Arn"],
+        region=spec.region,
+        service_context={"events:source": event.get("Source"), "events:detail-type": event.get("DetailType"),
+                         "events:eventbusinvocation": "true"},
+    )
+    limits = _permissions_boundary(_iam._roles, role_name, account)
+    if evaluate(ctx, _gather_role_policies(role_name, account), *limits).decision != "Allow":
+        return "NO_PERMISSIONS"
+    name = spec.resource.split("/", 1)[1]
+    with request_scope(spec.account_id, spec.region):
+        policy = _event_bus_policies.get(name) if _event_bus_exists(name) else None
+    same_account = spec.account_id == account
+    if policy is None:
+        return None if same_account else "NO_PERMISSIONS"
+    document = _bus_policy_document(policy)
+    decision = "Deny" if document is None else evaluate_resource_policy(document, ctx).decision
+    if decision == "Deny" or (decision != "Allow" and not same_account):
+        return "NO_PERMISSIONS"
+    return None
+
+
+def _dispatch_to_event_bus(spec, event, rule, target, target_input_payload=None, from_rule=True):
+    """Forward ``event`` to the bus ``spec`` names, in its owner's account and region.
+
+    The event keeps its ``account`` and ``region``; crossing into another region
+    gives it a new id and time. MiniStack does not model target dead-letter
+    queues, so a refusal is logged with the ``ERROR_CODE`` AWS would record.
+
+    A schedule's target (``from_rule`` False) publishes to a bus of its own
+    account and region, as an ingestion rather than a rule's hop."""
+    if not spec.resource.startswith("event-bus/"):
         logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
         return
-
-    if spec.account_id != get_account_id() or spec.region != get_region():
-        logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
-        return
-
     bus_name = spec.resource.split("/", 1)[1]
-    if bus_name not in _event_buses:
-        logger.warning("EventBridge -> Event bus: event bus %s not found", spec)
+    same_region = spec.region == get_region()
+    if from_rule:
+        if (spec.account_id == get_account_id() and same_region
+                and bus_name == event.get("EventBusName", "default")):
+            # PutTargets refuses such a target; state saved before it did, or a
+            # CloudFormation update moving a rule onto the bus, can still hold one.
+            logger.warning("EventBridge -> Event bus %s: not delivered: the rule's own bus", target["Arn"])
+            return
+        code = _event_bus_hop_refusal(event, same_region) or _event_bus_target_denial(spec, event, rule, target)
+        if code:
+            logger.warning("EventBridge -> Event bus %s: not delivered from rule %s: %s",
+                           target["Arn"], rule.get("Arn"), code)
+            return
+    elif spec.account_id != get_account_id() or not same_region:
+        logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
         return
-    source_rule_key = _rule_key(rule.get("Name"), rule.get("EventBusName", "default"))
-    if source_rule_key in event_path:
-        logger.warning("EventBridge -> Event bus: recursive target dispatch skipped for %s", spec)
-        return
-    forwarded = dict(event)
-    forwarded["EventBusName"] = bus_name
-    forwarded["Region"] = spec.region
-    forwarded["_DispatchPath"] = [*event_path, source_rule_key]
+    forwarded = dict(event, Account=event.get("Account", get_account_id()), Region=event.get("Region", get_region()))
+    if from_rule and same_region:
+        forwarded[_SAME_REGION_HOP] = True
+    elif from_rule:
+        forwarded.update({"EventId": new_uuid(), "Time": int(_now_ts()),
+                          _SAME_REGION_HOP: False, _CROSSED_REGION: True})
     if target_input_payload is not None:
         forwarded["Detail"] = target_input_payload
-    _dispatch_event(forwarded)
-    archived = dict(forwarded)
-    archived.pop("_DispatchPath", None)
-    _archive_event(archived)
-    logger.info("EventBridge -> Event bus %s: dispatched", spec)
+    with request_scope(spec.account_id, spec.region):
+        if not _event_bus_exists(bus_name):
+            logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
+            return
+        forwarded["EventBusName"] = bus_name
+        _dispatch_event(forwarded)
+        _archive_event({k: v for k, v in forwarded.items() if k not in (_SAME_REGION_HOP, _CROSSED_REGION)})
+    logger.info("EventBridge -> Event bus %s: dispatched", target["Arn"])
 
 
 def _apply_input_transformer(transformer, rule, view):
