@@ -4730,6 +4730,61 @@ def test_rds_modify_cluster_password(rds):
     assert cluster["DBClusterIdentifier"] == "pw-mod-cluster"
 
 
+def test_rds_cluster_password_reset_is_visible_before_it_settles(rds):
+    """Real AWS (us-west-2): pending ****, then resetting-master-credentials, then available."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-reset-status",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    modified = rds.modify_db_cluster(
+        DBClusterIdentifier="pw-reset-status", MasterUserPassword="new_pass")["DBCluster"]
+    assert modified["Status"] == "available"
+    assert modified["PendingModifiedValues"] == {"MasterUserPassword": "****"}
+    seen = [(c["Status"], c.get("PendingModifiedValues", {}))
+            for c in (rds.describe_db_clusters(DBClusterIdentifier="pw-reset-status")["DBClusters"][0]
+                      for _ in range(4))]
+    pending = {"MasterUserPassword": "****"}
+    assert seen == [("available", pending), ("resetting-master-credentials", pending),
+                    ("available", {}), ("available", {})]
+
+
+def test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster(rds):
+    kw = dict(DBClusterIdentifier="pw-reset-recreate", Engine="aurora-postgresql",
+              MasterUsername="admin", MasterUserPassword="old_pass")
+    rds.create_db_cluster(**kw)
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-recreate", MasterUserPassword="new_pass")
+    rds.delete_db_cluster(DBClusterIdentifier="pw-reset-recreate", SkipFinalSnapshot=True)
+    rds.create_db_cluster(**kw)
+    assert rds.describe_db_clusters(DBClusterIdentifier="pw-reset-recreate")["DBClusters"][0]["Status"] == "available"
+
+
+def test_rds_cluster_password_reset_on_stopped_cluster_is_rejected(rds):
+    """Real AWS: a stopped cluster refuses a password change; a stop clears a pending reset."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-reset-stop",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    def status():
+        return rds.describe_db_clusters(DBClusterIdentifier="pw-reset-stop")["DBClusters"][0]["Status"]
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="new_pass")
+    rds.stop_db_cluster(DBClusterIdentifier="pw-reset-stop")
+    assert status() != "resetting-master-credentials"
+    for _ in range(60):
+        if status() == "stopped":
+            break
+        time.sleep(0.5)
+    assert status() == "stopped"
+    with pytest.raises(ClientError) as exc:
+        rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="newer_pass")
+    assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+    assert exc.value.response["Error"]["Message"] == "Db cluster pw-reset-stop cannot be in the stopped state."
+    assert status() == "stopped"
+
+
 def test_rds_modify_instance_password(rds):
     """ModifyDBInstance with MasterUserPassword updates the stored password."""
     rds.create_db_instance(

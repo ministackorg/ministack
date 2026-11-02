@@ -78,8 +78,8 @@ def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None 
 def _runs_on_worker_thread(resource_type: str) -> bool:
     """The types whose provisioning blocks, so they run on a worker thread:
     custom resources wait for the ResponseURL PUT, a WaitCondition for the
-    signals on its handle, and a nested stack deploys inline and may contain
-    either. ElastiCache clusters and replication groups start and stop their
+    signals on its handle, and a nested stack or a StackSet's instance
+    deploys inline and may contain either. ElastiCache clusters and replication groups start and stop their
     containers through the Docker daemon, the calls elasticache.py itself
     keeps off the event loop. An IoT certificate is registered through the
     async IoT handler, which a worker thread can wait for."""
@@ -87,6 +87,7 @@ def _runs_on_worker_thread(resource_type: str) -> bool:
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::WaitCondition",
                                  "AWS::CloudFormation::Stack",
+                                 "AWS::CloudFormation::StackSet",
                                  "AWS::ElastiCache::CacheCluster",
                                  "AWS::ElastiCache::ReplicationGroup",
                                  "AWS::IoT::Certificate"))
@@ -267,10 +268,12 @@ def _rollback_failure_reason(failed_records: dict) -> str:
 
 def _sends_back_failed_update(resource_type: str) -> bool:
     """Whether the resource whose own update failed is sent back too: a provider
-    or a child stack may have changed state before failing; a type's handler did not."""
+    or a child stack (a StackSet's instance is one) may have changed state before
+    failing; a type's handler did not."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
-                                 "AWS::CloudFormation::Stack"))
+                                 "AWS::CloudFormation::Stack",
+                                 "AWS::CloudFormation::StackSet"))
 
 
 def _mark_rolled_back(record):
