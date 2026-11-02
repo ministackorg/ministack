@@ -3193,26 +3193,35 @@ def _create_archive(data):
     if not name:
         return error_response_json("ValidationException", "ArchiveName is required", 400)
     if name in _archives:
-        return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists", 400)
+        return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists.", 400)
+
+    source_arn = data.get("EventSourceArn", "")
+    if ":event-bus/" in source_arn:
+        _ensure_default_bus()
+        bus_name = source_arn.split(":event-bus/", 1)[1]
+        if bus_name not in _event_buses:
+            return error_response_json("ResourceNotFoundException", f"Event bus {bus_name} does not exist.", 400)
 
     pattern_error = _event_pattern_error(data.get("EventPattern", ""))
     if pattern_error:
         return _invalid_event_pattern(pattern_error)
 
-    source_arn = data.get("EventSourceArn", "")
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:archive/{name}"
     _archives[name] = {
         "ArchiveName": name,
         "ArchiveArn": arn,
         "EventSourceArn": source_arn,
-        "Description": data.get("Description", ""),
-        "EventPattern": data.get("EventPattern", ""),
         "RetentionDays": data.get("RetentionDays", 0),
         "State": "ENABLED",
         "CreationTime": _now_ts(),
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    # An archive created without a description or a pattern has neither in
+    # DescribeArchive.
+    for key in ("Description", "EventPattern"):
+        if key in data:
+            _archives[name][key] = data[key]
     # Unlike event buses, an empty identifier is not stored: an archive with no
     # customer managed key has no KmsKeyIdentifier in DescribeArchive.
     if data.get("KmsKeyIdentifier"):
