@@ -252,6 +252,39 @@ def _highest_field_id(fields):
     return highest
 
 
+def _assign_fresh_ids(fields):
+    """Renumber field ids from 1 as Iceberg's assignFreshIds does: a struct's fields first, then
+    their nested types. Returns the new fields and the old-to-new id map."""
+    counter, ids = [0], {}
+
+    def fresh(old):
+        counter[0] += 1
+        ids.setdefault(old, counter[0])
+        return counter[0]
+
+    def struct(old_fields):
+        new_fields = [{**f, "id": fresh(f.get("id"))} for f in old_fields]
+        for new, old in zip(new_fields, old_fields):
+            new["type"] = nested(old.get("type"))
+        return new_fields
+
+    def nested(kind):
+        if not isinstance(kind, dict):
+            return kind
+        if kind.get("type") == "struct":
+            return {**kind, "fields": struct(kind.get("fields", []))}
+        if kind.get("type") == "list":
+            element_id = fresh(kind.get("element-id"))
+            return {**kind, "element-id": element_id, "element": nested(kind.get("element"))}
+        if kind.get("type") == "map":
+            key_id, value_id = fresh(kind.get("key-id")), fresh(kind.get("value-id"))
+            return {**kind, "key-id": key_id, "value-id": value_id,
+                    "key": nested(kind.get("key")), "value": nested(kind.get("value"))}
+        return kind
+
+    return struct(fields), ids
+
+
 def _initial_iceberg_metadata(table_name, schema_fields, location):
     table_uuid = new_uuid()
     fields = []
@@ -694,8 +727,8 @@ def _iceberg_error(message, exc_type, code):
     ``ErrorModel`` (``{"error": {"message", "type", "code"}}``). This is the
     shape spec-compliant REST clients (DuckDB, Spark, Trino) require, and is
     distinct from the AWS ``{"__type", "message"}`` shape the S3 Tables control
-    plane returns. A client hitting LoadTable on a not-yet-created table must
-    receive a proper ``NoSuchTableException`` so it proceeds to create it."""
+    plane returns. Clients decide on the 404, so loadTable and loadNamespace can
+    answer AWS's own types (``no_such_table``, ``no_such_namespace``)."""
     body = json.dumps({"error": {"message": message, "type": exc_type, "code": code}}).encode("utf-8")
     return code, {"Content-Type": "application/json"}, body
 
@@ -787,7 +820,7 @@ def _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter=Non
 def _iceberg_get_namespace(namespace, allow_cross_region, bucket_filter=None):
     if _iceberg_namespaces(namespace, allow_cross_region, bucket_filter):
         return json_response({"namespace": [namespace], "properties": {}})
-    return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
+    return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
 
 
 # dropTable, dropNamespace and HEAD below follow responses recorded on AWS (us-east-1, an
@@ -970,7 +1003,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
                 },
             }
         )
-    return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
+    return _iceberg_error("The specified table does not exist.", "no_such_table", 404)
 
 
 def _apply_iceberg_updates(metadata, updates):
@@ -1122,6 +1155,9 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
 
 
 def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=None):
+    # S3 Tables requires stage-create, which the Iceberg REST spec leaves optional.
+    if data.get("stage-create") is None:
+        return _iceberg_error("stage-create is a required field and cannot be null", "required_field_is_null", 400)
     table_name = data.get("name", "")
     schema = data.get("schema", {})
     bucket_arn = None
@@ -1151,22 +1187,35 @@ def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=Non
     ]
 
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
-    location = data.get("location", f"s3://{bucket_name}/{namespace}/{table_name}")
+    # S3 Tables assigns the location; a client's, null or not, is ignored.
+    location = f"s3://{bucket_name}/{namespace}/{table_name}"
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
     # Honor a format-version from the client's request or properties.
     fmt_ver = data.get("format-version") or data.get("properties", {}).get("format-version")
     if fmt_ver is not None:
         iceberg_metadata["format-version"] = int(fmt_ver)
+    ids = {}
     if schema:
-        iceberg_metadata["schemas"] = [schema]
-        iceberg_metadata["last-column-id"] = _highest_field_id(schema.get("fields", []))
+        # Field ids are renumbered from 1, and the partition spec and sort order follow.
+        fields, ids = _assign_fresh_ids(schema.get("fields", []))
+        iceberg_metadata["schemas"] = [{**schema, "fields": fields}]
+        iceberg_metadata["last-column-id"] = _highest_field_id(fields)
+
+    def remap(spec_fields):
+        return [{**f, "source-id": ids.get(f.get("source-id"), f.get("source-id"))} for f in spec_fields]
+
     partition_spec = data.get("partition-spec")
     if partition_spec:
-        # Echo back the client's requested partition spec as the default, so a
-        # later commit initialized from this response matches it instead of
-        # asserting an empty spec back at us.
+        partition_spec = {**partition_spec, "fields": remap(partition_spec.get("fields", []))}
         iceberg_metadata["partition-specs"] = [partition_spec]
         iceberg_metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
+        iceberg_metadata["last-partition-id"] = max(
+            [999, *(f.get("field-id", 0) for f in partition_spec["fields"])])
+    write_order = data.get("write-order")
+    if write_order and write_order.get("fields"):
+        write_order = {**write_order, "fields": remap(write_order["fields"])}
+        iceberg_metadata["sort-orders"] = [write_order]
+        iceberg_metadata["default-sort-order-id"] = write_order.get("order-id", 1)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
 

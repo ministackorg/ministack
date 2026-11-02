@@ -4409,10 +4409,7 @@ _EB_ARCHIVE_SETTINGS = ("Description", "EventPattern", "RetentionDays")
 
 
 def _java_hash_map_order(value):
-    """``value`` with every object's keys in the order a java.util.HashMap built
-    from them iterates: by bucket, then by insertion. CloudFormation hands
-    EventBridge an EventPattern in that order, so DescribeArchive returns it so
-    (measured: twelve patterns of 2 to 20 keys, nested objects included)."""
+    """``value`` with its keys in java.util.HashMap order, as CloudFormation hands EventBridge an EventPattern."""
     if isinstance(value, list):
         return [_java_hash_map_order(item) for item in value]
     if not isinstance(value, dict):
@@ -4464,11 +4461,7 @@ _EB_ARCHIVE_SOURCE_ARN_PATTERN = r"^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0
 
 
 def eb_archive_schema_errors(props):
-    """(path under Properties, reason) for each way ``props`` breaks the
-    AWS::Events::Archive resource schema, in the order Early Validation reports
-    them: unsupported properties, the required one, then each property as the
-    template lists it (measured). A property that is None resolves only at
-    deploy time and is not checked."""
+    """(path, reason) for each AWS::Events::Archive schema error, in Early Validation's order; None is unchecked."""
     errors = [(key, f"Unsupported property [{key}]") for key in props if key not in _EB_ARCHIVE_SCHEMA]
     if "SourceArn" not in props:
         errors.append(("", "Required property [SourceArn] not found"))
@@ -5308,10 +5301,7 @@ def _cfn_nested_stack_delete(physical_id, props):
     # whose parents are torn down.
 
 
-# --- CloudFormation StackSet (AWS::CloudFormation::StackSet) ---
-# A SELF_MANAGED StackSet with one stack instance in the stack's own account and
-# Region, deployed, updated, rolled back and deleted as a nested stack. StackSet
-# operations and the StackSet write APIs are not emulated.
+# --- CloudFormation StackSet: one SELF_MANAGED instance in the stack's own account and Region, as a nested stack ---
 
 _STACK_SET_PROPERTIES = frozenset({
     "StackSetName", "PermissionModel", "StackInstancesGroup", "TemplateBody", "Parameters",
@@ -5330,8 +5320,8 @@ def _stack_set_instance(props):
             or props.get("StackInstancesGroup") != local
             or not isinstance(props.get("TemplateBody"), str)):
         raise ValueError(
-            "MiniStack deploys an AWS::CloudFormation::StackSet only with a StackSetName, "
-            "PermissionModel SELF_MANAGED, an inline TemplateBody and one StackInstancesGroup "
+            "MiniStack does not emulate this AWS::CloudFormation::StackSet: it deploys only one with a "
+            "StackSetName, PermissionModel SELF_MANAGED, an inline TemplateBody and one StackInstancesGroup "
             "whose DeploymentTargets.Accounts and Regions are this stack's own account and Region"
             + (f"; unsupported properties: {', '.join(unsupported)}" if unsupported else ""))
     return {"Parameters": {p["ParameterKey"]: p["ParameterValue"] for p in props.get("Parameters") or []},

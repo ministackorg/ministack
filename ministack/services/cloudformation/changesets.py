@@ -788,9 +788,7 @@ def _create_change_set(params):
         else:
             _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", _IMPORT_REVIEW
     elif validation_errors:
-        # AWS's Early Validation fails the change set and keeps its changes
-        # (measured). It let some invalid in-place modifications through to
-        # fail at execution and failed others; every one fails here.
+        # Early Validation fails the change set and keeps its changes.
         hooks = dict.fromkeys(_EARLY_VALIDATION_HOOKS.get(validation_name, validation_name)
                               for _, _, validation_name, _, _ in validation_errors)
         _cs_status, _cs_exec = "FAILED", "UNAVAILABLE"
@@ -1070,9 +1068,7 @@ def _execute_change_set(params):
     if not is_update:
         stack["DisableRollback"] = disable_rollback
     stack["_disable_validation"] = cs.get("_disable_validation", False)
-    # Executing a change set does not run Early Validation over what it left
-    # alone: AWS let invalid in-place changes it had accepted fail at the
-    # resource instead (measured).
+    # Executing a change set validates only what it adds or modifies.
     stack["_validation_scope"] = cs.get("_validated")
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()

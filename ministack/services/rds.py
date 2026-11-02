@@ -6279,16 +6279,8 @@ def _delete_db_cluster(p):
 
 
 def _password_reset_view(c, advance):
-    """Return *c* as AWS shows it during a master password reset.
-
-    Real AWS (captured, us-west-2): after the change, the ModifyDBCluster
-    response and the next DescribeDBClusters show an available cluster with
-    PendingModifiedValues {MasterUserPassword: ****}, the one after reports
-    resetting-master-credentials, and later ones available with nothing
-    pending. ``_password_reset_describes`` counts the describes answered;
-    once set it is only reassigned (3 = settled), so describe and stop never
-    change the cluster dict's size under a concurrent get_state() deepcopy.
-    """
+    """*c* as AWS shows it during a master password reset: pending, then resetting, then settled, one describe each.
+    ``_password_reset_describes`` is only reassigned (3 = settled), never popped, for concurrent get_state()."""
     seen = c.get("_password_reset_describes")
     if seen is None or seen > 2:
         return c
