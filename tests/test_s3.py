@@ -11313,6 +11313,10 @@ def test_access_point_control_same_name_in_another_region(bucket):
         euw1_s3.delete_bucket(Bucket=euw1_bucket)
 
 
+# The account-level block applies to every bucket of its account, so these tests use their own account.
+_PAB_ACCOUNT = "777788889999"
+
+
 def test_account_public_access_block_round_trip():
     """GET/PUT/DELETE the account-level public access block via s3control.
 
@@ -11320,28 +11324,48 @@ def test_account_public_access_block_round_trip():
     <AccountId>, 405 names ResourceType ACCOUNT_PUBLIC_ACCESS_BLOCK, GET's
     payload root is http://-namespaced.
     """
-    ctl = _client("s3control", "us-east-1")
+    ctl = _client("s3control", "us-east-1", _PAB_ACCOUNT)
     with pytest.raises(ClientError) as exc:
-        ctl.get_public_access_block(AccountId=ACCOUNT)
+        ctl.get_public_access_block(AccountId=_PAB_ACCOUNT)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
-    assert exc.value.response["Error"]["AccountId"] == ACCOUNT
+    assert exc.value.response["Error"]["AccountId"] == _PAB_ACCOUNT
 
     cfg = {"BlockPublicAcls": True, "IgnorePublicAcls": True,
            "BlockPublicPolicy": False, "RestrictPublicBuckets": True}
-    ctl.put_public_access_block(AccountId=ACCOUNT, PublicAccessBlockConfiguration=cfg)
+    ctl.put_public_access_block(AccountId=_PAB_ACCOUNT, PublicAccessBlockConfiguration=cfg)
     try:
-        assert ctl.get_public_access_block(AccountId=ACCOUNT)["PublicAccessBlockConfiguration"] == cfg
-
-        # The setting is regional — another region reports it unset.
-        with pytest.raises(ClientError) as exc:
-            _client("s3control", "eu-west-1").get_public_access_block(AccountId=ACCOUNT)
-        assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+        assert ctl.get_public_access_block(AccountId=_PAB_ACCOUNT)["PublicAccessBlockConfiguration"] == cfg
+        # The setting applies in every region.
+        other = _client("s3control", "eu-west-1", _PAB_ACCOUNT)
+        assert other.get_public_access_block(AccountId=_PAB_ACCOUNT)["PublicAccessBlockConfiguration"] == cfg
     finally:
-        ctl.delete_public_access_block(AccountId=ACCOUNT)
+        ctl.delete_public_access_block(AccountId=_PAB_ACCOUNT)
     with pytest.raises(ClientError) as exc:
-        ctl.get_public_access_block(AccountId=ACCOUNT)
+        ctl.get_public_access_block(AccountId=_PAB_ACCOUNT)
     assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+
+
+def test_account_block_public_policy_refuses_a_public_bucket_policy():
+    """The account's BlockPublicPolicy applies to a bucket with no block of its own."""
+    ctl = _client("s3control", "us-east-1", _PAB_ACCOUNT)
+    s3 = _client("s3", "us-east-1", _PAB_ACCOUNT)
+    bkt = f"intg-s3-acct-bpp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    public = json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bkt}/*"}]})
+    ctl.put_public_access_block(AccountId=_PAB_ACCOUNT, PublicAccessBlockConfiguration={
+        "BlockPublicAcls": False, "IgnorePublicAcls": False, "BlockPublicPolicy": True, "RestrictPublicBuckets": False})
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_bucket_policy(Bucket=bkt, Policy=public)
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        ctl.delete_public_access_block(AccountId=_PAB_ACCOUNT)
+        s3.put_bucket_policy(Bucket=bkt, Policy=public)
+    finally:
+        ctl.delete_public_access_block(AccountId=_PAB_ACCOUNT)
+        s3.delete_bucket_policy(Bucket=bkt)
+        s3.delete_bucket(Bucket=bkt)
 
 
 def test_account_public_access_block_unserved_method():

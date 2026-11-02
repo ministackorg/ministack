@@ -6729,45 +6729,19 @@ def test_cognito_pretoken_lambda_error_fails_refresh(cognito_idp, lam):
         assert exc.value.response["Error"]["Message"] == "PreTokenGenerationV2_0 failed with error boom."
 
 
-def test_cognito_pretoken_missing_lambda_fails_open(cognito_idp):
-    """A PreTokenGeneration Lambda that cannot be invoked fails open: token issued without overrides (#533)."""
+def test_cognito_pretoken_missing_lambda_fails_closed(cognito_idp):
+    """A PreTokenGeneration Lambda that cannot be invoked fails the request, as on AWS."""
     _, cid = _pretoken_password_pool(
         cognito_idp, "pretoken-missing", "arn:aws:lambda:us-east-1:000000000000:function:ministack-pretoken-missing")
-    tok = cognito_idp.initiate_auth(
-        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
-    )["AuthenticationResult"]
-    access = _decode_jwt_claims(tok["AccessToken"])
-    assert access["client_id"] == cid  # token still issued
-
-
-def test_cognito_pretoken_missing_lambda_strict_fails_closed(cognito_idp, monkeypatch):
-    """MINISTACK_COGNITO_PRETOKEN_STRICT=1 answers UnexpectedLambdaException for a Lambda that cannot be invoked."""
-    mod = _cognito_module()
-    monkeypatch.setenv("MINISTACK_COGNITO_PRETOKEN_STRICT", "1")
-    pid = json.loads(mod._create_user_pool({
-        "PoolName": "pretoken-missing-strict",
-        "LambdaConfig": {"PreTokenGenerationConfig": {
-            "LambdaArn": "arn:aws:lambda:us-east-1:000000000000:function:ministack-pretoken-missing",
-            "LambdaVersion": "V2_0",
-        }},
-    })[2])["UserPool"]["Id"]
-    cid = json.loads(mod._create_user_pool_client({
-        "UserPoolId": pid, "ClientName": "app", "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH"],
-    })[2])["UserPoolClient"]["ClientId"]
-    mod._admin_create_user({
-        "UserPoolId": pid, "Username": "u", "TemporaryPassword": "Temp1234!", "MessageAction": "SUPPRESS",
-    })
-    mod._admin_set_user_password({"UserPoolId": pid, "Username": "u", "Password": "Pwd1234!", "Permanent": True})
-
-    status, _, body = mod._run_idp_handler(mod._initiate_auth, "InitiateAuth", {
-        "ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH",
-        "AuthParameters": {"USERNAME": "u", "PASSWORD": "Pwd1234!"},
-    })
-    error = json.loads(body)
-    assert status == 400
-    assert error["__type"] == "UnexpectedLambdaException"
-    assert error["message"] == "PreTokenGenerationV2_0 invocation failed due to error AccessDeniedException."
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "UnexpectedLambdaException"
+    assert exc.value.response["Error"]["Message"] == \
+        "PreTokenGenerationV2_0 invocation failed due to error AccessDeniedException."
 
 
 def test_cognito_pretoken_lambda_error_fails_client_credentials_grant(cognito_idp, lam):
