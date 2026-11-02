@@ -11313,6 +11313,47 @@ def test_access_point_control_same_name_in_another_region(bucket):
         euw1_s3.delete_bucket(Bucket=euw1_bucket)
 
 
+def test_account_public_access_block_round_trip():
+    """GET/PUT/DELETE the account-level public access block via s3control.
+
+    Wire shapes pinned from real AWS (us-east-2, 2026-10-30): 404 carries
+    <AccountId>, 405 names ResourceType ACCOUNT_PUBLIC_ACCESS_BLOCK, GET's
+    payload root is http://-namespaced.
+    """
+    ctl = _client("s3control", "us-east-1")
+    with pytest.raises(ClientError) as exc:
+        ctl.get_public_access_block(AccountId=ACCOUNT)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+    assert exc.value.response["Error"]["AccountId"] == ACCOUNT
+
+    cfg = {"BlockPublicAcls": True, "IgnorePublicAcls": True,
+           "BlockPublicPolicy": False, "RestrictPublicBuckets": True}
+    ctl.put_public_access_block(AccountId=ACCOUNT, PublicAccessBlockConfiguration=cfg)
+    try:
+        assert ctl.get_public_access_block(AccountId=ACCOUNT)["PublicAccessBlockConfiguration"] == cfg
+
+        # The setting is regional — another region reports it unset.
+        with pytest.raises(ClientError) as exc:
+            _client("s3control", "eu-west-1").get_public_access_block(AccountId=ACCOUNT)
+        assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+    finally:
+        ctl.delete_public_access_block(AccountId=ACCOUNT)
+    with pytest.raises(ClientError) as exc:
+        ctl.get_public_access_block(AccountId=ACCOUNT)
+    assert exc.value.response["Error"]["Code"] == "NoSuchPublicAccessBlockConfiguration"
+
+
+def test_account_public_access_block_unserved_method():
+    """An unsupported method on the configuration path answers the real 405."""
+    resp = requests.post(
+        f"{ENDPOINT}/v20180820/configuration/publicAccessBlock",
+        headers={"x-amz-account-id": ACCOUNT}, timeout=10)
+    assert resp.status_code == 405
+    assert "<Code>MethodNotAllowed</Code>" in resp.text
+    assert "<ResourceType>ACCOUNT_PUBLIC_ACCESS_BLOCK</ResourceType>" in resp.text
+
+
 def test_access_point_control_policy_round_trip(access_point):
     name, _ = access_point
     ctl = _client("s3control", "us-east-1")
