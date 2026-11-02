@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 — security group rules with `IpProtocol` `-1` match whatever ports a call sends** — the AWS Terraform provider revokes a new group's default allow-all egress rule as `-1` with `FromPort`/`ToPort` `0`, which matched nothing because the default rule has no ports, so the rule stayed and the `aws_vpc_security_group_egress_rule` declared next matched it and lost its description and tags, showing drift on every plan. As on AWS, `AuthorizeSecurityGroupIngress`/`Egress` and `RevokeSecurityGroupIngress`/`Egress` now ignore `FromPort`/`ToPort` for `-1`: a rule sent in `IpPermissions` is stored without ports, and a `-1` rule matches whatever ports a later call sends. A `-1` rule MiniStack still stores with ports (the flat `IpProtocol`/`FromPort` form, CloudFormation, `ModifySecurityGroupRules`) matches the same way. A revoked rule without ports is reported as `-1`/`-1` in the `RevokedSecurityGroupRules` of `RevokeSecurityGroupEgress` and of a revoke by `SecurityGroupRuleId`, as `DescribeSecurityGroupRules` already did. Measured against a real account in us-east-1. Fixes #2531.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
