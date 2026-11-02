@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — cluster endpoints under `MINISTACK_RDS_PUBLIC_ENDPOINT`** — `CreateDBCluster` reported the AWS-shaped writer and reader names and the engine port, and the first instance's container then changed all three to `MINISTACK_HOST` and its published host port, so Terraform showed drift on `endpoint`, `reader_endpoint` and `port`. When Docker can run the engine, the host port is now chosen at `CreateDBCluster` and reported from the first response, so the values no longer change; AWS keeps them identical from creation through the first instance (captured for aurora-postgresql, aurora-mysql and a Multi-AZ postgres DB cluster in us-east-1). The host address itself is the flag's MiniStack-only behavior.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
