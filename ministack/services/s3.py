@@ -126,6 +126,9 @@ _olap_requests: dict[tuple[str, str], dict] = {}
 _olap_requests_lock = threading.Lock()
 _OBJECT_LAMBDA_ALIAS_SUFFIX = "--ol-s3"
 
+# Account-level public access block, per account and region: {"config": {flags}}.
+_account_public_access_block = AccountRegionScopedDict()
+
 
 def object_lambda_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
     return f"arn:aws:s3-object-lambda:{region or get_region()}:{account_id or get_account_id()}:accesspoint/{name}"
@@ -431,6 +434,7 @@ _PERSISTED_BUCKET_DICTS = {
     "mrap_operations": _mrap_operations,
     "access_points": _access_points,
     "object_lambda_access_points": _object_lambda_access_points,
+    "account_public_access_block": _account_public_access_block,
 }
 
 
@@ -10144,6 +10148,56 @@ def handle_access_point_control(method: str, path: str, headers: dict, body: byt
 
 
 # ---------------------------------------------------------------------------
+# S3 Control: account-level public access block
+# ---------------------------------------------------------------------------
+_ACCOUNT_PAB_PATH = "/v20180820/configuration/publicAccessBlock"
+
+_ACCOUNT_PAB_ACTIONS = {
+    "PUT": "s3:PutAccountPublicAccessBlock",
+    "GET": "s3:GetAccountPublicAccessBlock",
+    "DELETE": "s3:DeleteAccountPublicAccessBlock",
+}
+
+_ACCOUNT_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+def is_account_public_access_block_path(path: str) -> bool:
+    return path.rstrip("/") == _ACCOUNT_PAB_PATH
+
+
+def handle_account_public_access_block(method: str, path: str, body: bytes) -> tuple:
+    """The account's public access block in the request's account and region."""
+    if method == "PUT":
+        root = None
+        if body:
+            try:
+                raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+                root = fromstring(raw)
+            except ParseError:
+                root = None
+        _account_public_access_block["config"] = {
+            field: _child_text(root, field, "false").lower() == "true" for field in _ACCOUNT_PAB_FIELDS}
+        return 200, {}, b""
+    if method == "GET":
+        cfg = _account_public_access_block.get("config")
+        if cfg is None:
+            return s3control_error(
+                "NoSuchPublicAccessBlockConfiguration",
+                "The public access block configuration was not found", 404,
+                {"AccountId": get_account_id()})
+        # The real wire xmlns is http://, not https:// (observed us-east-2 2026-10-30).
+        out = Element("PublicAccessBlockConfiguration", xmlns="http://awss3control.amazonaws.com/doc/2018-08-20/")
+        for field in _ACCOUNT_PAB_FIELDS:
+            SubElement(out, field).text = str(bool(cfg.get(field))).lower()
+        return _s3control_response(out)
+    if method == "DELETE":
+        _account_public_access_block.pop("config", None)
+        return 204, {}, b""
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405,
+                           {"Method": method, "ResourceType": "ACCOUNT_PUBLIC_ACCESS_BLOCK"})
+
+
+# ---------------------------------------------------------------------------
 # S3 Control: Object Lambda Access Points
 # ---------------------------------------------------------------------------
 
@@ -10403,6 +10457,7 @@ def reset():
         _mrap_operations,
         _access_points,
         _object_lambda_access_points,
+        _account_public_access_block,
         _olap_requests,
     ):
         d.clear()
