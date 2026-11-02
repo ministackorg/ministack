@@ -299,8 +299,10 @@ def test_eventbridge_put_targets_requires_role_for_foreign_region_event_bus(eb):
             ],
         )
 
-    assert exc.value.response["Error"]["Code"] == "ValidationException"
-    assert "RoleArn is required" in exc.value.response["Error"]["Message"]
+    assert exc.value.response["Error"] == {
+        "Code": "ValidationException",
+        "Message": "RoleArn is required for target arn:aws:events:us-west-2:000000000000:event-bus/foreign-bus.",
+    }
 
 
 def test_eventbridge_foreign_region_sqs_target_does_not_deliver_to_same_name_queue(eb, sqs):
@@ -469,7 +471,7 @@ def test_eventbridge_foreign_region_bus_target_does_not_deliver_to_same_name_bus
     assert msgs.get("Messages", []) == []
 
 
-def test_eventbridge_same_bus_target_does_not_recursively_dispatch(eb, sqs):
+def test_eventbridge_put_targets_refuses_the_rules_own_bus(eb, sqs):
     rule_name = f"target-self-bus-{_uuid_mod.uuid4().hex[:8]}"
     queue_name = f"target-self-bus-{_uuid_mod.uuid4().hex[:8]}"
     q_url = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
@@ -479,34 +481,29 @@ def test_eventbridge_same_bus_target_does_not_recursively_dispatch(eb, sqs):
         EventPattern=json.dumps({"source": ["self.bus"]}),
         State="ENABLED",
     )
-    eb.put_targets(
-        Rule=rule_name,
-        Targets=[
-            {
-                "Id": "same-bus",
-                "Arn": "arn:aws:events:us-east-1:000000000000:event-bus/default",
-            },
-            {
-                "Id": "local-q",
-                "Arn": q_arn,
-            },
-        ],
-    )
+    with pytest.raises(ClientError) as exc:
+        eb.put_targets(
+            Rule=rule_name,
+            Targets=[
+                {
+                    "Id": "same-bus",
+                    "Arn": "arn:aws:events:us-east-1:000000000000:event-bus/default",
+                    "RoleArn": "arn:aws:iam::000000000000:role/eb-forward",
+                },
+                {
+                    "Id": "local-q",
+                    "Arn": q_arn,
+                },
+            ],
+        )
 
-    resp = eb.put_events(
-        Entries=[
-            {
-                "Source": "self.bus",
-                "DetailType": "SelfBus",
-                "Detail": json.dumps({"ok": True}),
-                "EventBusName": "default",
-            }
-        ]
-    )
-
-    assert resp["FailedEntryCount"] == 0
-    msgs = sqs.receive_message(QueueUrl=q_url, MaxNumberOfMessages=10, WaitTimeSeconds=1)
-    assert len(msgs.get("Messages", [])) == 1
+    assert exc.value.response["Error"] == {
+        "Code": "ValidationException",
+        "Message": "Source EventBus and Target EventBus must not be the same.",
+    }
+    assert eb.list_targets_by_rule(Rule=rule_name)["Targets"] == []
+    eb.delete_rule(Name=rule_name)
+    sqs.delete_queue(QueueUrl=q_url)
 
 
 def test_eventbridge_event_bus_target_archives_forwarded_event(eb):
@@ -531,6 +528,7 @@ def test_eventbridge_event_bus_target_archives_forwarded_event(eb):
             {
                 "Id": "dest-bus",
                 "Arn": dest_bus_arn,
+                "RoleArn": "arn:aws:iam::000000000000:role/eb-forward",
             },
         ],
     )
@@ -585,6 +583,7 @@ def test_eventbridge_event_bus_target_honors_input_override(eb, sqs):
             {
                 "Id": "dest-bus",
                 "Arn": dest_bus_arn,
+                "RoleArn": "arn:aws:iam::000000000000:role/eb-forward",
                 "Input": json.dumps({"rewritten": True}),
             },
         ],
@@ -1136,6 +1135,41 @@ def test_eventbridge_archive(eb):
     eb.delete_archive(ArchiveName=archive_name)
     archives2 = eb.list_archives()
     assert not any(a["ArchiveName"] == archive_name for a in archives2["Archives"])
+
+
+def test_eventbridge_archive_without_description_or_pattern_has_neither(eb):
+    import uuid as _uuid
+
+    archive_name = f"intg-archive-nodesc-{_uuid.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=archive_name,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+    try:
+        desc = eb.describe_archive(ArchiveName=archive_name)
+        assert "Description" not in desc and "EventPattern" not in desc
+        assert desc["RetentionDays"] == 0
+    finally:
+        eb.delete_archive(ArchiveName=archive_name)
+
+
+def test_eventbridge_create_archive_refusals(eb):
+    """A taken name and a bus that does not exist, with AWS's messages."""
+    archive_name = f"intg-archive-refused-{_uuid_mod.uuid4().hex[:8]}"
+    bus_arn = "arn:aws:events:us-east-1:000000000000:event-bus/default"
+    eb.create_archive(ArchiveName=archive_name, EventSourceArn=bus_arn)
+    try:
+        with pytest.raises(ClientError) as exc:
+            eb.create_archive(ArchiveName=archive_name, EventSourceArn=bus_arn)
+        assert exc.value.response["Error"] == {
+            "Code": "ResourceAlreadyExistsException", "Message": f"Archive {archive_name} already exists."}
+        with pytest.raises(ClientError) as exc:
+            eb.create_archive(ArchiveName=f"{archive_name}-2",
+                              EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/intg-no-such-bus")
+        assert exc.value.response["Error"] == {
+            "Code": "ResourceNotFoundException", "Message": "Event bus intg-no-such-bus does not exist."}
+    finally:
+        eb.delete_archive(ArchiveName=archive_name)
 
 
 def test_eventbridge_endpoints_and_partner_stubs(eb):
@@ -6259,3 +6293,404 @@ def test_put_events_cross_account_explicit_deny_on_event_keys(xa, auth_enabled, 
         assert xa.publisher.put_events(Entries=[entry])["FailedEntryCount"] == 0
     if allowed is not None:
         assert xa.publisher.put_events(Entries=[{**_xa_entry("d2", arn), **allowed}])["FailedEntryCount"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Rule targets that are event buses in another account or region (#2526).
+# Probe ids name captures of rounds 1 to 5 (eu-west-2, us-east-1 and us-west-2;
+# three real accounts, the rules in eu-west-2).
+# ---------------------------------------------------------------------------
+
+_FWD_RULES = "444455556666"
+_FWD_BUSES = "111122223333"
+_FWD_THIRD = "777788889999"
+
+
+@pytest.fixture
+def fwd():
+    """Buses that hand every ``fwd`` event to a queue, and rules that forward to them."""
+    slug = _uuid_mod.uuid4().hex[:8]
+    clients, cleanup = {}, []
+
+    def client(service, account, region="us-east-1"):
+        key = (service, account, region)
+        if key not in clients:
+            clients[key] = boto3.client(service, endpoint_url=_ENDPOINT, region_name=region,
+                                        aws_access_key_id=account, aws_secret_access_key="test")
+        return clients[key]
+
+    def role(account=_FWD_RULES, service="events.amazonaws.com", resource="*", put_events=True,
+             trust_condition=None, policy_condition=None):
+        iam = client("iam", account)
+        name = f"fwd-role-{_uuid_mod.uuid4().hex[:8]}"
+        trust_stmt = {"Effect": "Allow", "Principal": {"Service": service}, "Action": "sts:AssumeRole"}
+        if trust_condition:
+            trust_stmt["Condition"] = trust_condition
+        trust = {"Version": "2012-10-17", "Statement": [trust_stmt]}
+        iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust))
+        cleanup.append(lambda: iam.delete_role(RoleName=name))
+        if put_events:
+            statement = {"Effect": "Allow", "Action": "events:PutEvents", "Resource": resource}
+            if policy_condition:
+                statement["Condition"] = policy_condition
+            iam.put_role_policy(RoleName=name, PolicyName="put-events", PolicyDocument=json.dumps({
+                "Version": "2012-10-17", "Statement": [statement]}))
+            cleanup.append(lambda: iam.delete_role_policy(RoleName=name, PolicyName="put-events"))
+        return f"arn:aws:iam::{account}:role/{name}"
+
+    def bus(account, region, label, policy=None):
+        events, sqs = client("events", account, region), client("sqs", account, region)
+        name = f"fwd-{label}-{slug}"
+        arn = events.create_event_bus(Name=name)["EventBusArn"]
+        url = sqs.create_queue(QueueName=name)["QueueUrl"]
+        queue_arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        events.put_rule(Name=f"{name}-sink", EventBusName=name, EventPattern=json.dumps({"detail-type": ["fwd"]}))
+        events.put_targets(Rule=f"{name}-sink", EventBusName=name, Targets=[{"Id": "q", "Arn": queue_arn}])
+        if policy is not None:
+            events.put_permission(EventBusName=name, Policy=json.dumps(policy(arn)))
+        cleanup.append(lambda: sqs.delete_queue(QueueUrl=url))
+        cleanup.append(lambda: events.delete_event_bus(Name=name))
+        cleanup.append(lambda: events.delete_rule(Name=f"{name}-sink", EventBusName=name))
+        cleanup.append(lambda: events.remove_targets(Rule=f"{name}-sink", EventBusName=name, Ids=["q"]))
+
+        def received():
+            msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1).get("Messages", [])
+            return [json.loads(m["Body"]) for m in msgs]
+
+        return name, arn, received
+
+    def forward(account, region, bus_name, targets, rule=None):
+        events = client("events", account, region)
+        rule = rule or f"fwd-to-{_uuid_mod.uuid4().hex[:8]}"
+        events.put_rule(Name=rule, EventBusName=bus_name, EventPattern=json.dumps({"detail-type": ["fwd"]}))
+        events.put_targets(Rule=rule, EventBusName=bus_name, Targets=[
+            {"Id": f"t{i}", **target} for i, target in enumerate(targets)])
+        cleanup.append(lambda: events.delete_rule(Name=rule, EventBusName=bus_name))
+        cleanup.append(lambda: events.remove_targets(Rule=rule, EventBusName=bus_name,
+                                                     Ids=[f"t{i}" for i in range(len(targets))]))
+
+    def publish(account, region, bus_name, marker):
+        resp = client("events", account, region).put_events(Entries=[{
+            "EventBusName": bus_name, "Source": "fwd.test", "DetailType": "fwd",
+            "Resources": ["arn:aws:s3:::fwd-resource"], "Detail": json.dumps({"marker": marker})}])
+        assert resp["FailedEntryCount"] == 0
+        return resp["Entries"][0]["EventId"]
+
+    class Ctx:
+        pass
+
+    ctx = Ctx()
+    ctx.client, ctx.role, ctx.bus, ctx.forward, ctx.publish = client, role, bus, forward, publish
+    try:
+        yield ctx
+    finally:
+        for undo in reversed(cleanup):
+            try:
+                undo()
+            except ClientError:
+                pass
+
+
+def _allow(principal, condition=None):
+    def policy(bus_arn):
+        stmt = {"Sid": "allow", "Effect": "Allow", "Principal": {"AWS": principal},
+                "Action": "events:PutEvents", "Resource": bus_arn}
+        if condition:
+            stmt["Condition"] = condition
+        return {"Version": "2012-10-17", "Statement": [stmt]}
+    return policy
+
+
+def _deny(principal):
+    def policy(bus_arn):
+        return {"Version": "2012-10-17", "Statement": [{"Sid": "deny", "Effect": "Deny", "Principal": {"AWS": principal},
+                                                        "Action": "events:PutEvents", "Resource": bus_arn}]}
+    return policy
+
+
+_FWD_RETRY = {"MaximumRetryAttempts": 3}
+_OWN_BUS = f"arn:aws:events:us-east-1:{_FWD_RULES}:event-bus/fwd-own"
+_OTHER_REGION_BUS = f"arn:aws:events:us-west-2:{_FWD_RULES}:event-bus/fwd-west"
+_OTHER_ACCOUNT_BUS = f"arn:aws:events:us-east-1:{_FWD_BUSES}:event-bus/fwd-theirs"
+_RULES_DEFAULT_BUS = f"arn:aws:events:us-east-1:{_FWD_RULES}:event-bus/default"
+_FWD_ROLE = f"arn:aws:iam::{_FWD_RULES}:role/fwd"
+_THEIR_ROLE = f"arn:aws:iam::{_FWD_BUSES}:role/fwd"
+_RETRY_REFUSED = ("ValidationException", "Retry policy is not supported for Event bus targets.")
+_OWN_BUS_REFUSED = ("ValidationException", "Source EventBus and Target EventBus must not be the same.")
+_PASS_ROLE_REFUSED = ("AccessDeniedException",
+                      f"Access to the resource {_THEIR_ROLE} is denied. Reason: Cross-account pass role is not allowed.")
+
+
+def _role_required(arn):
+    return "ValidationException", f"RoleArn is required for target {arn}."
+
+
+@pytest.mark.parametrize("targets,error", [
+    # round1 V1, V2, V3, V12: every event bus target needs a role.
+    ([{"Arn": _OWN_BUS}], _role_required(_OWN_BUS)),
+    ([{"Arn": _OTHER_REGION_BUS}], _role_required(_OTHER_REGION_BUS)),
+    ([{"Arn": _OTHER_ACCOUNT_BUS}], _role_required(_OTHER_ACCOUNT_BUS)),
+    # round1 V4..V7, round3 S9: no event bus target takes a retry policy, even an empty one.
+    ([{"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY}], _RETRY_REFUSED),
+    ([{"Arn": _OWN_BUS, "RetryPolicy": _FWD_RETRY}], _RETRY_REFUSED),
+    ([{"Arn": _OWN_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": {}}], _RETRY_REFUSED),
+    # round3 S2, S3: the rule's own bus is checked before a retry policy.
+    ([{"Arn": _RULES_DEFAULT_BUS, "RetryPolicy": _FWD_RETRY}], _OWN_BUS_REFUSED),
+    # round4 S10, S11: across targets those two are checked target by target, in order...
+    ([{"Arn": _OWN_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY},
+      {"Arn": _RULES_DEFAULT_BUS, "RoleArn": _FWD_ROLE}], _RETRY_REFUSED),
+    ([{"Arn": _RULES_DEFAULT_BUS, "RoleArn": _FWD_ROLE},
+      {"Arn": _OWN_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY}], _OWN_BUS_REFUSED),
+    # round3 S5..S8: ...and both before any target's missing role.
+    ([{"Arn": _OWN_BUS}, {"Arn": _OTHER_REGION_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY}],
+     _RETRY_REFUSED),
+    ([{"Arn": _OTHER_REGION_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY}, {"Arn": _OWN_BUS}],
+     _RETRY_REFUSED),
+    ([{"Arn": _OWN_BUS}, {"Arn": _RULES_DEFAULT_BUS, "RoleArn": _FWD_ROLE}], _OWN_BUS_REFUSED),
+    ([{"Arn": _RULES_DEFAULT_BUS, "RoleArn": _FWD_ROLE}, {"Arn": _OWN_BUS}], _OWN_BUS_REFUSED),
+    # round1 V8, V9: the first target without a role is named, and nothing is stored.
+    ([{"Arn": f"arn:aws:sqs:us-east-1:{_FWD_RULES}:fwd-q"}, {"Arn": _OTHER_ACCOUNT_BUS}],
+     _role_required(_OTHER_ACCOUNT_BUS)),
+    ([{"Arn": _OTHER_ACCOUNT_BUS}, {"Arn": _OTHER_REGION_BUS}], _role_required(_OTHER_ACCOUNT_BUS)),
+    # round4 P8, round5 X1..X5: a role in another account cannot be passed, which is
+    # checked before a retry policy or a missing role.
+    ([{"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
+    ([{"Arn": _OWN_BUS}, {"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
+    ([{"Arn": _OWN_BUS, "RoleArn": _FWD_ROLE, "RetryPolicy": _FWD_RETRY},
+      {"Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _THEIR_ROLE}], _PASS_ROLE_REFUSED),
+])
+def test_put_targets_event_bus_target_checks(fwd, targets, error):
+    events = fwd.client("events", _FWD_RULES)
+    rule = f"fwd-checks-{_uuid_mod.uuid4().hex[:8]}"
+    events.put_rule(Name=rule, EventPattern=json.dumps({"detail-type": ["fwd"]}))
+    try:
+        with pytest.raises(ClientError) as exc:
+            events.put_targets(Rule=rule, Targets=[{"Id": f"t{i}", **t} for i, t in enumerate(targets)])
+        assert exc.value.response["Error"] == {"Code": error[0], "Message": error[1]}
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert events.list_targets_by_rule(Rule=rule)["Targets"] == []
+    finally:
+        events.delete_rule(Name=rule)
+
+
+def test_put_targets_event_bus_target_with_role_and_dead_letter_queue_is_accepted(fwd):
+    """round1 V10, V11, round4 P11, P12: a role of the rule's account makes any other
+    bus a valid target, even one that does not exist, whatever the role ARN's path or region."""
+    events = fwd.client("events", _FWD_RULES)
+    rule = f"fwd-ok-{_uuid_mod.uuid4().hex[:8]}"
+    events.put_rule(Name=rule, EventPattern=json.dumps({"detail-type": ["fwd"]}))
+    targets = [
+        {"Id": "a", "Arn": _OTHER_ACCOUNT_BUS, "RoleArn": _FWD_ROLE,
+         "DeadLetterConfig": {"Arn": f"arn:aws:sqs:us-east-1:{_FWD_RULES}:fwd-dlq"}},
+        {"Id": "b", "Arn": _OTHER_REGION_BUS, "RoleArn": f"arn:aws:iam::{_FWD_RULES}:role/some/path/fwd"},
+        {"Id": "c", "Arn": _OWN_BUS, "RoleArn": f"arn:aws:iam:us-east-1:{_FWD_RULES}:role/fwd"},
+    ]
+    try:
+        assert events.put_targets(Rule=rule, Targets=targets)["FailedEntryCount"] == 0
+        assert events.list_targets_by_rule(Rule=rule)["Targets"] == targets
+    finally:
+        events.remove_targets(Rule=rule, Ids=["a", "b", "c"])
+        events.delete_rule(Name=rule)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("account,region,crossed", [
+    (_FWD_BUSES, "us-east-1", False),  # round1 D1
+    (_FWD_RULES, "us-west-2", True),   # round1 D2
+    (_FWD_BUSES, "us-west-2", True),   # round1 D3
+])
+def test_rule_forwards_to_bus_in_another_account_or_region(fwd, auth_enabled, account, region, crossed):
+    """The event reaches the target bus's rules in its owner's account and region,
+    keeping its account, region and resources, and its id within a region;
+    crossing a region gives it a new id."""
+    role = fwd.role()
+    _, target, received = fwd.bus(account, region, "target", _allow(_FWD_RULES))
+    src, _, _ = fwd.bus(_FWD_RULES, "us-east-1", "src")
+    fwd.forward(_FWD_RULES, "us-east-1", src, [{"Arn": target, "RoleArn": role}])
+    event_id = fwd.publish(_FWD_RULES, "us-east-1", src, "d")
+    [event] = received()
+    assert event["account"] == _FWD_RULES
+    assert event["region"] == "us-east-1"
+    assert event["resources"] == ["arn:aws:s3:::fwd-resource"]
+    assert event["detail"] == {"marker": "d"}
+    assert (event["id"] != event_id) is crossed
+
+
+_REFUSALS = [
+    ("no-bus-policy", _FWD_BUSES, "us-east-1"),              # round1 F1
+    ("policy-names-another-role", _FWD_BUSES, "us-east-1"),  # round2 Q1b
+    ("policy-condition-unmet", _FWD_BUSES, "us-east-1"),     # round1 F7
+    ("policy-source-unmet", _FWD_BUSES, "us-east-1"),        # round4 P3b
+    ("direct-publish-only", _FWD_BUSES, "us-east-1"),        # round1 G2: a rule's target is a bus invocation
+    ("own-bus-policy-denies", _FWD_RULES, "us-east-1"),      # round4 P6
+    ("role-missing", _FWD_BUSES, "us-east-1"),               # round2 Q12
+    ("role-missing", _FWD_RULES, "us-east-1"),               # round2 Q13
+    ("role-without-put-events", _FWD_BUSES, "us-east-1"),    # round1 F4
+    ("role-without-put-events", _FWD_RULES, "us-east-1"),    # round2 Q8
+    ("role-without-put-events", _FWD_RULES, "us-west-2"),    # round2 Q9
+    ("role-trusts-another-service", _FWD_RULES, "us-east-1"),  # round3 T1
+    ("role-trusts-another-service", _FWD_BUSES, "us-east-1"),  # round4 P4
+    ("role-allowed-another-bus", _FWD_RULES, "us-east-1"),   # round3 T2
+    ("role-allowed-another-bus", _FWD_BUSES, "us-east-1"),   # round4 P5
+    ("trust-names-another-account", _FWD_RULES, "us-east-1"),  # round4 P9
+    ("role-arn-wrong-path", _FWD_RULES, "us-east-1"),        # round4 P11
+    ("role-arn-with-region", _FWD_RULES, "us-east-1"),       # round4 P12
+    ("role-allowed-another-region", _FWD_RULES, "us-east-1"),  # round4 P13b
+]
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case,account,region", _REFUSALS)
+def test_rule_forwarding_refused_without_permission(fwd, auth_enabled, case, account, region):
+    """Under AUTH=true a forward the role, its trust or the bus policy does not allow
+    is not delivered (AWS records NO_PERMISSIONS); AUTH=false delivers it."""
+    role = fwd.role()
+    name = role.rsplit("/", 1)[-1]
+    role = {
+        "role-missing": f"arn:aws:iam::{_FWD_RULES}:role/fwd-missing-{_uuid_mod.uuid4().hex[:8]}",
+        "role-without-put-events": lambda: fwd.role(put_events=False),
+        "role-trusts-another-service": lambda: fwd.role(service="lambda.amazonaws.com"),
+        "role-allowed-another-bus": lambda: fwd.role(resource=f"arn:aws:events:{region}:{account}:event-bus/elsewhere"),
+        "trust-names-another-account": lambda: fwd.role(
+            trust_condition={"StringEquals": {"aws:SourceAccount": _FWD_BUSES}}),
+        "role-arn-wrong-path": f"arn:aws:iam::{_FWD_RULES}:role/wrong/path/{name}",
+        "role-arn-with-region": f"arn:aws:iam:us-east-1:{_FWD_RULES}:role/{name}",
+        "role-allowed-another-region": lambda: fwd.role(
+            policy_condition={"StringEquals": {"aws:RequestedRegion": "us-west-2"}}),
+    }.get(case, role)
+    role = role() if callable(role) else role
+    policy = {
+        "no-bus-policy": None,
+        "policy-names-another-role": _allow(fwd.role()),
+        "policy-condition-unmet": _allow(_FWD_RULES, {"StringEquals": {"events:detail-type": "other"}}),
+        "policy-source-unmet": _allow(_FWD_RULES, {"StringEquals": {"events:source": "other"}}),
+        "direct-publish-only": _allow(_FWD_RULES, {"StringEquals": {"events:eventBusInvocation": "false"}}),
+        "own-bus-policy-denies": _deny(role),
+    }.get(case, _allow(_FWD_RULES))
+    _, target, received = fwd.bus(account, region, "target", policy)
+    src, _, _ = fwd.bus(_FWD_RULES, "us-east-1", "src")
+    fwd.forward(_FWD_RULES, "us-east-1", src, [{"Arn": target, "RoleArn": role}])
+    fwd.publish(_FWD_RULES, "us-east-1", src, "r")
+    assert len(received()) == (0 if auth_enabled else 1)
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case,account,region", [
+    ("names-the-role", _FWD_BUSES, "us-east-1"),        # round2 Q1a: the assumed role is the principal
+    ("bus-invocation", _FWD_BUSES, "us-east-1"),        # round1 G1: events:eventBusInvocation is "true"
+    ("detail-type-condition", _FWD_BUSES, "us-east-1"),  # round1 F6
+    ("source-condition", _FWD_BUSES, "us-east-1"),      # round4 P3a
+    ("own-bus-allows-another-account", _FWD_RULES, "us-east-1"),  # round4 P7
+    ("trust-names-the-rule", _FWD_RULES, "us-east-1"),  # round4 P10: aws:SourceArn is the rule's ARN
+    ("trust-names-the-account", _FWD_RULES, "us-east-1"),  # round5 R2: aws:SourceAccount is the rule's account
+    ("role-allowed-the-bus-region", _FWD_RULES, "us-west-2"),  # round4 P13a
+])
+def test_rule_forwarding_allowed(fwd, auth_enabled, case, account, region):
+    src, _, _ = fwd.bus(_FWD_RULES, "us-east-1", "src")
+    rule = f"fwd-to-{_uuid_mod.uuid4().hex[:8]}"
+    if case == "trust-names-the-rule":
+        role = fwd.role(trust_condition={"StringEquals": {
+            "aws:SourceArn": f"arn:aws:events:us-east-1:{_FWD_RULES}:rule/{src}/{rule}"}})
+    elif case == "trust-names-the-account":
+        role = fwd.role(trust_condition={"StringEquals": {"aws:SourceAccount": _FWD_RULES}})
+    elif case == "role-allowed-the-bus-region":
+        role = fwd.role(policy_condition={"StringEquals": {"aws:RequestedRegion": region}})
+    else:
+        role = fwd.role()
+    policy = {
+        "names-the-role": _allow(role),
+        "bus-invocation": _allow(_FWD_RULES, {"StringEquals": {"events:eventBusInvocation": "true"}}),
+        "detail-type-condition": _allow(_FWD_RULES, {"StringEquals": {"events:detail-type": "fwd"}}),
+        "source-condition": _allow(_FWD_RULES, {"StringEquals": {"events:source": "fwd.test"}}),
+        "own-bus-allows-another-account": _allow(_FWD_BUSES),
+    }.get(case)
+    _, target, received = fwd.bus(account, region, "target", policy)
+    fwd.forward(_FWD_RULES, "us-east-1", src, [{"Arn": target, "RoleArn": role}], rule=rule)
+    fwd.publish(_FWD_RULES, "us-east-1", src, "a")
+    assert len(received()) == 1
+
+
+def test_rule_forwarding_reaches_a_bus_target_in_the_same_region_once(fwd):
+    """round1 H1, H4: an event a rule forwarded within its region may not reach another
+    bus in that region, in any account (AWS records THIRD_ACCOUNT_HOP_DETECTED), but may still
+    cross into another region with a new id. round2 Q3: that crossing may then
+    reach another account. round4 P1: and the crossed event may make one more
+    same-region hop."""
+    role = fwd.role()
+    open_to_rules = _allow(_FWD_RULES)
+    src, _, _ = fwd.bus(_FWD_RULES, "us-east-1", "src")
+    hop, hop_arn, hop_received = fwd.bus(_FWD_RULES, "us-east-1", "hop")
+    _, same_region, same_region_received = fwd.bus(_FWD_RULES, "us-east-1", "same")
+    _, third, third_received = fwd.bus(_FWD_THIRD, "us-east-1", "third", open_to_rules)
+    west, west_arn, west_received = fwd.bus(_FWD_BUSES, "us-west-2", "west", open_to_rules)
+    _, west_onward, west_onward_received = fwd.bus(_FWD_BUSES, "us-west-2", "onward")
+    fwd.forward(_FWD_RULES, "us-east-1", src, [{"Arn": hop_arn, "RoleArn": role}])
+    fwd.forward(_FWD_RULES, "us-east-1", hop, [
+        {"Arn": same_region, "RoleArn": role}, {"Arn": third, "RoleArn": role}, {"Arn": west_arn, "RoleArn": role}])
+    fwd.forward(_FWD_BUSES, "us-west-2", west, [{"Arn": west_onward, "RoleArn": fwd.role(account=_FWD_BUSES)}])
+    event_id = fwd.publish(_FWD_RULES, "us-east-1", src, "h")
+    assert [e["id"] for e in hop_received()] == [event_id]
+    assert same_region_received() == []
+    assert third_received() == []
+    [crossed] = west_received()
+    assert crossed["id"] != event_id
+    assert crossed["region"] == "us-east-1"
+    assert [e["id"] for e in west_onward_received()] == [crossed["id"]]
+
+
+def test_rule_forwarding_crosses_regions_once(fwd):
+    """round1 H3, round2 Q2, round5 R1: after crossing into another region an event
+    may make one more same-region hop, in any account, but crosses no further region,
+    its own included, not even after that hop (AWS records THIRD_REGION_HOP_DETECTED)."""
+    role = fwd.role()
+    src, _, _ = fwd.bus(_FWD_RULES, "us-east-1", "src")
+    _, back, back_received = fwd.bus(_FWD_RULES, "us-east-1", "back")
+    hop, hop_arn, hop_received = fwd.bus(_FWD_RULES, "us-west-2", "hop")
+    hop2, hop2_arn, hop2_received = fwd.bus(_FWD_RULES, "us-west-2", "hop2")
+    _, other_account, other_account_received = fwd.bus(_FWD_BUSES, "us-west-2", "theirs", _allow(_FWD_RULES))
+    _, after_hop2, after_hop2_received = fwd.bus(_FWD_RULES, "us-west-2", "after")
+    _, third_region, third_region_received = fwd.bus(_FWD_RULES, "eu-west-2", "third")
+    _, after_hop2_crossed, after_hop2_crossed_received = fwd.bus(_FWD_RULES, "eu-west-2", "after-crossed")
+    fwd.forward(_FWD_RULES, "us-east-1", src, [{"Arn": hop_arn, "RoleArn": role}])
+    fwd.forward(_FWD_RULES, "us-west-2", hop, [
+        {"Arn": back, "RoleArn": role}, {"Arn": third_region, "RoleArn": role},
+        {"Arn": hop2_arn, "RoleArn": role}, {"Arn": other_account, "RoleArn": role}])
+    fwd.forward(_FWD_RULES, "us-west-2", hop2, [
+        {"Arn": after_hop2, "RoleArn": role}, {"Arn": after_hop2_crossed, "RoleArn": role}])
+    event_id = fwd.publish(_FWD_RULES, "us-east-1", src, "x")
+    [crossed] = hop_received()
+    assert crossed["id"] != event_id
+    assert [e["id"] for e in hop2_received()] == [crossed["id"]]
+    assert [e["id"] for e in other_account_received()] == [crossed["id"]]
+    assert back_received() == []
+    assert third_region_received() == []
+    assert after_hop2_received() == []
+    assert after_hop2_crossed_received() == []
+
+
+@pytest.mark.auth_contract
+def test_schedule_publishing_to_a_bus_is_not_a_rules_forward(fwd, auth_enabled):
+    """MiniStack's existing behaviour, not a capture: a schedule whose target is an
+    event bus publishes to it without the checks a rule's target gets (its role
+    trusts EventBridge Scheduler), and a rule on that bus may forward the event on."""
+    scheduler = fwd.client("scheduler", _FWD_RULES)
+    role = fwd.role(service="scheduler.amazonaws.com")
+    bus, bus_arn, bus_received = fwd.bus(_FWD_RULES, "us-east-1", "scheduled")
+    _, onward, onward_received = fwd.bus(_FWD_RULES, "us-east-1", "onward")
+    fwd.forward(_FWD_RULES, "us-east-1", bus, [{"Arn": onward, "RoleArn": fwd.role()}])
+    name = f"fwd-schedule-{_uuid_mod.uuid4().hex[:8]}"
+    past = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 2))
+    scheduler.create_schedule(Name=name, ScheduleExpression=f"at({past})", FlexibleTimeWindow={"Mode": "OFF"},
+                              Target={"Arn": bus_arn, "RoleArn": role,
+                                      "EventBridgeParameters": {"Source": "fwd.test", "DetailType": "fwd"}})
+    try:
+        delivered, deadline = [], time.time() + 25
+        while time.time() < deadline and not delivered:
+            delivered = bus_received()
+        assert [e["source"] for e in delivered] == ["fwd.test"]
+        assert [e["id"] for e in onward_received()] == [delivered[0]["id"]]
+    finally:
+        try:
+            scheduler.delete_schedule(Name=name)
+        except ClientError:
+            pass
