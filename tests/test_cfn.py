@@ -17593,6 +17593,786 @@ def test_cfn_logs_metric_filter_provisions(cfn, logs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+_LONG_ARCHIVE_ID = "GeneratedArchiveWithAVeryLongLogicalIdentifierForTruncationAbc"
+
+
+def _cfn_archive_template(uid, named_props, generated_bus="Bus", outputs=None):
+    return json.dumps({
+        "Resources": {
+            "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"cfn-archive-bus-{uid}"}},
+            "Bus2": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"cfn-archive-bus2-{uid}"}},
+            "Named": {"Type": "AWS::Events::Archive", "Properties": {
+                "SourceArn": {"Fn::GetAtt": ["Bus", "Arn"]}, **named_props}},
+            "Unnamed": {"Type": "AWS::Events::Archive", "Properties": {
+                "SourceArn": {"Fn::GetAtt": [generated_bus, "Arn"]}}},
+        },
+        "Outputs": outputs or {
+            "NamedRef": {"Value": {"Ref": "Named"}},
+            "NamedArn": {"Value": {"Fn::GetAtt": ["Named", "Arn"]}},
+            "UnnamedRef": {"Value": {"Ref": "Unnamed"}},
+        },
+    })
+
+
+def _cfn_archive_props(uid, name=None, description="v1", retention=3, sources=("app.orders",)):
+    return {"ArchiveName": name or f"cfn-archive-{uid}", "Description": description,
+            "RetentionDays": retention, "EventPattern": {"source": list(sources)}}
+
+
+def _describe_archive(eb, name):
+    return {k: v for k, v in eb.describe_archive(ArchiveName=name).items() if k != "ResponseMetadata"}
+
+
+def _stack_failure_reasons(cfn, stack_name):
+    return [e.get("ResourceStatusReason") or ""
+            for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]]
+
+
+def test_cfn_events_archive_provisions(cfn, eb):
+    """Ref is the archive name, and a generated one is the logical id, - and 12
+    letters and digits. The pattern is stored compact, an archive created
+    without a description or a pattern has neither, and a stack delete removes
+    the archives."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        named = f"cfn-archive-{uid}"
+        assert _output(stack, "NamedRef") == named
+        assert _output(stack, "NamedArn").endswith(f":archive/{named}")
+        unnamed = _output(stack, "UnnamedRef")
+        assert re.fullmatch(r"Unnamed-[A-Za-z0-9]{12}", unnamed)
+
+        bus_arn = eb.describe_event_bus(Name=f"cfn-archive-bus-{uid}")["Arn"]
+        archive = _describe_archive(eb, named)
+        assert {k: archive[k] for k in ("EventSourceArn", "Description", "EventPattern", "RetentionDays")} == {
+            "EventSourceArn": bus_arn, "Description": "v1",
+            "EventPattern": '{"source":["app.orders"]}', "RetentionDays": 3}
+        generated = _describe_archive(eb, unnamed)
+        assert "Description" not in generated and "EventPattern" not in generated
+        assert generated["RetentionDays"] == 0
+        assert generated["EventSourceArn"] == bus_arn
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        left = {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+        assert named not in left and unnamed not in left
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_generated_name_fits_the_limit(cfn, eb):
+    """A long logical id is cut to 35 characters, so the generated name is 48,
+    the API's limit. A pattern keeps non-ASCII characters as written."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-long-{uid}"
+    body = json.loads(_cfn_archive_template(uid, {
+        **_cfn_archive_props(uid),
+        "EventPattern": {"source": ["app.orders"], "detail-type": ["caf\u00e9 order"]}}))
+    body["Resources"][_LONG_ARCHIVE_ID] = body["Resources"].pop("Unnamed")
+    body["Outputs"]["UnnamedRef"] = {"Value": {"Ref": _LONG_ARCHIVE_ID}}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        generated = _output(stack, "UnnamedRef")
+        assert re.fullmatch(rf"{_LONG_ARCHIVE_ID[:35]}-[A-Za-z0-9]{{12}}", generated)
+        assert len(generated) == 48
+        stored = _describe_archive(eb, f"cfn-archive-{uid}")["EventPattern"]
+        assert json.loads(stored) == {"source": ["app.orders"], "detail-type": ["caf\u00e9 order"]}
+        assert "caf\u00e9" in stored and ", " not in stored and ": " not in stored
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("attribute", ["ArchiveName", "SourceArn", "Description", "EventPattern",
+                                       "RetentionDays", "KmsKeyIdentifier", "NoSuchAttribute"])
+def test_cfn_events_archive_getatt_rolls_back(cfn, eb, attribute):
+    """Arn is the type's one read-only property, so Fn::GetAtt reads nothing
+    else; a writable property gets its own wording."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-attr-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+        uid, _cfn_archive_props(uid), outputs={"Out": {"Value": {"Fn::GetAtt": ["Named", attribute]}}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+        wording = "does not exist" if attribute == "NoSuchAttribute" else "must be a readonly property"
+        assert any(f"Requested attribute {attribute} {wording} in schema for AWS::Events::Archive" in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_updates_in_place(cfn, eb):
+    """Description, RetentionDays and EventPattern change on the existing
+    archive, which keeps its name and creation time."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-upd-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        named = f"cfn-archive-{uid}"
+        created = _describe_archive(eb, named)["CreationTime"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+            uid, _cfn_archive_props(uid, description="v2", retention=7,
+                                    sources=("app.orders", "app.invoices"))))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "NamedRef") == named
+        archive = _describe_archive(eb, named)
+        assert archive["CreationTime"] == created
+        assert (archive["Description"], archive["RetentionDays"], archive["EventPattern"]) == (
+            "v2", 7, '{"source":["app.orders","app.invoices"]}')
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_update_dropping_every_setting_fails(cfn, eb):
+    """An update that leaves none of Description, RetentionDays and EventPattern
+    is refused by the handler, and the archive keeps its settings."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-drop-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        named = f"cfn-archive-{uid}"
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_archive_template(uid, {"ArchiveName": named}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any('Resource handler returned message: "Invalid request provided: At least one of '
+                   'EventPattern, RetentionDays or Description must be provided."' in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+        archive = _describe_archive(eb, named)
+        assert (archive["Description"], archive["RetentionDays"]) == ("v1", 3)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_rollback_to_no_settings_fails(cfn, eb):
+    """Rolling back an in-place update to a template with no Description,
+    RetentionDays or EventPattern meets the same handler refusal, so the stack
+    ends UPDATE_ROLLBACK_FAILED and the archive keeps the update's value."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-rb-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        generated = _output(stack, "UnnamedRef")
+        body = json.loads(_cfn_archive_template(uid, _cfn_archive_props(uid)))
+        body["Resources"]["Unnamed"]["Properties"]["RetentionDays"] = 5
+        body["Resources"]["Bad"] = {"Type": "AWS::Events::Archive", "DependsOn": "Unnamed",
+                                    "Properties": {"SourceArn": "nope"}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
+        assert any('At least one of EventPattern, RetentionDays or Description must be provided.' in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+        assert _describe_archive(eb, generated)["RetentionDays"] == 5
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_rename_replaces_it(cfn, eb):
+    """A new ArchiveName creates a new archive with the template's settings
+    and deletes the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-ren-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        renamed = f"cfn-archive-renamed-{uid}"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+            uid, _cfn_archive_props(uid, name=renamed)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "NamedRef") == renamed
+        assert _output(stack, "NamedArn").endswith(f":archive/{renamed}")
+        assert _describe_archive(eb, renamed)["Description"] == "v1"
+        left = {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+        assert f"cfn-archive-{uid}" not in left
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_new_source_on_a_custom_name_is_refused(cfn, eb):
+    """A new SourceArn needs a new archive, which a kept custom name cannot get."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-src-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        named = f"cfn-archive-{uid}"
+        moved = {**_cfn_archive_props(uid), "SourceArn": {"Fn::GetAtt": ["Bus2", "Arn"]}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(uid, moved))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any("CloudFormation cannot update a stack when a custom-named resource requires "
+                   f"replacing. Rename {named} and update the stack again." in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+        bus_arn = eb.describe_event_bus(Name=f"cfn-archive-bus-{uid}")["Arn"]
+        assert _describe_archive(eb, named)["EventSourceArn"] == bus_arn
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_new_source_replaces_a_generated_one(cfn, eb):
+    """A generated archive given a new SourceArn is replaced under a new name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-gsrc-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        before = _output(stack, "UnnamedRef")
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+            uid, _cfn_archive_props(uid), generated_bus="Bus2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        after = _output(stack, "UnnamedRef")
+        assert after != before and re.fullmatch(r"Unnamed-[A-Za-z0-9]{12}", after)
+        bus2_arn = eb.describe_event_bus(Name=f"cfn-archive-bus2-{uid}")["Arn"]
+        assert _describe_archive(eb, after)["EventSourceArn"] == bus2_arn
+        assert before not in {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_archive_validation_template(uid, **props):
+    return json.dumps({"Resources": {
+        "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"cfn-archive-bus-{uid}"}},
+        "A": {"Type": "AWS::Events::Archive", "Properties": props}}})
+
+
+def _cfn_archive_bus_arn():
+    return {"Fn::GetAtt": ["Bus", "Arn"]}
+
+
+_EARLY_VALIDATION_FAILED = (
+    "The following hook(s)/validation failed: [{}]. To troubleshoot Early Validation errors, use the "
+    "DescribeEvents API for detailed failure information.")
+_ARCHIVE_NAME_PATTERN = r"[\.\-_A-Za-z0-9]+"
+
+# Each template property set and the PROPERTY_VALIDATION errors AWS reported for it, in its order (measured).
+_ARCHIVE_SCHEMA_CASES = {
+    "no-source": ({"RetentionDays": 1}, [("", "Required property [SourceArn] not found")]),
+    "long-name": ({"ArchiveName": "n" * 49}, [("/ArchiveName", "#/ArchiveName: expected maxLength: 48, actual: 49")]),
+    "empty-name": ({"ArchiveName": ""}, [
+        ("/ArchiveName", "#/ArchiveName: expected minLength: 1, actual: 0"),
+        ("/ArchiveName", f"Property value [] does not match pattern: {_ARCHIVE_NAME_PATTERN}")]),
+    "name-pattern": ({"ArchiveName": "///"},
+                     [("/ArchiveName", f"Property value [///] does not match pattern: {_ARCHIVE_NAME_PATTERN}")]),
+    "string-pattern": ({"EventPattern": '{"source": ["x"]}'},
+                       [("/EventPattern", "Property [EventPattern] expected type: JSONObject, found: String")]),
+    "list-pattern": ({"EventPattern": [{"source": ["x"]}]},
+                     [("/EventPattern", "Property [EventPattern] expected type: JSONObject, found: JSONArray")]),
+    "string-retention": ({"RetentionDays": "abc"},
+                         [("/RetentionDays", "Property [RetentionDays] expected type: Integer, found: String")]),
+    "bool-retention": ({"RetentionDays": True},
+                       [("/RetentionDays", "Property [RetentionDays] expected type: Integer, found: Boolean")]),
+    "float-retention": ({"RetentionDays": 1.5},
+                        [("/RetentionDays", "Property [RetentionDays] expected type: Integer, found: Float")]),
+    "object-source": ({"SourceArn": {"a": "b"}},
+                      [("/SourceArn", "Property [SourceArn] expected type: String, found: JSONObject")]),
+    "list-description": ({"Description": ["x"]},
+                         [("/Description", "Property [Description] expected type: String, found: JSONArray")]),
+    "unsupported": ({"Foo": "x"}, [("/Foo", "Unsupported property [Foo]")]),
+    "long-kms-key": ({"KmsKeyIdentifier": "k" * 2049},
+                     [("/KmsKeyIdentifier", "#/KmsKeyIdentifier: expected maxLength: 2048, actual: 2049")]),
+    "several": ({"ArchiveName": "n" * 49, "Foo": "x", "RetentionDays": "abc", "EventPattern": "{}"}, [
+        ("/Foo", "Unsupported property [Foo]"),
+        ("", "Required property [SourceArn] not found"),
+        ("/ArchiveName", "#/ArchiveName: expected maxLength: 48, actual: 49"),
+        ("/RetentionDays", "Property [RetentionDays] expected type: Integer, found: String"),
+        ("/EventPattern", "Property [EventPattern] expected type: JSONObject, found: String")]),
+}
+
+
+def _cfn_archive_case_props(case):
+    props, _ = _ARCHIVE_SCHEMA_CASES[case]
+    if case in ("no-source", "several") or "SourceArn" in props:
+        return dict(props)
+    return {"SourceArn": _cfn_archive_bus_arn(), **props}
+
+
+def _cfn_validation_events(cfn, **kwargs):
+    return [(e["OperationType"], e["LogicalResourceId"], e["ValidationName"], e["ValidationPath"],
+             e["ValidationStatusReason"])
+            for e in cfn.describe_events(**kwargs)["OperationEvents"] if e["EventType"] == "VALIDATION_ERROR"]
+
+
+@pytest.mark.parametrize("case", list(_ARCHIVE_SCHEMA_CASES))
+def test_cfn_events_archive_early_validation_fails_the_change_set(cfn, case):
+    """A change set creating an archive that breaks the resource schema fails
+    with the hook's reason and keeps its changes; the errors are the change
+    set's operation events, not the stack's, and it cannot be executed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-ev-{uid}"
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE",
+                          TemplateBody=_cfn_archive_validation_template(uid, **_cfn_archive_case_props(case)))
+    try:
+        cs = _wait_change_set(cfn, stack_name, "cs")
+        assert (cs["Status"], cs["ExecutionStatus"], cs["StatusReason"]) == (
+            "FAILED", "UNAVAILABLE", _EARLY_VALIDATION_FAILED.format("AWS::EarlyValidation::PropertyValidation"))
+        assert {c["ResourceChange"]["LogicalResourceId"] for c in cs["Changes"]} == {"Bus", "A"}
+        assert _cfn_validation_events(cfn, StackName=stack_name, ChangeSetName="cs") == [
+            ("CREATE_CHANGESET", "A", "PROPERTY_VALIDATION", f"/Resources/A/Properties{path}", reason)
+            for path, reason in _ARCHIVE_SCHEMA_CASES[case][1]]
+        assert cfn.describe_events(StackName=stack_name)["OperationEvents"] == []
+        with pytest.raises(ClientError) as exc:
+            cfn.execute_change_set(StackName=stack_name, ChangeSetName="cs")
+        assert exc.value.response["Error"]["Code"] == "InvalidChangeSetStatus"
+        assert exc.value.response["Error"]["Message"] == (
+            f"ChangeSet [{cs['ChangeSetId']}] cannot be executed in its current status of [FAILED]")
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] == "REVIEW_IN_PROGRESS"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("case", ["no-source", "long-name", "string-pattern"])
+def test_cfn_events_archive_early_validation_fails_create_stack(cfn, eb, case):
+    """A direct CreateStack fails the same validation before creating anything."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-evc-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_validation_template(uid, **_cfn_archive_case_props(case)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert [(e["ResourceStatus"], e.get("ResourceStatusReason") or None)
+                for e in _stack_level_events(cfn, stack_name)] == [
+            ("CREATE_IN_PROGRESS", "User Initiated"),
+            ("CREATE_FAILED", _VALIDATION_FAILED_ONE),
+            ("ROLLBACK_IN_PROGRESS", "Validation failure detected. See the operation's FAILED event for details."),
+            ("ROLLBACK_COMPLETE", None)]
+        assert _cfn_validation_events(cfn, StackName=stack_name) == [
+            ("CREATE_STACK", "A", "PROPERTY_VALIDATION", f"/Resources/A/Properties{path}", reason)
+            for path, reason in _ARCHIVE_SCHEMA_CASES[case][1]]
+        ops = cfn.describe_events(StackName=stack_name)["OperationEvents"]
+        assert {e["EventType"] for e in ops} == {"VALIDATION_ERROR", "PROVISIONING_ERROR"}
+        assert all("OperationStatus" not in e for e in ops)
+        assert cfn.describe_events(StackName=stack_name, Filters={"FailedEvents": True})["OperationEvents"] == ops
+        assert cfn.list_stack_resources(StackName=stack_name)["StackResourceSummaries"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.mark.parametrize("case", ["long-name", "string-pattern"])
+def test_cfn_events_archive_early_validation_fails_update_stack(cfn, eb, case):
+    """A direct UpdateStack to an invalid archive fails validation and rolls
+    back with the update's wording; the archive is untouched."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-evu-{uid}"
+    name = f"cfn-archive-evu-{uid}"
+    valid = {"SourceArn": _cfn_archive_bus_arn(), "ArchiveName": name, "Description": "ok"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(uid, **valid))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        props = {**valid, **_ARCHIVE_SCHEMA_CASES[case][0]}
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(uid, **props))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [(e["ResourceStatus"], e.get("ResourceStatusReason") or None)
+                   for e in _stack_level_events(cfn, stack_name)]
+        assert reasons[-4:] == [
+            ("UPDATE_FAILED", _VALIDATION_FAILED_ONE),
+            ("UPDATE_ROLLBACK_IN_PROGRESS", "Validation failure detected. See operation's FAILED event for details."),
+            ("UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS", None),
+            ("UPDATE_ROLLBACK_COMPLETE", None)]
+        assert _describe_archive(eb, name)["Description"] == "ok"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_template_scalars_pass_validation(cfn, eb):
+    """A string of digits is an Integer to the schema check, and a number is a String."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-scalar-{uid}"
+    name = f"cfn-archive-scalar-{uid}"
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE",
+                          TemplateBody=_cfn_archive_validation_template(
+                              uid, SourceArn=_cfn_archive_bus_arn(), ArchiveName=name, RetentionDays="3",
+                              Description=5))
+    try:
+        assert _wait_change_set(cfn, stack_name, "cs")["Status"] == "CREATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+@pytest.fixture
+def taken_archive(eb):
+    name = f"cfn-taken-archive-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_archive(ArchiveName=name, EventSourceArn=eb.describe_event_bus(Name="default")["Arn"])
+    yield name
+    eb.delete_archive(ArchiveName=name)
+
+
+def _cfn_archive_exists(name):
+    return f"Resource of type 'AWS::Events::Archive' with identifier '{name}' already exists."
+
+
+def test_cfn_events_archive_name_conflict_fails_the_change_set(cfn, taken_archive):
+    """A new archive whose name is taken fails the ResourceExistenceCheck hook,
+    which the reason lists before PropertyValidation when both fail."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-nc-{uid}"
+    body = json.loads(_cfn_archive_validation_template(
+        uid, SourceArn=_cfn_archive_bus_arn(), ArchiveName=taken_archive))
+    body["Resources"]["B"] = {"Type": "AWS::Events::Archive", "Properties": {"RetentionDays": 1}}
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE",
+                          TemplateBody=json.dumps(body))
+    try:
+        cs = _wait_change_set(cfn, stack_name, "cs")
+        assert (cs["Status"], cs["StatusReason"]) == ("FAILED", _EARLY_VALIDATION_FAILED.format(
+            "AWS::EarlyValidation::ResourceExistenceCheck, AWS::EarlyValidation::PropertyValidation"))
+        assert _cfn_validation_events(cfn, StackName=stack_name, ChangeSetName="cs") == [
+            ("CREATE_CHANGESET", "A", "NAME_CONFLICT_VALIDATION", "/Resources/A", _cfn_archive_exists(taken_archive)),
+            ("CREATE_CHANGESET", "B", "PROPERTY_VALIDATION", "/Resources/B/Properties",
+             "Required property [SourceArn] not found")]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_name_conflict_fails_create_stack(cfn, eb, taken_archive):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-ncc-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+        uid, SourceArn=_cfn_archive_bus_arn(), ArchiveName=taken_archive))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_validation_events(cfn, StackName=stack_name) == [
+            ("CREATE_STACK", "A", "NAME_CONFLICT_VALIDATION", "/Resources/A", _cfn_archive_exists(taken_archive))]
+        assert "Description" not in _describe_archive(eb, taken_archive)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def _cfn_archive_handler_reason(message, code, relayed=False):
+    """The handler's reason; one EventBridge relays carries the SDK's suffix."""
+    sdk = (r" \(Service: EventBridge, Status Code: 400, Request ID: [0-9a-f-]{36}\) \(SDK Attempt Count: 1\)"
+           if relayed else "")
+    return re.compile(re.escape(f'Resource handler returned message: "{message}') + sdk +
+                      re.escape('" (RequestToken: ') + r"[0-9a-f-]{36}" +
+                      re.escape(f", HandlerErrorCode: {code})"))
+
+
+def _cfn_resource_failure(cfn, stack_name, logical_id):
+    return next(e["ResourceStatusReason"] for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
+                if e["LogicalResourceId"] == logical_id and e["ResourceStatus"].endswith("_FAILED"))
+
+
+def test_cfn_events_archive_taken_name_reaches_the_handler(cfn, eb, taken_archive):
+    """Without validation, and on a replacement onto a taken name, the
+    handler relays EventBridge's refusal as AlreadyExists."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    exists = _cfn_archive_handler_reason(f"Archive {taken_archive} already exists.", "AlreadyExists", relayed=True)
+    disabled = f"cfn-archive-ncd-{uid}"
+    renamed = f"cfn-archive-ncr-{uid}"
+    try:
+        cfn.create_stack(StackName=disabled, DisableValidation=True, TemplateBody=_cfn_archive_validation_template(
+            uid, SourceArn=_cfn_archive_bus_arn(), ArchiveName=taken_archive))
+        assert _wait_stack(cfn, disabled)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert exists.fullmatch(_cfn_resource_failure(cfn, disabled, "A"))
+
+        uid2 = _uuid_mod.uuid4().hex[:8]
+        own = {"SourceArn": _cfn_archive_bus_arn(), "ArchiveName": f"cfn-archive-own-{uid2}"}
+        cfn.create_stack(StackName=renamed, TemplateBody=_cfn_archive_validation_template(uid2, **own))
+        assert _wait_stack(cfn, renamed)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=renamed, TemplateBody=_cfn_archive_validation_template(
+            uid2, **{**own, "ArchiveName": taken_archive}))
+        assert _wait_stack(cfn, renamed)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert exists.fullmatch(_cfn_resource_failure(cfn, renamed, "A"))
+        assert _cfn_validation_events(cfn, StackName=renamed) == []
+    finally:
+        _delete_cfn_test_stack(cfn, disabled)
+        _delete_cfn_test_stack(cfn, renamed)
+
+
+_ARCHIVE_HANDLER_CASES = {
+    "name-pattern": ({"ArchiveName": "a/b"}, "InvalidRequest",
+                     "Invalid request provided: 1 validation error detected: Value 'a/b' at 'archiveName' failed to "
+                     f"satisfy constraint: Member must satisfy regular expression pattern: {_ARCHIVE_NAME_PATTERN}"),
+    "source-not-an-arn": ({"SourceArn": "nope"}, "InvalidRequest",
+                          "Invalid request provided: 1 validation error detected: Value 'nope' at 'eventSourceArn' "
+                          "failed to satisfy constraint: Member must satisfy regular expression pattern: "
+                          r"^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:.+\/.+$"),
+    "negative-retention": ({"RetentionDays": -1}, "InvalidRequest",
+                           "Invalid request provided: 1 validation error detected: Value '-1' at 'retentionDays' "
+                           "failed to satisfy constraint: Member must have value greater than or equal to 0"),
+    "missing-kms-key": ({"KmsKeyIdentifier": "arn:aws:kms:us-east-1:000000000000:key/"
+                                             "00000000-0000-0000-0000-000000000000"}, "InvalidRequest",
+                        "Invalid request provided: The provided KMS key does not exist. Please ensure that the key "
+                        "identifier is correct and your key exists in the same region as the event source."),
+    "missing-bus": ({"SourceArn": "arn:aws:events:us-east-1:000000000000:event-bus/cfn-no-such-bus"}, "NotFound",
+                    "Event bus cfn-no-such-bus does not exist."),
+    "several": ({"SourceArn": "nope", "ArchiveName": "a/b", "RetentionDays": -1}, "InvalidRequest",
+                "Invalid request provided: 3 validation errors detected: Value '-1' at 'retentionDays' failed to "
+                "satisfy constraint: Member must have value greater than or equal to 0; Value 'nope' at "
+                "'eventSourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: "
+                r"^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:.+\/.+$; Value 'a/b' at 'archiveName' "
+                f"failed to satisfy constraint: Member must satisfy regular expression pattern: {_ARCHIVE_NAME_PATTERN}"),
+}
+
+
+@pytest.mark.parametrize("case", list(_ARCHIVE_HANDLER_CASES))
+def test_cfn_events_archive_handler_refusals(cfn, eb, case):
+    """Values the schema allows but the handler, or EventBridge behind it, refuses."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-hr-{uid}"
+    props, code, message = _ARCHIVE_HANDLER_CASES[case]
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+        uid, **{"SourceArn": _cfn_archive_bus_arn(), **props}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert _cfn_archive_handler_reason(message, code, relayed=code == "NotFound").fullmatch(
+            _cfn_resource_failure(cfn, stack_name, "A"))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_update_relays_an_invalid_pattern(cfn, eb):
+    """EventBridge's own pattern refusal reaches the update as InvalidRequest."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-bp-{uid}"
+    props = {"SourceArn": _cfn_archive_bus_arn(), "ArchiveName": f"cfn-archive-bp-{uid}", "Description": "d"}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(uid, **props))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+            uid, **props, EventPattern={"source": "x"}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reason = _cfn_resource_failure(cfn, stack_name, "A")
+        assert reason.startswith('Resource handler returned message: "Event pattern is not valid. Reason: '
+                                 '"source" must be an object or an array')
+        assert re.search(r" \(Service: EventBridge, Status Code: 400, Request ID: [0-9a-f-]{36}\) "
+                         r"\(SDK Attempt Count: 1\)\" \(RequestToken: [0-9a-f-]{36}, HandlerErrorCode: "
+                         r"InvalidRequest\)$", reason)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_kms_key(cfn, eb, kms_client):
+    """KmsKeyIdentifier is passed through; an empty one clears the key, and one
+    left out of the template keeps it. A negative RetentionDays and a key that
+    does not exist are refused on update as on create."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-kms-{uid}"
+    name = f"cfn-archive-kms-{uid}"
+    key = kms_client.create_key()["KeyMetadata"]["Arn"]
+    base = {"SourceArn": _cfn_archive_bus_arn(), "ArchiveName": name, "Description": "d"}
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+            uid, **base, KmsKeyIdentifier=key))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert _describe_archive(eb, name)["KmsKeyIdentifier"] == key
+        for props, expected in (({"KmsKeyIdentifier": ""}, None), ({"KmsKeyIdentifier": key}, key), ({}, key)):
+            cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+                uid, **base, **props, RetentionDays=len(props)))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+            assert _describe_archive(eb, name).get("KmsKeyIdentifier") == expected
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+            uid, **base, RetentionDays=-1))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert _cfn_archive_handler_reason(
+            _ARCHIVE_HANDLER_CASES["negative-retention"][2], "InvalidRequest",
+        ).fullmatch(_cfn_resource_failure(cfn, stack_name, "A"))
+        missing = key.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+            uid, **base, KmsKeyIdentifier=missing))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert _cfn_archive_handler_reason(
+            _ARCHIVE_HANDLER_CASES["missing-kms-key"][2], "InvalidRequest",
+        ).fullmatch(_cfn_resource_failure(cfn, stack_name, "A"))
+        assert _describe_archive(eb, name)["KmsKeyIdentifier"] == key
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+# Patterns and the EventPattern DescribeArchive returned for them on AWS: the
+# keys of every object in java.util.HashMap order (measured).
+_ARCHIVE_PATTERN_ORDER = [
+    ({"source": ["a"], "detail-type": ["b"], "account": ["123456789012"]},
+     '{"detail-type":["b"],"source":["a"],"account":["123456789012"]}'),
+    ({"detail": {"b": [1], "a": [2], "state": ["x"], "zz": [{"prefix": "p"}]}, "source": ["s"]},
+     '{"detail":{"zz":[{"prefix":"p"}],"a":[2],"b":[1],"state":["x"]},"source":["s"]}'),
+    ({"zeta": ["1"], "alpha": ["2"], "mid": ["3"]}, '{"zeta":["1"],"alpha":["2"],"mid":["3"]}'),
+    ({f"k{i:02d}": ["v"] for i in range(1, 15)},
+     '{"k11":["v"],"k10":["v"],"k02":["v"],"k13":["v"],"k01":["v"],"k12":["v"],"k04":["v"],"k03":["v"],'
+     '"k14":["v"],"k06":["v"],"k05":["v"],"k08":["v"],"k07":["v"],"k09":["v"]}'),
+    ({f"key{i}": ["v"] for i in range(12)},
+     '{"key1":["v"],"key2":["v"],"key0":["v"],"key5":["v"],"key6":["v"],"key3":["v"],"key4":["v"],"key9":["v"],'
+     '"key7":["v"],"key8":["v"],"key11":["v"],"key10":["v"]}'),
+    ({f"key{i}": ["v"] for i in range(20)},
+     '{"key1":["v"],"key2":["v"],"key0":["v"],"key5":["v"],"key6":["v"],"key3":["v"],"key4":["v"],"key9":["v"],'
+     '"key7":["v"],"key8":["v"],"key11":["v"],"key10":["v"],"key15":["v"],"key14":["v"],"key13":["v"],'
+     '"key12":["v"],"key19":["v"],"key18":["v"],"key17":["v"],"key16":["v"]}'),
+]
+
+
+@pytest.mark.parametrize("pattern,stored", _ARCHIVE_PATTERN_ORDER)
+def test_cfn_events_archive_pattern_key_order(cfn, eb, pattern, stored):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-order-{uid}"
+    name = f"cfn-archive-order-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+        uid, SourceArn=_cfn_archive_bus_arn(), ArchiveName=name, EventPattern=pattern))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        assert _describe_archive(eb, name)["EventPattern"] == stored
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_dropped_settings_are_kept(cfn, eb):
+    """A setting left out of an update keeps the archive's value."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-keep-{uid}"
+    name = f"cfn-archive-keep-{uid}"
+    base = {"SourceArn": _cfn_archive_bus_arn(), "ArchiveName": name}
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(
+        uid, **base, Description="d", RetentionDays=3, EventPattern={"source": ["x"]}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        for props, expected in (({"RetentionDays": 3}, ("d", 3, '{"source":["x"]}')),
+                                ({"Description": "d2"}, ("d2", 3, '{"source":["x"]}')),
+                                ({"EventPattern": {"source": ["y"]}}, ("d2", 3, '{"source":["y"]}'))):
+            cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_validation_template(uid, **base, **props))
+            assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+            archive = _describe_archive(eb, name)
+            assert (archive["Description"], archive["RetentionDays"], archive["EventPattern"]) == expected
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+def test_cfn_events_archive_change_set_operation_events(cfn, taken_archive):
+    """A change set's operation events, newest first: its outcome, its
+    validation errors (no OperationStatus), then its start. Hooks are listed in
+    the order of their first errors, resources by logical id whatever the
+    template's order, and an archive's name conflict before its property errors."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-ops-{uid}"
+    resources = {name: {"Type": "AWS::Events::Archive", "Properties": {"RetentionDays": 1}}
+                 for name in ("Zeta", "Alpha", "Mid")}
+    resources["Kilo"] = {"Type": "AWS::Events::Archive", "Properties": {
+        "SourceArn": "arn:aws:events:us-east-1:000000000000:event-bus/default", "ArchiveName": taken_archive,
+        "Foo": "x"}}
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE",
+                          TemplateBody=json.dumps({"Resources": resources}))
+    try:
+        cs = _wait_change_set(cfn, stack_name, "cs")
+        assert cs["StatusReason"] == _EARLY_VALIDATION_FAILED.format(
+            "AWS::EarlyValidation::PropertyValidation, AWS::EarlyValidation::ResourceExistenceCheck")
+        ops = cfn.describe_events(StackName=stack_name, ChangeSetName="cs")["OperationEvents"]
+        assert [(e["EventType"], e.get("OperationStatus"), e.get("LogicalResourceId"), e.get("ValidationName"))
+                for e in ops] == [
+            ("STACK_EVENT", "FAILED", None, None),
+            ("VALIDATION_ERROR", None, "Alpha", "PROPERTY_VALIDATION"),
+            ("VALIDATION_ERROR", None, "Kilo", "NAME_CONFLICT_VALIDATION"),
+            ("VALIDATION_ERROR", None, "Kilo", "PROPERTY_VALIDATION"),
+            ("VALIDATION_ERROR", None, "Mid", "PROPERTY_VALIDATION"),
+            ("VALIDATION_ERROR", None, "Zeta", "PROPERTY_VALIDATION"),
+            ("STACK_EVENT", "IN_PROGRESS", None, None)]
+        assert {e["OperationType"] for e in ops} == {"CREATE_CHANGESET"}
+        assert "StartTime" in ops[0] and "EndTime" in ops[0] and "EndTime" not in ops[-1]
+        assert cfn.describe_events(OperationId=ops[0]["OperationId"])["OperationEvents"] == ops
+        failed = cfn.describe_events(StackName=stack_name, ChangeSetName="cs",
+                                     Filters={"FailedEvents": True})["OperationEvents"]
+        assert failed == ops[:-1]
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_change_set_operation_events_on_success_and_no_changes(cfn):
+    """A change set that succeeds has a start and a SUCCEEDED event; one that
+    fails for having no changes has none, and executing it is refused as any
+    failed change set is."""
+    stack_name = f"cfn-cs-ops-{_uuid_mod.uuid4().hex[:8]}"
+    body = json.dumps({"Resources": {"T": {"Type": "AWS::SNS::Topic"}}})
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE", TemplateBody=body)
+    try:
+        assert _wait_change_set(cfn, stack_name, "cs")["Status"] == "CREATE_COMPLETE"
+        assert [(e["EventType"], e["OperationStatus"])
+                for e in cfn.describe_events(StackName=stack_name, ChangeSetName="cs")["OperationEvents"]] == [
+            ("STACK_EVENT", "SUCCEEDED"), ("STACK_EVENT", "IN_PROGRESS")]
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="cs")
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_change_set(StackName=stack_name, ChangeSetName="same", ChangeSetType="UPDATE", TemplateBody=body)
+        same = _wait_change_set(cfn, stack_name, "same")
+        assert same["Status"] == "FAILED"
+        assert cfn.describe_events(StackName=stack_name, ChangeSetName="same")["OperationEvents"] == []
+        with pytest.raises(ClientError) as exc:
+            cfn.execute_change_set(StackName=stack_name, ChangeSetName="same")
+        assert exc.value.response["Error"]["Message"] == (
+            f"ChangeSet [{same['ChangeSetId']}] cannot be executed in its current status of [FAILED]")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_change_set_validates_only_what_it_changes(cfn, eb):
+    """A change set checks the resources it adds or modifies, on creation and
+    on execution, so an archive created with DisableValidation does not fail
+    an update that leaves it be."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-cs-scope-{uid}"
+    archive = {"Type": "AWS::Events::Archive", "Properties": {
+        "SourceArn": "arn:aws:events:us-east-1:000000000000:event-bus/default",
+        "ArchiveName": f"cfn-cs-scope-{uid}", "Foo": "x"}}
+    cfn.create_stack(StackName=stack_name, DisableValidation=True,
+                     TemplateBody=json.dumps({"Resources": {"A": archive}}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps({"Resources": {"A": archive, "T": {"Type": "AWS::SNS::Topic"}}}))
+        assert _wait_change_set(cfn, stack_name, "cs")["Status"] == "CREATE_COMPLETE"
+        cfn.execute_change_set(StackName=stack_name, ChangeSetName="cs")
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_change_set_validation_leaves_unresolvable_templates_alone(cfn):
+    """Values that only resolve at deploy time, Properties that is not an
+    object and a dependency cycle don't break CreateChangeSet."""
+    stack_name = f"cfn-cs-unresolved-{_uuid_mod.uuid4().hex[:8]}"
+    template = {"Resources": {
+        "A": {"Type": "AWS::Events::Archive", "Properties": {
+            "SourceArn": {"Fn::ImportValue": "cfn-no-such-export"}, "Description": {"Fn::GetAtt": ["B", "TopicName"]}}},
+        "B": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": {"Fn::GetAtt": ["C", "TopicName"]}}},
+        "C": {"Type": "AWS::SNS::Topic", "Properties": {"TopicName": {"Fn::GetAtt": ["B", "TopicName"]}}},
+        "D": {"Type": "AWS::Events::Archive", "Properties": "x"}}}
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE",
+                          TemplateBody=json.dumps(template))
+    try:
+        assert _wait_change_set(cfn, stack_name, "cs")["Status"] in ("CREATE_COMPLETE", "FAILED")
+        assert [e for e in _cfn_validation_events(cfn, StackName=stack_name, ChangeSetName="cs") if e[1] != "D"] == []
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_import_existing_bucket_passes_change_set_validation(cfn, s3):
+    """A bucket ImportExistingResources adopts is not a name conflict."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-import-existing-{uid}"
+    stack_name = f"cfn-import-existing-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    cfn.create_change_set(StackName=stack_name, ChangeSetName="cs", ChangeSetType="CREATE",
+                          ImportExistingResources=True, TemplateBody=json.dumps({"Resources": {"B": {
+                              "Type": "AWS::S3::Bucket", "DeletionPolicy": "Retain",
+                              "Properties": {"BucketName": bucket}}}}))
+    try:
+        cs = _wait_change_set(cfn, stack_name, "cs")
+        assert cs["Status"] == "CREATE_COMPLETE", cs.get("StatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        s3.delete_bucket(Bucket=bucket)
+
+
 @pytest.mark.parametrize("rollback", [False, True])
 def test_cfn_logs_metric_filter_updates_in_place(cfn, logs, rollback):
     """FilterPattern and MetricTransformations change on the existing filter,
@@ -37799,3 +38579,179 @@ def test_cfn_asg_mixed_instances_policy_and_launch_source(cfn, autoscaling, ec2)
         for name in (f"cfn-mix-{suffix}", f"cfn-mix-bad-{suffix}"):
             _delete_cfn_test_stack(cfn, name)
         ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def _stack_set_template(set_name, queue_name, **overrides):
+    """A parent stack with one SELF_MANAGED StackSet deploying an SQS queue to its own account and Region
+    (the template of the real-AWS capture, with the retention passed through the parent)."""
+    instance = {
+        "Parameters": {"Retention": {"Type": "Number", "Default": "345600"}},
+        "Resources": {"Queue": {"Type": "AWS::SQS::Queue", "Properties": {
+            "QueueName": queue_name, "MessageRetentionPeriod": {"Ref": "Retention"}}}},
+        "Outputs": {"QueueUrl": {"Value": {"Ref": "Queue"}}},
+    }
+    props = {
+        "StackSetName": set_name,
+        "PermissionModel": "SELF_MANAGED",
+        "StackInstancesGroup": [{"DeploymentTargets": {"Accounts": [{"Ref": "AWS::AccountId"}]},
+                                 "Regions": [{"Ref": "AWS::Region"}]}],
+        "TemplateBody": json.dumps(instance),
+        "Parameters": [{"ParameterKey": "Retention", "ParameterValue": {"Ref": "Retention"}}],
+        "Tags": [{"Key": "owner", "Value": "ministack"}],
+        **overrides,
+    }
+    return json.dumps({
+        "Parameters": {"Retention": {"Type": "String", "Default": "345600"}},
+        "Resources": {"Set": {"Type": "AWS::CloudFormation::StackSet", "Properties": props}},
+        "Outputs": {"SetId": {"Value": {"Ref": "Set"}}},
+    })
+
+
+def test_cfn_stackset_deploys_its_one_local_instance_and_deletes_it(cfn, sqs):
+    """A self-managed StackSet in a template deploys its TemplateBody as one stack instance in the stack's own
+    account and Region, and answers DescribeStackSet and ListStackInstances with the shapes of a real-AWS capture."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name, queue = f"cfn-ss-{suffix}", f"ss-{suffix}", f"ss-q-{suffix}"
+    cfn.create_stack(StackName=name, TemplateBody=_stack_set_template(set_name, queue))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        set_id = stack["Outputs"][0]["OutputValue"]
+        assert re.fullmatch(rf"{set_name}:[0-9a-f-]{{36}}", set_id)
+        region = cfn.meta.region_name
+
+        by_name = cfn.describe_stack_set(StackSetName=set_name)["StackSet"]
+        assert cfn.describe_stack_set(StackSetName=set_id)["StackSet"] == by_name
+        assert by_name["StackSetId"] == set_id and by_name["Status"] == "ACTIVE"
+        assert by_name["Parameters"] == [
+            {"ParameterKey": "Retention", "ParameterValue": "345600", "UsePreviousValue": False}]
+        assert by_name["Capabilities"] == [] and by_name["OrganizationalUnitIds"] == []
+        assert by_name["Tags"] == [{"Key": "owner", "Value": "ministack"}]
+        assert by_name["StackSetARN"].endswith(f":stackset/{set_id}")
+        assert by_name["StackSetDriftDetectionDetails"]["DriftStatus"] == "NOT_CHECKED"
+        assert by_name["StackSetDriftDetectionDetails"]["TotalStackInstancesCount"] == 0
+        assert by_name["ManagedExecution"] == {"Active": False}
+        assert by_name["Regions"] == [region]
+
+        [summary] = cfn.list_stack_instances(StackSetName=set_name)["Summaries"]
+        assert summary["Status"] == "CURRENT" and summary["StackInstanceStatus"] == {"DetailedStatus": "SUCCEEDED"}
+        assert summary["OrganizationalUnitId"] == "" and summary["DriftStatus"] == "NOT_CHECKED"
+        assert f":stack/StackSet-{set_name}-" in summary["StackId"]
+        assert "StatusReason" not in summary
+        [instance_stack] = cfn.describe_stacks(StackName=summary["StackId"])["Stacks"]
+        assert instance_stack["Tags"] == [{"Key": "owner", "Value": "ministack"}]
+        assert instance_stack["Outputs"][0]["OutputValue"].endswith(f"/{queue}")
+        sqs.get_queue_url(QueueName=queue)
+
+        cfn.delete_stack(StackName=name)
+        _wait_stack(cfn, name)
+        with pytest.raises(ClientError) as exc:
+            cfn.describe_stack_set(StackSetName=set_name)
+        assert exc.value.response["Error"]["Code"] == "StackSetNotFoundException"
+        assert exc.value.response["Error"]["Message"] == f"StackSet {set_name} not found"
+        deleted = cfn.describe_stack_set(StackSetName=set_id)["StackSet"]
+        assert deleted["Status"] == "DELETED" and deleted["Tags"] == [] and deleted["Regions"] == []
+        assert cfn.list_stack_instances(StackSetName=set_id)["Summaries"] == []
+        with pytest.raises(ClientError) as exc:
+            sqs.get_queue_url(QueueName=queue)
+        assert "NonExistentQueue" in exc.value.response["Error"]["Code"]
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stackset_failed_instance_update_rolls_back(cfn, sqs):
+    """An update whose instance fails (MessageRetentionPeriod below SQS's minimum, as in the real-AWS capture)
+    fails the StackSet and the stack's rollback returns the instance, its parameters and the queue to before."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name, queue = f"cfn-ss-up-{suffix}", f"ss-up-{suffix}", f"ss-up-q-{suffix}"
+    template = _stack_set_template(set_name, queue)
+    cfn.create_stack(StackName=name, TemplateBody=template)
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        cfn.update_stack(StackName=name, TemplateBody=template,
+                         Parameters=[{"ParameterKey": "Retention", "ParameterValue": "30"}])
+        assert _wait_stack(cfn, name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        failed = [e for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                  if e["LogicalResourceId"] == "Set" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert failed and "MessageRetentionPeriod" in failed[0]["ResourceStatusReason"]
+
+        [summary] = cfn.list_stack_instances(StackSetName=set_name)["Summaries"]
+        assert summary["Status"] == "CURRENT"
+        [instance_stack] = cfn.describe_stacks(StackName=summary["StackId"])["Stacks"]
+        assert instance_stack["Parameters"] == [{"ParameterKey": "Retention", "ParameterValue": "345600"}]
+        assert instance_stack["Outputs"][0]["OutputKey"] == "QueueUrl"
+        assert cfn.describe_stack_set(StackSetName=set_name)["StackSet"]["Parameters"][0]["ParameterValue"] == "345600"
+        url = sqs.get_queue_url(QueueName=queue)["QueueUrl"]
+        attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["MessageRetentionPeriod"])["Attributes"]
+        assert attrs["MessageRetentionPeriod"] == "345600"
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_stackset_refuses_what_it_does_not_deploy(cfn):
+    """A SERVICE_MANAGED StackSet, one targeting another Region, or one with TemplateURL fails its stack with an
+    error naming what MiniStack deploys, and leaves no StackSet behind."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    for i, overrides in enumerate([
+        {"PermissionModel": "SERVICE_MANAGED"},
+        {"StackInstancesGroup": [{"DeploymentTargets": {"Accounts": [{"Ref": "AWS::AccountId"}]},
+                                  "Regions": ["eu-west-3"]}]},
+        {"TemplateURL": "https://example.com/t.json"},
+    ]):
+        name, set_name = f"cfn-ss-no-{i}-{suffix}", f"ss-no-{i}-{suffix}"
+        cfn.create_stack(StackName=name, TemplateBody=_stack_set_template(set_name, f"q-{i}-{suffix}", **overrides))
+        try:
+            assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+            [reason] = [e["ResourceStatusReason"] for e in cfn.describe_stack_events(StackName=name)["StackEvents"]
+                        if e["LogicalResourceId"] == "Set" and e["ResourceStatus"] == "CREATE_FAILED"]
+            assert "PermissionModel SELF_MANAGED, an inline TemplateBody and one StackInstancesGroup" in reason
+            with pytest.raises(ClientError) as exc:
+                cfn.describe_stack_set(StackSetName=set_name)
+            assert exc.value.response["Error"]["Code"] == "StackSetNotFoundException"
+        finally:
+            _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.auth_contract
+def test_cfn_stackset_capabilities_and_reads_contract(auth_enabled, cfn, iam_user):
+    """The StackSet's own Capabilities acknowledge its instance's IAM resources, and DescribeStackSet and
+    ListStackInstances are authorized against the StackSet's ARN (ending in its StackSetId) under AUTH=true."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name = f"cfn-ss-auth-{suffix}", f"ss-auth-{suffix}"
+    instance = {"Resources": {"Role": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}}}}}
+    template = json.loads(_stack_set_template(set_name, f"q-auth-{suffix}", TemplateBody=json.dumps(instance),
+                                              Capabilities=["CAPABILITY_IAM"]))
+    del template["Resources"]["Set"]["Properties"]["Parameters"]
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = cfn.describe_stack_set(StackSetName=set_name)["StackSet"]["StackSetARN"]
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "cloudformation:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": ["cloudformation:DescribeStackSet", "cloudformation:ListStackInstances"],
+             "Resource": arn}]}).client("cloudformation")
+        for call in (user.describe_stack_set, user.list_stack_instances):
+            for ref in (set_name, arn.split("stackset/")[1]):
+                if auth_enabled:
+                    with pytest.raises(ClientError) as exc:
+                        call(StackSetName=ref)
+                    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+                else:
+                    call(StackSetName=ref)
+        # A StackSetName on another action does not change what that action is authorized against.
+        stack_arn = cfn.describe_stacks(StackName=name)["Stacks"][0]["StackId"].rsplit("/", 1)[0] + "/*"
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "cloudformation:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "cloudformation:DescribeStacks", "Resource": stack_arn}]}).client("cloudformation")
+        user.meta.events.register("before-sign.cloudformation.DescribeStacks",
+                                  lambda request, **_: request.data.update({"StackSetName": set_name}))
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                user.describe_stacks(StackName=name)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        else:
+            user.describe_stacks(StackName=name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)

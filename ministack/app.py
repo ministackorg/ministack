@@ -1671,6 +1671,23 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             or handler(method, path, headers, body, query_params)
         )
         return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
+    if s3.is_account_public_access_block_path(path):
+        headers = headers or {}
+        if AUTH:
+            action = s3._ACCOUNT_PAB_ACTIONS.get(method)
+            if action:
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id)
+                if denied:
+                    return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or s3.handle_account_public_access_block(method, path, body)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
     if failure := _authenticate_only("s3", headers, query_params, request_id):
         return failure
 

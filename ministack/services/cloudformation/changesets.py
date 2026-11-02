@@ -59,9 +59,11 @@ from .stacks import (
     _create_then_delete_on_failure,
     _deploy_stack_async,
     _diff_resources,
+    _operation_event,
     _stack_region,
     _stack_region_context,
     _stack_tags_changed,
+    change_set_validation_errors,
 )
 
 logger = logging.getLogger("cloudformation")
@@ -527,8 +529,17 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
     return {"Resources": resolved}
 
 
+# Early Validation's hook for each validation name. A change set's
+# StatusReason lists the hooks in the order of their first errors (measured).
+_EARLY_VALIDATION_HOOKS = {
+    "NAME_CONFLICT_VALIDATION": "AWS::EarlyValidation::ResourceExistenceCheck",
+    "PROPERTY_VALIDATION": "AWS::EarlyValidation::PropertyValidation",
+}
+
+
 def _create_change_set(params):
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    started = now_iso()
     from ministack.services.cloudformation.handlers import (
         _check_capabilities,
         _resolve_stack,
@@ -753,6 +764,16 @@ def _create_change_set(params):
         f"changeSet/{cs_name}/{new_uuid()}"
     )
 
+    disable_validation = _p(params, "DisableValidation", "false").lower() == "true"
+    validation_errors = []
+    # A list, not a set: the change set is persisted as JSON.
+    validated = sorted({c["ResourceChange"]["LogicalResourceId"] for c in changes
+                        if c["ResourceChange"]["Action"] in ("Add", "Modify")})
+    if cs_type in ("CREATE", "UPDATE") and not disable_validation and import_failure is None:
+        with _stack_region_context(stack, stack_id):
+            validation_errors = change_set_validation_errors(
+                template, param_values, stack_name, stack_id, validated,
+                stack if cs_type == "UPDATE" else None)
     if import_failure is not None:
         # AWS accepts an import of a resource that does not exist and fails
         # the change set, with no changes, once it looks the resource up.
@@ -766,6 +787,15 @@ def _create_change_set(params):
                           + ", ".join(unsupported))
         else:
             _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", _IMPORT_REVIEW
+    elif validation_errors:
+        # AWS's Early Validation fails the change set and keeps its changes
+        # (measured). It let some invalid in-place modifications through to
+        # fail at execution and failed others; every one fails here.
+        hooks = dict.fromkeys(_EARLY_VALIDATION_HOOKS.get(validation_name, validation_name)
+                              for _, _, validation_name, _, _ in validation_errors)
+        _cs_status, _cs_exec = "FAILED", "UNAVAILABLE"
+        _cs_reason = (f"The following hook(s)/validation failed: [{', '.join(hooks)}]. To troubleshoot "
+                      "Early Validation errors, use the DescribeEvents API for detailed failure information.")
     elif changes:
         _cs_status, _cs_exec, _cs_reason = "CREATE_COMPLETE", "AVAILABLE", ""
     else:
@@ -776,6 +806,23 @@ def _create_change_set(params):
             "The submitted information didn't contain changes. "
             "Submit different information to create a change set."
         )
+    operation_events = []
+    if cs_type in ("CREATE", "UPDATE") and (validation_errors or _cs_status == "CREATE_COMPLETE"):
+        # Newest first, as DescribeEvents lists them; a change set that fails
+        # for having no changes has none (measured).
+        operation_id = new_uuid()
+        operation_events = [
+            _operation_event(stack_id, operation_id, "STACK_EVENT", "CREATE_CHANGESET",
+                             OperationStatus="FAILED" if validation_errors else "SUCCEEDED",
+                             StartTime=started, EndTime=now_iso()),
+            *(_operation_event(stack_id, operation_id, "VALIDATION_ERROR", "CREATE_CHANGESET", OperationStatus=None,
+                               LogicalResourceId=logical_id, ResourceType=rtype, ValidationFailureMode="FAIL",
+                               ValidationName=validation_name, ValidationStatus="FAILED",
+                               ValidationStatusReason=reason, ValidationPath=path)
+              for logical_id, rtype, validation_name, path, reason in validation_errors),
+            _operation_event(stack_id, operation_id, "STACK_EVENT", "CREATE_CHANGESET",
+                             OperationStatus="IN_PROGRESS", Timestamp=started, StartTime=started),
+        ]
     change_set = {
         "ChangeSetId": cs_id,
         "ChangeSetName": cs_name,
@@ -802,7 +849,9 @@ def _create_change_set(params):
         "_resources_to_import": resources_to_import,
         "_import_existing": {e["LogicalResourceId"]: e["ResourceIdentifier"] for e in existing},
         "ImportExistingResources": import_existing,
-        "_disable_validation": _p(params, "DisableValidation", "false").lower() == "true",
+        "_disable_validation": disable_validation,
+        "_validated": validated,
+        "_operation_events": operation_events,
     }
     _change_sets[cs_id] = change_set
 
@@ -960,6 +1009,9 @@ def _execute_change_set(params):
         return _error("ChangeSetNotFound",
                       f"ChangeSet [{cs_name}] does not exist", 404)
 
+    if cs["Status"] == "FAILED":
+        return _error("InvalidChangeSetStatus",
+                      f"ChangeSet [{cs['ChangeSetId']}] cannot be executed in its current status of [FAILED]")
     if cs["ExecutionStatus"] != "AVAILABLE":
         return _error("InvalidChangeSetStatus",
                       f"ChangeSet [{cs_name}] is in {cs['ExecutionStatus']} status")
@@ -1018,6 +1070,10 @@ def _execute_change_set(params):
     if not is_update:
         stack["DisableRollback"] = disable_rollback
     stack["_disable_validation"] = cs.get("_disable_validation", False)
+    # Executing a change set does not run Early Validation over what it left
+    # alone: AWS let invalid in-place changes it had accepted fail at the
+    # resource instead (measured).
+    stack["_validation_scope"] = cs.get("_validated")
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
