@@ -4032,9 +4032,45 @@ def _invoke_ecs_run_task(resource, input_data):
     if is_sync and result.get("tasks"):
         task_arns = [t["taskArn"] for t in result["tasks"]]
         cluster = ecs_data.get("cluster", "default")
-        result = _poll_ecs_tasks(cluster, task_arns)
+        task = _poll_ecs_tasks(cluster, task_arns)["tasks"][0]
+        # As on AWS, the state's result (or its failure's cause) is the stopped task itself.
+        document = _ecs_task_document(task)
+        if _ecs_task_failed(cluster, task):
+            raise _ExecutionError("States.TaskFailed", json.dumps(document))
+        return document
 
     return result
+
+
+def _ecs_task_failed(cluster, task):
+    """Whether a stopped task failed: an essential container exited non-zero, or none exited (it never started)."""
+    from ministack.services import ecs
+
+    stored = ecs._resolve_task(task.get("taskArn", ""), ecs._resolve_cluster_name(cluster) or cluster) or {}
+    essentials = stored.get("_container_essentials") or []
+    exits = [c.get("exitCode") for i, c in enumerate(task.get("containers", []))
+             if (essentials[i] if i < len(essentials) else True)]
+    return not any(code is not None for code in exits) or any(code not in (None, 0) for code in exits)
+
+
+def _ecs_task_document(task):
+    """An ECS task as the optimized integration reports it: PascalCase keys, epoch-millisecond timestamps."""
+    from ministack.services import ecs
+
+    def millis(value):
+        if isinstance(value, str):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+        return int(value * 1000) if isinstance(value, (int, float)) else value
+
+    def convert(value):
+        if isinstance(value, list):
+            return [convert(v) for v in value]
+        if not isinstance(value, dict):
+            return value
+        return {(k[:1].upper() + k[1:]): (millis(v) if k in ecs._ECS_TIMESTAMP_FIELDS else convert(v))
+                for k, v in value.items()}
+
+    return convert(task)
 
 
 def _poll_ecs_tasks(cluster, task_arns):
