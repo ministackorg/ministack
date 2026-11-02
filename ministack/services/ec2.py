@@ -1738,8 +1738,8 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
     rule_id = _sg_rule_id(sg_id, is_egress, rule)
 
     def _item(extra_xml=""):
-        from_port = f"<fromPort>{rule['FromPort']}</fromPort>" if "FromPort" in rule else ""
-        to_port = f"<toPort>{rule['ToPort']}</toPort>" if "ToPort" in rule else ""
+        from_port = f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+        to_port = f"<toPort>{rule.get('ToPort', -1)}</toPort>"
         return (
             "<item>"
             f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
@@ -1780,6 +1780,10 @@ def _strip_descriptions(rule):
     }
     for key in ("IpRanges", "Ipv6Ranges"):
         r[key] = [{k: v for k, v in entry.items() if k != "Description"} for entry in r.get(key, [])]
+    # IpProtocol -1 covers every port, so AWS ignores any port range given with it.
+    if r.get("IpProtocol") == "-1":
+        r.pop("FromPort", None)
+        r.pop("ToPort", None)
     return r
 
 
@@ -4713,9 +4717,10 @@ def _parse_ip_permissions(params, prefix):
                 "PrefixListIds": [], "UserIdGroupPairs": []}
         from_port = _p(params, f"{prefix}.{i}.FromPort")
         to_port = _p(params, f"{prefix}.{i}.ToPort")
-        if from_port:
+        # AWS keeps no port range on an IpProtocol -1 rule, whatever the call sent.
+        if from_port and proto != "-1":
             rule["FromPort"] = int(from_port)
-        if to_port:
+        if to_port and proto != "-1":
             rule["ToPort"] = int(to_port)
         j = 1
         while True:

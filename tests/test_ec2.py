@@ -739,6 +739,65 @@ def test_ec2_revoke_security_group_egress_returns_revoked_rules(ec2):
     ec2.delete_security_group(GroupId=sg_id)
 
 
+def test_ec2_sg_all_protocols_rule_ignores_ports(ec2):
+    """AWS ignores a port range sent with IpProtocol -1 (#2531): the Terraform
+    provider revokes the default egress rule with ports 0/0, and it goes. The
+    responses here were recorded on AWS (us-east-1, an Organizations member
+    account, 2026-11-02)."""
+    vpc_id = ec2.create_vpc(CidrBlock="10.77.0.0/16")["Vpc"]["VpcId"]
+    sg_id = ec2.create_security_group(GroupName="qa-ec2-sg-all-ports", Description="d", VpcId=vpc_id)["GroupId"]
+
+    def perm(**ports):
+        return [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}], **ports}]
+
+    def group():
+        return ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+
+    def rules(egress):
+        found = ec2.describe_security_group_rules(Filters=[{"Name": "group-id", "Values": [sg_id]}])
+        return [r for r in found["SecurityGroupRules"] if r["IsEgress"] is egress]
+
+    try:
+        revoked = ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=perm(FromPort=0, ToPort=0))
+        assert [(r["FromPort"], r["ToPort"]) for r in revoked["RevokedSecurityGroupRules"]] == [(-1, -1)]
+        assert group()["IpPermissionsEgress"] == []
+
+        # The rule declared again is a new one, so it keeps its description and tags.
+        ec2.authorize_security_group_egress(
+            GroupId=sg_id,
+            IpPermissions=[{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "Allow all outbound"}]}],
+            TagSpecifications=[{"ResourceType": "security-group-rule", "Tags": [{"Key": "Name", "Value": "egress-all"}]}],
+        )
+        rule = rules(True)[0]
+        assert rule["Description"] == "Allow all outbound"
+        assert rule["Tags"] == [{"Key": "Name", "Value": "egress-all"}]
+
+        # Any range matches, and none is kept on the rule.
+        ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=perm(FromPort=5, ToPort=10))
+        assert group()["IpPermissionsEgress"] == []
+        ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=perm(FromPort=5, ToPort=10))
+        stored = group()["IpPermissionsEgress"][0]
+        assert "FromPort" not in stored and "ToPort" not in stored
+        assert (rules(True)[0]["FromPort"], rules(True)[0]["ToPort"]) == (-1, -1)
+        ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=perm())
+        assert group()["IpPermissionsEgress"] == []
+
+        # Ingress takes the same path.
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=perm(FromPort=0, ToPort=0))
+        assert "FromPort" not in group()["IpPermissions"][0]
+        ec2.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=perm(FromPort=7, ToPort=8))
+        assert group()["IpPermissions"] == []
+
+        # Ports still count for any other protocol.
+        tcp = [{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=tcp)
+        ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=[{**tcp[0], "FromPort": 81, "ToPort": 81}])
+        assert [r["FromPort"] for r in group()["IpPermissionsEgress"]] == [80]
+    finally:
+        ec2.delete_security_group(GroupId=sg_id)
+        ec2.delete_vpc(VpcId=vpc_id)
+
+
 def test_ec2_revoke_sg_ingress_by_rule_id(ec2):
     """RevokeSecurityGroupIngress(SecurityGroupRuleIds=[...]) must remove exactly
     the addressed rules — previously the ids were ignored and the call returned

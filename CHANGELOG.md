@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 — a security group rule with `IpProtocol` `-1` ignores ports** — the Terraform provider removes a new group's default egress rule by revoking it with `FromPort` and `ToPort` 0, which matched nothing, so the rule stayed, and a later allow-all `aws_vpc_security_group_egress_rule` lost its description and tags and showed a change on every plan. As on AWS, any port range sent with `-1` is now ignored on authorize and revoke and not kept on the rule, and `RevokedSecurityGroupRules` reports such a rule with ports `-1`. Reported by @kharabasz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
