@@ -1320,7 +1320,9 @@ def _create_document(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
-    if name.lower().startswith("aws-"):
+    # botocore CreateDocument Name: prefixes reserved by AWS.
+    if name.lower().startswith("aws-") or name.startswith(
+            ("aws", "amazon", "amzn", "AWSEC2", "AWSConfigRemediation", "AWSSupport")):
         return error_response_json(
             "ValidationException", f"Invalid document name {name}", 400)
     content = data.get("Content")
@@ -1492,6 +1494,58 @@ def _sleep_seconds(duration):
     return int(hours or 0) * 3600 + int(minutes or 0) * 60 + float(seconds or 0)
 
 
+def _automation_principal(doc, resolved, caller):
+    """Who the steps run as: the document's assumeRole when it names a role, else the caller."""
+    role = doc["ParsedContent"].get("assumeRole")
+    role = _render_param_refs(role, resolved) if role else None
+    return role if isinstance(role, str) and ":role/" in role else caller
+
+
+def _step_denial(record, api, resource):
+    """Under AUTH=true, the error a step gets when its principal may not call ssm:<api>, or None."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import identity_denial_message
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _gather_user_policies,
+        _permissions_boundary,
+        evaluate,
+    )
+    from ministack.services import iam as _iam
+
+    principal = record.get("_RunAs") or record.get("ExecutedBy") or ""
+    account = get_account_id()
+    if not principal or principal.endswith(":root"):
+        return None
+    if ":assumed-role/" in principal or ":role/" in principal:
+        role = principal.split(":assumed-role/", 1)[1].split("/")[0] if ":assumed-role/" in principal \
+            else principal.rsplit("/", 1)[-1]
+        policies, limits = _gather_role_policies(role, account), _permissions_boundary(_iam._roles, role, account)
+        principal_type = "AssumedRole"
+    else:
+        user = principal.rsplit("/", 1)[-1]
+        policies, limits = _gather_user_policies(user, account), _permissions_boundary(_iam._users, user, account)
+        principal_type = "User"
+    action = f"ssm:{api}"
+    result = evaluate(EvalContext(principal_arn=principal, principal_type=principal_type, principal_account=account,
+                                  action=action, resource_arn=resource, region=get_region()), policies, *limits)
+    if result.decision == "Allow":
+        return None
+    return (f"An error occurred (AccessDeniedException) when calling the {api} operation: "
+            + identity_denial_message(action, principal, resource, result.decision == "Deny"))
+
+
+def _step_resource(api, inputs):
+    if "Parameter" in api and isinstance(inputs.get("Name"), str):
+        return f"arn:aws:ssm:{get_region()}:{get_account_id()}:parameter/{inputs['Name'].lstrip('/')}"
+    if api == "SendCommand":
+        return f"arn:aws:ssm:{get_region()}::document/{inputs.get('DocumentName', 'AWS-RunShellScript')}"
+    return "*"
+
+
 def _execute_step(step, record):
     action = step["Action"]
     inputs = {k: json.loads(v) for k, v in step["Inputs"].items()}
@@ -1505,6 +1559,9 @@ def _execute_step(step, record):
         fn = _AUTOMATION_SSM_APIS.get(api)
         if fn is None:
             return f"MiniStack does not emulate ssm:{api} in aws:executeAwsApi"
+        denied = _step_denial(record, api, _step_resource(api, inputs))
+        if denied:
+            return denied
         status, _headers, body = fn(
             {k: v for k, v in inputs.items() if k not in ("Service", "Api")})
         payload = json.loads(body)
@@ -1513,6 +1570,9 @@ def _execute_step(step, record):
                     f"the {api} operation: {payload.get('message', '')}")
         return None
     if action == "aws:runCommand":
+        denied = _step_denial(record, "SendCommand", _step_resource("SendCommand", inputs))
+        if denied:
+            return denied
         status, _headers, body = _send_command({
             "DocumentName": inputs.get("DocumentName", "AWS-RunShellScript"),
             "InstanceIds": inputs.get("InstanceIds", []),
@@ -1668,6 +1728,7 @@ def _start_automation_execution(data, caller):
         "Status": "Pending",
         "ExecutionStartTime": _now_epoch(),
         "ExecutedBy": caller,
+        "_RunAs": _automation_principal(doc, resolved, caller),
         "Parameters": passed,
         "Mode": data.get("Mode", "Auto"),
         "Targets": data.get("Targets", []),

@@ -1521,3 +1521,48 @@ mainSteps:
     st = d["StepExecutions"][0]
     assert st["StepStatus"] == "Failed" and st["FailureDetails"]["FailureStage"] == "Invocation"
     ssm.delete_document(Name=name)
+
+
+@pytest.mark.auth_contract
+def test_ssm_automation_steps_need_the_callers_permissions(ssm, auth_enabled, iam_user):
+    """An automation step calls the API as the caller (or the document's assumeRole), so under AUTH=true
+    it cannot do what the caller may not: a user allowed only to run automations cannot write a parameter."""
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": [
+        "ssm:CreateDocument", "ssm:DeleteDocument", "ssm:StartAutomationExecution", "ssm:GetAutomationExecution"],
+        "Resource": "*"}]})
+    client = user.client("ssm")
+    name, param = _unique_name("auto-auth"), f"/auto-auth/{_uuid_mod.uuid4().hex[:8]}"
+    doc = f"""schemaVersion: '0.3'
+mainSteps:
+- name: write
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: PutParameter
+    Name: {param}
+    Value: x
+    Type: String
+"""
+    client.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    try:
+        d = _wait_terminal(client, client.start_automation_execution(DocumentName=name)["AutomationExecutionId"])
+        if auth_enabled:
+            assert d["AutomationExecutionStatus"] == "Failed"
+            assert "AccessDeniedException" in d["FailureMessage"] and "ssm:PutParameter" in d["FailureMessage"]
+            with pytest.raises(ClientError):
+                ssm.get_parameter(Name=param)
+        else:
+            assert d["AutomationExecutionStatus"] == "Success"
+            ssm.delete_parameter(Name=param)
+    finally:
+        client.delete_document(Name=name)
+
+
+def test_ssm_create_document_refuses_reserved_prefixes(ssm):
+    """botocore CreateDocument Name: aws, amazon, amzn, AWSEC2, AWSConfigRemediation, AWSSupport are reserved."""
+    doc = json.dumps({"schemaVersion": "0.3", "mainSteps": [{"name": "s", "action": "aws:sleep",
+                                                              "inputs": {"Duration": "PT1S"}}]})
+    for name in ("awsMine", "amazonMine", "amznMine", "AWSEC2-Mine", "AWSSupport-Mine"):
+        with pytest.raises(ClientError) as exc:
+            ssm.create_document(Name=name, DocumentType="Automation", Content=doc)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
