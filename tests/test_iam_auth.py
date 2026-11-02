@@ -1810,7 +1810,7 @@ def _capture_enforced_arn(monkeypatch) -> dict:
     seen: dict[str, str] = {}
 
     def _capture(service, iam_action, headers, query_params, request_id, resource_arn="*",
-                 service_context=None, auth_error_response=None):
+                 service_context=None, auth_error_response=None, denied_response=None):
         seen["action"] = iam_action
         seen["arn"] = resource_arn
         seen["context"] = service_context
@@ -1826,6 +1826,10 @@ class _NoApiModule:
 
     @staticmethod
     def find_api_scope(api_id):
+        return None
+
+    @staticmethod
+    def find_api_owner(api_id):
         return None
 
     @staticmethod
