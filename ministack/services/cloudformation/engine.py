@@ -1023,10 +1023,20 @@ def _validate_template_statics(template: dict) -> None:
     _check_rules_section(template)
 
 
+# Properties a type's schema has that Fn::GetAtt still cannot read, because
+# they are not read-only (measured against AWS::Events::Archive's ArchiveName).
+_WRITABLE_SCHEMA_PROPERTIES = {
+    "AWS::Events::Archive": frozenset(("ArchiveName", "Description", "EventPattern", "KmsKeyIdentifier",
+                                       "RetentionDays", "SourceArn")),
+}
+
+
 def _unknown_attribute_message(res: dict, logical_id: str, attr: str) -> str:
     # Verbatim what CloudFormation reports in the stack event that starts the
     # rollback (measured on a real account against AWS::SQS::Queue).
     rtype = res.get("ResourceType") or logical_id
+    if attr in _WRITABLE_SCHEMA_PROPERTIES.get(rtype, ()):
+        return f"Requested attribute {attr} must be a readonly property in schema for {rtype}"
     return f"Requested attribute {attr} does not exist in schema for {rtype}"
 
 

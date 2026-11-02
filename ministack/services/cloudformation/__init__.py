@@ -30,6 +30,7 @@ _stacks = AccountRegionScopedDict()        # stack_name -> stack dict
 _stack_events = AccountRegionScopedDict()  # stack_id -> [event list]
 _exports = AccountRegionScopedDict()       # export_name -> {StackId, Name, Value}
 _change_sets = AccountRegionScopedDict()   # cs_id -> change set dict
+_stack_sets = AccountRegionScopedDict()    # StackSetId -> StackSet resource record
 
 from .helpers import _p  # noqa: E402
 
@@ -91,6 +92,7 @@ def reset():
     _stack_events.clear()
     _exports.clear()
     _change_sets.clear()
+    _stack_sets.clear()
     from ministack.services.cloudformation import custom_resource as _cr
     _cr.reset()
     from ministack.services.cloudformation import wait_conditions as _wc
@@ -107,6 +109,7 @@ _PERSISTED_STORES = (
     (lambda: _stack_events, "stack_events"),
     (lambda: _exports, "exports"),
     (lambda: _change_sets, "change_sets"),
+    (lambda: _stack_sets, "stack_sets"),
 )
 
 
