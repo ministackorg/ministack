@@ -6520,6 +6520,13 @@ def _modify_db_cluster_impl(p):
     )
     if global_version_conflict:
         return global_version_conflict
+    old_family = _aurora_cluster_family(cluster.get("Engine"), cluster.get("EngineVersion"))
+    new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
+    if (old_family and new_family and old_family != new_family
+            and _p(p, "AllowMajorVersionUpgrade").lower() != "true"):
+        # AWS Aurora user guide, in-place upgrade tutorial.
+        return _error("InvalidParameterCombination",
+                      "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.", 400)
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(

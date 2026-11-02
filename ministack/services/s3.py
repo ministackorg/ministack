@@ -4877,12 +4877,17 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        # A new object: an overwritten one's tags do not carry over.
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
     elif grant_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
+    else:
+        _object_acl.pop((bucket_name, key, obj.get("version_id")), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -5283,8 +5288,12 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, version_id), None)
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    else:
+        _object_acl.pop((bucket_name, key, version_id), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.

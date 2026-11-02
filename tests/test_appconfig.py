@@ -2733,6 +2733,10 @@ def test_cross_account_secret_that_cannot_be_read_is_not_found(secret_target, ac
     s = account_b_secrets["keyid"]
     sm_b.delete_secret(SecretId=s["arn"], RecoveryWindowInDays=7)
     nv = sm_b.create_secret(Name=f"{t.name}-b-novalue")
+    # Readable by the retrieval role like account B's other secrets, so under AUTH=true too
+    # it is the missing value, not the policy, that answers.
+    sm_b.put_resource_policy(SecretId=nv["ARN"], ResourcePolicy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": t.role}, "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]}))
     try:
         for uri in (s["arn"], "secretsmanager://" + s["arn"], nv["ARN"]):
             assert _profile_error(t, uri) == (404, "ResourceNotFoundException", f"Secret {uri} not found")

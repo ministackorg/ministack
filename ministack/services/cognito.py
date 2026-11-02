@@ -1289,10 +1289,11 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
         raise _PreSignUpRejected(str(e)) from e
 
     if isinstance(result, dict) and result.get("error"):
-        reason = result.get("body") or "PreSignUp Lambda rejected the request."
+        reason = _lambda_error_message(result.get("body"))
         logger.info("PreSignUp Lambda rejected sign-up for pool %s user %s: %s",
                     pool_id, username, reason)
-        raise _PreSignUpRejected(str(reason))
+        # AWS's format for every trigger error: "[trigger] failed with error [error text]".
+        raise _PreSignUpRejected(f"PreSignUp failed with error {reason}.")
 
     payload = result.get("body") if isinstance(result, dict) else result
     response = _extract_trigger_response(payload) or {}
@@ -3737,8 +3738,7 @@ def _apply_custom_message_trigger(pool: dict, trigger_source: str, username: str
         raise _CustomMessageRejected(str(e)) from e
 
     if isinstance(result, dict) and result.get("error"):
-        raise _CustomMessageRejected(
-            str(result.get("body") or "CustomMessage Lambda rejected the request."))
+        raise _CustomMessageRejected(f"CustomMessage failed with error {_lambda_error_message(result.get('body'))}.")
     payload = result.get("body") if isinstance(result, dict) else result
     return _extract_trigger_response(payload) or {}
 

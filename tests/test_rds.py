@@ -1382,6 +1382,21 @@ def test_rds_pending_upgrade_does_not_leak_to_a_recreated_cluster_and_survives_s
     assert "_major_upgrade_pending" not in restored
 
 
+def test_rds_major_upgrade_needs_allow_major_version_upgrade(rds):
+    """AWS (Aurora in-place upgrade tutorial): a major version change without the flag is refused."""
+    rds.create_db_cluster(DBClusterIdentifier="amvu", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(DBClusterIdentifier="amvu", EngineVersion="16.8", ApplyImmediately=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert exc.value.response["Error"]["Message"] == (
+            "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.")
+        assert rds.describe_db_clusters(DBClusterIdentifier="amvu")["DBClusters"][0]["EngineVersion"] == "15.13"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier="amvu", SkipFinalSnapshot=True)
+
+
 def test_rds_default_cluster_parameter_groups_are_immutable(rds):
     """Captured on AWS (us-east-1): a default group cannot be modified or deleted; a reset succeeds."""
     name = "default.aurora-mysql8.0"

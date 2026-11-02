@@ -12839,6 +12839,16 @@ def test_lambda_platform_pinned_only_when_architectures_declared(monkeypatch):
     assert _lam._declared_docker_platform({"FunctionName": "never-created"}) is None
 
 
+def test_lambda_host_docker_arch_names_the_image_architecture(monkeypatch):
+    """The daemon reports x86_64/aarch64; image metadata says amd64/arm64."""
+    from ministack.services import lambda_svc as _lam
+
+    for daemon, expected in (("x86_64", "amd64"), ("aarch64", "arm64")):
+        monkeypatch.setattr(_lam, "_host_docker_arch_cache", [])
+        client = type("C", (), {"info": staticmethod(lambda d=daemon: {"Architecture": d})})()
+        assert _lam._host_docker_arch(client) == expected
+
+
 # ─────────────────────────────── SnapStart ───────────────────────────────
 
 

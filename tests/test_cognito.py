@@ -3585,6 +3585,7 @@ def test_cognito_saml_presignup_lambda_rejects_unauthorized_user(cognito_idp, la
         assert e.code == 400
         body = json.loads(e.read())
         assert "UserLambdaValidationException" in body.get("__type", "")
+        assert body.get("message") == "PreSignUp failed with error not invited."
 
     with pytest.raises(ClientError):
         cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_uninvited@example.com")
@@ -7715,6 +7716,7 @@ def test_cognito_custom_message_failure_fails_admin_create_user(cognito_idp, lam
                 ClientMetadata={"notification_type": "boom"},
             )
         assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+        assert exc.value.response["Error"]["Message"].startswith("CustomMessage failed with error ")
         with pytest.raises(ClientError) as exc:
             cognito_idp.admin_get_user(UserPoolId=pid, Username="invitee")
         assert exc.value.response["Error"]["Code"] == "UserNotFoundException"

@@ -4317,6 +4317,20 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", cop
             )))
 
 
+_host_docker_arch_cache: list = []
+
+
+def _host_docker_arch(client):
+    """The Docker daemon's architecture as image metadata names it (amd64, arm64), or None."""
+    if not _host_docker_arch_cache:
+        try:
+            arch = (client.info() or {}).get("Architecture", "")
+        except Exception:
+            arch = ""
+        _host_docker_arch_cache.append({"x86_64": "amd64", "aarch64": "arm64"}.get(arch, arch) or None)
+    return _host_docker_arch_cache[0]
+
+
 def _declared_docker_platform(config: dict):
     """The linux/* platform to pin, or None when the function never declared one.
 
@@ -4470,7 +4484,7 @@ exports.handler = async (event, context) => {
   if (ARN) { try { context.invokedFunctionArn = ARN; } catch (e) {} }
   const fn = await load();
   // The runtime refuses this itself, but the shim's own signature hides the handler's.
-  const major = /^AWS_Lambda_nodejs(\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
+  const major = /^AWS_Lambda_nodejs(\\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
   if (major && Number(major[1]) >= 24 && fn.length >= 3
       && !fn[Symbol.for("aws.lambda.runtime.handler.streaming")]) {
     const err = new Error("ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
@@ -4792,6 +4806,16 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         # the host's, which is what will run.
         if docker_arch and local_image.attrs.get("Architecture") not in (None, docker_arch):
             raise docker_lib.errors.ImageNotFound("cached image is the wrong architecture")
+        # An undeclared function runs on the host's platform, but the tag may hold another
+        # architecture's image, pulled for a function that declared one: get the host's back.
+        host_arch = None if docker_platform else _host_docker_arch(client)
+        if host_arch and local_image.attrs.get("Architecture") not in (None, host_arch):
+            try:
+                client.images.pull(image, platform=f"linux/{host_arch}")
+                run_kwargs["platform"] = f"linux/{host_arch}"
+            except Exception as exc:
+                logger.info("Lambda image %s is %s and the host's could not be pulled (%s); running it as is",
+                            image, local_image.attrs.get("Architecture"), exc)
     except docker_lib.errors.ImageNotFound:
         logger.info("Pulling Lambda image: %s (%s)", image, docker_platform or "host platform")
         try:
