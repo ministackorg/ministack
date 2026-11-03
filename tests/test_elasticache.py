@@ -1518,8 +1518,9 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
             ec.delete_user(UserId=user)
 
 
-# Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS (serverless and
-# node-based Valkey 7.2, us-east-2; captures dataplane-serverless and dataplane-node).
+# Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS in us-east-2: the
+# same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (captures
+# dataplane-serverless, dataplane-node, dataplane-v8, dataplane-v9, dataplane-r7).
 _AWS_ACL_CHANNELS = {
     "on ~* +@all": "&*",
     "on ~* &allowed* +@all": "&allowed*",
@@ -1533,8 +1534,8 @@ _AWS_ACL_CHANNELS = {
 
 
 def test_user_acl_channels_default_to_all():
-    """`allchannels` goes before an access string without channel rules, and on the `default` user of a
-    group without one; AWS reports that user as `off &* -@all` (capture dataplane-serverless)."""
+    """The ACL SETUSER commands MiniStack sends: `allchannels` before an access string without channel
+    rules or selectors, and on the `default` user of a group without one."""
     def user(access):
         return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
 
@@ -1553,27 +1554,39 @@ def test_user_acl_channels_default_to_all():
 
 
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
-def test_serverless_cache_user_pubsub_channels(ec, tmp_path):
-    """Captures dataplane-serverless and dataplane-node (AWS, Valkey 7.2, us-east-2): each user's channels
-    match `_AWS_ACL_CHANNELS`, the group's default user is `off &* -@all`, an iam user with
-    `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all`
-    gets NOPERM outside `allowed*`."""
+@pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
+def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
+    """Captures dataplane-serverless, dataplane-v8, dataplane-v9 and dataplane-r7 (AWS, us-east-2): each
+    user's channels match `_AWS_ACL_CHANNELS`, an iam user with `on ~* +@all` can SUBSCRIBE and PUBLISH
+    on any channel, and one with `on ~* &allowed* +@all` gets the engine's NOPERM outside `allowed*`.
+    A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
+    one (DefaultUserRequired), so the Redis group has one with `on ~* +@all`, which gets `&*`."""
     import socket
     import ssl
-    uid = _uid()
+    uid, pw = _uid(), "msc-capture-default-password-1"
     users = {access: f"u-{i}-{uid}" for i, access in enumerate(_AWS_ACL_CHANNELS)}
     all_user, ctl_user = users["on ~* +@all"], users["on ~* &allowed* +@all"]
-    group, name = f"g-{uid}", f"sls-chan-{uid}"
+    group, name, default_id = f"g-{uid}", f"sls-chan-{uid}", f"u-def-{uid}"
     for access, user_id in users.items():
-        ec.create_user(UserId=user_id, UserName=user_id, Engine="valkey", AccessString=access,
+        ec.create_user(UserId=user_id, UserName=user_id, Engine=engine, AccessString=access,
                        AuthenticationMode={"Type": "iam"})
-    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=list(users.values()))
-    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="7", UserGroupId=group)
+    group_ids = list(users.values())
+    if engine == "redis":
+        ec.create_user(UserId=default_id, UserName="default", Engine="redis", AccessString="on ~* +@all",
+                       AuthenticationMode={"Type": "password", "Passwords": [pw]})
+        group_ids.append(default_id)
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=group_ids)
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
     try:
         cache = _wait_serverless(ec, name)
         assert cache["Status"] == "available"
         ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
-        nochan = b"-NOPERM No permissions to access a channel\r\n"
+        # AWS's Redis OSS 7.1 words the error "this user has no permissions to access one of the channels
+        # used as arguments"; MiniStack's redis:7 image words it like Valkey, so only the code is compared.
+        valkey_nochan = b"-NOPERM No permissions to access a channel\r\n"
+
+        def nochan(reply):
+            return reply.startswith(b"-NOPERM ") if engine == "redis" else reply == valkey_nochan
 
         def auth(user):
             return ("AUTH", user, f"{name}/?Action=connect&User={user}")
@@ -1594,28 +1607,34 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path):
         for access, user_id in users.items():
             channels = _AWS_ACL_CHANNELS[access]
             reply = _tls_session(ep, ca, auth(user_id), ("ACL", "GETUSER", user_id))[1]
-            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n".encode() in reply, access
+            # the root channels come right before `selectors`; each selector has its own channels field
+            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
         selector_user = users["on ~* +@all (&chan +get ~k)"]
         reply = _tls_session(ep, ca, auth(selector_user), ("ACL", "GETUSER", selector_user), ("PUBLISH", "chan", "x"))
-        assert b"$8\r\nchannels\r\n$5\r\n&chan\r\n" in reply[1] and reply[2] == nochan
-        assert b"$25\r\nuser default off &* -@all\r\n" in _tls_session(ep, ca, auth(all_user), ("ACL", "LIST"))[1]
+        assert b"$8\r\nchannels\r\n$5\r\n&chan\r\n" in reply[1] and nochan(reply[2])
+        if engine == "redis":
+            default = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"))[1]
+            assert b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in default
+        else:
+            assert b"$25\r\nuser default off &* -@all\r\n" in _tls_session(ep, ca, auth(all_user), ("ACL", "LIST"))[1]
         chan = b"$8\r\nany-chan\r\n"
         assert subscribe_and_publish(all_user, "any-chan") == (
             b"*3\r\n$9\r\nsubscribe\r\n" + chan + b":1\r\n", b":1\r\n",
             b"*3\r\n$7\r\nmessage\r\n" + chan + b"$5\r\nhello\r\n")
-        assert subscribe_and_publish(ctl_user, "any-chan") == (nochan, nochan, None)
+        subscribed, published, message = subscribe_and_publish(ctl_user, "any-chan")
+        assert nochan(subscribed) and nochan(published) and message is None
         assert subscribe_and_publish(ctl_user, "allowed-chan")[1] == b":1\r\n"
     finally:
         ec.delete_serverless_cache(ServerlessCacheName=name)
         ec.delete_user_group(UserGroupId=group)
-        for user in users.values():
+        for user in group_ids:
             ec.delete_user(UserId=user)
 
 
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
 def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path):
-    """Capture dataplane-serverless-with-default (AWS, Valkey 7.2, us-east-2): a password user named
-    default with `on ~* +@all` in the group has channels `&*` and can SUBSCRIBE and PUBLISH."""
+    """Capture dataplane-v7def (AWS, serverless Valkey 7, us-east-2): a password user named default with
+    `on ~* +@all`, in the group when the cache is created, has channels `&*` and can PUBLISH."""
     uid, pw = _uid(), "msc-capture-default-password-1"
     user_id, group, name = f"u-def-{uid}", f"g-{uid}", f"sls-def-{uid}"
     ec.create_user(UserId=user_id, UserName="default", Engine="valkey", AccessString="on ~* +@all",
@@ -1628,7 +1647,7 @@ def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path):
         ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
         replies = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"),
                                ("PUBLISH", "any-chan", "x"))
-        assert replies[0] == b"+OK\r\n" and b"$8\r\nchannels\r\n$2\r\n&*\r\n" in replies[1]
+        assert replies[0] == b"+OK\r\n" and b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in replies[1]
         assert replies[2] == b":0\r\n"
     finally:
         ec.delete_serverless_cache(ServerlessCacheName=name)
