@@ -1537,6 +1537,12 @@ _AWS_ACL_CHANNELS = {
     "on ~* -@all +publish +subscribe": "&*",
     "on ~app:* +@all": "&*",
     "on +@all": "&*",
+    # more selectors, serverless only (aws-selectors-default)
+    "on ~k +get (&chan +publish)": "",
+    "off (+get ~k)": "",
+    "on ~* &x +@all (+get ~k)": "&x",
+    "on ~* +@all (+get ~k) (&c +publish)": "",
+    "on (~k +get)": "",
 }
 
 
@@ -1564,7 +1570,7 @@ def test_user_acl_channels_default_to_all():
         return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
 
     with_allchannels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
-                        "on ~app:* +@all", "on +@all"}
+                        "on ~app:* +@all", "on +@all"}  # the rest set channels or have a selector
     for access in _AWS_ACL_CHANNELS:
         prefix = ["reset", "allchannels"] if access in with_allchannels else ["reset"]
         assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
@@ -1670,15 +1676,17 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
 
 
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
-def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path):
-    """Capture dataplane-v7def (AWS, serverless Valkey 7, us-east-2): a password user named default with
-    `on ~* +@all`, in the group when the cache is created, has channels `&*` and can PUBLISH."""
+@pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
+def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path, engine, major):
+    """Capture rounds aws-engines (v7def) and aws-selectors-default (AWS, serverless, us-east-2): a
+    password user named default with `on ~* +@all`, in the group when the cache is created, has channels
+    `&*` and can PUBLISH."""
     uid, pw = _uid(), "msc-capture-default-password-1"
     user_id, group, name = f"u-def-{uid}", f"g-{uid}", f"sls-def-{uid}"
-    ec.create_user(UserId=user_id, UserName="default", Engine="valkey", AccessString="on ~* +@all",
+    ec.create_user(UserId=user_id, UserName="default", Engine=engine, AccessString="on ~* +@all",
                    AuthenticationMode={"Type": "password", "Passwords": [pw]})
-    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[user_id])
-    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="7", UserGroupId=group)
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=[user_id])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
     try:
         cache = _wait_serverless(ec, name)
         assert cache["Status"] == "available"
