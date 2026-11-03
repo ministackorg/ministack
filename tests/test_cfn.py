@@ -37518,6 +37518,33 @@ def test_cfn_elasticache_user_group_reorder_keeps_outside_changes(cfn, ec):
             ec.delete_user(UserId=user_id)
 
 
+def test_cfn_elasticache_user_group_engine_update_resets_outside_changes(cfn, ec):
+    """Real AWS (us-east-1): an update that changes only Engine leaves the group with the template's users, dropping
+    a user added outside the stack."""
+    s = _uuid_mod.uuid4().hex[:8]
+    stack, group = f"ec-uge-{s}", f"uge-{s}"
+    default, member, other = f"d-{s}", f"m-{s}", f"o-{s}"
+    for user_id, name in ((default, "default"), (member, member), (other, other)):
+        ec.create_user(UserId=user_id, UserName=name, Engine="redis", AccessString="on ~* +@all",
+                       Passwords=[f"password-{s}-{s}"])
+
+    def template(engine):
+        return {"Resources": {"Group": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": group, "Engine": engine, "UserIds": [default, member]}}}}
+
+    _ec_create(cfn, stack, template("redis"))
+    try:
+        ec.modify_user_group(UserGroupId=group, UserIdsToAdd=[other])
+        _ec_update(cfn, stack, template("valkey"))
+        assert sorted(ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"]) == sorted([default, member])
+        assert ec.describe_users(UserId=other)["Users"][0]["UserGroupIds"] == []
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack, timeout=120)
+        for user_id in (default, member, other):
+            ec.delete_user(UserId=user_id)
+
+
 def test_cfn_elasticache_stack_create_and_delete(cfn, ec):
     s = _uuid_mod.uuid4().hex[:8]
     stack = f"ec-full-{s}"
