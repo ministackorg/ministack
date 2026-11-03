@@ -1583,13 +1583,8 @@ def _start_pg_reader_container(db_id, cluster):
         ports={f"{container_port}/tcp": host_port},
         name=_rds_docker_name(db_id),
         network=ms_network,
-        labels={
-            "ministack": "rds",
-            "db_id": db_id,
-            "cluster_id": cluster_id,
-            "account_id": get_account_id(),
-            "region": get_region(),
-        },
+        labels=container_reaper.own_labels(
+            "rds", db_id=db_id, cluster_id=cluster_id, account_id=get_account_id(), region=get_region()),
     )
     volume_name = None
     if RDS_PERSIST:
@@ -6490,10 +6485,7 @@ def _create_db_cluster_impl(p):
     _prepare_mysql_gtid_history(cluster)
     if (RDS_PUBLIC_ENDPOINT and _get_docker()
             and _docker_image_for_engine(engine, engine_version, master_user, master_pass, "mydb")[0]):
-        # MiniStack-only: under MINISTACK_RDS_PUBLIC_ENDPOINT the backing
-        # container is reported as {MINISTACK_HOST, host_port} once it runs.
-        # Choose that port now, and the container reuses it, so the first
-        # DescribeDBClusters already reports what later ones do (#2532).
+        # Report the published endpoint from create on; the container reuses this port.
         host_port = _next_port()
         cluster.update({
             "_shared_host_port": host_port,

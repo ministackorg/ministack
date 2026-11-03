@@ -675,6 +675,11 @@ def _validation_errors(resources_defs, ordered, param_values, conditions, mappin
             transforms = static(raw_props["Transforms"])
             errors += [(logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, path), reason)
                        for path, reason in listener_rule_transforms_schema_errors(transforms)]
+        if rtype == "AWS::ElastiCache::UserGroup" and "UserIds" in raw_props:
+            user_ids = static(raw_props["UserIds"])
+            if isinstance(user_ids, list) and len({repr(u) for u in user_ids}) != len(user_ids):
+                errors.append((logical_id, rtype, "PROPERTY_VALIDATION", property_path(logical_id, "UserIds"),
+                               "#/UserIds: array items are not unique"))
         if rtype == "AWS::Events::Archive":
             archive_props = {key: static(value) for key, value in raw_props.items()}
             archive_props = {key: value for key, value in archive_props.items() if value is not _NO_VALUE}

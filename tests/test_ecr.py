@@ -791,3 +791,60 @@ def test_ecr_tag_apis_reject_invalid_or_out_of_scope_repository_arns(resource_ar
 
     tags = _body(ecr_svc._list_tags_for_resource({"resourceArn": valid_arn}))["tags"]
     assert tags == [{"Key": "existing", "Value": "tag"}]
+
+
+
+def test_ecr_held_image_archive_loads_as_its_repository_uri():
+    """ECS loads an image this MiniStack's ECR holds as a `docker load` archive under its repositoryUri
+    (layers inflated, the platform picked from an index) instead of asking the real ECR."""
+    import gzip
+    import hashlib
+    import io
+    import json as _json
+    import tarfile
+
+    from ministack.core.responses import request_scope
+    from ministack.services import ecr
+
+    def digest(data):
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    layer = b"layer-bytes"
+    gz_layer = gzip.compress(layer)
+    config = b'{"rootfs": {"type": "layers"}}'
+    image = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+             "config": {"digest": digest(config)},
+             "layers": [{"digest": digest(gz_layer), "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]}
+    image_raw = _json.dumps(image).encode()
+    index = _json.dumps({"mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [
+        {"digest": digest(image_raw), "platform": {"architecture": "arm64", "os": "linux"}}]}).encode()
+    with request_scope("111122223333", "us-east-2"):
+        ecr._repositories["held"] = {"repositoryName": "held"}
+        ecr._layer_blobs["held"] = {digest(config): config, digest(gz_layer): gz_layer}
+        ecr._manifest_blobs["held"] = {digest(image_raw): image_raw, digest(index): index}
+        ecr._images["held"] = [{"imageDigest": digest(index), "imageTags": ["v1"],
+                                "imageManifestMediaType": "application/vnd.oci.image.index.v1+json"}]
+    try:
+        uri = "111122223333.dkr.ecr.us-east-2.amazonaws.com/held:v1"
+        assert ecr.held_image_digest(uri) == digest(index)
+        assert ecr.held_image_archive(uri, "amd64") is None  # no amd64 image in the index
+        archive, config_digest = ecr.held_image_archive(uri, "arm64")
+        assert config_digest == digest(config)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            manifest = _json.loads(tar.extractfile("manifest.json").read())[0]
+            assert manifest["RepoTags"] == [uri]
+            assert tar.extractfile(manifest["Layers"][0]).read() == layer
+            assert all(".." not in n and not n.startswith("/") for n in tar.getnames())
+        assert ecr.held_image_digest("111122223333.dkr.ecr.us-east-2.amazonaws.com/other:v1") is None
+        assert ecr.held_image_digest("public.ecr.aws/held:v1") is None
+        # A stored config digest that is not sha256:<64 hex> is never written into the archive.
+        bad = dict(image, config={"digest": "sha256:../../x"})
+        with request_scope("111122223333", "us-east-2"):
+            ecr._manifest_blobs["held"][digest(index)] = _json.dumps({"manifests": [
+                {"digest": "sha256:" + "0" * 64, "platform": {"architecture": "arm64"}}]}).encode()
+            ecr._manifest_blobs["held"]["sha256:" + "0" * 64] = _json.dumps(bad).encode()
+        assert ecr.held_image_archive(uri, "arm64") is None
+    finally:
+        with request_scope("111122223333", "us-east-2"):
+            for store in (ecr._repositories, ecr._layer_blobs, ecr._manifest_blobs, ecr._images):
+                store.pop("held", None)

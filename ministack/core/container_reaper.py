@@ -67,6 +67,29 @@ def instance_id() -> str:
     return f"{host}:{port}"
 
 
+_testcontainers_labels: dict | None = None
+
+
+def _inherited_testcontainers_labels() -> dict:
+    """Testcontainers' session labels from MiniStack's own container, so Ryuk also removes what MiniStack started
+    when the test process dies. Only the labels Ryuk matches on: the reuse hash would let Testcontainers mistake
+    a spawned container for MiniStack."""
+    global _testcontainers_labels
+    if _testcontainers_labels is None:
+        found = {}
+        if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+            try:
+                import docker
+                me = docker.from_env(timeout=5).containers.get(os.environ.get("HOSTNAME", ""))
+                found = {k: v for k, v in (me.labels or {}).items()
+                         if k in ("org.testcontainers", "org.testcontainers.golang")
+                         or (k.startswith("org.testcontainers.") and "session" in k.lower())}
+            except Exception as exc:
+                logger.debug("reaper: own container labels unavailable: %s", exc)
+        _testcontainers_labels = found
+    return _testcontainers_labels
+
+
 def own_labels(service: str, **extra) -> dict:
     """Labels every MiniStack-created container must carry.
 
@@ -74,6 +97,7 @@ def own_labels(service: str, **extra) -> dict:
     ``extra`` is merged, so callers keep their own labels.
     """
     labels = {
+        **_inherited_testcontainers_labels(),
         "ministack": service,
         INSTANCE_LABEL: instance_id(),
         BOOT_LABEL: _boot_nonce,

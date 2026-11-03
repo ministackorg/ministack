@@ -178,6 +178,9 @@ def _resolve_dynamic_reference(literal: str) -> str:
         raise ValueError(
             f"Dynamic reference {literal} is invalid: specify either a version "
             "stage or a version id, not both")
+    if not secretsmanager.foreign_secret_readable(secret_id):
+        raise ValueError(
+            f"Dynamic reference {literal} could not be resolved: access to secret {secret_id} denied")
     value = secretsmanager.resolve_secret_string(
         secret_id, version_stage or "AWSCURRENT", version_id or None, cross_account=True)
     if value is None:
