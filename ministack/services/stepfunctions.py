@@ -1819,12 +1819,14 @@ def _run_execution(exec_arn):
             ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
-            _add_event(execution, f"{state_type}StateEntered", {
+            entered = _add_event(execution, f"{state_type}StateEntered", {
                 "stateEnteredEventDetails": {
                     "name": current_name,
                     "input": json.dumps(current_input),
                 },
             })
+            if state_type == "Map":
+                _check_inline_map_fields(state_def, current_name, entered["id"])
 
             if state_type == "Succeed":
                 current_input = _apply_input_path(state_def, current_input, ctx)
@@ -2642,6 +2644,24 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
 # Map state
 # ---------------------------------------------------------------------------
 
+def _check_inline_map_fields(state_def, state_name, entered_event_id):
+    """Fail an Inline Map that has a field that only a Distributed Map supports.
+
+    AWS fails the execution when it enters such a Map, and a Catch or Retry on the Map does not handle the error.
+    So the state loops call this right after they write MapStateEntered, with that event's id for the cause text,
+    and not through the Map's _with_retry_and_catch.
+    """
+    processor = state_def.get("Iterator") or state_def.get("ItemProcessor", {})
+    if (processor.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return
+    if any(field in state_def for field in ("ItemReader", "ItemBatcher", "ResultWriter")):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"An error occurred while executing the state '{state_name}' (entered at the event id "
+            f"#{entered_event_id}). The ItemReader, ItemBatcher and ResultWriter fields are not supported for "
+            "INLINE maps")
+
+
 def _execute_map(state_def, raw_input, execution, ctx):
     return _with_retry_and_catch(
         state_def, raw_input, ctx,
@@ -2662,13 +2682,13 @@ def _run_map_items(state_def, raw_input, execution, ctx):
         items = [items]
 
     iterator = state_def.get("Iterator") or state_def.get("ItemProcessor", {})
-    if (iterator.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
-        return _run_distributed_map(state_def, raw_input, effective, iterator, execution, ctx)
     iter_states = iterator.get("States", {})
     iter_start = iterator.get("StartAt")
     max_conc = state_def.get("MaxConcurrency", 0)
     if is_jsonata and "MaxConcurrency" in state_def:
         max_conc = _jsonata_state_field(state_def, "MaxConcurrency", "number", raw_input, ctx)
+    if (iterator.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return _run_distributed_map(state_def, raw_input, effective, items, int(max_conc), iterator, execution, ctx)
 
     results = [None] * len(items)
     errors = [None] * len(items)
@@ -2796,22 +2816,20 @@ def _epoch_seconds(stamp):
         return 0
 
 
-def _run_distributed_map(state_def, raw_input, effective, iterator, execution, ctx):
+def _run_distributed_map(state_def, raw_input, effective, items, max_conc, iterator, execution, ctx):
     """Each item runs as a child workflow execution of a Map Run, which ListMapRuns, DescribeMapRun and
     ListExecutions(mapRunArn) report."""
     if state_def.get("ItemReader"):
         items = _read_map_items(state_def["ItemReader"], effective, ctx)
-    else:
-        items = _resolve_path_or_ctx(state_def.get("ItemsPath", "$"), effective, ctx)
     if not isinstance(items, list):
         items = [items]
+    is_jsonata = _state_query_language(state_def, ctx) == "JSONata"
 
     parent_sm = execution["stateMachineArn"].split(":")
     sm_name, region, account = parent_sm[6], parent_sm[3], parent_sm[4]
     label = state_def.get("Label") or new_uuid()
     child_sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{sm_name}/{label}"
     map_run_arn = f"arn:aws:states:{region}:{account}:mapRun:{sm_name}/{label}:{new_uuid()}"
-    max_conc = int(state_def.get("MaxConcurrency") or 0)
     tolerated_pct = float(state_def.get("ToleratedFailurePercentage") or 0)
     tolerated_count = int(state_def.get("ToleratedFailureCount") or 0)
     zero = {k: 0 for k in ("pending", "running", "succeeded", "failed", "timedOut", "aborted", "total", "resultsWritten",
@@ -2832,7 +2850,12 @@ def _run_distributed_map(state_def, raw_input, effective, iterator, execution, c
     def run_child(idx, item):
         item_ctx = copy.deepcopy(ctx)
         item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
-        child_input = _resolve_params_obj(item_selector, effective, item_ctx) if item_selector else item
+        if not item_selector:
+            child_input = item
+        elif is_jsonata:
+            child_input = _apply_jsonata_template(item_selector, raw_input, item_ctx)
+        else:
+            child_input = _resolve_params_obj(item_selector, effective, item_ctx)
         name = new_uuid()
         child = {
             "executionArn": f"arn:aws:states:{region}:{account}:execution:{sm_name}/{label}:{name}",
@@ -2879,6 +2902,10 @@ def _run_distributed_map(state_def, raw_input, effective, iterator, execution, c
     if exceeded:
         raise _ExecutionError("States.ExceedToleratedFailureThreshold",
                               "The specified tolerated failure threshold was exceeded")
+    if is_jsonata:
+        output = _apply_jsonata_output(state_def, raw_input, ctx, result=results, default=results)
+        _apply_state_assign(state_def, raw_input, ctx, result=results)
+        return output, _next_or_end(state_def)
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
     output = _apply_output_path(state_def, output, ctx)
@@ -2904,12 +2931,14 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
         state_type = state_def.get("Type")
         ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
-        _add_event(execution, f"{state_type}StateEntered", {
+        entered = _add_event(execution, f"{state_type}StateEntered", {
             "stateEnteredEventDetails": {
                 "name": current_name,
                 "input": json.dumps(current_input),
             },
         })
+        if state_type == "Map":
+            _check_inline_map_fields(state_def, current_name, entered["id"])
 
         if state_type == "Succeed":
             current_input = _apply_input_path(state_def, current_input, ctx)
