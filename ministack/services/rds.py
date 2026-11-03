@@ -8666,6 +8666,10 @@ def _modify_global_cluster_impl(p):
             if member_cluster:
                 _set_cluster_engine_version(member_cluster, engine_version)
 
+    if new_id and new_id != gc_id:
+        # The writer's container rejoins with the new global name in place of the old one.
+        _sync_global_writer_endpoint_aliases(gc)
+
     return _xml(200, "ModifyGlobalClusterResponse",
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
 

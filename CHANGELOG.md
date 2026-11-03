@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- **RDS — the global writer endpoint resolves on the Docker network** — `DescribeGlobalClusters` reported `<id>.global-<token>.global.rds.amazonaws.com`, but no container answered for it, so an ECS task or Lambda given the global endpoint could not resolve the database host. As on AWS, where the name is a CNAME to the primary cluster's writer, it is now a network alias on the writer member's engine container, and it moves on `SwitchoverGlobalCluster` and `FailoverGlobalCluster` and is dropped when the writer leaves with `RemoveFromGlobalCluster`. Contributed by @kharabasz.
+- **RDS — the global writer endpoint resolves on the Docker network** — `DescribeGlobalClusters` reported `<id>.global-<token>.global.rds.amazonaws.com`, but no container answered for it, so an ECS task or Lambda given the global endpoint could not resolve the database host. As on AWS, where the name is a CNAME to the primary cluster's writer, it is now a network alias on the writer member's engine container, and it moves on `SwitchoverGlobalCluster` and `FailoverGlobalCluster`, is renamed with `ModifyGlobalCluster` `NewGlobalClusterIdentifier`, and is dropped when the writer leaves with `RemoveFromGlobalCluster`. Contributed by @kharabasz.
 
 ## [1.5.36] — 2026-11-02
 

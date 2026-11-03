@@ -17033,6 +17033,36 @@ def test_rds_global_switch_handlers_sync_aliases_on_the_live_global_cluster(
     assert synced == []
 
 
+def test_rds_global_alias_follows_a_rename(monkeypatch):
+    """A renamed global cluster hands out a new endpoint; the writer's container
+    must carry it in place of the old one, and the secondary stays untouched."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    gc["GlobalClusterIdentifier"] = "gdb2"
+    new_name = m._global_cluster_endpoint(gc)
+    assert new_name != _GLOBAL_ALIAS_NAME
+    m._sync_global_writer_endpoint_aliases(gc)
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"]]
+    assert connects[0][2] == m._cluster_endpoint_aliases(clusters["a"]) + [new_name]
+
+
+def test_rds_modify_global_cluster_rename_syncs_aliases(monkeypatch):
+    """Only a rename moves the alias; other modifications leave the network alone."""
+    m, live, synced = _global_switch_spy(monkeypatch)
+    live.update(GlobalClusterArn="arn:aws:rds::000000000000:global-cluster:gdb", GlobalClusterMembers=[])
+    monkeypatch.setattr(m, "_mysql_global_writer_switch_mutation_error", lambda _cluster: None)
+    monkeypatch.setattr(m, "_tags", {})
+    # Record the identifier at call time: the sync must see the renamed cluster.
+    monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases",
+                        lambda gc: synced.append((gc, gc["GlobalClusterIdentifier"])))
+    assert m._modify_global_cluster({"GlobalClusterIdentifier": ["gdb"], "DeletionProtection": ["true"]})[0] == 200
+    assert synced == []
+    assert m._modify_global_cluster(
+        {"GlobalClusterIdentifier": ["gdb"], "NewGlobalClusterIdentifier": ["gdb2"]})[0] == 200
+    assert len(synced) == 1 and synced[0][0] is live and synced[0][1] == "gdb2"
+    assert live["GlobalClusterIdentifier"] == "gdb2"
+
+
 def _wait_cluster_status(rds, cluster_id, status, timeout=180):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -17064,6 +17094,7 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
     docker = pytest.importorskip("docker").from_env()
     suffix = uuid.uuid4().hex[:8]
     gid, cid, did = f"gdbep-{suffix}", f"gdbep-{suffix}-c", f"gdbep-{suffix}-i"
+    renamed = f"{gid}-r"
 
     def resolve(name):
         try:
@@ -17103,8 +17134,20 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
         assert cluster_ip
         assert resolve(global_name) == cluster_ip
 
+        # Renamed, the writer answers for the new name and no longer for the old
+        # one (AWS: dns-new-global-after-rename, dns-old-global-after-rename).
+        rds.modify_global_cluster(GlobalClusterIdentifier=gid, NewGlobalClusterIdentifier=renamed)
+        old_name, global_name = global_name, rds.describe_global_clusters(
+            GlobalClusterIdentifier=renamed)["GlobalClusters"][0]["Endpoint"]
+        assert global_name != old_name
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(global_name) == cluster_ip
+        assert resolve(old_name) is None
+
         rds.remove_from_global_cluster(
-            GlobalClusterIdentifier=gid,
+            GlobalClusterIdentifier=renamed,
             DbClusterIdentifier=rds.describe_db_clusters(
                 DBClusterIdentifier=cid)["DBClusters"][0]["DBClusterArn"])
         assert resolve(global_name) is None
@@ -17112,13 +17155,13 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
             DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
     finally:
         for call, kwargs in (
-            (rds.remove_from_global_cluster, {
-                "GlobalClusterIdentifier": gid,
-                "DbClusterIdentifier": cid}),
+            *((rds.remove_from_global_cluster, {
+                "GlobalClusterIdentifier": g,
+                "DbClusterIdentifier": cid}) for g in (gid, renamed)),
             (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
             (_wait_instance_gone, {"rds": rds, "instance_id": did}),
             (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
-            (rds.delete_global_cluster, {"GlobalClusterIdentifier": gid}),
+            *((rds.delete_global_cluster, {"GlobalClusterIdentifier": g}) for g in (gid, renamed)),
         ):
             try:
                 call(**kwargs)
