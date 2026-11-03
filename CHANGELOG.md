@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — a failed container start no longer leaks the container** — with `LAMBDA_EXECUTOR=docker`, when the daemon answered `create` but a later step (copying code in, or `start`) failed, for example on a `Read timed out` from a slow daemon, the created container was never removed and stayed in `Created` state. It is now removed (with its anonymous volumes) before the error propagates or the platform fallback runs. A Docker read timeout or connection error is also no longer reported as "declares linux/arm64 but this host cannot run it" with a second container spawned on the host architecture: it is raised as it is, and only genuine platform refusals fall back.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
