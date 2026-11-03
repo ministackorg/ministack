@@ -5128,6 +5128,29 @@ def test_sfn_stop_writes_no_event_after_abort(sfn, query_language, run_state, en
         sfn.delete_state_machine(stateMachineArn=machine)
 
 
+def test_sfn_stop_is_not_overwritten_by_a_failure_after_it(sfn):
+    """A Parallel whose ResultSelector fails on what its stopped branches return stays ABORTED."""
+    machine = sfn.create_state_machine(
+        name=f"stop-then-fail-{_uuid_mod.uuid4().hex[:12]}",
+        definition=json.dumps({"StartAt": "Run", "States": {"Run": {
+            "Type": "Parallel", "Branches": [_two_second_wait("WaitA")],
+            "ResultSelector": {"x.$": "States.MathAdd($[0].n, 1)"}, "End": True}}}),
+        roleArn=_LAMBDA_ROLE,
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=machine)["executionArn"]
+        for _ in range(50):
+            if any(e["type"] == "WaitStateEntered" for e in sfn.get_execution_history(executionArn=execution)["events"]):
+                break
+            time.sleep(0.05)
+        sfn.stop_execution(executionArn=execution, error="TestStop", cause="stopped by test")
+        time.sleep(1)
+        assert sfn.describe_execution(executionArn=execution)["status"] == "ABORTED"
+        assert sfn.get_execution_history(executionArn=execution)["events"][-1]["type"] == "ExecutionAborted"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=machine)
+
+
 def test_sfn_stopped_child_in_wait_ends_its_sync_parent_at_once(sfn):
     """A child stopped during a long Wait ends its .sync parent at once, not when the Wait ends."""
     unique = _uuid_mod.uuid4().hex[:12]

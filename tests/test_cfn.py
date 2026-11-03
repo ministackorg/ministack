@@ -3204,6 +3204,50 @@ def test_cfn_secretsmanager_reference_reads_another_account(cfn, ssm, other_acco
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+@pytest.mark.auth_contract
+def test_cfn_secretsmanager_reference_to_another_account_needs_its_grants(auth_enabled):
+    """Under AUTH=true a secret in another account resolves only with an Allow in its resource policy and a
+    customer managed key whose policy grants kms:Decrypt (the AWS managed key cannot be shared); under
+    AUTH=false it always resolves."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(service, account):
+        return boto3.client(service, endpoint_url=endpoint, region_name="us-east-1",
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    owner_sm, owner_kms, cfn = client("secretsmanager", "111122223333"), client("kms", "111122223333"), \
+        client("cloudformation", "000000000000")
+    stack_root = {"AWS": "arn:aws:iam::000000000000:root"}
+    owner_root = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                  "Action": "kms:*", "Resource": "*"}
+    granting = owner_kms.create_key(Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        owner_root, {"Effect": "Allow", "Principal": stack_root, "Action": "kms:Decrypt", "Resource": "*"}]}))
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": stack_root, "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]})
+
+    def deploy(with_policy, key_id):
+        name = f"cfn-xacct-grant-{_uuid_mod.uuid4().hex[:8]}"
+        arn = owner_sm.create_secret(Name=name, SecretString="v", **({"KmsKeyId": key_id} if key_id else {}))["ARN"]
+        if with_policy:
+            owner_sm.put_resource_policy(SecretId=name, ResourcePolicy=policy)
+        stack = f"cfn-xacct-grant-{_uuid_mod.uuid4().hex[:8]}"
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"P": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/{stack}", "Type": "String", "Value": f"{{{{resolve:secretsmanager:{arn}}}}}"}}}}))
+        try:
+            return _wait_stack(cfn, stack)["StackStatus"]
+        finally:
+            _delete_cfn_test_stack(cfn, stack)
+            owner_sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    key = granting["KeyMetadata"]["Arn"]
+    refused = "ROLLBACK_COMPLETE" if auth_enabled else "CREATE_COMPLETE"
+    assert deploy(False, None) == refused
+    assert deploy(True, None) == refused
+    assert deploy(False, key) == refused
+    assert deploy(True, key) == "CREATE_COMPLETE"
+
+
 def test_cfn_dynamic_reference_that_cannot_resolve_fails_the_resource(cfn, ssm):
     """A reference to a missing parameter fails the resource and rolls the
     stack back with the reason."""
@@ -37614,6 +37658,47 @@ def test_cfn_elasticache_memcached_configuration_endpoint(cfn, ec):
         _delete_cfn_test_stack(cfn, stack)
 
 
+def test_cfn_elasticache_user_group_update_sets_template_users(cfn, ec):
+    """A stack update leaves the group with exactly the template's users, diffed against the live group,
+    so members added or removed outside the stack don't fail it (real AWS, us-east-1)."""
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-ug-{s}"
+    dflt, a, b, c = f"d-{s}", f"a-{s}", f"b-{s}", f"c-{s}"
+    ec.create_user(UserId=dflt, UserName="default", Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    for user in (a, b, c):
+        ec.create_user(UserId=user, UserName=user, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+
+    def tmpl(users):
+        return {"Resources": {"G": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": f"ug-{s}", "Engine": "redis", "UserIds": users}}}}
+
+    members = lambda: sorted(ec.describe_user_groups(UserGroupId=f"ug-{s}")["UserGroups"][0]["UserIds"])
+    try:
+        _ec_create(cfn, stack, tmpl([dflt, a]))
+        ec.modify_user_group(UserGroupId=f"ug-{s}", UserIdsToAdd=[b, c])
+        _ec_update(cfn, stack, tmpl([dflt, a, b]))
+        assert members() == sorted([dflt, a, b])
+        assert ec.describe_users(UserId=c)["Users"][0]["UserGroupIds"] == []
+        ec.modify_user_group(UserGroupId=f"ug-{s}", UserIdsToRemove=[a])
+        _ec_update(cfn, stack, tmpl([dflt, b]))
+        assert members() == sorted([dflt, b])
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(tmpl([dflt, b, b])))
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert members() == sorted([dflt, b])
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(tmpl([dflt, b, f"ghost-{s}"])))
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any(re.fullmatch(
+            rf'Resource handler returned message: "User ghost-{s} not found\. \(Service: ElastiCache, Status Code: 404, '
+            r'Request ID: [0-9a-f-]{36}\) \(SDK Attempt Count: 1\)" \(RequestToken: [0-9a-f-]{36}, '
+            r'HandlerErrorCode: GeneralServiceException\)', r) for r in _ec_reasons(cfn, stack, "G"))
+        assert members() == sorted([dflt, b])
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack, timeout=120)
+        for user in (dflt, a, b, c):
+            ec.delete_user(UserId=user)
+
+
 @pytest.mark.parametrize("rtype,old,new,expected", [
     ("AWS::ElastiCache::CacheCluster", {"Engine": "redis"}, {"Engine": "memcached"}, "Always"),
     ("AWS::ElastiCache::CacheCluster", {"NumCacheNodes": 1}, {"NumCacheNodes": 2}, "Conditionally"),
@@ -38918,3 +39003,59 @@ def test_cfn_stackset_capabilities_and_reads_contract(auth_enabled, cfn, iam_use
             user.describe_stacks(StackName=name)
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_ecs_task_definition_reaches_the_ecs_api_shape(cfn):
+    """Every nested template property reaches DescribeTaskDefinition in the ECS API's names (Secrets,
+    RepositoryCredentials, HealthCheck, LinuxParameters, volumes, runtime platform...), user-keyed maps
+    such as DockerLabels and log options keep their keys."""
+    from conftest import make_client
+
+    ecs = make_client("ecs")
+    stack = f"cfn-td-shape-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"td-shape-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"TD": {
+        "Type": "AWS::ECS::TaskDefinition", "Properties": {
+            "Family": family, "Cpu": "256", "Memory": "512", "NetworkMode": "awsvpc",
+            "RequiresCompatibilities": ["FARGATE"],
+            "RuntimePlatform": {"CpuArchitecture": "ARM64", "OperatingSystemFamily": "LINUX"},
+            "EphemeralStorage": {"SizeInGiB": 30},
+            "Volumes": [{"Name": "data", "Host": {"SourcePath": "/tmp/data"}},
+                        {"Name": "efs", "EFSVolumeConfiguration": {"FilesystemId": "fs-1", "TransitEncryption": "ENABLED",
+                                                                   "AuthorizationConfig": {"AccessPointId": "fsap-1", "IAM": "ENABLED"}}},
+                        {"Name": "dv", "DockerVolumeConfiguration": {"Driver": "local", "DriverOpts": {"Type": "nfs"},
+                                                                     "Labels": {"Team": "a"}}}],
+            "ContainerDefinitions": [{
+                "Name": "app", "Image": "alpine:3.22", "Essential": True,
+                "Secrets": [{"Name": "DB_PASSWORD", "ValueFrom": "/repro/db-password"}],
+                "RepositoryCredentials": {"CredentialsParameter": "arn:aws:secretsmanager:us-east-1:000000000000:secret:x"},
+                "HealthCheck": {"Command": ["CMD", "true"], "Interval": 30, "Retries": 3},
+                "LinuxParameters": {"InitProcessEnabled": True, "Capabilities": {"Add": ["SYS_PTRACE"]}},
+                "Ulimits": [{"Name": "nofile", "SoftLimit": 1024, "HardLimit": 2048}],
+                "DependsOn": [{"ContainerName": "side", "Condition": "START"}],
+                "DockerLabels": {"Team": "payments"},
+                "LogConfiguration": {"LogDriver": "awslogs", "Options": {"awslogs-group": "g", "Mode": "x"},
+                                     "SecretOptions": [{"Name": "Key", "ValueFrom": "arn"}]}}]}}}}))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        td = ecs.describe_task_definition(taskDefinition=family)["taskDefinition"]
+        cdef = td["containerDefinitions"][0]
+        assert cdef["secrets"] == [{"name": "DB_PASSWORD", "valueFrom": "/repro/db-password"}]
+        assert cdef["repositoryCredentials"] == {"credentialsParameter": "arn:aws:secretsmanager:us-east-1:000000000000:secret:x"}
+        assert cdef["healthCheck"] == {"command": ["CMD", "true"], "interval": 30, "retries": 3}
+        assert cdef["linuxParameters"] == {"initProcessEnabled": True, "capabilities": {"add": ["SYS_PTRACE"]}}
+        assert cdef["ulimits"] == [{"name": "nofile", "softLimit": 1024, "hardLimit": 2048}]
+        assert cdef["dependsOn"] == [{"containerName": "side", "condition": "START"}]
+        assert cdef["dockerLabels"] == {"Team": "payments"}
+        assert cdef["logConfiguration"] == {"logDriver": "awslogs", "options": {"awslogs-group": "g", "Mode": "x"},
+                                            "secretOptions": [{"name": "Key", "valueFrom": "arn"}]}
+        assert td["volumes"] == [
+            {"name": "data", "host": {"sourcePath": "/tmp/data"}},
+            {"name": "efs", "efsVolumeConfiguration": {"fileSystemId": "fs-1", "transitEncryption": "ENABLED",
+                                                       "authorizationConfig": {"accessPointId": "fsap-1", "iam": "ENABLED"}}},
+            {"name": "dv", "dockerVolumeConfiguration": {"driver": "local", "driverOpts": {"Type": "nfs"},
+                                                         "labels": {"Team": "a"}}}]
+        assert td["runtimePlatform"] == {"cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX"}
+        assert td["ephemeralStorage"] == {"sizeInGiB": 30}
+    finally:
+        _delete_cfn_test_stack(cfn, stack)

@@ -430,6 +430,7 @@ def _execute_build(build_id, project):
             run_kwargs.update(extra)
 
         container = client.containers.run(AGENT_IMAGE, **run_kwargs)
+        _live_build_containers.add(getattr(container, "id", None))
     except Exception:
         logger.exception("Failed to start build %s", build_id)
         _finish_build(build, "FAULT")
@@ -513,10 +514,16 @@ def _execute_build(build_id, project):
                 "Build %s produced no 'Phase complete' lines; %s may not report "
                 "phases in this format", build_id, AGENT_IMAGE
             )
+        _live_build_containers.discard(getattr(container, "id", None))
         try:
             container.remove(force=True, v=True)
         except Exception:
             pass
+
+
+# Builds still running; any other stopped codebuild container is the reaper's.
+_live_build_containers: set = set()
+container_reaper.register_live_ids("codebuild", lambda: set(_live_build_containers) - {None})
 
 
 # ---------------------------------------------------------------------------
