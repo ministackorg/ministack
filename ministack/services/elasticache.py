@@ -3052,8 +3052,10 @@ _ACL_COMMANDS_SINCE = (
 _ACL_COMMANDS |= {c for _since, names in _ACL_COMMANDS_SINCE for c in names.split()}
 _ACL_CATEGORIES = frozenset((
     "all keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast "
-    "slow blocking dangerous connection transaction scripting json bloom").split())
-_ACL_MODULE_NAMES = frozenset({"json", "bloom"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
+    "slow blocking dangerous connection transaction scripting json bloom search").split())
+_ACL_MODULE_NAMES = frozenset({"json", "bloom", "search"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
+# Real AWS refuses these two as invalid commands (us-east-2, issue #2551, CreateUser and ModifyUser).
+_ACL_COMMANDS -= {"waitaof", "bf.load"}
 _ACL_KEYWORDS = frozenset((
     "on off nopass resetpass reset allkeys allchannels resetkeys resetchannels allcommands nocommands "
     "clearselectors").split())
@@ -3089,10 +3091,14 @@ def _reported_access_string(access):
 
 def _minimum_engine_version(user):
     if user.get("Engine") == "valkey":
-        return "7.2"
-    if user.get("Authentication", {}).get("Type") == "iam":
-        return "7.0"
-    return None
+        floor = "7.2"
+    elif user.get("Authentication", {}).get("Type") == "iam":
+        floor = "7.0"
+    else:
+        return None
+    # An append's rules can need a later engine (real AWS, issue #2551: +hgetex reports 9.0).
+    version = user.get("_AclVersion")
+    return version if version and _acl_version_key(version) > _acl_version_key(floor) else floor
 
 
 def _create_user(p):
@@ -3169,6 +3175,83 @@ _ACL_PATTERN_AFTER_STAR = ("Adding a pattern '{}' after the * pattern (or the '{
                            "have any effect. Try '{}' to start with an empty list of {}")
 
 
+# What real AWS answered for each rule on its own (us-east-2, issue #2551, rounds 13-15): the engine
+# version MinimumEngineVersion reports for it (rules not listed need no more than the engine's floor);
+# a user without channel rules gets `&*` written for a 6.2 rule and `resetchannels` from 7.0.
+_ACL_RULE_VERSIONS = {
+    **dict.fromkeys((
+        "@json blmove copy failover geosearch geosearchstore getdel getex hrandfield json.arrappend "
+        "json.arrindex json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.debug json.del "
+        "json.forget json.get json.mget json.numincrby json.nummultby json.objkeys json.objlen json.resp "
+        "json.set json.strappend json.strlen json.toggle json.type lmove lpos reset smismember xautoclaim "
+        "zdiff zdiffstore zinter zmscore zrandmember zrangestore zunion "
+    ).split(), "6.2"),
+    **dict.fromkeys((
+        "blmpop bzmpop eval_ro evalsha_ro expiretime fcall fcall_ro function lcs lmpop pexpiretime quit "
+        "sintercard sort_ro spublish ssubscribe sunsubscribe zintercard zmpop "
+    ).split(), "7.0"),
+    **dict.fromkeys((
+        "@bloom bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve commandlog json.mset "
+    ).split(), "8.1"),
+    **dict.fromkeys((
+        "@search "
+    ).split(), "8.2"),
+    **dict.fromkeys((
+        "delifeq hexpire hexpireat hexpiretime hgetex hpersist hpexpire hpexpireat hpexpiretime hpttl hsetex "
+        "httl "
+    ).split(), "9.0"),
+}
+# The subcommands AWS accepts in a -command|subcommand rule, and those needing more than 7.0 there.
+_ACL_SUBCOMMANDS = frozenset((
+    "acl|cat acl|deluser acl|dryrun acl|genpass acl|getuser acl|help acl|list acl|load acl|log acl|save "
+    "acl|setuser acl|users acl|whoami client|caching client|capa client|getname client|getredir "
+    "client|help client|id client|info client|kill client|list client|no-evict client|no-touch "
+    "client|pause client|reply client|setinfo client|setname client|tracking client|trackinginfo "
+    "client|unblock client|unpause cluster|addslots cluster|addslotsrange cluster|bumpepoch "
+    "cluster|count-failure-reports cluster|countkeysinslot cluster|delslots cluster|delslotsrange "
+    "cluster|failover cluster|flushslot cluster|flushslots cluster|forget cluster|getkeysinslot "
+    "cluster|help cluster|info cluster|keyslot cluster|links cluster|meet cluster|myid cluster|myshardid "
+    "cluster|nodes cluster|replicas cluster|replicate cluster|reset cluster|saveconfig "
+    "cluster|set-config-epoch cluster|setslot cluster|shards cluster|slaves cluster|slot-stats "
+    "cluster|slots commandlog|get commandlog|help commandlog|len commandlog|reset command|count "
+    "command|docs command|getkeys command|getkeysandflags command|help command|info command|list "
+    "config|get config|help config|resetstat config|rewrite config|set function|delete function|dump "
+    "function|flush function|help function|kill function|list function|load function|restore "
+    "function|stats latency|doctor latency|graph latency|help latency|histogram latency|history "
+    "latency|latest latency|reset memory|doctor memory|help memory|malloc-stats memory|purge memory|stats "
+    "memory|usage module|help module|list module|load module|loadex module|unload object|encoding "
+    "object|freq object|help object|idletime object|refcount pubsub|channels pubsub|help pubsub|numpat "
+    "pubsub|numsub pubsub|shardchannels pubsub|shardnumsub script|debug script|exists script|flush "
+    "script|help script|kill script|load script|show slowlog|get slowlog|help slowlog|len slowlog|reset "
+    "xgroup|create xgroup|createconsumer xgroup|delconsumer xgroup|destroy xgroup|help xgroup|setid "
+    "xinfo|consumers xinfo|groups xinfo|help xinfo|stream "
+).split())
+_ACL_SUBCOMMAND_VERSIONS = {
+    **dict.fromkeys("client|no-touch client|setinfo cluster|myshardid".split(), "7.2"),
+    **dict.fromkeys("client|capa cluster|slot-stats script|show".split(), "8.0"),
+    **dict.fromkeys("commandlog|get commandlog|help commandlog|len commandlog|reset".split(), "8.1"),
+    **dict.fromkeys("cluster|flushslot".split(), "9.0"),
+}
+# The categories that make AWS count a command with subcommands as fully added, so that +command|sub is
+# refused after them and -command|sub accepted.
+_ACL_CONTAINER_CATEGORIES = {
+    "acl": frozenset("admin dangerous slow".split()),
+    "client": frozenset("admin connection dangerous slow".split()),
+    "cluster": frozenset("admin dangerous slow".split()),
+    "command": frozenset("connection slow".split()),
+    "commandlog": frozenset("admin dangerous slow".split()),
+    "config": frozenset("admin dangerous slow".split()),
+    "function": frozenset("scripting slow write".split()),
+    "latency": frozenset("admin dangerous slow".split()),
+    "memory": frozenset("read slow".split()),
+    "module": frozenset("admin dangerous slow".split()),
+    "object": frozenset("keyspace read slow".split()),
+    "pubsub": frozenset("pubsub slow".split()),
+    "script": frozenset("scripting slow".split()),
+    "slowlog": frozenset("admin dangerous slow".split()),
+    "xgroup": frozenset("slow stream write".split()),
+    "xinfo": frozenset("read slow stream".split()),
+}
 _ACL_WHITESPACE = " \t\n\r\x0b\x0c"  # AWS splits rules on these only; NBSP and other spaces stay in a rule
 
 
@@ -3227,7 +3310,9 @@ def _acl_refusal(rule, keywords):
             "Access string contains invalid category(s). Please verify the list of available category in user-api.")
     if rule[0] in "+-":
         command, bar, subcommand = low[1:].partition("|")
-        return None if command in _ACL_COMMANDS and (subcommand or not bar) else (
+        # -command|subcommand must name a real subcommand; +command|anything only a non-empty one.
+        valid = not bar or (low[1:] in _ACL_SUBCOMMANDS if rule[0] == "-" else subcommand)
+        return None if command in _ACL_COMMANDS and valid else (
             "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
     if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
         return None
@@ -3267,14 +3352,20 @@ def _acl_apply(scope, rule):
         sign, name = low[0], low[1:]
         family = name.split("|")[0]
         if "|" in name:
-            allowed = scope["base"] == "+"
+            # +command|sub is refused once the command is fully added, and -command|sub until something
+            # granted it; a -@category takes the first away but not the second.
+            categories = _ACL_CONTAINER_CATEGORIES.get(family, frozenset())
+            full = granted = scope["base"] == "+"
             for command in scope["commands"]:
                 if command[1:] == family:
-                    allowed = command[0] == "+"
-            if sign == "+" and allowed:
+                    full = granted = command[0] == "+"
+                elif command[1] == "@" and command[2:] in categories:
+                    full = command[0] == "+"
+                    granted = granted or full
+            if sign == "+" and full:
                 return (f"Adding a subcommand({low}) of a command already fully added is not allowed. "
                         "Remove the command to start. Example: -DEBUG +DEBUG|DIGEST")
-            if sign == "-" and not allowed:
+            if sign == "-" and not granted:
                 return (f"Removing a subcommand({low}) of a command not fully added is not allowed. "
                         "Add the command to start. Example: +DEBUG -DEBUG|DIGEST")
         # A rule replaces its earlier one (a whole command also its subcommands'), and is dropped
@@ -3292,13 +3383,15 @@ def _acl_scope(flag=None):
             "base": "-", "commands": [], "selectors": []}
 
 
-def _acl_describe(scope, channels_shown):
+def _acl_describe(scope, default_channels):
     parts = [scope["flag"]] if scope["flag"] else []
     parts += ["~*"] if scope["allkeys"] else scope["keys"]
     if scope["channels"] == "all":
         parts.append("&*")
-    elif scope["channels"] or channels_shown:
+    elif scope["channels"]:
         parts += ["resetchannels", *scope["patterns"]]
+    elif default_channels:
+        parts.append(default_channels)
     parts += [f"{scope['base']}@all", *scope["commands"], *scope["selectors"]]
     return " ".join(parts)
 
@@ -3312,8 +3405,27 @@ def _acl_apply_rule(root, rule):
         message = _acl_apply(selector, inner)
         if message:
             return message
-    root["selectors"].append(f"({_acl_describe(selector, True)})")
+    root["selectors"].append(f"({_acl_describe(selector, 'resetchannels')})")
     return None
+
+
+def _acl_version_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def _acl_version(rule):
+    """The engine version AWS reports for one rule or selector, or None if it needs no more than the floor."""
+    if isinstance(rule, list):
+        return max(["7.0", *filter(None, map(_acl_version, rule))], key=_acl_version_key)
+    low = rule.lower()
+    if rule.startswith("%") or low == "clearselectors":
+        return "7.0"
+    if rule[0] not in "+-":
+        return None
+    command, bar, _ = low[1:].partition("|")
+    if bar and rule[0] == "-":
+        return _ACL_SUBCOMMAND_VERSIONS.get(low[1:], "7.0")
+    return _ACL_RULE_VERSIONS.get(command)
 
 
 def _acl_refused(rule):
@@ -3323,14 +3435,15 @@ def _acl_refused(rule):
 
 
 def _append_access_string(access, append):
-    """The stored AccessString with AppendAccessString's rules applied, written as AWS stores it
-    (real-AWS captures in issue #2551), or AWS's message refusing the appended rules."""
+    """(AccessString, version, None): the stored AccessString with AppendAccessString's rules applied,
+    written as AWS stores it (real-AWS captures in issue #2551), with the engine version its rules need
+    (None for the floor); or (None, None, AWS's message) refusing the appended rules."""
     rules = _acl_rules(append)
     if rules is None:
-        return None, "The access-string is invalid."
+        return None, None, "The access-string is invalid."
     message = next(filter(None, map(_acl_refused, rules)), None)
     if message:
-        return None, message
+        return None, None, message
     # MiniStack-only: a stored rule AWS would have refused (CreateUser here doesn't check them all)
     # is skipped rather than failing every later append.
     stored = _acl_rules(access)
@@ -3341,11 +3454,11 @@ def _append_access_string(access, append):
     for rule in rules:
         message = _acl_apply_rule(root, rule)
         if message:
-            return None, message
-    # These rules make AWS write the root's resetchannels even without channel rules.
-    redis7 = any(isinstance(rule, list) or rule.startswith("%") or rule.lower() == "clearselectors"
-                 or (rule.startswith("-") and "|" in rule) for rule in [*stored, *rules])
-    return _acl_describe(root, redis7), None
+            return None, None, message
+    # Every rule present counts, even one a later rule replaced (rounds 5 and 9 of the captures).
+    version = max(filter(None, map(_acl_version, [*stored, *rules])), key=_acl_version_key, default=None)
+    default = None if not version else "&*" if version == "6.2" else "resetchannels"
+    return _acl_describe(root, default), version, None
 
 
 def _modify_user(p):
@@ -3363,13 +3476,14 @@ def _modify_user(p):
         return err
     appended = None
     if _acl_split(_p(p, "AppendAccessString")):
-        appended, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
+        appended, version, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
         if message:
             return _error("InvalidParameterValue", xml_escape(message, _XML_QUOTE), 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
+        user.pop("_AclVersion", None)
     if appended is not None:
-        user["AccessString"] = appended
+        user["AccessString"], user["_AclVersion"] = appended, version
     if auth:
         user["Authentication"] = auth
         user["_PasswordHashes"] = _password_hashes(p)

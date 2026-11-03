@@ -2767,266 +2767,41 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         ec.delete_user(UserId=uid)
 
 
-# ModifyUser AppendAccessString on real AWS (us-east-2, issue #2551): capture round/key, engine, the
-# user's AccessString at CreateUser, the appended rules, and what AWS answered.
-_APPEND_CAPTURES = [
-    ('round1/cmd', 'valkey', 'on ~* +@all', '-flushall', 'on ~* +@all -flushall'),
-    ('round1/chan-none', 'valkey', 'on ~* +@all', '&y', 'on ~* resetchannels &y +@all'),
-    ('round1/chan-reset', 'valkey', 'on ~* resetchannels &x +@all', '&y', 'on ~* resetchannels &x &y +@all'),
-    ('round1/multi', 'valkey', 'on ~a* resetchannels &c +get', '+set ~b* &d', 'on ~a* ~b* resetchannels &c &d -@all +get +set'),
-    ('round1/off', 'valkey', 'on ~* +@all', 'off', 'off ~* +@all'),
-    ('round1/allchannels', 'valkey', 'on ~* resetchannels &x +@all', 'allchannels', 'on ~* &* +@all'),
-    ('round1/resetchannels', 'valkey', 'on ~* resetchannels &x +@all', 'resetchannels &z', 'on ~* resetchannels &z +@all'),
-    ('round1/dup', 'valkey', 'on ~* +@all', '~*', 'on ~* +@all'),
-    ('round1/spaces', 'valkey', 'on ~* +@all', '  +get  ', 'on ~* +@all'),
-    ('round1/redis-chan', 'redis', 'on ~* +@all', '&y', 'on ~* resetchannels &y +@all'),
-    ('round1/redis-cmd', 'redis', 'on ~* +@all', '-flushall', 'on ~* +@all -flushall'),
-    ('round10/a-plus-plain-nosub', 'valkey', 'on ~* -@all', '+get|nosub', 'on ~* -@all +get|nosub'),
-    ('round10/a-plus-container-nosub', 'valkey', 'on ~* -@all', '+config|nosub', 'on ~* -@all +config|nosub'),
-    ('round10/a-plus-plain-realsub', 'valkey', 'on ~* -@all', '+get|set', 'on ~* -@all +get|set'),
-    ('round2/ws', 'valkey', 'on ~* +@all', '  -flushall  ', 'on ~* +@all -flushall'),
-    ('round2/two', 'valkey', 'on ~* +@all', '-flushall -flushdb', 'on ~* +@all -flushall -flushdb'),
-    ('round2/inner-ws', 'valkey', 'on ~* +@all', '-flushall    -flushdb', 'on ~* +@all -flushall -flushdb'),
-    ('round3/f-on', 'valkey', 'off ~* +@all', 'on', 'on ~* +@all'),
-    ('round3/f-off-on', 'valkey', 'on ~* +@all', 'off on', 'on ~* +@all'),
-    ('round3/f-upper-on', 'valkey', 'off ~* +@all', 'ON', 'on ~* +@all'),
-    ('round3/k-resetkeys-pattern', 'valkey', 'on ~* +@all', 'resetkeys ~a*', 'on ~a* +@all'),
-    ('round3/k-resetkeys', 'valkey', 'on ~* +@all', 'resetkeys', 'on +@all'),
-    ('round3/k-allkeys', 'valkey', 'on ~a* +@all', 'allkeys', 'on ~* +@all'),
-    ('round3/k-add', 'valkey', 'on ~a* +@all', '~b*', 'on ~a* ~b* +@all'),
-    ('round3/k-dup', 'valkey', 'on ~a* +@all', '~a*', 'on ~a* +@all'),
-    ('round3/k-star', 'valkey', 'on ~a* +@all', '~*', 'on ~* +@all'),
-    ('round3/k-read', 'valkey', 'on ~a* +@all', '%R~b*', 'on ~a* %R~b* resetchannels +@all'),
-    ('round3/k-rw', 'valkey', 'on ~a* +@all', '%RW~b*', 'on ~a* ~b* resetchannels +@all'),
-    ('round3/c-dup', 'valkey', 'on ~* resetchannels &x +@all', '&x', 'on ~* resetchannels &x +@all'),
-    ('round3/c-reset-after-star', 'valkey', 'on ~* &* +@all', 'resetchannels', 'on ~* resetchannels +@all'),
-    ('round3/c-reset-none', 'valkey', 'on ~* +@all', 'resetchannels', 'on ~* resetchannels +@all'),
-    ('round3/c-allchannels-none', 'valkey', 'on ~* +@all', 'allchannels', 'on ~* &* +@all'),
-    ('round3/c-star-none', 'valkey', 'on ~* +@all', '&*', 'on ~* &* +@all'),
-    ('round3/c-star-over-patterns', 'valkey', 'on ~* resetchannels &x +@all', '&*', 'on ~* &* +@all'),
-    ('round3/m-minus-all', 'valkey', 'on ~* +@all', '-@all', 'on ~* -@all'),
-    ('round3/m-plus-all', 'valkey', 'on ~* -@all +get', '+@all', 'on ~* +@all'),
-    ('round3/m-allcommands', 'valkey', 'on ~* -@all +get', 'allcommands', 'on ~* +@all'),
-    ('round3/m-nocommands', 'valkey', 'on ~* +@all', 'nocommands', 'on ~* -@all'),
-    ('round3/m-add-cmd', 'valkey', 'on ~* -@all +set', '+get', 'on ~* -@all +set +get'),
-    ('round3/m-remove-cmd', 'valkey', 'on ~* -@all +get +set', '-get', 'on ~* -@all +set'),
-    ('round3/m-dup-cmd', 'valkey', 'on ~* -@all +get', '+get', 'on ~* -@all +get'),
-    ('round3/m-add-cat', 'valkey', 'on ~* -@all', '+@read', 'on ~* -@all +@read'),
-    ('round3/m-minus-in-cat', 'valkey', 'on ~* -@all +@read', '-get', 'on ~* -@all +@read -get'),
-    ('round3/m-plus-in-cat', 'valkey', 'on ~* -@all +@read', '+get', 'on ~* -@all +@read +get'),
-    ('round3/m-minus-cat', 'valkey', 'on ~* +@all', '-@write', 'on ~* +@all -@write'),
-    ('round3/m-plus-after-minus-cat', 'valkey', 'on ~* +@all -@write', '+set', 'on ~* +@all -@write +set'),
-    ('round3/m-dup-minus', 'valkey', 'on ~* +@all -flushall', '-flushall', 'on ~* +@all -flushall'),
-    ('round3/m-undo-minus', 'valkey', 'on ~* +@all -flushall', '+flushall', 'on ~* +@all'),
-    ('round3/m-sub-plus', 'valkey', 'on ~* -@all', '+config|get', 'on ~* -@all +config|get'),
-    ('round3/m-sub-minus', 'valkey', 'on ~* +@all', '-config|set', 'on ~* resetchannels +@all -config|set'),
-    ('round3/m-upper', 'valkey', 'on ~* -@all', '+GET', 'on ~* -@all +get'),
-    ('round3/m-minus-plus-all', 'valkey', 'on ~* +@all', '-@all +@all', 'on ~* +@all'),
-    ('round3/x-mixed', 'valkey', 'on ~a* -@all', '+get ~b* &c off', 'off ~a* ~b* resetchannels &c -@all +get'),
-    ('round3/x-selector', 'valkey', 'on ~* +@all', '(~x +get)', 'on ~* resetchannels +@all (~x resetchannels -@all +get)'),
-    ('round3/x-clearselectors', 'valkey', 'on ~* +@all', 'clearselectors', 'on ~* resetchannels +@all'),
-    ('round4/d-plus-on-plus-rules', 'valkey', 'on ~* +@all -flushall', '+get', 'on ~* +@all -flushall'),
-    ('round4/d-minus-on-minus-rules', 'valkey', 'on ~* -@all +set', '-get', 'on ~* -@all +set'),
-    ('round4/d-minus-set-in-read', 'valkey', 'on ~* -@all +@read', '-set', 'on ~* -@all +@read -set'),
-    ('round4/d-cat-after-cmd', 'valkey', 'on ~* -@all +get', '+@read', 'on ~* -@all +get +@read'),
-    ('round4/d-remove-cat', 'valkey', 'on ~* -@all +@read', '-@read', 'on ~* -@all'),
-    ('round4/d-dup-cat', 'valkey', 'on ~* -@all +@read', '+@read', 'on ~* -@all +@read'),
-    ('round4/d-plus-cat-on-all', 'valkey', 'on ~* +@all', '+@read', 'on ~* +@all'),
-    ('round4/d-minus-cat-on-none', 'valkey', 'on ~* -@all', '-@read', 'on ~* -@all'),
-    ('round4/d-sub-then-cmd', 'valkey', 'on ~* -@all +config|get', '+config', 'on ~* -@all +config'),
-    ('round4/d-cmd-then-sub', 'valkey', 'on ~* -@all +config', '-config|set', 'on ~* resetchannels -@all +config -config|set'),
-    ('round4/d-plus-minus-same', 'valkey', 'on ~* -@all', '+get -get', 'on ~* -@all'),
-    ('round4/d-minus-plus-same', 'valkey', 'on ~* +@all', '-get +get', 'on ~* +@all'),
-    ('round4/k-write', 'valkey', 'on ~a* +@all', '%W~b*', 'on ~a* %W~b* resetchannels +@all'),
-    ('round4/k-read-star', 'valkey', 'on ~a* +@all', '%R~*', 'on ~a* %R~* resetchannels +@all'),
-    ('round4/k-upper-pattern', 'valkey', 'on ~a* +@all', '~B*', 'on ~a* ~B* +@all'),
-    ('round4/k-resetkeys-in-7', 'valkey', 'on ~a* +@all', 'resetkeys %R~b*', 'on %R~b* resetchannels +@all'),
-    ('round4/c-upper-allchannels', 'valkey', 'on ~* +@all', 'ALLCHANNELS', 'on ~* &* +@all'),
-    ('round4/c-upper-pattern', 'valkey', 'on ~* resetchannels &x +@all', '&Y', 'on ~* resetchannels &x &Y +@all'),
-    ('round4/m-all-categories', 'valkey', 'on ~* -@all', '+@keyspace +@read +@write +@set +@sortedset +@list +@hash +@string +@bitmap +@hyperloglog +@geo +@stream +@pubsub +@admin +@fast +@slow +@blocking +@dangerous +@connection +@transaction +@scripting', 'on ~* -@all +@keyspace +@read +@write +@set +@sortedset +@list +@hash +@string +@bitmap +@hyperloglog +@geo +@stream +@pubsub +@admin +@fast +@slow +@blocking +@dangerous +@connection +@transaction +@scripting'),
-    ('round4/m-upper-cat', 'valkey', 'on ~* -@all', '+@READ', 'on ~* -@all +@read'),
-    ('round4/s-two', 'valkey', 'on ~* +@all', '(~x +get) (~y &c +set)', 'on ~* resetchannels +@all (~x resetchannels -@all +get) (~y resetchannels &c -@all +set)'),
-    ('round4/s-with-channels', 'valkey', 'on ~* +@all', '(~x &c +get)', 'on ~* resetchannels +@all (~x resetchannels &c -@all +get)'),
-    ('round4/s-clear-after', 'valkey', 'on ~* +@all', '(~x +get) clearselectors', 'on ~* resetchannels +@all'),
-    ('round5/p-lower-r', 'valkey', 'on ~a* +@all', '%r~b*', 'on ~a* %r~b* resetchannels +@all'),
-    ('round5/p-rw-star', 'valkey', 'on ~a* +@all', '%RW~*', 'on ~* resetchannels +@all'),
-    ('round5/t-read-then-resetkeys', 'valkey', 'on ~a* +@all', '%R~b* resetkeys', 'on resetchannels +@all'),
-    ('round5/t-sub-then-cmd', 'valkey', 'on ~* -@all +config', '-config|set +config', 'on ~* resetchannels -@all +config'),
-    ('round5/t-sub-then-all', 'valkey', 'on ~* +@all', '-config|set +@all', 'on ~* resetchannels +@all'),
-    ('round5/c-minus-cat-with-cmd', 'valkey', 'on ~* -@all +@read +get', '-@read', 'on ~* -@all +get -@read'),
-    ('round5/s-no-keys', 'valkey', 'on ~* +@all', '(+get)', 'on ~* resetchannels +@all (resetchannels -@all +get)'),
-    ('round5/s-dup', 'valkey', 'on ~* +@all', '(~x +get) (~x +get)', 'on ~* resetchannels +@all (~x resetchannels -@all +get) (~x resetchannels -@all +get)'),
-    ('round5/s-star-inside', 'valkey', 'on ~* +@all', '(~x &* +get)', 'on ~* resetchannels +@all (~x &* -@all +get)'),
-    ('round5/s-allcommands-inside', 'valkey', 'on ~* +@all', '(~x allcommands)', 'on ~* resetchannels +@all (~x resetchannels +@all)'),
-    ('round5/m-upper-all', 'valkey', 'on ~* -@all +get', '+@ALL', 'on ~* +@all'),
-    ('round6/s-allkeys', 'valkey', 'on ~* +@all', '(allkeys +get)', 'on ~* resetchannels +@all (~* resetchannels -@all +get)'),
-    ('round6/s-resetkeys', 'valkey', 'on ~* +@all', '(~x resetkeys ~y +get)', 'on ~* resetchannels +@all (~y resetchannels -@all +get)'),
-    ('round6/s-allchannels', 'valkey', 'on ~* +@all', '(~x allchannels +get)', 'on ~* resetchannels +@all (~x &* -@all +get)'),
-    ('round6/s-resetchannels', 'valkey', 'on ~* +@all', '(~x &c resetchannels +get)', 'on ~* resetchannels +@all (~x resetchannels -@all +get)'),
-    ('round6/s-nocommands', 'valkey', 'on ~* +@all', '(~x +get nocommands)', 'on ~* resetchannels +@all (~x resetchannels -@all)'),
-    ('round6/p-w-lower', 'valkey', 'on ~a* +@all', '%w~b*', 'on ~a* %w~b* resetchannels +@all'),
-    ('round6/p-rw-lower', 'valkey', 'on ~a* +@all', '%rw~b*', 'on ~a* ~b* resetchannels +@all'),
-    ('round6/p-rw-mixed', 'valkey', 'on ~a* +@all', '%Rw~b*', 'on ~a* ~b* resetchannels +@all'),
-    ('round6/u-allkeys', 'valkey', 'on ~a* +@all', 'ALLKEYS', 'on ~* +@all'),
-    ('round6/u-resetkeys', 'valkey', 'on ~* +@all', 'RESETKEYS', 'on +@all'),
-    ('round6/u-allcommands', 'valkey', 'on ~* -@all +get', 'ALLCOMMANDS', 'on ~* +@all'),
-    ('round6/u-nocommands', 'valkey', 'on ~* +@all', 'NOCOMMANDS', 'on ~* -@all'),
-    ('round6/u-clearselectors', 'valkey', 'on ~* +@all', 'CLEARSELECTORS', 'on ~* resetchannels +@all'),
-    ('round6/u-resetchannels', 'valkey', 'on ~* +@all', 'RESETCHANNELS', 'on ~* resetchannels +@all'),
-    ('round6/u-off', 'valkey', 'on ~* +@all', 'Off', 'off ~* +@all'),
-    ('round6/n-no-flag', 'valkey', '~* +@all', '-flushall', 'off ~* +@all -flushall'),
-    ('round6/c-sub-minus-out-cat', 'valkey', 'on ~* +@all -@admin', '-config|get', 'on ~* resetchannels +@all -@admin -config|get'),
-    ('round7/k-read-star-then-key', 'valkey', 'on ~a* +@all', '%R~* ~x', 'on ~a* %R~* ~x resetchannels +@all'),
-    ('round7/t-paren-in-key', 'valkey', 'on ~a* +@all', '~x)', 'on ~a* ~x) +@all'),
-    ('round7/t-joined-selectors', 'valkey', 'on ~* +@all', '(~x +get)(~y +set)', 'on ~* resetchannels +@all (~x resetchannels -@all +get) (~y resetchannels -@all +set)'),
-    ('round7/t-spaced-selector', 'valkey', 'on ~* +@all', '( ~x +get )', 'on ~* resetchannels +@all (~x resetchannels -@all +get)'),
-    ('round7/r-read-key', 'redis', 'on ~a* +@all', '%R~b*', 'on ~a* %R~b* resetchannels +@all'),
-    ('round7/r-selector', 'redis', 'on ~* +@all', '(~x +get)', 'on ~* resetchannels +@all (~x resetchannels -@all +get)'),
-    ('round7/r-minus-sub', 'redis', 'on ~* +@all', '-config|set', 'on ~* resetchannels +@all -config|set'),
-    ('round7/r-keys-channels', 'redis', 'on ~a* -@all +get', '~b* &c +set off', 'off ~a* ~b* resetchannels &c -@all +get +set'),
-    ('round7/r-drop', 'redis', 'on ~* -@all +get +set', '-get', 'on ~* -@all +set'),
-    ('round8/w-tab', 'valkey', 'on ~* +@all', '-flushall\t-flushdb', 'on ~* +@all -flushall -flushdb'),
-    ('round8/w-newline', 'valkey', 'on ~* +@all', '-flushall\n-flushdb', 'on ~* +@all -flushall -flushdb'),
-    ('round8/k-case-dup', 'valkey', 'on ~a* +@all', '%R~b* %r~b*', 'on ~a* %R~b* %r~b* resetchannels +@all'),
-]
-_APPEND_REFUSALS = [
-    ('round1/key', 'valkey', 'on ~* +@all', '~foo:*', "Adding a pattern '~foo:*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round1/after-star', 'valkey', 'on ~* &* +@all', '&z', "Adding a pattern '&z' after the * pattern (or the 'allchannels' flag) is not valid and does not have any effect. Try 'resetchannels' to start with an empty list of channels"),
-    ('round1/invalid', 'valkey', 'on ~* +@all', 'bogus', 'The access-string is invalid.'),
-    ('round1/reset', 'valkey', 'on ~* +@all', 'reset', 'reset rule is not supported in Elasticache user api.'),
-    ('round3/f-nopass', 'valkey', 'on ~* +@all', 'nopass', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round3/f-pass', 'valkey', 'on ~* +@all', '>a-long-enough-password-1', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round3/f-resetpass', 'valkey', 'on ~* +@all', 'resetpass', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round3/f-skip-sanitize', 'valkey', 'on ~* +@all', 'skip-sanitize-payload', 'sanitize-payload and skip-sanitize-payload rules are not supported in user api.'),
-    ('round3/f-sanitize', 'valkey', 'on ~* +@all', 'sanitize-payload', 'sanitize-payload and skip-sanitize-payload rules are not supported in user api.'),
-    ('round3/k-empty-tilde', 'valkey', 'on ~a* +@all', '~', 'The access-string is invalid.'),
-    ('round3/c-empty-amp', 'valkey', 'on ~* +@all', '&', 'The access-string is invalid.'),
-    ('round3/m-unknown-cmd', 'valkey', 'on ~* +@all', '-nosuchcmd', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-    ('round3/m-unknown-cat', 'valkey', 'on ~* +@all', '+@nosuchcat', 'Access string contains invalid category(s). Please verify the list of available category in user-api.'),
-    ('round3/m-bare-plus', 'valkey', 'on ~* +@all', '+', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-    ('round3/x-word', 'valkey', 'on ~* +@all', 'foo', 'The access-string is invalid.'),
-    ('round4/k-read-after-star', 'valkey', 'on ~* +@all', '%R~b*', "Adding a pattern '%R~b*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round4/c-7-with-patterns', 'valkey', 'on ~* resetchannels &x +@all', '%R~b*', "Adding a pattern '%R~b*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round4/c-7-with-star', 'valkey', 'on ~* &* +@all', '%R~b*', "Adding a pattern '%R~b*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round4/p-lt', 'valkey', 'on ~* +@all', '<a-long-enough-password-1', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round4/p-hash', 'valkey', 'on ~* +@all', '#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round4/p-unhash', 'valkey', 'on ~* +@all', '!aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round4/e-reset-then-word', 'valkey', 'on ~* +@all', 'reset foo', 'reset rule is not supported in Elasticache user api.'),
-    ('round4/e-word-then-reset', 'valkey', 'on ~* +@all', 'foo reset', 'The access-string is invalid.'),
-    ('round4/e-pass-then-reset', 'valkey', 'on ~* +@all', 'nopass reset', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round4/e-reset-then-pass', 'valkey', 'on ~* +@all', 'reset nopass', 'reset rule is not supported in Elasticache user api.'),
-    ('round4/e-word-then-pass', 'valkey', 'on ~* +@all', 'foo nopass', 'The access-string is invalid.'),
-    ('round4/e-cmd-then-word', 'valkey', 'on ~* +@all', '-nosuchcmd foo', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-    ('round4/e-word-then-cmd', 'valkey', 'on ~* +@all', 'foo -nosuchcmd', 'The access-string is invalid.'),
-    ('round4/e-star-then-word', 'valkey', 'on ~* &* +@all', '&z foo', 'The access-string is invalid.'),
-    ('round4/e-sanitize-then-pass', 'valkey', 'on ~* +@all', 'sanitize-payload nopass', 'sanitize-payload and skip-sanitize-payload rules are not supported in user api.'),
-    ('round4/s-unclosed', 'valkey', 'on ~* +@all', '(~x +get', 'The access-string is invalid.'),
-    ('round4/s-empty', 'valkey', 'on ~* +@all', '()', 'The access-string is invalid.'),
-    ('round4/s-invalid-inside', 'valkey', 'on ~* +@all', '(~x foo)', 'The access-string is invalid.'),
-    ('round4/redis-7', 'redis', 'on ~* +@all', '%R~b*', "Adding a pattern '%R~b*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round5/p-wr', 'valkey', 'on ~a* +@all', '%WR~b*', 'The access-string is invalid.'),
-    ('round5/p-no-perm', 'valkey', 'on ~a* +@all', '%~b*', 'The access-string is invalid.'),
-    ('round5/p-empty-pattern', 'valkey', 'on ~a* +@all', '%R~', 'The access-string is invalid.'),
-    ('round5/p-bad-perm', 'valkey', 'on ~a* +@all', '%X~b*', 'The access-string is invalid.'),
-    ('round5/p-rw-after-star', 'valkey', 'on ~* +@all', '%RW~b*', "Adding a pattern '%RW~b*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round5/s-flag-inside', 'valkey', 'on ~* +@all', '(on ~x +get)', 'The access-string is invalid.'),
-    ('round5/s-pattern-after-star-inside', 'valkey', 'on ~* +@all', '(~* ~x +get)', "Adding a pattern '~x' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round5/s-reset-inside', 'valkey', 'on ~* +@all', '(~x reset)', 'reset rule is not supported in Elasticache user api.'),
-    ('round5/m-lone-minus', 'valkey', 'on ~* +@all', '-', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-    ('round5/m-lone-at', 'valkey', 'on ~* +@all', '+@', 'Access string contains invalid category(s). Please verify the list of available category in user-api.'),
-    ('round5/m-sub-on-all', 'valkey', 'on ~* +@all', '+config|get', 'Adding a subcommand(+config|get) of a command already fully added is not allowed. Remove the command to start. Example: -DEBUG +DEBUG|DIGEST'),
-    ('round5/m-sub-dup-minus', 'valkey', 'on ~* -@all', '-config|get', 'Removing a subcommand(-config|get) of a command not fully added is not allowed. Add the command to start. Example: +DEBUG -DEBUG|DIGEST'),
-    ('round6/s-off', 'valkey', 'on ~* +@all', '(~x off)', 'The access-string is invalid.'),
-    ('round6/s-clearselectors', 'valkey', 'on ~* +@all', '(~x clearselectors)', 'The access-string is invalid.'),
-    ('round6/u-nopass', 'valkey', 'on ~* +@all', 'NOPASS', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round6/u-reset', 'valkey', 'on ~* +@all', 'RESET', 'reset rule is not supported in Elasticache user api.'),
-    ('round6/u-sanitize', 'valkey', 'on ~* +@all', 'Sanitize-Payload', 'sanitize-payload and skip-sanitize-payload rules are not supported in user api.'),
-    ('round7/m-cmd-then-sub', 'valkey', 'on ~* -@all', '+config +config|get', 'Adding a subcommand(+config|get) of a command already fully added is not allowed. Remove the command to start. Example: -DEBUG +DEBUG|DIGEST'),
-    ('round7/m-pipe-only', 'valkey', 'on ~* -@all', '+|get', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-    ('round7/t-paren-in-cmd', 'valkey', 'on ~* -@all', '+get)', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-    ('round7/e-upper-key-after-star', 'valkey', 'on ~* +@all', '~FOO', "Adding a pattern '~FOO' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round7/e-upper-sub', 'valkey', 'on ~* +@all', '+CONFIG|GET', 'Adding a subcommand(+config|get) of a command already fully added is not allowed. Remove the command to start. Example: -DEBUG +DEBUG|DIGEST'),
-    ('round7/r-refusal', 'redis', 'on ~* +@all', 'nopass', 'Password rules are not supported in Elasticache access string. Please use Passwords parameter to set/modify user password.'),
-    ('round8/m-sub-readd', 'valkey', 'on ~* +@all', '-config|set +config|set', 'Adding a subcommand(+config|set) of a command already fully added is not allowed. Remove the command to start. Example: -DEBUG +DEBUG|DIGEST'),
-    ('round8/m-sub-readd-split', 'valkey', 'on ~* +@all -config|set', '+config|set', 'Adding a subcommand(+config|set) of a command already fully added is not allowed. Remove the command to start. Example: -DEBUG +DEBUG|DIGEST'),
-    ('round8/t-selector-then-word', 'valkey', 'on ~* +@all', '(~x +get)extra', 'The access-string is invalid.'),
-    ('round8/t-word-then-selector', 'valkey', 'on ~* +@all', 'a(~x +get)', 'The access-string is invalid.'),
-    ('round8/t-nested', 'valkey', 'on ~* +@all', '((~x +get))', 'The access-string is invalid.'),
-    ('round8/k-write-star-after-star', 'valkey', 'on ~* +@all', '%W~*', "Adding a pattern '%W~*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round8/e-lt-gt', 'valkey', 'on ~* +@all', '~<x>', "Adding a pattern '~<x>' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
-    ('round8/e-quote', 'valkey', 'on ~* +@all', '~a"b', 'Adding a pattern \'~a"b\' after the * pattern (or the \'allkeys\' flag) is not valid and does not have any effect. Try \'resetkeys\' to start with an empty list of patterns'),
-    ('round9/q-sub-empty', 'valkey', 'on ~* -@all', '+config|', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
-]
+# Real AWS (us-east-2, issue #2551): each captured user's CreateUser, ModifyUser and DescribeUsers calls in
+# order, with AWS's answers. Built from the raw captures; a user's calls stop before one MiniStack doesn't model.
+with open(os.path.join(os.path.dirname(__file__), "fixtures", "elasticache", "append_access_string.json")) as _f:
+    _APPEND_CAPTURES = json.load(_f)
 
-@pytest.mark.parametrize("key,engine,access,append,expected", _APPEND_CAPTURES, ids=[c[0] for c in _APPEND_CAPTURES])
-def test_elasticache_modify_user_appends_access_string(ec, key, engine, access, append, expected):
-    """AppendAccessString's rules are applied to the stored AccessString and written as AWS stores them."""
-    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
-    ec.create_user(UserId=uid, UserName=uid, Engine=engine, AccessString=access, AuthenticationMode={"Type": "iam"})
+
+@pytest.mark.parametrize("case", _APPEND_CAPTURES, ids=[c["id"] for c in _APPEND_CAPTURES])
+def test_elasticache_modify_user_append_replays_aws(ec, case):
+    """Each step is sent as captured and answered as AWS answered: the error's status, code and message, or
+    the user's Status, AccessString, MinimumEngineVersion and Authentication."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:8]}"
+    calls = {"c": ec.create_user, "m": ec.modify_user, "d": ec.describe_users}
+    created = False
     try:
-        modified = ec.modify_user(UserId=uid, AppendAccessString=append)
-        assert (modified["Status"], modified["AccessString"]) == ("modifying", expected)
-        described = ec.describe_users(UserId=uid)["Users"][0]
-        assert (described["Status"], described["AccessString"]) == ("active", expected)
+        for op, params, expect in case["steps"]:
+            kwargs = {"UserId": uid, **({"UserName": uid} if op == "c" else {}), **(params or {})}
+            if expect and isinstance(expect[0], int):
+                with pytest.raises(ClientError) as exc:
+                    calls[op](**kwargs)
+                response = exc.value.response
+                assert [response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"],
+                        response["Error"]["Message"]] == expect
+                continue
+            answer = calls[op](**kwargs)
+            created = created or op == "c"
+            if op == "c":
+                continue
+            user = answer["Users"][0] if op == "d" else answer
+            want = {"Status": "modifying" if op == "m" else "active", "AccessString": expect[0],
+                    "MinimumEngineVersion": expect[1], "Authentication": expect[2] if len(expect) > 2 else {"Type": "iam"}}
+            assert {k: user.get(k) for k in want} == want
     finally:
-        ec.delete_user(UserId=uid)
+        if created:
+            ec.delete_user(UserId=uid)
 
-
-@pytest.mark.parametrize("key,engine,access,append,message", _APPEND_REFUSALS, ids=[c[0] for c in _APPEND_REFUSALS])
-def test_elasticache_modify_user_refuses_append_access_string(ec, key, engine, access, append, message):
-    """AppendAccessString rules AWS refuses answer its message and leave the user unchanged."""
-    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
-    ec.create_user(UserId=uid, UserName=uid, Engine=engine, AccessString=access, AuthenticationMode={"Type": "iam"})
-    try:
-        with pytest.raises(ClientError) as exc:
-            ec.modify_user(UserId=uid, AppendAccessString=append)
-        err = exc.value.response["Error"]
-        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Type"], err["Code"], err["Message"]) == (
-            400, "Sender", "InvalidParameterValue", message)
-        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == access
-    finally:
-        ec.delete_user(UserId=uid)
-
-
-def test_elasticache_modify_user_append_with_authentication_mode(ec):
-    """An append and a password change in one call both apply (AWS capture round8 modify-pw-auth-and-append,
-    describe-pw); a refused append leaves an iam user untouched (round7 modify-auth-valid-bad-append,
-    describe-auth)."""
-    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
-    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all",
-                   AuthenticationMode={"Type": "password", "Passwords": ["a-long-enough-password-1"]})
-    iam = f"app-{_uuid_mod.uuid4().hex[:6]}"
-    ec.create_user(UserId=iam, UserName=iam, Engine="valkey", AccessString="on ~* +@all",
-                   AuthenticationMode={"Type": "iam"})
-    try:
-        modified = ec.modify_user(UserId=uid, AppendAccessString="-flushall", AuthenticationMode={
-            "Type": "password", "Passwords": ["another-long-password-2"]})
-        expected = ("on ~* +@all -flushall", {"Type": "password", "PasswordCount": 1})
-        assert (modified["Status"], modified["AccessString"], modified["Authentication"]) == ("modifying", *expected)
-        described = ec.describe_users(UserId=uid)["Users"][0]
-        assert (described["Status"], described["AccessString"], described["Authentication"]) == ("active", *expected)
-        with pytest.raises(ClientError) as exc:
-            ec.modify_user(UserId=iam, AppendAccessString="foo", AuthenticationMode={"Type": "iam"})
-        err = exc.value.response["Error"]
-        assert (err["Code"], err["Message"]) == ("InvalidParameterValue", "The access-string is invalid.")
-        described = ec.describe_users(UserId=iam)["Users"][0]
-        assert (described["AccessString"], described["Authentication"]) == ("on ~* +@all", {"Type": "iam"})
-    finally:
-        ec.delete_user(UserId=uid)
-        ec.delete_user(UserId=iam)
-
-def test_elasticache_modify_user_append_reapplies_stored_rules(ec):
-    """Each append re-applies the stored rules, so a rule kept because a later category touched it can
-    drop out on the next append (AWS captures round9 modify-reparse-1, modify-reparse-2 and describes)."""
-    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
-    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all", AuthenticationMode={"Type": "iam"})
-    try:
-        first = ec.modify_user(UserId=uid, AppendAccessString="-flushdb +@read +flushall +@read")["AccessString"]
-        assert first == "on ~* +@all -flushdb +flushall +@read"
-        assert ec.modify_user(UserId=uid, AppendAccessString="on")["AccessString"] == "on ~* +@all -flushdb +@read"
-        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~* +@all -flushdb +@read"
-    finally:
-        ec.delete_user(UserId=uid)
 
 def test_elasticache_modify_user_append_skips_stored_rules_aws_refuses(ec):
     """MiniStack contract, not AWS behavior: a stored AccessString can hold rules AWS would have refused
