@@ -1321,7 +1321,7 @@ def _describe_cache_clusters(p):
         clusters = list(_clusters.values())
     members = "".join(_cluster_xml(c) for c in clusters)
     return _xml(200, "DescribeCacheClustersResponse",
-        f"<DescribeCacheClustersResult><CacheClusters>{xml_escape(str(members))}</CacheClusters></DescribeCacheClustersResult>")
+        f"<DescribeCacheClustersResult><CacheClusters>{members}</CacheClusters></DescribeCacheClustersResult>")
 
 
 def _modify_cache_cluster(p):
@@ -1656,7 +1656,7 @@ def _describe_replication_groups(p):
     # Strict SDKs (aws-sdk-go-v2, Java/Rust v2) parse a <member>-wrapped list as empty.
     members = "".join(f"<ReplicationGroup>{_rg_xml(g)}</ReplicationGroup>" for g in groups)
     return _xml(200, "DescribeReplicationGroupsResponse",
-        f"<DescribeReplicationGroupsResult><ReplicationGroups>{xml_escape(str(members))}</ReplicationGroups></DescribeReplicationGroupsResult>")
+        f"<DescribeReplicationGroupsResult><ReplicationGroups>{members}</ReplicationGroups></DescribeReplicationGroupsResult>")
 
 
 def _modify_replication_group(p):
@@ -1876,7 +1876,7 @@ def _describe_subnet_groups(p):
     groups = [_subnet_groups[name]] if name else list(_subnet_groups.values())
     members = "".join(f"<CacheSubnetGroup>{_subnet_group_xml(g)}</CacheSubnetGroup>" for g in groups)
     return _xml(200, "DescribeCacheSubnetGroupsResponse",
-        f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{xml_escape(str(members))}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
+        f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
 
 
 def _delete_subnet_group(p):
@@ -1955,7 +1955,7 @@ def _describe_param_groups(p):
         for g in groups
     )
     return _xml(200, "DescribeCacheParameterGroupsResponse",
-        f"<DescribeCacheParameterGroupsResult><CacheParameterGroups>{xml_escape(str(members))}</CacheParameterGroups></DescribeCacheParameterGroupsResult>")
+        f"<DescribeCacheParameterGroupsResult><CacheParameterGroups>{members}</CacheParameterGroups></DescribeCacheParameterGroupsResult>")
 
 
 def _delete_param_group(p):
@@ -1994,7 +1994,7 @@ def _describe_cache_parameters(p):
             f"</Parameter>"
         )
     return _xml(200, "DescribeCacheParametersResponse",
-        f"<DescribeCacheParametersResult><Parameters>{xml_escape(str(members))}</Parameters></DescribeCacheParametersResult>")
+        f"<DescribeCacheParametersResult><Parameters>{members}</Parameters></DescribeCacheParametersResult>")
 
 
 def _modify_cache_parameter_group(p):
@@ -2105,7 +2105,7 @@ def _describe_engine_versions(p):
         for v in versions.get(engine, ["7.0.12"])
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
-        f"<DescribeCacheEngineVersionsResult><CacheEngineVersions>{xml_escape(str(members))}</CacheEngineVersions></DescribeCacheEngineVersionsResult>")
+        f"<DescribeCacheEngineVersionsResult><CacheEngineVersions>{members}</CacheEngineVersions></DescribeCacheEngineVersionsResult>")
 
 
 # ---- Tags ----
@@ -2334,7 +2334,7 @@ def _describe_snapshots(p):
     # SnapshotList.member.locationName = "Snapshot"
     members = "".join(f"<Snapshot>{_snapshot_xml(s)}</Snapshot>" for s in snaps)
     return _xml(200, "DescribeSnapshotsResponse",
-        f"<DescribeSnapshotsResult><Snapshots>{xml_escape(str(members))}</Snapshots></DescribeSnapshotsResult>")
+        f"<DescribeSnapshotsResult><Snapshots>{members}</Snapshots></DescribeSnapshotsResult>")
 
 
 # ---- Serverless Caches ----
@@ -2426,7 +2426,13 @@ def _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce):
     return archive.getvalue()
 
 
-def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl_commands=()):
+# Until the cluster is up, `default` can only bootstrap it: no keys, no channels, no data commands.
+_SERVERLESS_BOOTSTRAP_DEFAULT = ("user default on nopass resetkeys resetchannels -@all +ping +cluster|addslotsrange "
+                                 "+cluster|info +acl|load\n")
+_OPEN_DEFAULT_ACL = "user default on nopass ~* &* +@all\n"
+
+
+def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl=_OPEN_DEFAULT_ACL):
     """Start a TLS-only Valkey/Redis container and return ``(address, port, id)``.
 
     Raises on any failure, after removing what it started: a serverless cache
@@ -2450,6 +2456,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
             "--tls-auth-clients", "no",
             "--protected-mode", "no",
             "--cluster-enabled", "yes", "--tls-cluster", "yes",
+            "--aclfile", _ACL_FILE,
         ],
     )
     if DOCKER_NETWORK:
@@ -2470,14 +2477,19 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
         cert_pem, key_pem, _public = sign_leaf_certificate(
             ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
         announce = _serverless_announce_flags(address, port)
+        bootstrap = acl != _OPEN_DEFAULT_ACL
+        _write_acl_file(container, "".join(line + "\n" for line in acl.splitlines()
+                                           if not line.startswith("user default ")) + _SERVERLESS_BOOTSTRAP_DEFAULT
+                        if bootstrap else acl)
         if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce)):
             raise RuntimeError("Docker rejected the TLS material")
-        if (wait or acl_commands) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+        if (wait or bootstrap) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
             raise RuntimeError(f"{engine} in {name} never reported cluster_state:ok over TLS")
-        for command in acl_commands:
-            result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", str(container_port), *command])
+        if bootstrap:
+            _write_acl_file(container, acl)
+            result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", str(container_port), "ACL", "LOAD"])
             if result.exit_code != 0 or result.output.strip() != b"OK":
-                raise RuntimeError(f"{name}: {command[:3]} answered {result.output[:200]!r}")
+                raise RuntimeError(f"{name}: ACL LOAD answered {result.output[:200]!r}")
     except Exception:
         _teardown_containers(docker_client, [container.id])
         raise
@@ -2627,13 +2639,16 @@ def _apply_user_groups_of(group_ids):
     for rg in list(_replication_groups.values()):
         if set(group_ids) & set(rg.get("UserGroupIds") or []):
             _apply_user_groups(rg, get_account_id(), get_region())
+    for cache in list(_serverless_caches.values()):
+        if cache.get("UserGroupId") and cache["UserGroupId"] in group_ids:
+            _apply_serverless_acl(cache, get_account_id(), get_region())
 
 
 def _start_serverless_container(record, account_id, region, wait=True):
     """Start ``record``'s container and publish its endpoint, unless the cache
     was deleted meanwhile — then the container is removed instead."""
     name = record["ServerlessCacheName"]
-    acl_commands = _user_group_acl_commands(account_id, region, [record.get("UserGroupId")])
+    acl = _serverless_acl(record, account_id, region)
     address, port, cid = _spawn_serverless_container(
         name=_serverless_container_name(account_id, region, name),
         engine=record["Engine"],
@@ -2646,7 +2661,7 @@ def _start_serverless_container(record, account_id, region, wait=True):
             "region": region,
         },
         wait=wait,
-        **({"acl_commands": acl_commands} if acl_commands else {}),
+        acl=acl,
     )
     with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
         orphaned = _serverless_caches.get_scoped(account_id, region, name) is not record
@@ -2657,6 +2672,33 @@ def _start_serverless_container(record, account_id, region, wait=True):
             record["Status"] = "available"
     if orphaned:
         _teardown_containers(_get_docker(), [cid])
+    elif _serverless_acl(record, account_id, region) != acl:  # users or groups changed while it started
+        _apply_serverless_acl(record, account_id, region)
+
+
+def _serverless_acl(record, account_id, region):
+    """The ACL file of a serverless cache: its user group's users with the restricted-command deny list, or
+    `default` open when no group is attached."""
+    if not record.get("UserGroupId"):
+        return _OPEN_DEFAULT_ACL
+    return _engine_acl({"Engine": record["Engine"], "EngineVersion": record.get("FullEngineVersion") or "7",
+                        "UserGroupIds": [record["UserGroupId"]]}, account_id, region) or _OPEN_DEFAULT_ACL
+
+
+def _apply_serverless_acl(record, account_id, region):
+    """Rewrite a running serverless cache's ACL file and restart its engine, which reads it on start."""
+    docker_client, cid = _get_docker(), record.get("_docker_container_id")
+    if not docker_client or not cid:
+        return  # not started yet: the start reads the current users
+    try:
+        container = docker_client.containers.get(cid)
+        _write_acl_file(container, _serverless_acl(record, account_id, region))
+        container.restart(timeout=10)
+        if not _wait_redis_ready(container, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+            logger.warning("ElastiCache: serverless cache %s did not come back after its users changed",
+                           record["ServerlessCacheName"])
+    except Exception as e:
+        logger.warning("ElastiCache: users not applied on serverless cache %s: %s", record["ServerlessCacheName"], e)
 
 
 def _provision_serverless_cache(record, account_id, region, replaced_container_id=None):
@@ -2818,7 +2860,7 @@ def _describe_serverless_caches(p):
         token = f"<NextToken>{xml_escape(str(start + max_results))}</NextToken>"
     members = "".join(f"<member>{_serverless_cache_xml(c)}</member>" for c in page)
     return _xml(200, "DescribeServerlessCachesResponse",
-                f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{xml_escape(str(members))}</ServerlessCaches>"
+                f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{members}</ServerlessCaches>"
                 f"</DescribeServerlessCachesResult>")
 
 
@@ -2880,6 +2922,8 @@ def _modify_serverless_cache(p):
         return _error("InvalidParameterCombination", "No modifications were requested", 400)
 
     cache.update(changes)
+    if "UserGroupId" in changes and engine_change is None:
+        _apply_serverless_acl(cache, get_account_id(), get_region())
     if engine_change is not None:
         cache["Engine"], cache["MajorEngineVersion"], cache["FullEngineVersion"] = engine_change
         if cache.get("_docker_container_id") or _get_docker() is not None:
@@ -2937,7 +2981,7 @@ def _serverless_cache_xml(c):
         parts = "".join(
             f"<{part}>" + "".join(optional(k, v) for k, v in limits[part].items()) + f"</{part}>"
             for part in ("DataStorage", "ECPUPerSecond") if part in limits)
-        limits_xml = f"<CacheUsageLimits>{xml_escape(str(parts))}</CacheUsageLimits>"
+        limits_xml = f"<CacheUsageLimits>{parts}</CacheUsageLimits>"
     created = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(c["CreateTime"]))
     security_groups = "".join(f"<SecurityGroupId>{xml_escape(g)}</SecurityGroupId>"
                               for g in c.get("SecurityGroupIds") or [])
@@ -2953,12 +2997,12 @@ def _serverless_cache_xml(c):
         f"{limits_xml}"
         f"{optional('KmsKeyId', c.get('KmsKeyId'))}"
         f"<StorageEncryptionType>{'sse-kms' if c.get('KmsKeyId') else 'sse-elasticache'}</StorageEncryptionType>"
-        f"<SecurityGroupIds>{xml_escape(str(security_groups))}</SecurityGroupIds>"
+        f"<SecurityGroupIds>{security_groups}</SecurityGroupIds>"
         f"{endpoint('Endpoint')}"
         f"{endpoint('ReaderEndpoint')}"
         f"<ARN>{xml_escape(str(c['ARN']))}</ARN>"
         f"{optional('UserGroupId', c.get('UserGroupId'))}"
-        f"<SubnetIds>{xml_escape(str(subnets))}</SubnetIds>"
+        f"<SubnetIds>{subnets}</SubnetIds>"
         f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
         f"{optional('DailySnapshotTime', c.get('DailySnapshotTime'))}"
         f"<NetworkType>{xml_escape(str(c.get('NetworkType', 'ipv4')))}</NetworkType>"
@@ -2990,7 +3034,7 @@ def _describe_events(p):
         for e in filtered
     )
     return _xml(200, "DescribeEventsResponse",
-        f"<DescribeEventsResult><Events>{xml_escape(str(members))}</Events></DescribeEventsResult>")
+        f"<DescribeEventsResult><Events>{members}</Events></DescribeEventsResult>")
 
 
 # ---- Users (Redis ACL) ----
@@ -3163,7 +3207,7 @@ def _describe_users(p):
 
     members = "".join(f"<member>{_user_xml(u)}</member>" for u in users)
     return _xml(200, "DescribeUsersResponse",
-        f"<DescribeUsersResult><Users>{xml_escape(str(members))}</Users></DescribeUsersResult>")
+        f"<DescribeUsersResult><Users>{members}</Users></DescribeUsersResult>")
 
 
 def _delete_user(p):
@@ -3251,7 +3295,7 @@ def _describe_user_groups(p):
 
     members = "".join(f"<member>{_user_group_xml(g)}</member>" for g in groups)
     return _xml(200, "DescribeUserGroupsResponse",
-        f"<DescribeUserGroupsResult><UserGroups>{xml_escape(str(members))}</UserGroups></DescribeUserGroupsResult>")
+        f"<DescribeUserGroupsResult><UserGroups>{members}</UserGroups></DescribeUserGroupsResult>")
 
 
 def _delete_user_group(p):
