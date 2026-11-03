@@ -2524,7 +2524,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
 def _acl_setuser(user, deny=()):
     """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
     An iam user's token is not checked, as with AUTH=false elsewhere."""
-    tokens = user.get("AccessString", "").split()
+    tokens = _acl_split(user.get("AccessString", ""))  # as stored: NBSP stays inside a pattern
     # A string without channel rules gets all channels (real AWS, us-west-2: "on ~* +@all" is
     # "user app on ... ~* &* +@all" on the engine); reset alone would leave none. A string with a
     # selector and no root channel rule gets none outside its selectors (real AWS, us-east-2, every
@@ -3512,6 +3512,8 @@ def _acl_refusal(rule, keywords):
         valid = not bar or (low[1:] in _ACL_SUBCOMMANDS if rule[0] == "-" else subcommand)
         return None if command in _ACL_COMMANDS and valid else (
             "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
+    if _acl_key(rule) and "\u2028" in rule:  # NBSP and em space are kept in a pattern (us-east-2, round 23)
+        return "The access-string is invalid."
     if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
         return None
     return "The access-string is invalid."

@@ -1619,6 +1619,14 @@ def test_user_acl_channels_default_to_all():
         assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
 
 
+def test_user_acl_keeps_unicode_space_inside_a_pattern():
+    """AWS stores `~a\\xa0b` appended to `on ~x +@all` as one key pattern (us-east-2, issue #2551,
+    round23 modify-a-key-nbsp), so the engine gets it as one rule too."""
+    user = {"UserId": "u", "UserName": "u", "AccessString": "on ~x ~a\xa0b +@all", "Authentication": {"Type": "iam"}}
+    assert elasticache._acl_setuser(user) == ["ACL", "SETUSER", "u", "reset", "&*", "on", "~x", "~a\xa0b", "+@all",
+                                              "nopass"]
+
+
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
 @pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
 def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
