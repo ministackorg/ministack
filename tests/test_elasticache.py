@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import time
 import types
 import uuid as _uuid_mod
@@ -2893,8 +2894,8 @@ def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path
         assert unauthenticated.startswith(b"-NOAUTH")
         assert _tls_session(ep, ca, ("AUTH", app, "wrong-password-123456"))[0].startswith(b"-WRONGPASS")
         assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v")) == [ok, ok]
-        # All channels, as on AWS, for an access string without channel rules.
-        assert _tls_session(ep, ca, ("AUTH", app, pw), ("PUBLISH", "ch", "x")) == [ok, b":0\r\n"]
+        # No channels outside its selectors, as on AWS, for an access string with a selector.
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("PUBLISH", "ch", "x"))[1].startswith(b"-NOPERM")
         took = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "SETUSER", "default", "on", "nopass", "+@all"))
         assert took[1].startswith(b"-NOPERM")
         # Only the group's users and `default off`, as on AWS (real AWS, us-west-2, Valkey 8.1).
@@ -3027,3 +3028,113 @@ def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkey
     finally:
         del _ec._users[user["UserId"]], _ec._user_groups[f"g-{uid}"]
 
+
+
+def test_elasticache_modify_user_group_refuses_member_adds_and_non_member_removes(ec):
+    """Adding a current member or removing a non-member is refused before anything changes, adds checked
+    first, the first bad entry named (real AWS, us-east-1); a group is never recorded twice on a user."""
+    uid = _uid()
+    dflt, member, other, group = f"d-{uid}", f"m-{uid}", f"o-{uid}", f"g-{uid}"
+    ec.create_user(UserId=dflt, UserName="default", Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    for user in (member, other):
+        ec.create_user(UserId=user, UserName=user, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    ec.create_user_group(UserGroupId=group, Engine="redis", UserIds=[dflt, member])
+
+    def refused(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user_group(UserGroupId=group, **kwargs)
+        err = exc.value.response["Error"]
+        return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
+
+    try:
+        already = (400, "InvalidParameterCombination", f"{member} is already a member of {group}.")
+        assert refused(UserIdsToAdd=[member], UserIdsToRemove=[member]) == already
+        assert refused(UserIdsToAdd=[member]) == already
+        assert refused(UserIdsToAdd=[other, member]) == already
+        not_member = (400, "InvalidParameterValue", f"User {other} is not a member of user group {group}.")
+        assert refused(UserIdsToRemove=[other]) == not_member
+        assert refused(UserIdsToAdd=[other], UserIdsToRemove=[other]) == not_member
+        assert refused(UserIdsToRemove=[member, other]) == not_member
+        assert refused(UserIdsToAdd=[member], UserIdsToRemove=[other]) == already  # adds first
+        group_after = ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]
+        assert sorted(group_after["UserIds"]) == sorted([dflt, member])
+        assert ec.describe_users(UserId=other)["Users"][0]["UserGroupIds"] == []
+        assert ec.describe_users(UserId=member)["Users"][0]["UserGroupIds"] == [group]
+    finally:
+        ec.delete_user_group(UserGroupId=group)
+        for user in (dflt, member, other):
+            ec.delete_user(UserId=user)
+
+
+def test_elasticache_builtin_default_user(ec):
+    """Every account has the built-in `default` user, which can't be modified or deleted (real AWS, us-east-1)."""
+    user = ec.describe_users(UserId="default")["Users"][0]
+    assert {k: v for k, v in user.items() if k != "ARN"} == {
+        "UserId": "default", "UserName": "default", "Status": "active", "Engine": "redis",
+        "MinimumEngineVersion": "6.0", "AccessString": "on ~* +@all", "UserGroupIds": [],
+        "Authentication": {"Type": "no-password"}}
+    assert re.fullmatch(r"arn:aws:elasticache:[a-z0-9-]+:\d{12}:user:default", user["ARN"])
+    assert [u for u in ec.describe_users()["Users"] if u["UserId"] == "default"] == [user]
+    for call, word in ((lambda: ec.modify_user(UserId="default", AccessString="on ~* +@read"), "modified"),
+                       (lambda: ec.delete_user(UserId="default"), "deleted")):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == f"default user can't be {word}."
+    uid = _uid()
+    group = f"g-{uid}"
+    ec.create_user_group(UserGroupId=group, Engine="redis", UserIds=["default"])
+    try:
+        assert ec.describe_users(UserId="default")["Users"][0]["UserGroupIds"] == [group]
+    finally:
+        ec.delete_user_group(UserGroupId=group)
+    assert ec.describe_users(UserId="default")["Users"][0]["UserGroupIds"] == []
+
+
+def test_elasticache_user_group_duplicate_and_unknown_users(ec):
+    """ModifyUserGroup checks run member-to-add, duplicate-to-add, unknown-to-add, non-member-to-remove,
+    duplicate-to-remove; CreateUserGroup checks duplicates before unknown users; DeleteUser drops the user
+    from its groups (real AWS, us-east-1)."""
+    uid = _uid()
+    dflt, member, other, group, ghost = f"d-{uid}", f"m-{uid}", f"o-{uid}", f"g-{uid}", f"x-{uid}"
+    ec.create_user(UserId=dflt, UserName="default", Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    for user in (member, other):
+        ec.create_user(UserId=user, UserName=user, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+
+    def refused(fn, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            fn(**kwargs)
+        err = exc.value.response["Error"]
+        return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
+
+    dup = (400, "InvalidParameterValue", "Duplicate user id specified.")
+    unknown = (404, "UserNotFound", f"User {ghost} not found.")
+    already = (400, "InvalidParameterCombination", f"{member} is already a member of {group}.")
+    not_member = (400, "InvalidParameterValue", f"User {other} is not a member of user group {group}.")
+    create = lambda ids: refused(ec.create_user_group, UserGroupId=group, Engine="redis", UserIds=ids)
+    assert create([dflt, member, member]) == dup
+    assert create([dflt, ghost, member, member]) == dup
+    assert create([dflt, ghost, f"y-{uid}"]) == unknown
+    assert ec.describe_users(UserId=member)["Users"][0]["UserGroupIds"] == []
+    ec.create_user_group(UserGroupId=group, Engine="redis", UserIds=[dflt, member])
+    modify = lambda **kw: refused(ec.modify_user_group, UserGroupId=group, **kw)
+    try:
+        assert modify(UserIdsToAdd=[other, other, member]) == already
+        assert modify(UserIdsToAdd=[ghost, other, other]) == dup
+        assert modify(UserIdsToAdd=[ghost], UserIdsToRemove=[member, member]) == unknown
+        assert modify(UserIdsToAdd=[ghost, f"y-{uid}"]) == unknown
+        assert modify(UserIdsToAdd=[ghost], UserIdsToRemove=[other]) == unknown
+        assert modify(UserIdsToRemove=[member, member, other]) == not_member
+        assert modify(UserIdsToRemove=[ghost]) == (400, "InvalidParameterValue",
+                                                   f"User {ghost} is not a member of user group {group}.")
+        assert modify(UserIdsToAdd=[other], UserIdsToRemove=[member, member]) == dup
+        assert sorted(ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"]) == sorted([dflt, member])
+        assert ec.describe_users(UserId=other)["Users"][0]["UserGroupIds"] == []
+        ec.delete_user(UserId=member)
+        assert ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"] == [dflt]
+        assert modify(UserIdsToRemove=[member]) == (400, "InvalidParameterValue",
+                                                    f"User {member} is not a member of user group {group}.")
+    finally:
+        ec.delete_user_group(UserGroupId=group)
+        for user in (dflt, other):
+            ec.delete_user(UserId=user)

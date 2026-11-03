@@ -8,6 +8,7 @@ import base64
 import contextvars
 import copy
 import hashlib
+import html
 import io
 import json
 import logging
@@ -13359,14 +13360,16 @@ def _ec_query(props, renames=None):
 
 def _ec_call(fn, params, resource_type, action):
     _ec._seed_default_param_groups()
+    _ec._seed_default_user()
     status, _headers, body = fn(params)
     if status >= 400:
         text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
         code = re.search(r"<Code>(.*?)</Code>", text)
         message = re.search(r"<Message>(.*?)</Message>", text, re.S)
-        raise ValueError(
-            f"{resource_type} {action} failed: "
-            f"{code.group(1) if code else status}: {message.group(1) if message else text}")
+        # The handler's reason (real AWS, us-east-1, AWS::ElastiCache::UserGroup).
+        message = html.unescape(message.group(1)) if message else text
+        raise ValueError(f'Resource handler returned message: "{_sdk_error(message, "ElastiCache", status)}" '
+                         f"(RequestToken: {new_uuid()}, HandlerErrorCode: GeneralServiceException)")
 
 
 def _ec_sync_tags(arn, old_props, new_props, resource_type):
@@ -13753,10 +13756,11 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
         _ec_user_group_create, _ec_user_group_delete)
     if replaced:
         return replaced
-    old_users = list(old_props.get("UserIds") or [])
+    # The group ends with the template's users, diffed against the live group (real AWS, us-east-1).
+    live_users = list((_ec._user_groups.get(physical_id) or {}).get("UserIds") or [])
     new_users = list(new_props.get("UserIds") or [])
-    params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in old_users],
-                        "UserIdsToRemove": [u for u in old_users if u not in new_users]})
+    params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
+                        "UserIdsToRemove": [u for u in live_users if u not in new_users]})
     if params:
         _ec_call(_ec._modify_user_group, {"UserGroupId": physical_id, **params},
                  "AWS::ElastiCache::UserGroup", "update")

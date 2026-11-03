@@ -37658,6 +37658,47 @@ def test_cfn_elasticache_memcached_configuration_endpoint(cfn, ec):
         _delete_cfn_test_stack(cfn, stack)
 
 
+def test_cfn_elasticache_user_group_update_sets_template_users(cfn, ec):
+    """A stack update leaves the group with exactly the template's users, diffed against the live group,
+    so members added or removed outside the stack don't fail it (real AWS, us-east-1)."""
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"ec-ug-{s}"
+    dflt, a, b, c = f"d-{s}", f"a-{s}", f"b-{s}", f"c-{s}"
+    ec.create_user(UserId=dflt, UserName="default", Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+    for user in (a, b, c):
+        ec.create_user(UserId=user, UserName=user, Engine="redis", AccessString="on ~* +@all", NoPasswordRequired=True)
+
+    def tmpl(users):
+        return {"Resources": {"G": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": f"ug-{s}", "Engine": "redis", "UserIds": users}}}}
+
+    members = lambda: sorted(ec.describe_user_groups(UserGroupId=f"ug-{s}")["UserGroups"][0]["UserIds"])
+    try:
+        _ec_create(cfn, stack, tmpl([dflt, a]))
+        ec.modify_user_group(UserGroupId=f"ug-{s}", UserIdsToAdd=[b, c])
+        _ec_update(cfn, stack, tmpl([dflt, a, b]))
+        assert members() == sorted([dflt, a, b])
+        assert ec.describe_users(UserId=c)["Users"][0]["UserGroupIds"] == []
+        ec.modify_user_group(UserGroupId=f"ug-{s}", UserIdsToRemove=[a])
+        _ec_update(cfn, stack, tmpl([dflt, b]))
+        assert members() == sorted([dflt, b])
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(tmpl([dflt, b, b])))
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert members() == sorted([dflt, b])
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(tmpl([dflt, b, f"ghost-{s}"])))
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any(re.fullmatch(
+            rf'Resource handler returned message: "User ghost-{s} not found\. \(Service: ElastiCache, Status Code: 404, '
+            r'Request ID: [0-9a-f-]{36}\) \(SDK Attempt Count: 1\)" \(RequestToken: [0-9a-f-]{36}, '
+            r'HandlerErrorCode: GeneralServiceException\)', r) for r in _ec_reasons(cfn, stack, "G"))
+        assert members() == sorted([dflt, b])
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack, timeout=120)
+        for user in (dflt, a, b, c):
+            ec.delete_user(UserId=user)
+
+
 @pytest.mark.parametrize("rtype,old,new,expected", [
     ("AWS::ElastiCache::CacheCluster", {"Engine": "redis"}, {"Engine": "memcached"}, "Always"),
     ("AWS::ElastiCache::CacheCluster", {"NumCacheNodes": 1}, {"NumCacheNodes": 2}, "Conditionally"),

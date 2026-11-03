@@ -388,6 +388,16 @@ def _seed_default_param_groups():
             _param_group_params[_name] = _default_params_for_family(_family)
 
 
+def _seed_default_user():
+    """The account's built-in `default` user (real AWS, us-east-1)."""
+    if "default" not in _users:
+        _users["default"] = {
+            "UserId": "default", "UserName": "default", "Engine": "redis", "Status": "active",
+            "AccessString": "on ~* +@all", "UserGroupIds": [], "Authentication": {"Type": "no-password"},
+            "ARN": _arn_user("default"), "_PasswordHashes": [], "_builtin": True,
+        }
+
+
 def _stamp_replication_group_on_user_groups(rg_id, user_group_ids):
     for group_id in user_group_ids:
         group = _user_groups.get(group_id)
@@ -1057,6 +1067,7 @@ async def handle_request(method, path, headers, body, query_params):
     # from disk (issue #853). Cheap fast-path when nothing's pending.
     _ensure_live_containers()
     _seed_default_param_groups()
+    _seed_default_user()
     params = dict(query_params)
     if method == "POST" and body:
         form_params = parse_qs(body.decode("utf-8", errors="replace"))
@@ -2432,6 +2443,24 @@ _SERVERLESS_BOOTSTRAP_DEFAULT = ("user default on nopass resetkeys resetchannels
 _OPEN_DEFAULT_ACL = "user default on nopass ~* &* +@all\n"
 
 
+def _bootstrap_acl(acl):
+    """``acl`` with `default` limited to bringing the cluster up; the open ACL needs no bootstrap."""
+    if acl == _OPEN_DEFAULT_ACL:
+        return acl
+    return "".join(line + "\n" for line in acl.splitlines()
+                   if not line.startswith("user default ")) + _SERVERLESS_BOOTSTRAP_DEFAULT
+
+
+def _finish_serverless_acl(container, name, acl):
+    """Once the cluster is up under the bootstrap ACL, load the real one."""
+    if acl == _OPEN_DEFAULT_ACL:
+        return
+    _write_acl_file(container, acl)
+    result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", "6379", "ACL", "LOAD"])
+    if result.exit_code != 0 or result.output.strip() != b"OK":
+        raise RuntimeError(f"{name}: ACL LOAD answered {result.output[:200]!r}")
+
+
 def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl=_OPEN_DEFAULT_ACL):
     """Start a TLS-only Valkey/Redis container and return ``(address, port, id)``.
 
@@ -2478,18 +2507,12 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
             ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
         announce = _serverless_announce_flags(address, port)
         bootstrap = acl != _OPEN_DEFAULT_ACL
-        _write_acl_file(container, "".join(line + "\n" for line in acl.splitlines()
-                                           if not line.startswith("user default ")) + _SERVERLESS_BOOTSTRAP_DEFAULT
-                        if bootstrap else acl)
+        _write_acl_file(container, _bootstrap_acl(acl))
         if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce)):
             raise RuntimeError("Docker rejected the TLS material")
         if (wait or bootstrap) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
             raise RuntimeError(f"{engine} in {name} never reported cluster_state:ok over TLS")
-        if bootstrap:
-            _write_acl_file(container, acl)
-            result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", str(container_port), "ACL", "LOAD"])
-            if result.exit_code != 0 or result.output.strip() != b"OK":
-                raise RuntimeError(f"{name}: ACL LOAD answered {result.output[:200]!r}")
+        _finish_serverless_acl(container, name, acl)
     except Exception:
         _teardown_containers(docker_client, [container.id])
         raise
@@ -2692,11 +2715,12 @@ def _apply_serverless_acl(record, account_id, region):
         return  # not started yet: the start reads the current users
     try:
         container = docker_client.containers.get(cid)
-        _write_acl_file(container, _serverless_acl(record, account_id, region))
+        acl = _serverless_acl(record, account_id, region)
+        _write_acl_file(container, _bootstrap_acl(acl))
         container.restart(timeout=10)
-        if not _wait_redis_ready(container, cli_args=_SERVERLESS_TLS_CLI_ARGS):
-            logger.warning("ElastiCache: serverless cache %s did not come back after its users changed",
-                           record["ServerlessCacheName"])
+        if not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+            raise RuntimeError("the cluster did not come back after the restart")
+        _finish_serverless_acl(container, record["ServerlessCacheName"], acl)
     except Exception as e:
         logger.warning("ElastiCache: users not applied on serverless cache %s: %s", record["ServerlessCacheName"], e)
 
@@ -3152,6 +3176,8 @@ def _reported_access_string(access):
 
 
 def _minimum_engine_version(user):
+    if user.get("_builtin"):
+        return "6.0"
     if user.get("Engine") == "valkey":
         return "7.2"
     if user.get("Authentication", {}).get("Type") == "iam":
@@ -3215,6 +3241,8 @@ def _delete_user(p):
     user = _users.get(user_id)
     if not user:
         return _error("UserNotFound", f"User {user_id} not found.", 404)
+    if user.get("_builtin"):  # real AWS, us-east-1
+        return _error("InvalidParameterValue", "default user can't be deleted.", 400)
     if user.get("UserName") == "default" and user.get("UserGroupIds"):  # real AWS, us-west-2
         return _error("DefaultUserAssociatedToUserGroup",
                       "User is associated to user group(s) as a default user and can't be deleted.", 400)
@@ -3222,6 +3250,10 @@ def _delete_user(p):
         return _error("UserNotFound", f"User {user_id} not found.", 404)
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
+    for gid in user.get("UserGroupIds", []):  # the groups drop a deleted member (real AWS, us-east-1)
+        group = _user_groups.get(gid)
+        if group and user_id in group["UserIds"]:
+            group["UserIds"].remove(user_id)
     _apply_user_groups_of(user.get("UserGroupIds", []))
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
 
@@ -3231,6 +3263,8 @@ def _modify_user(p):
     user = _users.get(user_id)
     if not user:
         return _error("UserNotFound", f"User {user_id} not found.", 404)
+    if user.get("_builtin"):  # real AWS, us-east-1
+        return _error("InvalidParameterValue", "default user can't be modified.", 400)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
     err = err or _access_string_error(_p(p, "AccessString"))
@@ -3261,6 +3295,11 @@ def _create_user_group(p):
     while _p(p, f"UserIds.member.{idx}"):
         user_ids.append(_p(p, f"UserIds.member.{idx}"))
         idx += 1
+    if len(set(user_ids)) != len(user_ids):  # duplicates before unknown users (real AWS, us-east-1)
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+    for uid in user_ids:
+        if uid not in _users:
+            return _error("UserNotFound", f"User {uid} not found.", 404)
 
     group = {
         "UserGroupId": group_id,
@@ -3339,16 +3378,29 @@ def _modify_user_group(p):
         to_remove.append(_p(p, f"UserIdsToRemove.member.{idx}"))
         idx += 1
 
+    # Refused before anything changes, in this order, naming the first bad entry (real AWS, us-east-1).
+    for uid in to_add:
+        if uid in group["UserIds"]:
+            return _error("InvalidParameterCombination", f"{uid} is already a member of {group_id}.", 400)
+    if len(set(to_add)) != len(to_add):
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+    for uid in to_add:
+        if uid not in _users:
+            return _error("UserNotFound", f"User {uid} not found.", 404)
+    for uid in to_remove:
+        if uid not in group["UserIds"]:
+            return _error("InvalidParameterValue", f"User {uid} is not a member of user group {group_id}.", 400)
+    if len(set(to_remove)) != len(to_remove):
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+
     before = list(group["UserIds"])
     for uid in to_add:
-        if uid not in group["UserIds"]:
-            group["UserIds"].append(uid)
-        if uid in _users:
-            _users[uid].setdefault("UserGroupIds", []).append(group_id)
+        group["UserIds"].append(uid)
+        if uid in _users and group_id not in _users[uid].setdefault("UserGroupIds", []):
+            _users[uid]["UserGroupIds"].append(group_id)
 
     for uid in to_remove:
-        if uid in group["UserIds"]:
-            group["UserIds"].remove(uid)
+        group["UserIds"].remove(uid)
         if uid in _users:
             gids = _users[uid].get("UserGroupIds", [])
             if group_id in gids:
@@ -3377,7 +3429,7 @@ def _user_xml(u):
            if _minimum_engine_version(u) else "")
         + f"<Authentication><Type>{xml_escape(str(auth.get('Type', 'no-password')))}</Type>"
         + (f"<PasswordCount>{xml_escape(str(auth['PasswordCount']))}</PasswordCount>" if "PasswordCount" in auth
-           else "" if auth.get("Type") == "iam" else "<PasswordCount>0</PasswordCount>")
+           else "" if auth.get("Type") == "iam" or u.get("_builtin") else "<PasswordCount>0</PasswordCount>")
         + "</Authentication>"
         f"<ARN>{xml_escape(str(u.get('ARN', '')))}</ARN>"
     )
