@@ -13333,6 +13333,29 @@ def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
     assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
 
 
+def test_context_arn_shim_concurrent_cold_starts_all_get_the_shim(tmp_path):
+    """Concurrent cold starts of one function write the shim into the same code dir; each gets it."""
+    import threading
+
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    barrier = threading.Barrier(8)
+    results = []
+
+    def cold_start():
+        barrier.wait()
+        results.append(lsvc._write_context_arn_shim(str(code_dir), "nodejs22.x", "lambda.handler"))
+
+    threads = [threading.Thread(target=cold_start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == ["_msctx_shim.handler"] * 8
+    assert sorted(p.name for p in code_dir.iterdir()) == ["_msctx_shim.cjs"]
+
+
+
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_node_context_shim_runs_in_a_type_module_package(tmp_path):
     """A package.json with "type": "module" makes Node load every .js file as
