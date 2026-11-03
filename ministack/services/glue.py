@@ -126,6 +126,7 @@ _workflow_runs = AccountRegionScopedDict()  # workflow_name -> [run, ...]
 _user_defined_functions = AccountRegionScopedDict()  # "db_name/function_name" -> udf dict
 _table_column_statistics = AccountRegionScopedDict()  # "db/table" -> {column_name: stats}
 _partition_column_statistics = AccountRegionScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
+_table_optimizers = AccountRegionScopedDict()  # "db/table" -> {optimizer type: TableOptimizer}
 
 _ALL_STATE = {
     "databases": _databases,
@@ -144,6 +145,7 @@ _ALL_STATE = {
     "workflow_runs": _workflow_runs,
     "user_defined_functions": _user_defined_functions,
     "table_column_statistics": _table_column_statistics,
+    "table_optimizers": _table_optimizers,
     "partition_column_statistics": _partition_column_statistics,
 }
 
@@ -293,6 +295,13 @@ def _handle_request_sync(method, path, headers, body, query_params):
         "GetTables": _get_tables,
         "UpdateTable": _update_table,
         "BatchDeleteTable": _batch_delete_table,
+        # Table optimizers
+        "CreateTableOptimizer": _create_table_optimizer,
+        "GetTableOptimizer": _get_table_optimizer,
+        "UpdateTableOptimizer": _update_table_optimizer,
+        "DeleteTableOptimizer": _delete_table_optimizer,
+        "BatchGetTableOptimizer": _batch_get_table_optimizer,
+        "ListTableOptimizerRuns": _list_table_optimizer_runs,
         # Partitions
         "CreatePartition": _create_partition,
         "DeletePartition": _delete_partition,
@@ -911,6 +920,7 @@ def _delete_database(data):
         _partition_indexes.pop(k, None)
         _table_column_statistics.pop(k, None)
         _partition_column_statistics.pop(k, None)
+        _table_optimizers.pop(k, None)
     return json_response({})
 
 
@@ -987,6 +997,7 @@ def _delete_table(data):
     _partition_indexes.pop(key, None)
     _table_column_statistics.pop(key, None)
     _partition_column_statistics.pop(key, None)
+    _table_optimizers.pop(key, None)
     return json_response({})
 
 
@@ -1069,7 +1080,143 @@ def _batch_delete_table(data):
             _partition_indexes.pop(key, None)
             _table_column_statistics.pop(key, None)
             _partition_column_statistics.pop(key, None)
+            _table_optimizers.pop(key, None)
     return json_response({"Errors": errors})
+
+
+# ---- Table optimizers (control plane only: optimizers never run) ----
+# Shapes, defaults and messages from a real-AWS capture (eu-west-2, 2026-11-01).
+
+
+def _optimizer_config(optimizer_type, config):
+    """The stored configuration: what the call sent, with the defaults AWS fills in for its type."""
+    config = copy.deepcopy(config or {})
+    if optimizer_type == "compaction":
+        block = config.setdefault("compactionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("strategy", "binpack")
+    elif optimizer_type == "retention":
+        block = config.setdefault("retentionConfiguration", {}).setdefault("icebergConfiguration", {})
+        if not block:
+            block["cleanExpiredFiles"] = True
+        block.setdefault("runRateInHours", 24)
+    elif optimizer_type == "orphan_file_deletion":
+        block = config.setdefault("orphanFileDeletionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("runRateInHours", 24)
+    return config
+
+
+def _optimizer_table(data):
+    """(key, table, optimizers) for the call's table, or an error response when the table doesn't exist."""
+    key = f"{data.get('DatabaseName')}/{data.get('TableName')}"
+    table = _tables.get(key)
+    if table is None:
+        return None, error_response_json("EntityNotFoundException", "Entity Not Found", 400)
+    return (key, table, _table_optimizers.get(key) or {}), None
+
+
+def _optimizer_response(optimizer_type, config):
+    return {"type": optimizer_type, "configuration": config, "configurationSource": "table"}
+
+
+def _no_optimizer(optimizer_type, table_name):
+    return error_response_json("EntityNotFoundException",
+                               f"No optimizer of type {optimizer_type} found for the table: {table_name}", 400)
+
+
+def _sort_order_missing(table):
+    metadata = _iceberg_fetch_metadata((table.get("Parameters") or {}).get("metadata_location")) or {}
+    default_id = metadata.get("default-sort-order-id", 0)
+    order = next((o for o in metadata.get("sort-orders", []) if o.get("order-id") == default_id), {})
+    return not order.get("fields")
+
+
+def _create_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type, name = data.get("Type"), data.get("TableName")
+    if optimizer_type in optimizers:
+        return error_response_json("AlreadyExistsException",
+                                   f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return error_response_json("InvalidInputException", "Glue table metadata filepath is null", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: _optimizer_config(
+        optimizer_type, data.get("TableOptimizerConfiguration"))}
+    return json_response({})
+
+
+def _get_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    _key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+
+
+def _update_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    config = _optimizer_config(optimizer_type, data.get("TableOptimizerConfiguration"))
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return error_response_json("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: config}  # replaces it: fields left out are dropped
+    return json_response({})
+
+
+def _delete_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return error_response_json("EntityNotFoundException",
+                                   f"An optimizer of type {optimizer_type} does not exist on table {data.get('TableName')}",
+                                   400)
+    _table_optimizers[key] = {t: c for t, c in optimizers.items() if t != optimizer_type}
+    return json_response({})
+
+
+def _batch_get_table_optimizer(data):
+    found, failures = [], []
+    for entry in data.get("Entries") or []:
+        catalog_id = entry.get("catalogId") or get_account_id()
+        db_name, name, optimizer_type = entry.get("databaseName"), entry.get("tableName"), entry.get("type")
+        table = _tables.get(f"{db_name}/{name}")
+        optimizers = _table_optimizers.get(f"{db_name}/{name}") or {}
+        ids = {"catalogId": catalog_id, "databaseName": db_name, "tableName": name}
+        if table is None:
+            error = ("EntityNotFoundException", "Entity Not Found")
+        elif not (table.get("Parameters") or {}).get("metadata_location"):
+            error = ("InvalidInputException", "Request Validation Failed: Unsupported Table type")
+        elif optimizer_type not in optimizers:
+            error = ("EntityNotFoundException", f"No optimizer of type {optimizer_type} found for the table: {name}")
+        else:
+            found.append({**ids, "tableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+            continue
+        failures.append({"error": {"ErrorCode": error[0], "ErrorMessage": error[1]}, **ids, "type": optimizer_type})
+    return json_response({"TableOptimizers": found, "Failures": failures})
+
+
+def _list_table_optimizer_runs(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizerRuns": []})
 
 
 # ---- Partitions ----
@@ -2786,6 +2933,7 @@ def reset():
     _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
+    _table_optimizers.clear()
 
 
 async def handle_request(method, path, headers, body, query_params):

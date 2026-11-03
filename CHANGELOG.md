@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Glue — table optimizers** — `CreateTableOptimizer`, `GetTableOptimizer`, `UpdateTableOptimizer`, `DeleteTableOptimizer`, `BatchGetTableOptimizer` and `ListTableOptimizerRuns` answered `InvalidAction`. Optimizers are now stored per Iceberg table and type with AWS's defaults and errors, `Update` replaces the configuration, and dropping a table or database removes them. They never run. Reported by @lucasmfraser.
+
 ### Fixed
 - **Lambda — concurrent cold starts of one function all get the context-ARN shim** — two containers of the same function starting at once wrote the shim through the same temp file, so one failed and reported the RIE's `012345678912` account as `invokedFunctionArn`. Each cold start now writes its own temp file. Reported by @chandra-purbia.
 - **ElastiCache — user groups are enforced on the engine** — a replication group's `UserGroupIds` were stored but never applied, so every command ran as the open `default` user. The groups' users now reach the engine and follow each user or group change, with `default` off unless a group has one. Access strings are reported with AWS's `-@all` and invalid ones answer `InvalidParameterValue`. Contributed by @chris-plucker.

@@ -1827,7 +1827,7 @@ def test_glue_reset_clears_every_store_across_regions():
 
     account = "123456789012"
     regional_stores = {key: store for key, store in gluemod._ALL_STATE.items() if key != "tags"}
-    assert len(regional_stores) == 16
+    assert len(regional_stores) == 17
 
     for index, store in enumerate(regional_stores.values()):
         store.set_scoped(account, "us-east-1", f"east-{index}", {"scope": "east"})
@@ -3023,3 +3023,105 @@ def test_glue_extract_python_error_finds_last_traceback():
     assert out.startswith("Traceback")
     assert "ValueError: real" in out and "OldError" not in out
     assert _extract_python_error("just INFO lines") == ""
+
+
+# ---- Table optimizers: shapes, defaults and messages from a real-AWS capture (eu-west-2) ----
+
+
+def _optimizer_tables(glue, s3, sort_fields=()):
+    import uuid
+
+    db = f"opt{uuid.uuid4().hex[:8]}"
+    bucket = f"opt-wh-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="t/metadata/00000.metadata.json", Body=json.dumps({
+        "format-version": 2, "default-sort-order-id": 1,
+        "sort-orders": [{"order-id": 1, "fields": list(sort_fields)}]}).encode())
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(DatabaseName=db, TableInput={"Name": "t", "TableType": "EXTERNAL_TABLE", "Parameters": {
+        "table_type": "ICEBERG", "metadata_location": f"s3://{bucket}/t/metadata/00000.metadata.json"}})
+    glue.create_table(DatabaseName=db, TableInput={"Name": "plain", "TableType": "EXTERNAL_TABLE"})
+    return db
+
+
+def _optimizer_error(call):
+    with pytest.raises(ClientError) as exc:
+        call()
+    err = exc.value.response
+    return err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]
+
+
+def test_glue_table_optimizer_lifecycle_and_defaults(glue, s3):
+    db = _optimizer_tables(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    role = {"roleArn": "arn:aws:iam::000000000000:role/glue", "enabled": False}
+    assert "TableOptimizer" not in glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=role)
+    got = glue.get_table_optimizer(**ids, Type="compaction")
+    assert {k: got[k] for k in ("CatalogId", "DatabaseName", "TableName")} == ids
+    assert got["TableOptimizer"] == {"type": "compaction", "configurationSource": "table", "configuration": {
+        **role, "compactionConfiguration": {"icebergConfiguration": {"strategy": "binpack"}}}}
+
+    glue.create_table_optimizer(**ids, Type="orphan_file_deletion", TableOptimizerConfiguration=role)
+    assert glue.get_table_optimizer(**ids, Type="orphan_file_deletion")["TableOptimizer"]["configuration"][
+        "orphanFileDeletionConfiguration"] == {"icebergConfiguration": {"runRateInHours": 24}}
+
+    glue.create_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+        **role, "retentionConfiguration": {"icebergConfiguration": {"numberOfSnapshotsToRetain": 3}}})
+    assert glue.get_table_optimizer(**ids, Type="retention")["TableOptimizer"]["configuration"][
+        "retentionConfiguration"] == {"icebergConfiguration": {"numberOfSnapshotsToRetain": 3, "runRateInHours": 24}}
+    # Update replaces the configuration: what it leaves out is dropped, then defaulted again.
+    glue.update_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration=role)
+    assert glue.get_table_optimizer(**ids, Type="retention")["TableOptimizer"]["configuration"] == {
+        **role, "retentionConfiguration": {"icebergConfiguration": {"cleanExpiredFiles": True, "runRateInHours": 24}}}
+
+    assert glue.list_table_optimizer_runs(**ids, Type="compaction")["TableOptimizerRuns"] == []
+    glue.delete_table_optimizer(**ids, Type="orphan_file_deletion")
+    assert _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="orphan_file_deletion")) == (
+        400, "EntityNotFoundException", "No optimizer of type orphan_file_deletion found for the table: t")
+
+
+def test_glue_table_optimizer_errors(glue, s3):
+    db = _optimizer_tables(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    role = {"roleArn": "arn:aws:iam::000000000000:role/glue", "enabled": False}
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=role)
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=role)) == (
+        400, "AlreadyExistsException", "An optimizer of type compaction already exists on table with name: t")
+    assert _optimizer_error(lambda: glue.update_table_optimizer(
+        **ids, Type="retention", TableOptimizerConfiguration=role)) == (
+        400, "EntityNotFoundException", "No optimizer of type retention found for the table: t")
+    assert _optimizer_error(lambda: glue.delete_table_optimizer(**ids, Type="orphan_file_deletion")) == (
+        400, "EntityNotFoundException", "An optimizer of type orphan_file_deletion does not exist on table t")
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **{**ids, "TableName": "plain"}, Type="compaction", TableOptimizerConfiguration=role)) == (
+        400, "InvalidInputException", "Glue table metadata filepath is null")
+    assert _optimizer_error(lambda: glue.update_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration={
+        **role, "compactionConfiguration": {"icebergConfiguration": {"strategy": "sort"}}})) == (
+        400, "InvalidInputException", "Sort order is not present in metadata")
+    assert glue.get_table_optimizer(**ids, Type="compaction")["TableOptimizer"]["configuration"][
+        "compactionConfiguration"] == {"icebergConfiguration": {"strategy": "binpack"}}
+
+    batch = glue.batch_get_table_optimizer(Entries=[
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "t", "type": "compaction"},
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "plain", "type": "compaction"}])
+    assert [o["tableOptimizer"]["type"] for o in batch["TableOptimizers"]] == ["compaction"]
+    assert batch["Failures"] == [{"error": {"ErrorCode": "InvalidInputException",
+                                            "ErrorMessage": "Request Validation Failed: Unsupported Table type"},
+                                  "catalogId": "000000000000", "databaseName": db, "tableName": "plain",
+                                  "type": "compaction"}]
+
+    glue.delete_table(DatabaseName=db, Name="t")
+    assert _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="compaction"))[1] == "EntityNotFoundException"
+
+
+def test_glue_table_optimizer_sort_strategy_with_a_sort_order(glue, s3):
+    db = _optimizer_tables(glue, s3, sort_fields=[{"source-id": 1, "transform": "identity",
+                                                   "direction": "asc", "null-order": "nulls-first"}])
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    role = {"roleArn": "arn:aws:iam::000000000000:role/glue", "enabled": False}
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=role)
+    glue.update_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration={
+        **role, "compactionConfiguration": {"icebergConfiguration": {"strategy": "sort"}}})
+    assert glue.get_table_optimizer(**ids, Type="compaction")["TableOptimizer"]["configuration"][
+        "compactionConfiguration"] == {"icebergConfiguration": {"strategy": "sort"}}
