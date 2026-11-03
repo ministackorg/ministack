@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — a cold start's tar is released when the copy ends** — a cold start that copies files into the function's container (its code when MiniStack runs in Docker, its layers, and its CA files under `USE_SSL=1`) built each tar in memory, and `tarfile` keeps a reference cycle to that buffer, so it stayed in memory until a full garbage collection. Eight concurrent cold starts of a function with 52 MB of unpacked code left MiniStack 415 MB larger; they now leave it 21 MB larger. The buffer is closed once `put_archive` returns.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added

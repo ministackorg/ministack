@@ -3974,21 +3974,23 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     under that subdir.
     """
     import tarfile
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        tar.add(src_dir, arcname=arcname)
-    buf.seek(0)
-    container.put_archive(dest_dir, buf)
+    # Closed on return: tarfile's TarInfo -> TarFile reference cycle keeps the
+    # buffer object alive until a full garbage collection.
+    with io.BytesIO() as buf:
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            tar.add(src_dir, arcname=arcname)
+        buf.seek(0)
+        container.put_archive(dest_dir, buf)
 
 
 def _docker_cp_file(container, src_path: str, dest_path: str):
     """Copy one local file (symlinks followed) into a container at ``dest_path``."""
     import tarfile
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w", dereference=True) as tar:
-        tar.add(src_path, arcname=dest_path.lstrip("/"))
-    buf.seek(0)
-    container.put_archive("/", buf)
+    with io.BytesIO() as buf:
+        with tarfile.open(fileobj=buf, mode="w", dereference=True) as tar:
+            tar.add(src_path, arcname=dest_path.lstrip("/"))
+        buf.seek(0)
+        container.put_archive("/", buf)
 
 
 # Bare-text body the RIE answers with (HTTP 200) when a run hits the function
