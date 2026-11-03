@@ -8853,26 +8853,30 @@ def _cfn_to_camel(key):
     return key[0].lower() + key[1:]
 
 
+# ECS API names that are not the template name with a lower-case first letter (botocore ecs model).
+_ECS_API_NAMES = {"EFSVolumeConfiguration": "efsVolumeConfiguration", "FilesystemId": "fileSystemId",
+                  "IAM": "iam", "FSxWindowsFileServerVolumeConfiguration": "fsxWindowsFileServerVolumeConfiguration",
+                  "ProxyConfigurationProperties": "properties"}
+# Map-typed fields whose keys are the user's own (dockerLabels, log/firelens options, docker volume opts).
+_ECS_USER_MAPS = frozenset(("dockerLabels", "options", "driverOpts", "labels"))
+
+
+def _ecs_api_form(value):
+    """A task definition property in the ECS API's camelCase, at every depth, user-keyed maps untouched."""
+    if isinstance(value, list):
+        return [_ecs_api_form(v) for v in value]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            name = _ECS_API_NAMES.get(k) or _cfn_to_camel(k)
+            out[name] = v if name in _ECS_USER_MAPS else _ecs_api_form(v)
+        return out
+    return value
+
+
 def _normalize_container_defs(cdefs):
     """Convert CF PascalCase container definitions to camelCase for ECS API."""
-    result = []
-    for cdef in cdefs:
-        normalized = {}
-        for k, v in cdef.items():
-            camel = _cfn_to_camel(k)
-            if camel == "portMappings" and isinstance(v, list):
-                v = [{_cfn_to_camel(pk): pv for pk, pv in pm.items()} for pm in v]
-            elif camel == "environment" and isinstance(v, list):
-                v = [{_cfn_to_camel(ek): ev for ek, ev in e.items()} for e in v]
-            elif camel == "mountPoints" and isinstance(v, list):
-                v = [{_cfn_to_camel(mk): mv for mk, mv in m.items()} for m in v]
-            elif camel == "volumesFrom" and isinstance(v, list):
-                v = [{_cfn_to_camel(vk): vv for vk, vv in vf.items()} for vf in v]
-            elif camel == "logConfiguration" and isinstance(v, dict):
-                v = {_cfn_to_camel(lk): lv for lk, lv in v.items()}
-            normalized[camel] = v
-        result.append(normalized)
-    return result
+    return _ecs_api_form(list(cdefs or []))
 
 
 def _ecs_task_def_create(logical_id, props, stack_name):
@@ -8891,10 +8895,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "networkMode": props.get("NetworkMode", "bridge"),
         "executionRoleArn": props.get("ExecutionRoleArn", ""),
         "taskRoleArn": props.get("TaskRoleArn", ""),
-        "volumes": props.get("Volumes", []),
+        "volumes": _ecs_api_form(props.get("Volumes", [])),
         "pidMode": props.get("PidMode", ""),
         "ipcMode": props.get("IpcMode", ""),
-        "placementConstraints": props.get("PlacementConstraints", []),
+        "placementConstraints": _ecs_api_form(props.get("PlacementConstraints", [])),
         "registeredAt": now_iso(),
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
     }
@@ -8902,6 +8906,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
                       ("Memory", "memory")):
         if prop in props:
             td[key] = props[prop]
+    for prop in ("RuntimePlatform", "EphemeralStorage", "ProxyConfiguration", "InferenceAccelerators",
+                 "EnableFaultInjection"):
+        if prop in props:
+            td[_cfn_to_camel(prop)] = _ecs_api_form(props[prop])
     _ecs._task_defs[td_key] = td
     _ecs._tags[arn] = _pascal_to_camel(props.get("Tags") or [])
     return arn, {"TaskDefinitionArn": arn}

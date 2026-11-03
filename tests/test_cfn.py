@@ -38962,3 +38962,59 @@ def test_cfn_stackset_capabilities_and_reads_contract(auth_enabled, cfn, iam_use
             user.describe_stacks(StackName=name)
     finally:
         _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_ecs_task_definition_reaches_the_ecs_api_shape(cfn):
+    """Every nested template property reaches DescribeTaskDefinition in the ECS API's names (Secrets,
+    RepositoryCredentials, HealthCheck, LinuxParameters, volumes, runtime platform...), user-keyed maps
+    such as DockerLabels and log options keep their keys."""
+    from conftest import make_client
+
+    ecs = make_client("ecs")
+    stack = f"cfn-td-shape-{_uuid_mod.uuid4().hex[:8]}"
+    family = f"td-shape-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"TD": {
+        "Type": "AWS::ECS::TaskDefinition", "Properties": {
+            "Family": family, "Cpu": "256", "Memory": "512", "NetworkMode": "awsvpc",
+            "RequiresCompatibilities": ["FARGATE"],
+            "RuntimePlatform": {"CpuArchitecture": "ARM64", "OperatingSystemFamily": "LINUX"},
+            "EphemeralStorage": {"SizeInGiB": 30},
+            "Volumes": [{"Name": "data", "Host": {"SourcePath": "/tmp/data"}},
+                        {"Name": "efs", "EFSVolumeConfiguration": {"FilesystemId": "fs-1", "TransitEncryption": "ENABLED",
+                                                                   "AuthorizationConfig": {"AccessPointId": "fsap-1", "IAM": "ENABLED"}}},
+                        {"Name": "dv", "DockerVolumeConfiguration": {"Driver": "local", "DriverOpts": {"Type": "nfs"},
+                                                                     "Labels": {"Team": "a"}}}],
+            "ContainerDefinitions": [{
+                "Name": "app", "Image": "alpine:3.22", "Essential": True,
+                "Secrets": [{"Name": "DB_PASSWORD", "ValueFrom": "/repro/db-password"}],
+                "RepositoryCredentials": {"CredentialsParameter": "arn:aws:secretsmanager:us-east-1:000000000000:secret:x"},
+                "HealthCheck": {"Command": ["CMD", "true"], "Interval": 30, "Retries": 3},
+                "LinuxParameters": {"InitProcessEnabled": True, "Capabilities": {"Add": ["SYS_PTRACE"]}},
+                "Ulimits": [{"Name": "nofile", "SoftLimit": 1024, "HardLimit": 2048}],
+                "DependsOn": [{"ContainerName": "side", "Condition": "START"}],
+                "DockerLabels": {"Team": "payments"},
+                "LogConfiguration": {"LogDriver": "awslogs", "Options": {"awslogs-group": "g", "Mode": "x"},
+                                     "SecretOptions": [{"Name": "Key", "ValueFrom": "arn"}]}}]}}}}))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        td = ecs.describe_task_definition(taskDefinition=family)["taskDefinition"]
+        cdef = td["containerDefinitions"][0]
+        assert cdef["secrets"] == [{"name": "DB_PASSWORD", "valueFrom": "/repro/db-password"}]
+        assert cdef["repositoryCredentials"] == {"credentialsParameter": "arn:aws:secretsmanager:us-east-1:000000000000:secret:x"}
+        assert cdef["healthCheck"] == {"command": ["CMD", "true"], "interval": 30, "retries": 3}
+        assert cdef["linuxParameters"] == {"initProcessEnabled": True, "capabilities": {"add": ["SYS_PTRACE"]}}
+        assert cdef["ulimits"] == [{"name": "nofile", "softLimit": 1024, "hardLimit": 2048}]
+        assert cdef["dependsOn"] == [{"containerName": "side", "condition": "START"}]
+        assert cdef["dockerLabels"] == {"Team": "payments"}
+        assert cdef["logConfiguration"] == {"logDriver": "awslogs", "options": {"awslogs-group": "g", "Mode": "x"},
+                                            "secretOptions": [{"name": "Key", "valueFrom": "arn"}]}
+        assert td["volumes"] == [
+            {"name": "data", "host": {"sourcePath": "/tmp/data"}},
+            {"name": "efs", "efsVolumeConfiguration": {"fileSystemId": "fs-1", "transitEncryption": "ENABLED",
+                                                       "authorizationConfig": {"accessPointId": "fsap-1", "iam": "ENABLED"}}},
+            {"name": "dv", "dockerVolumeConfiguration": {"driver": "local", "driverOpts": {"Type": "nfs"},
+                                                         "labels": {"Team": "a"}}}]
+        assert td["runtimePlatform"] == {"cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX"}
+        assert td["ephemeralStorage"] == {"sizeInGiB": 30}
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
