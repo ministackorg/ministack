@@ -8534,7 +8534,7 @@ def _ec2_sg_reconcile(store, old_perms, new_perms):
         return
 
     def key(perm):
-        return json.dumps(_ec2._strip_descriptions(perm), sort_keys=True)
+        return json.dumps(_ec2._rule_match_form(perm), sort_keys=True)
 
     keys = {key(p) for p in old_perms} | {key(p) for p in new_perms}
     store[:] = [p for p in store if key(p) not in keys] + new_perms
