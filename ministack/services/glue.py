@@ -1096,8 +1096,7 @@ def _optimizer_config(optimizer_type, config):
         block.setdefault("strategy", "binpack")
     elif optimizer_type == "retention":
         block = config.setdefault("retentionConfiguration", {}).setdefault("icebergConfiguration", {})
-        if not block:
-            block["cleanExpiredFiles"] = True
+        block.setdefault("cleanExpiredFiles", True)
         block.setdefault("runRateInHours", 24)
     elif optimizer_type == "orphan_file_deletion":
         block = config.setdefault("orphanFileDeletionConfiguration", {}).setdefault("icebergConfiguration", {})
@@ -1110,8 +1109,14 @@ def _optimizer_table(data):
     key = f"{data.get('DatabaseName')}/{data.get('TableName')}"
     table = _tables.get(key)
     if table is None:
-        return None, error_response_json("EntityNotFoundException", _entity_not_found_message(), 400)
+        return None, _optimizer_error("EntityNotFoundException", _entity_not_found_message(), 404)
     return (key, table, _table_optimizers.get(key) or {}), None
+
+
+def _optimizer_error(code, message, glue_status):
+    """AWS ends every table optimizer error with Glue's service suffix (real AWS capture)."""
+    return error_response_json(code, f"{message} (Service: glue; Status Code: {glue_status}; Error Code: {code}; "
+                                     f"Request ID: {new_uuid()}; Proxy: null)", 400)
 
 
 def _entity_not_found_message():
@@ -1124,8 +1129,8 @@ def _run_rate_error(config):
     for block in ("retentionConfiguration", "orphanFileDeletionConfiguration"):
         rate = (((config or {}).get(block) or {}).get("icebergConfiguration") or {}).get("runRateInHours")
         if rate is not None and not 3 <= rate <= 168:
-            return error_response_json("InvalidInputException", "Request Validation Failed with error: "
-                                       "Run rate for ICEBERG tables must be between 3 and 168 hours", 400)
+            return _optimizer_error("InvalidInputException", "Request Validation Failed with error: "
+                                    "Run rate for ICEBERG tables must be between 3 and 168 hours", 400)
     return None
 
 
@@ -1134,8 +1139,36 @@ def _optimizer_response(optimizer_type, config):
 
 
 def _no_optimizer(optimizer_type, table_name):
-    return error_response_json("EntityNotFoundException",
-                               f"No optimizer of type {optimizer_type} found for the table: {table_name}", 400)
+    return _optimizer_error("EntityNotFoundException",
+                            f"No optimizer of type {optimizer_type} found for the table: {table_name}", 404)
+
+
+def _role_refusal(table, role_arn):
+    """Under AUTH=true, the optimizer role must be able to read the table and reach its S3 location."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _gather_role_policies, evaluate
+
+    account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else get_account_id()
+    policies = _gather_role_policies(role_arn.rsplit("/", 1)[-1], account)
+
+    def allowed(action, resource):
+        ctx = EvalContext(principal_arn=role_arn, principal_type="AssumedRole", principal_account=account,
+                          action=action, resource_arn=resource, region=get_region())
+        return evaluate(ctx, policies).decision == "Allow"
+
+    table_arn = f"arn:aws:glue:{get_region()}:{get_account_id()}:table/{table['DatabaseName']}/{table['Name']}"
+    if not allowed("glue:GetTable", table_arn):
+        return _optimizer_error("AccessDeniedException", f"The provided IAM Role: {role_arn} does not have the "
+                                "proper IAM permissions to call Glue APIs. Please update the role's IAM "
+                                "permissions to allow access to the table", 403)
+    location = (table.get("StorageDescriptor") or {}).get("Location", "")
+    bucket = location.split("://", 1)[-1].split("/", 1)[0]
+    if not (allowed("s3:ListBucket", f"arn:aws:s3:::{bucket}")
+            or any(allowed(f"s3:{a}", f"arn:aws:s3:::{bucket}/*") for a in ("GetObject", "PutObject", "DeleteObject"))):
+        return _optimizer_error("AccessDeniedException", "Access denied", 403)
+    return None
 
 
 def _sort_order_missing(table):
@@ -1151,14 +1184,24 @@ def _create_table_optimizer(data):
         return err
     key, table, optimizers = found
     optimizer_type, name = data.get("Type"), data.get("TableName")
-    rate_error = _run_rate_error(data.get("TableOptimizerConfiguration"))
+    config = data.get("TableOptimizerConfiguration") or {}
+    # Order as captured on AWS: the table's location, the run rate, an existing optimizer, the role, the sort order.
+    if not (table.get("StorageDescriptor") or {}).get("Location"):
+        return _optimizer_error("InvalidInputException", "Glue table storage warehouse location is null", 400)
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return _optimizer_error("InvalidInputException", "Glue table metadata filepath is null", 400)
+    rate_error = _run_rate_error(config)
     if rate_error:
         return rate_error
     if optimizer_type in optimizers:
-        return error_response_json("AlreadyExistsException",
-                                   f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
-    if not (table.get("Parameters") or {}).get("metadata_location"):
-        return error_response_json("InvalidInputException", "Glue table metadata filepath is null", 400)
+        return _optimizer_error("AlreadyExistsException",
+                                f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
+    role_error = _role_refusal(table, config.get("roleArn") or "")
+    if role_error:
+        return role_error
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
     _table_optimizers[key] = {**optimizers, optimizer_type: _optimizer_config(
         optimizer_type, data.get("TableOptimizerConfiguration"))}
     return json_response({})
@@ -1188,7 +1231,7 @@ def _update_table_optimizer(data):
     config = _optimizer_config(optimizer_type, data.get("TableOptimizerConfiguration"))
     strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
     if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
-        return error_response_json("InvalidInputException", "Sort order is not present in metadata", 400)
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
     _table_optimizers[key] = {**optimizers, optimizer_type: config}  # replaces it: fields left out are dropped
     return json_response({})
 
@@ -1200,9 +1243,9 @@ def _delete_table_optimizer(data):
     key, _table, optimizers = found
     optimizer_type = data.get("Type")
     if optimizer_type not in optimizers:
-        return error_response_json("EntityNotFoundException",
-                                   f"An optimizer of type {optimizer_type} does not exist on table {data.get('TableName')}",
-                                   400)
+        return _optimizer_error("EntityNotFoundException",
+                                f"An optimizer of type {optimizer_type} does not exist on table {data.get('TableName')}",
+                                404)
     _table_optimizers[key] = {t: c for t, c in optimizers.items() if t != optimizer_type}
     return json_response({})
 
