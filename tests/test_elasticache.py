@@ -1537,7 +1537,11 @@ _AWS_ACL_CHANNELS = {
     "on ~* -@all +publish +subscribe": "&*",
     "on ~app:* +@all": "&*",
     "on +@all": "&*",
-    # more selectors, serverless only (aws-selectors-default)
+}
+# More selector shapes, captured in groups that also held a password user named default, on every
+# serverless engine (aws-selectors-default); checked in the same setup.
+_AWS_ACL_CHANNELS_WITH_DEFAULT = {
+    "on ~* +@all": "&*",
     "on ~k +get (&chan +publish)": "",
     "off (+get ~k)": "",
     "on ~* &x +@all (+get ~k)": "&x",
@@ -1571,7 +1575,7 @@ def test_user_acl_channels_default_to_all():
 
     with_allchannels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
                         "on ~app:* +@all", "on +@all"}  # the rest set channels or have a selector
-    for access in _AWS_ACL_CHANNELS:
+    for access in {**_AWS_ACL_CHANNELS, **_AWS_ACL_CHANNELS_WITH_DEFAULT}:
         prefix = ["reset", "allchannels"] if access in with_allchannels else ["reset"]
         assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
 
@@ -1680,12 +1684,17 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
 def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path, engine, major):
     """Capture rounds aws-engines (v7def) and aws-selectors-default (AWS, serverless, us-east-2): a
     password user named default with `on ~* +@all`, in the group when the cache is created, has channels
-    `&*` and can PUBLISH."""
+    `&*` and can PUBLISH, and the group's other users have the root channels in
+    `_AWS_ACL_CHANNELS_WITH_DEFAULT`."""
     uid, pw = _uid(), "msc-capture-default-password-1"
     user_id, group, name = f"u-def-{uid}", f"g-{uid}", f"sls-def-{uid}"
     ec.create_user(UserId=user_id, UserName="default", Engine=engine, AccessString="on ~* +@all",
                    AuthenticationMode={"Type": "password", "Passwords": [pw]})
-    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=[user_id])
+    users = {access: f"u-{i}-{uid}" for i, access in enumerate(_AWS_ACL_CHANNELS_WITH_DEFAULT)}
+    for access, other in users.items():
+        ec.create_user(UserId=other, UserName=other, Engine=engine, AccessString=access,
+                       AuthenticationMode={"Type": "iam"})
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=[user_id, *users.values()])
     ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
     try:
         cache = _wait_serverless(ec, name)
@@ -1695,10 +1704,17 @@ def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path, engine, maj
                                ("PUBLISH", "any-chan", "x"))
         assert replies[0] == b"+OK\r\n" and b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in replies[1]
         assert replies[2] == b":0\r\n"
+        reader = users["on ~* +@all"]
+        for access, other in users.items():
+            channels = _AWS_ACL_CHANNELS_WITH_DEFAULT[access]
+            reply = _tls_session(ep, ca, ("AUTH", reader, f"{name}/?Action=connect&User={reader}"),
+                                 ("ACL", "GETUSER", other))[1]
+            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
     finally:
         ec.delete_serverless_cache(ServerlessCacheName=name)
         ec.delete_user_group(UserGroupId=group)
-        ec.delete_user(UserId=user_id)
+        for user in (user_id, *users.values()):
+            ec.delete_user(UserId=user)
 
 
 def test_serverless_cache_create_describe_delete(ec):
