@@ -1518,6 +1518,42 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
             ec.delete_user(UserId=user)
 
 
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+def test_serverless_cache_user_changes_reach_the_engine_with_restricted_commands(ec, tmp_path):
+    """User and group changes reach a running serverless cache (#2554), its users cannot run ACL SETUSER or
+    CONFIG (AWS restricted commands), and detaching the group reopens `default`."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    keep, rem, group, name = f"u-keep-{uid}", f"u-rem-{uid}", f"g-{uid}", f"sls-chg-{uid}"
+    for user in (keep, rem):
+        ec.create_user(UserId=user, UserName=user, Engine="valkey", AccessString="on ~* +@all",
+                       AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[keep, rem])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="8", UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        ok, wrongpass = b"+OK\r\n", b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        replies = _tls_session(ep, ca, ("AUTH", keep, pw), ("SET", "k", "v"), ("ACL", "SETUSER", "x", "on"),
+                               ("CONFIG", "GET", "maxmemory"))
+        assert replies[:2] == [ok, ok] and all(r.startswith(b"-NOPERM") for r in replies[2:])
+        assert _tls_session(ep, ca, ("AUTH", rem, pw)) == [ok]
+
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[rem])
+        assert _tls_session(ep, ca, ("AUTH", rem, pw)) == [wrongpass]
+        assert _tls_session(ep, ca, ("AUTH", keep, pw), ("GET", "k")) == [ok, b"$1\r\nv\r\n"]  # data kept
+
+        ec.modify_user(UserId=keep, AccessString="on ~app:* -@all +get")
+        assert _tls_session(ep, ca, ("AUTH", keep, pw), ("SET", "k", "v"))[1].startswith(b"-NOPERM")
+
+        ec.modify_serverless_cache(ServerlessCacheName=name, RemoveUserGroup=True)
+        assert _tls_session(ep, ca, ("PING",)) == [b"+PONG\r\n"]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (keep, rem):
+            ec.delete_user(UserId=user)
+
+
 # Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS in us-east-2: the
 # same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (capture rounds
 # aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7), aws-channel-cases and

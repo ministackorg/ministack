@@ -2661,7 +2661,7 @@ def _start_serverless_container(record, account_id, region, wait=True):
             "region": region,
         },
         wait=wait,
-        acl=acl,
+        **({"acl": acl} if acl != _OPEN_DEFAULT_ACL else {}),
     )
     with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
         orphaned = _serverless_caches.get_scoped(account_id, region, name) is not record
