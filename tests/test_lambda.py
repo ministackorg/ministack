@@ -3323,6 +3323,43 @@ def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
     assert "layer_0" in names or any(n.startswith("layer_0/") for n in names)
 
 
+def test_lambda_docker_cp_releases_tar_buffer():
+    """The tar built for put_archive is released when the copy returns. tarfile
+    keeps a reference cycle to its fileobj (TarInfo._tarfile), so an unclosed
+    buffer stayed in memory until a full garbage collection: the size of the
+    function's unpacked code on every cold start."""
+    import gc
+    import tempfile
+    import tracemalloc
+
+    from ministack.services.lambda_svc import _docker_cp_dir, _docker_cp_file
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            data.read()
+
+    with tempfile.TemporaryDirectory() as src_dir:
+        path = os.path.join(src_dir, "code.bin")
+        with open(path, "wb") as f:
+            f.write(os.urandom(4 * 1024 * 1024))
+        started = not tracemalloc.is_tracing()
+        if started:
+            tracemalloc.start()
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            _docker_cp_dir(_FakeContainer(), src_dir, "/var/task")
+            _docker_cp_file(_FakeContainer(), path, "/etc/code.bin")
+            held = tracemalloc.get_traced_memory()[0] - base
+        finally:
+            if started:
+                tracemalloc.stop()
+            if gc_enabled:
+                gc.enable()
+    assert held < 1024 * 1024, held
+
+
 def test_lambda_pool_kill_function_reaps_all_qualifiers():
     """_pool_kill_function must remove every pooled docker container for a
     function across all qualifiers (the pool key includes CodeSha256, so
