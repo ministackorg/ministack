@@ -4572,6 +4572,12 @@ def test_ecr_held_image_from_another_account_needs_its_repository_policy(auth_en
                 "Action": "ecr:BatchGetImage"}]})
             assert ecr.held_image_readable(uri, "arn:aws:iam::222233334444:root") is True
         with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is False  # layers need GetDownloadUrlForLayer too
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repo_policies["shared"] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]}]})
+        with request_scope("111122223333", "us-east-1"):
             assert ecr.held_image_readable(uri, reader) is True
     finally:
         with request_scope("222233334444", "us-east-1"):

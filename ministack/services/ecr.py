@@ -1178,18 +1178,20 @@ _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 def held_image_readable(image, principal_arn):
     """Under AUTH=true, a repository in another account is readable only when its policy allows the
-    caller ecr:BatchGetImage, as on AWS; its own account always can."""
+    caller to pull (ecr:BatchGetImage and ecr:GetDownloadUrlForLayer, the ECR guide's pull example); its own
+    account always can."""
     from ministack.app import AUTH
     held = _held_image(image)
     if held is None or not AUTH or held[0] == get_account_id():
         return True
     from ministack.core.iam_evaluator import EvalContext, resource_policy_allows
     account, region, repo, _ref = held
-    ctx = EvalContext(principal_arn=principal_arn, principal_account=principal_arn.split(":")[4],
-                      principal_type="AssumedRole" if ":role/" in principal_arn else "Root",
-                      action="ecr:BatchGetImage", resource_arn=f"arn:aws:ecr:{region}:{account}:repository/{repo}",
-                      region=region)
-    return resource_policy_allows(_repo_policies.get_scoped(account, region, repo), ctx, same_account=False)
+    policy = _repo_policies.get_scoped(account, region, repo)
+    return all(resource_policy_allows(policy, EvalContext(
+        principal_arn=principal_arn, principal_account=principal_arn.split(":")[4],
+        principal_type="AssumedRole" if ":role/" in principal_arn else "Root", action=action,
+        resource_arn=f"arn:aws:ecr:{region}:{account}:repository/{repo}", region=region), same_account=False)
+        for action in ("ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"))
 
 
 def held_image_digest(image):
