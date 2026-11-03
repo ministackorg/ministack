@@ -275,6 +275,7 @@ def _run_backend_container(identifier):
         }
 
     container = docker_client.containers.run(**container_kwargs)
+    _backend_containers[identifier] = getattr(container, "id", None)
     container.reload()
 
     host = port = None
@@ -299,12 +300,23 @@ def _run_backend_container(identifier):
     if not rds._wait_for_database_ready(
         host, port, "postgres", "postgres", "", "postgres", _container_alive
     ):
+        _backend_containers.pop(identifier, None)
+        try:  # metadata-only from here: nothing keeps the container
+            container.remove(v=True, force=True)
+        except Exception as e:
+            logger.warning("DSQL: could not remove the unready backend for %s: %s", identifier, e)
         raise RuntimeError(f"backend at {host}:{port} did not become ready")
     return host, port
 
 
+# Backends of live clusters; any other stopped dsql container is the reaper's.
+_backend_containers: dict = {}
+container_reaper.register_live_ids("dsql", lambda: set(_backend_containers.values()) - {None})
+
+
 def _remove_container(identifier):
     """Best-effort blocking removal of a cluster's backend container."""
+    _backend_containers.pop(identifier, None)
     if not _docker_available():
         return
     try:
@@ -1217,6 +1229,7 @@ def reset():
                         logger.warning("reset: failed to remove container %s: %s", c.name, e)
         except Exception as e:
             logger.warning("reset: DSQL container sweep failed: %s", e)
+    _backend_containers.clear()
     _clusters.clear()
     _client_tokens.clear()
     _tags.clear()

@@ -1581,13 +1581,8 @@ def _start_pg_reader_container(db_id, cluster):
         ports={f"{container_port}/tcp": host_port},
         name=_rds_docker_name(db_id),
         network=ms_network,
-        labels={
-            "ministack": "rds",
-            "db_id": db_id,
-            "cluster_id": cluster_id,
-            "account_id": get_account_id(),
-            "region": get_region(),
-        },
+        labels=container_reaper.own_labels(
+            "rds", db_id=db_id, cluster_id=cluster_id, account_id=get_account_id(), region=get_region()),
     )
     volume_name = None
     if RDS_PERSIST:

@@ -938,6 +938,93 @@ def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monk
 
 
 @pytest.mark.serial
+@pytest.mark.parametrize("label,module,mark_live", [
+    ("glue", "glue", lambda m, cid: m._live_job_containers.add(cid)),
+    ("codebuild", "codebuild", lambda m, cid: m._live_build_containers.add(cid)),
+    ("dsql", "dsql", lambda m, cid: m._backend_containers.__setitem__("cl", cid)),
+    ("agentcore", "bedrock_agentcore", lambda m, cid: m._containers.__setitem__(("a", "r", "rt", "1"),
+                                                                                type("C", (), {"id": cid})())),
+])
+def test_reaper_reclaims_each_services_abandoned_containers(fake_docker, monkeypatch, label, module, mark_live):
+    """Glue, CodeBuild, DSQL and AgentCore report what they still own, so the reaper reclaims the rest."""
+    import importlib
+
+    from ministack.core import container_reaper
+
+    svc = importlib.import_module(f"ministack.services.{module}")
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    for store in ("_live_job_containers", "_live_build_containers", "_backend_containers", "_containers"):
+        if hasattr(svc, store):
+            monkeypatch.setattr(svc, store, type(getattr(svc, store))())
+    kept, leaked = (fake_docker.containers.run(name=n, labels=container_reaper.own_labels(label))
+                    for n in ("kept", "leaked"))
+    for c in (kept, leaked):
+        c.status = "exited"
+        c.attrs["State"] = {"FinishedAt": ""}
+    mark_live(svc, kept.id)
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert "kept" in fake_docker.live() and "leaked" not in fake_docker.live()
+
+
+@pytest.mark.serial
+def test_spawned_containers_carry_the_testcontainers_session_labels(monkeypatch):
+    """In a Testcontainers-run MiniStack, spawned containers carry its session labels, so Ryuk removes them when the
+    test process dies; never the reuse hash (Testcontainers would take a spawned container for MiniStack)."""
+    import docker
+
+    from ministack.core import container_reaper
+
+    own = {"org.testcontainers": "true", "org.testcontainers.sessionId": "s-java",
+           "org.testcontainers.resource-reaper-session": "s-dotnet", "org.testcontainers.golang": "true",
+           "org.testcontainers.golang.sessionId": "s-go", "org.testcontainers.hash": "reuse",
+           "org.testcontainers.lang": "java", "ministack": "spoofed", "other": "x"}
+    client = type("C", (), {"containers": type("Cs", (), {
+        "get": staticmethod(lambda name: type("Me", (), {"labels": own})() if name == "ms-host" else None)})()})()
+    monkeypatch.setattr(container_reaper, "_testcontainers_labels", None)
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: path == "/.dockerenv")
+    monkeypatch.setenv("HOSTNAME", "ms-host")
+    monkeypatch.setattr(docker, "from_env", lambda **_kw: client)
+    try:
+        labels = container_reaper.own_labels("lambda")
+        assert {k: v for k, v in labels.items() if k.startswith("org.testcontainers")} == {
+            "org.testcontainers": "true", "org.testcontainers.sessionId": "s-java",
+            "org.testcontainers.resource-reaper-session": "s-dotnet", "org.testcontainers.golang": "true",
+            "org.testcontainers.golang.sessionId": "s-go"}
+        assert labels["ministack"] == "lambda" and "other" not in labels
+    finally:
+        container_reaper._testcontainers_labels = None
+
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: False)
+    try:
+        assert not any(k.startswith("org.testcontainers") for k in container_reaper.own_labels("rds"))
+    finally:
+        container_reaper._testcontainers_labels = None
+
+
+@pytest.mark.serial
+def test_reaper_reclaims_stopped_lambda_containers_the_pool_no_longer_holds(fake_docker, monkeypatch):
+    """A Lambda container whose removal failed (a slow daemon) is reclaimed once stopped; pooled ones are kept."""
+    from ministack.core import container_reaper
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    pooled, leaked = (fake_docker.containers.run(name=n, labels=container_reaper.own_labels("lambda"))
+                      for n in ("pooled", "leaked"))
+    for c in (pooled, leaked):
+        c.status = "exited"
+        c.attrs["State"] = {"FinishedAt": ""}
+    monkeypatch.setattr(lambda_svc, "_warm_pool", {"fn": [{"container": pooled}]})
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert "pooled" in fake_docker.live() and "leaked" not in fake_docker.live()
+
+
+@pytest.mark.serial
 def test_periodic_reaper_skips_only_the_container_it_cannot_inspect(fake_docker, monkeypatch):
     from ministack.core import container_reaper
 

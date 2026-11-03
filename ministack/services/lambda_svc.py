@@ -3480,12 +3480,22 @@ def _kill_pool_entry(entry: dict) -> None:
             pass
         try:
             container.remove(force=True, v=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Lambda container %s not removed (%s); the reaper reclaims it once it has stopped",
+                           getattr(container, "id", "?"), exc)
     tmpdir = entry.get("tmpdir")
     if tmpdir and os.path.exists(tmpdir):
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _live_container_ids() -> set:
+    """Pooled containers: any other stopped container labelled lambda is garbage for the reaper."""
+    with _warm_pool_lock:
+        return {getattr(e.get("container"), "id", None) for entries in _warm_pool.values() for e in entries} - {None}
+
+
+container_reaper.register_live_ids("lambda", _live_container_ids)
 
 
 def _pool_acquire(key: str, max_concurrency: int | None):

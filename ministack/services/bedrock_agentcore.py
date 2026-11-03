@@ -52,6 +52,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import unquote
 
+from ministack.core import container_reaper
 from ministack.core.responses import (
     AccountRegionScopedDict,
     StreamingResponse,
@@ -78,6 +79,14 @@ _memory_events = AccountRegionScopedDict()   # memoryId -> {actorId -> {sessionI
 _memory_records = AccountRegionScopedDict()  # memoryId -> {memoryRecordId -> record}
 _containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
+
+
+def _live_container_ids():
+    """Running runtimes; any other stopped agentcore container is the reaper's."""
+    return {getattr(c, "id", None) for c in list(_containers.values())} - {None}
+
+
+container_reaper.register_live_ids("agentcore", _live_container_ids)
 
 # AgentRuntimeName / EndpointName: start with a letter, then letters/digits/_,
 # up to 48 chars total (botocore pattern ^[a-zA-Z][a-zA-Z0-9_]{0,47}$).

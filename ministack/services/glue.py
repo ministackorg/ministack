@@ -2190,6 +2190,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
 
     try:
         container = docker_client.containers.create(**container_kwargs)
+        _live_job_containers.add(getattr(container, "id", None))
         # Copy script into container (avoids Docker-in-Docker volume mount issues)
         import io
         import tarfile
@@ -2211,6 +2212,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
         try:
             container.remove(force=True, v=True)
+            _live_job_containers.discard(getattr(container, "id", None))
         except Exception:
             pass
         return
@@ -2239,10 +2241,16 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["ErrorMessage"] = f"Container execution error: {e}"[:4000]
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
+        _live_job_containers.discard(getattr(container, "id", None))
         try:
             container.remove(force=True, v=True)
         except Exception:
             pass
+
+
+# Job runs still in progress; any other stopped glue container is the reaper's.
+_live_job_containers: set = set()
+container_reaper.register_live_ids("glue", lambda: set(_live_job_containers) - {None})
 
 
 def _get_job_run(data):
