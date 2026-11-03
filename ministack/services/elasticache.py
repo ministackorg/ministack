@@ -3512,7 +3512,7 @@ def _acl_refusal(rule, keywords):
         valid = not bar or (low[1:] in _ACL_SUBCOMMANDS if rule[0] == "-" else subcommand)
         return None if command in _ACL_COMMANDS and valid else (
             "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
-    if _acl_key(rule) and "\u2028" in rule:  # NBSP and em space are kept in a pattern (us-east-2, round 23)
+    if rule.startswith("~") and "\u2028" in rule:  # NBSP and em space stay in a pattern (us-east-2, round 23)
         return "The access-string is invalid."
     if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
         return None
