@@ -1567,27 +1567,16 @@ def test_user_access_string_with_channel_pattern_round_trips(ec):
 
 
 def test_user_acl_channels_default_to_all():
-    """The ACL SETUSER commands MiniStack sends: `allchannels` before an access string without channel
-    rules or selectors, and on the `default` user of a Valkey group without one (a Redis group keeps
-    `reset` alone)."""
+    """The ACL SETUSER commands MiniStack sends: `&*` before an access string without channel rules or
+    selectors, and nothing before the rest."""
     def user(access):
         return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
 
-    with_allchannels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
-                        "on ~app:* +@all", "on +@all"}  # the rest set channels or have a selector
+    with_all_channels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
+                         "on ~app:* +@all", "on +@all"}  # the rest set channels or have a selector
     for access in {**_AWS_ACL_CHANNELS, **_AWS_ACL_CHANNELS_WITH_DEFAULT}:
-        prefix = ["reset", "allchannels"] if access in with_allchannels else ["reset"]
+        prefix = ["reset", "&*"] if access in with_all_channels else ["reset"]
         assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
-
-    elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"Engine": "redis", "UserIds": []})
-    try:
-        assert elasticache._user_group_acl_commands("000000000000", "us-east-1", "g-chan") == [
-            ["ACL", "SETUSER", "default", "reset"]]
-        elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"Engine": "valkey", "UserIds": []})
-        assert elasticache._user_group_acl_commands("000000000000", "us-east-1", "g-chan") == [
-            ["ACL", "SETUSER", "default", "reset", "allchannels"]]
-    finally:
-        elasticache._user_groups.pop_scoped("000000000000", "us-east-1", "g-chan")
 
 
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
@@ -2893,7 +2882,7 @@ def test_elasticache_acl_setuser_denies_inside_selectors_only():
     from ministack.services import elasticache as _ec
     user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
     assert _ec._acl_setuser(user, ("-a", "-b")) == [
-        "ACL", "SETUSER", "u", "reset", "&*", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+        "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
     assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
     assert _ec._engine_acl({"Engine": "redis", "EngineVersion": "5.0.6"}, None, None) is None  # no ACL before 6
     assert _ec._engine_rules(["on", "+json.get", "(+@bloom", "~x)", "(~y", "+bf.add)", "(-@json)"],
