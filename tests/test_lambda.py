@@ -12894,6 +12894,44 @@ def test_lambda_host_docker_arch_names_the_image_architecture(monkeypatch):
         assert _lam._host_docker_arch(client) == expected
 
 
+def test_lambda_docker_flags_platform_wins_and_never_falls_back(monkeypatch):
+    """--platform in LAMBDA_DOCKER_FLAGS is parsed (it was silently ignored), beats the declared
+    platform, and a host that cannot run it raises instead of falling back to the host's."""
+    assert lsvc._parse_docker_flags("--platform linux/amd64 -m 256m") == {"platform": "linux/amd64", "mem_limit": "256m"}
+    assert lsvc._parse_docker_flags("--platform=linux/arm64")["platform"] == "linux/arm64"
+    assert "platform" not in lsvc._parse_docker_flags("--privileged")
+
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "--platform linux/amd64")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    monkeypatch.setattr(lsvc, "_host_docker_arch_cache", [])
+    monkeypatch.setattr(lsvc, "_unrunnable_docker_platforms", set())
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+    monkeypatch.setattr(lsvc, "_functions", lsvc.AccountRegionScopedDict())
+    lsvc._functions["flag-fn"] = {"architectures_declared": True}
+    runs, pulls = [], []
+
+    def _run(**kwargs):
+        runs.append(kwargs.get("platform"))
+        container = _mk_container(running=False)
+        container.logs.return_value = b"exec /lambda-entrypoint.sh: exec format error"
+        container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+        return container
+
+    client = MagicMock()
+    client.info.return_value = {"Architecture": "aarch64"}
+    client.containers.run = client.containers.create = _run
+    client.images.get.return_value = MagicMock(attrs={"Architecture": "arm64"})
+    client.images.pull.side_effect = lambda image, platform=None: pulls.append(platform)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: client)
+    config = {"FunctionName": "flag-fn", "Runtime": "python3.12", "Handler": "index.handler", "PackageType": "Zip",
+              "Timeout": 3, "MemorySize": 128, "Architectures": ["arm64"],
+              "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:flag-fn"}
+    with pytest.raises(Exception, match="LAMBDA_DOCKER_FLAGS --platform linux/amd64"):
+        lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
+    assert runs == ["linux/amd64"] and pulls == ["linux/amd64"] and not lsvc._unrunnable_docker_platforms
+
+
 @pytest.mark.parametrize("failure,remembered", [
     # What the runtime image logged as it died on GitHub's x86_64 and arm64
     # runners (no binfmt handler) for a function declaring the other platform.
@@ -13293,6 +13331,29 @@ def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
     # A same-named file that came from the user's own zip is left alone.
     (code_dir / "_msctx_shim.js").write_text("// user's own module")
     assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
+
+
+def test_context_arn_shim_concurrent_cold_starts_all_get_the_shim(tmp_path):
+    """Concurrent cold starts of one function write the shim into the same code dir; each gets it."""
+    import threading
+
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    barrier = threading.Barrier(8)
+    results = []
+
+    def cold_start():
+        barrier.wait()
+        results.append(lsvc._write_context_arn_shim(str(code_dir), "nodejs22.x", "lambda.handler"))
+
+    threads = [threading.Thread(target=cold_start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == ["_msctx_shim.handler"] * 8
+    assert sorted(p.name for p in code_dir.iterdir()) == ["_msctx_shim.cjs"]
+
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")

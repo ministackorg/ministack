@@ -3334,6 +3334,39 @@ def test_ec2_sg_legacy_form_all_protocols_rule_matches_without_ports(ec2):
     assert ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"] == []
 
 
+def test_ec2_sg_port_ranges_dropped_where_the_protocol_covers_all_ports(ec2):
+    """botocore IpPermission.IpProtocol: -1 and protocol numbers other than tcp/udp/icmp/icmpv6 allow all
+    ports "regardless of any port range you specify": no write path stores one, and any ports match."""
+    vpc = ec2.create_vpc(CidrBlock="10.73.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(GroupName="sg-ports-ignored", Description="t", VpcId=vpc["VpcId"])["GroupId"]
+
+    def ingress():
+        return ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"]
+
+    try:
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpProtocol="-1", FromPort=0, ToPort=0, CidrIp="10.9.0.0/16")
+        assert "FromPort" not in ingress()[0] and "ToPort" not in ingress()[0]
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
+            {"IpProtocol": "50", "FromPort": 5, "ToPort": 10, "IpRanges": [{"CidrIp": "10.8.0.0/16"}]}])
+        esp = next(r for r in ingress() if r["IpProtocol"] == "50")
+        assert "FromPort" not in esp and "ToPort" not in esp
+        ec2.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=[
+            {"IpProtocol": "50", "FromPort": 1, "ToPort": 2, "IpRanges": [{"CidrIp": "10.8.0.0/16"}]}])
+        assert [r["IpProtocol"] for r in ingress()] == ["-1"]
+
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
+            {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "10.7.0.0/16"}]}])
+        rule_id = next(r["SecurityGroupRuleId"] for r in ec2.describe_security_group_rules(
+            Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"] if r["IpProtocol"] == "tcp")
+        ec2.modify_security_group_rules(GroupId=sg_id, SecurityGroupRules=[{"SecurityGroupRuleId": rule_id,
+            "SecurityGroupRule": {"IpProtocol": "-1", "FromPort": 80, "ToPort": 80, "CidrIpv4": "10.7.0.0/16"}}])
+        modified = [r for r in ingress() if r.get("IpRanges", [{}])[0].get("CidrIp") == "10.7.0.0/16"][0]
+        assert modified["IpProtocol"] == "-1" and "FromPort" not in modified and "ToPort" not in modified
+    finally:
+        ec2.delete_security_group(GroupId=sg_id)
+        ec2.delete_vpc(VpcId=vpc["VpcId"])
+
+
 def test_ec2_cfn_sg_reconcile_matches_all_protocols_rule_without_ports():
     """A CloudFormation update that drops a template's -1 egress rule declared
     with ports -1/-1 also drops the same rule stored without ports, as an

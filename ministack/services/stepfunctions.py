@@ -1896,6 +1896,8 @@ def _run_execution(exec_arn):
 
 
 def _fail_execution(execution, error, cause):
+    if execution["status"] != "RUNNING":  # stopped meanwhile: AWS writes nothing after ExecutionAborted
+        return
     execution["status"] = "FAILED"
     execution["error"] = error
     execution["cause"] = cause

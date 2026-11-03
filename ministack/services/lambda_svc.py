@@ -3480,12 +3480,22 @@ def _kill_pool_entry(entry: dict) -> None:
             pass
         try:
             container.remove(force=True, v=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Lambda container %s not removed (%s); the reaper reclaims it once it has stopped",
+                           getattr(container, "id", "?"), exc)
     tmpdir = entry.get("tmpdir")
     if tmpdir and os.path.exists(tmpdir):
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _live_container_ids() -> set:
+    """Pooled containers: any other stopped container labelled lambda is garbage for the reaper."""
+    with _warm_pool_lock:
+        return {getattr(e.get("container"), "id", None) for entries in _warm_pool.values() for e in entries} - {None}
+
+
+container_reaper.register_live_ids("lambda", _live_container_ids)
 
 
 def _pool_acquire(key: str, max_concurrency: int | None):
@@ -4235,6 +4245,7 @@ def _parse_docker_flags(flags: str) -> dict:
     parser.add_argument("--security-opt", action="append", default=[])
     parser.add_argument("--privileged", action="store_true")
     parser.add_argument("--read-only", action="store_true")
+    parser.add_argument("--platform")
     args, _ = parser.parse_known_args(shlex.split(flags))
 
     kwargs: dict = {}
@@ -4272,6 +4283,8 @@ def _parse_docker_flags(flags: str) -> dict:
         kwargs["privileged"] = True
     if args.read_only:
         kwargs["read_only"] = True
+    if args.platform:
+        kwargs["platform"] = args.platform
 
     if args.tmpfs:
         tmpfs = {}
@@ -4354,12 +4367,7 @@ def _host_docker_arch(client):
     return _host_docker_arch_cache[0]
 
 
-# Declared platforms this Docker host has failed to run (no qemu/Rosetta for the
-# emulation). A host's emulation support doesn't change while MiniStack runs, so
-# once a pinned container could not start, later spawns run that platform on the
-# host's own architecture straight away. Retrying would pull the foreign image
-# over the runtime tag and the host's back on every cold start, and an
-# undeclared function spawning in between would start the foreign one.
+# Declared platforms this host failed to run (no qemu/Rosetta): later spawns use the host's at once.
 _unrunnable_docker_platforms: set = set()
 # What a container whose runtime image is the wrong architecture logs as it dies.
 _ENTRYPOINT_EXEC_FORMAT_ERROR = "exec /lambda-entrypoint.sh: exec format error"
@@ -4572,7 +4580,7 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
     try:
         # Another container of the same code may already hold the dir as a
         # read-only mount; a rename lands the file whole rather than truncated.
-        tmp_path = f"{shim_path}.{os.getpid()}.tmp"
+        tmp_path = f"{shim_path}.{os.getpid()}.{threading.get_ident()}.tmp"  # concurrent cold starts of one function
         with open(tmp_path, "w") as f:
             f.write(source)
         os.replace(tmp_path, shim_path)
@@ -4797,18 +4805,17 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         logger.debug("Lambda %s declares %s, which this host cannot run; using the host architecture",
                      config.get("FunctionName"), docker_platform)
         docker_platform = None
+    # An explicit --platform in LAMBDA_DOCKER_FLAGS wins over the declaration and never falls back.
+    flag_platform = _parse_docker_flags(LAMBDA_DOCKER_FLAGS).get("platform") if LAMBDA_DOCKER_FLAGS else None
+    docker_platform = flag_platform or docker_platform
     docker_arch = docker_platform.rsplit("/", 1)[1] if docker_platform else None
     if docker_platform:
         run_kwargs["platform"] = docker_platform
 
     def _platform_fallback(reason):
-        """The declared platform cannot run here: log it, run on the host's.
-
-        Only the runtime image's own entrypoint failing to exec marks the
-        pinned platform unrunnable on this host. A failed pull may be
-        transient, a create can fail because another spawn swapped the runtime
-        tag, and an image's own entrypoint can be broken for reasons of its own.
-        """
+        """The declared platform cannot run here: log it, run on the host's (only an exec format error is remembered)."""
+        if flag_platform:
+            raise RuntimeError(f"LAMBDA_DOCKER_FLAGS --platform {flag_platform} cannot run here: {reason}")
         if _ENTRYPOINT_EXEC_FORMAT_ERROR in reason:
             _unrunnable_docker_platforms.add(docker_platform)
         logger.warning(
