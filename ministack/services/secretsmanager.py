@@ -111,13 +111,16 @@ def _secret_arn_for_region(secret, region):
     return f"arn:{spec.partition}:secretsmanager:{region}:{spec.account_id}:{spec.resource}"
 
 
-def _resolve(secret_id, *, use_arn_scope=False):
+def _resolve(secret_id, *, use_arn_scope=False, cross_account=False):
     """Look up a secret by name or ARN.  Returns (storage_key, record) or (None, None).
 
     Supports three lookup modes (matching real AWS behaviour):
       1. By name:        "my-secret"
       2. By full ARN:    "arn:aws:secretsmanager:...:secret:my-secret-A1B2C3"
       3. By partial ARN: "arn:aws:secretsmanager:...:secret:my-secret" (no random suffix)
+
+    ``use_arn_scope`` searches the region in the ARN. ``cross_account`` also
+    lets the ARN name another account.
     """
     if not secret_id:
         return None, None
@@ -126,7 +129,7 @@ def _resolve(secret_id, *, use_arn_scope=False):
         if not scope:
             return None, None
         spec, _ = scope
-        if spec.account_id != get_account_id():
+        if spec.account_id != get_account_id() and not cross_account:
             return None, None
         if use_arn_scope:
             candidates = _secrets.items_scoped(spec.account_id, spec.region)
@@ -164,16 +167,17 @@ def _find_stage_version(secret, stage):
     return None, None
 
 
-def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None):
+def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None, cross_account=False):
     """Return the SecretString for *secret_id* at *version_stage* (or the
     version *version_id*), or None.
 
     Used by other services (e.g. ECS, CloudFormation dynamic references) that
     need to read a secret value in-process without going through the HTTP API.
+    With *cross_account*, an ARN is read in the account it names.
     Returns None if the secret does not exist, is scheduled for deletion, or
     has no value for the stage / version.
     """
-    _, secret = _resolve(secret_id, use_arn_scope=True)
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=cross_account)
     if not secret or secret.get("DeletedDate"):
         return None
     if version_id:

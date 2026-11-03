@@ -149,7 +149,7 @@ def _resolve_dynamic_reference(literal: str) -> str:
     ``ssm`` / ``ssm-secure`` take ``name[:version]`` (no version = latest);
     ``secretsmanager`` takes
     ``secret-id[:SecretString[:json-key[:version-stage[:version-id]]]]``,
-    the secret id being a name or an ARN."""
+    the secret id being a name, or an ARN that can name another account."""
     from ministack.services import secretsmanager, ssm
 
     m = _DYNAMIC_REFERENCE.fullmatch(literal)
@@ -179,7 +179,7 @@ def _resolve_dynamic_reference(literal: str) -> str:
             f"Dynamic reference {literal} is invalid: specify either a version "
             "stage or a version id, not both")
     value = secretsmanager.resolve_secret_string(
-        secret_id, version_stage or "AWSCURRENT", version_id or None)
+        secret_id, version_stage or "AWSCURRENT", version_id or None, cross_account=True)
     if value is None:
         raise ValueError(
             f"Dynamic reference {literal} could not be resolved: secret "

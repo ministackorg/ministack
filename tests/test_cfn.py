@@ -3175,6 +3175,35 @@ def test_cfn_secretsmanager_reference_by_arn_version_id_and_json_number(cfn, ssm
             pass
 
 
+@pytest.fixture
+def other_account_secret():
+    sm = boto3.client("secretsmanager", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                      region_name="us-east-1", aws_access_key_id="111122223333", aws_secret_access_key="test")
+    name = f"cfn-dynref-xacct-{_uuid_mod.uuid4().hex[:8]}"
+    yield sm.create_secret(Name=name, SecretString="vpc-0abc")["ARN"]
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+@pytest.mark.parametrize("arn_form", ["full", "partial"])
+def test_cfn_secretsmanager_reference_reads_another_account(cfn, ssm, other_account_secret, arn_form):
+    """A secret ARN that names another account resolves in that account, with
+    or without the 6-character suffix, as on AWS (observed 2026-11-02)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-xacct-{uid}"
+    arn = other_account_secret if arn_form == "full" else other_account_secret.rsplit("-", 1)[0]
+    out = f"/cfn-dynref-xacct/{uid}"
+    template = json.dumps({"Resources": {"P": {
+        "Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": out, "Type": "String", "Value": f"{{{{resolve:secretsmanager:{arn}}}}}"}}}})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _ssm_value(ssm, out) == "vpc-0abc"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_dynamic_reference_that_cannot_resolve_fails_the_resource(cfn, ssm):
     """A reference to a missing parameter fails the resource and rolls the
     stack back with the reason."""
@@ -18839,6 +18868,120 @@ def test_cfn_lambda_function_unheld_foreign_layer_attaches_empty():
     finally:
         cfn.delete_stack(StackName=stack_name)
         _wait_stack(cfn, stack_name)
+
+
+def test_cfn_lambda_function_architectures_pin_the_docker_platform(monkeypatch):
+    """A template's Architectures pins the container platform the way
+    CreateFunction's does, and an update declares what a create of the same
+    template would. Observed on AWS (eu-west-1, 2026-11-02, a stack of inline
+    python3.12 functions returning platform.machine()): [x86_64] runs x86_64,
+    [arm64] runs aarch64, none reports and runs x86_64; an in-place update that
+    removes [arm64] reports and runs x86_64, and one that adds [arm64] runs
+    aarch64. The reported Architectures follow AWS; a function that declares
+    none is deliberately left unpinned (None, the host's platform) rather than
+    pinned to x86_64, as for CreateFunction."""
+    from ministack.services import lambda_svc as _lam
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setattr(_lam, "_functions", _lam.AccountRegionScopedDict())
+    stack = "cfn-arch-stack"
+
+    def props(name, arch):
+        p = {"FunctionName": name, "Runtime": "python3.12", "Handler": "index.handler",
+             "Code": {"ZipFile": "def handler(event, context):\n    return 1\n"}}
+        if arch:
+            p["Architectures"] = [arch]
+        return p
+
+    def platform(name):
+        return _lam._declared_docker_platform(_lam._functions[name]["config"])
+
+    before = {"arch-x86": "x86_64", "arch-arm": "arm64", "arch-none": None}
+    for name, arch in before.items():
+        provisioners._lambda_create(name, props(name, arch), stack)
+    assert platform("arch-x86") == "linux/amd64"
+    assert platform("arch-arm") == "linux/arm64"
+    assert platform("arch-none") is None
+    assert _lam._functions["arch-none"]["config"]["Architectures"] == ["x86_64"]
+
+    after = {"arch-x86": None, "arch-arm": None, "arch-none": "arm64"}
+    for name, arch in after.items():
+        physical_id, _ = provisioners._lambda_update(
+            name, props(name, before[name]), props(name, arch), stack, name)
+        assert physical_id == name
+    for name in ("arch-x86", "arch-arm"):
+        assert _lam._functions[name]["config"]["Architectures"] == ["x86_64"]
+        assert platform(name) is None
+    assert _lam._functions["arch-none"]["config"]["Architectures"] == ["arm64"]
+    assert platform("arch-none") == "linux/arm64"
+
+
+def test_cfn_sam_globals_architectures_reach_the_lambda_function():
+    """SAM's Globals.Function.Architectures lands on the AWS::Lambda::Function
+    the transform emits, so _lambda_create sees it declared. Observed on AWS
+    (eu-west-1, 2026-11-02): an AWS::Serverless::Function under Globals
+    Architectures [arm64] has [arm64] in the processed template and runs
+    aarch64. That the translator emits no Architectures when neither Globals
+    nor the function names one is samtranslator's own behaviour, which keeps
+    such a function undeclared."""
+    pytest.importorskip("samtranslator")
+    from ministack.services.cloudformation.engine import _apply_transforms
+
+    def emitted(template):
+        out = _apply_transforms(json.loads(json.dumps(template)))
+        return out["Resources"]["Fn"]["Properties"]
+
+    fn = {"Type": "AWS::Serverless::Function", "Properties": {
+        "Runtime": "python3.12", "Handler": "index.handler", "CodeUri": "s3://b/k"}}
+    base = {"AWSTemplateFormatVersion": "2010-09-09",
+            "Transform": "AWS::Serverless-2016-10-31", "Resources": {"Fn": fn}}
+    assert emitted({**base, "Globals": {"Function": {"Architectures": ["arm64"]}}})[
+        "Architectures"] == ["arm64"]
+    assert "Architectures" not in emitted(base)
+
+
+@pytest.mark.data_plane
+def test_cfn_lambda_function_runs_on_the_architecture_it_declares(cfn, lam):
+    """A template's function runs as the architecture it declares where the
+    host can run it, and on the host's own architecture where it cannot (no
+    qemu/Rosetta), never failing the invoke; a function that declares none
+    runs on the host's. On AWS (eu-west-1, 2026-11-02) [x86_64] ran x86_64,
+    [arm64] aarch64, and none x86_64."""
+    import platform as _platform
+    import sys as _sys
+
+    native = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64",
+              "aarch64": "aarch64"}.get(_platform.machine().lower())
+
+    def emulated(machine):
+        return machine == native or _sys.platform == "darwin" or os.path.exists(
+            f"/proc/sys/fs/binfmt_misc/qemu-{machine}")
+
+    s = _uuid_mod.uuid4().hex[:8]
+    stack = f"cfn-arch-run-{s}"
+    code = "import platform\ndef handler(event, context):\n    return {'machine': platform.machine()}\n"
+    declared = {"X86": ["x86_64"], "Arm": ["arm64"], "None": None}
+    resources = {}
+    for logical, arch in declared.items():
+        props = {"FunctionName": f"cfn-arch-{logical.lower()}-{s}", "Runtime": "python3.12",
+                 "Handler": "index.handler", "Role": "arn:aws:iam::000000000000:role/cfn-role",
+                 "Timeout": 30, "Code": {"ZipFile": code}}
+        if arch:
+            props["Architectures"] = arch
+        resources[logical] = {"Type": "AWS::Lambda::Function", "Properties": props}
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": resources}))
+    try:
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        expected = {"X86": "x86_64", "Arm": "aarch64", "None": native}
+        for logical, machine in expected.items():
+            for _ in range(2):
+                resp = lam.invoke(FunctionName=f"cfn-arch-{logical.lower()}-{s}", Payload=b"{}")
+                payload = json.loads(resp["Payload"].read())
+                assert resp.get("FunctionError") is None, (logical, payload)
+                ran = payload["machine"]
+                assert ran == (machine if emulated(machine) else native), (logical, ran)
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
 
 
 def test_cfn_lambda_layer_version_permission(cfn, s3, lam):
