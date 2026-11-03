@@ -1521,7 +1521,8 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
 # Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS in us-east-2: the
 # same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (capture rounds
 # aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7), aws-channel-cases and
-# aws-selectors-node).
+# aws-selectors-node). Round aws-one-group-password captured every string here again in one group per
+# engine, as the test sets them up, and four of them also as password users, with the same channels.
 _AWS_ACL_CHANNELS = {
     "on ~* +@all": "&*",
     "on ~* &allowed* +@all": "&allowed*",
@@ -1537,6 +1538,8 @@ _AWS_ACL_CHANNELS = {
     "on ~* -@all +publish +subscribe": "&*",
     "on ~app:* +@all": "&*",
     "on +@all": "&*",
+    # the #2518 unit test's string; serverless only (aws-one-group-password)
+    "on ~foo) (~x +get) +set": "",
 }
 # More selector shapes, captured in groups that also held a password user named default, on every
 # serverless engine (aws-selectors-default); checked in the same setup.
