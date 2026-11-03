@@ -4259,10 +4259,16 @@ def _cluster_container_starting(cluster):
 
     Stopped or failed containers have no probe, so they can move at once.
     """
-    if cluster.get("_shared_container_ready"):
+    if cluster.get("_shared_container_ready") and not any(
+        instance.get("DBInstanceStatus") == "rebooting"
+        for instance in _cluster_member_instances(cluster)
+    ):
         return False
-    return cluster.get("Status") in ("creating", "starting") or any(
-        instance.get("DBInstanceStatus") in ("creating", "starting")
+    if cluster.get("Status") in ("creating", "starting"):
+        return True
+    # A reboot restarts the container and probes the address it had before.
+    return any(
+        instance.get("DBInstanceStatus") in ("creating", "starting", "rebooting")
         for instance in _cluster_member_instances(cluster)
     )
 
@@ -4340,14 +4346,28 @@ def _sync_global_writer_endpoint_aliases(global_cluster):
 
 
 def _apply_deferred_global_writer_alias(cluster):
-    """Bring a cluster's container that just became ready in line with the
-    global writer endpoint: moves skipped while it was starting, or a name it
-    kept across a restart after leaving or renaming its global cluster."""
+    """Bring the global writer endpoint in line once a cluster's container has
+    finished starting, whether it became ready or failed: moves held back while
+    it was starting, and global names a member container no longer owns (kept
+    across a restart, or left on a non-writer by a rename during the hold)."""
     global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+    clusters = [cluster]
     if global_cluster:
         _sync_global_writer_endpoint_aliases(global_cluster)
+        for member in global_cluster.get("GlobalClusterMembers", []):
+            other = _resolve_global_member_cluster(member)
+            if other is not None and other is not cluster:
+                clusters.append(other)
+    for target in clusters:
+        _drop_stale_global_writer_aliases(target)
+
+
+def _drop_stale_global_writer_aliases(cluster):
+    """Rejoin without any global endpoint this cluster's container should not carry."""
     expected = _global_writer_endpoint_aliases(cluster)
     with _shared_container_lock:
+        if _cluster_container_starting(cluster):
+            return
         container_id = cluster.get("_shared_container_id")
         docker_client = _get_docker() if container_id else None
         if not docker_client:
@@ -5457,6 +5477,7 @@ def _create_db_instance_impl(p):
                         cluster["_shared_container_ready"] = False
                         _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
+                        _apply_deferred_global_writer_alias(cluster)
                         return
 
                     cluster["_shared_storage_initialized"] = True
@@ -5471,6 +5492,7 @@ def _create_db_instance_impl(p):
                         cluster["_shared_container_ready"] = False
                         _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
+                        _apply_deferred_global_writer_alias(cluster)
                         return
                     if pending_rotation:
                         cluster.pop("_pending_master_password_rotation", None)
@@ -6033,6 +6055,7 @@ def _finish_instance_reboot(instance, cluster):
     finally:
         if cluster:
             _end_mysql_global_instance_mutation(cluster)
+            _apply_deferred_global_writer_alias(cluster)
 
 
 # ---------------------------------------------------------------------------
@@ -7898,6 +7921,7 @@ def _start_db_cluster(p):
                 cluster["Status"] = "stopped"
                 for inst in _cluster_member_instances(cluster):
                     inst["DBInstanceStatus"] = "stopped"
+                _apply_deferred_global_writer_alias(cluster)
 
             start_failed = False
             pending_rotation = cluster.get("_pending_master_password_rotation")

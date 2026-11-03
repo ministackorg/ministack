@@ -17084,6 +17084,55 @@ def test_rds_global_alias_waits_for_a_starting_container(monkeypatch):
     assert _GLOBAL_ALIAS_NAME in connects[1][2]
 
 
+def test_rds_global_alias_waits_for_a_rebooting_container(monkeypatch):
+    """A reboot restarts the container and probes its old address, so a ready
+    cluster with a rebooting instance is held back like a starting one."""
+    m, gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    rebooting = {"DBInstanceStatus": "rebooting"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [rebooting] if cluster is clusters["a"] else [])
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+    rebooting["DBInstanceStatus"] = "available"
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    assert [c[1] for c in calls if c[0] == "connect"] == [_containers["c-a"], _containers["c-b"]]
+
+
+def test_rds_failed_start_releases_a_held_back_move(monkeypatch):
+    """A starting writer that fails never becomes ready; once it has failed the
+    held-back move runs, so the new writer gets the name."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    clusters["a"].update(_shared_container_ready=False, Status="starting")
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+    clusters["a"]["Status"] = "stopped"
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+
+
+def test_rds_hook_drops_an_old_name_left_on_another_member(monkeypatch):
+    """A rename during a held-back switchover leaves the old name on the old
+    writer; the hook run for the new writer drops it there too."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    clusters["b"].update(_shared_container_ready=False, Status="starting")
+    _flip_global_writer(gc)
+    gc["GlobalClusterIdentifier"] = "gdb2"
+    for c in clusters.values():
+        c["GlobalClusterIdentifier"] = "gdb2"
+    monkeypatch.setattr(m, "_global_clusters", {"gdb2": gc})
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+    clusters["b"].update(_shared_container_ready=True, Status="available")
+    m._apply_deferred_global_writer_alias(clusters["b"])
+    aliases = {cid: containers[f"c-{cid}"].attrs["NetworkSettings"]["Networks"]["net"]["Aliases"] for cid in "ab"}
+    assert _GLOBAL_ALIAS_NAME not in aliases["a"] and _GLOBAL_ALIAS_NAME not in aliases["b"]
+    assert m._global_cluster_endpoint(gc) in aliases["b"]
+
+
 def test_rds_stopped_old_writer_does_not_hold_back_the_move(monkeypatch):
     """No readiness probe polls a stopped or failed container, so a failover away
     from one moves the name at once instead of waiting for a start that may
