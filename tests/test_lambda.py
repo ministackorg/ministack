@@ -3323,6 +3323,43 @@ def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
     assert "layer_0" in names or any(n.startswith("layer_0/") for n in names)
 
 
+def test_lambda_docker_cp_releases_tar_buffer():
+    """The tar built for put_archive is released when the copy returns. tarfile
+    keeps a reference cycle to its fileobj (TarInfo._tarfile), so an unclosed
+    buffer stayed in memory until a full garbage collection: the size of the
+    function's unpacked code on every cold start."""
+    import gc
+    import tempfile
+    import tracemalloc
+
+    from ministack.services.lambda_svc import _docker_cp_dir, _docker_cp_file
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            data.read()
+
+    with tempfile.TemporaryDirectory() as src_dir:
+        path = os.path.join(src_dir, "code.bin")
+        with open(path, "wb") as f:
+            f.write(os.urandom(4 * 1024 * 1024))
+        started = not tracemalloc.is_tracing()
+        if started:
+            tracemalloc.start()
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            _docker_cp_dir(_FakeContainer(), src_dir, "/var/task")
+            _docker_cp_file(_FakeContainer(), path, "/etc/code.bin")
+            held = tracemalloc.get_traced_memory()[0] - base
+        finally:
+            if started:
+                tracemalloc.stop()
+            if gc_enabled:
+                gc.enable()
+    assert held < 1024 * 1024, held
+
+
 def test_lambda_pool_kill_function_reaps_all_qualifiers():
     """_pool_kill_function must remove every pooled docker container for a
     function across all qualifiers (the pool key includes CodeSha256, so
@@ -12855,6 +12892,86 @@ def test_lambda_host_docker_arch_names_the_image_architecture(monkeypatch):
         monkeypatch.setattr(_lam, "_host_docker_arch_cache", [])
         client = type("C", (), {"info": staticmethod(lambda d=daemon: {"Architecture": d})})()
         assert _lam._host_docker_arch(client) == expected
+
+
+@pytest.mark.parametrize("failure,remembered", [
+    # What the runtime image logged as it died on GitHub's x86_64 and arm64
+    # runners (no binfmt handler) for a function declaring the other platform.
+    (b"exec /lambda-entrypoint.sh: exec format error", True),
+    (b"some unrelated crash", False),
+    # An Image function's own entrypoint, broken whatever the platform.
+    (b"exec /app/entry.sh: exec format error", False),
+    # Docker's error carries the request URL, ?platform=linux%2Famd64 included.
+    ('400 Client Error for http+docker://localhost/v1.53/containers/create?platform=linux%2Famd64: '
+     'Bad Request ("invalid mount config for type "bind": bind source path does not exist")', False),
+    # Another spawn swapped the runtime tag between this one's pull and create.
+    ("404 Client Error: image with reference public.ecr.aws/lambda/python:3.12 was found "
+     "but does not match the specified platform: wanted linux/amd64, actual: linux/arm64", False),
+])
+def test_lambda_unrunnable_declared_platform_is_remembered(monkeypatch, tmp_path, failure, remembered):
+    """A host that cannot run a declared platform falls back to its own once.
+
+    On an arm64 host with no amd64 emulation, a function declaring x86_64 used
+    to relearn that on every cold start: pull the amd64 image over the runtime
+    tag, start a container that dies with an exec-format error, then pull the
+    host's image back. Once a container has failed for its architecture, later
+    spawns run on the host's straight away. A container that died for another
+    reason, or could not be created for one, says nothing about the host, so
+    the platform is pinned again.
+    """
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    monkeypatch.setattr(lsvc, "_host_docker_arch_cache", [])
+    monkeypatch.setattr(lsvc, "_unrunnable_docker_platforms", set())
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+    monkeypatch.setattr(lsvc, "_functions", lsvc.AccountRegionScopedDict())
+    lsvc._functions["arch-x86-fn"] = {"architectures_declared": True}
+
+    runs, pulls = [], []
+
+    def _run(**kwargs):
+        runs.append(kwargs.get("platform"))
+        if kwargs.get("platform") == "linux/amd64" and isinstance(failure, str):
+            raise RuntimeError(failure)
+        container = _mk_container(running=kwargs.get("platform") != "linux/amd64")
+        container.logs.return_value = failure
+        container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+        return container
+
+    client = MagicMock()
+    client.info.return_value = {"Architecture": "aarch64"}
+    client.containers.run = _run
+    client.containers.create = _run
+    client.images.get.return_value = MagicMock(attrs={"Architecture": "arm64"})
+    client.images.pull.side_effect = lambda image, platform=None: pulls.append(platform)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: client)
+
+    config = {
+        "FunctionName": "arch-x86-fn", "Runtime": "python3.12", "Handler": "index.handler",
+        "PackageType": "Zip", "Timeout": 3, "MemorySize": 128, "Architectures": ["x86_64"],
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:arch-x86-fn",
+    }
+    code = _make_zip("def handler(e, c): pass")
+    lsvc._spawn_lambda_container(config, code)
+    assert runs == ["linux/amd64", None]
+    assert pulls == ["linux/amd64"]
+
+    runs.clear(), pulls.clear()
+    lsvc._spawn_lambda_container(config, code)
+    if remembered:
+        assert runs == [None] and pulls == []
+        # A handler installed since takes effect after a reset. The reset runs
+        # on throwaway state: the code caches are shared with the live server.
+        _fresh_extract_cache(monkeypatch, tmp_path)
+        for name in ("_layers", "_esms", "_function_urls", "_kinesis_positions",
+                     "_dynamodb_stream_positions", "_esm_backoff_until"):
+            monkeypatch.setattr(lsvc, name, lsvc.AccountRegionScopedDict())
+        monkeypatch.setattr(lsvc, "_pool_clear_all", lambda: None)
+        lsvc.reset()
+        assert lsvc._unrunnable_docker_platforms == set()
+    else:
+        assert runs == ["linux/amd64", None] and pulls == ["linux/amd64"]
 
 
 # ─────────────────────────────── SnapStart ───────────────────────────────
