@@ -2836,6 +2836,7 @@ def test_elasticache_modify_user_append_replays_aws(ec, case):
                     "MinimumEngineVersion": expect[1], "Authentication": expect[2] if len(expect) > 2 else {"Type": "iam"}}
             if want["Authentication"] is None:  # no-password: AWS omits PasswordCount, MiniStack writes 0
                 del want["Authentication"]
+                assert user["Authentication"]["Type"] == "no-password"
             assert {k: user.get(k) for k in want} == want
     finally:
         if created:
@@ -2852,6 +2853,19 @@ def test_elasticache_modify_user_append_skips_stored_rules_aws_refuses(ec):
         assert ec.modify_user(UserId=uid, AppendAccessString="-flushall")["AccessString"] == "on ~* +@all -flushall"
     finally:
         ec.delete_user(UserId=uid)
+
+
+def test_elasticache_no_password_redis_user_reports_engine_floor(ec):
+    """AWS reports 6.0 for a no-password Redis user (us-east-2, issue #2551, round22 create-nopass-get)."""
+    uid = "ec-nopass-floor"
+    user = ec.create_user(UserId=uid, UserName=uid, Engine="redis", AccessString="on ~* -@all",
+                          AuthenticationMode={"Type": "no-password-required"})
+    try:
+        assert user["MinimumEngineVersion"] == "6.0"
+        assert user["Authentication"]["Type"] == "no-password"
+    finally:
+        ec.delete_user(UserId=uid)
+
 
 def test_elasticache_modify_user_access_string_and_append_together(ec):
     """AccessString with AppendAccessString is refused and the user keeps its rules
