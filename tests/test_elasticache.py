@@ -1518,6 +1518,75 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
             ec.delete_user(UserId=user)
 
 
+def test_user_acl_channels_default_to_all():
+    """AWS capture (node-based Valkey 7.2, us-east-2): a user created as `on ~* +@all` reads back from ACL LIST as
+    `on ~* &* +@all`, one with `&allowed*` keeps only that pattern, and the default user of a group
+    without one is `off &* -@all`."""
+    def user(access):
+        return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
+
+    assert elasticache._acl_setuser(user("on ~* +@all")) == [
+        "ACL", "SETUSER", "u", "reset", "allchannels", "on", "~*", "+@all", "nopass"]
+    for access in ("on ~* &allowed* +@all", "on ~* resetchannels +@all", "on ~* allchannels +@all"):
+        assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", "reset", *access.split(), "nopass"]
+
+    elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"UserIds": []})
+    try:
+        assert elasticache._user_group_acl_commands("000000000000", "us-east-1", "g-chan") == [
+            ["ACL", "SETUSER", "default", "reset", "allchannels"]]
+    finally:
+        elasticache._user_groups.pop_scoped("000000000000", "us-east-1", "g-chan")
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+def test_serverless_cache_user_pubsub_channels(ec, tmp_path):
+    """AWS capture (node-based Valkey 7.2, us-east-2): an iam user with `on ~* +@all` can SUBSCRIBE and PUBLISH on any
+    channel; one with `on ~* &allowed* +@all` gets NOPERM outside `allowed*`."""
+    import socket
+    import ssl
+    uid = _uid()
+    all_user, ctl_user, group, name = f"u-all-{uid}", f"u-ctl-{uid}", f"g-{uid}", f"sls-chan-{uid}"
+    for user_id, access in ((all_user, "on ~* +@all"), (ctl_user, "on ~* &allowed* +@all")):
+        ec.create_user(UserId=user_id, UserName=user_id, Engine="valkey", AccessString=access,
+                       AuthenticationMode={"Type": "iam"})
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[all_user, ctl_user])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="7", UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        nochan = b"-NOPERM No permissions to access a channel\r\n"
+
+        def auth(user):
+            return ("AUTH", user, f"{name}/?Action=connect&User={user}")
+
+        def subscribe_and_publish(user, channel):
+            ctx = ssl.create_default_context(cafile=ca)
+            with socket.create_connection((ep["Address"], ep["Port"]), timeout=10) as raw:
+                with ctx.wrap_socket(raw, server_hostname=ep["Address"]) as sub:
+                    for parts in (auth(user), ("SUBSCRIBE", channel)):
+                        sub.sendall(f"*{len(parts)}\r\n".encode()
+                                    + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                        time.sleep(0.2)
+                        subscribed = sub.recv(65536)
+                    published = _tls_session(ep, ca, auth(user), ("PUBLISH", channel, "hello"))[1]
+                    time.sleep(0.2)
+                    return subscribed, published, sub.recv(65536) if published == b":1\r\n" else None
+
+        assert _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", all_user))[1].count(b"&*") == 1
+        chan = b"$8\r\nany-chan\r\n"
+        assert subscribe_and_publish(all_user, "any-chan") == (
+            b"*3\r\n$9\r\nsubscribe\r\n" + chan + b":1\r\n", b":1\r\n",
+            b"*3\r\n$7\r\nmessage\r\n" + chan + b"$5\r\nhello\r\n")
+        assert subscribe_and_publish(ctl_user, "any-chan") == (nochan, nochan, None)
+        assert subscribe_and_publish(ctl_user, "allowed-chan")[1] == b":1\r\n"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (all_user, ctl_user):
+            ec.delete_user(UserId=user)
+
+
 def test_serverless_cache_create_describe_delete(ec):
     name = f"sls-{_uid()}"
     created = ec.create_serverless_cache(
