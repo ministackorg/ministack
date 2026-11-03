@@ -1527,6 +1527,8 @@ _AWS_ACL_CHANNELS = {
     "on ~* allchannels +@all": "&*",
     "on ~* &* +@all": "&*",
     "on ~* &a resetchannels &b +@all": "&b",
+    "on ~* +@all (&chan +get ~k)": "",
+    "on ~* +@all (+get ~k)": "",
 }
 
 
@@ -1593,6 +1595,9 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path):
             channels = _AWS_ACL_CHANNELS[access]
             reply = _tls_session(ep, ca, auth(user_id), ("ACL", "GETUSER", user_id))[1]
             assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n".encode() in reply, access
+        selector_user = users["on ~* +@all (&chan +get ~k)"]
+        reply = _tls_session(ep, ca, auth(selector_user), ("ACL", "GETUSER", selector_user), ("PUBLISH", "chan", "x"))
+        assert b"$8\r\nchannels\r\n$5\r\n&chan\r\n" in reply[1] and reply[2] == nochan
         assert b"$25\r\nuser default off &* -@all\r\n" in _tls_session(ep, ca, auth(all_user), ("ACL", "LIST"))[1]
         chan = b"$8\r\nany-chan\r\n"
         assert subscribe_and_publish(all_user, "any-chan") == (
