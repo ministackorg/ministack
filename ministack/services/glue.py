@@ -1110,8 +1110,23 @@ def _optimizer_table(data):
     key = f"{data.get('DatabaseName')}/{data.get('TableName')}"
     table = _tables.get(key)
     if table is None:
-        return None, error_response_json("EntityNotFoundException", "Entity Not Found", 400)
+        return None, error_response_json("EntityNotFoundException", _entity_not_found_message(), 400)
     return (key, table, _table_optimizers.get(key) or {}), None
+
+
+def _entity_not_found_message():
+    return (f"Entity Not Found (Service: AmazonDataCatalog; Status Code: 400; Error Code: EntityNotFoundException; "
+            f"Request ID: {new_uuid()}; Proxy: null)")
+
+
+def _run_rate_error(config):
+    """Retention and orphan file deletion run every 3 to 168 hours."""
+    for block in ("retentionConfiguration", "orphanFileDeletionConfiguration"):
+        rate = (((config or {}).get(block) or {}).get("icebergConfiguration") or {}).get("runRateInHours")
+        if rate is not None and not 3 <= rate <= 168:
+            return error_response_json("InvalidInputException", "Request Validation Failed with error: "
+                                       "Run rate for ICEBERG tables must be between 3 and 168 hours", 400)
+    return None
 
 
 def _optimizer_response(optimizer_type, config):
@@ -1136,6 +1151,9 @@ def _create_table_optimizer(data):
         return err
     key, table, optimizers = found
     optimizer_type, name = data.get("Type"), data.get("TableName")
+    rate_error = _run_rate_error(data.get("TableOptimizerConfiguration"))
+    if rate_error:
+        return rate_error
     if optimizer_type in optimizers:
         return error_response_json("AlreadyExistsException",
                                    f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
@@ -1198,7 +1216,7 @@ def _batch_get_table_optimizer(data):
         optimizers = _table_optimizers.get(f"{db_name}/{name}") or {}
         ids = {"catalogId": catalog_id, "databaseName": db_name, "tableName": name}
         if table is None:
-            error = ("EntityNotFoundException", "Entity Not Found")
+            error = ("EntityNotFoundException", _entity_not_found_message())
         elif not (table.get("Parameters") or {}).get("metadata_location"):
             error = ("InvalidInputException", "Request Validation Failed: Unsupported Table type")
         elif optimizer_type not in optimizers:
@@ -1214,6 +1232,8 @@ def _list_table_optimizer_runs(data):
     found, err = _optimizer_table(data)
     if err:
         return err
+    if data.get("Type") not in found[2]:
+        return _no_optimizer(data.get("Type"), data.get("TableName"))
     return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
                           "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
                           "TableOptimizerRuns": []})

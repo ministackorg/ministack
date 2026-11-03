@@ -3111,8 +3111,19 @@ def test_glue_table_optimizer_errors(glue, s3):
                                   "catalogId": "000000000000", "databaseName": db, "tableName": "plain",
                                   "type": "compaction"}]
 
+    assert _optimizer_error(lambda: glue.list_table_optimizer_runs(**ids, Type="retention")) == (
+        400, "EntityNotFoundException", "No optimizer of type retention found for the table: t")
+    for rate in (1, 200):
+        assert _optimizer_error(lambda: glue.create_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+            **role, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": rate}}})) == (
+            400, "InvalidInputException",
+            "Request Validation Failed with error: Run rate for ICEBERG tables must be between 3 and 168 hours")
+
     glue.delete_table(DatabaseName=db, Name="t")
-    assert _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="compaction"))[1] == "EntityNotFoundException"
+    status, code, message = _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="compaction"))
+    assert (status, code) == (400, "EntityNotFoundException")
+    assert message.startswith("Entity Not Found (Service: AmazonDataCatalog; Status Code: 400; "
+                              "Error Code: EntityNotFoundException; Request ID: ") and message.endswith("; Proxy: null)")
 
 
 def test_glue_table_optimizer_sort_strategy_with_a_sort_order(glue, s3):
