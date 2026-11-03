@@ -3456,8 +3456,12 @@ _ACL_CATEGORY_COMMANDS = {
         "zpopmin zrangestore zrem zremrangebylex zremrangebyrank zremrangebyscore zunionstore"
     ).split()),
 }
-# +command|arg needs 7.0 for these, though +command alone needs no more than the floor (us-east-2, issue #2551).
-_ACL_FIRST_ARG_7_0 = frozenset("asking readonly readwrite select wait".split())
+# +command|arg needs a later engine when it follows +@category for these pairs, unless a later rule took the
+# command away again (us-east-2, issue #2551).
+_ACL_CATEGORY_ARG_VERSIONS = {
+    **dict.fromkeys((("read", c) for c in "echo lastsave role time".split()), "6.2"),
+    **dict.fromkeys((("keyspace", c) for c in "asking readonly readwrite select wait".split()), "7.0"),
+}
 _ACL_WHITESPACE = " \t\n\r\x0b\x0c"  # AWS splits rules on these only; NBSP and other spaces stay in a rule
 
 
@@ -3561,18 +3565,25 @@ def _acl_apply(scope, rule):
             # +command|sub is refused once the command is fully added, and -command|sub until something
             # granted it; a -@category takes the first away but not the second.
             full = granted = scope["base"] == "+"
+            version = None
             for command in scope["commands"]:
                 if command[1:] == family:
                     full = granted = command[0] == "+"
+                    version = None
                 elif command[1] == "@" and family in _ACL_CATEGORY_COMMANDS.get(command[2:], ()):
                     full = command[0] == "+"
                     granted = granted or full
+                    version = None
+                elif command[1] == "@" and (command[2:], family) in _ACL_CATEGORY_ARG_VERSIONS:
+                    version = _ACL_CATEGORY_ARG_VERSIONS[command[2:], family] if command[0] == "+" else None
             if sign == "+" and full:
                 return (f"Adding a subcommand({low}) of a command already fully added is not allowed. "
                         "Remove the command to start. Example: -DEBUG +DEBUG|DIGEST")
             if sign == "-" and not granted:
                 return (f"Removing a subcommand({low}) of a command not fully added is not allowed. "
                         "Add the command to start. Example: +DEBUG -DEBUG|DIGEST")
+            if sign == "+" and version:
+                scope["versions"].append(version)
         # A rule replaces its earlier one (a whole command also its subcommands'), and is dropped
         # when it repeats the +@all/-@all base without touching a remaining rule.
         scope["commands"] = [c for c in scope["commands"]
@@ -3585,7 +3596,7 @@ def _acl_apply(scope, rule):
 
 def _acl_scope(flag=None):
     return {"flag": flag, "allkeys": False, "keys": [], "channels": None, "patterns": [],
-            "base": "-", "commands": [], "selectors": []}
+            "base": "-", "commands": [], "selectors": [], "versions": []}
 
 
 def _acl_describe(scope, default_channels):
@@ -3611,6 +3622,7 @@ def _acl_apply_rule(root, rule):
         if message:
             return message
     root["selectors"].append(f"({_acl_describe(selector, 'resetchannels')})")
+    root["versions"] += selector["versions"]
     return None
 
 
@@ -3632,8 +3644,6 @@ def _acl_version(rule):
     command, bar, _ = low[1:].partition("|")
     if bar and rule[0] == "-":
         return _ACL_SUBCOMMAND_VERSIONS.get(low[1:], "7.0")
-    if bar and command in _ACL_FIRST_ARG_7_0:
-        return "7.0"
     return _ACL_RULE_VERSIONS.get(command)
 
 
@@ -3671,8 +3681,10 @@ def _append_access_string(access, append):
         message = _acl_apply_rule(root, rule)
         if message:
             return None, None, message
-    # Every rule present counts, even one a later rule replaced or dropped (rounds 5, 9 and 16).
-    version = max(filter(None, map(_acl_version, [*stored, *rules])), key=_acl_version_key, default=None)
+    # Every rule present counts, even one a later rule replaced or dropped (rounds 5, 9 and 16), and so do
+    # the category pairs the rules met on the way (rounds 19 and 20).
+    version = max(filter(None, [*map(_acl_version, [*stored, *rules]), *root["versions"]]),
+                  key=_acl_version_key, default=None)
     default = None if not version else "&*" if version == "6.2" else "resetchannels"
     return _acl_describe(root, default), version, None
 
