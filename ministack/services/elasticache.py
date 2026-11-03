@@ -1321,7 +1321,7 @@ def _describe_cache_clusters(p):
         clusters = list(_clusters.values())
     members = "".join(_cluster_xml(c) for c in clusters)
     return _xml(200, "DescribeCacheClustersResponse",
-        f"<DescribeCacheClustersResult><CacheClusters>{members}</CacheClusters></DescribeCacheClustersResult>")
+        f"<DescribeCacheClustersResult><CacheClusters>{xml_escape(str(members))}</CacheClusters></DescribeCacheClustersResult>")
 
 
 def _modify_cache_cluster(p):
@@ -1656,7 +1656,7 @@ def _describe_replication_groups(p):
     # Strict SDKs (aws-sdk-go-v2, Java/Rust v2) parse a <member>-wrapped list as empty.
     members = "".join(f"<ReplicationGroup>{_rg_xml(g)}</ReplicationGroup>" for g in groups)
     return _xml(200, "DescribeReplicationGroupsResponse",
-        f"<DescribeReplicationGroupsResult><ReplicationGroups>{members}</ReplicationGroups></DescribeReplicationGroupsResult>")
+        f"<DescribeReplicationGroupsResult><ReplicationGroups>{xml_escape(str(members))}</ReplicationGroups></DescribeReplicationGroupsResult>")
 
 
 def _modify_replication_group(p):
@@ -1833,16 +1833,16 @@ def _resolve_subnets(p):
 
 def _subnet_group_xml(sg):
     subnets_xml = "".join(
-        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
-        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></Subnet>"
+        f"<Subnet><SubnetIdentifier>{xml_escape(str(s['SubnetIdentifier']))}</SubnetIdentifier>"
+        f"<SubnetAvailabilityZone><Name>{xml_escape(str(s['SubnetAvailabilityZone']['Name']))}</Name></SubnetAvailabilityZone></Subnet>"
         for s in sg.get("Subnets", [])
     )
     return (
-        f"<CacheSubnetGroupName>{sg['CacheSubnetGroupName']}</CacheSubnetGroupName>"
+        f"<CacheSubnetGroupName>{xml_escape(str(sg['CacheSubnetGroupName']))}</CacheSubnetGroupName>"
         f"<CacheSubnetGroupDescription>{xml_escape(sg.get('CacheSubnetGroupDescription', ''))}</CacheSubnetGroupDescription>"
-        f"<VpcId>{sg.get('VpcId', '')}</VpcId>"
+        f"<VpcId>{xml_escape(str(sg.get('VpcId', '')))}</VpcId>"
         f"<Subnets>{subnets_xml}</Subnets>"
-        f"<ARN>{sg.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(sg.get('ARN', '')))}</ARN>"
     )
 
 
@@ -1876,7 +1876,7 @@ def _describe_subnet_groups(p):
     groups = [_subnet_groups[name]] if name else list(_subnet_groups.values())
     members = "".join(f"<CacheSubnetGroup>{_subnet_group_xml(g)}</CacheSubnetGroup>" for g in groups)
     return _xml(200, "DescribeCacheSubnetGroupsResponse",
-        f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
+        f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{xml_escape(str(members))}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
 
 
 def _delete_subnet_group(p):
@@ -1934,10 +1934,10 @@ def _create_param_group(p):
 
     return _xml(200, "CreateCacheParameterGroupResponse",
         f"<CreateCacheParameterGroupResult><CacheParameterGroup>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
-        f"<CacheParameterGroupFamily>{family}</CacheParameterGroupFamily>"
-        f"<Description>{desc}</Description>"
-        f"<ARN>{arn}</ARN>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(family))}</CacheParameterGroupFamily>"
+        f"<Description>{xml_escape(str(desc))}</Description>"
+        f"<ARN>{xml_escape(str(arn))}</ARN>"
         f"</CacheParameterGroup></CreateCacheParameterGroupResult>")
 
 
@@ -1948,14 +1948,14 @@ def _describe_param_groups(p):
     groups = [_param_groups[name]] if name and name in _param_groups else list(_param_groups.values())
     # CacheParameterGroupList.member.locationName = "CacheParameterGroup"
     members = "".join(
-        f"<CacheParameterGroup><CacheParameterGroupName>{g['CacheParameterGroupName']}</CacheParameterGroupName>"
-        f"<CacheParameterGroupFamily>{g.get('CacheParameterGroupFamily', '')}</CacheParameterGroupFamily>"
-        f"<Description>{g.get('Description', '')}</Description>"
-        f"<ARN>{g.get('ARN', '')}</ARN></CacheParameterGroup>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(g['CacheParameterGroupName']))}</CacheParameterGroupName>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(g.get('CacheParameterGroupFamily', '')))}</CacheParameterGroupFamily>"
+        f"<Description>{xml_escape(str(g.get('Description', '')))}</Description>"
+        f"<ARN>{xml_escape(str(g.get('ARN', '')))}</ARN></CacheParameterGroup>"
         for g in groups
     )
     return _xml(200, "DescribeCacheParameterGroupsResponse",
-        f"<DescribeCacheParameterGroupsResult><CacheParameterGroups>{members}</CacheParameterGroups></DescribeCacheParameterGroupsResult>")
+        f"<DescribeCacheParameterGroupsResult><CacheParameterGroups>{xml_escape(str(members))}</CacheParameterGroups></DescribeCacheParameterGroupsResult>")
 
 
 def _delete_param_group(p):
@@ -1983,18 +1983,18 @@ def _describe_cache_parameters(p):
     for pname, pval in params.items():
         members += (
             f"<Parameter>"
-            f"<ParameterName>{pname}</ParameterName>"
-            f"<ParameterValue>{pval.get('Value', '')}</ParameterValue>"
-            f"<Description>{pval.get('Description', '')}</Description>"
-            f"<Source>{pval.get('Source', 'system')}</Source>"
-            f"<DataType>{pval.get('DataType', 'string')}</DataType>"
-            f"<AllowedValues>{pval.get('AllowedValues', '')}</AllowedValues>"
-            f"<IsModifiable>{str(pval.get('IsModifiable', True)).lower()}</IsModifiable>"
-            f"<MinimumEngineVersion>{pval.get('MinimumEngineVersion', '5.0.0')}</MinimumEngineVersion>"
+            f"<ParameterName>{xml_escape(str(pname))}</ParameterName>"
+            f"<ParameterValue>{xml_escape(str(pval.get('Value', '')))}</ParameterValue>"
+            f"<Description>{xml_escape(str(pval.get('Description', '')))}</Description>"
+            f"<Source>{xml_escape(str(pval.get('Source', 'system')))}</Source>"
+            f"<DataType>{xml_escape(str(pval.get('DataType', 'string')))}</DataType>"
+            f"<AllowedValues>{xml_escape(str(pval.get('AllowedValues', '')))}</AllowedValues>"
+            f"<IsModifiable>{xml_escape(str(str(pval.get('IsModifiable', True)).lower()))}</IsModifiable>"
+            f"<MinimumEngineVersion>{xml_escape(str(pval.get('MinimumEngineVersion', '5.0.0')))}</MinimumEngineVersion>"
             f"</Parameter>"
         )
     return _xml(200, "DescribeCacheParametersResponse",
-        f"<DescribeCacheParametersResult><Parameters>{members}</Parameters></DescribeCacheParametersResult>")
+        f"<DescribeCacheParametersResult><Parameters>{xml_escape(str(members))}</Parameters></DescribeCacheParametersResult>")
 
 
 def _modify_cache_parameter_group(p):
@@ -2021,7 +2021,7 @@ def _modify_cache_parameter_group(p):
 
     return _xml(200, "ModifyCacheParameterGroupResponse",
         f"<ModifyCacheParameterGroupResult>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
         f"</ModifyCacheParameterGroupResult>")
 
 
@@ -2051,7 +2051,7 @@ def _reset_cache_parameter_group(p):
 
     return _xml(200, "ResetCacheParameterGroupResponse",
         f"<ResetCacheParameterGroupResult>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
         f"</ResetCacheParameterGroupResult>")
 
 
@@ -2100,12 +2100,12 @@ def _describe_engine_versions(p):
     }
     # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
-        f"<CacheEngineVersion><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"
-        f"<CacheParameterGroupFamily>{_param_group_family_for_engine(engine, v)}</CacheParameterGroupFamily></CacheEngineVersion>"
+        f"<CacheEngineVersion><Engine>{xml_escape(str(engine))}</Engine><EngineVersion>{xml_escape(str(v))}</EngineVersion>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(_param_group_family_for_engine(engine, v)))}</CacheParameterGroupFamily></CacheEngineVersion>"
         for v in versions.get(engine, ["7.0.12"])
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
-        f"<DescribeCacheEngineVersionsResult><CacheEngineVersions>{members}</CacheEngineVersions></DescribeCacheEngineVersionsResult>")
+        f"<DescribeCacheEngineVersionsResult><CacheEngineVersions>{xml_escape(str(members))}</CacheEngineVersions></DescribeCacheEngineVersionsResult>")
 
 
 # ---- Tags ----
@@ -2228,7 +2228,7 @@ def _list_tags(p):
         return err
     tags = _tags.get(arn, [])
     # TagList.member.locationName = "Tag"
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "ListTagsForResourceResponse",
         f"<ListTagsForResourceResult><TagList>{tag_xml}</TagList></ListTagsForResourceResult>")
 
@@ -2241,7 +2241,7 @@ def _add_tags(p):
     new_tags = _extract_tags(p)
     tags = _merge_tags_for_arn(arn, new_tags)
 
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "AddTagsToResourceResponse",
         f"<AddTagsToResourceResult><TagList>{tag_xml}</TagList></AddTagsToResourceResult>")
 
@@ -2257,7 +2257,7 @@ def _remove_tags(p):
         keys_to_remove.add(_p(p, f"TagKeys.member.{idx}"))
         idx += 1
     tags = _remove_tag_keys_for_arn(arn, keys_to_remove)
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "RemoveTagsFromResourceResponse",
         f"<RemoveTagsFromResourceResult><TagList>{tag_xml}</TagList></RemoveTagsFromResourceResult>")
 
@@ -2334,7 +2334,7 @@ def _describe_snapshots(p):
     # SnapshotList.member.locationName = "Snapshot"
     members = "".join(f"<Snapshot>{_snapshot_xml(s)}</Snapshot>" for s in snaps)
     return _xml(200, "DescribeSnapshotsResponse",
-        f"<DescribeSnapshotsResult><Snapshots>{members}</Snapshots></DescribeSnapshotsResult>")
+        f"<DescribeSnapshotsResult><Snapshots>{xml_escape(str(members))}</Snapshots></DescribeSnapshotsResult>")
 
 
 # ---- Serverless Caches ----
@@ -2815,10 +2815,10 @@ def _describe_serverless_caches(p):
     page = caches[start:start + max_results]
     token = ""
     if start + max_results < len(caches):
-        token = f"<NextToken>{start + max_results}</NextToken>"
+        token = f"<NextToken>{xml_escape(str(start + max_results))}</NextToken>"
     members = "".join(f"<member>{_serverless_cache_xml(c)}</member>" for c in page)
     return _xml(200, "DescribeServerlessCachesResponse",
-                f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{members}</ServerlessCaches>"
+                f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{xml_escape(str(members))}</ServerlessCaches>"
                 f"</DescribeServerlessCachesResult>")
 
 
@@ -2926,7 +2926,7 @@ def _serverless_cache_xml(c):
         e = c.get(tag)
         if not e:
             return ""
-        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{e['Port']}</Port></{tag}>"
+        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{xml_escape(str(e['Port']))}</Port></{tag}>"
 
     def optional(tag, value):
         return f"<{tag}>{xml_escape(str(value))}</{tag}>" if value not in (None, "") else ""
@@ -2937,7 +2937,7 @@ def _serverless_cache_xml(c):
         parts = "".join(
             f"<{part}>" + "".join(optional(k, v) for k, v in limits[part].items()) + f"</{part}>"
             for part in ("DataStorage", "ECPUPerSecond") if part in limits)
-        limits_xml = f"<CacheUsageLimits>{parts}</CacheUsageLimits>"
+        limits_xml = f"<CacheUsageLimits>{xml_escape(str(parts))}</CacheUsageLimits>"
     created = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(c["CreateTime"]))
     security_groups = "".join(f"<SecurityGroupId>{xml_escape(g)}</SecurityGroupId>"
                               for g in c.get("SecurityGroupIds") or [])
@@ -2945,23 +2945,23 @@ def _serverless_cache_xml(c):
     return (
         f"<ServerlessCacheName>{xml_escape(c['ServerlessCacheName'])}</ServerlessCacheName>"
         f"{optional('Description', c.get('Description'))}"
-        f"<CreateTime>{created}</CreateTime>"
-        f"<Status>{c['Status']}</Status>"
-        f"<Engine>{c['Engine']}</Engine>"
-        f"<MajorEngineVersion>{c['MajorEngineVersion']}</MajorEngineVersion>"
-        f"<FullEngineVersion>{c['FullEngineVersion']}</FullEngineVersion>"
+        f"<CreateTime>{xml_escape(str(created))}</CreateTime>"
+        f"<Status>{xml_escape(str(c['Status']))}</Status>"
+        f"<Engine>{xml_escape(str(c['Engine']))}</Engine>"
+        f"<MajorEngineVersion>{xml_escape(str(c['MajorEngineVersion']))}</MajorEngineVersion>"
+        f"<FullEngineVersion>{xml_escape(str(c['FullEngineVersion']))}</FullEngineVersion>"
         f"{limits_xml}"
         f"{optional('KmsKeyId', c.get('KmsKeyId'))}"
         f"<StorageEncryptionType>{'sse-kms' if c.get('KmsKeyId') else 'sse-elasticache'}</StorageEncryptionType>"
-        f"<SecurityGroupIds>{security_groups}</SecurityGroupIds>"
+        f"<SecurityGroupIds>{xml_escape(str(security_groups))}</SecurityGroupIds>"
         f"{endpoint('Endpoint')}"
         f"{endpoint('ReaderEndpoint')}"
-        f"<ARN>{c['ARN']}</ARN>"
+        f"<ARN>{xml_escape(str(c['ARN']))}</ARN>"
         f"{optional('UserGroupId', c.get('UserGroupId'))}"
-        f"<SubnetIds>{subnets}</SubnetIds>"
-        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
+        f"<SubnetIds>{xml_escape(str(subnets))}</SubnetIds>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
         f"{optional('DailySnapshotTime', c.get('DailySnapshotTime'))}"
-        f"<NetworkType>{c.get('NetworkType', 'ipv4')}</NetworkType>"
+        f"<NetworkType>{xml_escape(str(c.get('NetworkType', 'ipv4')))}</NetworkType>"
     )
 
 
@@ -2982,15 +2982,15 @@ def _describe_events(p):
     # EventList.member.locationName = "Event"
     members = "".join(
         f"<Event>"
-        f"<SourceIdentifier>{e['SourceIdentifier']}</SourceIdentifier>"
-        f"<SourceType>{e['SourceType']}</SourceType>"
-        f"<Message>{e['Message']}</Message>"
-        f"<Date>{e['Date']}</Date>"
+        f"<SourceIdentifier>{xml_escape(str(e['SourceIdentifier']))}</SourceIdentifier>"
+        f"<SourceType>{xml_escape(str(e['SourceType']))}</SourceType>"
+        f"<Message>{xml_escape(str(e['Message']))}</Message>"
+        f"<Date>{xml_escape(str(e['Date']))}</Date>"
         f"</Event>"
         for e in filtered
     )
     return _xml(200, "DescribeEventsResponse",
-        f"<DescribeEventsResult><Events>{members}</Events></DescribeEventsResult>")
+        f"<DescribeEventsResult><Events>{xml_escape(str(members))}</Events></DescribeEventsResult>")
 
 
 # ---- Users (Redis ACL) ----
@@ -3163,7 +3163,7 @@ def _describe_users(p):
 
     members = "".join(f"<member>{_user_xml(u)}</member>" for u in users)
     return _xml(200, "DescribeUsersResponse",
-        f"<DescribeUsersResult><Users>{members}</Users></DescribeUsersResult>")
+        f"<DescribeUsersResult><Users>{xml_escape(str(members))}</Users></DescribeUsersResult>")
 
 
 def _delete_user(p):
@@ -3251,7 +3251,7 @@ def _describe_user_groups(p):
 
     members = "".join(f"<member>{_user_group_xml(g)}</member>" for g in groups)
     return _xml(200, "DescribeUserGroupsResponse",
-        f"<DescribeUserGroupsResult><UserGroups>{members}</UserGroups></DescribeUserGroupsResult>")
+        f"<DescribeUserGroupsResult><UserGroups>{xml_escape(str(members))}</UserGroups></DescribeUserGroupsResult>")
 
 
 def _delete_user_group(p):
@@ -3320,38 +3320,38 @@ def _modify_user_group(p):
 
 
 def _user_xml(u):
-    group_ids_xml = "".join(f"<member>{gid}</member>" for gid in u.get("UserGroupIds", []))
+    group_ids_xml = "".join(f"<member>{xml_escape(str(gid))}</member>" for gid in u.get("UserGroupIds", []))
     auth = u.get("Authentication", {})
     return (
-        f"<UserId>{u['UserId']}</UserId>"
-        f"<UserName>{u.get('UserName', '')}</UserName>"
-        f"<Engine>{u.get('Engine', 'redis')}</Engine>"
-        f"<Status>{u.get('Status', 'active')}</Status>"
+        f"<UserId>{xml_escape(str(u['UserId']))}</UserId>"
+        f"<UserName>{xml_escape(str(u.get('UserName', '')))}</UserName>"
+        f"<Engine>{xml_escape(str(u.get('Engine', 'redis')))}</Engine>"
+        f"<Status>{xml_escape(str(u.get('Status', 'active')))}</Status>"
         f"<AccessString>{xml_escape(u.get('AccessString', ''))}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
-        + (f"<MinimumEngineVersion>{_minimum_engine_version(u)}</MinimumEngineVersion>"
+        + (f"<MinimumEngineVersion>{xml_escape(str(_minimum_engine_version(u)))}</MinimumEngineVersion>"
            if _minimum_engine_version(u) else "")
-        + f"<Authentication><Type>{auth.get('Type', 'no-password')}</Type>"
-        + (f"<PasswordCount>{auth['PasswordCount']}</PasswordCount>" if "PasswordCount" in auth
+        + f"<Authentication><Type>{xml_escape(str(auth.get('Type', 'no-password')))}</Type>"
+        + (f"<PasswordCount>{xml_escape(str(auth['PasswordCount']))}</PasswordCount>" if "PasswordCount" in auth
            else "" if auth.get("Type") == "iam" else "<PasswordCount>0</PasswordCount>")
         + "</Authentication>"
-        f"<ARN>{u.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(u.get('ARN', '')))}</ARN>"
     )
 
 
 def _user_group_xml(g):
-    user_ids_xml = "".join(f"<member>{uid}</member>" for uid in g.get("UserIds", []))
-    rg_xml = "".join(f"<member>{rg}</member>" for rg in g.get("ReplicationGroups", []))
-    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{u}</member>" for u in ids) + f"</{k}>"
+    user_ids_xml = "".join(f"<member>{xml_escape(str(uid))}</member>" for uid in g.get("UserIds", []))
+    rg_xml = "".join(f"<member>{xml_escape(str(rg))}</member>" for rg in g.get("ReplicationGroups", []))
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{xml_escape(str(u))}</member>" for u in ids) + f"</{k}>"
                           for k, ids in (g.get("PendingChanges") or {}).items() if ids)
     return (
-        f"<UserGroupId>{g['UserGroupId']}</UserGroupId>"
-        f"<Status>{g.get('Status', 'active')}</Status>"
-        f"<Engine>{g.get('Engine', 'redis')}</Engine>"
+        f"<UserGroupId>{xml_escape(str(g['UserGroupId']))}</UserGroupId>"
+        f"<Status>{xml_escape(str(g.get('Status', 'active')))}</Status>"
+        f"<Engine>{xml_escape(str(g.get('Engine', 'redis')))}</Engine>"
         f"<UserIds>{user_ids_xml}</UserIds>"
         + (f"<PendingChanges>{pending_xml}</PendingChanges>" if pending_xml else "")
         + f"<ReplicationGroups>{rg_xml}</ReplicationGroups>"
-        f"<ARN>{g.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(g.get('ARN', '')))}</ARN>"
     )
 
 
@@ -3361,8 +3361,8 @@ def _security_groups_xml(groups):
     xml = ""
     for g in groups or []:
         xml += (
-            f"<member><SecurityGroupId>{g.get('SecurityGroupId', '')}</SecurityGroupId>"
-            f"<Status>{g.get('Status', 'active')}</Status></member>"
+            f"<member><SecurityGroupId>{xml_escape(str(g.get('SecurityGroupId', '')))}</SecurityGroupId>"
+            f"<Status>{xml_escape(str(g.get('Status', 'active')))}</Status></member>"
         )
     return xml
 
@@ -3377,17 +3377,17 @@ def _log_delivery_configs_xml(configs):
         if log_group:
             destination_xml = (
                 f"<DestinationDetails><CloudWatchLogsDetails>"
-                f"<LogGroup>{log_group}</LogGroup>"
+                f"<LogGroup>{xml_escape(str(log_group))}</LogGroup>"
                 f"</CloudWatchLogsDetails></DestinationDetails>"
             )
         items.append(
             f"<LogDeliveryConfiguration>"
             f"{destination_xml}"
-            f"<DestinationType>{config.get('DestinationType', 'cloudwatch-logs')}</DestinationType>"
-            f"<LogFormat>{config.get('LogFormat', 'text')}</LogFormat>"
-            f"<LogType>{config.get('LogType', '')}</LogType>"
-            f"<Status>{config.get('Status', 'active')}</Status>"
-            f"<Message>{config.get('Message', '')}</Message>"
+            f"<DestinationType>{xml_escape(str(config.get('DestinationType', 'cloudwatch-logs')))}</DestinationType>"
+            f"<LogFormat>{xml_escape(str(config.get('LogFormat', 'text')))}</LogFormat>"
+            f"<LogType>{xml_escape(str(config.get('LogType', '')))}</LogType>"
+            f"<Status>{xml_escape(str(config.get('Status', 'active')))}</Status>"
+            f"<Message>{xml_escape(str(config.get('Message', '')))}</Message>"
             f"</LogDeliveryConfiguration>"
         )
     return "".join(items)
@@ -3409,16 +3409,16 @@ def _cluster_xml_inner(c):
         node_az = node.get("CustomerAvailabilityZone") or az
         pgs = node.get("ParameterGroupStatus", "in-sync")
         src = node.get("SourceCacheNodeId") or ""
-        src_xml = f"<SourceCacheNodeId>{src}</SourceCacheNodeId>" if src else ""
+        src_xml = f"<SourceCacheNodeId>{xml_escape(str(src))}</SourceCacheNodeId>" if src else ""
         nodes_xml += (
             f"<CacheNode>"
-            f"<CacheNodeId>{node['CacheNodeId']}</CacheNodeId>"
-            f"<CacheNodeStatus>{node['CacheNodeStatus']}</CacheNodeStatus>"
-            f"<CacheNodeCreateTime>{created_iso}</CacheNodeCreateTime>"
-            f"<Endpoint><Address>{nep.get('Address', 'localhost')}</Address>"
-            f"<Port>{nep.get('Port', 6379)}</Port></Endpoint>"
-            f"<ParameterGroupStatus>{pgs}</ParameterGroupStatus>"
-            f"<CustomerAvailabilityZone>{node_az}</CustomerAvailabilityZone>"
+            f"<CacheNodeId>{xml_escape(str(node['CacheNodeId']))}</CacheNodeId>"
+            f"<CacheNodeStatus>{xml_escape(str(node['CacheNodeStatus']))}</CacheNodeStatus>"
+            f"<CacheNodeCreateTime>{xml_escape(str(created_iso))}</CacheNodeCreateTime>"
+            f"<Endpoint><Address>{xml_escape(str(nep.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(nep.get('Port', 6379)))}</Port></Endpoint>"
+            f"<ParameterGroupStatus>{xml_escape(str(pgs))}</ParameterGroupStatus>"
+            f"<CustomerAvailabilityZone>{xml_escape(str(node_az))}</CustomerAvailabilityZone>"
             f"{src_xml}"
             f"</CacheNode>"
         )
@@ -3433,36 +3433,36 @@ def _cluster_xml_inner(c):
     else:
         cluster_created_iso = str(cluster_created)
     return (
-        f"<CacheClusterId>{c['CacheClusterId']}</CacheClusterId>"
-        f"<CacheClusterStatus>{c['CacheClusterStatus']}</CacheClusterStatus>"
-        f"<CacheClusterCreateTime>{cluster_created_iso}</CacheClusterCreateTime>"
-        f"<Engine>{c['Engine']}</Engine>"
-        f"<EngineVersion>{c['EngineVersion']}</EngineVersion>"
-        f"<CacheNodeType>{c['CacheNodeType']}</CacheNodeType>"
-        f"<NumCacheNodes>{c['NumCacheNodes']}</NumCacheNodes>"
-        f"<CacheClusterArn>{c['CacheClusterArn']}</CacheClusterArn>"
-        f"<ARN>{c.get('CacheClusterArn', '')}</ARN>"
-        f"<PreferredAvailabilityZone>{c.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
-        f"<PreferredMaintenanceWindow>{c.get('PreferredMaintenanceWindow', '')}</PreferredMaintenanceWindow>"
-        f"<CacheParameterGroup><CacheParameterGroupName>{parameter_group.get('CacheParameterGroupName', '')}</CacheParameterGroupName>"
-        f"<ParameterApplyStatus>{parameter_group.get('ParameterApplyStatus', 'in-sync')}</ParameterApplyStatus></CacheParameterGroup>"
-        f"<CacheSubnetGroupName>{c.get('CacheSubnetGroupName', '')}</CacheSubnetGroupName>"
+        f"<CacheClusterId>{xml_escape(str(c['CacheClusterId']))}</CacheClusterId>"
+        f"<CacheClusterStatus>{xml_escape(str(c['CacheClusterStatus']))}</CacheClusterStatus>"
+        f"<CacheClusterCreateTime>{xml_escape(str(cluster_created_iso))}</CacheClusterCreateTime>"
+        f"<Engine>{xml_escape(str(c['Engine']))}</Engine>"
+        f"<EngineVersion>{xml_escape(str(c['EngineVersion']))}</EngineVersion>"
+        f"<CacheNodeType>{xml_escape(str(c['CacheNodeType']))}</CacheNodeType>"
+        f"<NumCacheNodes>{xml_escape(str(c['NumCacheNodes']))}</NumCacheNodes>"
+        f"<CacheClusterArn>{xml_escape(str(c['CacheClusterArn']))}</CacheClusterArn>"
+        f"<ARN>{xml_escape(str(c.get('CacheClusterArn', '')))}</ARN>"
+        f"<PreferredAvailabilityZone>{xml_escape(str(c.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
+        f"<PreferredMaintenanceWindow>{xml_escape(str(c.get('PreferredMaintenanceWindow', '')))}</PreferredMaintenanceWindow>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(parameter_group.get('CacheParameterGroupName', '')))}</CacheParameterGroupName>"
+        f"<ParameterApplyStatus>{xml_escape(str(parameter_group.get('ParameterApplyStatus', 'in-sync')))}</ParameterApplyStatus></CacheParameterGroup>"
+        f"<CacheSubnetGroupName>{xml_escape(str(c.get('CacheSubnetGroupName', '')))}</CacheSubnetGroupName>"
         f"<SecurityGroups>{security_groups_xml}</SecurityGroups>"
-        f"<ReplicationGroupId>{c.get('ReplicationGroupId', '')}</ReplicationGroupId>"
-        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
-        f"<SnapshotWindow>{c.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<ReplicationGroupId>{xml_escape(str(c.get('ReplicationGroupId', '')))}</ReplicationGroupId>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
+        f"<SnapshotWindow>{xml_escape(str(c.get('SnapshotWindow', '')))}</SnapshotWindow>"
         f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
-        f"<AuthTokenEnabled>{str(c.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
-        f"<TransitEncryptionEnabled>{str(c.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"<AuthTokenEnabled>{xml_escape(str(str(c.get('AuthTokenEnabled', False)).lower()))}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{xml_escape(str(str(c.get('TransitEncryptionEnabled', False)).lower()))}</TransitEncryptionEnabled>"
         f"{_transit_mode_xml(c)}"
-        f"<AtRestEncryptionEnabled>{str(c.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
+        f"<AtRestEncryptionEnabled>{xml_escape(str(str(c.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
         f"<CacheNodes>{nodes_xml}</CacheNodes>"
     )
 
 
 def _transit_mode_xml(record):
     mode = record.get("TransitEncryptionMode")
-    return f"<TransitEncryptionMode>{mode}</TransitEncryptionMode>" if mode else ""
+    return f"<TransitEncryptionMode>{xml_escape(str(mode))}</TransitEncryptionMode>" if mode else ""
 
 
 def _cluster_xml(c):
@@ -3483,24 +3483,24 @@ def _rg_xml(rg):
             rep = m.get("ReadEndpoint", {})
             members_xml += (
                 f"<NodeGroupMember>"
-                f"<CacheClusterId>{m.get('CacheClusterId', '')}</CacheClusterId>"
-                f"<CacheNodeId>{m.get('CacheNodeId', '0001')}</CacheNodeId>"
-                f"<CurrentRole>{m.get('CurrentRole', 'primary')}</CurrentRole>"
-                f"<PreferredAvailabilityZone>{m.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
-                f"<ReadEndpoint><Address>{rep.get('Address', 'localhost')}</Address>"
-                f"<Port>{rep.get('Port', 6379)}</Port></ReadEndpoint>"
+                f"<CacheClusterId>{xml_escape(str(m.get('CacheClusterId', '')))}</CacheClusterId>"
+                f"<CacheNodeId>{xml_escape(str(m.get('CacheNodeId', '0001')))}</CacheNodeId>"
+                f"<CurrentRole>{xml_escape(str(m.get('CurrentRole', 'primary')))}</CurrentRole>"
+                f"<PreferredAvailabilityZone>{xml_escape(str(m.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
+                f"<ReadEndpoint><Address>{xml_escape(str(rep.get('Address', 'localhost')))}</Address>"
+                f"<Port>{xml_escape(str(rep.get('Port', 6379)))}</Port></ReadEndpoint>"
                 f"</NodeGroupMember>"
             )
         pep = ng.get("PrimaryEndpoint", {})
         rdr = ng.get("ReaderEndpoint", {})
         node_groups_xml += (
             f"<NodeGroup>"
-            f"<NodeGroupId>{ng['NodeGroupId']}</NodeGroupId>"
-            f"<Status>{ng['Status']}</Status>"
-            f"<PrimaryEndpoint><Address>{pep.get('Address', 'localhost')}</Address>"
-            f"<Port>{pep.get('Port', 6379)}</Port></PrimaryEndpoint>"
-            f"<ReaderEndpoint><Address>{rdr.get('Address', 'localhost')}</Address>"
-            f"<Port>{rdr.get('Port', 6379)}</Port></ReaderEndpoint>"
+            f"<NodeGroupId>{xml_escape(str(ng['NodeGroupId']))}</NodeGroupId>"
+            f"<Status>{xml_escape(str(ng['Status']))}</Status>"
+            f"<PrimaryEndpoint><Address>{xml_escape(str(pep.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(pep.get('Port', 6379)))}</Port></PrimaryEndpoint>"
+            f"<ReaderEndpoint><Address>{xml_escape(str(rdr.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(rdr.get('Port', 6379)))}</Port></ReaderEndpoint>"
             f"<NodeGroupMembers>{members_xml}</NodeGroupMembers>"
             f"</NodeGroup>"
         )
@@ -3509,36 +3509,36 @@ def _rg_xml(rg):
     cep = rg.get("ConfigurationEndpoint")
     if cep:
         config_ep_xml = (
-            f"<ConfigurationEndpoint><Address>{cep['Address']}</Address>"
-            f"<Port>{cep['Port']}</Port></ConfigurationEndpoint>"
+            f"<ConfigurationEndpoint><Address>{xml_escape(str(cep['Address']))}</Address>"
+            f"<Port>{xml_escape(str(cep['Port']))}</Port></ConfigurationEndpoint>"
         )
 
     member_clusters_xml = ""
     for cluster_id in rg.get("MemberClusters", []):
-        member_clusters_xml += f"<ClusterId>{cluster_id}</ClusterId>"
+        member_clusters_xml += f"<ClusterId>{xml_escape(str(cluster_id))}</ClusterId>"
     user_group_ids_xml = ""
     for user_group_id in rg.get("UserGroupIds", []):
-        user_group_ids_xml += f"<member>{user_group_id}</member>"
+        user_group_ids_xml += f"<member>{xml_escape(str(user_group_id))}</member>"
     log_delivery_configs_xml = _log_delivery_configs_xml(rg.get("LogDeliveryConfigurations", []))
-    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{g}</member>" for g in ids) + f"</{k}>"
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{xml_escape(str(g))}</member>" for g in ids) + f"</{k}>"
                           for k, ids in (rg.get("PendingModifiedValues") or {}).get("UserGroups", {}).items())
     return (
-        f"<ReplicationGroupId>{rg['ReplicationGroupId']}</ReplicationGroupId>"
-        f"<Description>{rg.get('Description', '')}</Description>"
-        f"<Status>{rg['Status']}</Status>"
-        f"<Engine>{rg.get('Engine', 'redis')}</Engine>"
-        f"<CacheNodeType>{rg.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
-        f"<AutomaticFailover>{rg.get('AutomaticFailover', 'disabled')}</AutomaticFailover>"
-        f"<AutoMinorVersionUpgrade>{str(rg.get('AutoMinorVersionUpgrade', False)).lower()}</AutoMinorVersionUpgrade>"
-        f"<MultiAZ>{rg.get('MultiAZ', 'disabled')}</MultiAZ>"
-        f"<ClusterEnabled>{str(rg.get('ClusterEnabled', False)).lower()}</ClusterEnabled>"
-        f"<ClusterMode>{rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')}</ClusterMode>"
-        f"<AuthTokenEnabled>{str(rg.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
-        f"<TransitEncryptionEnabled>{str(rg.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"<ReplicationGroupId>{xml_escape(str(rg['ReplicationGroupId']))}</ReplicationGroupId>"
+        f"<Description>{xml_escape(str(rg.get('Description', '')))}</Description>"
+        f"<Status>{xml_escape(str(rg['Status']))}</Status>"
+        f"<Engine>{xml_escape(str(rg.get('Engine', 'redis')))}</Engine>"
+        f"<CacheNodeType>{xml_escape(str(rg.get('CacheNodeType', 'cache.t3.micro')))}</CacheNodeType>"
+        f"<AutomaticFailover>{xml_escape(str(rg.get('AutomaticFailover', 'disabled')))}</AutomaticFailover>"
+        f"<AutoMinorVersionUpgrade>{xml_escape(str(str(rg.get('AutoMinorVersionUpgrade', False)).lower()))}</AutoMinorVersionUpgrade>"
+        f"<MultiAZ>{xml_escape(str(rg.get('MultiAZ', 'disabled')))}</MultiAZ>"
+        f"<ClusterEnabled>{xml_escape(str(str(rg.get('ClusterEnabled', False)).lower()))}</ClusterEnabled>"
+        f"<ClusterMode>{xml_escape(str(rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')))}</ClusterMode>"
+        f"<AuthTokenEnabled>{xml_escape(str(str(rg.get('AuthTokenEnabled', False)).lower()))}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{xml_escape(str(str(rg.get('TransitEncryptionEnabled', False)).lower()))}</TransitEncryptionEnabled>"
         f"{_transit_mode_xml(rg)}"
-        f"<AtRestEncryptionEnabled>{str(rg.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
-        f"<SnapshotRetentionLimit>{rg.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
-        f"<SnapshotWindow>{rg.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<AtRestEncryptionEnabled>{xml_escape(str(str(rg.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(rg.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
+        f"<SnapshotWindow>{xml_escape(str(rg.get('SnapshotWindow', '')))}</SnapshotWindow>"
         f"{config_ep_xml}"
         f"<MemberClusters>{member_clusters_xml}</MemberClusters>"
         f"<NodeGroups>{node_groups_xml}</NodeGroups>"
@@ -3546,7 +3546,7 @@ def _rg_xml(rg):
         # AWS leaves UserGroupIds out once none is attached (real AWS, us-west-2).
         + (f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>" if user_group_ids_xml else "")
         + (f"<PendingModifiedValues><UserGroups>{pending_xml}</UserGroups></PendingModifiedValues>" if pending_xml else "")
-        + f"<ARN>{rg['ARN']}</ARN>"
+        + f"<ARN>{xml_escape(str(rg['ARN']))}</ARN>"
     )
 
 
@@ -3556,22 +3556,22 @@ def _snapshot_xml(snap):
     for ns in snap.get("NodeSnapshots", []):
         nodes_xml += (
             f"<NodeSnapshot>"
-            f"<CacheNodeId>{ns.get('CacheNodeId', '0001')}</CacheNodeId>"
-            f"<SnapshotCreateTime>{ns.get('SnapshotCreateTime', 0)}</SnapshotCreateTime>"
-            f"<CacheSize>{ns.get('CacheSize', '0 MB')}</CacheSize>"
+            f"<CacheNodeId>{xml_escape(str(ns.get('CacheNodeId', '0001')))}</CacheNodeId>"
+            f"<SnapshotCreateTime>{xml_escape(str(ns.get('SnapshotCreateTime', 0)))}</SnapshotCreateTime>"
+            f"<CacheSize>{xml_escape(str(ns.get('CacheSize', '0 MB')))}</CacheSize>"
             f"</NodeSnapshot>"
         )
     return (
-        f"<SnapshotName>{snap['SnapshotName']}</SnapshotName>"
-        f"<SnapshotStatus>{snap['SnapshotStatus']}</SnapshotStatus>"
-        f"<SnapshotSource>{snap.get('SnapshotSource', 'manual')}</SnapshotSource>"
-        f"<CacheClusterId>{snap.get('CacheClusterId', '')}</CacheClusterId>"
-        f"<ReplicationGroupId>{snap.get('ReplicationGroupId', '')}</ReplicationGroupId>"
-        f"<CacheNodeType>{snap.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
-        f"<Engine>{snap.get('Engine', 'redis')}</Engine>"
-        f"<EngineVersion>{snap.get('EngineVersion', '7.0.12')}</EngineVersion>"
+        f"<SnapshotName>{xml_escape(str(snap['SnapshotName']))}</SnapshotName>"
+        f"<SnapshotStatus>{xml_escape(str(snap['SnapshotStatus']))}</SnapshotStatus>"
+        f"<SnapshotSource>{xml_escape(str(snap.get('SnapshotSource', 'manual')))}</SnapshotSource>"
+        f"<CacheClusterId>{xml_escape(str(snap.get('CacheClusterId', '')))}</CacheClusterId>"
+        f"<ReplicationGroupId>{xml_escape(str(snap.get('ReplicationGroupId', '')))}</ReplicationGroupId>"
+        f"<CacheNodeType>{xml_escape(str(snap.get('CacheNodeType', 'cache.t3.micro')))}</CacheNodeType>"
+        f"<Engine>{xml_escape(str(snap.get('Engine', 'redis')))}</Engine>"
+        f"<EngineVersion>{xml_escape(str(snap.get('EngineVersion', '7.0.12')))}</EngineVersion>"
         f"<NodeSnapshots>{nodes_xml}</NodeSnapshots>"
-        f"<ARN>{snap.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(snap.get('ARN', '')))}</ARN>"
     )
 
 
@@ -3588,7 +3588,7 @@ def _xml(status, root_tag, inner):
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <{root_tag} xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
     {inner}
-    <ResponseMetadata><RequestId>{new_uuid()}</RequestId></ResponseMetadata>
+    <ResponseMetadata><RequestId>{xml_escape(str(new_uuid()))}</RequestId></ResponseMetadata>
 </{root_tag}>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
@@ -3597,8 +3597,8 @@ def _error(code, message, status):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
     body = f"""<ErrorResponse xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
-    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
-    <RequestId>{new_uuid()}</RequestId>
+    <Error><Type>{xml_escape(str(fault_type))}</Type><Code>{xml_escape(str(code))}</Code><Message>{xml_escape(str(message))}</Message></Error>
+    <RequestId>{xml_escape(str(new_uuid()))}</RequestId>
 </ErrorResponse>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
