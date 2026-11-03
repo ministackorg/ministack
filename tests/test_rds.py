@@ -17138,6 +17138,18 @@ def test_rds_hook_drops_an_old_name_left_on_another_member(monkeypatch):
     assert m._global_cluster_endpoint(gc) in aliases["b"]
 
 
+def test_rds_hook_keeps_the_current_name_on_the_old_writer_during_a_hold(monkeypatch):
+    """While a switchover waits on the new writer, the old writer keeps the
+    current name; the hook run for some other reason must not drop it early."""
+    m, gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    rebooting = {"DBInstanceStatus": "rebooting"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [rebooting] if cluster is clusters["b"] else [])
+    _flip_global_writer(gc)
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    assert calls == []
+
+
 def test_rds_stopped_old_writer_does_not_hold_back_the_move(monkeypatch):
     """No readiness probe polls a stopped or failed container, so a failover away
     from one moves the name at once instead of waiting for a start that may
@@ -17194,7 +17206,9 @@ def test_rds_global_alias_move_follows_an_address_shaped_endpoint(monkeypatch):
     assert clusters["a"]["_shared_endpoint"]["Address"] == "10.0.0.51"
     assert instance["Endpoint"]["Address"] == instance["_internal_address"] == "10.0.0.51"
     assert clusters["b"]["_shared_endpoint"]["Address"].startswith("b.cluster-")
-    assert synced == [clusters["a"]]
+    # Both moved, and the reader endpoint can publish the internal address
+    # even when the writer publishes a name, so both are resynced.
+    assert synced == [clusters["a"], clusters["b"]]
 
 
 def test_rds_create_global_cluster_from_a_source_syncs_aliases(monkeypatch):
@@ -17324,6 +17338,13 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
         assert resolve(rds.describe_db_clusters(
             DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
     finally:
+        # DeleteDBInstance is refused while the cluster is stopped.
+        try:
+            if rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]["Status"] == "stopped":
+                rds.start_db_cluster(DBClusterIdentifier=cid)
+                _wait_cluster_status(rds, cid, "available")
+        except (ClientError, AssertionError):
+            pass
         for call, kwargs in (
             *((rds.remove_from_global_cluster, {
                 "GlobalClusterIdentifier": g,

@@ -4127,6 +4127,9 @@ def _cluster_endpoint_aliases(cluster):
     return []
 
 
+_GLOBAL_ENDPOINT_SUFFIX = ".global.rds.amazonaws.com"
+
+
 def _global_writer_endpoint_aliases(cluster):
     """The global writer endpoint, while this cluster is its global cluster's writer.
 
@@ -4147,6 +4150,15 @@ def _global_writer_alias_rejoin(cluster, global_endpoint, is_writer):
     network_name, container)``, or None when nothing has to change or there is
     no container on an aliasable network.
     """
+    found = _cluster_container_on_alias_network(cluster)
+    if not found or (global_endpoint in _container_network_aliases(*found[1:])) == is_writer:
+        return None
+    return found
+
+
+def _cluster_container_on_alias_network(cluster):
+    """``(docker_client, network_name, container)`` for a cluster's container on
+    a network that takes aliases, or None."""
     container_id = cluster.get("_shared_container_id")
     docker_client = _get_docker() if container_id else None
     if not docker_client:
@@ -4158,14 +4170,18 @@ def _global_writer_alias_rejoin(cluster, global_endpoint, is_writer):
         container = docker_client.containers.get(container_id)
     except Exception as e:
         logger.warning(
-            "RDS: cannot check global writer endpoint %s on cluster %s: %s",
-            global_endpoint, cluster.get("DBClusterIdentifier", "unknown"), e,
+            "RDS: cannot check the network aliases of cluster %s: %s",
+            cluster.get("DBClusterIdentifier", "unknown"), e,
         )
         return None
-    endpoint = container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {}
-    if (global_endpoint in (endpoint.get("Aliases") or [])) == is_writer:
-        return None
     return docker_client, network_name, container
+
+
+def _container_network_aliases(network_name, container):
+    return list(
+        (container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {})
+        .get("Aliases") or []
+    )
 
 
 def _refresh_cluster_internal_address(cluster, container, network_name):
@@ -4192,8 +4208,9 @@ def _refresh_cluster_internal_address(cluster, container, network_name):
             instance["_internal_address"] = address
         if reported_moved and (instance.get("Endpoint") or {}).get("Address") == previous:
             instance["Endpoint"]["Address"] = address
-    if reported_moved:
-        _sync_cluster_endpoints(cluster)
+    # The reader endpoint can publish the internal address even when the
+    # writer publishes a name.
+    _sync_cluster_endpoints(cluster)
     return True
 
 
@@ -4206,10 +4223,7 @@ def _rejoin_with_global_writer_alias(cluster, global_endpoint, is_writer, docker
     the writer's new address. Returns whether the aliases now match ``is_writer``.
     """
     cluster_id = cluster.get("DBClusterIdentifier", "unknown")
-    previous = list(
-        (container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {})
-        .get("Aliases") or []
-    )
+    previous = _container_network_aliases(network_name, container)
     aliases = _cluster_endpoint_aliases(cluster) + ([global_endpoint] if is_writer else [])
     network = None
     disconnected = False
@@ -4368,27 +4382,20 @@ def _apply_deferred_global_writer_alias(cluster):
 
 
 def _drop_stale_global_writer_aliases(cluster):
-    """Rejoin without any global endpoint this cluster's container should not carry."""
+    """Rejoin without global endpoints that are not its global cluster's current
+    name: one kept across a restart after the cluster left or renamed its global
+    cluster. Whether the current name belongs here is the sync's call, which
+    holds it on the old writer until the new one can take it."""
     with _shared_container_lock:
-        expected = _global_writer_endpoint_aliases(cluster)
         if _cluster_container_starting(cluster):
             return
-        container_id = cluster.get("_shared_container_id")
-        docker_client = _get_docker() if container_id else None
-        if not docker_client:
+        global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+        current = _global_cluster_endpoint(global_cluster) if global_cluster else None
+        found = _cluster_container_on_alias_network(cluster)
+        if not found:
             return
-        network_name = _get_ministack_network(docker_client)
-        if not _network_supports_aliases(network_name):
-            return
-        try:
-            container = docker_client.containers.get(container_id)
-        except Exception:
-            return
-        aliases = (
-            (container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {})
-            .get("Aliases") or []
-        )
-        stale = [a for a in aliases if a.endswith(".global.rds.amazonaws.com") and a not in expected]
+        aliases = _container_network_aliases(*found[1:])
+        stale = [a for a in aliases if a.endswith(_GLOBAL_ENDPOINT_SUFFIX) and a != current]
         if not stale:
             return
         if any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster)):
@@ -4398,11 +4405,9 @@ def _drop_stale_global_writer_aliases(cluster):
                 ", ".join(stale), cluster.get("DBClusterIdentifier", "unknown"),
             )
             return
-        # Drop stale names only; a name this container should carry but lacks
-        # is the sync's to add, after the old writer has let go of it.
-        keep = [a for a in expected if a in aliases]
+        keeps_current = current in aliases
         _rejoin_with_global_writer_alias(
-            cluster, keep[0] if keep else stale[0], bool(keep), docker_client, network_name, container,
+            cluster, current if keeps_current else ", ".join(stale), keeps_current, *found,
         )
 
 
@@ -9848,7 +9853,7 @@ def _global_endpoint_token():
 def _global_cluster_endpoint(gc):
     """<id>.global-<12 lowercase alphanumerics>.global.rds.amazonaws.com, present with no members (AWS capture)."""
     token = gc.setdefault("_EndpointToken", _global_endpoint_token())
-    return f"{gc['GlobalClusterIdentifier']}.global-{token}.global.rds.amazonaws.com"
+    return f"{gc['GlobalClusterIdentifier']}.global-{token}{_GLOBAL_ENDPOINT_SUFFIX}"
 
 
 def _global_cluster_xml(gc):
