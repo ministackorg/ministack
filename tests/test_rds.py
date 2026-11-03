@@ -16809,6 +16809,192 @@ def test_rds_cluster_reader_alias_skipped_under_pg_replication(monkeypatch):
         name, "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"]
 
 
+_GLOBAL_ALIAS_NAME = "gdb.global-abc123def456.global.rds.amazonaws.com"
+
+
+def _global_alias_world(monkeypatch, writer="a"):
+    """Two clusters in one global cluster, behind a fake Docker that models
+    network-scoped aliases: a container keeps them only until it leaves the
+    network, and rejoining hands out the next address."""
+    from ministack.services import rds as m
+
+    gc = {"GlobalClusterIdentifier": "gdb", "_EndpointToken": "abc123def456"}
+    clusters, containers, calls = {}, {}, []
+    for index, cid in enumerate(("a", "b"), start=1):
+        arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{cid}"
+        clusters[arn] = {
+            "DBClusterIdentifier": cid, "DBClusterArn": arn,
+            "GlobalClusterIdentifier": "gdb", "Engine": "aurora-postgresql",
+            "Endpoint": f"{cid}.cluster-abc123.us-east-1.rds.amazonaws.com",
+            "_shared_container_id": f"c-{cid}",
+            "_shared_internal_address": f"10.0.0.{index}",
+        }
+        container = type("FakeContainer", (), {})()
+        container.attrs = {"NetworkSettings": {"Networks": {"net": {
+            "Aliases": m._cluster_endpoint_aliases(clusters[arn])
+            + ([_GLOBAL_ALIAS_NAME] if cid == writer else []),
+            "IPAddress": f"10.0.0.{index}"}}}}
+        container.reload = lambda: None
+        containers[f"c-{cid}"] = container
+    gc["GlobalClusterMembers"] = [
+        {"DBClusterArn": arn, "IsWriter": c["DBClusterIdentifier"] == writer}
+        for arn, c in clusters.items()]
+
+    class Network:
+        next_ip = 50
+
+        def disconnect(self, container):
+            calls.append(("disconnect", container))
+            container.attrs["NetworkSettings"]["Networks"]["net"] = {}
+
+        def connect(self, container, aliases):
+            calls.append(("connect", container, list(aliases)))
+            Network.next_ip += 1
+            container.attrs["NetworkSettings"]["Networks"]["net"] = {
+                "Aliases": list(aliases), "IPAddress": f"10.0.0.{Network.next_ip}"}
+
+    class Docker:
+        class containers:
+            get = staticmethod(lambda cid: containers[cid])
+
+        class networks:
+            get = staticmethod(lambda _name: Network())
+
+    monkeypatch.setattr(m, "_get_docker", lambda: Docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "net")
+    monkeypatch.setattr(m, "_global_clusters", {"gdb": gc})
+    monkeypatch.setattr(m, "_resolve_global_member_cluster",
+                        lambda member: clusters.get(member["DBClusterArn"]))
+    monkeypatch.setattr(m, "_cluster_member_instances", lambda _cluster: [])
+    replication = []
+    monkeypatch.setattr(m, "_configure_or_defer_mysql_replication",
+                        lambda cid, _cluster: replication.append(cid))
+    by_id = {c["DBClusterIdentifier"]: c for c in clusters.values()}
+    return m, gc, by_id, containers, calls, replication
+
+
+def test_rds_global_writer_endpoint_alias_only_for_the_writer_member(monkeypatch):
+    """Docker answers a name carried by several containers with all of their
+    addresses, so the global endpoint may sit on the writer's container alone."""
+    m, _gc, clusters, *_ = _global_alias_world(monkeypatch)
+    assert m._global_writer_endpoint_aliases(clusters["a"]) == [_GLOBAL_ALIAS_NAME]
+    assert m._global_writer_endpoint_aliases(clusters["b"]) == []
+    assert m._global_writer_endpoint_aliases(
+        {"DBClusterIdentifier": "solo", "DBClusterArn": "arn:x"}) == []
+
+
+def test_rds_global_writer_endpoint_alias_moves_with_the_writer(monkeypatch):
+    """After a switchover the global name must follow the new writer: the old
+    writer is rejoined without it first (so the name never resolves to two
+    containers), the new one gains it, and the internal address follows the
+    container to its new IP. A member already in the right state is left
+    alone, since rejoining the network costs it its address."""
+    m, gc, clusters, containers, calls, replication = _global_alias_world(monkeypatch)
+
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == [] and replication == []
+
+    for member in gc["GlobalClusterMembers"]:
+        member["IsWriter"] = not member["IsWriter"]
+    m._sync_global_writer_endpoint_aliases(gc)
+
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert connects[0][2] == m._cluster_endpoint_aliases(clusters["a"])
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+    assert clusters["a"]["_shared_internal_address"] == "10.0.0.51"
+    assert clusters["b"]["_shared_internal_address"] == "10.0.0.52"
+    # Replicas are re-pointed for the writer only.
+    assert replication == ["b"]
+
+
+def test_rds_leaving_a_global_cluster_drops_the_global_alias(monkeypatch):
+    """A cluster that leaves its global cluster must stop answering to the
+    global endpoint."""
+    m, _gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    m._set_cluster_global_writer_alias(clusters["a"], _GLOBAL_ALIAS_NAME, False)
+    assert [c[0] for c in calls] == ["disconnect", "connect"]
+    assert _GLOBAL_ALIAS_NAME not in calls[1][2]
+
+
+def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
+    """A writer launched (or relaunched) joins the network already holding the
+    global endpoint; a non-writer member does not."""
+    m, _gc, clusters, *_ = _global_alias_world(monkeypatch)
+    launches = {}
+
+    def run(_client, _engine, kwargs, tls_names=None):
+        launches[kwargs["networking_config"]["net"]["Aliases"].__contains__(_GLOBAL_ALIAS_NAME)] = kwargs
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(m, "_run_rds_container", run)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    for cid in ("a", "b"):
+        cluster = dict(clusters[cid], MasterUsername="admin",
+                       _MasterUserPassword="password123", DatabaseName="mydb")
+        m._start_cluster_shared_container(cid, cluster)
+    assert set(launches) == {True, False}
+    assert "a" in launches[True]["name"] and "b" in launches[False]["name"]
+
+
+@pytest.mark.data_plane
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
+    """DescribeGlobalClusters hands out a global endpoint; on AWS it resolves
+    to the primary's writer. Here it has to resolve inside the Docker network
+    too, and stop doing so once the cluster leaves the global cluster."""
+    docker = pytest.importorskip("docker").from_env()
+    suffix = uuid.uuid4().hex[:8]
+    gid, cid, did = f"gdbep-{suffix}", f"gdbep-{suffix}-c", f"gdbep-{suffix}-i"
+
+    def resolve(name):
+        try:
+            out = docker.containers.run(
+                "alpine:latest", ["getent", "hosts", name],
+                network=os.environ["DOCKER_NETWORK"], remove=True)
+        except Exception:
+            return None
+        return out.decode().split()[0]
+
+    try:
+        rds.create_global_cluster(GlobalClusterIdentifier=gid, Engine="aurora-postgresql")
+        rds.create_db_cluster(
+            DBClusterIdentifier=cid, Engine="aurora-postgresql",
+            MasterUsername="admin", MasterUserPassword=PASSWORD,
+            GlobalClusterIdentifier=gid)
+        rds.create_db_instance(
+            DBInstanceIdentifier=did, DBClusterIdentifier=cid,
+            DBInstanceClass="db.r6g.large", Engine="aurora-postgresql")
+        _wait_for_instance(rds, did)
+        global_name = rds.describe_global_clusters(
+            GlobalClusterIdentifier=gid)["GlobalClusters"][0]["Endpoint"]
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(global_name) == cluster_ip
+
+        rds.remove_from_global_cluster(
+            GlobalClusterIdentifier=gid,
+            DbClusterIdentifier=rds.describe_db_clusters(
+                DBClusterIdentifier=cid)["DBClusters"][0]["DBClusterArn"])
+        assert resolve(global_name) is None
+        assert resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+    finally:
+        for call, kwargs in (
+            (rds.remove_from_global_cluster, {
+                "GlobalClusterIdentifier": gid,
+                "DbClusterIdentifier": f"arn:aws:rds:{rds.meta.region_name}:000000000000:cluster:{cid}"}),
+            (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
+            (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
+            (rds.delete_global_cluster, {"GlobalClusterIdentifier": gid}),
+        ):
+            try:
+                call(**kwargs)
+            except ClientError:
+                pass
+
+
 def _rds_ca_pem(tmp_path):
     """The CA that signs DB server certificates, written where libpq can read it."""
     import urllib.request
