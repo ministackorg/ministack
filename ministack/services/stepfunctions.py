@@ -3907,8 +3907,9 @@ def _invoke_nested_start_execution_sync(resource, input_data):
         )
 
     if payload.get("status") != "SUCCEEDED":
-        error, cause = _nested_execution_failure(payload)
-        raise _ExecutionError(error, cause)
+        # The response has no error or cause for a stopped child, so read its record.
+        child = _executions.get(payload.get("executionArn")) or payload
+        raise _ExecutionError(*_nested_execution_failure(child))
 
     output_value = payload.get("output") or "{}"
     if resource.endswith(".sync:2") and isinstance(output_value, str):
@@ -3952,19 +3953,31 @@ def _nested_start_execution_request(input_data):
     return request
 
 
-def _nested_execution_failure(payload):
-    output = payload.get("output")
-    if isinstance(output, str):
-        try:
-            decoded = json.loads(output)
-        except json.JSONDecodeError:
-            decoded = None
-        if isinstance(decoded, dict) and decoded.get("Error"):
-            return decoded["Error"], decoded.get("Cause", "")
+def _nested_execution_failure(child):
+    """Return the error and cause that a .sync parent Task fails with when its child doesn't succeed.
 
-    execution_arn = payload.get("executionArn", "")
-    status = payload.get("status", "FAILED")
-    return "States.TaskFailed", f"Nested execution {execution_arn} ended with status {status}"
+    AWS always uses States.TaskFailed. The cause is the child's DescribeExecution
+    response as compact JSON with sorted keys.
+    """
+    describe = {
+        "ExecutionArn": child.get("executionArn"),
+        "Input": child.get("input", "{}"),
+        "InputDetails": {"Included": True},
+        "Name": child.get("name"),
+        "RedriveCount": 0,
+        # AWS reported REDRIVABLE for a FAILED, TIMED_OUT and ABORTED child.
+        "RedriveStatus": "REDRIVABLE",
+        "StartDate": _iso_to_epoch_ms(child.get("startDate")),
+        "StateMachineArn": child.get("stateMachineArn"),
+        "Status": child.get("status"),
+        "StopDate": _iso_to_epoch_ms(child.get("stopDate")),
+    }
+    # AWS leaves out both keys for a timed-out child, which has no error or cause.
+    if child.get("error"):
+        describe["Error"] = child["error"]
+    if child.get("cause"):
+        describe["Cause"] = child["cause"]
+    return "States.TaskFailed", json.dumps(describe, separators=(",", ":"), sort_keys=True)
 
 
 def _invoke_sqs_send_message(resource, input_data):
