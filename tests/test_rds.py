@@ -16812,10 +16812,11 @@ def test_rds_cluster_reader_alias_skipped_under_pg_replication(monkeypatch):
 _GLOBAL_ALIAS_NAME = "gdb.global-abc123def456.global.rds.amazonaws.com"
 
 
-def _global_alias_world(monkeypatch, writer="a"):
+def _global_alias_world(monkeypatch, writer="a", fail_first_connect=False):
     """Two clusters in one global cluster, behind a fake Docker that models
     network-scoped aliases: a container keeps them only until it leaves the
-    network, and rejoining hands out the next address."""
+    network, and rejoining hands out the next address. With
+    ``fail_first_connect`` the first connect raises."""
     from ministack.services import rds as m
 
     gc = {"GlobalClusterIdentifier": "gdb", "_EndpointToken": "abc123def456"}
@@ -16849,6 +16850,8 @@ def _global_alias_world(monkeypatch, writer="a"):
 
         def connect(self, container, aliases):
             calls.append(("connect", container, list(aliases)))
+            if fail_first_connect and sum(c[0] == "connect" for c in calls) == 1:
+                raise RuntimeError("connect failed")
             Network.next_ip += 1
             container.attrs["NetworkSettings"]["Networks"]["net"] = {
                 "Aliases": list(aliases), "IPAddress": f"10.0.0.{Network.next_ip}"}
@@ -16912,7 +16915,7 @@ def test_rds_leaving_a_global_cluster_drops_the_global_alias(monkeypatch):
     """A cluster that leaves its global cluster must stop answering to the
     global endpoint."""
     m, _gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
-    m._set_cluster_global_writer_alias(clusters["a"], _GLOBAL_ALIAS_NAME, False)
+    m._move_global_writer_alias(_GLOBAL_ALIAS_NAME, [(clusters["a"], False)])
     assert [c[0] for c in calls] == ["disconnect", "connect"]
     assert _GLOBAL_ALIAS_NAME not in calls[1][2]
 
@@ -16935,7 +16938,99 @@ def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
         m._start_cluster_shared_container(cid, cluster)
     with_global = {name for name, aliases in launches.items() if _GLOBAL_ALIAS_NAME in aliases}
     assert len(launches) == 2 and len(with_global) == 1
-    assert "-a" in next(iter(with_global))
+    assert next(iter(with_global)).endswith("-cluster-a")
+
+    # A writer whose Endpoint holds an address rather than a name still gets
+    # the global name, without the address becoming an alias.
+    launches.clear()
+    cluster = dict(clusters["a"], Endpoint="172.20.0.4", MasterUsername="admin",
+                   _MasterUserPassword="password123", DatabaseName="mydb")
+    m._start_cluster_shared_container("a", cluster)
+    assert list(launches.values()) == [[_GLOBAL_ALIAS_NAME]]
+
+
+def _flip_global_writer(gc):
+    for member in gc["GlobalClusterMembers"]:
+        member["IsWriter"] = not member["IsWriter"]
+
+
+def test_rds_global_alias_not_moved_while_a_pg_standby_depends_on_the_old_writer(monkeypatch):
+    """Rejoining the network can change the writer's address, which would strand
+    its hot standbys, so no container may move (half a move leaves the name on two)."""
+    m, gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [{"_pg_standby": True}] if cluster is clusters["a"] else [])
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+
+
+def test_rds_global_alias_failed_move_restores_the_previous_aliases(monkeypatch):
+    """A failed rejoin must not leave the cluster endpoint unreachable, must
+    follow the container to the address it came back on, and must not hand the
+    name to the new writer while the old one still carries it."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(
+        monkeypatch, fail_first_connect=True)
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    connects = [c for c in calls if c[0] == "connect"]
+    assert len(connects) == 2
+    assert connects[0][1] is connects[1][1] is containers["c-a"]
+    assert _GLOBAL_ALIAS_NAME not in connects[0][2]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+    restored = containers["c-a"].attrs["NetworkSettings"]["Networks"]["net"]["IPAddress"]
+    assert clusters["a"]["_shared_internal_address"] == restored
+    assert clusters["b"]["_shared_internal_address"] == "10.0.0.2"
+
+
+def test_rds_global_alias_replication_error_does_not_fail_the_writer_change(monkeypatch):
+    """The writer change is already committed when replicas are re-pointed, so
+    a failure there must not surface, nor skip the address refresh."""
+    m, gc, clusters, _containers, _calls, _ = _global_alias_world(monkeypatch)
+
+    def boom(_cid, _cluster):
+        raise RuntimeError("replication failed")
+
+    monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", boom)
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert clusters["a"]["_shared_internal_address"] == "10.0.0.51"
+    assert clusters["b"]["_shared_internal_address"] == "10.0.0.52"
+
+
+def _global_switch_spy(monkeypatch):
+    """Stub the switch internals; return (m, live global cluster, synced list)."""
+    from ministack.services import rds as m
+
+    live = {"GlobalClusterIdentifier": "gdb"}
+    synced = []
+    monkeypatch.setattr(m, "_global_clusters", {"gdb": live})
+    monkeypatch.setattr(m, "_resolve_global_cluster", lambda gid: live if gid == "gdb" else None)
+    monkeypatch.setattr(m, "_global_cluster_xml", lambda gc: "<x/>")
+    monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases", synced.append)
+    return m, live, synced
+
+
+@pytest.mark.parametrize("handler, params, patched", [
+    ("_switchover_global_cluster", {"GlobalClusterIdentifier": ["gdb"]}, "_planned_mysql_global_writer_switch"),
+    ("_failover_global_cluster", {"GlobalClusterIdentifier": ["gdb"]}, "_planned_mysql_global_writer_switch"),
+    ("_failover_global_cluster", {"GlobalClusterIdentifier": ["gdb"], "AllowDataLoss": ["true"]},
+     "_switch_global_cluster_writer"),
+])
+def test_rds_global_switch_handlers_sync_aliases_on_the_live_global_cluster(
+        monkeypatch, handler, params, patched):
+    """The alias must follow the writer on the stored global cluster, not on the
+    copy the switch returns, and only when the switch succeeded."""
+    m, live, synced = _global_switch_spy(monkeypatch)
+    monkeypatch.setattr(m, patched, lambda *a, **k: dict(live))
+    assert getattr(m, handler)(params)[0] == 200
+    assert len(synced) == 1 and synced[0] is live
+
+    synced.clear()
+    error = (400, {}, b"error")
+    monkeypatch.setattr(m, patched, lambda *a, **k: error)
+    assert getattr(m, handler)(params) == error
+    assert synced == []
 
 
 def _wait_cluster_status(rds, cluster_id, status, timeout=180):
@@ -16945,6 +17040,19 @@ def _wait_cluster_status(rds, cluster_id, status, timeout=180):
             return
         time.sleep(1)
     raise AssertionError(f"cluster {cluster_id} never reached {status}")
+
+
+def _wait_instance_gone(rds, instance_id, timeout=60):
+    """Deleting a cluster fails while its instance still exists."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            rds.describe_db_instances(DBInstanceIdentifier=instance_id)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "DBInstanceNotFound":
+                return
+            raise
+        time.sleep(1)
 
 
 @pytest.mark.data_plane
@@ -17008,6 +17116,7 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
                 "GlobalClusterIdentifier": gid,
                 "DbClusterIdentifier": cid}),
             (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
+            (_wait_instance_gone, {"rds": rds, "instance_id": did}),
             (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
             (rds.delete_global_cluster, {"GlobalClusterIdentifier": gid}),
         ):
