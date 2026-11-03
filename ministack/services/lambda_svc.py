@@ -4352,6 +4352,17 @@ def _host_docker_arch(client):
     return _host_docker_arch_cache[0]
 
 
+# Declared platforms this Docker host has failed to run (no qemu/Rosetta for the
+# emulation). A host's emulation support doesn't change while MiniStack runs, so
+# once a pinned container could not start, later spawns run that platform on the
+# host's own architecture straight away. Retrying would pull the foreign image
+# over the runtime tag and the host's back on every cold start, and an
+# undeclared function spawning in between would start the foreign one.
+_unrunnable_docker_platforms: set = set()
+# What a container whose runtime image is the wrong architecture logs as it dies.
+_ENTRYPOINT_EXEC_FORMAT_ERROR = "exec /lambda-entrypoint.sh: exec format error"
+
+
 def _declared_docker_platform(config: dict):
     """The linux/* platform to pin, or None when the function never declared one.
 
@@ -4780,16 +4791,29 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     # functions that never declared one would break arm64 hosts without a
     # binfmt handler that ran those functions natively before.
     docker_platform = _declared_docker_platform(config) if _pin_platform else None
+    if docker_platform in _unrunnable_docker_platforms:
+        logger.debug("Lambda %s declares %s, which this host cannot run; using the host architecture",
+                     config.get("FunctionName"), docker_platform)
+        docker_platform = None
     docker_arch = docker_platform.rsplit("/", 1)[1] if docker_platform else None
     if docker_platform:
         run_kwargs["platform"] = docker_platform
 
     def _platform_fallback(reason):
-        """The declared platform cannot run here: log it, run on the host's."""
+        """The declared platform cannot run here: log it, run on the host's.
+
+        Only the runtime image's own entrypoint failing to exec marks the
+        pinned platform unrunnable on this host. A failed pull may be
+        transient, a create can fail because another spawn swapped the runtime
+        tag, and an image's own entrypoint can be broken for reasons of its own.
+        """
+        if _ENTRYPOINT_EXEC_FORMAT_ERROR in reason:
+            _unrunnable_docker_platforms.add(docker_platform)
         logger.warning(
             "Lambda %s declares %s but this host cannot run it (%s); "
-            "running on the host architecture instead. Install a binfmt/qemu "
-            "handler (or Rosetta) for real cross-architecture execution.",
+            "running on the host architecture instead until MiniStack is reset "
+            "or restarted. Install a binfmt/qemu handler (or Rosetta) for real "
+            "cross-architecture execution.",
             config.get("FunctionName"), docker_platform, reason)
         return _spawn_lambda_container(config, code_zip, _pin_platform=False)
 
@@ -8588,6 +8612,8 @@ def reset():
     _dynamodb_stream_positions.clear()
     _esm_backoff_until.clear()
     _pool_clear_all()
+    # A binfmt/qemu handler installed since takes effect from here.
+    _unrunnable_docker_platforms.clear()
     lambda_runtime.reset()
     with _provided_code_lock:
         _provided_code_dirs.clear()

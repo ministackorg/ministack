@@ -3209,6 +3209,173 @@ def test_ec2_authorize_sg_egress_duplicate_of_default_returns_rule(ec2):
     assert len([r for r in after if r["IsEgress"]]) == 1
 
 
+def test_ec2_revoke_sg_default_egress_all_protocols_with_ports(ec2):
+    """Revoking -1 with FromPort/ToPort 0 removes the default egress rule (#2531).
+
+    The AWS provider revokes a new group's default rule this way. AWS ignores the
+    ports for -1 (captures revoke-egress-all-0-0, after-revoke-0-0-sg), so the
+    allow-all rule Terraform then declares is a new rule that keeps its
+    description and tags (authorize-egress-all-noports-tagged,
+    after-authorize-tagged-rules).
+    """
+    vpc = ec2.create_vpc(CidrBlock="10.77.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sg-2531-default", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+
+    revoked = ec2.revoke_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "FromPort": 0, "ToPort": 0,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+    )["RevokedSecurityGroupRules"]
+    assert [(r["IpProtocol"], r["FromPort"], r["ToPort"], r["CidrIpv4"]) for r in revoked] == [
+        ("-1", -1, -1, "0.0.0.0/0")]
+    sg = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+    assert sg["IpPermissionsEgress"] == []
+
+    rule = ec2.authorize_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1",
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "Allow all outbound"}]}],
+        TagSpecifications=[{"ResourceType": "security-group-rule",
+                            "Tags": [{"Key": "Name", "Value": "egress-all"}]}],
+    )["SecurityGroupRules"][0]
+    assert rule["Description"] == "Allow all outbound"
+    assert rule["Tags"] == [{"Key": "Name", "Value": "egress-all"}]
+
+    rules = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    assert len(rules) == 1
+    assert (rules[0]["FromPort"], rules[0]["ToPort"]) == (-1, -1)
+    assert rules[0]["Description"] == "Allow all outbound"
+    assert rules[0]["Tags"] == [{"Key": "Name", "Value": "egress-all"}]
+
+
+def test_ec2_sg_egress_all_protocols_ignores_ports(ec2):
+    """Authorize -1 with ports 0/0 stores the rule without ports, and revoke -1
+    with any ports (80/80) removes it (captures authorize-egress-all-0-0,
+    after-authorize-0-0-sg, after-authorize-0-0-rules, revoke-egress-all-80-80,
+    after-revoke-80-80-sg)."""
+    vpc = ec2.create_vpc(CidrBlock="10.76.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sg-2531-ports", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+    ec2.revoke_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+
+    rule = ec2.authorize_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "FromPort": 0, "ToPort": 0,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+    )["SecurityGroupRules"][0]
+    assert (rule["FromPort"], rule["ToPort"]) == (-1, -1)
+    egress = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissionsEgress"]
+    assert len(egress) == 1
+    assert "FromPort" not in egress[0] and "ToPort" not in egress[0]
+    rules = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"]
+    assert [(r["FromPort"], r["ToPort"]) for r in rules] == [(-1, -1)]
+
+    revoked = ec2.revoke_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "FromPort": 80, "ToPort": 80,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+    )["RevokedSecurityGroupRules"]
+    assert [r["SecurityGroupRuleId"] for r in revoked] == [rule["SecurityGroupRuleId"]]
+    egress = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissionsEgress"]
+    assert egress == []
+
+
+def test_ec2_revoked_sg_rules_without_ports_report_minus_one(ec2):
+    """Revoked rules stored without ports report FromPort/ToPort -1: the default
+    -1 rule revoked by id, and a protocol 50 rule revoked by IpPermissions and by
+    id (captures r2-revoke-egress-default-by-id, r2-revoke-egress-p50,
+    r2-revoke-ingress-p50-by-id)."""
+    vpc = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sg-2531-revoked", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+    default_id = ec2.describe_security_group_rules(
+        Filters=[{"Name": "group-id", "Values": [sg_id]}])["SecurityGroupRules"][0]["SecurityGroupRuleId"]
+
+    def ports(resp):
+        return [(r["IpProtocol"], r["FromPort"], r["ToPort"]) for r in resp["RevokedSecurityGroupRules"]]
+
+    assert ports(ec2.revoke_security_group_egress(
+        GroupId=sg_id, SecurityGroupRuleIds=[default_id])) == [("-1", -1, -1)]
+
+    ec2.authorize_security_group_egress(
+        GroupId=sg_id, IpPermissions=[{"IpProtocol": "50", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+    assert ports(ec2.revoke_security_group_egress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "50", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])) == [("50", -1, -1)]
+
+    rule_id = ec2.authorize_security_group_ingress(
+        GroupId=sg_id, IpPermissions=[{"IpProtocol": "50", "IpRanges": [{"CidrIp": "10.9.0.0/16"}]}],
+    )["SecurityGroupRules"][0]["SecurityGroupRuleId"]
+    assert ports(ec2.revoke_security_group_ingress(
+        GroupId=sg_id, SecurityGroupRuleIds=[rule_id])) == [("50", -1, -1)]
+
+
+def test_ec2_sg_legacy_form_all_protocols_rule_matches_without_ports(ec2):
+    """A -1 rule authorized in the flat top-level form with ports 0/0 (the CLI's
+    --protocol -1 --port 0) is matched by an IpPermissions revoke without ports.
+    The flat form itself was not captured; that -1 matching ignores the ports
+    is (captures revoke-ingress-all-0-0, revoke-ingress-all-noports,
+    revoke-egress-all-80-80)."""
+    vpc = ec2.create_vpc(CidrBlock="10.74.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sg-2531-legacy", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id, IpProtocol="-1", FromPort=0, ToPort=0, CidrIp="10.9.0.0/16")
+    assert len(ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"]) == 1
+
+    ec2.revoke_security_group_ingress(
+        GroupId=sg_id, IpPermissions=[{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "10.9.0.0/16"}]}])
+    assert ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"] == []
+
+
+def test_ec2_cfn_sg_reconcile_matches_all_protocols_rule_without_ports():
+    """A CloudFormation update that drops a template's -1 egress rule declared
+    with ports -1/-1 also drops the same rule stored without ports, as an
+    IpPermissions authorize now stores it (capture after-authorize-0-0-sg).
+    Exercised over the reconcile helper's in-memory shape."""
+    from ministack.services.cloudformation.provisioners import _ec2_sg_reconcile
+
+    def rule(**ports):
+        return {"IpProtocol": "-1", **ports, "IpRanges": [{"CidrIp": "10.9.0.0/16"}],
+                "Ipv6Ranges": [], "PrefixListIds": [], "UserIdGroupPairs": []}
+
+    store = [rule()]
+    _ec2_sg_reconcile(store, [rule(FromPort=-1, ToPort=-1)], [])
+    assert store == []
+
+
+def test_ec2_sg_ingress_all_protocols_ignores_ports(ec2):
+    """Ingress -1 rules match whatever ports the call sends: authorize without
+    ports then revoke with 0/0, and authorize with -1/-1 then revoke without
+    ports (captures authorize-ingress-all-noports, revoke-ingress-all-0-0,
+    after-revoke-ingress-0-0-sg, authorize-ingress-all-m1,
+    revoke-ingress-all-noports, final-sg)."""
+    vpc = ec2.create_vpc(CidrBlock="10.75.0.0/16")["Vpc"]
+    sg_id = ec2.create_security_group(
+        GroupName="sg-2531-ingress", Description="test", VpcId=vpc["VpcId"])["GroupId"]
+    other = [{"CidrIp": "10.9.0.0/16"}]
+
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id, IpPermissions=[{"IpProtocol": "-1", "IpRanges": other}])
+    ec2.revoke_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "FromPort": 0, "ToPort": 0, "IpRanges": other}])
+    assert ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"] == []
+
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[{"IpProtocol": "-1", "FromPort": -1, "ToPort": -1, "IpRanges": other}])
+    ec2.revoke_security_group_ingress(
+        GroupId=sg_id, IpPermissions=[{"IpProtocol": "-1", "IpRanges": other}])
+    assert ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]["IpPermissions"] == []
+
+
 def test_ec2_authorize_sg_ingress_duplicate_returns_rule(ec2):
     """A duplicate ingress authorize returns the stored rule id, not an empty set."""
     vpc = ec2.create_vpc(CidrBlock="10.95.0.0/16")["Vpc"]
