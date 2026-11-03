@@ -1519,8 +1519,9 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
 
 
 # Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS in us-east-2: the
-# same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (captures
-# dataplane-serverless, dataplane-node, dataplane-v8, dataplane-v9, dataplane-r7).
+# same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (capture rounds
+# aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7), aws-channel-cases and
+# aws-selectors-node).
 _AWS_ACL_CHANNELS = {
     "on ~* +@all": "&*",
     "on ~* &allowed* +@all": "&allowed*",
@@ -1535,7 +1536,8 @@ _AWS_ACL_CHANNELS = {
 
 def test_user_acl_channels_default_to_all():
     """The ACL SETUSER commands MiniStack sends: `allchannels` before an access string without channel
-    rules or selectors, and on the `default` user of a group without one."""
+    rules or selectors, and on the `default` user of a Valkey group without one (a group without an
+    Engine is a Redis one in MiniStack, and keeps `reset` alone)."""
     def user(access):
         return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
 
@@ -1547,6 +1549,9 @@ def test_user_acl_channels_default_to_all():
 
     elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"UserIds": []})
     try:
+        assert elasticache._user_group_acl_commands("000000000000", "us-east-1", "g-chan") == [
+            ["ACL", "SETUSER", "default", "reset"]]
+        elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"Engine": "valkey", "UserIds": []})
         assert elasticache._user_group_acl_commands("000000000000", "us-east-1", "g-chan") == [
             ["ACL", "SETUSER", "default", "reset", "allchannels"]]
     finally:
@@ -1582,11 +1587,14 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
         assert cache["Status"] == "available"
         ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
         # AWS's Redis OSS 7.1 words the error "this user has no permissions to access one of the channels
-        # used as arguments"; MiniStack's redis:7 image words it like Valkey, so only the code is compared.
+        # used as arguments"; MiniStack's redis:7 image words it like Valkey, so for Redis only a channel
+        # NOPERM is required.
         valkey_nochan = b"-NOPERM No permissions to access a channel\r\n"
 
         def nochan(reply):
-            return reply.startswith(b"-NOPERM ") if engine == "redis" else reply == valkey_nochan
+            if engine == "redis":
+                return reply.startswith(b"-NOPERM ") and b"channel" in reply
+            return reply == valkey_nochan
 
         def auth(user):
             return ("AUTH", user, f"{name}/?Action=connect&User={user}")
@@ -1611,7 +1619,8 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
             assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
         selector_user = users["on ~* +@all (&chan +get ~k)"]
         reply = _tls_session(ep, ca, auth(selector_user), ("ACL", "GETUSER", selector_user), ("PUBLISH", "chan", "x"))
-        assert b"$8\r\nchannels\r\n$5\r\n&chan\r\n" in reply[1] and nochan(reply[2])
+        # a selector's channels are its last field, and the selectors list ends the reply
+        assert reply[1].endswith(b"$8\r\nchannels\r\n$5\r\n&chan\r\n") and nochan(reply[2])
         if engine == "redis":
             default = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"))[1]
             assert b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in default
