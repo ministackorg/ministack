@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — a stop ends the running state** — `StopExecution` marked an execution `ABORTED`, but a `Wait` state kept sleeping for its full time, and the branches of a `Parallel` or `Map` state kept running. Their `WaitStateExited`, `ParallelStateExited` and `MapStateExited` events came after `ExecutionAborted`. A stopped `startExecution.sync` child in a `Wait` also kept its parent waiting for the full time. A `Wait` now ends when its execution is stopped, a branch starts no more states, and the history ends with `ExecutionAborted`, as on AWS. Recorded against a real AWS account in us-east-1. Contributed by @mishukdutta-cz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
