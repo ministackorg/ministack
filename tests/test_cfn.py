@@ -3175,6 +3175,35 @@ def test_cfn_secretsmanager_reference_by_arn_version_id_and_json_number(cfn, ssm
             pass
 
 
+@pytest.fixture
+def other_account_secret():
+    sm = boto3.client("secretsmanager", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                      region_name="us-east-1", aws_access_key_id="111122223333", aws_secret_access_key="test")
+    name = f"cfn-dynref-xacct-{_uuid_mod.uuid4().hex[:8]}"
+    yield sm.create_secret(Name=name, SecretString="vpc-0abc")["ARN"]
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+@pytest.mark.parametrize("arn_form", ["full", "partial"])
+def test_cfn_secretsmanager_reference_reads_another_account(cfn, ssm, other_account_secret, arn_form):
+    """A secret ARN that names another account resolves in that account, with
+    or without the 6-character suffix, as on AWS (observed 2026-11-02)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-dynref-xacct-{uid}"
+    arn = other_account_secret if arn_form == "full" else other_account_secret.rsplit("-", 1)[0]
+    out = f"/cfn-dynref-xacct/{uid}"
+    template = json.dumps({"Resources": {"P": {
+        "Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": out, "Type": "String", "Value": f"{{{{resolve:secretsmanager:{arn}}}}}"}}}})
+    try:
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _ssm_value(ssm, out) == "vpc-0abc"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 def test_cfn_dynamic_reference_that_cannot_resolve_fails_the_resource(cfn, ssm):
     """A reference to a missing parameter fails the resource and rolls the
     stack back with the reason."""
