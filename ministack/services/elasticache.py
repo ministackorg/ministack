@@ -3184,10 +3184,8 @@ def _minimum_engine_version(user):
         floor = "7.2"
     elif user.get("Authentication", {}).get("Type") == "iam":
         floor = "7.0"
-    elif user.get("Authentication", {}).get("Type") == "password":
-        floor = "6.0"
     else:
-        return None
+        floor = "6.0"  # password and no-password Redis users alike (us-east-2, issue #2551)
     # An append's rules can need a later engine (real AWS, issue #2551: +hgetex reports 9.0).
     version = user.get("_AclVersion")
     return version if version and _acl_version_key(version) > _acl_version_key(floor) else floor
