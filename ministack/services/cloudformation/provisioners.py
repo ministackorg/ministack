@@ -2439,8 +2439,7 @@ def _lambda_create(logical_id, props, stack_name):
         "aliases": {},
         "concurrency": None,
         "provisioned_concurrency": {},
-        # As CreateFunction records it: only a template that names an
-        # architecture pins the Docker executor's container platform.
+        # As CreateFunction: only a template naming an architecture pins the container platform.
         "architectures_declared": "Architectures" in props,
     }
     if is_image:
@@ -2548,10 +2547,7 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     resp = _lambda_svc._update_config(name, config_data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::Lambda::Function configuration update failed: {resp[2]!r}")
-    # _update_config marks the architecture declared because config_data always
-    # carries it; the template is the whole desired state, so an update declares
-    # exactly what a create of the same template would. A removed Architectures
-    # reverts to x86_64 above, as it does on AWS, and stops pinning the platform.
+    # The template is the whole desired state: an update declares what a create of it would.
     func["architectures_declared"] = "Architectures" in new_props
     if not func["architectures_declared"]:
         # A container spawned while the flag read True would stay pooled pinned.
@@ -8507,9 +8503,9 @@ def _ec2_sg_permissions(rules):
             "PrefixListIds": [],
             "UserIdGroupPairs": [],
         }
-        if "FromPort" in rule:
+        if "FromPort" in rule and not _ec2._ignores_ports(perm["IpProtocol"]):
             perm["FromPort"] = int(rule["FromPort"])
-        if "ToPort" in rule:
+        if "ToPort" in rule and not _ec2._ignores_ports(perm["IpProtocol"]):
             perm["ToPort"] = int(rule["ToPort"])
         described = {"Description": rule["Description"]} if rule.get("Description") else {}
         if "CidrIp" in rule:

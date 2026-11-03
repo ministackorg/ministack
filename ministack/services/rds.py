@@ -6200,10 +6200,7 @@ def _create_db_cluster_impl(p):
     _prepare_mysql_gtid_history(cluster)
     if (RDS_PUBLIC_ENDPOINT and _get_docker()
             and _docker_image_for_engine(engine, engine_version, master_user, master_pass, "mydb")[0]):
-        # MiniStack-only: under MINISTACK_RDS_PUBLIC_ENDPOINT the backing
-        # container is reported as {MINISTACK_HOST, host_port} once it runs.
-        # Choose that port now, and the container reuses it, so the first
-        # DescribeDBClusters already reports what later ones do (#2532).
+        # Report the published endpoint from create on; the container reuses this port.
         host_port = _next_port()
         cluster.update({
             "_shared_host_port": host_port,
