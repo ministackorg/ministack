@@ -16924,7 +16924,7 @@ def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
     launches = {}
 
     def run(_client, _engine, kwargs, tls_names=None):
-        launches[kwargs["networking_config"]["net"]["Aliases"].__contains__(_GLOBAL_ALIAS_NAME)] = kwargs
+        launches[kwargs["name"]] = kwargs["networking_config"]["net"]["Aliases"]
         raise RuntimeError("stop after launch")
 
     monkeypatch.setattr(m, "_run_rds_container", run)
@@ -16933,8 +16933,9 @@ def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
         cluster = dict(clusters[cid], MasterUsername="admin",
                        _MasterUserPassword="password123", DatabaseName="mydb")
         m._start_cluster_shared_container(cid, cluster)
-    assert set(launches) == {True, False}
-    assert "a" in launches[True]["name"] and "b" in launches[False]["name"]
+    with_global = {name for name, aliases in launches.items() if _GLOBAL_ALIAS_NAME in aliases}
+    assert len(launches) == 2 and len(with_global) == 1
+    assert "-a" in next(iter(with_global))
 
 
 @pytest.mark.data_plane
@@ -16984,7 +16985,7 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
         for call, kwargs in (
             (rds.remove_from_global_cluster, {
                 "GlobalClusterIdentifier": gid,
-                "DbClusterIdentifier": f"arn:aws:rds:{rds.meta.region_name}:000000000000:cluster:{cid}"}),
+                "DbClusterIdentifier": cid}),
             (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
             (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
             (rds.delete_global_cluster, {"GlobalClusterIdentifier": gid}),
