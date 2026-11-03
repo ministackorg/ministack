@@ -16938,6 +16938,15 @@ def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
     assert "-a" in next(iter(with_global))
 
 
+def _wait_cluster_status(rds, cluster_id, status, timeout=180):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["Status"] == status:
+            return
+        time.sleep(1)
+    raise AssertionError(f"cluster {cluster_id} never reached {status}")
+
+
 @pytest.mark.data_plane
 @pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
 def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
@@ -16969,6 +16978,18 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
         _wait_for_instance(rds, did)
         global_name = rds.describe_global_clusters(
             GlobalClusterIdentifier=gid)["GlobalClusters"][0]["Endpoint"]
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(global_name) == cluster_ip
+
+        # A stopped and restarted primary answers for the name again once it is up
+        # (AWS: dns-global-cluster-started).
+        rds.stop_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "stopped")
+        rds.start_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "available")
+        _wait_for_instance(rds, did)
         cluster_ip = resolve(rds.describe_db_clusters(
             DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
         assert cluster_ip
