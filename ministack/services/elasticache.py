@@ -3094,6 +3094,8 @@ def _minimum_engine_version(user):
         floor = "7.2"
     elif user.get("Authentication", {}).get("Type") == "iam":
         floor = "7.0"
+    elif user.get("Authentication", {}).get("Type") == "password":
+        floor = "6.0"
     else:
         return None
     # An append's rules can need a later engine (real AWS, issue #2551: +hgetex reports 9.0).
@@ -3126,6 +3128,7 @@ def _create_user(p):
         "ARN": arn,
         "_PasswordHashes": _password_hashes(p),
     }
+    user["_AclVersion"] = _acl_rules_version(user["AccessString"])
     _users[user_id] = user
 
     _tags[arn] = _extract_tags(p)
@@ -3232,26 +3235,133 @@ _ACL_SUBCOMMAND_VERSIONS = {
     **dict.fromkeys("commandlog|get commandlog|help commandlog|len commandlog|reset".split(), "8.1"),
     **dict.fromkeys("cluster|flushslot".split(), "9.0"),
 }
-# The categories that make AWS count a command with subcommands as fully added, so that +command|sub is
-# refused after them and -command|sub accepted.
-_ACL_CONTAINER_CATEGORIES = {
-    "acl": frozenset("admin dangerous slow".split()),
-    "client": frozenset("admin connection dangerous slow".split()),
-    "cluster": frozenset("admin dangerous slow".split()),
-    "command": frozenset("connection slow".split()),
-    "commandlog": frozenset("admin dangerous slow".split()),
-    "config": frozenset("admin dangerous slow".split()),
-    "function": frozenset("scripting slow write".split()),
-    "latency": frozenset("admin dangerous slow".split()),
-    "memory": frozenset("read slow".split()),
-    "module": frozenset("admin dangerous slow".split()),
-    "object": frozenset("keyspace read slow".split()),
-    "pubsub": frozenset("pubsub slow".split()),
-    "script": frozenset("scripting slow".split()),
-    "slowlog": frozenset("admin dangerous slow".split()),
-    "xgroup": frozenset("slow stream write".split()),
-    "xinfo": frozenset("read slow stream".split()),
+# The commands each category holds as AWS counts them for subcommand rules (us-east-2, issue #2551):
+# +command|sub is refused after +@category, and -command|sub accepted.
+_ACL_CATEGORY_COMMANDS = {
+    "admin": frozenset((
+        "acl bgrewriteaof bgsave client cluster commandlog config debug failover json.debug lastsave "
+        "latency module monitor pfdebug pfselftest psync replconf replicaof save shutdown slaveof "
+        "slowlog sync"
+    ).split()),
+    "bitmap": frozenset("bitcount bitfield bitfield_ro bitop bitpos getbit setbit".split()),
+    "blocking": frozenset("blmove blmpop blpop brpop brpoplpush bzmpop bzpopmax bzpopmin xread xreadgroup".split()),
+    "bloom": frozenset("bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve".split()),
+    "connection": frozenset("auth client command echo hello ping quit reset".split()),
+    "dangerous": frozenset((
+        "acl bgrewriteaof bgsave client cluster commandlog config debug failover flushall flushdb "
+        "info keys lastsave latency migrate module monitor pfdebug pfselftest psync replconf "
+        "replicaof restore restore-asking role save shutdown slaveof slowlog sort sort_ro swapdb sync"
+    ).split()),
+    "fast": frozenset((
+        "append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve "
+        "bitfield_ro bzpopmax bzpopmin dbsize decr decrby delifeq discard echo exists expire expireat "
+        "expiretime get getbit getdel getex getset hdel hello hexists hexpire hexpireat hexpiretime "
+        "hget hgetex hincrby hincrbyfloat hlen hmget hmset hpersist hpexpire hpexpireat hpexpiretime "
+        "hpttl hset hsetex hsetnx hstrlen httl incr incrby incrbyfloat json.arrappend json.arrindex "
+        "json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.del json.forget json.get "
+        "json.mget json.numincrby json.nummultby json.objkeys json.objlen json.resp json.strappend "
+        "json.strlen json.toggle json.type lastsave llen lolwut lpop lpush lpushx mget move multi "
+        "persist pexpire pexpireat pexpiretime pfadd ping pttl publish quit readonly readwrite "
+        "renamenx reset role rpop rpush rpushx sadd scard select setnx sismember smismember smove "
+        "spop spublish srem strlen swapdb time touch ttl type unlink unwatch watch xack xadd "
+        "xautoclaim xclaim xdel xlen xsetid zadd zcard zcount zincrby zlexcount zmscore zpopmax "
+        "zpopmin zrank zrem zrevrank zscore"
+    ).split()),
+    "geo": frozenset((
+        "geoadd geodist geohash geopos georadius georadius_ro georadiusbymember georadiusbymember_ro "
+        "geosearch geosearchstore"
+    ).split()),
+    "hash": frozenset((
+        "hdel hexists hexpire hexpireat hexpiretime hget hgetall hgetex hincrby hincrbyfloat hkeys "
+        "hlen hmget hmset hpersist hpexpire hpexpireat hpexpiretime hpttl hrandfield hscan hset "
+        "hsetex hsetnx hstrlen httl hvals"
+    ).split()),
+    "hyperloglog": frozenset("pfadd pfcount pfmerge pfselftest".split()),
+    "json": frozenset((
+        "json.arrappend json.arrindex json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear "
+        "json.debug json.del json.forget json.get json.mget json.mset json.numincrby json.nummultby "
+        "json.objkeys json.objlen json.resp json.set json.strappend json.strlen json.toggle json.type"
+    ).split()),
+    "keyspace": frozenset((
+        "copy dbsize del dump exists expire expireat expiretime flushall flushdb keys migrate move "
+        "object persist pexpire pexpireat pexpiretime pttl randomkey rename renamenx restore "
+        "restore-asking scan swapdb touch ttl type unlink"
+    ).split()),
+    "list": frozenset((
+        "blmove blmpop blpop brpop brpoplpush lindex linsert llen lmove lmpop lpop lpos lpush lpushx "
+        "lrange lrem lset ltrim rpop rpoplpush rpush rpushx sort sort_ro"
+    ).split()),
+    "pubsub": frozenset((
+        "psubscribe publish pubsub punsubscribe spublish ssubscribe subscribe sunsubscribe "
+        "unsubscribe"
+    ).split()),
+    "read": frozenset((
+        "bf.card bf.exists bf.info bf.mexists bitcount bitfield_ro bitpos dbsize dump exists "
+        "expiretime geodist geohash geopos georadius_ro georadiusbymember_ro geosearch get getbit "
+        "getrange hexists hexpiretime hget hgetall hkeys hlen hmget hpexpiretime hpttl hrandfield "
+        "hscan hstrlen httl hvals json.arrindex json.arrlen json.debug json.get json.mget "
+        "json.objkeys json.objlen json.resp json.strlen json.type keys lcs lindex llen lolwut lpos "
+        "lrange memory mget object pexpiretime pfcount pttl randomkey scan scard sdiff sinter "
+        "sintercard sismember smembers smismember sort_ro srandmember sscan strlen substr sunion "
+        "touch ttl type xinfo xlen xpending xrange xread xrevrange zcard zcount zdiff zinter "
+        "zintercard zlexcount zmscore zrandmember zrange zrangebylex zrangebyscore zrank zrevrange "
+        "zrevrangebylex zrevrangebyscore zrevrank zscan zscore zunion"
+    ).split()),
+    "scripting": frozenset("eval eval_ro evalsha evalsha_ro fcall fcall_ro function script".split()),
+    "set": frozenset((
+        "sadd scard sdiff sdiffstore sinter sintercard sinterstore sismember smembers smismember "
+        "smove sort sort_ro spop srandmember srem sscan sunion sunionstore"
+    ).split()),
+    "slow": frozenset((
+        "acl bgrewriteaof bgsave bitcount bitfield bitop bitpos blmove blmpop blpop brpop brpoplpush "
+        "bzmpop client cluster command commandlog config copy debug del dump eval eval_ro evalsha "
+        "evalsha_ro exec failover fcall fcall_ro flushall flushdb function geoadd geodist geohash "
+        "geopos georadius georadius_ro georadiusbymember georadiusbymember_ro geosearch "
+        "geosearchstore getrange hgetall hkeys hrandfield hscan hvals info json.debug json.mset "
+        "json.set keys latency lcs lindex linsert lmove lmpop lpos lrange lrem lset ltrim memory "
+        "migrate module monitor mset msetnx object pfcount pfdebug pfmerge pfselftest psetex "
+        "psubscribe psync pubsub punsubscribe randomkey rename replconf replicaof restore "
+        "restore-asking rpoplpush save scan script sdiff sdiffstore set setbit setex setrange "
+        "shutdown sinter sintercard sinterstore slaveof slowlog smembers sort sort_ro srandmember "
+        "sscan ssubscribe subscribe substr sunion sunionstore sunsubscribe sync unsubscribe wait "
+        "xgroup xinfo xpending xrange xread xreadgroup xrevrange xtrim zdiff zdiffstore zinter "
+        "zintercard zinterstore zmpop zrandmember zrange zrangebylex zrangebyscore zrangestore "
+        "zremrangebylex zremrangebyrank zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore "
+        "zscan zunion zunionstore"
+    ).split()),
+    "sortedset": frozenset((
+        "bzmpop bzpopmax bzpopmin sort sort_ro zadd zcard zcount zdiff zdiffstore zincrby zinter "
+        "zintercard zinterstore zlexcount zmpop zmscore zpopmax zpopmin zrandmember zrange "
+        "zrangebylex zrangebyscore zrangestore zrank zrem zremrangebylex zremrangebyrank "
+        "zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore zrevrank zscan zscore zunion "
+        "zunionstore"
+    ).split()),
+    "stream": frozenset((
+        "xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup "
+        "xrevrange xsetid xtrim"
+    ).split()),
+    "string": frozenset((
+        "append decr decrby delifeq get getdel getex getrange getset incr incrby incrbyfloat lcs mget "
+        "mset msetnx psetex set setex setnx setrange strlen substr"
+    ).split()),
+    "transaction": frozenset("discard exec multi unwatch watch".split()),
+    "write": frozenset((
+        "append bf.add bf.insert bf.madd bf.reserve bitfield bitop blmove blmpop blpop brpop "
+        "brpoplpush bzmpop bzpopmax bzpopmin copy decr decrby del delifeq expire expireat flushall "
+        "flushdb function geoadd georadius georadiusbymember geosearchstore getdel getex getset hdel "
+        "hexpire hexpireat hgetex hincrby hincrbyfloat hmset hpersist hpexpire hpexpireat hset hsetex "
+        "hsetnx incr incrby incrbyfloat json.arrappend json.arrinsert json.arrpop json.arrtrim "
+        "json.clear json.del json.forget json.mset json.numincrby json.nummultby json.set "
+        "json.strappend json.toggle linsert lmove lmpop lpop lpush lpushx lrem lset ltrim migrate "
+        "move mset msetnx persist pexpire pexpireat pfadd pfdebug pfmerge psetex rename renamenx "
+        "restore restore-asking rpop rpoplpush rpush rpushx sadd sdiffstore set setbit setex setnx "
+        "setrange sinterstore smove sort spop srem sunionstore swapdb unlink xack xadd xautoclaim "
+        "xclaim xdel xgroup xreadgroup xsetid xtrim zadd zdiffstore zincrby zinterstore zmpop zpopmax "
+        "zpopmin zrangestore zrem zremrangebylex zremrangebyrank zremrangebyscore zunionstore"
+    ).split()),
 }
+# +command|arg needs 7.0 for these, though +command alone needs no more than the floor (us-east-2, issue #2551).
+_ACL_FIRST_ARG_7_0 = frozenset("asking readonly readwrite select wait".split())
 _ACL_WHITESPACE = " \t\n\r\x0b\x0c"  # AWS splits rules on these only; NBSP and other spaces stay in a rule
 
 
@@ -3354,12 +3464,11 @@ def _acl_apply(scope, rule):
         if "|" in name:
             # +command|sub is refused once the command is fully added, and -command|sub until something
             # granted it; a -@category takes the first away but not the second.
-            categories = _ACL_CONTAINER_CATEGORIES.get(family, frozenset())
             full = granted = scope["base"] == "+"
             for command in scope["commands"]:
                 if command[1:] == family:
                     full = granted = command[0] == "+"
-                elif command[1] == "@" and command[2:] in categories:
+                elif command[1] == "@" and family in _ACL_CATEGORY_COMMANDS.get(command[2:], ()):
                     full = command[0] == "+"
                     granted = granted or full
             if sign == "+" and full:
@@ -3418,14 +3527,25 @@ def _acl_version(rule):
     if isinstance(rule, list):
         return max(["7.0", *filter(None, map(_acl_version, rule))], key=_acl_version_key)
     low = rule.lower()
-    if rule.startswith("%") or low == "clearselectors":
+    if rule.startswith("%") or low == "clearselectors" or (rule.startswith("&") and rule != "&*"):
         return "7.0"
+    if low in ("resetchannels", "allchannels", "&*"):
+        return "6.2"
     if rule[0] not in "+-":
         return None
     command, bar, _ = low[1:].partition("|")
     if bar and rule[0] == "-":
         return _ACL_SUBCOMMAND_VERSIONS.get(low[1:], "7.0")
+    if bar and command in _ACL_FIRST_ARG_7_0:
+        return "7.0"
     return _ACL_RULE_VERSIONS.get(command)
+
+
+def _acl_rules_version(access):
+    """The engine version an access string's rules need (None for the floor); every rule present counts."""
+    rules = _acl_rules(access)
+    return max(filter(None, map(_acl_version, _acl_split(access) if rules is None else rules)),
+               key=_acl_version_key, default=None)
 
 
 def _acl_refused(rule):
@@ -3455,7 +3575,7 @@ def _append_access_string(access, append):
         message = _acl_apply_rule(root, rule)
         if message:
             return None, None, message
-    # Every rule present counts, even one a later rule replaced (rounds 5 and 9 of the captures).
+    # Every rule present counts, even one a later rule replaced or dropped (rounds 5, 9 and 16).
     version = max(filter(None, map(_acl_version, [*stored, *rules])), key=_acl_version_key, default=None)
     default = None if not version else "&*" if version == "6.2" else "resetchannels"
     return _acl_describe(root, default), version, None
@@ -3481,7 +3601,7 @@ def _modify_user(p):
             return _error("InvalidParameterValue", xml_escape(message, _XML_QUOTE), 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
-        user.pop("_AclVersion", None)
+        user["_AclVersion"] = _acl_rules_version(user["AccessString"])
     if appended is not None:
         user["AccessString"], user["_AclVersion"] = appended, version
     if auth:
