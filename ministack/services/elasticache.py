@@ -3167,6 +3167,16 @@ _ACL_PATTERN_AFTER_STAR = ("Adding a pattern '{}' after the * pattern (or the '{
                            "have any effect. Try '{}' to start with an empty list of {}")
 
 
+_ACL_WHITESPACE = " \t\n\r\x0b\x0c"  # AWS splits rules on these only; NBSP and other spaces stay in a rule
+
+
+_XML_QUOTE = {'"': "&quot;"}  # AWS's user bodies escape `"` as well as & < >
+
+
+def _acl_split(text):
+    return [w for w in "".join(" " if c in _ACL_WHITESPACE else c for c in text).split(" ") if w]
+
+
 def _acl_rules(access):
     """An access string's rules, each selector as a list of its rules; None if a selector is empty or
     unclosed. A selector runs from a `(` that starts a rule to the next `)`, so `(~x +get)(~y +set)`
@@ -3175,13 +3185,13 @@ def _acl_rules(access):
     while i < len(access):
         if access[i] == "(" and not word:
             end = access.find(")", i)
-            inner = access[i + 1:end].split() if end >= 0 else []
+            inner = _acl_split(access[i + 1:end]) if end >= 0 else []
             if not inner:
                 return None
             rules.append(inner)
             i = end + 1
             continue
-        if access[i].isspace():
+        if access[i] in _ACL_WHITESPACE:
             rules += [word] if word else []
             word = ""
         else:
@@ -3322,7 +3332,7 @@ def _append_access_string(access, append):
     # MiniStack-only: a stored rule AWS would have refused (CreateUser here doesn't check them all)
     # is skipped rather than failing every later append.
     stored = _acl_rules(access)
-    stored = [rule for rule in (access.split() if stored is None else stored) if not _acl_refused(rule)]
+    stored = [rule for rule in (_acl_split(access) if stored is None else stored) if not _acl_refused(rule)]
     root = _acl_scope(flag="off")
     for rule in stored:
         _acl_apply_rule(root, rule)  # a refusal returns before changing anything, so the rule is skipped
@@ -3341,19 +3351,19 @@ def _modify_user(p):
     user = _users.get(user_id)
     if not user:
         return _error("UserNotFound", f"User {user_id} not found", 404)
-    if _p(p, "AccessString") and _p(p, "AppendAccessString"):
-        return _error("InvalidParameterCombination",
-                      "Both AccessString and AppendAccessString provided together. Pass either one of them.", 400)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
+    if not err and _p(p, "AccessString") and _p(p, "AppendAccessString"):
+        err = _error("InvalidParameterCombination",
+                     "Both AccessString and AppendAccessString provided together. Pass either one of them.", 400)
     err = err or _access_string_error(_p(p, "AccessString"))
     if err:
         return err
     appended = None
-    if _p(p, "AppendAccessString").split():
+    if _acl_split(_p(p, "AppendAccessString")):
         appended, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
         if message:
-            return _error("InvalidParameterValue", xml_escape(message, {'"': "&quot;"}), 400)
+            return _error("InvalidParameterValue", xml_escape(message, _XML_QUOTE), 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
     if appended is not None:
@@ -3491,7 +3501,7 @@ def _user_xml(u):
         f"<UserName>{u.get('UserName', '')}</UserName>"
         f"<Engine>{u.get('Engine', 'redis')}</Engine>"
         f"<Status>{u.get('Status', 'active')}</Status>"
-        f"<AccessString>{xml_escape(u.get('AccessString', ''))}</AccessString>"
+        f"<AccessString>{xml_escape(u.get('AccessString', ''), _XML_QUOTE)}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
         + (f"<MinimumEngineVersion>{_minimum_engine_version(u)}</MinimumEngineVersion>"
            if _minimum_engine_version(u) else "")
