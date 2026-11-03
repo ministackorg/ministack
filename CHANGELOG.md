@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CloudFormation — a `secretsmanager` dynamic reference reads a secret in another account** — a `{{resolve:secretsmanager:<ARN>}}` whose ARN names another account looked for the secret only in the stack's account, so the resource failed with "secret … not found". The ARN, with or without its 6-character suffix, now resolves in the account it names, as on AWS. MiniStack does not check the secret's resource policy, which AWS requires to let the stack's account read it. Recorded against a real AWS account in us-east-1. Contributed by @mishukdutta-cz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
