@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — a JSONata Distributed Map evaluates `Items`, `ItemSelector`, `MaxConcurrency` and `Output`** — an Inline Map evaluated these JSONata fields, but a Distributed Map did not. It ran one child with the whole state input as its item, gave the child the `ItemSelector` expressions as plain text, and ignored `Output`. A `MaxConcurrency` expression failed the execution with `States.Runtime`. A Distributed Map now evaluates all four fields, as on AWS. Measured against a real account in us-east-1. Contributed by @mishukdutta-cz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added

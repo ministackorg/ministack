@@ -10279,6 +10279,34 @@ def test_sfn_distributed_map_runs_child_executions_of_a_map_run(sfn, s3):
     assert set(json.loads(desc["output"])[0]) == {"Etag", "Key", "LastModified", "Size", "StorageClass"}
 
 
+def test_sfn_jsonata_distributed_map_evaluates_its_fields(sfn):
+    """A JSONata DISTRIBUTED Map evaluates Items, ItemSelector, MaxConcurrency and Output, as on AWS."""
+    definition = {"QueryLanguage": "JSONata", "StartAt": "Map", "States": {"Map": {
+        "Type": "Map", "Items": "{% $states.input.items %}",
+        "ItemSelector": {"id": "{% $states.context.Map.Item.Value.id %}",
+                         "index": "{% $states.context.Map.Item.Index %}",
+                         "org": "{% $states.input.org %}", "static": "fixed-value"},
+        "MaxConcurrency": "{% $states.input.batch_size %}",
+        "Output": '{% {"count": $count($states.result), "results": $states.result} %}',
+        "ItemProcessor": {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                          "StartAt": "Echo", "States": {"Echo": {"Type": "Pass", "End": True}}},
+        "End": True}}}
+    arn = sfn.create_state_machine(name=f"dmap-jsonata-{_uuid_mod.uuid4().hex[:8]}", definition=json.dumps(definition),
+                                   roleArn="arn:aws:iam::000000000000:role/r")["stateMachineArn"]
+    payload = {"org": "org-123", "batch_size": 2, "items": [{"id": 1}, {"id": 2}, {"id": 3}]}
+    execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(payload))["executionArn"]
+
+    desc = _wait_sfn(sfn, execution, timeout=20)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert json.loads(desc["output"]) == {"count": 3, "results": [
+        {"id": 1, "index": 0, "org": "org-123", "static": "fixed-value"},
+        {"id": 2, "index": 1, "org": "org-123", "static": "fixed-value"},
+        {"id": 3, "index": 2, "org": "org-123", "static": "fixed-value"},
+    ]}
+    (map_run,) = sfn.list_map_runs(executionArn=execution)["mapRuns"]
+    assert sfn.describe_map_run(mapRunArn=map_run["mapRunArn"])["maxConcurrency"] == 2
+
+
 def _history(sfn, definition):
     arn = sfn.create_state_machine(name=f"sfn-inner-events-{_uuid_mod.uuid4().hex[:8]}",
                                    definition=json.dumps(definition),
