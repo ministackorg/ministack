@@ -1543,6 +1543,22 @@ _AWS_ACL_CHANNELS_7 = {
 }
 
 
+def test_user_access_string_with_channel_pattern_round_trips(ec):
+    """AWS returns an access string with `&` XML-escaped in CreateUser, DescribeUsers, ModifyUser and
+    DeleteUser (captures create-user-ctl, describe-user-ctl, modify-user-amp, delete-user-amp); AWS also
+    rewrites it (`on ~* resetchannels &allowed* +@all`), which MiniStack does not, so only the pattern
+    is compared."""
+    uid = f"u-amp-{_uid()}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* &allowed* +@all",
+                             AuthenticationMode={"Type": "iam"})
+    try:
+        assert "&allowed*" in created["AccessString"]
+        assert "&allowed*" in ec.describe_users(UserId=uid)["Users"][0]["AccessString"]
+        assert "&other*" in ec.modify_user(UserId=uid, AccessString="on ~* &other* +@all")["AccessString"]
+    finally:
+        assert "&other*" in ec.delete_user(UserId=uid)["AccessString"]
+
+
 def test_user_acl_channels_default_to_all():
     """The ACL SETUSER commands MiniStack sends: `allchannels` before an access string without channel
     rules or selectors, and on the `default` user of a Valkey group without one (a Redis group keeps
@@ -1576,7 +1592,7 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
     """Captures dataplane-serverless, dataplane-v8, dataplane-v9, dataplane-r7 and aws-no-channel-shapes
     (AWS, us-east-2): each user's channels match the table captured for the engine, an iam user with
     `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all` gets
-    the engine's NOPERM outside `allowed*`.
+    NOPERM outside `allowed*` (Valkey's exact text; for Redis only a channel NOPERM, see below).
     A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
     one (DefaultUserRequired), so the Redis group has one with `on ~* +@all`, which gets `&*`."""
     import socket
@@ -1636,6 +1652,9 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
         reply = _tls_session(ep, ca, auth(selector_user), ("ACL", "GETUSER", selector_user), ("PUBLISH", "chan", "x"))
         # a selector's channels are its last field, and the selectors list ends the reply
         assert reply[1].endswith(b"$8\r\nchannels\r\n$5\r\n&chan\r\n") and nochan(reply[2])
+        selector_user = users["on ~* +@all (+get ~k)"]
+        reply = _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", selector_user))[1]
+        assert reply.endswith(b"$8\r\nchannels\r\n$0\r\n\r\n")
         if engine == "redis":
             default = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"))[1]
             assert b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in default
