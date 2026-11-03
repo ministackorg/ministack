@@ -1532,22 +1532,34 @@ _AWS_ACL_CHANNELS = {
     "on ~* +@all (&chan +get ~k)": "",
     "on ~* +@all (+get ~k)": "",
 }
+# More access strings without channel rules, captured on serverless Valkey 7 and Redis OSS 7 only
+# (aws-no-channel-shapes).
+_AWS_ACL_CHANNELS_7 = {
+    "on ~k +get": "&*",
+    "off ~* +@all": "&*",
+    "on ~* -@all +publish +subscribe": "&*",
+    "on ~app:* +@all": "&*",
+    "on +@all": "&*",
+}
 
 
 def test_user_acl_channels_default_to_all():
     """The ACL SETUSER commands MiniStack sends: `allchannels` before an access string without channel
-    rules or selectors, and on the `default` user of a Valkey group without one (a group without an
-    Engine is a Redis one in MiniStack, and keeps `reset` alone)."""
+    rules or selectors, and on the `default` user of a Valkey group without one (a Redis group keeps
+    `reset` alone)."""
     def user(access):
         return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
 
     assert elasticache._acl_setuser(user("on ~* +@all")) == [
         "ACL", "SETUSER", "u", "reset", "allchannels", "on", "~*", "+@all", "nopass"]
+    for access in _AWS_ACL_CHANNELS_7:
+        assert elasticache._acl_setuser(user(access)) == [
+            "ACL", "SETUSER", "u", "reset", "allchannels", *access.split(), "nopass"]
     for access in _AWS_ACL_CHANNELS:
         if access != "on ~* +@all":
             assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", "reset", *access.split(), "nopass"]
 
-    elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"UserIds": []})
+    elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"Engine": "redis", "UserIds": []})
     try:
         assert elasticache._user_group_acl_commands("000000000000", "us-east-1", "g-chan") == [
             ["ACL", "SETUSER", "default", "reset"]]
@@ -1561,15 +1573,17 @@ def test_user_acl_channels_default_to_all():
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
 @pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
 def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
-    """Captures dataplane-serverless, dataplane-v8, dataplane-v9 and dataplane-r7 (AWS, us-east-2): each
-    user's channels match `_AWS_ACL_CHANNELS`, an iam user with `on ~* +@all` can SUBSCRIBE and PUBLISH
-    on any channel, and one with `on ~* &allowed* +@all` gets the engine's NOPERM outside `allowed*`.
+    """Captures dataplane-serverless, dataplane-v8, dataplane-v9, dataplane-r7 and aws-no-channel-shapes
+    (AWS, us-east-2): each user's channels match the table captured for the engine, an iam user with
+    `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all` gets
+    the engine's NOPERM outside `allowed*`.
     A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
     one (DefaultUserRequired), so the Redis group has one with `on ~* +@all`, which gets `&*`."""
     import socket
     import ssl
     uid, pw = _uid(), "msc-capture-default-password-1"
-    users = {access: f"u-{i}-{uid}" for i, access in enumerate(_AWS_ACL_CHANNELS)}
+    expected = {**_AWS_ACL_CHANNELS, **(_AWS_ACL_CHANNELS_7 if major == "7" else {})}
+    users = {access: f"u-{i}-{uid}" for i, access in enumerate(expected)}
     all_user, ctl_user = users["on ~* +@all"], users["on ~* &allowed* +@all"]
     group, name, default_id = f"g-{uid}", f"sls-chan-{uid}", f"u-def-{uid}"
     for access, user_id in users.items():
@@ -1613,8 +1627,9 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
                     return subscribed, published, sub.recv(65536) if published == b":1\r\n" else None
 
         for access, user_id in users.items():
-            channels = _AWS_ACL_CHANNELS[access]
-            reply = _tls_session(ep, ca, auth(user_id), ("ACL", "GETUSER", user_id))[1]
+            channels = expected[access]
+            # read through the `on ~* +@all` user, as in the capture: an `off` user cannot AUTH
+            reply = _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", user_id))[1]
             # the root channels come right before `selectors`; each selector has its own channels field
             assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
         selector_user = users["on ~* +@all (&chan +get ~k)"]
