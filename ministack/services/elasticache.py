@@ -3218,7 +3218,6 @@ def _create_user(p):
         "ARN": arn,
         "_PasswordHashes": _password_hashes(p),
     }
-    user["_AclVersion"] = _acl_rules_version(user["AccessString"])
     _users[user_id] = user
 
     _tags[arn] = _extract_tags(p)
@@ -3647,13 +3646,6 @@ def _acl_version(rule):
     return _ACL_RULE_VERSIONS.get(command)
 
 
-def _acl_rules_version(access):
-    """The engine version an access string's rules need (None for the floor); every rule present counts."""
-    rules = _acl_rules(access)
-    return max(filter(None, map(_acl_version, _acl_split(access) if rules is None else rules)),
-               key=_acl_version_key, default=None)
-
-
 def _acl_refused(rule):
     keywords = _ACL_SELECTOR_KEYWORDS if isinstance(rule, list) else _ACL_ROOT_KEYWORDS
     return next(filter(None, (_acl_refusal(inner, keywords) for inner in (rule if isinstance(rule, list) else [rule]))),
@@ -3711,7 +3703,7 @@ def _modify_user(p):
             return _error("InvalidParameterValue", message, 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
-        user["_AclVersion"] = _acl_rules_version(user["AccessString"])
+        user.pop("_AclVersion", None)
     if appended is not None:
         user["AccessString"], user["_AclVersion"] = appended, version
     if auth:
