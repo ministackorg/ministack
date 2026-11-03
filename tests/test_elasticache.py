@@ -1531,10 +1531,7 @@ _AWS_ACL_CHANNELS = {
     "on ~* &a resetchannels &b +@all": "&b",
     "on ~* +@all (&chan +get ~k)": "",
     "on ~* +@all (+get ~k)": "",
-}
-# More access strings without channel rules, captured on serverless Valkey 7 and Redis OSS 7 only
-# (aws-no-channel-shapes).
-_AWS_ACL_CHANNELS_7 = {
+    # without channel rules, serverless only (aws-no-channel-shapes, aws-no-channel-shapes-v8-v9)
     "on ~k +get": "&*",
     "off ~* +@all": "&*",
     "on ~* -@all +publish +subscribe": "&*",
@@ -1566,14 +1563,11 @@ def test_user_acl_channels_default_to_all():
     def user(access):
         return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
 
-    assert elasticache._acl_setuser(user("on ~* +@all")) == [
-        "ACL", "SETUSER", "u", "reset", "allchannels", "on", "~*", "+@all", "nopass"]
-    for access in _AWS_ACL_CHANNELS_7:
-        assert elasticache._acl_setuser(user(access)) == [
-            "ACL", "SETUSER", "u", "reset", "allchannels", *access.split(), "nopass"]
+    with_allchannels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
+                        "on ~app:* +@all", "on +@all"}
     for access in _AWS_ACL_CHANNELS:
-        if access != "on ~* +@all":
-            assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", "reset", *access.split(), "nopass"]
+        prefix = ["reset", "allchannels"] if access in with_allchannels else ["reset"]
+        assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
 
     elasticache._user_groups.set_scoped("000000000000", "us-east-1", "g-chan", {"Engine": "redis", "UserIds": []})
     try:
@@ -1590,7 +1584,7 @@ def test_user_acl_channels_default_to_all():
 @pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
 def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
     """Captures dataplane-serverless, dataplane-v8, dataplane-v9, dataplane-r7 and aws-no-channel-shapes
-    (AWS, us-east-2): each user's channels match the table captured for the engine, an iam user with
+    (AWS, us-east-2): each user's channels match `_AWS_ACL_CHANNELS`, an iam user with
     `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all` gets
     NOPERM outside `allowed*` (Valkey's exact text; for Redis only a channel NOPERM, see below).
     A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
@@ -1598,7 +1592,7 @@ def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
     import socket
     import ssl
     uid, pw = _uid(), "msc-capture-default-password-1"
-    expected = {**_AWS_ACL_CHANNELS, **(_AWS_ACL_CHANNELS_7 if major == "7" else {})}
+    expected = _AWS_ACL_CHANNELS
     users = {access: f"u-{i}-{uid}" for i, access in enumerate(expected)}
     all_user, ctl_user = users["on ~* +@all"], users["on ~* &allowed* +@all"]
     group, name, default_id = f"g-{uid}", f"sls-chan-{uid}", f"u-def-{uid}"
