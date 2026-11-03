@@ -2806,8 +2806,21 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
 
 # Real AWS (us-east-2, issue #2551): each captured user's CreateUser, ModifyUser and DescribeUsers calls in
 # order, with AWS's answers. Built from the raw captures; a user's calls stop before one MiniStack doesn't model.
-with open(os.path.join(os.path.dirname(__file__), "fixtures", "elasticache", "append_access_string.json")) as _f:
-    _APPEND_CAPTURES = json.load(_f)
+def _append_captures():
+    """Expand the compact fixture: a step is ["c", create], [append, expect], ["m", params, expect] or
+    ["d", expect], and an integer expect is an index into "errors"."""
+    with open(os.path.join(os.path.dirname(__file__), "fixtures", "elasticache", "append_access_string.json")) as f:
+        data = json.load(f)
+    def step(row):
+        if row[0] == "c":
+            return "c", data["creates"][row[1]], None
+        op, params, expect = (("d", None, row[1]) if row[0] == "d" else ("m", row[1], row[2]) if row[0] == "m"
+                              else ("m", {"AppendAccessString": row[0]}, row[1]))
+        return op, params, data["errors"][expect] if isinstance(expect, int) else expect
+    return [{"id": case_id, "steps": [step(row) for row in rows]} for case_id, rows in data["cases"]]
+
+
+_APPEND_CAPTURES = _append_captures()
 
 
 @pytest.mark.parametrize("case", _APPEND_CAPTURES, ids=[c["id"] for c in _APPEND_CAPTURES])
@@ -2857,7 +2870,7 @@ def test_elasticache_modify_user_append_skips_stored_rules_aws_refuses(ec):
 
 def test_elasticache_no_password_redis_user_reports_engine_floor(ec):
     """AWS reports 6.0 for a no-password Redis user (us-east-2, issue #2551, round22 create-nopass-get)."""
-    uid = "ec-nopass-floor"
+    uid = f"nopass-{_uuid_mod.uuid4().hex[:8]}"
     user = ec.create_user(UserId=uid, UserName=uid, Engine="redis", AccessString="on ~* -@all",
                           AuthenticationMode={"Type": "no-password-required"})
     try:

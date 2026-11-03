@@ -3103,7 +3103,7 @@ def _password_hashes(p):
 # with valkey/valkey-bundle:8.1's JSON and Bloom commands and the ones valkey/valkey:9.0 adds, and the categories of the engine's
 # `ACL CAT` on AWS (real AWS, us-west-2, Valkey 8.1). `all` is no category but is accepted.
 _ACL_COMMANDS = frozenset((
-    "acl append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.load bf.madd bf.mexists "
+    "acl append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists "
     "bf.reserve bgrewriteaof bgsave bitcount bitfield bitfield_ro bitop bitpos blmove blmpop blpop brpop "
     "brpoplpush bzmpop bzpopmax bzpopmin client cluster command commandlog config copy dbsize debug decr "
     "decrby del discard dump echo eval eval_ro evalsha evalsha_ro exec exists expire expireat expiretime "
@@ -3121,7 +3121,7 @@ _ACL_COMMANDS = frozenset((
     "rpoplpush rpush rpushx sadd save scan scard script sdiff sdiffstore select set setbit setex setnx "
     "setrange shutdown sinter sintercard sinterstore sismember slaveof slowlog smembers smismember smove "
     "sort sort_ro spop spublish srandmember srem sscan ssubscribe strlen subscribe substr sunion "
-    "sunionstore sunsubscribe swapdb sync time touch ttl type unlink unsubscribe unwatch wait waitaof "
+    "sunionstore sunsubscribe swapdb sync time touch ttl type unlink unsubscribe unwatch wait "
     "watch xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup xrevrange "
     "xsetid xtrim zadd zcard zcount zdiff zdiffstore zincrby zinter zintercard zinterstore zlexcount "
     "zmpop zmscore zpopmax zpopmin zrandmember zrange zrangebylex zrangebyscore zrangestore zrank zrem "
@@ -3132,7 +3132,7 @@ _ACL_COMMANDS = frozenset((
 # valkey/valkey:7.2-9.0 images' command lists); they are left out of its ACL, where they couldn't run.
 _ACL_COMMANDS_SINCE = (
     ((7, 0), "blmpop bzmpop eval_ro evalsha_ro expiretime fcall fcall_ro function lcs lmpop pexpiretime quit "
-             "sintercard sort_ro spublish ssubscribe sunsubscribe waitaof zintercard zmpop"),
+             "sintercard sort_ro spublish ssubscribe sunsubscribe zintercard zmpop"),
     ((8, 1), "commandlog"),
     ((9, 0), "delifeq hexpire hexpireat hexpiretime hgetex hpersist hpexpire hpexpireat hpexpiretime hpttl "
              "hsetex httl"),
@@ -3142,8 +3142,6 @@ _ACL_CATEGORIES = frozenset((
     "all keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast "
     "slow blocking dangerous connection transaction scripting json bloom search").split())
 _ACL_MODULE_NAMES = frozenset({"json", "bloom", "search"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
-# Real AWS refuses these two as invalid commands (us-east-2, issue #2551, CreateUser and ModifyUser).
-_ACL_COMMANDS -= {"waitaof", "bf.load"}
 _ACL_KEYWORDS = frozenset((
     "on off nopass resetpass reset allkeys allchannels resetkeys resetchannels allcommands nocommands "
     "clearselectors").split())
@@ -3282,20 +3280,13 @@ _ACL_RULE_VERSIONS = {
         "json.set json.strappend json.strlen json.toggle json.type lmove lpos reset smismember xautoclaim "
         "zdiff zdiffstore zinter zmscore zrandmember zrangestore zunion "
     ).split(), "6.2"),
+    **{c: ".".join(map(str, since)) for since, names in _ACL_COMMANDS_SINCE for c in names.split()},
     **dict.fromkeys((
-        "blmpop bzmpop eval_ro evalsha_ro expiretime fcall fcall_ro function lcs lmpop pexpiretime quit "
-        "sintercard sort_ro spublish ssubscribe sunsubscribe zintercard zmpop "
-    ).split(), "7.0"),
-    **dict.fromkeys((
-        "@bloom bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve commandlog json.mset "
+        "@bloom bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve json.mset "
     ).split(), "8.1"),
     **dict.fromkeys((
         "@search "
     ).split(), "8.2"),
-    **dict.fromkeys((
-        "delifeq hexpire hexpireat hexpiretime hgetex hpersist hpexpire hpexpireat hpexpiretime hpttl hsetex "
-        "httl "
-    ).split(), "9.0"),
 }
 # The subcommands AWS accepts in a -command|subcommand rule, and those needing more than 7.0 there.
 _ACL_SUBCOMMANDS = frozenset((
