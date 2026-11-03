@@ -1857,9 +1857,16 @@ def _run_execution(exec_arn):
             if state_type in ("Task", "Parallel", "Map"):
                 current_input, next_name = handler_fn(
                     state_def, current_input, execution, ctx)
+            elif state_type == "Wait":
+                current_input, next_name = handler_fn(
+                    state_def, current_input, ctx, execution=execution)
             else:
                 current_input, next_name = handler_fn(
                     state_def, current_input, ctx)
+
+            # AWS writes no event after ExecutionAborted, so a stopped run skips the exit event.
+            if execution["status"] != "RUNNING":
+                break
 
             _add_event(execution, f"{state_type}StateExited", {
                 "stateExitedEventDetails": {
@@ -2442,14 +2449,14 @@ def _evaluate_rule(rule, data, ctx=None):
 # Wait state
 # ---------------------------------------------------------------------------
 
-def _execute_wait(state_def, raw_input, ctx=None):
+def _execute_wait(state_def, raw_input, ctx=None, execution=None):
     if _state_query_language(state_def, ctx) == "JSONata":
         # JSONata Wait: Seconds and Timestamp may be expressions, and Output
         # and Assign replace the JSONPath chain, as for Pass.
         if "Seconds" in state_def:
-            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx))
+            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx), execution)
         elif "Timestamp" in state_def:
-            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx))
+            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx), execution)
         output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
         _apply_state_assign(state_def, raw_input, ctx)
         return output, _next_or_end(state_def)
@@ -2457,17 +2464,17 @@ def _execute_wait(state_def, raw_input, ctx=None):
     effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
-        _scaled_sleep(state_def["Seconds"])
+        _scaled_sleep(state_def["Seconds"], execution)
     elif "Timestamp" in state_def:
-        _sleep_until(state_def["Timestamp"])
+        _sleep_until(state_def["Timestamp"], execution)
     elif "SecondsPath" in state_def:
         secs = _resolve_path(state_def["SecondsPath"], effective)
         if isinstance(secs, (int, float)) and secs > 0:
-            _scaled_sleep(secs)
+            _scaled_sleep(secs, execution)
     elif "TimestampPath" in state_def:
         ts_str = _resolve_path(state_def["TimestampPath"], effective)
         if isinstance(ts_str, str):
-            _sleep_until(ts_str)
+            _sleep_until(ts_str, execution)
 
     output = _apply_output_path(state_def, effective, ctx)
     _apply_state_assign(state_def, effective, ctx)
@@ -2497,18 +2504,25 @@ def _jsonata_wait_timestamp(state_def, raw_input, ctx):
     return timestamp
 
 
-def _scaled_sleep(seconds):
+def _scaled_sleep(seconds, execution=None):
     scaled = seconds * _SFN_WAIT_SCALE
-    if scaled > 0:
+    if scaled <= 0:
+        return
+    if execution is None:
         time.sleep(scaled)
+        return
+    # A stopped execution ends its Wait at once, as on AWS.
+    deadline = time.monotonic() + scaled
+    while execution["status"] == "RUNNING" and time.monotonic() < deadline:
+        time.sleep(max(0, min(0.1, deadline - time.monotonic())))
 
 
-def _sleep_until(iso_ts):
+def _sleep_until(iso_ts, execution=None):
     try:
         target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         delta = (target - datetime.now(timezone.utc)).total_seconds()
         if delta > 0:
-            _scaled_sleep(delta)
+            _scaled_sleep(delta, execution)
     except (ValueError, TypeError):
         pass
 
@@ -2880,7 +2894,8 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
     current_name = start_at
     current_input = copy.deepcopy(input_data)
 
-    while current_name:
+    # A stopped execution starts no more states in a Map or Parallel branch, as on AWS.
+    while current_name and execution["status"] == "RUNNING":
         state_def = states.get(current_name)
         if not state_def:
             raise _ExecutionError(
@@ -2925,9 +2940,15 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
         if state_type in ("Task", "Parallel", "Map"):
             current_input, next_name = handler_fn(
                 state_def, current_input, execution, ctx)
+        elif state_type == "Wait":
+            current_input, next_name = handler_fn(
+                state_def, current_input, ctx, execution=execution)
         else:
             current_input, next_name = handler_fn(
                 state_def, current_input, ctx)
+
+        if execution["status"] != "RUNNING":
+            break
 
         _add_event(execution, f"{state_type}StateExited", {
             "stateExitedEventDetails": {
