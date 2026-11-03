@@ -1862,6 +1862,11 @@ def test_ecs_container_secret_ssm_valuefrom_is_region_scoped():
         # Full ARN resolves by the ARN's region regardless of request region.
         arn_cdef = {"secrets": [{"name": "DB_PASS", "valueFrom": east_arn}]}
         assert ecs_service._resolve_container_secrets(arn_cdef) == {"DB_PASS": "east-secret"}
+
+        # A SecureString reaches the container decrypted, as on AWS.
+        ssm_service._put_parameter({"Name": f"{name}-secure", "Type": "SecureString", "Value": "s3cr3t"})
+        assert ecs_service._resolve_container_secrets(
+            {"secrets": [{"name": "DB_PASS", "valueFrom": f"{name}-secure"}]}) == {"DB_PASS": "s3cr3t"}
     finally:
         ssm_service.reset()
         set_request_account_id(original_account)

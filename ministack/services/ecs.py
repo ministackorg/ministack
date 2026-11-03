@@ -1978,7 +1978,7 @@ def _resolve_container_secrets(cdef):
         else:
             # SSM Parameter Store reference (ARN or bare name).
             from ministack.services import ssm
-            value = ssm.resolve_parameter_value(value_from)
+            value = ssm.resolve_parameter_value(value_from, decrypt=True)  # ECS injects SecureStrings decrypted
         if value is None:
             raise _SecretResolutionError(
                 f"unable to retrieve secret {value_from} for environment "
