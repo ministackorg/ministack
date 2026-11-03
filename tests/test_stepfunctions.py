@@ -10506,6 +10506,87 @@ def test_sfn_distributed_map_runs_child_executions_of_a_map_run(sfn, s3):
     assert set(json.loads(desc["output"])[0]) == {"Etag", "Key", "LastModified", "Size", "StorageClass"}
 
 
+def test_sfn_jsonata_distributed_map_evaluates_its_fields(sfn):
+    """A JSONata DISTRIBUTED Map evaluates Items, ItemSelector, MaxConcurrency and Output, as on AWS."""
+    definition = {"QueryLanguage": "JSONata", "StartAt": "Map", "States": {"Map": {
+        "Type": "Map", "Items": "{% $states.input.items %}",
+        "ItemSelector": {"id": "{% $states.context.Map.Item.Value.id %}",
+                         "index": "{% $states.context.Map.Item.Index %}",
+                         "org": "{% $states.input.org %}", "static": "fixed-value"},
+        "MaxConcurrency": "{% $states.input.batch_size %}",
+        "Output": '{% {"count": $count($states.result), "results": $states.result} %}',
+        "ItemProcessor": {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                          "StartAt": "Echo", "States": {"Echo": {"Type": "Pass", "End": True}}},
+        "End": True}}}
+    arn = sfn.create_state_machine(name=f"dmap-jsonata-{_uuid_mod.uuid4().hex[:8]}", definition=json.dumps(definition),
+                                   roleArn="arn:aws:iam::000000000000:role/r")["stateMachineArn"]
+    payload = {"org": "org-123", "batch_size": 2, "items": [{"id": 1}, {"id": 2}, {"id": 3}]}
+    execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(payload))["executionArn"]
+
+    desc = _wait_sfn(sfn, execution, timeout=20)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert json.loads(desc["output"]) == {"count": 3, "results": [
+        {"id": 1, "index": 0, "org": "org-123", "static": "fixed-value"},
+        {"id": 2, "index": 1, "org": "org-123", "static": "fixed-value"},
+        {"id": 3, "index": 2, "org": "org-123", "static": "fixed-value"},
+    ]}
+    (map_run,) = sfn.list_map_runs(executionArn=execution)["mapRuns"]
+    assert sfn.describe_map_run(mapRunArn=map_run["mapRunArn"])["maxConcurrency"] == 2
+def _inline_map_field_cause(entered_event_id):
+    return (f"An error occurred while executing the state 'Map' (entered at the event id #{entered_event_id}). "
+            "The ItemReader, ItemBatcher and ResultWriter fields are not supported for INLINE maps")
+
+
+def _run_inline_map(sfn, map_fields, extra_states=None, start_at="Map"):
+    definition = {"StartAt": start_at, "States": {
+        "Map": {**map_fields, "Type": "Map", "End": True,
+                "ItemProcessor": {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "P",
+                                  "States": {"P": {"Type": "Pass", "End": True}}}},
+        **(extra_states or {}),
+    }}
+    arn = sfn.create_state_machine(name=f"sfn-inline-field-{_uuid_mod.uuid4().hex[:8]}",
+                                   definition=json.dumps(definition),
+                                   roleArn="arn:aws:iam::000000000000:role/R")["stateMachineArn"]
+    execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"items": [1, 2, 3]}))["executionArn"]
+    desc = _wait_sfn(sfn, execution, timeout=20)
+    events = sfn.get_execution_history(executionArn=execution, maxResults=1000)["events"]
+    return desc, [e["type"] for e in events]
+
+
+@pytest.mark.parametrize("map_fields", [
+    {"ItemsPath": "$.items", "ItemBatcher": {"MaxItemsPerBatch": 2}},
+    {"ItemReader": {"Resource": "arn:aws:states:::s3:getObject", "ReaderConfig": {"InputType": "JSON"},
+                    "Parameters": {"Bucket": "no-such-bucket", "Key": "items.json"}}},
+    {"ItemsPath": "$.items", "ResultWriter": {"Resource": "arn:aws:states:::s3:putObject",
+                                              "Parameters": {"Bucket": "no-such-bucket", "Prefix": "results"}}},
+], ids=["ItemBatcher", "ItemReader", "ResultWriter"])
+def test_sfn_inline_map_with_a_distributed_map_field_fails_the_execution(sfn, map_fields):
+    desc, event_types = _run_inline_map(sfn, map_fields)
+    assert (desc["status"], desc["error"], desc["cause"]) == ("FAILED", "States.Runtime", _inline_map_field_cause(2))
+    assert event_types == ["ExecutionStarted", "MapStateEntered", "ExecutionFailed"]
+
+
+@pytest.mark.parametrize("handler", [
+    {"Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.caught", "Next": "Caught"}]},
+    {"Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 2}]},
+], ids=["Catch", "Retry"])
+def test_sfn_catch_or_retry_on_the_map_does_not_handle_the_inline_map_field_error(sfn, handler):
+    desc, event_types = _run_inline_map(
+        sfn, {"ItemsPath": "$.items", "ItemBatcher": {"MaxItemsPerBatch": 2}, **handler},
+        extra_states={"Caught": {"Type": "Pass", "End": True}})
+    assert (desc["status"], desc["error"], desc["cause"]) == ("FAILED", "States.Runtime", _inline_map_field_cause(2))
+    assert event_types == ["ExecutionStarted", "MapStateEntered", "ExecutionFailed"]
+
+
+def test_sfn_inline_map_field_error_names_the_maps_own_entered_event(sfn):
+    desc, event_types = _run_inline_map(
+        sfn, {"ItemsPath": "$.items", "ItemBatcher": {"MaxItemsPerBatch": 2}},
+        extra_states={"First": {"Type": "Pass", "Next": "Map"}}, start_at="First")
+    assert (desc["status"], desc["error"], desc["cause"]) == ("FAILED", "States.Runtime", _inline_map_field_cause(4))
+    assert event_types == ["ExecutionStarted", "PassStateEntered", "PassStateExited", "MapStateEntered",
+                           "ExecutionFailed"]
+
+
 def _history(sfn, definition):
     arn = sfn.create_state_machine(name=f"sfn-inner-events-{_uuid_mod.uuid4().hex[:8]}",
                                    definition=json.dumps(definition),
