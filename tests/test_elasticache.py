@@ -2896,7 +2896,7 @@ def test_elasticache_modify_user_append_refuses_control_characters(ec):
     ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~x +@all",
                    AuthenticationMode={"Type": "iam"})
     try:
-        for append in ("~a\x1cb", "&a\x01b"):
+        for append in ("~a\x1cb", "&a\x01b", "(+get|\x01)", "~a\ufffeb"):
             with pytest.raises(ClientError) as exc:
                 ec.modify_user(UserId=uid, AppendAccessString=append)
             assert exc.value.response["Error"]["Message"] == "The access-string is invalid."
