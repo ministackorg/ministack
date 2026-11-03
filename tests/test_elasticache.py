@@ -2714,6 +2714,26 @@ def test_elasticache_acl_setuser_denies_inside_selectors_only():
         del _ec._users[f"u-{uid}"], _ec._user_groups[f"g-{uid}"]
 
 
+def test_elasticache_engine_acl_takes_no_credentials_or_lines_from_the_api():
+    """A user name cannot add ACL file lines, and an access string cannot set passwords or nopass."""
+    from ministack.core.responses import get_account_id, get_region
+    from ministack.services import elasticache as _ec
+    uid = _uid()
+    _ec._users[f"u-{uid}"] = {"UserId": f"u-{uid}", "UserName": "app\nuser evil on nopass ~* &* +@all",
+                              "AccessString": "on ~* +@all", "Authentication": {"Type": "iam"}}
+    _ec._users[f"p-{uid}"] = {"UserId": f"p-{uid}", "UserName": "pw", "Authentication": {"Type": "password"},
+                              "AccessString": "on ~* >secret #ab !cd <x nopass resetpass reset +@all",
+                              "_PasswordHashes": ["ef"]}
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"u-{uid}", f"p-{uid}"]}
+    try:
+        acl = _ec._engine_acl({"Engine": "valkey", "EngineVersion": "8.0", "UserGroupIds": [f"g-{uid}"]},
+                              get_account_id(), get_region())
+        assert "evil" not in acl and acl.count("\n") == 2
+        assert "user pw reset &* on ~* +@all -acl|setuser -acl|deluser -acl|load -acl|save -config #ef\n" in acl
+    finally:
+        del _ec._users[f"u-{uid}"], _ec._users[f"p-{uid}"], _ec._user_groups[f"g-{uid}"]
+
+
 @requires_docker
 @pytest.mark.data_plane
 def test_elasticache_replication_group_keeps_its_data_when_users_change(ec, tmp_path):

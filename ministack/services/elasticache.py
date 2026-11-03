@@ -2496,6 +2496,8 @@ def _acl_setuser(user, deny=()):
     if not any(t.startswith(("&", "(&")) or t.lower() in ("allchannels", "resetchannels") for t in tokens):
         rules.append("&*")
     for token in tokens:  # each (selector) grants on its own: deny there too
+        if _is_credential_rule(token):
+            continue
         in_selector = in_selector or token.startswith("(")
         if deny and in_selector and token.endswith(")"):
             rules += [token[:-1], *deny[:-1], deny[-1] + ")"]
@@ -2510,6 +2512,19 @@ def _acl_setuser(user, deny=()):
     return ["ACL", "SETUSER", user.get("UserName") or user["UserId"], *rules]
 
 
+# Credentials come only from the user's authentication mode, never from its access string.
+_CREDENTIAL_KEYWORDS = frozenset(("nopass", "resetpass", "reset"))
+
+
+def _is_credential_rule(token):
+    return token[:1] in (">", "<", "#", "!") or token.lower() in _CREDENTIAL_KEYWORDS
+
+
+def _engine_user_name_ok(user):
+    # The ACL file holds one user per line: a name with whitespace or a control character would add lines.
+    return bool(re.fullmatch(r"[^\s\x00-\x1f\x7f]+", user.get("UserName") or user.get("UserId") or ""))
+
+
 def _user_group_acl_commands(account_id, region, group_ids, deny=()):
     """The engine ACL for a cache with user groups: the groups' users, then `default` last. Groups
     without a user named default turn it off (AWS RBAC docs: attaching a Valkey user group disables it)."""
@@ -2518,6 +2533,11 @@ def _user_group_acl_commands(account_id, region, group_ids, deny=()):
     user_ids = dict.fromkeys(uid for gid in group_ids
                              for uid in (_user_groups.get_scoped(account_id, region, gid) or {}).get("UserIds", []))
     users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in user_ids) if u]
+    for u in users:
+        if not _engine_user_name_ok(u):
+            logger.warning("ElastiCache: user %r left off the engine: its name is not a valid engine user name",
+                           u.get("UserId"))
+    users = [u for u in users if _engine_user_name_ok(u)]
     default = next((u for u in users if u.get("UserName") == "default"), None)
     commands = [_acl_setuser(u, deny) for u in users if u.get("UserName") != "default"]
     commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset", "&*"])
@@ -3132,7 +3152,7 @@ def _describe_users(p):
     if user_id:
         user = _users.get(user_id)
         if not user:
-            return _error("UserNotFound", f"User {user_id} not found", 404)
+            return _error("UserNotFound", f"User {user_id} not found.", 404)
         users = [user]
     else:
         users = list(_users.values())
@@ -3148,12 +3168,12 @@ def _delete_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
     if not user:
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
     if user.get("UserName") == "default" and user.get("UserGroupIds"):  # real AWS, us-west-2
         return _error("DefaultUserAssociatedToUserGroup",
                       "User is associated to user group(s) as a default user and can't be deleted.", 400)
     if _users.pop(user_id, None) is None:  # deleted meanwhile by a concurrent request
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
     _apply_user_groups_of(user.get("UserGroupIds", []))
@@ -3164,7 +3184,7 @@ def _modify_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
     if not user:
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
     err = err or _access_string_error(_p(p, "AccessString"))
