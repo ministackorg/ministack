@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — an Inline Map with `ItemReader`, `ItemBatcher` or `ResultWriter` fails the execution** — these fields work only in a Distributed Map, but an Inline Map that had one ran and ignored the field. As on AWS, the execution now fails when it enters the Map. The error is `States.Runtime`, with the cause `An error occurred while executing the state '<name>' (entered at the event id #<id>). The ItemReader, ItemBatcher and ResultWriter fields are not supported for INLINE maps`. A `Catch` or `Retry` on the Map does not handle it. Measured against a real account in us-east-1. Contributed by @mishukdutta-cz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
