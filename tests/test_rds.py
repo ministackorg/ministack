@@ -16829,6 +16829,7 @@ def _global_alias_world(monkeypatch, writer="a", fail_first_connect=False):
             "Endpoint": f"{cid}.cluster-abc123.us-east-1.rds.amazonaws.com",
             "_shared_container_id": f"c-{cid}",
             "_shared_internal_address": f"10.0.0.{index}",
+            "_shared_container_ready": True,
         }
         container = type("FakeContainer", (), {})()
         container.attrs = {"NetworkSettings": {"Networks": {"net": {
@@ -17061,6 +17062,90 @@ def test_rds_modify_global_cluster_rename_syncs_aliases(monkeypatch):
         {"GlobalClusterIdentifier": ["gdb"], "NewGlobalClusterIdentifier": ["gdb2"]})[0] == 200
     assert len(synced) == 1 and synced[0][0] is live and synced[0][1] == "gdb2"
     assert live["GlobalClusterIdentifier"] == "gdb2"
+
+
+def test_rds_global_alias_waits_for_a_starting_container(monkeypatch):
+    """The readiness probe holds a starting container's launch address, so a
+    move that involves it waits until it is ready, then runs."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    clusters["b"]["_shared_container_ready"] = False
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+
+    clusters["b"]["_shared_container_ready"] = True
+    m._apply_deferred_global_writer_alias(clusters["b"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+
+
+def test_rds_ready_container_drops_a_global_name_it_no_longer_owns(monkeypatch):
+    """A writer that left its global cluster while stopped keeps the name across
+    the restart; once ready it rejoins without it. A container with only the
+    names it should carry is left alone."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    assert calls == []
+
+    gc["GlobalClusterMembers"] = [mem for mem in gc["GlobalClusterMembers"] if not mem["IsWriter"]]
+    clusters["a"].pop("GlobalClusterIdentifier")
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"]]
+    assert connects[0][2] == m._cluster_endpoint_aliases(clusters["a"])
+
+
+def test_rds_global_alias_failed_writer_move_still_repoints_replicas(monkeypatch):
+    """When the writer's reconnect fails and the restore lands on another
+    address, replicas must follow it."""
+    m, gc, clusters, _containers, _calls, replication = _global_alias_world(
+        monkeypatch, fail_first_connect=True)
+    gc["GlobalClusterIdentifier"] = "gdb2"
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert clusters["a"]["_shared_internal_address"] == "10.0.0.51"
+    assert replication == ["a"]
+
+
+def test_rds_global_alias_move_follows_an_address_shaped_endpoint(monkeypatch):
+    """Without endpoint aliases the reported endpoint is the container address,
+    so it must follow the container to its new one."""
+    m, gc, clusters, _containers, _calls, _ = _global_alias_world(monkeypatch)
+    instance = {"_internal_address": "10.0.0.1", "Endpoint": {"Address": "10.0.0.1", "Port": 5432}}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [instance] if cluster is clusters["a"] else [])
+    synced = []
+    monkeypatch.setattr(m, "_sync_cluster_endpoints", synced.append)
+    clusters["a"]["_shared_endpoint"] = {"Address": "10.0.0.1", "Port": 5432}
+    clusters["b"]["_shared_endpoint"] = {"Address": "b.cluster-abc123.us-east-1.rds.amazonaws.com", "Port": 5432}
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert clusters["a"]["_shared_endpoint"]["Address"] == "10.0.0.51"
+    assert instance["Endpoint"]["Address"] == instance["_internal_address"] == "10.0.0.51"
+    assert clusters["b"]["_shared_endpoint"]["Address"].startswith("b.cluster-")
+    assert synced == [clusters["a"]]
+
+
+def test_rds_create_global_cluster_from_a_source_syncs_aliases(monkeypatch):
+    """A running source cluster becomes the writer and takes the global name."""
+    from ministack.services import rds as m
+
+    source = {"DBClusterIdentifier": "src", "DBClusterArn": "arn:aws:rds:us-east-1:000000000000:cluster:src",
+              "Engine": "aurora-postgresql", "EngineVersion": "16.4"}
+    synced = []
+    monkeypatch.setattr(m, "_global_clusters", {})
+    monkeypatch.setattr(m, "_tags", {})
+    monkeypatch.setattr(m, "_resolve_cluster_in_request_region", lambda cid: source if cid == "src" else None)
+    monkeypatch.setattr(m, "_unsupported_aurora_engine_version_error", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_attach_cluster_to_global", lambda gc, cluster, is_writer: gc[
+        "GlobalClusterMembers"].append({"DBClusterArn": cluster["DBClusterArn"], "IsWriter": is_writer}))
+    monkeypatch.setattr(m, "_global_cluster_xml", lambda gc: "<x/>")
+    monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases", synced.append)
+    assert m._create_global_cluster({"GlobalClusterIdentifier": ["empty"]})[0] == 200
+    assert synced == []
+    assert m._create_global_cluster(
+        {"GlobalClusterIdentifier": ["fromsrc"], "SourceDBClusterIdentifier": ["src"]})[0] == 200
+    assert len(synced) == 1 and synced[0] is m._global_clusters["fromsrc"]
 
 
 def _wait_cluster_status(rds, cluster_id, status, timeout=180):

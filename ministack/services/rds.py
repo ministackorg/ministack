@@ -909,6 +909,8 @@ def _restore_state(data, *, resume_runtime=False):
                             cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
+                    if authenticated_ready:
+                        _apply_deferred_global_writer_alias(cluster)
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
                         cluster,
                     ):
@@ -4176,12 +4178,22 @@ def _refresh_cluster_internal_address(cluster, container, network_name):
         container.attrs.get("NetworkSettings", {}).get("Networks", {})
         .get(network_name, {}).get("IPAddress", "")
     )
-    if not (address and cluster.get("_shared_internal_address")) or address == cluster["_shared_internal_address"]:
+    previous = cluster.get("_shared_internal_address")
+    if not (address and previous) or address == previous:
         return False
     cluster["_shared_internal_address"] = address
+    endpoint = cluster.get("_shared_endpoint") or {}
+    # Without endpoint aliases the reported endpoint is the address itself.
+    reported_moved = endpoint.get("Address") == previous
+    if reported_moved:
+        endpoint["Address"] = address
     for instance in _cluster_member_instances(cluster):
         if instance.get("_internal_address"):
             instance["_internal_address"] = address
+        if reported_moved and (instance.get("Endpoint") or {}).get("Address") == previous:
+            instance["Endpoint"]["Address"] = address
+    if reported_moved:
+        _sync_cluster_endpoints(cluster)
     return True
 
 
@@ -4221,18 +4233,25 @@ def _rejoin_with_global_writer_alias(cluster, global_endpoint, is_writer, docker
                     "RDS: could not reconnect cluster %s to %s: %s",
                     cluster_id, network_name, restore_error,
                 )
-        _refresh_cluster_internal_address(cluster, container, network_name)
+        if _refresh_cluster_internal_address(cluster, container, network_name) and is_writer:
+            _repoint_global_replicas(cluster)
         return False
     if _refresh_cluster_internal_address(cluster, container, network_name) and is_writer:
-        try:
-            _configure_or_defer_mysql_replication(cluster_id, cluster)
-        except Exception as e:
-            # The writer change this follows has already been committed.
-            logger.warning(
-                "RDS: failed to re-point MySQL replicas for cluster %s: %s",
-                cluster_id, e,
-            )
+        _repoint_global_replicas(cluster)
     return True
+
+
+def _repoint_global_replicas(cluster):
+    """Point MySQL global replicas at a writer whose container changed address."""
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    try:
+        _configure_or_defer_mysql_replication(cluster_id, cluster)
+    except Exception as e:
+        # The writer change this follows has already been committed.
+        logger.warning(
+            "RDS: failed to re-point MySQL replicas for cluster %s: %s",
+            cluster_id, e,
+        )
 
 
 def _move_global_writer_alias(global_endpoint, targets):
@@ -4247,6 +4266,20 @@ def _move_global_writer_alias(global_endpoint, targets):
             rejoin = _global_writer_alias_rejoin(cluster, global_endpoint, is_writer)
             if rejoin:
                 moves.append((cluster, is_writer, rejoin))
+        starting = [
+            cluster.get("DBClusterIdentifier", "unknown")
+            for cluster, _is_writer, _rejoin in moves
+            if not cluster.get("_shared_container_ready")
+        ]
+        if starting:
+            # The readiness probe holds the launch address, and rejoining the
+            # network can change it. The move is applied once the container is
+            # ready (_apply_deferred_global_writer_alias).
+            logger.info(
+                "RDS: deferring global writer endpoint %s until %s is ready",
+                global_endpoint, ", ".join(starting),
+            )
+            return
         stranded = [
             cluster.get("DBClusterIdentifier", "unknown")
             for cluster, _is_writer, _rejoin in moves
@@ -4291,6 +4324,41 @@ def _sync_global_writer_endpoint_aliases(global_cluster):
             if cluster:
                 targets.append((cluster, bool(member.get("IsWriter"))))
         _move_global_writer_alias(_global_cluster_endpoint(global_cluster), targets)
+
+
+def _apply_deferred_global_writer_alias(cluster):
+    """Bring a cluster's container that just became ready in line with the
+    global writer endpoint: moves skipped while it was starting, or a name it
+    kept across a restart after leaving or renaming its global cluster."""
+    global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+    if global_cluster:
+        _sync_global_writer_endpoint_aliases(global_cluster)
+    expected = _global_writer_endpoint_aliases(cluster)
+    with _shared_container_lock:
+        container_id = cluster.get("_shared_container_id")
+        docker_client = _get_docker() if container_id else None
+        if not docker_client:
+            return
+        network_name = _get_ministack_network(docker_client)
+        if not _network_supports_aliases(network_name):
+            return
+        try:
+            container = docker_client.containers.get(container_id)
+        except Exception:
+            return
+        aliases = (
+            (container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {})
+            .get("Aliases") or []
+        )
+        stale = [a for a in aliases if a.endswith(".global.rds.amazonaws.com") and a not in expected]
+        if not stale or any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster)):
+            return
+        # Drop stale names only; a name this container should carry but lacks
+        # is the sync's to add, after the old writer has let go of it.
+        keep = [a for a in expected if a in aliases]
+        _rejoin_with_global_writer_alias(
+            cluster, keep[0] if keep else stale[0], bool(keep), docker_client, network_name, container,
+        )
 
 
 def _next_port():
@@ -5397,6 +5465,7 @@ def _create_db_instance_impl(p):
                             cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
+                    _apply_deferred_global_writer_alias(cluster)
                     if _aurora_mysql_8_replication_enabled(cluster):
                         _configure_or_defer_mysql_replication(cluster_id, cluster)
                     for member in cluster.get("DBClusterMembers", []):
