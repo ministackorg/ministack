@@ -17103,11 +17103,16 @@ def test_rds_failed_start_releases_a_held_back_move(monkeypatch):
     """A starting writer that fails never becomes ready; once it has failed the
     held-back move runs, so the new writer gets the name."""
     m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
-    clusters["a"].update(_shared_container_ready=False, Status="starting")
+    instance = {"DBInstanceStatus": "creating"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [instance] if cluster is clusters["a"] else [])
+    clusters["a"].update(_shared_container_ready=False, Status="creating")
     _flip_global_writer(gc)
     m._sync_global_writer_endpoint_aliases(gc)
     assert calls == []
-    clusters["a"]["Status"] = "stopped"
+    # A failed first instance leaves the cluster "creating" (derived from its
+    # members), so only the member status shows the wait is over.
+    instance["DBInstanceStatus"] = "failed"
     m._apply_deferred_global_writer_alias(clusters["a"])
     connects = [c for c in calls if c[0] == "connect"]
     assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]

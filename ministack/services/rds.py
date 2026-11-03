@@ -4264,7 +4264,9 @@ def _cluster_container_starting(cluster):
         for instance in _cluster_member_instances(cluster)
     ):
         return False
-    if cluster.get("Status") in ("creating", "starting"):
+    # Cluster "creating" is derived from member statuses and stays set when a
+    # member failed, so the members decide; "starting" is StartDBCluster's own.
+    if cluster.get("Status") == "starting":
         return True
     # A reboot restarts the container and probes the address it had before.
     return any(
@@ -4350,22 +4352,25 @@ def _apply_deferred_global_writer_alias(cluster):
     finished starting, whether it became ready or failed: moves held back while
     it was starting, and global names a member container no longer owns (kept
     across a restart, or left on a non-writer by a rename during the hold)."""
-    global_cluster, _member = _global_cluster_member_for_cluster(cluster)
-    clusters = [cluster]
-    if global_cluster:
-        _sync_global_writer_endpoint_aliases(global_cluster)
-        for member in global_cluster.get("GlobalClusterMembers", []):
-            other = _resolve_global_member_cluster(member)
-            if other is not None and other is not cluster:
-                clusters.append(other)
-    for target in clusters:
-        _drop_stale_global_writer_aliases(target)
+    # One lock for the sync and the drops: a writer change in between would
+    # let a drop strip the name the sync just gave the new writer.
+    with _shared_container_lock:
+        global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+        clusters = [cluster]
+        if global_cluster:
+            _sync_global_writer_endpoint_aliases(global_cluster)
+            for member in global_cluster.get("GlobalClusterMembers", []):
+                other = _resolve_global_member_cluster(member)
+                if other is not None and other is not cluster:
+                    clusters.append(other)
+        for target in clusters:
+            _drop_stale_global_writer_aliases(target)
 
 
 def _drop_stale_global_writer_aliases(cluster):
     """Rejoin without any global endpoint this cluster's container should not carry."""
-    expected = _global_writer_endpoint_aliases(cluster)
     with _shared_container_lock:
+        expected = _global_writer_endpoint_aliases(cluster)
         if _cluster_container_starting(cluster):
             return
         container_id = cluster.get("_shared_container_id")
