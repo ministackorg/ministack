@@ -3204,6 +3204,50 @@ def test_cfn_secretsmanager_reference_reads_another_account(cfn, ssm, other_acco
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+@pytest.mark.auth_contract
+def test_cfn_secretsmanager_reference_to_another_account_needs_its_grants(auth_enabled):
+    """Under AUTH=true a secret in another account resolves only with an Allow in its resource policy and a
+    customer managed key whose policy grants kms:Decrypt (the AWS managed key cannot be shared); under
+    AUTH=false it always resolves."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(service, account):
+        return boto3.client(service, endpoint_url=endpoint, region_name="us-east-1",
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    owner_sm, owner_kms, cfn = client("secretsmanager", "111122223333"), client("kms", "111122223333"), \
+        client("cloudformation", "000000000000")
+    stack_root = {"AWS": "arn:aws:iam::000000000000:root"}
+    owner_root = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                  "Action": "kms:*", "Resource": "*"}
+    granting = owner_kms.create_key(Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        owner_root, {"Effect": "Allow", "Principal": stack_root, "Action": "kms:Decrypt", "Resource": "*"}]}))
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": stack_root, "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]})
+
+    def deploy(with_policy, key_id):
+        name = f"cfn-xacct-grant-{_uuid_mod.uuid4().hex[:8]}"
+        arn = owner_sm.create_secret(Name=name, SecretString="v", **({"KmsKeyId": key_id} if key_id else {}))["ARN"]
+        if with_policy:
+            owner_sm.put_resource_policy(SecretId=name, ResourcePolicy=policy)
+        stack = f"cfn-xacct-grant-{_uuid_mod.uuid4().hex[:8]}"
+        cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {"P": {
+            "Type": "AWS::SSM::Parameter",
+            "Properties": {"Name": f"/{stack}", "Type": "String", "Value": f"{{{{resolve:secretsmanager:{arn}}}}}"}}}}))
+        try:
+            return _wait_stack(cfn, stack)["StackStatus"]
+        finally:
+            _delete_cfn_test_stack(cfn, stack)
+            owner_sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+    key = granting["KeyMetadata"]["Arn"]
+    refused = "ROLLBACK_COMPLETE" if auth_enabled else "CREATE_COMPLETE"
+    assert deploy(False, None) == refused
+    assert deploy(True, None) == refused
+    assert deploy(False, key) == refused
+    assert deploy(True, key) == "CREATE_COMPLETE"
+
+
 def test_cfn_dynamic_reference_that_cannot_resolve_fails_the_resource(cfn, ssm):
     """A reference to a missing parameter fails the resource and rolls the
     stack back with the reason."""
