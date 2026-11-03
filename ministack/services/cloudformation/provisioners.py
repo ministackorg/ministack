@@ -13756,11 +13756,14 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
         _ec_user_group_create, _ec_user_group_delete)
     if replaced:
         return replaced
-    # The group ends with the template's users, diffed against the live group (real AWS, us-east-1).
+    # A change to the set of users leaves the group with the template's users, diffed against the live group; an
+    # update that leaves that set alone (tags, a reorder) keeps changes made outside the stack (real AWS, us-east-1).
     live_users = list((_ec._user_groups.get(physical_id) or {}).get("UserIds") or [])
     new_users = list(new_props.get("UserIds") or [])
-    params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
-                        "UserIdsToRemove": [u for u in live_users if u not in new_users]})
+    params = {}
+    if set(new_users) != set(old_props.get("UserIds") or []):
+        params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
+                            "UserIdsToRemove": [u for u in live_users if u not in new_users]})
     if params:
         _ec_call(_ec._modify_user_group, {"UserGroupId": physical_id, **params},
                  "AWS::ElastiCache::UserGroup", "update")

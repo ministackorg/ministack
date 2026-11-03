@@ -37444,6 +37444,80 @@ def _ec_cache_stack(s, *, rg_description="sessions", num_cache_clusters=2,
     return {"Resources": resources, "Outputs": outputs}
 
 
+def test_cfn_elasticache_user_group_tags_only_update_keeps_outside_changes(cfn, ec):
+    """Real AWS (us-east-1): a stack update, or the rollback of one, that leaves UserIds alone keeps the
+    membership changes made outside the stack and still applies the tags."""
+    s = _uuid_mod.uuid4().hex[:8]
+    stack, group = f"ec-ugt-{s}", f"ugt-{s}"
+    default, member, extra, other, bad = f"d-{s}", f"m-{s}", f"e-{s}", f"o-{s}", f"b-{s}"
+    for user_id, name in ((default, "default"), (member, member), (extra, extra), (other, other)):
+        ec.create_user(UserId=user_id, UserName=name, Engine="redis", AccessString="on ~* +@all",
+                       NoPasswordRequired=True)
+
+    def template(rev, failing=False):
+        resources = {"Group": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": group, "Engine": "redis", "UserIds": [default, member],
+            "Tags": [{"Key": "Rev", "Value": rev}]}}}
+        if failing:
+            resources["Bad"] = {"Type": "AWS::ElastiCache::User", "DependsOn": "Group", "Properties": {
+                "UserId": bad, "UserName": bad, "Engine": "redis", "AccessString": "on ~* +doesnotexist",
+                "NoPasswordRequired": True}}
+        return {"Resources": resources}
+
+    def members():
+        return sorted(ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"])
+
+    def rev():
+        arn = ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["ARN"]
+        return {t["Key"]: t["Value"] for t in ec.list_tags_for_resource(ResourceName=arn)["TagList"]}.get("Rev")
+
+    _ec_create(cfn, stack, template("1"))
+    try:
+        ec.modify_user_group(UserGroupId=group, UserIdsToAdd=[extra])
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[member])
+        _ec_update(cfn, stack, template("2"))
+        assert (members(), rev()) == (sorted([default, extra]), "2")
+
+        ec.modify_user_group(UserGroupId=group, UserIdsToAdd=[other])
+        cfn.update_stack(StackName=stack, TemplateBody=json.dumps(template("3", failing=True)))
+        assert _wait_stack(cfn, stack, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert members() == sorted([default, extra, other])
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack, timeout=120)
+        for user_id in (default, member, extra, other):
+            ec.delete_user(UserId=user_id)
+
+
+def test_cfn_elasticache_user_group_reorder_keeps_outside_changes(cfn, ec):
+    """Real AWS (us-east-1): a template that only reorders UserIds keeps a user added outside the stack."""
+    s = _uuid_mod.uuid4().hex[:8]
+    stack, group = f"ec-ugo-{s}", f"ugo-{s}"
+    default, member, extra = f"d-{s}", f"m-{s}", f"e-{s}"
+    for user_id, name in ((default, "default"), (member, member), (extra, extra)):
+        ec.create_user(UserId=user_id, UserName=name, Engine="redis", AccessString="on ~* +@all",
+                       NoPasswordRequired=True)
+
+    def template(ids):
+        return {"Resources": {"Group": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": group, "Engine": "redis", "UserIds": ids}}}}
+
+    def members():
+        return sorted(ec.describe_user_groups(UserGroupId=group)["UserGroups"][0]["UserIds"])
+
+    _ec_create(cfn, stack, template([default, member]))
+    try:
+        ec.modify_user_group(UserGroupId=group, UserIdsToAdd=[extra])
+        _ec_update(cfn, stack, template([member, default]))
+        assert members() == sorted([default, member, extra])
+        assert ec.describe_users(UserId=extra)["Users"][0]["UserGroupIds"] == [group]
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack, timeout=120)
+        for user_id in (default, member, extra):
+            ec.delete_user(UserId=user_id)
+
+
 def test_cfn_elasticache_stack_create_and_delete(cfn, ec):
     s = _uuid_mod.uuid4().hex[:8]
     stack = f"ec-full-{s}"
