@@ -292,6 +292,27 @@ except ImportError:
     docker_lib = None
     _docker_available = False
 
+# docker-py talks to the daemon through requests, so a slow or wedged daemon
+# surfaces as a requests timeout or connection error (or a raw socket one on
+# attach/archive streams). Those say nothing about the image's architecture.
+_DOCKER_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError)
+try:
+    _requests_exc: Any = importlib.import_module("requests.exceptions")
+    _DOCKER_TRANSPORT_ERRORS += (_requests_exc.ConnectionError, _requests_exc.Timeout)
+except ImportError:
+    pass
+
+
+def _is_docker_transport_error(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything it wraps) is a daemon transport failure."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, _DOCKER_TRANSPORT_ERRORS):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 _cached_docker_client = None
 _is_in_container: bool | None = None
 
@@ -4844,15 +4865,23 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         try:
             client.images.pull(image, platform=docker_platform)
         except Exception as exc:
-            if docker_platform:
+            if docker_platform and not _is_docker_transport_error(exc):
                 return _platform_fallback(f"pull failed: {exc}")
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
+    # Always create then start, never containers.run(): run() creates the
+    # container before starting it and drops the handle when start raises, so
+    # a failed start (a daemon read timeout, say) would leave it behind.
+    create_kwargs = {k: v for k, v in run_kwargs.items()
+                     if k not in ("detach", "stdin_open")}
+    try:
+        container = client.containers.create(**create_kwargs)
+    except Exception as exc:
+        if docker_platform and not _is_docker_transport_error(exc):
+            return _platform_fallback(f"container create failed: {exc}")
+        raise
     try:
         if _use_docker_cp or _cp_layers or trust_copies:
-            create_kwargs = {k: v for k, v in run_kwargs.items()
-                             if k not in ("detach", "stdin_open")}
-            container = client.containers.create(**create_kwargs)
             # Code: cp'd only in DinD mode (otherwise it's bind-mounted above).
             if _use_docker_cp:
                 _docker_cp_dir(container, code_dir, "/var/task")
@@ -4868,12 +4897,15 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
                 _docker_cp_dir(container, ld, "/opt", arcname=".")
             for target, source in trust_copies or ():
                 _docker_cp_file(container, source, target)
-            container.start()
-        else:
-            container = client.containers.run(**run_kwargs)
+        container.start()
     except Exception as exc:
-        if docker_platform:
-            return _platform_fallback(f"container create/start failed: {exc}")
+        try:
+            container.remove(force=True, v=True)
+        except Exception as rm_exc:
+            logger.warning("Lambda %s: could not remove container %s after a failed start: %s",
+                           config.get("FunctionName"), getattr(container, "id", "?"), rm_exc)
+        if docker_platform and not _is_docker_transport_error(exc):
+            return _platform_fallback(f"container start failed: {exc}")
         raise
 
     if docker_platform:
@@ -4894,7 +4926,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             except Exception:
                 tail = ""
             try:
-                container.remove(force=True)
+                container.remove(force=True, v=True)
             except Exception:
                 pass
             return _platform_fallback(

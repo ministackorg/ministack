@@ -13234,6 +13234,73 @@ def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     assert key.startswith("code-") and os.path.isdir(lsvc._docker_extract_dirs[key])
 
 
+
+def _pinned_arm64_spawn(monkeypatch, tmp_path, containers):
+    """A fake daemon for an arm64-pinned function on an arm64 host whose
+    ``containers.create`` hands out ``containers`` in order. MiniStack runs in
+    a container (the Testcontainers case), so code goes in by docker cp."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: True)
+    monkeypatch.setattr(lsvc, "_functions", {"leak-fn": {"architectures_declared": True}})
+    monkeypatch.setattr(lsvc, "_host_docker_arch_cache", [])
+    fake_client = MagicMock()
+    fake_client.info.return_value = {"Architecture": "aarch64"}
+    fake_client.images.get.return_value.attrs = {"Architecture": "arm64"}
+    fake_client.containers.create.side_effect = list(containers)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    config = dict(_SPAWN_LEAK_CONFIG, Architectures=["arm64"])
+    return fake_client, config
+
+
+@pytest.mark.parametrize("error", [
+    pytest.param(lambda: __import__("requests").exceptions.ReadTimeout(
+        "UnixHTTPConnectionPool(host='localhost', port=None): Read timed out."), id="requests-read-timeout"),
+    pytest.param(lambda: __import__("requests").exceptions.ConnectionError("Connection aborted."),
+                 id="requests-connection-error"),
+    pytest.param(lambda: TimeoutError("timed out"), id="socket-timeout"),
+])
+def test_spawn_start_transport_error_removes_container_without_platform_fallback(
+        monkeypatch, tmp_path, caplog, error):
+    """A daemon transport failure after create() must not leave the created
+    container behind, and is not evidence the host cannot run the declared
+    platform: it propagates instead of spawning a second, host-arch container."""
+    exc = error()
+    leaked = MagicMock(id="c-timeout")
+    leaked.start.side_effect = exc
+    fake_client, config = _pinned_arm64_spawn(monkeypatch, tmp_path, [leaked])
+
+    with caplog.at_level("WARNING", logger=lsvc.logger.name):
+        with pytest.raises(type(exc)):
+            lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
+
+    leaked.remove.assert_called_once_with(force=True, v=True)
+    assert fake_client.containers.create.call_count == 1
+    assert fake_client.containers.create.call_args.kwargs["platform"] == "linux/arm64"
+    assert "cannot run it" not in caplog.text
+
+
+def test_spawn_platform_error_removes_container_then_falls_back(monkeypatch, tmp_path):
+    """A daemon refusal that is about the platform still falls back to the
+    host's architecture, and the refused container is removed first."""
+    import docker
+
+    refused = MagicMock(id="c-refused")
+    refused.start.side_effect = docker.errors.APIError(
+        "exec /lambda-entrypoint.sh: exec format error")
+    fallback = MagicMock(id="c-fallback")
+    fake_client, config = _pinned_arm64_spawn(monkeypatch, tmp_path, [refused, fallback])
+
+    container, _tmpdir = lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
+
+    assert container is fallback
+    refused.remove.assert_called_once_with(force=True, v=True)
+    fallback.remove.assert_not_called()
+    first, second = fake_client.containers.create.call_args_list
+    assert first.kwargs["platform"] == "linux/arm64"
+    assert second.kwargs.get("platform") != "linux/arm64"
+
+
 def test_docker_extracted_dir_is_content_addressed(monkeypatch, tmp_path):
     """Identical blobs share one tree; different blobs and kinds get their
     own. The dirs are what every container of that code receives (read-only
