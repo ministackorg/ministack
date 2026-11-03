@@ -1522,7 +1522,7 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
 # same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (capture rounds
 # aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7), aws-channel-cases and
 # aws-selectors-node). Round aws-one-group-password captured every string here again in one group per
-# engine, as the test sets them up, and four of them also as password users, with the same channels.
+# engine, as the test sets them up, and three of them also as password users, with the same channels.
 _AWS_ACL_CHANNELS = {
     "on ~* +@all": "&*",
     "on ~* &allowed* +@all": "&allowed*",
