@@ -3512,6 +3512,10 @@ def _acl_refusal(rule, keywords):
         valid = not bar or (low[1:] in _ACL_SUBCOMMANDS if rule[0] == "-" else subcommand)
         return None if command in _ACL_COMMANDS and valid else (
             "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
+    if any(c < " " for c in rule):
+        # MiniStack-only: XML can't carry these. AWS stores them, then fails every DescribeUsers in the
+        # region with InternalFailure until the user is deleted (us-east-2, round 23), which isn't emulated.
+        return "The access-string is invalid."
     if rule.startswith("~") and "\u2028" in rule:  # NBSP and em space stay in a pattern (us-east-2, round 23)
         return "The access-string is invalid."
     if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):

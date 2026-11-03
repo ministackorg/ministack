@@ -1621,7 +1621,8 @@ def test_user_acl_channels_default_to_all():
 
 def test_user_acl_keeps_unicode_space_inside_a_pattern():
     """AWS stores `~a\\xa0b` appended to `on ~x +@all` as one key pattern (us-east-2, issue #2551,
-    round23 modify-a-key-nbsp), so the engine gets it as one rule too."""
+    round23 modify-a-key-nbsp). MiniStack sends the engine the rules as stored; no capture reads a
+    real cache's ACL for it."""
     user = {"UserId": "u", "UserName": "u", "AccessString": "on ~x ~a\xa0b +@all", "Authentication": {"Type": "iam"}}
     assert elasticache._acl_setuser(user) == ["ACL", "SETUSER", "u", "reset", "&*", "on", "~x", "~a\xa0b", "+@all",
                                               "nopass"]
@@ -2884,6 +2885,22 @@ def test_elasticache_no_password_redis_user_reports_engine_floor(ec):
     try:
         assert user["MinimumEngineVersion"] == "6.0"
         assert user["Authentication"]["Type"] == "no-password"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_append_refuses_control_characters(ec):
+    """MiniStack contract: XML can't carry a control character, so an append holding one is refused and
+    the user keeps its access string. (AWS stores `~a\\x1cb` and then answers InternalFailure, round 23.)"""
+    uid = f"ctrl-{_uuid_mod.uuid4().hex[:8]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~x +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        for append in ("~a\x1cb", "&a\x01b"):
+            with pytest.raises(ClientError) as exc:
+                ec.modify_user(UserId=uid, AppendAccessString=append)
+            assert exc.value.response["Error"]["Message"] == "The access-string is invalid."
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~x +@all"
     finally:
         ec.delete_user(UserId=uid)
 
