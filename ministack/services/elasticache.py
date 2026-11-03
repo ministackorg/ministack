@@ -2491,9 +2491,11 @@ def _acl_setuser(user, deny=()):
     An iam user's token is not checked, as with AUTH=false elsewhere."""
     tokens = user.get("AccessString", "").split()
     # A string without channel rules gets all channels (real AWS, us-west-2: "on ~* +@all" is
-    # "user app on ... ~* &* +@all" on the engine); reset alone would leave none.
+    # "user app on ... ~* &* +@all" on the engine); reset alone would leave none. A string with a
+    # selector and no root channel rule gets none outside its selectors (real AWS, us-east-2, every
+    # serverless engine: "on ~* +@all (+get ~k)" reads back with root channels "").
     rules, in_selector = ["reset"], False
-    if not any(t.startswith(("&", "(&")) or t.lower() in ("allchannels", "resetchannels") for t in tokens):
+    if not any(t.startswith(("&", "(")) or t.lower() in ("allchannels", "resetchannels") for t in tokens):
         rules.append("&*")
     for token in tokens:  # each (selector) grants on its own: deny there too
         if _is_credential_rule(token):
@@ -3325,7 +3327,7 @@ def _user_xml(u):
         f"<UserName>{u.get('UserName', '')}</UserName>"
         f"<Engine>{u.get('Engine', 'redis')}</Engine>"
         f"<Status>{u.get('Status', 'active')}</Status>"
-        f"<AccessString>{u.get('AccessString', '')}</AccessString>"
+        f"<AccessString>{xml_escape(u.get('AccessString', ''))}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
         + (f"<MinimumEngineVersion>{_minimum_engine_version(u)}</MinimumEngineVersion>"
            if _minimum_engine_version(u) else "")
