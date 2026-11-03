@@ -1819,12 +1819,14 @@ def _run_execution(exec_arn):
             ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
-            _add_event(execution, f"{state_type}StateEntered", {
+            entered = _add_event(execution, f"{state_type}StateEntered", {
                 "stateEnteredEventDetails": {
                     "name": current_name,
                     "input": json.dumps(current_input),
                 },
             })
+            if state_type == "Map":
+                _check_inline_map_fields(state_def, current_name, entered["id"])
 
             if state_type == "Succeed":
                 current_input = _apply_input_path(state_def, current_input, ctx)
@@ -2642,6 +2644,24 @@ def _run_parallel_branches(state_def, raw_input, execution, ctx):
 # Map state
 # ---------------------------------------------------------------------------
 
+def _check_inline_map_fields(state_def, state_name, entered_event_id):
+    """Fail an Inline Map that has a field that only a Distributed Map supports.
+
+    AWS fails the execution when it enters such a Map, and a Catch or Retry on the Map does not handle the error.
+    So the state loops call this right after they write MapStateEntered, with that event's id for the cause text,
+    and not through the Map's _with_retry_and_catch.
+    """
+    processor = state_def.get("Iterator") or state_def.get("ItemProcessor", {})
+    if (processor.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return
+    if any(field in state_def for field in ("ItemReader", "ItemBatcher", "ResultWriter")):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"An error occurred while executing the state '{state_name}' (entered at the event id "
+            f"#{entered_event_id}). The ItemReader, ItemBatcher and ResultWriter fields are not supported for "
+            "INLINE maps")
+
+
 def _execute_map(state_def, raw_input, execution, ctx):
     return _with_retry_and_catch(
         state_def, raw_input, ctx,
@@ -2904,12 +2924,14 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
         state_type = state_def.get("Type")
         ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
-        _add_event(execution, f"{state_type}StateEntered", {
+        entered = _add_event(execution, f"{state_type}StateEntered", {
             "stateEnteredEventDetails": {
                 "name": current_name,
                 "input": json.dumps(current_input),
             },
         })
+        if state_type == "Map":
+            _check_inline_map_fields(state_def, current_name, entered["id"])
 
         if state_type == "Succeed":
             current_input = _apply_input_path(state_def, current_input, ctx)
