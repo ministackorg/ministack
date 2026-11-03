@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — concurrent cold starts of one function all get the context-ARN shim** — under `LAMBDA_EXECUTOR=docker`, two containers of the same function starting at once (for example one SQS event source mapping per queue) wrote the shim through the same temp file, so the second rename failed with `No such file or directory` and that container ran without the shim, reporting the RIE's `arn:aws:lambda:us-east-1:012345678912:function:…` as `invokedFunctionArn`. The temp file is now unique per thread, and every container gets the function's real ARN.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added

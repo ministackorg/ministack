@@ -4538,7 +4538,9 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
     try:
         # Another container of the same code may already hold the dir as a
         # read-only mount; a rename lands the file whole rather than truncated.
-        tmp_path = f"{shim_path}.{os.getpid()}.tmp"
+        # Unique per thread too: two cold starts of one function in the same process
+        # would otherwise share the temp file, and the second rename would fail.
+        tmp_path = f"{shim_path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp_path, "w") as f:
             f.write(source)
         os.replace(tmp_path, shim_path)
