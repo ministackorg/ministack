@@ -4254,6 +4254,19 @@ def _repoint_global_replicas(cluster):
         )
 
 
+def _cluster_container_starting(cluster):
+    """A readiness probe is polling this cluster's container at its launch address.
+
+    Stopped or failed containers have no probe, so they can move at once.
+    """
+    if cluster.get("_shared_container_ready"):
+        return False
+    return cluster.get("Status") in ("creating", "starting") or any(
+        instance.get("DBInstanceStatus") in ("creating", "starting")
+        for instance in _cluster_member_instances(cluster)
+    )
+
+
 def _move_global_writer_alias(global_endpoint, targets):
     """Give each ``(cluster, is_writer)`` the global writer endpoint exactly when it is the writer.
 
@@ -4269,7 +4282,7 @@ def _move_global_writer_alias(global_endpoint, targets):
         starting = [
             cluster.get("DBClusterIdentifier", "unknown")
             for cluster, _is_writer, _rejoin in moves
-            if not cluster.get("_shared_container_ready")
+            if _cluster_container_starting(cluster)
         ]
         if starting:
             # The readiness probe holds the launch address, and rejoining the
@@ -4351,7 +4364,14 @@ def _apply_deferred_global_writer_alias(cluster):
             .get("Aliases") or []
         )
         stale = [a for a in aliases if a.endswith(".global.rds.amazonaws.com") and a not in expected]
-        if not stale or any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster)):
+        if not stale:
+            return
+        if any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster)):
+            logger.error(
+                "RDS: not dropping global endpoint %s from cluster %s: its readers "
+                "replicate from the current address",
+                ", ".join(stale), cluster.get("DBClusterIdentifier", "unknown"),
+            )
             return
         # Drop stale names only; a name this container should carry but lacks
         # is the sync's to add, after the old writer has let go of it.
@@ -7908,6 +7928,7 @@ def _start_db_cluster(p):
                         cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
+                _apply_deferred_global_writer_alias(cluster)
                 if _aurora_mysql_8_replication_enabled(cluster):
                     if compute_recreated:
                         # A new container has a new hostname, while the

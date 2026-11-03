@@ -17068,13 +17068,30 @@ def test_rds_global_alias_waits_for_a_starting_container(monkeypatch):
     """The readiness probe holds a starting container's launch address, so a
     move that involves it waits until it is ready, then runs."""
     m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    starting = {"DBInstanceStatus": "creating"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [starting] if cluster is clusters["b"] else [])
     clusters["b"]["_shared_container_ready"] = False
     _flip_global_writer(gc)
     m._sync_global_writer_endpoint_aliases(gc)
     assert calls == []
 
     clusters["b"]["_shared_container_ready"] = True
+    starting["DBInstanceStatus"] = "available"
     m._apply_deferred_global_writer_alias(clusters["b"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+
+
+def test_rds_stopped_old_writer_does_not_hold_back_the_move(monkeypatch):
+    """No readiness probe polls a stopped or failed container, so a failover away
+    from one moves the name at once instead of waiting for a start that may
+    never come."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    clusters["a"].update(_shared_container_ready=False, Status="stopped")
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
     connects = [c for c in calls if c[0] == "connect"]
     assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
     assert _GLOBAL_ALIAS_NAME in connects[1][2]
@@ -17230,6 +17247,20 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
         assert cluster_ip
         assert resolve(global_name) == cluster_ip
         assert resolve(old_name) is None
+
+        # Renamed back while stopped, the restarted writer carries the current name.
+        rds.stop_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "stopped")
+        rds.modify_global_cluster(GlobalClusterIdentifier=renamed, NewGlobalClusterIdentifier=gid)
+        rds.start_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "available")
+        _wait_for_instance(rds, did)
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(old_name) == cluster_ip
+        assert resolve(global_name) is None
+        renamed, global_name = gid, old_name
 
         rds.remove_from_global_cluster(
             GlobalClusterIdentifier=renamed,
