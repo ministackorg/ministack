@@ -1583,8 +1583,9 @@ def test_user_acl_channels_default_to_all():
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
 @pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
 def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
-    """Captures dataplane-serverless, dataplane-v8, dataplane-v9, dataplane-r7 and aws-no-channel-shapes
-    (AWS, us-east-2): each user's channels match `_AWS_ACL_CHANNELS`, an iam user with
+    """Capture rounds aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7),
+    aws-no-channel-shapes and aws-no-channel-shapes-v8-v9 (AWS, us-east-2): each user's channels match
+    `_AWS_ACL_CHANNELS`, an iam user with
     `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all` gets
     NOPERM outside `allowed*` (Valkey's exact text; for Redis only a channel NOPERM, see below).
     A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
