@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ElastiCache — a replication group's user groups reach the engine** — `UserGroupIds` were stored but never applied, so the group's users did not exist on Valkey or Redis and unauthenticated commands ran as the open `default` user. The groups' users (their passwords, `nopass` for IAM users, and access strings) are now configured on the engine at create, at restart, and whenever a user, user group or the group's attachments change, over TLS when transit encryption is on; `default` is off unless a group has a user named `default`, users no group has are removed, detaching the last group restores `default`, and application users cannot run `ACL SETUSER`/`DELUSER`/`LOAD`/`SAVE` or `CONFIG`. As on AWS (real AWS, us-west-2): access strings are reported with the `-@all` their rules build on, `ModifyUserGroup` and a user-group change in `ModifyReplicationGroup` answer `modifying` with the change pending, `UserGroupIds` is absent once none is attached, and deleting a group's default user fails with `DefaultUserAssociatedToUserGroup`; `CreateUser` and `ModifyUser` refuse an access string naming an unknown command or category or with invalid syntax (`InvalidParameterValue`), and `DeleteUserGroup` refuses a group still attached to a replication group or serverless cache (`InvalidUserGroupState`), which it deleted before.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
