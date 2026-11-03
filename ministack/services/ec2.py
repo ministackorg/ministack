@@ -1738,8 +1738,10 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
     rule_id = _sg_rule_id(sg_id, is_egress, rule)
 
     def _item(extra_xml=""):
-        from_port = f"<fromPort>{rule['FromPort']}</fromPort>" if "FromPort" in rule else ""
-        to_port = f"<toPort>{rule['ToPort']}</toPort>" if "ToPort" in rule else ""
+        # A rule stored without ports (IpProtocol -1) is reported as -1/-1, as
+        # in DescribeSecurityGroupRules.
+        from_port = f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+        to_port = f"<toPort>{rule.get('ToPort', -1)}</toPort>"
         return (
             "<item>"
             f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
@@ -1783,9 +1785,24 @@ def _strip_descriptions(rule):
     return r
 
 
+def _rule_match_form(rule):
+    """A copy of rule in the form SG rules are compared in.
+
+    Descriptions are ignored, and so are an IpProtocol -1 rule's FromPort/ToPort,
+    since -1 covers all ports: a -1 rule still stored with ports (legacy flat
+    form, CloudFormation, ModifySecurityGroupRules, older persisted state)
+    matches a call that sends other ports or none.
+    """
+    r = _strip_descriptions(rule)
+    if r.get("IpProtocol") == "-1":
+        r.pop("FromPort", None)
+        r.pop("ToPort", None)
+    return r
+
+
 def _rules_match(a, b):
     """Compare two SG rules ignoring Description fields (matches AWS behavior)."""
-    return _strip_descriptions(a) == _strip_descriptions(b)
+    return _rule_match_form(a) == _rule_match_form(b)
 
 
 def _is_malformed_security_group_id(group_id):
@@ -4711,12 +4728,16 @@ def _parse_ip_permissions(params, prefix):
             break
         rule = {"IpProtocol": proto, "IpRanges": [], "Ipv6Ranges": [],
                 "PrefixListIds": [], "UserIdGroupPairs": []}
-        from_port = _p(params, f"{prefix}.{i}.FromPort")
-        to_port = _p(params, f"{prefix}.{i}.ToPort")
-        if from_port:
-            rule["FromPort"] = int(from_port)
-        if to_port:
-            rule["ToPort"] = int(to_port)
+        # IpProtocol -1 covers all ports: AWS ignores FromPort/ToPort on authorize
+        # and revoke, stores the rule without them, and matches it whatever
+        # ports a later call sends (Terraform revokes the default rule as -1/0/0).
+        if proto != "-1":
+            from_port = _p(params, f"{prefix}.{i}.FromPort")
+            to_port = _p(params, f"{prefix}.{i}.ToPort")
+            if from_port:
+                rule["FromPort"] = int(from_port)
+            if to_port:
+                rule["ToPort"] = int(to_port)
         j = 1
         while True:
             cidr = _p(params, f"{prefix}.{i}.IpRanges.{j}.CidrIp")
