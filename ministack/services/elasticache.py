@@ -3214,7 +3214,8 @@ def _acl_refusal(rule, keywords):
         return None if low[2:] in _ACL_CATEGORIES else (
             "Access string contains invalid category(s). Please verify the list of available category in user-api.")
     if rule[0] in "+-":
-        return None if low[1:].split("|")[0] in _ACL_COMMANDS else (
+        command, bar, subcommand = low[1:].partition("|")
+        return None if command in _ACL_COMMANDS and (subcommand or not bar) else (
             "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
     if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
         return None

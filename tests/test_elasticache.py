@@ -2590,6 +2590,9 @@ _APPEND_CAPTURES = [
     ('round1/spaces', 'valkey', 'on ~* +@all', '  +get  ', 'on ~* +@all'),
     ('round1/redis-chan', 'redis', 'on ~* +@all', '&y', 'on ~* resetchannels &y +@all'),
     ('round1/redis-cmd', 'redis', 'on ~* +@all', '-flushall', 'on ~* +@all -flushall'),
+    ('round10/a-plus-plain-nosub', 'valkey', 'on ~* -@all', '+get|nosub', 'on ~* -@all +get|nosub'),
+    ('round10/a-plus-container-nosub', 'valkey', 'on ~* -@all', '+config|nosub', 'on ~* -@all +config|nosub'),
+    ('round10/a-plus-plain-realsub', 'valkey', 'on ~* -@all', '+get|set', 'on ~* -@all +get|set'),
     ('round2/ws', 'valkey', 'on ~* +@all', '  -flushall  ', 'on ~* +@all -flushall'),
     ('round2/two', 'valkey', 'on ~* +@all', '-flushall -flushdb', 'on ~* +@all -flushall -flushdb'),
     ('round2/inner-ws', 'valkey', 'on ~* +@all', '-flushall    -flushdb', 'on ~* +@all -flushall -flushdb'),
@@ -2761,6 +2764,7 @@ _APPEND_REFUSALS = [
     ('round8/k-write-star-after-star', 'valkey', 'on ~* +@all', '%W~*', "Adding a pattern '%W~*' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
     ('round8/e-lt-gt', 'valkey', 'on ~* +@all', '~<x>', "Adding a pattern '~<x>' after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns"),
     ('round8/e-quote', 'valkey', 'on ~* +@all', '~a"b', 'Adding a pattern \'~a"b\' after the * pattern (or the \'allkeys\' flag) is not valid and does not have any effect. Try \'resetkeys\' to start with an empty list of patterns'),
+    ('round9/q-sub-empty', 'valkey', 'on ~* -@all', '+config|', 'Access string contains invalid command(s). Please verify the list of available commands in user-api.'),
 ]
 
 @pytest.mark.parametrize("key,engine,access,append,expected", _APPEND_CAPTURES, ids=[c[0] for c in _APPEND_CAPTURES])
@@ -2819,6 +2823,19 @@ def test_elasticache_modify_user_append_with_authentication_mode(ec):
     finally:
         ec.delete_user(UserId=uid)
         ec.delete_user(UserId=iam)
+
+def test_elasticache_modify_user_append_reapplies_stored_rules(ec):
+    """Each append re-applies the stored rules, so a rule kept because a later category touched it can
+    drop out on the next append (AWS captures round9 modify-reparse-1, modify-reparse-2 and describes)."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all", AuthenticationMode={"Type": "iam"})
+    try:
+        first = ec.modify_user(UserId=uid, AppendAccessString="-flushdb +@read +flushall +@read")["AccessString"]
+        assert first == "on ~* +@all -flushdb +flushall +@read"
+        assert ec.modify_user(UserId=uid, AppendAccessString="on")["AccessString"] == "on ~* +@all -flushdb +@read"
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~* +@all -flushdb +@read"
+    finally:
+        ec.delete_user(UserId=uid)
 
 def test_elasticache_modify_user_append_skips_stored_rules_aws_refuses(ec):
     """MiniStack contract, not AWS behavior: a stored AccessString can hold rules AWS would have refused
