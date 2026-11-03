@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — a failed or stopped `startExecution.sync` child fails the parent with `States.TaskFailed`** — a child that failed gave the parent Task its own error name and cause, so a `Catch` on that name matched, which it doesn't on AWS. A stopped child gave a text cause. With `.sync` and `.sync:2`, the parent Task now fails with `States.TaskFailed`, and the cause is the child's DescribeExecution response as JSON: its `Status`, its `Error` and `Cause` when it has them, and its dates in epoch milliseconds. Recorded against a real AWS account in us-east-1. Contributed by @mishukdutta-cz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added
