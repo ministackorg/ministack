@@ -4667,6 +4667,115 @@ def test_sfn_integration_nested_start_execution_sync2_returns_json_output(sfn):
     )["executions"]
     assert any(e["executionArn"] == output["child"]["ExecutionArn"] for e in child_execs)
 
+
+NESTED_SYNC_RESOURCES = [
+    "arn:aws:states:::states:startExecution.sync",
+    "arn:aws:states:::states:startExecution.sync:2",
+]
+
+
+@pytest.mark.parametrize("resource", NESTED_SYNC_RESOURCES)
+def test_sfn_nested_start_execution_sync_failed_child_fails_with_task_failed(sfn, resource):
+    """A failed child fails the parent Task with States.TaskFailed, not with the child's error name."""
+    unique = str(time.time_ns())
+    child = sfn.create_state_machine(
+        name=f"sfn-child-fail-{unique}",
+        definition=json.dumps({
+            "StartAt": "Boom",
+            "States": {"Boom": {"Type": "Fail", "Error": "MyError", "Cause": "child boom"}},
+        }),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    parent = sfn.create_state_machine(
+        name=f"sfn-parent-fail-{unique}",
+        definition=json.dumps({
+            "StartAt": "RunChild",
+            "States": {
+                "RunChild": {
+                    "Type": "Task",
+                    "Resource": resource,
+                    "Parameters": {"StateMachineArn": child["stateMachineArn"]},
+                    "Catch": [
+                        {"ErrorEquals": ["MyError"], "Next": "WrongCatch"},
+                        {"ErrorEquals": ["States.TaskFailed"], "ResultPath": "$.error", "Next": "Caught"},
+                    ],
+                    "End": True,
+                },
+                "WrongCatch": {"Type": "Fail", "Error": "WrongCatch"},
+                "Caught": {"Type": "Pass", "End": True},
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    ex = sfn.start_execution(stateMachineArn=parent["stateMachineArn"], input="{}")
+    desc = _wait_sfn(sfn, ex["executionArn"])
+
+    assert desc["status"] == "SUCCEEDED"
+    error = json.loads(desc["output"])["error"]
+    assert error["Error"] == "States.TaskFailed"
+    # AWS sends the child's DescribeExecution response as compact JSON with sorted keys.
+    cause = json.loads(error["Cause"])
+    assert error["Cause"] == json.dumps(cause, separators=(",", ":"), sort_keys=True)
+    assert cause["Status"] == "FAILED"
+    assert cause["Error"] == "MyError"
+    assert cause["Cause"] == "child boom"
+    assert cause["StateMachineArn"] == child["stateMachineArn"]
+    assert cause["ExecutionArn"].startswith(child["stateMachineArn"].replace(":stateMachine:", ":execution:"))
+    assert isinstance(cause["StartDate"], int)
+    assert isinstance(cause["StopDate"], int)
+    assert cause["InputDetails"] == {"Included": True}
+
+
+@pytest.mark.parametrize("resource", NESTED_SYNC_RESOURCES)
+def test_sfn_nested_start_execution_sync_stopped_child_fails_with_task_failed(sfn, resource):
+    """A stopped child fails the parent Task with States.TaskFailed, with the stop error in the cause."""
+    unique = str(time.time_ns())
+    # A run checks for a stop only between states, so short Waits make the stop take effect quickly.
+    waits = {f"Wait{i}": {"Type": "Wait", "Seconds": 1, "Next": f"Wait{i + 1}"} for i in range(9)}
+    waits["Wait9"] = {"Type": "Wait", "Seconds": 1, "End": True}
+    child = sfn.create_state_machine(
+        name=f"sfn-child-stop-{unique}",
+        definition=json.dumps({"StartAt": "Wait0", "States": waits}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    parent = sfn.create_state_machine(
+        name=f"sfn-parent-stop-{unique}",
+        definition=json.dumps({
+            "StartAt": "RunChild",
+            "States": {
+                "RunChild": {
+                    "Type": "Task",
+                    "Resource": resource,
+                    "Parameters": {"StateMachineArn": child["stateMachineArn"]},
+                    "Catch": [{"ErrorEquals": ["States.TaskFailed"], "ResultPath": "$.error", "Next": "Caught"}],
+                    "End": True,
+                },
+                "Caught": {"Type": "Pass", "End": True},
+            },
+        }),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+
+    ex = sfn.start_execution(stateMachineArn=parent["stateMachineArn"], input="{}")
+    running = []
+    for _ in range(50):
+        running = sfn.list_executions(stateMachineArn=child["stateMachineArn"], statusFilter="RUNNING")["executions"]
+        if running:
+            break
+        time.sleep(0.1)
+    assert running, "The child execution did not start"
+    sfn.stop_execution(executionArn=running[0]["executionArn"], error="TestAbort", cause="stopped by test")
+    desc = _wait_sfn(sfn, ex["executionArn"])
+
+    assert desc["status"] == "SUCCEEDED"
+    error = json.loads(desc["output"])["error"]
+    assert error["Error"] == "States.TaskFailed"
+    cause = json.loads(error["Cause"])
+    assert cause["Status"] == "ABORTED"
+    assert cause["Error"] == "TestAbort"
+    assert cause["Cause"] == "stopped by test"
+
 def test_sfn_integration_multi_service_pipeline(sfn, sqs, ddb):
     """End-to-end: Pass → DynamoDB putItem → SQS sendMessage → Succeed."""
     table_name = "sfn-pipeline-test"
@@ -4968,6 +5077,101 @@ def test_sfn_stop_execution_retry_preserves_abort(sfn):
         assert before["cause"] == "first cause"
     finally:
         sfn.delete_state_machine(stateMachineArn=machine)
+
+
+def _two_second_wait(name):
+    return {"StartAt": name, "States": {name: {"Type": "Wait", "Seconds": 2, "End": True}}}
+
+
+@pytest.mark.parametrize("query_language, run_state, entered", [
+    ("JSONPath", {"Type": "Wait", "Seconds": 2}, ["WaitStateEntered"]),
+    ("JSONata", {"Type": "Wait", "Seconds": 2}, ["WaitStateEntered"]),
+    (
+        "JSONPath",
+        {"Type": "Parallel", "Branches": [_two_second_wait("WaitA"), _two_second_wait("WaitB")]},
+        ["ParallelStateEntered", "WaitStateEntered", "WaitStateEntered"],
+    ),
+    (
+        "JSONPath",
+        {"Type": "Map", "ItemsPath": "$.items",
+         "ItemProcessor": {**_two_second_wait("Wait"), "ProcessorConfig": {"Mode": "INLINE"}}},
+        ["MapStateEntered", "WaitStateEntered", "WaitStateEntered"],
+    ),
+], ids=["wait-jsonpath", "wait-jsonata", "parallel", "map"])
+def test_sfn_stop_writes_no_event_after_abort(sfn, query_language, run_state, entered):
+    """A stop ends the running state at once, so the history ends with ExecutionAborted, as on AWS."""
+    machine = sfn.create_state_machine(
+        name=f"stop-states-{_uuid_mod.uuid4().hex[:12]}",
+        definition=json.dumps({"QueryLanguage": query_language, "StartAt": "Run", "States": {
+            "Run": {**run_state, "Next": "Done"},
+            "Done": {"Type": "Pass", "End": True},
+        }}),
+        roleArn=_LAMBDA_ROLE,
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=machine, input=json.dumps({"items": [1, 2]}))["executionArn"]
+        waits = entered.count("WaitStateEntered")
+        for _ in range(50):
+            events = sfn.get_execution_history(executionArn=execution)["events"]
+            if sum(e["type"] == "WaitStateEntered" for e in events) == waits:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("The execution did not reach its Wait states")
+        sfn.stop_execution(executionArn=execution, error="TestStop", cause="stopped by test")
+        # Wait past the end of the Wait states, so a late event has time to appear.
+        time.sleep(3)
+
+        types = [e["type"] for e in sfn.get_execution_history(executionArn=execution)["events"]]
+        assert types == ["ExecutionStarted", *entered, "ExecutionAborted"]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=machine)
+
+
+def test_sfn_stopped_child_in_wait_ends_its_sync_parent_at_once(sfn):
+    """A child stopped during a long Wait ends its .sync parent at once, not when the Wait ends."""
+    unique = _uuid_mod.uuid4().hex[:12]
+    child = sfn.create_state_machine(
+        name=f"stop-wait-child-{unique}",
+        definition=json.dumps({"StartAt": "Wait", "States": {
+            "Wait": {"Type": "Wait", "Seconds": 30, "End": True},
+        }}),
+        roleArn=_LAMBDA_ROLE,
+    )["stateMachineArn"]
+    parent = sfn.create_state_machine(
+        name=f"stop-wait-parent-{unique}",
+        definition=json.dumps({"StartAt": "RunChild", "States": {
+            "RunChild": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::states:startExecution.sync",
+                "Parameters": {"StateMachineArn": child},
+                "Catch": [{"ErrorEquals": ["States.TaskFailed"], "Next": "Caught"}],
+                "End": True,
+            },
+            "Caught": {"Type": "Pass", "End": True},
+        }}),
+        roleArn=_LAMBDA_ROLE,
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=parent)["executionArn"]
+        # Stop the child only when it is in its Wait. A stop before that ends it at once anyway.
+        child_execution = None
+        for _ in range(50):
+            running = sfn.list_executions(stateMachineArn=child, statusFilter="RUNNING")["executions"]
+            if running:
+                events = sfn.get_execution_history(executionArn=running[0]["executionArn"])["events"]
+                if any(e["type"] == "WaitStateEntered" for e in events):
+                    child_execution = running[0]["executionArn"]
+                    break
+            time.sleep(0.05)
+        assert child_execution, "The child execution did not reach its Wait state"
+        sfn.stop_execution(executionArn=child_execution, error="TestStop", cause="stopped by test")
+
+        desc = _wait_sfn(sfn, execution, timeout=5)
+        assert desc["status"] == "SUCCEEDED"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=parent)
+        sfn.delete_state_machine(stateMachineArn=child)
 
 
 def test_sfn_list_executions_filter(sfn):
@@ -10394,7 +10598,7 @@ def test_sfn_jsonpath_parallel_reads_outer_variable_without_leaking_assignment()
         "Type": "Pass", "Parameters": {"address.$": "$target.id"},
         "Assign": {"branchOnly": "value"}, "End": True}}}
     output, _ = m._execute_parallel({"Type": "Parallel", "Branches": [branch, branch], "End": True}, {},
-                                    {"events": []}, ctx)
+                                    {"events": [], "status": "RUNNING"}, ctx)
     assert output == [{"address": "physical"}, {"address": "physical"}]
     assert "branchOnly" not in ctx["variables"]
 
@@ -10407,7 +10611,7 @@ def test_sfn_jsonpath_map_assignment_uses_aggregate_result():
         "StartAt": "Read", "States": {"Read": {"Type": "Pass",
                                                "Parameters": {"target.$": "$target"}, "End": True}}},
         "Assign": {"results.$": "$"}, "ResultPath": None, "End": True}
-    output, _ = m._execute_map(state, {"items": [1, 2]}, {"events": []}, ctx)
+    output, _ = m._execute_map(state, {"items": [1, 2]}, {"events": [], "status": "RUNNING"}, ctx)
     assert output == {"items": [1, 2]}
     assert ctx["variables"]["results"] == [{"target": "outer"}] * 2
 

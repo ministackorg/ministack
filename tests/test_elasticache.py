@@ -2,6 +2,7 @@ import io
 import json
 import os
 import time
+import types
 import uuid as _uuid_mod
 import zipfile
 
@@ -2619,3 +2620,209 @@ def test_elasticache_modify_user_access_string_and_append_together(ec):
                 exc.value.response["Error"]["Code"]) == (404, "UserNotFound")
     finally:
         ec.delete_user(UserId=uid)
+
+
+def test_elasticache_user_group_changes_answer_as_aws(ec):
+    """Real AWS (us-west-2): access strings are reported with `-@all`, user-group changes answer pending,
+    a group's default user cannot be deleted, and UserGroupIds is absent once the last group is detached."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    default, app, group, rg_id = f"d-{uid}", f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=default, UserName="default", Engine="valkey", AccessString="off -@all", Passwords=[pw])
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[default, app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        assert ec.modify_user(UserId=app, AccessString="on ~app:* +@read")["AccessString"] == "on ~app:* -@all +@read"
+        removed = ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert (removed["Status"], removed["UserIds"], removed["PendingChanges"]) == (
+            "modifying", [default, app], {"UserIdsToRemove": [app]})
+        with pytest.raises(ClientError) as exc:
+            ec.delete_user(UserId=default)
+        assert exc.value.response["Error"]["Code"] == "DefaultUserAssociatedToUserGroup"
+        detached = ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group],
+                                               ApplyImmediately=True)["ReplicationGroup"]
+        assert (detached["Status"], detached["UserGroupIds"], detached["PendingModifiedValues"]) == (
+            "modifying", [group], {"UserGroups": {"UserGroupIdsToAdd": [], "UserGroupIdsToRemove": [group]}})
+        assert "UserGroupIds" not in ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+        # A group still attached cannot be deleted; a user in it can (real AWS, us-west-2).
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToAdd=[group], ApplyImmediately=True)
+        with pytest.raises(ClientError) as exc:
+            ec.delete_user_group(UserGroupId=group)
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "InvalidUserGroupState", f"User group {group} can't be deleted because it is still associated "
+            "with at least 1 replication group or serverless cache.")
+        assert ec.delete_user(UserId=app)["Status"] == "deleting"
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group], ApplyImmediately=True)
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=default)
+
+
+def test_elasticache_user_access_string_validated_as_aws(ec):
+    """Real AWS (us-west-2, Valkey 8.1): unknown commands, categories and syntax are refused; subcommands are not checked."""
+    uid = _uid()
+    for access, message in (
+            ("on ~* +doesnotexist", "Access string contains invalid command(s). "
+                                    "Please verify the list of available commands in user-api."),
+            ("on ~* +@notacategory", "Access string contains invalid category(s). "
+                                     "Please verify the list of available category in user-api."),
+            ("garbage", "The access-string is invalid.")):
+        with pytest.raises(ClientError) as exc:
+            ec.create_user(UserId=f"bad-{uid}", UserName=f"bad-{uid}", Engine="valkey", AccessString=access,
+                           Passwords=["a-long-enough-password-1"])
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "InvalidParameterValue", message)
+    ec.create_user(UserId=f"ok-{uid}", UserName=f"ok-{uid}", Engine="valkey", AccessString="on ~* +get|nosub",
+                   Passwords=["a-long-enough-password-1"])
+    try:
+        assert ec.describe_users(UserId=f"ok-{uid}")["Users"][0]["AccessString"] == "on ~* -@all +get|nosub"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=f"ok-{uid}", AccessString="on ~* (+doesnotexist)")
+        assert "invalid command(s)" in exc.value.response["Error"]["Message"]
+        assert ec.modify_user(UserId=f"ok-{uid}", AccessString="on ~* +@json +bf.add +hgetex")["AccessString"] == (
+            "on ~* -@all +@json +bf.add +hgetex")
+    finally:
+        ec.delete_user(UserId=f"ok-{uid}")
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path):
+    """A replication group's user group is configured on its engine and follows every change: default is
+    off without a default user, application users cannot change users, and detaching restores default."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all (~* +@all)", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        ep = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0]["PrimaryEndpoint"]
+        ca = _serverless_ca_file(tmp_path)
+        ok, deadline = b"+OK\r\n", time.time() + 30
+        while True:
+            try:
+                unauthenticated = _tls_session(ep, ca, ("SET", "k", "v"))[0]
+                break
+            except OSError:  # still starting
+                assert time.time() < deadline
+                time.sleep(0.5)
+        assert unauthenticated.startswith(b"-NOAUTH")
+        assert _tls_session(ep, ca, ("AUTH", app, "wrong-password-123456"))[0].startswith(b"-WRONGPASS")
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v")) == [ok, ok]
+        # All channels, as on AWS, for an access string without channel rules.
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("PUBLISH", "ch", "x")) == [ok, b":0\r\n"]
+        took = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "SETUSER", "default", "on", "nopass", "+@all"))
+        assert took[1].startswith(b"-NOPERM")
+        # Only the group's users and `default off`, as on AWS (real AWS, us-west-2, Valkey 8.1).
+        users, acl = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "USERS"), ("ACL", "LIST"))[1:]
+        assert users == f"*2\r\n${len(app)}\r\n{app}\r\n$7\r\ndefault\r\n".encode()
+        acl_lines = [line for line in acl.split(b"\r\n") if line.startswith(b"user ")]
+        assert len(acl_lines) == 2 and acl_lines[0].startswith(f"user {app} on #".encode())
+        assert acl_lines[1] == b"user default off &* -@all"
+
+        ec.modify_user(UserId=app, AccessString="on ~app:* +@read")  # re-applied with default off
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v"))[1].startswith(b"-NOPERM")
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert _tls_session(ep, ca, ("AUTH", app, pw))[0].startswith(b"-WRONGPASS")
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group], ApplyImmediately=True)
+        assert _tls_session(ep, ca, ("SET", "k", "v")) == [ok]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=app)
+
+
+def test_elasticache_acl_setuser_denies_inside_selectors_only():
+    """Restricted commands are denied inside each (selector), and a key pattern ending in `)` is no selector."""
+    from ministack.services import elasticache as _ec
+    user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
+    assert _ec._acl_setuser(user, ("-a", "-b")) == [
+        "ACL", "SETUSER", "u", "reset", "&*", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+    assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
+    assert _ec._engine_acl({"Engine": "redis", "EngineVersion": "5.0.6"}, None, None) is None  # no ACL before 6
+    assert _ec._engine_rules(["on", "+json.get", "(+@bloom", "~x)", "(~y", "+bf.add)", "(-@json)"],
+                             _ec._ACL_MODULE_NAMES) == ["on", "(~x)", "(~y)", "()"]
+    from ministack.core.responses import get_account_id, get_region
+    uid = _uid()
+    _ec._users[f"u-{uid}"] = {"UserId": f"u-{uid}", "UserName": "u", "AccessString": "on ~* +get +hgetex +json.get",
+                              "Authentication": {"Type": "iam"}}
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"u-{uid}"]}
+    try:
+        _ec._users[f"u-{uid}"]["AccessString"] += " -eval_ro"
+        for engine, version, rules in (("valkey", "8.0", "~* +get -eval_ro"), ("valkey", "9.0", "~* +get +hgetex -eval_ro"),
+                                       ("redis", "7", "~* +get -eval_ro"), ("redis", "6.2", "~* +get")):
+            rg = {"Engine": engine, "EngineVersion": version, "UserGroupIds": [f"g-{uid}"]}
+            assert f"user u reset &* on {rules} -acl" in _ec._engine_acl(rg, get_account_id(), get_region())
+    finally:
+        del _ec._users[f"u-{uid}"], _ec._user_groups[f"g-{uid}"]
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_elasticache_replication_group_keeps_its_data_when_users_change(ec, tmp_path):
+    """A user change restarts the engines to read the new ACL file; the data survives the restart."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        ep = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0]["PrimaryEndpoint"]
+        ca = _serverless_ca_file(tmp_path)
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "app:k", "v"))[1] == b"+OK\r\n"
+        ec.modify_user(UserId=app, AccessString="on ~app:* +@read")
+        got = _tls_session(ep, ca, ("AUTH", app, pw), ("GET", "app:k"), ("SET", "app:k", "w"))
+        assert got[1] == b"$1\r\nv\r\n" and got[2].startswith(b"-NOPERM")  # the new access string, the old key
+        # Module commands the engine image does not load are left out of its ACL; the rest applies.
+        ec.modify_user(UserId=app, AccessString="on ~* +@write +json.get (+@bloom ~x)")
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "app:k", "w")) == [b"+OK\r\n", b"+OK\r\n"]
+        assert ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0][
+            "PrimaryEndpoint"] == ep
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=app)
+
+
+def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkeypatch):
+    """A change that lands while the ACL file is being written is written too, without a lock."""
+    from ministack.core.responses import get_account_id, get_region
+    from ministack.services import elasticache as _ec
+    uid = _uid()
+    user = {"UserId": f"a-{uid}", "UserName": f"a-{uid}", "AccessString": "on ~* +@all",
+            "Authentication": {"Type": "iam"}}
+    _ec._users[user["UserId"]] = user
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [user["UserId"]]}
+    written = []
+
+    class Container:
+        id = "c1"
+
+        def put_archive(self, path, data):
+            import tarfile
+            with tarfile.open(fileobj=io.BytesIO(data)) as bundle:
+                written.append(bundle.extractfile(bundle.getmembers()[0]).read().decode())
+            user["AccessString"] = "on ~app:* -@all +@read"  # a ModifyUser landing meanwhile
+            return True
+
+        def restart(self, timeout):
+            written.append("restart")
+
+        def exec_run(self, cmd):
+            return types.SimpleNamespace(exit_code=0, output=b"NOAUTH Authentication required.")
+
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda cid: Container()))
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    rg = {"ReplicationGroupId": f"rg-{uid}", "Engine": "valkey", "EngineVersion": "8.0",
+          "UserGroupIds": [f"g-{uid}"], "_docker_container_ids": ["c1"]}
+    try:
+        _ec._apply_user_groups(rg, get_account_id(), get_region())
+        assert written[-1] == "restart" and "~app:*" in written[-2] and "+@all" not in written[-2]
+        assert written[-2].endswith("user default reset &*\n")
+    finally:
+        del _ec._users[user["UserId"]], _ec._user_groups[f"g-{uid}"]
+

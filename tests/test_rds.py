@@ -17208,6 +17208,113 @@ def test_rds_public_endpoint_cluster_reports_published_port(monkeypatch):
         m._clusters.clear()
 
 
+@pytest.mark.parametrize("engine", ["aurora-postgresql", "aurora-mysql"])
+@pytest.mark.parametrize("network", [None, "ms_net"])
+def test_rds_public_endpoint_cluster_endpoint_stable_across_first_instance(monkeypatch, network, engine):
+    """#2532: Endpoint, ReaderEndpoint and Port do not move when the first instance starts.
+
+    Real AWS (aurora-postgresql and aurora-mysql, us-east-1) reports the same three values in
+    captures `describe-cluster-just-created`, `describe-cluster-instance-creating`
+    and `describe-cluster-after-first-instance`. The {MINISTACK_HOST, host_port}
+    values themselves are MiniStack-only, from the flag.
+    """
+    import itertools
+
+    from ministack.services import rds as m
+
+    class FakeContainer:
+        id = "public-endpoint-stable-container"
+        status = "running"
+        attrs = {"NetworkSettings": {"Networks": {"ms_net": {"IPAddress": "172.31.77.51"}}}}
+
+        def reload(self):
+            pass
+
+    container = FakeContainer()
+    published_ports = []
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            published_ports.extend(kwargs["ports"].values())
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeImages:
+        def get(self, _image):
+            return object()
+
+    class FakeDocker:
+        containers = FakeContainers()
+        images = FakeImages()
+
+    ports = itertools.count(16200)
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: network)
+    monkeypatch.setattr(m, "_next_port", lambda: next(ports))
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "public-endpoint-stable",
+            "Engine": engine,
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters["public-endpoint-stable"]
+        created = (cluster["Endpoint"], cluster["ReaderEndpoint"], cluster["Port"])
+        assert created == (m._MINISTACK_HOST, m._MINISTACK_HOST, 16200)
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "public-endpoint-stable-1",
+            "DBClusterIdentifier": "public-endpoint-stable",
+            "DBInstanceClass": "db.t4g.medium",
+            "Engine": engine,
+        })
+        deadline = time.time() + 2
+        while time.time() < deadline and cluster["Status"] != "available":
+            time.sleep(0.01)
+        assert cluster["Status"] == "available"
+        assert published_ports == [16200]
+        assert (cluster["Endpoint"], cluster["ReaderEndpoint"], cluster["Port"]) == created
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_public_endpoint_cluster_without_docker_keeps_aws_names(monkeypatch):
+    """#2532: with no Docker no container is published, so CreateDBCluster keeps the AWS-shaped names."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "public-endpoint-no-docker",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters["public-endpoint-no-docker"]
+        assert ".cluster-" in cluster["Endpoint"]
+        assert ".cluster-ro-" in cluster["ReaderEndpoint"]
+        assert cluster["Port"] == 5432
+        assert cluster["_shared_host_port"] is None
+    finally:
+        m._clusters.clear()
+
+
 # ---------------------------------------------------------------------------
 # ModifyDBInstance settings that apply immediately (synthetic instances)
 # ---------------------------------------------------------------------------
