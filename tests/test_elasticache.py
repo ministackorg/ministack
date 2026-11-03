@@ -2573,3 +2573,49 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
     finally:
         ec.delete_user(UserId=uid)
+
+
+@pytest.mark.parametrize("engine,append,expected", [
+    ("valkey", "-flushall", "on ~* +@all -flushall"),
+    ("redis", "-flushall", "on ~* +@all -flushall"),
+    ("valkey", "  -flushall  ", "on ~* +@all -flushall"),
+    ("valkey", "-flushall -flushdb", "on ~* +@all -flushall -flushdb"),
+    ("valkey", "-flushall    -flushdb", "on ~* +@all -flushall -flushdb"),
+])
+def test_elasticache_modify_user_appends_access_string(ec, engine, append, expected):
+    """ModifyUser appends AppendAccessString's command rules to the stored AccessString
+    (AWS captures modify-cmd/describe-cmd, modify-redis-cmd/describe-redis-cmd, modify-ws,
+    modify-two, modify-inner-ws and their describes)."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine=engine, AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        modified = ec.modify_user(UserId=uid, AppendAccessString=append)
+        assert (modified["Status"], modified["AccessString"]) == ("modifying", expected)
+        described = ec.describe_users(UserId=uid)["Users"][0]
+        assert (described["Status"], described["AccessString"]) == ("active", expected)
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_access_string_and_append_together(ec):
+    """AccessString with AppendAccessString is refused and the user keeps its rules
+    (AWS captures modify-both, describe-both); an unknown user is reported first
+    (modify-both-missing)."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=uid, AccessString="on ~* +get", AppendAccessString="-get")
+        err = exc.value.response["Error"]
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]) == (
+            400, "InvalidParameterCombination",
+            "Both AccessString and AppendAccessString provided together. Pass either one of them.")
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~* +@all"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=f"{uid}-nosuch", AccessString="on ~* +get", AppendAccessString="-get")
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"],
+                exc.value.response["Error"]["Code"]) == (404, "UserNotFound")
+    finally:
+        ec.delete_user(UserId=uid)

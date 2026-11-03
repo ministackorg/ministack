@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ElastiCache — `ModifyUser` `AppendAccessString`** — the parameter was ignored, so the user kept its old access string. Its rules are now added to the end of the stored `AccessString`, separated by single spaces, which is what AWS stores when command rules such as `-flushall` and `-flushdb` are appended (`on ~* +@all` with `-flushall` becomes `on ~* +@all -flushall`). A non-empty `AccessString` with a non-empty `AppendAccessString` answers AWS's 400 `InvalidParameterCombination` "Both AccessString and AppendAccessString provided together. Pass either one of them." AWS also reorders appended key and channel rules and drops rules that change nothing, which MiniStack does not do here or in `CreateUser`. Contributed by @kharabasz.
+
 ## [1.5.36] — 2026-11-02
 
 ### Added

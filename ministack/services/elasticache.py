@@ -2930,12 +2930,20 @@ def _modify_user(p):
     user = _users.get(user_id)
     if not user:
         return _error("UserNotFound", f"User {user_id} not found", 404)
+    if _p(p, "AccessString") and _p(p, "AppendAccessString"):
+        return _error("InvalidParameterCombination",
+                      "Both AccessString and AppendAccessString provided together. Pass either one of them.", 400)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
     if err:
         return err
     if _p(p, "AccessString"):
         user["AccessString"] = _p(p, "AccessString")
+    append = _p(p, "AppendAccessString").split()
+    if append:
+        # Command rules land at the end as on AWS; AWS also reorders key and channel
+        # rules and drops no-op ones, which MiniStack doesn't (nor does CreateUser).
+        user["AccessString"] = " ".join([user.get("AccessString", ""), *append]).strip()
     if auth:
         user["Authentication"] = auth
         user["_PasswordHashes"] = _password_hashes(p)
