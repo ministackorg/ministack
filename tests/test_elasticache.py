@@ -1518,6 +1518,197 @@ def test_serverless_cache_user_group_enforces_acl(ec, tmp_path):
             ec.delete_user(UserId=user)
 
 
+# Each access string's channels on the engine, as `ACL GETUSER` reported them on AWS in us-east-2: the
+# same on serverless Valkey 7, 8 and 9 and Redis OSS 7 and on node-based Valkey 7.2 (capture rounds
+# aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7), aws-channel-cases and
+# aws-selectors-node). Round aws-one-group-password captured every string here again in one group per
+# engine, as the test sets them up, and three of them also as password users, with the same channels.
+_AWS_ACL_CHANNELS = {
+    "on ~* +@all": "&*",
+    "on ~* &allowed* +@all": "&allowed*",
+    "on ~* resetchannels +@all": "",
+    "on ~* allchannels +@all": "&*",
+    "on ~* &* +@all": "&*",
+    "on ~* &a resetchannels &b +@all": "&b",
+    "on ~* +@all (&chan +get ~k)": "",
+    "on ~* +@all (+get ~k)": "",
+    # without channel rules, serverless only (aws-no-channel-shapes, aws-no-channel-shapes-v8-v9)
+    "on ~k +get": "&*",
+    "off ~* +@all": "&*",
+    "on ~* -@all +publish +subscribe": "&*",
+    "on ~app:* +@all": "&*",
+    "on +@all": "&*",
+    # the #2518 unit test's string; serverless only (aws-one-group-password)
+    "on ~foo) (~x +get) +set": "",
+}
+# More selector shapes, captured in groups that also held a password user named default, on every
+# serverless engine (aws-selectors-default); checked in the same setup.
+_AWS_ACL_CHANNELS_WITH_DEFAULT = {
+    "on ~* +@all": "&*",
+    "on ~k +get (&chan +publish)": "",
+    "off (+get ~k)": "",
+    "on ~* &x +@all (+get ~k)": "&x",
+    "on ~* +@all (+get ~k) (&c +publish)": "",
+    "on (~k +get)": "",
+}
+
+
+def test_user_access_string_with_channel_pattern_round_trips(ec):
+    """AWS returns an access string with `&` XML-escaped in CreateUser, DescribeUsers, ModifyUser and
+    DeleteUser (captures create-user-ctl, describe-user-ctl, modify-user-amp, delete-user-amp); AWS also
+    rewrites it (`on ~* resetchannels &allowed* +@all`), which MiniStack does not, so only the pattern
+    is compared."""
+    uid = f"u-amp-{_uid()}"
+    created = ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* &allowed* +@all",
+                             AuthenticationMode={"Type": "iam"})
+    try:
+        assert "&allowed*" in created["AccessString"]
+        assert "&allowed*" in ec.describe_users(UserId=uid)["Users"][0]["AccessString"]
+        assert "&other*" in ec.modify_user(UserId=uid, AccessString="on ~* &other* +@all")["AccessString"]
+    finally:
+        assert "&other*" in ec.delete_user(UserId=uid)["AccessString"]
+
+
+def test_user_acl_channels_default_to_all():
+    """The ACL SETUSER commands MiniStack sends: `&*` before an access string without channel rules or
+    selectors, and nothing before the rest."""
+    def user(access):
+        return {"UserId": "u", "UserName": "u", "AccessString": access, "Authentication": {"Type": "iam"}}
+
+    with_all_channels = {"on ~* +@all", "on ~k +get", "off ~* +@all", "on ~* -@all +publish +subscribe",
+                         "on ~app:* +@all", "on +@all"}  # the rest set channels or have a selector
+    for access in {**_AWS_ACL_CHANNELS, **_AWS_ACL_CHANNELS_WITH_DEFAULT}:
+        prefix = ["reset", "&*"] if access in with_all_channels else ["reset"]
+        assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+@pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
+def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
+    """Capture rounds aws-serverless-cases, aws-selectors-serverless, aws-engines (v8, v9, r7),
+    aws-no-channel-shapes and aws-no-channel-shapes-v8-v9 (AWS, us-east-2): each user's channels match
+    `_AWS_ACL_CHANNELS`, an iam user with
+    `on ~* +@all` can SUBSCRIBE and PUBLISH on any channel, and one with `on ~* &allowed* +@all` gets
+    NOPERM outside `allowed*` (Valkey's exact text; for Redis only a channel NOPERM, see below).
+    A Valkey group without a default user has it as `off &* -@all`; AWS refuses a Redis group without
+    one (DefaultUserRequired), so the Redis group has one with `on ~* +@all`, which gets `&*`."""
+    import socket
+    import ssl
+    uid, pw = _uid(), "msc-capture-default-password-1"
+    expected = _AWS_ACL_CHANNELS
+    users = {access: f"u-{i}-{uid}" for i, access in enumerate(expected)}
+    all_user, ctl_user = users["on ~* +@all"], users["on ~* &allowed* +@all"]
+    group, name, default_id = f"g-{uid}", f"sls-chan-{uid}", f"u-def-{uid}"
+    for access, user_id in users.items():
+        ec.create_user(UserId=user_id, UserName=user_id, Engine=engine, AccessString=access,
+                       AuthenticationMode={"Type": "iam"})
+    group_ids = list(users.values())
+    if engine == "redis":
+        ec.create_user(UserId=default_id, UserName="default", Engine="redis", AccessString="on ~* +@all",
+                       AuthenticationMode={"Type": "password", "Passwords": [pw]})
+        group_ids.append(default_id)
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=group_ids)
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        # AWS's Redis OSS 7.1 words the error "this user has no permissions to access one of the channels
+        # used as arguments"; MiniStack's redis:7 image words it like Valkey, so for Redis only a channel
+        # NOPERM is required.
+        valkey_nochan = b"-NOPERM No permissions to access a channel\r\n"
+
+        def nochan(reply):
+            if engine == "redis":
+                return reply.startswith(b"-NOPERM ") and b"channel" in reply
+            return reply == valkey_nochan
+
+        def auth(user):
+            return ("AUTH", user, f"{name}/?Action=connect&User={user}")
+
+        def subscribe_and_publish(user, channel):
+            ctx = ssl.create_default_context(cafile=ca)
+            with socket.create_connection((ep["Address"], ep["Port"]), timeout=10) as raw:
+                with ctx.wrap_socket(raw, server_hostname=ep["Address"]) as sub:
+                    for parts in (auth(user), ("SUBSCRIBE", channel)):
+                        sub.sendall(f"*{len(parts)}\r\n".encode()
+                                    + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+                        time.sleep(0.2)
+                        subscribed = sub.recv(65536)
+                    published = _tls_session(ep, ca, auth(user), ("PUBLISH", channel, "hello"))[1]
+                    time.sleep(0.2)
+                    return subscribed, published, sub.recv(65536) if published == b":1\r\n" else None
+
+        for access, user_id in users.items():
+            channels = expected[access]
+            # read through the `on ~* +@all` user, as in the capture: an `off` user cannot AUTH
+            reply = _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", user_id))[1]
+            # the root channels come right before `selectors`; each selector has its own channels field
+            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
+        selector_user = users["on ~* +@all (&chan +get ~k)"]
+        reply = _tls_session(ep, ca, auth(selector_user), ("ACL", "GETUSER", selector_user), ("PUBLISH", "chan", "x"))
+        # a selector's channels are its last field, and the selectors list ends the reply
+        assert reply[1].endswith(b"$8\r\nchannels\r\n$5\r\n&chan\r\n") and nochan(reply[2])
+        selector_user = users["on ~* +@all (+get ~k)"]
+        reply = _tls_session(ep, ca, auth(all_user), ("ACL", "GETUSER", selector_user))[1]
+        assert reply.endswith(b"$8\r\nchannels\r\n$0\r\n\r\n")
+        if engine == "redis":
+            default = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"))[1]
+            assert b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in default
+        else:
+            assert b"$25\r\nuser default off &* -@all\r\n" in _tls_session(ep, ca, auth(all_user), ("ACL", "LIST"))[1]
+        chan = b"$8\r\nany-chan\r\n"
+        assert subscribe_and_publish(all_user, "any-chan") == (
+            b"*3\r\n$9\r\nsubscribe\r\n" + chan + b":1\r\n", b":1\r\n",
+            b"*3\r\n$7\r\nmessage\r\n" + chan + b"$5\r\nhello\r\n")
+        subscribed, published, message = subscribe_and_publish(ctl_user, "any-chan")
+        assert nochan(subscribed) and nochan(published) and message is None
+        assert subscribe_and_publish(ctl_user, "allowed-chan")[1] == b":1\r\n"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in group_ids:
+            ec.delete_user(UserId=user)
+
+
+@pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
+@pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
+def test_serverless_cache_default_user_pubsub_channels(ec, tmp_path, engine, major):
+    """Capture rounds aws-engines (v7def) and aws-selectors-default (AWS, serverless, us-east-2): a
+    password user named default with `on ~* +@all`, in the group when the cache is created, has channels
+    `&*` and can PUBLISH, and the group's other users have the root channels in
+    `_AWS_ACL_CHANNELS_WITH_DEFAULT`."""
+    uid, pw = _uid(), "msc-capture-default-password-1"
+    user_id, group, name = f"u-def-{uid}", f"g-{uid}", f"sls-def-{uid}"
+    ec.create_user(UserId=user_id, UserName="default", Engine=engine, AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "password", "Passwords": [pw]})
+    users = {access: f"u-{i}-{uid}" for i, access in enumerate(_AWS_ACL_CHANNELS_WITH_DEFAULT)}
+    for access, other in users.items():
+        ec.create_user(UserId=other, UserName=other, Engine=engine, AccessString=access,
+                       AuthenticationMode={"Type": "iam"})
+    ec.create_user_group(UserGroupId=group, Engine=engine, UserIds=[user_id, *users.values()])
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine=engine, MajorEngineVersion=major, UserGroupId=group)
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        ep, ca = cache["Endpoint"], _serverless_ca_file(tmp_path)
+        replies = _tls_session(ep, ca, ("AUTH", "default", pw), ("ACL", "GETUSER", "default"),
+                               ("PUBLISH", "any-chan", "x"))
+        assert replies[0] == b"+OK\r\n" and b"$8\r\nchannels\r\n$2\r\n&*\r\n$9\r\nselectors\r\n" in replies[1]
+        assert replies[2] == b":0\r\n"
+        reader = users["on ~* +@all"]
+        for access, other in users.items():
+            channels = _AWS_ACL_CHANNELS_WITH_DEFAULT[access]
+            reply = _tls_session(ep, ca, ("AUTH", reader, f"{name}/?Action=connect&User={reader}"),
+                                 ("ACL", "GETUSER", other))[1]
+            assert f"$8\r\nchannels\r\n${len(channels)}\r\n{channels}\r\n$9\r\nselectors\r\n".encode() in reply, access
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (user_id, *users.values()):
+            ec.delete_user(UserId=user)
+
+
 def test_serverless_cache_create_describe_delete(ec):
     name = f"sls-{_uid()}"
     created = ec.create_serverless_cache(
@@ -2992,7 +3183,7 @@ def test_elasticache_acl_setuser_denies_inside_selectors_only():
     from ministack.services import elasticache as _ec
     user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
     assert _ec._acl_setuser(user, ("-a", "-b")) == [
-        "ACL", "SETUSER", "u", "reset", "&*", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+        "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
     assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
     assert _ec._engine_acl({"Engine": "redis", "EngineVersion": "5.0.6"}, None, None) is None  # no ACL before 6
     assert _ec._engine_rules(["on", "+json.get", "(+@bloom", "~x)", "(~y", "+bf.add)", "(-@json)"],
