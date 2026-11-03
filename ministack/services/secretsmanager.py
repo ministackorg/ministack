@@ -1383,6 +1383,42 @@ def secret_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     return _resource_policies.get(resource_arn) or "", get_account_id()
 
 
+def foreign_secret_readable(secret_id: str) -> bool:
+    """Under AUTH=true, whether the caller may read a secret another account owns: an explicit Allow in its
+    resource policy, the caller's own GetSecretValue and kms:Decrypt, and a customer managed key whose policy
+    allows the caller, since the AWS managed key cannot be used across accounts (Secrets Manager guide)."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import EvalContext, _verified_key, caller_arn, enforce, resource_policy_allows
+    from ministack.services import kms
+    if not AUTH:
+        return True
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=True)
+    if not secret:
+        return True  # not found is reported by the caller
+    spec, _ = _secret_scope_from_arn(secret["ARN"])
+    if spec.account_id == get_account_id():
+        return True
+    caller = caller_arn()
+    ctx = EvalContext(principal_arn=caller, principal_account=caller.split(":")[4],
+                      principal_type="Root" if caller.endswith(":root") else
+                      "AssumedRole" if ":assumed-role/" in caller else "User",
+                      action="secretsmanager:GetSecretValue", resource_arn=secret["ARN"], region=spec.region)
+    policy = _resource_policies.get_scoped(spec.account_id, spec.region, secret["ARN"])
+    if not resource_policy_allows(policy, ctx, same_account=False):
+        return False
+    kms_key = secret.get("KmsKeyId") or ""
+    if not kms_key or kms_key.endswith("alias/aws/secretsmanager"):
+        return False
+    if not kms_key.startswith("arn:"):
+        kms_key = f"arn:aws:kms:{spec.region}:{spec.account_id}:{'' if kms_key.startswith('alias/') else 'key/'}{kms_key}"
+    _owner, key = kms._foreign_key(kms_key)
+    if not key or not kms.key_policy_allows_caller(key, "Decrypt", caller):
+        return False
+    identity = _verified_key.get()
+    return (enforce(identity, "secretsmanager:GetSecretValue", "secretsmanager", spec.region, secret["ARN"]) is None
+            and enforce(identity, "kms:Decrypt", "kms", spec.region, kms_key) is None)
+
+
 def _put_resource_policy(data):
     secret_id = data.get("SecretId")
     _, secret = _resolve(secret_id)

@@ -1785,16 +1785,19 @@ def _strip_descriptions(rule):
     return r
 
 
-def _rule_match_form(rule):
-    """A copy of rule in the form SG rules are compared in.
+# botocore IpPermission.IpProtocol: -1 or a protocol number other than these allows all ports,
+# "regardless of any port range you specify".
+_PORTED_PROTOCOLS = frozenset(("tcp", "udp", "icmp", "icmpv6", "6", "17", "1", "58"))
 
-    Descriptions are ignored, and so are an IpProtocol -1 rule's FromPort/ToPort,
-    since -1 covers all ports: a -1 rule still stored with ports (legacy flat
-    form, CloudFormation, ModifySecurityGroupRules, older persisted state)
-    matches a call that sends other ports or none.
-    """
+
+def _ignores_ports(protocol):
+    return str(protocol).lower() not in _PORTED_PROTOCOLS
+
+
+def _rule_match_form(rule):
+    """A copy of rule as SG rules are compared: no descriptions, no ports where the protocol ignores them."""
     r = _strip_descriptions(rule)
-    if r.get("IpProtocol") == "-1":
+    if _ignores_ports(r.get("IpProtocol", "")):
         r.pop("FromPort", None)
         r.pop("ToPort", None)
     return r
@@ -4694,9 +4697,9 @@ def _parse_legacy_ip_permission(params):
             "PrefixListIds": [], "UserIdGroupPairs": []}
     from_port = _p(params, "FromPort")
     to_port = _p(params, "ToPort")
-    if from_port:
+    if from_port and not _ignores_ports(proto):
         rule["FromPort"] = int(from_port)
-    if to_port:
+    if to_port and not _ignores_ports(proto):
         rule["ToPort"] = int(to_port)
     cidr = _p(params, "CidrIp")
     if cidr:
@@ -4728,10 +4731,7 @@ def _parse_ip_permissions(params, prefix):
             break
         rule = {"IpProtocol": proto, "IpRanges": [], "Ipv6Ranges": [],
                 "PrefixListIds": [], "UserIdGroupPairs": []}
-        # IpProtocol -1 covers all ports: AWS ignores FromPort/ToPort on authorize
-        # and revoke, stores the rule without them, and matches it whatever
-        # ports a later call sends (Terraform revokes the default rule as -1/0/0).
-        if proto != "-1":
+        if not _ignores_ports(proto):
             from_port = _p(params, f"{prefix}.{i}.FromPort")
             to_port = _p(params, f"{prefix}.{i}.ToPort")
             if from_port:
@@ -6327,6 +6327,9 @@ def _modify_security_group_rules(p):
                     rule["FromPort"] = int(update["from_port"])
                 if update["to_port"] is not None:
                     rule["ToPort"] = int(update["to_port"])
+                if _ignores_ports(rule.get("IpProtocol", "")):
+                    rule.pop("FromPort", None)
+                    rule.pop("ToPort", None)
 
                 if update["cidr_ipv4"] is not None:
                     first = {}

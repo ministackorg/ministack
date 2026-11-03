@@ -388,6 +388,16 @@ def _seed_default_param_groups():
             _param_group_params[_name] = _default_params_for_family(_family)
 
 
+def _seed_default_user():
+    """The account's built-in `default` user (real AWS, us-east-1)."""
+    if "default" not in _users:
+        _users["default"] = {
+            "UserId": "default", "UserName": "default", "Engine": "redis", "Status": "active",
+            "AccessString": "on ~* +@all", "UserGroupIds": [], "Authentication": {"Type": "no-password"},
+            "ARN": _arn_user("default"), "_PasswordHashes": [], "_builtin": True,
+        }
+
+
 def _stamp_replication_group_on_user_groups(rg_id, user_group_ids):
     for group_id in user_group_ids:
         group = _user_groups.get(group_id)
@@ -1057,6 +1067,7 @@ async def handle_request(method, path, headers, body, query_params):
     # from disk (issue #853). Cheap fast-path when nothing's pending.
     _ensure_live_containers()
     _seed_default_param_groups()
+    _seed_default_user()
     params = dict(query_params)
     if method == "POST" and body:
         form_params = parse_qs(body.decode("utf-8", errors="replace"))
@@ -1833,16 +1844,16 @@ def _resolve_subnets(p):
 
 def _subnet_group_xml(sg):
     subnets_xml = "".join(
-        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
-        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></Subnet>"
+        f"<Subnet><SubnetIdentifier>{xml_escape(str(s['SubnetIdentifier']))}</SubnetIdentifier>"
+        f"<SubnetAvailabilityZone><Name>{xml_escape(str(s['SubnetAvailabilityZone']['Name']))}</Name></SubnetAvailabilityZone></Subnet>"
         for s in sg.get("Subnets", [])
     )
     return (
-        f"<CacheSubnetGroupName>{sg['CacheSubnetGroupName']}</CacheSubnetGroupName>"
+        f"<CacheSubnetGroupName>{xml_escape(str(sg['CacheSubnetGroupName']))}</CacheSubnetGroupName>"
         f"<CacheSubnetGroupDescription>{xml_escape(sg.get('CacheSubnetGroupDescription', ''))}</CacheSubnetGroupDescription>"
-        f"<VpcId>{sg.get('VpcId', '')}</VpcId>"
+        f"<VpcId>{xml_escape(str(sg.get('VpcId', '')))}</VpcId>"
         f"<Subnets>{subnets_xml}</Subnets>"
-        f"<ARN>{sg.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(sg.get('ARN', '')))}</ARN>"
     )
 
 
@@ -1934,10 +1945,10 @@ def _create_param_group(p):
 
     return _xml(200, "CreateCacheParameterGroupResponse",
         f"<CreateCacheParameterGroupResult><CacheParameterGroup>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
-        f"<CacheParameterGroupFamily>{family}</CacheParameterGroupFamily>"
-        f"<Description>{desc}</Description>"
-        f"<ARN>{arn}</ARN>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(family))}</CacheParameterGroupFamily>"
+        f"<Description>{xml_escape(str(desc))}</Description>"
+        f"<ARN>{xml_escape(str(arn))}</ARN>"
         f"</CacheParameterGroup></CreateCacheParameterGroupResult>")
 
 
@@ -1948,10 +1959,10 @@ def _describe_param_groups(p):
     groups = [_param_groups[name]] if name and name in _param_groups else list(_param_groups.values())
     # CacheParameterGroupList.member.locationName = "CacheParameterGroup"
     members = "".join(
-        f"<CacheParameterGroup><CacheParameterGroupName>{g['CacheParameterGroupName']}</CacheParameterGroupName>"
-        f"<CacheParameterGroupFamily>{g.get('CacheParameterGroupFamily', '')}</CacheParameterGroupFamily>"
-        f"<Description>{g.get('Description', '')}</Description>"
-        f"<ARN>{g.get('ARN', '')}</ARN></CacheParameterGroup>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(g['CacheParameterGroupName']))}</CacheParameterGroupName>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(g.get('CacheParameterGroupFamily', '')))}</CacheParameterGroupFamily>"
+        f"<Description>{xml_escape(str(g.get('Description', '')))}</Description>"
+        f"<ARN>{xml_escape(str(g.get('ARN', '')))}</ARN></CacheParameterGroup>"
         for g in groups
     )
     return _xml(200, "DescribeCacheParameterGroupsResponse",
@@ -1983,14 +1994,14 @@ def _describe_cache_parameters(p):
     for pname, pval in params.items():
         members += (
             f"<Parameter>"
-            f"<ParameterName>{pname}</ParameterName>"
-            f"<ParameterValue>{pval.get('Value', '')}</ParameterValue>"
-            f"<Description>{pval.get('Description', '')}</Description>"
-            f"<Source>{pval.get('Source', 'system')}</Source>"
-            f"<DataType>{pval.get('DataType', 'string')}</DataType>"
-            f"<AllowedValues>{pval.get('AllowedValues', '')}</AllowedValues>"
-            f"<IsModifiable>{str(pval.get('IsModifiable', True)).lower()}</IsModifiable>"
-            f"<MinimumEngineVersion>{pval.get('MinimumEngineVersion', '5.0.0')}</MinimumEngineVersion>"
+            f"<ParameterName>{xml_escape(str(pname))}</ParameterName>"
+            f"<ParameterValue>{xml_escape(str(pval.get('Value', '')))}</ParameterValue>"
+            f"<Description>{xml_escape(str(pval.get('Description', '')))}</Description>"
+            f"<Source>{xml_escape(str(pval.get('Source', 'system')))}</Source>"
+            f"<DataType>{xml_escape(str(pval.get('DataType', 'string')))}</DataType>"
+            f"<AllowedValues>{xml_escape(str(pval.get('AllowedValues', '')))}</AllowedValues>"
+            f"<IsModifiable>{xml_escape(str(str(pval.get('IsModifiable', True)).lower()))}</IsModifiable>"
+            f"<MinimumEngineVersion>{xml_escape(str(pval.get('MinimumEngineVersion', '5.0.0')))}</MinimumEngineVersion>"
             f"</Parameter>"
         )
     return _xml(200, "DescribeCacheParametersResponse",
@@ -2021,7 +2032,7 @@ def _modify_cache_parameter_group(p):
 
     return _xml(200, "ModifyCacheParameterGroupResponse",
         f"<ModifyCacheParameterGroupResult>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
         f"</ModifyCacheParameterGroupResult>")
 
 
@@ -2051,7 +2062,7 @@ def _reset_cache_parameter_group(p):
 
     return _xml(200, "ResetCacheParameterGroupResponse",
         f"<ResetCacheParameterGroupResult>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
         f"</ResetCacheParameterGroupResult>")
 
 
@@ -2100,8 +2111,8 @@ def _describe_engine_versions(p):
     }
     # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
-        f"<CacheEngineVersion><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"
-        f"<CacheParameterGroupFamily>{_param_group_family_for_engine(engine, v)}</CacheParameterGroupFamily></CacheEngineVersion>"
+        f"<CacheEngineVersion><Engine>{xml_escape(str(engine))}</Engine><EngineVersion>{xml_escape(str(v))}</EngineVersion>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(_param_group_family_for_engine(engine, v)))}</CacheParameterGroupFamily></CacheEngineVersion>"
         for v in versions.get(engine, ["7.0.12"])
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
@@ -2228,7 +2239,7 @@ def _list_tags(p):
         return err
     tags = _tags.get(arn, [])
     # TagList.member.locationName = "Tag"
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "ListTagsForResourceResponse",
         f"<ListTagsForResourceResult><TagList>{tag_xml}</TagList></ListTagsForResourceResult>")
 
@@ -2241,7 +2252,7 @@ def _add_tags(p):
     new_tags = _extract_tags(p)
     tags = _merge_tags_for_arn(arn, new_tags)
 
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "AddTagsToResourceResponse",
         f"<AddTagsToResourceResult><TagList>{tag_xml}</TagList></AddTagsToResourceResult>")
 
@@ -2257,7 +2268,7 @@ def _remove_tags(p):
         keys_to_remove.add(_p(p, f"TagKeys.member.{idx}"))
         idx += 1
     tags = _remove_tag_keys_for_arn(arn, keys_to_remove)
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "RemoveTagsFromResourceResponse",
         f"<RemoveTagsFromResourceResult><TagList>{tag_xml}</TagList></RemoveTagsFromResourceResult>")
 
@@ -2426,7 +2437,31 @@ def _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce):
     return archive.getvalue()
 
 
-def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl_commands=()):
+# Until the cluster is up, `default` can only bootstrap it: no keys, no channels, no data commands.
+_SERVERLESS_BOOTSTRAP_DEFAULT = ("user default on nopass resetkeys resetchannels -@all +ping +cluster|addslotsrange "
+                                 "+cluster|info +acl|load\n")
+_OPEN_DEFAULT_ACL = "user default on nopass ~* &* +@all\n"
+
+
+def _bootstrap_acl(acl):
+    """``acl`` with `default` limited to bringing the cluster up; the open ACL needs no bootstrap."""
+    if acl == _OPEN_DEFAULT_ACL:
+        return acl
+    return "".join(line + "\n" for line in acl.splitlines()
+                   if not line.startswith("user default ")) + _SERVERLESS_BOOTSTRAP_DEFAULT
+
+
+def _finish_serverless_acl(container, name, acl):
+    """Once the cluster is up under the bootstrap ACL, load the real one."""
+    if acl == _OPEN_DEFAULT_ACL:
+        return
+    _write_acl_file(container, acl)
+    result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", "6379", "ACL", "LOAD"])
+    if result.exit_code != 0 or result.output.strip() != b"OK":
+        raise RuntimeError(f"{name}: ACL LOAD answered {result.output[:200]!r}")
+
+
+def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl=_OPEN_DEFAULT_ACL):
     """Start a TLS-only Valkey/Redis container and return ``(address, port, id)``.
 
     Raises on any failure, after removing what it started: a serverless cache
@@ -2450,6 +2485,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
             "--tls-auth-clients", "no",
             "--protected-mode", "no",
             "--cluster-enabled", "yes", "--tls-cluster", "yes",
+            "--aclfile", _ACL_FILE,
         ],
     )
     if DOCKER_NETWORK:
@@ -2470,14 +2506,13 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
         cert_pem, key_pem, _public = sign_leaf_certificate(
             ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
         announce = _serverless_announce_flags(address, port)
+        bootstrap = acl != _OPEN_DEFAULT_ACL
+        _write_acl_file(container, _bootstrap_acl(acl))
         if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce)):
             raise RuntimeError("Docker rejected the TLS material")
-        if (wait or acl_commands) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+        if (wait or bootstrap) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
             raise RuntimeError(f"{engine} in {name} never reported cluster_state:ok over TLS")
-        for command in acl_commands:
-            result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", str(container_port), *command])
-            if result.exit_code != 0 or result.output.strip() != b"OK":
-                raise RuntimeError(f"{name}: {command[:3]} answered {result.output[:200]!r}")
+        _finish_serverless_acl(container, name, acl)
     except Exception:
         _teardown_containers(docker_client, [container.id])
         raise
@@ -2498,6 +2533,8 @@ def _acl_setuser(user, deny=()):
     if not any(t.startswith(("&", "(")) or t.lower() in ("allchannels", "resetchannels") for t in tokens):
         rules.append("&*")
     for token in tokens:  # each (selector) grants on its own: deny there too
+        if _is_credential_rule(token):
+            continue
         in_selector = in_selector or token.startswith("(")
         if deny and in_selector and token.endswith(")"):
             rules += [token[:-1], *deny[:-1], deny[-1] + ")"]
@@ -2512,6 +2549,19 @@ def _acl_setuser(user, deny=()):
     return ["ACL", "SETUSER", user.get("UserName") or user["UserId"], *rules]
 
 
+# Credentials come only from the user's authentication mode, never from its access string.
+_CREDENTIAL_KEYWORDS = frozenset(("nopass", "resetpass", "reset"))
+
+
+def _is_credential_rule(token):
+    return token[:1] in (">", "<", "#", "!") or token.lower() in _CREDENTIAL_KEYWORDS
+
+
+def _engine_user_name_ok(user):
+    # The ACL file holds one user per line: a name with whitespace or a control character would add lines.
+    return bool(re.fullmatch(r"[^\s\x00-\x1f\x7f]+", user.get("UserName") or user.get("UserId") or ""))
+
+
 def _user_group_acl_commands(account_id, region, group_ids, deny=()):
     """The engine ACL for a cache with user groups: the groups' users, then `default` last. Groups
     without a user named default turn it off (AWS RBAC docs: attaching a Valkey user group disables it)."""
@@ -2520,6 +2570,11 @@ def _user_group_acl_commands(account_id, region, group_ids, deny=()):
     user_ids = dict.fromkeys(uid for gid in group_ids
                              for uid in (_user_groups.get_scoped(account_id, region, gid) or {}).get("UserIds", []))
     users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in user_ids) if u]
+    for u in users:
+        if not _engine_user_name_ok(u):
+            logger.warning("ElastiCache: user %r left off the engine: its name is not a valid engine user name",
+                           u.get("UserId"))
+    users = [u for u in users if _engine_user_name_ok(u)]
     default = next((u for u in users if u.get("UserName") == "default"), None)
     commands = [_acl_setuser(u, deny) for u in users if u.get("UserName") != "default"]
     commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset", "&*"])
@@ -2607,13 +2662,16 @@ def _apply_user_groups_of(group_ids):
     for rg in list(_replication_groups.values()):
         if set(group_ids) & set(rg.get("UserGroupIds") or []):
             _apply_user_groups(rg, get_account_id(), get_region())
+    for cache in list(_serverless_caches.values()):
+        if cache.get("UserGroupId") and cache["UserGroupId"] in group_ids:
+            _apply_serverless_acl(cache, get_account_id(), get_region())
 
 
 def _start_serverless_container(record, account_id, region, wait=True):
     """Start ``record``'s container and publish its endpoint, unless the cache
     was deleted meanwhile — then the container is removed instead."""
     name = record["ServerlessCacheName"]
-    acl_commands = _user_group_acl_commands(account_id, region, [record.get("UserGroupId")])
+    acl = _serverless_acl(record, account_id, region)
     address, port, cid = _spawn_serverless_container(
         name=_serverless_container_name(account_id, region, name),
         engine=record["Engine"],
@@ -2626,7 +2684,7 @@ def _start_serverless_container(record, account_id, region, wait=True):
             "region": region,
         },
         wait=wait,
-        **({"acl_commands": acl_commands} if acl_commands else {}),
+        **({"acl": acl} if acl != _OPEN_DEFAULT_ACL else {}),
     )
     with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
         orphaned = _serverless_caches.get_scoped(account_id, region, name) is not record
@@ -2637,6 +2695,34 @@ def _start_serverless_container(record, account_id, region, wait=True):
             record["Status"] = "available"
     if orphaned:
         _teardown_containers(_get_docker(), [cid])
+    elif _serverless_acl(record, account_id, region) != acl:  # users or groups changed while it started
+        _apply_serverless_acl(record, account_id, region)
+
+
+def _serverless_acl(record, account_id, region):
+    """The ACL file of a serverless cache: its user group's users with the restricted-command deny list, or
+    `default` open when no group is attached."""
+    if not record.get("UserGroupId"):
+        return _OPEN_DEFAULT_ACL
+    return _engine_acl({"Engine": record["Engine"], "EngineVersion": record.get("FullEngineVersion") or "7",
+                        "UserGroupIds": [record["UserGroupId"]]}, account_id, region) or _OPEN_DEFAULT_ACL
+
+
+def _apply_serverless_acl(record, account_id, region):
+    """Rewrite a running serverless cache's ACL file and restart its engine, which reads it on start."""
+    docker_client, cid = _get_docker(), record.get("_docker_container_id")
+    if not docker_client or not cid:
+        return  # not started yet: the start reads the current users
+    try:
+        container = docker_client.containers.get(cid)
+        acl = _serverless_acl(record, account_id, region)
+        _write_acl_file(container, _bootstrap_acl(acl))
+        container.restart(timeout=10)
+        if not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+            raise RuntimeError("the cluster did not come back after the restart")
+        _finish_serverless_acl(container, record["ServerlessCacheName"], acl)
+    except Exception as e:
+        logger.warning("ElastiCache: users not applied on serverless cache %s: %s", record["ServerlessCacheName"], e)
 
 
 def _provision_serverless_cache(record, account_id, region, replaced_container_id=None):
@@ -2795,7 +2881,7 @@ def _describe_serverless_caches(p):
     page = caches[start:start + max_results]
     token = ""
     if start + max_results < len(caches):
-        token = f"<NextToken>{start + max_results}</NextToken>"
+        token = f"<NextToken>{xml_escape(str(start + max_results))}</NextToken>"
     members = "".join(f"<member>{_serverless_cache_xml(c)}</member>" for c in page)
     return _xml(200, "DescribeServerlessCachesResponse",
                 f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{members}</ServerlessCaches>"
@@ -2860,6 +2946,8 @@ def _modify_serverless_cache(p):
         return _error("InvalidParameterCombination", "No modifications were requested", 400)
 
     cache.update(changes)
+    if "UserGroupId" in changes and engine_change is None:
+        _apply_serverless_acl(cache, get_account_id(), get_region())
     if engine_change is not None:
         cache["Engine"], cache["MajorEngineVersion"], cache["FullEngineVersion"] = engine_change
         if cache.get("_docker_container_id") or _get_docker() is not None:
@@ -2906,7 +2994,7 @@ def _serverless_cache_xml(c):
         e = c.get(tag)
         if not e:
             return ""
-        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{e['Port']}</Port></{tag}>"
+        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{xml_escape(str(e['Port']))}</Port></{tag}>"
 
     def optional(tag, value):
         return f"<{tag}>{xml_escape(str(value))}</{tag}>" if value not in (None, "") else ""
@@ -2925,23 +3013,23 @@ def _serverless_cache_xml(c):
     return (
         f"<ServerlessCacheName>{xml_escape(c['ServerlessCacheName'])}</ServerlessCacheName>"
         f"{optional('Description', c.get('Description'))}"
-        f"<CreateTime>{created}</CreateTime>"
-        f"<Status>{c['Status']}</Status>"
-        f"<Engine>{c['Engine']}</Engine>"
-        f"<MajorEngineVersion>{c['MajorEngineVersion']}</MajorEngineVersion>"
-        f"<FullEngineVersion>{c['FullEngineVersion']}</FullEngineVersion>"
+        f"<CreateTime>{xml_escape(str(created))}</CreateTime>"
+        f"<Status>{xml_escape(str(c['Status']))}</Status>"
+        f"<Engine>{xml_escape(str(c['Engine']))}</Engine>"
+        f"<MajorEngineVersion>{xml_escape(str(c['MajorEngineVersion']))}</MajorEngineVersion>"
+        f"<FullEngineVersion>{xml_escape(str(c['FullEngineVersion']))}</FullEngineVersion>"
         f"{limits_xml}"
         f"{optional('KmsKeyId', c.get('KmsKeyId'))}"
         f"<StorageEncryptionType>{'sse-kms' if c.get('KmsKeyId') else 'sse-elasticache'}</StorageEncryptionType>"
         f"<SecurityGroupIds>{security_groups}</SecurityGroupIds>"
         f"{endpoint('Endpoint')}"
         f"{endpoint('ReaderEndpoint')}"
-        f"<ARN>{c['ARN']}</ARN>"
+        f"<ARN>{xml_escape(str(c['ARN']))}</ARN>"
         f"{optional('UserGroupId', c.get('UserGroupId'))}"
         f"<SubnetIds>{subnets}</SubnetIds>"
-        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
         f"{optional('DailySnapshotTime', c.get('DailySnapshotTime'))}"
-        f"<NetworkType>{c.get('NetworkType', 'ipv4')}</NetworkType>"
+        f"<NetworkType>{xml_escape(str(c.get('NetworkType', 'ipv4')))}</NetworkType>"
     )
 
 
@@ -2962,10 +3050,10 @@ def _describe_events(p):
     # EventList.member.locationName = "Event"
     members = "".join(
         f"<Event>"
-        f"<SourceIdentifier>{e['SourceIdentifier']}</SourceIdentifier>"
-        f"<SourceType>{e['SourceType']}</SourceType>"
-        f"<Message>{e['Message']}</Message>"
-        f"<Date>{e['Date']}</Date>"
+        f"<SourceIdentifier>{xml_escape(str(e['SourceIdentifier']))}</SourceIdentifier>"
+        f"<SourceType>{xml_escape(str(e['SourceType']))}</SourceType>"
+        f"<Message>{xml_escape(str(e['Message']))}</Message>"
+        f"<Date>{xml_escape(str(e['Date']))}</Date>"
         f"</Event>"
         for e in filtered
     )
@@ -3090,6 +3178,8 @@ def _reported_access_string(access):
 
 
 def _minimum_engine_version(user):
+    if user.get("_builtin"):
+        return "6.0"
     if user.get("Engine") == "valkey":
         floor = "7.2"
     elif user.get("Authentication", {}).get("Type") == "iam":
@@ -3143,7 +3233,7 @@ def _describe_users(p):
     if user_id:
         user = _users.get(user_id)
         if not user:
-            return _error("UserNotFound", f"User {user_id} not found", 404)
+            return _error("UserNotFound", f"User {user_id} not found.", 404)
         users = [user]
     else:
         users = list(_users.values())
@@ -3159,14 +3249,20 @@ def _delete_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
     if not user:
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
+    if user.get("_builtin"):  # real AWS, us-east-1
+        return _error("InvalidParameterValue", "default user can't be deleted.", 400)
     if user.get("UserName") == "default" and user.get("UserGroupIds"):  # real AWS, us-west-2
         return _error("DefaultUserAssociatedToUserGroup",
                       "User is associated to user group(s) as a default user and can't be deleted.", 400)
     if _users.pop(user_id, None) is None:  # deleted meanwhile by a concurrent request
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
+    for gid in user.get("UserGroupIds", []):  # the groups drop a deleted member (real AWS, us-east-1)
+        group = _user_groups.get(gid)
+        if group and user_id in group["UserIds"]:
+            group["UserIds"].remove(user_id)
     _apply_user_groups_of(user.get("UserGroupIds", []))
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
 
@@ -3585,7 +3681,9 @@ def _modify_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
     if not user:
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
+    if user.get("_builtin"):  # real AWS, us-east-1
+        return _error("InvalidParameterValue", "default user can't be modified.", 400)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
     if not err and _p(p, "AccessString") and _p(p, "AppendAccessString"):
@@ -3598,7 +3696,7 @@ def _modify_user(p):
     if _acl_split(_p(p, "AppendAccessString")):
         appended, version, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
         if message:
-            return _error("InvalidParameterValue", xml_escape(message, _XML_QUOTE), 400)
+            return _error("InvalidParameterValue", message, 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
         user["_AclVersion"] = _acl_rules_version(user["AccessString"])
@@ -3627,6 +3725,11 @@ def _create_user_group(p):
     while _p(p, f"UserIds.member.{idx}"):
         user_ids.append(_p(p, f"UserIds.member.{idx}"))
         idx += 1
+    if len(set(user_ids)) != len(user_ids):  # duplicates before unknown users (real AWS, us-east-1)
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+    for uid in user_ids:
+        if uid not in _users:
+            return _error("UserNotFound", f"User {uid} not found.", 404)
 
     group = {
         "UserGroupId": group_id,
@@ -3705,16 +3808,29 @@ def _modify_user_group(p):
         to_remove.append(_p(p, f"UserIdsToRemove.member.{idx}"))
         idx += 1
 
+    # Refused before anything changes, in this order, naming the first bad entry (real AWS, us-east-1).
+    for uid in to_add:
+        if uid in group["UserIds"]:
+            return _error("InvalidParameterCombination", f"{uid} is already a member of {group_id}.", 400)
+    if len(set(to_add)) != len(to_add):
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+    for uid in to_add:
+        if uid not in _users:
+            return _error("UserNotFound", f"User {uid} not found.", 404)
+    for uid in to_remove:
+        if uid not in group["UserIds"]:
+            return _error("InvalidParameterValue", f"User {uid} is not a member of user group {group_id}.", 400)
+    if len(set(to_remove)) != len(to_remove):
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+
     before = list(group["UserIds"])
     for uid in to_add:
-        if uid not in group["UserIds"]:
-            group["UserIds"].append(uid)
-        if uid in _users:
-            _users[uid].setdefault("UserGroupIds", []).append(group_id)
+        group["UserIds"].append(uid)
+        if uid in _users and group_id not in _users[uid].setdefault("UserGroupIds", []):
+            _users[uid]["UserGroupIds"].append(group_id)
 
     for uid in to_remove:
-        if uid in group["UserIds"]:
-            group["UserIds"].remove(uid)
+        group["UserIds"].remove(uid)
         if uid in _users:
             gids = _users[uid].get("UserGroupIds", [])
             if group_id in gids:
@@ -3730,38 +3846,38 @@ def _modify_user_group(p):
 
 
 def _user_xml(u):
-    group_ids_xml = "".join(f"<member>{gid}</member>" for gid in u.get("UserGroupIds", []))
+    group_ids_xml = "".join(f"<member>{xml_escape(str(gid))}</member>" for gid in u.get("UserGroupIds", []))
     auth = u.get("Authentication", {})
     return (
-        f"<UserId>{u['UserId']}</UserId>"
-        f"<UserName>{u.get('UserName', '')}</UserName>"
-        f"<Engine>{u.get('Engine', 'redis')}</Engine>"
-        f"<Status>{u.get('Status', 'active')}</Status>"
+        f"<UserId>{xml_escape(str(u['UserId']))}</UserId>"
+        f"<UserName>{xml_escape(str(u.get('UserName', '')))}</UserName>"
+        f"<Engine>{xml_escape(str(u.get('Engine', 'redis')))}</Engine>"
+        f"<Status>{xml_escape(str(u.get('Status', 'active')))}</Status>"
         f"<AccessString>{xml_escape(u.get('AccessString', ''), _XML_QUOTE)}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
-        + (f"<MinimumEngineVersion>{_minimum_engine_version(u)}</MinimumEngineVersion>"
+        + (f"<MinimumEngineVersion>{xml_escape(str(_minimum_engine_version(u)))}</MinimumEngineVersion>"
            if _minimum_engine_version(u) else "")
-        + f"<Authentication><Type>{auth.get('Type', 'no-password')}</Type>"
-        + (f"<PasswordCount>{auth['PasswordCount']}</PasswordCount>" if "PasswordCount" in auth
-           else "" if auth.get("Type") == "iam" else "<PasswordCount>0</PasswordCount>")
+        + f"<Authentication><Type>{xml_escape(str(auth.get('Type', 'no-password')))}</Type>"
+        + (f"<PasswordCount>{xml_escape(str(auth['PasswordCount']))}</PasswordCount>" if "PasswordCount" in auth
+           else "" if auth.get("Type") == "iam" or u.get("_builtin") else "<PasswordCount>0</PasswordCount>")
         + "</Authentication>"
-        f"<ARN>{u.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(u.get('ARN', '')))}</ARN>"
     )
 
 
 def _user_group_xml(g):
-    user_ids_xml = "".join(f"<member>{uid}</member>" for uid in g.get("UserIds", []))
-    rg_xml = "".join(f"<member>{rg}</member>" for rg in g.get("ReplicationGroups", []))
-    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{u}</member>" for u in ids) + f"</{k}>"
+    user_ids_xml = "".join(f"<member>{xml_escape(str(uid))}</member>" for uid in g.get("UserIds", []))
+    rg_xml = "".join(f"<member>{xml_escape(str(rg))}</member>" for rg in g.get("ReplicationGroups", []))
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{xml_escape(str(u))}</member>" for u in ids) + f"</{k}>"
                           for k, ids in (g.get("PendingChanges") or {}).items() if ids)
     return (
-        f"<UserGroupId>{g['UserGroupId']}</UserGroupId>"
-        f"<Status>{g.get('Status', 'active')}</Status>"
-        f"<Engine>{g.get('Engine', 'redis')}</Engine>"
+        f"<UserGroupId>{xml_escape(str(g['UserGroupId']))}</UserGroupId>"
+        f"<Status>{xml_escape(str(g.get('Status', 'active')))}</Status>"
+        f"<Engine>{xml_escape(str(g.get('Engine', 'redis')))}</Engine>"
         f"<UserIds>{user_ids_xml}</UserIds>"
         + (f"<PendingChanges>{pending_xml}</PendingChanges>" if pending_xml else "")
         + f"<ReplicationGroups>{rg_xml}</ReplicationGroups>"
-        f"<ARN>{g.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(g.get('ARN', '')))}</ARN>"
     )
 
 
@@ -3771,8 +3887,8 @@ def _security_groups_xml(groups):
     xml = ""
     for g in groups or []:
         xml += (
-            f"<member><SecurityGroupId>{g.get('SecurityGroupId', '')}</SecurityGroupId>"
-            f"<Status>{g.get('Status', 'active')}</Status></member>"
+            f"<member><SecurityGroupId>{xml_escape(str(g.get('SecurityGroupId', '')))}</SecurityGroupId>"
+            f"<Status>{xml_escape(str(g.get('Status', 'active')))}</Status></member>"
         )
     return xml
 
@@ -3787,17 +3903,17 @@ def _log_delivery_configs_xml(configs):
         if log_group:
             destination_xml = (
                 f"<DestinationDetails><CloudWatchLogsDetails>"
-                f"<LogGroup>{log_group}</LogGroup>"
+                f"<LogGroup>{xml_escape(str(log_group))}</LogGroup>"
                 f"</CloudWatchLogsDetails></DestinationDetails>"
             )
         items.append(
             f"<LogDeliveryConfiguration>"
             f"{destination_xml}"
-            f"<DestinationType>{config.get('DestinationType', 'cloudwatch-logs')}</DestinationType>"
-            f"<LogFormat>{config.get('LogFormat', 'text')}</LogFormat>"
-            f"<LogType>{config.get('LogType', '')}</LogType>"
-            f"<Status>{config.get('Status', 'active')}</Status>"
-            f"<Message>{config.get('Message', '')}</Message>"
+            f"<DestinationType>{xml_escape(str(config.get('DestinationType', 'cloudwatch-logs')))}</DestinationType>"
+            f"<LogFormat>{xml_escape(str(config.get('LogFormat', 'text')))}</LogFormat>"
+            f"<LogType>{xml_escape(str(config.get('LogType', '')))}</LogType>"
+            f"<Status>{xml_escape(str(config.get('Status', 'active')))}</Status>"
+            f"<Message>{xml_escape(str(config.get('Message', '')))}</Message>"
             f"</LogDeliveryConfiguration>"
         )
     return "".join(items)
@@ -3819,16 +3935,16 @@ def _cluster_xml_inner(c):
         node_az = node.get("CustomerAvailabilityZone") or az
         pgs = node.get("ParameterGroupStatus", "in-sync")
         src = node.get("SourceCacheNodeId") or ""
-        src_xml = f"<SourceCacheNodeId>{src}</SourceCacheNodeId>" if src else ""
+        src_xml = f"<SourceCacheNodeId>{xml_escape(str(src))}</SourceCacheNodeId>" if src else ""
         nodes_xml += (
             f"<CacheNode>"
-            f"<CacheNodeId>{node['CacheNodeId']}</CacheNodeId>"
-            f"<CacheNodeStatus>{node['CacheNodeStatus']}</CacheNodeStatus>"
-            f"<CacheNodeCreateTime>{created_iso}</CacheNodeCreateTime>"
-            f"<Endpoint><Address>{nep.get('Address', 'localhost')}</Address>"
-            f"<Port>{nep.get('Port', 6379)}</Port></Endpoint>"
-            f"<ParameterGroupStatus>{pgs}</ParameterGroupStatus>"
-            f"<CustomerAvailabilityZone>{node_az}</CustomerAvailabilityZone>"
+            f"<CacheNodeId>{xml_escape(str(node['CacheNodeId']))}</CacheNodeId>"
+            f"<CacheNodeStatus>{xml_escape(str(node['CacheNodeStatus']))}</CacheNodeStatus>"
+            f"<CacheNodeCreateTime>{xml_escape(str(created_iso))}</CacheNodeCreateTime>"
+            f"<Endpoint><Address>{xml_escape(str(nep.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(nep.get('Port', 6379)))}</Port></Endpoint>"
+            f"<ParameterGroupStatus>{xml_escape(str(pgs))}</ParameterGroupStatus>"
+            f"<CustomerAvailabilityZone>{xml_escape(str(node_az))}</CustomerAvailabilityZone>"
             f"{src_xml}"
             f"</CacheNode>"
         )
@@ -3843,36 +3959,36 @@ def _cluster_xml_inner(c):
     else:
         cluster_created_iso = str(cluster_created)
     return (
-        f"<CacheClusterId>{c['CacheClusterId']}</CacheClusterId>"
-        f"<CacheClusterStatus>{c['CacheClusterStatus']}</CacheClusterStatus>"
-        f"<CacheClusterCreateTime>{cluster_created_iso}</CacheClusterCreateTime>"
-        f"<Engine>{c['Engine']}</Engine>"
-        f"<EngineVersion>{c['EngineVersion']}</EngineVersion>"
-        f"<CacheNodeType>{c['CacheNodeType']}</CacheNodeType>"
-        f"<NumCacheNodes>{c['NumCacheNodes']}</NumCacheNodes>"
-        f"<CacheClusterArn>{c['CacheClusterArn']}</CacheClusterArn>"
-        f"<ARN>{c.get('CacheClusterArn', '')}</ARN>"
-        f"<PreferredAvailabilityZone>{c.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
-        f"<PreferredMaintenanceWindow>{c.get('PreferredMaintenanceWindow', '')}</PreferredMaintenanceWindow>"
-        f"<CacheParameterGroup><CacheParameterGroupName>{parameter_group.get('CacheParameterGroupName', '')}</CacheParameterGroupName>"
-        f"<ParameterApplyStatus>{parameter_group.get('ParameterApplyStatus', 'in-sync')}</ParameterApplyStatus></CacheParameterGroup>"
-        f"<CacheSubnetGroupName>{c.get('CacheSubnetGroupName', '')}</CacheSubnetGroupName>"
+        f"<CacheClusterId>{xml_escape(str(c['CacheClusterId']))}</CacheClusterId>"
+        f"<CacheClusterStatus>{xml_escape(str(c['CacheClusterStatus']))}</CacheClusterStatus>"
+        f"<CacheClusterCreateTime>{xml_escape(str(cluster_created_iso))}</CacheClusterCreateTime>"
+        f"<Engine>{xml_escape(str(c['Engine']))}</Engine>"
+        f"<EngineVersion>{xml_escape(str(c['EngineVersion']))}</EngineVersion>"
+        f"<CacheNodeType>{xml_escape(str(c['CacheNodeType']))}</CacheNodeType>"
+        f"<NumCacheNodes>{xml_escape(str(c['NumCacheNodes']))}</NumCacheNodes>"
+        f"<CacheClusterArn>{xml_escape(str(c['CacheClusterArn']))}</CacheClusterArn>"
+        f"<ARN>{xml_escape(str(c.get('CacheClusterArn', '')))}</ARN>"
+        f"<PreferredAvailabilityZone>{xml_escape(str(c.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
+        f"<PreferredMaintenanceWindow>{xml_escape(str(c.get('PreferredMaintenanceWindow', '')))}</PreferredMaintenanceWindow>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(parameter_group.get('CacheParameterGroupName', '')))}</CacheParameterGroupName>"
+        f"<ParameterApplyStatus>{xml_escape(str(parameter_group.get('ParameterApplyStatus', 'in-sync')))}</ParameterApplyStatus></CacheParameterGroup>"
+        f"<CacheSubnetGroupName>{xml_escape(str(c.get('CacheSubnetGroupName', '')))}</CacheSubnetGroupName>"
         f"<SecurityGroups>{security_groups_xml}</SecurityGroups>"
-        f"<ReplicationGroupId>{c.get('ReplicationGroupId', '')}</ReplicationGroupId>"
-        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
-        f"<SnapshotWindow>{c.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<ReplicationGroupId>{xml_escape(str(c.get('ReplicationGroupId', '')))}</ReplicationGroupId>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
+        f"<SnapshotWindow>{xml_escape(str(c.get('SnapshotWindow', '')))}</SnapshotWindow>"
         f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
-        f"<AuthTokenEnabled>{str(c.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
-        f"<TransitEncryptionEnabled>{str(c.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"<AuthTokenEnabled>{xml_escape(str(str(c.get('AuthTokenEnabled', False)).lower()))}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{xml_escape(str(str(c.get('TransitEncryptionEnabled', False)).lower()))}</TransitEncryptionEnabled>"
         f"{_transit_mode_xml(c)}"
-        f"<AtRestEncryptionEnabled>{str(c.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
+        f"<AtRestEncryptionEnabled>{xml_escape(str(str(c.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
         f"<CacheNodes>{nodes_xml}</CacheNodes>"
     )
 
 
 def _transit_mode_xml(record):
     mode = record.get("TransitEncryptionMode")
-    return f"<TransitEncryptionMode>{mode}</TransitEncryptionMode>" if mode else ""
+    return f"<TransitEncryptionMode>{xml_escape(str(mode))}</TransitEncryptionMode>" if mode else ""
 
 
 def _cluster_xml(c):
@@ -3893,24 +4009,24 @@ def _rg_xml(rg):
             rep = m.get("ReadEndpoint", {})
             members_xml += (
                 f"<NodeGroupMember>"
-                f"<CacheClusterId>{m.get('CacheClusterId', '')}</CacheClusterId>"
-                f"<CacheNodeId>{m.get('CacheNodeId', '0001')}</CacheNodeId>"
-                f"<CurrentRole>{m.get('CurrentRole', 'primary')}</CurrentRole>"
-                f"<PreferredAvailabilityZone>{m.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
-                f"<ReadEndpoint><Address>{rep.get('Address', 'localhost')}</Address>"
-                f"<Port>{rep.get('Port', 6379)}</Port></ReadEndpoint>"
+                f"<CacheClusterId>{xml_escape(str(m.get('CacheClusterId', '')))}</CacheClusterId>"
+                f"<CacheNodeId>{xml_escape(str(m.get('CacheNodeId', '0001')))}</CacheNodeId>"
+                f"<CurrentRole>{xml_escape(str(m.get('CurrentRole', 'primary')))}</CurrentRole>"
+                f"<PreferredAvailabilityZone>{xml_escape(str(m.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
+                f"<ReadEndpoint><Address>{xml_escape(str(rep.get('Address', 'localhost')))}</Address>"
+                f"<Port>{xml_escape(str(rep.get('Port', 6379)))}</Port></ReadEndpoint>"
                 f"</NodeGroupMember>"
             )
         pep = ng.get("PrimaryEndpoint", {})
         rdr = ng.get("ReaderEndpoint", {})
         node_groups_xml += (
             f"<NodeGroup>"
-            f"<NodeGroupId>{ng['NodeGroupId']}</NodeGroupId>"
-            f"<Status>{ng['Status']}</Status>"
-            f"<PrimaryEndpoint><Address>{pep.get('Address', 'localhost')}</Address>"
-            f"<Port>{pep.get('Port', 6379)}</Port></PrimaryEndpoint>"
-            f"<ReaderEndpoint><Address>{rdr.get('Address', 'localhost')}</Address>"
-            f"<Port>{rdr.get('Port', 6379)}</Port></ReaderEndpoint>"
+            f"<NodeGroupId>{xml_escape(str(ng['NodeGroupId']))}</NodeGroupId>"
+            f"<Status>{xml_escape(str(ng['Status']))}</Status>"
+            f"<PrimaryEndpoint><Address>{xml_escape(str(pep.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(pep.get('Port', 6379)))}</Port></PrimaryEndpoint>"
+            f"<ReaderEndpoint><Address>{xml_escape(str(rdr.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(rdr.get('Port', 6379)))}</Port></ReaderEndpoint>"
             f"<NodeGroupMembers>{members_xml}</NodeGroupMembers>"
             f"</NodeGroup>"
         )
@@ -3919,36 +4035,36 @@ def _rg_xml(rg):
     cep = rg.get("ConfigurationEndpoint")
     if cep:
         config_ep_xml = (
-            f"<ConfigurationEndpoint><Address>{cep['Address']}</Address>"
-            f"<Port>{cep['Port']}</Port></ConfigurationEndpoint>"
+            f"<ConfigurationEndpoint><Address>{xml_escape(str(cep['Address']))}</Address>"
+            f"<Port>{xml_escape(str(cep['Port']))}</Port></ConfigurationEndpoint>"
         )
 
     member_clusters_xml = ""
     for cluster_id in rg.get("MemberClusters", []):
-        member_clusters_xml += f"<ClusterId>{cluster_id}</ClusterId>"
+        member_clusters_xml += f"<ClusterId>{xml_escape(str(cluster_id))}</ClusterId>"
     user_group_ids_xml = ""
     for user_group_id in rg.get("UserGroupIds", []):
-        user_group_ids_xml += f"<member>{user_group_id}</member>"
+        user_group_ids_xml += f"<member>{xml_escape(str(user_group_id))}</member>"
     log_delivery_configs_xml = _log_delivery_configs_xml(rg.get("LogDeliveryConfigurations", []))
-    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{g}</member>" for g in ids) + f"</{k}>"
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{xml_escape(str(g))}</member>" for g in ids) + f"</{k}>"
                           for k, ids in (rg.get("PendingModifiedValues") or {}).get("UserGroups", {}).items())
     return (
-        f"<ReplicationGroupId>{rg['ReplicationGroupId']}</ReplicationGroupId>"
-        f"<Description>{rg.get('Description', '')}</Description>"
-        f"<Status>{rg['Status']}</Status>"
-        f"<Engine>{rg.get('Engine', 'redis')}</Engine>"
-        f"<CacheNodeType>{rg.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
-        f"<AutomaticFailover>{rg.get('AutomaticFailover', 'disabled')}</AutomaticFailover>"
-        f"<AutoMinorVersionUpgrade>{str(rg.get('AutoMinorVersionUpgrade', False)).lower()}</AutoMinorVersionUpgrade>"
-        f"<MultiAZ>{rg.get('MultiAZ', 'disabled')}</MultiAZ>"
-        f"<ClusterEnabled>{str(rg.get('ClusterEnabled', False)).lower()}</ClusterEnabled>"
-        f"<ClusterMode>{rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')}</ClusterMode>"
-        f"<AuthTokenEnabled>{str(rg.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
-        f"<TransitEncryptionEnabled>{str(rg.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"<ReplicationGroupId>{xml_escape(str(rg['ReplicationGroupId']))}</ReplicationGroupId>"
+        f"<Description>{xml_escape(str(rg.get('Description', '')))}</Description>"
+        f"<Status>{xml_escape(str(rg['Status']))}</Status>"
+        f"<Engine>{xml_escape(str(rg.get('Engine', 'redis')))}</Engine>"
+        f"<CacheNodeType>{xml_escape(str(rg.get('CacheNodeType', 'cache.t3.micro')))}</CacheNodeType>"
+        f"<AutomaticFailover>{xml_escape(str(rg.get('AutomaticFailover', 'disabled')))}</AutomaticFailover>"
+        f"<AutoMinorVersionUpgrade>{xml_escape(str(str(rg.get('AutoMinorVersionUpgrade', False)).lower()))}</AutoMinorVersionUpgrade>"
+        f"<MultiAZ>{xml_escape(str(rg.get('MultiAZ', 'disabled')))}</MultiAZ>"
+        f"<ClusterEnabled>{xml_escape(str(str(rg.get('ClusterEnabled', False)).lower()))}</ClusterEnabled>"
+        f"<ClusterMode>{xml_escape(str(rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')))}</ClusterMode>"
+        f"<AuthTokenEnabled>{xml_escape(str(str(rg.get('AuthTokenEnabled', False)).lower()))}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{xml_escape(str(str(rg.get('TransitEncryptionEnabled', False)).lower()))}</TransitEncryptionEnabled>"
         f"{_transit_mode_xml(rg)}"
-        f"<AtRestEncryptionEnabled>{str(rg.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
-        f"<SnapshotRetentionLimit>{rg.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
-        f"<SnapshotWindow>{rg.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<AtRestEncryptionEnabled>{xml_escape(str(str(rg.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(rg.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
+        f"<SnapshotWindow>{xml_escape(str(rg.get('SnapshotWindow', '')))}</SnapshotWindow>"
         f"{config_ep_xml}"
         f"<MemberClusters>{member_clusters_xml}</MemberClusters>"
         f"<NodeGroups>{node_groups_xml}</NodeGroups>"
@@ -3956,7 +4072,7 @@ def _rg_xml(rg):
         # AWS leaves UserGroupIds out once none is attached (real AWS, us-west-2).
         + (f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>" if user_group_ids_xml else "")
         + (f"<PendingModifiedValues><UserGroups>{pending_xml}</UserGroups></PendingModifiedValues>" if pending_xml else "")
-        + f"<ARN>{rg['ARN']}</ARN>"
+        + f"<ARN>{xml_escape(str(rg['ARN']))}</ARN>"
     )
 
 
@@ -3966,22 +4082,22 @@ def _snapshot_xml(snap):
     for ns in snap.get("NodeSnapshots", []):
         nodes_xml += (
             f"<NodeSnapshot>"
-            f"<CacheNodeId>{ns.get('CacheNodeId', '0001')}</CacheNodeId>"
-            f"<SnapshotCreateTime>{ns.get('SnapshotCreateTime', 0)}</SnapshotCreateTime>"
-            f"<CacheSize>{ns.get('CacheSize', '0 MB')}</CacheSize>"
+            f"<CacheNodeId>{xml_escape(str(ns.get('CacheNodeId', '0001')))}</CacheNodeId>"
+            f"<SnapshotCreateTime>{xml_escape(str(ns.get('SnapshotCreateTime', 0)))}</SnapshotCreateTime>"
+            f"<CacheSize>{xml_escape(str(ns.get('CacheSize', '0 MB')))}</CacheSize>"
             f"</NodeSnapshot>"
         )
     return (
-        f"<SnapshotName>{snap['SnapshotName']}</SnapshotName>"
-        f"<SnapshotStatus>{snap['SnapshotStatus']}</SnapshotStatus>"
-        f"<SnapshotSource>{snap.get('SnapshotSource', 'manual')}</SnapshotSource>"
-        f"<CacheClusterId>{snap.get('CacheClusterId', '')}</CacheClusterId>"
-        f"<ReplicationGroupId>{snap.get('ReplicationGroupId', '')}</ReplicationGroupId>"
-        f"<CacheNodeType>{snap.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
-        f"<Engine>{snap.get('Engine', 'redis')}</Engine>"
-        f"<EngineVersion>{snap.get('EngineVersion', '7.0.12')}</EngineVersion>"
+        f"<SnapshotName>{xml_escape(str(snap['SnapshotName']))}</SnapshotName>"
+        f"<SnapshotStatus>{xml_escape(str(snap['SnapshotStatus']))}</SnapshotStatus>"
+        f"<SnapshotSource>{xml_escape(str(snap.get('SnapshotSource', 'manual')))}</SnapshotSource>"
+        f"<CacheClusterId>{xml_escape(str(snap.get('CacheClusterId', '')))}</CacheClusterId>"
+        f"<ReplicationGroupId>{xml_escape(str(snap.get('ReplicationGroupId', '')))}</ReplicationGroupId>"
+        f"<CacheNodeType>{xml_escape(str(snap.get('CacheNodeType', 'cache.t3.micro')))}</CacheNodeType>"
+        f"<Engine>{xml_escape(str(snap.get('Engine', 'redis')))}</Engine>"
+        f"<EngineVersion>{xml_escape(str(snap.get('EngineVersion', '7.0.12')))}</EngineVersion>"
         f"<NodeSnapshots>{nodes_xml}</NodeSnapshots>"
-        f"<ARN>{snap.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(snap.get('ARN', '')))}</ARN>"
     )
 
 
@@ -3998,7 +4114,7 @@ def _xml(status, root_tag, inner):
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <{root_tag} xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
     {inner}
-    <ResponseMetadata><RequestId>{new_uuid()}</RequestId></ResponseMetadata>
+    <ResponseMetadata><RequestId>{xml_escape(str(new_uuid()))}</RequestId></ResponseMetadata>
 </{root_tag}>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
@@ -4007,8 +4123,8 @@ def _error(code, message, status):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
     body = f"""<ErrorResponse xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
-    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
-    <RequestId>{new_uuid()}</RequestId>
+    <Error><Type>{xml_escape(str(fault_type))}</Type><Code>{xml_escape(str(code))}</Code><Message>{xml_escape(str(message))}</Message></Error>
+    <RequestId>{xml_escape(str(new_uuid()))}</RequestId>
 </ErrorResponse>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
