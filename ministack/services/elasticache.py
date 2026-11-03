@@ -3160,6 +3160,181 @@ def _delete_user(p):
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
 
 
+_ACL_SELECTOR_KEYWORDS = frozenset((
+    "allkeys", "resetkeys", "allchannels", "resetchannels", "allcommands", "nocommands"))
+_ACL_ROOT_KEYWORDS = _ACL_SELECTOR_KEYWORDS | {"on", "off", "clearselectors"}
+_ACL_PATTERN_AFTER_STAR = ("Adding a pattern '{}' after the * pattern (or the '{}' flag) is not valid and does not "
+                           "have any effect. Try '{}' to start with an empty list of {}")
+
+
+def _acl_rules(access):
+    """An access string's rules, each selector as a list of its rules; None if a selector is empty or
+    unclosed. A selector runs from a `(` that starts a rule to the next `)`, so `(~x +get)(~y +set)`
+    is two."""
+    rules, word, i = [], "", 0
+    while i < len(access):
+        if access[i] == "(" and not word:
+            end = access.find(")", i)
+            inner = access[i + 1:end].split() if end >= 0 else []
+            if not inner:
+                return None
+            rules.append(inner)
+            i = end + 1
+            continue
+        if access[i].isspace():
+            rules += [word] if word else []
+            word = ""
+        else:
+            word += access[i]
+        i += 1
+    return rules + ([word] if word else [])
+
+
+def _acl_key(rule):
+    """A key rule as AWS stores it (`%RW~` becomes `~`), or None if `rule` is not a key pattern."""
+    if rule.startswith("~") and len(rule) > 1:
+        return rule
+    perm, _, pattern = rule[1:].partition("~")
+    if rule.startswith("%") and pattern and perm.upper() in ("R", "W", "RW"):
+        return f"~{pattern}" if perm.upper() == "RW" else rule
+    return None
+
+
+def _acl_refusal(rule, keywords):
+    """AWS's message refusing one rule on its own, before any rule is applied."""
+    low = rule.lower()
+    if low == "reset":
+        return "reset rule is not supported in Elasticache user api."
+    if low in ("nopass", "resetpass") or rule[0] in "><#!":
+        return ("Password rules are not supported in Elasticache access string. "
+                "Please use Passwords parameter to set/modify user password.")
+    if low in ("sanitize-payload", "skip-sanitize-payload"):
+        return "sanitize-payload and skip-sanitize-payload rules are not supported in user api."
+    if rule[0] in "+-" and low[1:2] == "@":
+        return None if low[2:] in _ACL_CATEGORIES else (
+            "Access string contains invalid category(s). Please verify the list of available category in user-api.")
+    if rule[0] in "+-":
+        return None if low[1:].split("|")[0] in _ACL_COMMANDS else (
+            "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
+    if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
+        return None
+    return "The access-string is invalid."
+
+
+def _acl_apply(scope, rule):
+    """Apply one rule to a root or selector scope; AWS's message if it is refused."""
+    low = rule.lower()
+    key = _acl_key(rule)
+    if low in ("on", "off"):
+        scope["flag"] = low
+    elif low == "allkeys" or key == "~*":
+        scope["allkeys"], scope["keys"] = True, []
+    elif low == "resetkeys":
+        scope["allkeys"], scope["keys"] = False, []
+    elif key:
+        if scope["allkeys"]:
+            return _ACL_PATTERN_AFTER_STAR.format(rule, "allkeys", "resetkeys", "patterns")
+        if key not in scope["keys"]:
+            scope["keys"].append(key)
+    elif low == "allchannels" or rule == "&*":
+        scope["channels"], scope["patterns"] = "all", []
+    elif low == "resetchannels":
+        scope["channels"], scope["patterns"] = "reset", []
+    elif rule.startswith("&"):
+        if scope["channels"] == "all":
+            return _ACL_PATTERN_AFTER_STAR.format(rule, "allchannels", "resetchannels", "channels")
+        scope["channels"] = "reset"
+        if rule not in scope["patterns"]:
+            scope["patterns"].append(rule)
+    elif low in ("allcommands", "+@all", "nocommands", "-@all"):
+        scope["base"], scope["commands"] = ("+" if low in ("allcommands", "+@all") else "-"), []
+    elif low == "clearselectors":
+        scope["selectors"] = []
+    else:
+        sign, name = low[0], low[1:]
+        family = name.split("|")[0]
+        if "|" in name:
+            allowed = scope["base"] == "+"
+            for command in scope["commands"]:
+                if command[1:] == family:
+                    allowed = command[0] == "+"
+            if sign == "+" and allowed:
+                return (f"Adding a subcommand({low}) of a command already fully added is not allowed. "
+                        "Remove the command to start. Example: -DEBUG +DEBUG|DIGEST")
+            if sign == "-" and not allowed:
+                return (f"Removing a subcommand({low}) of a command not fully added is not allowed. "
+                        "Add the command to start. Example: +DEBUG -DEBUG|DIGEST")
+        # A rule replaces its earlier one (a whole command also its subcommands'), and is dropped
+        # when it repeats the +@all/-@all base without touching a remaining rule.
+        scope["commands"] = [c for c in scope["commands"]
+                             if c[1:] != name and ("|" in name or not c[1:].startswith(f"{name}|"))]
+        if sign != scope["base"] or any(name[0] == "@" or c[1] == "@" or c[1:].split("|")[0] == family
+                                        for c in scope["commands"]):
+            scope["commands"].append(f"{sign}{name}")
+    return None
+
+
+def _acl_scope(flag=None):
+    return {"flag": flag, "allkeys": False, "keys": [], "channels": None, "patterns": [],
+            "base": "-", "commands": [], "selectors": []}
+
+
+def _acl_describe(scope, channels_shown):
+    parts = [scope["flag"]] if scope["flag"] else []
+    parts += ["~*"] if scope["allkeys"] else scope["keys"]
+    if scope["channels"] == "all":
+        parts.append("&*")
+    elif scope["channels"] or channels_shown:
+        parts += ["resetchannels", *scope["patterns"]]
+    parts += [f"{scope['base']}@all", *scope["commands"], *scope["selectors"]]
+    return " ".join(parts)
+
+
+def _acl_apply_rule(root, rule):
+    """Apply a root rule or a selector to ``root``; AWS's message if it is refused."""
+    if not isinstance(rule, list):
+        return _acl_apply(root, rule)
+    selector = _acl_scope()
+    for inner in rule:
+        message = _acl_apply(selector, inner)
+        if message:
+            return message
+    root["selectors"].append(f"({_acl_describe(selector, True)})")
+    return None
+
+
+def _acl_refused(rule):
+    keywords = _ACL_SELECTOR_KEYWORDS if isinstance(rule, list) else _ACL_ROOT_KEYWORDS
+    return next(filter(None, (_acl_refusal(inner, keywords) for inner in (rule if isinstance(rule, list) else [rule]))),
+                None)
+
+
+def _append_access_string(access, append):
+    """The stored AccessString with AppendAccessString's rules applied, written as AWS stores it
+    (real-AWS captures in issue #2551), or AWS's message refusing the appended rules."""
+    rules = _acl_rules(append)
+    if rules is None:
+        return None, "The access-string is invalid."
+    message = next(filter(None, map(_acl_refused, rules)), None)
+    if message:
+        return None, message
+    # MiniStack-only: a stored rule AWS would have refused (CreateUser here doesn't check them all)
+    # is skipped rather than failing every later append.
+    stored = _acl_rules(access)
+    stored = [rule for rule in (access.split() if stored is None else stored) if not _acl_refused(rule)]
+    root = _acl_scope(flag="off")
+    for rule in stored:
+        _acl_apply_rule(root, rule)  # a refusal returns before changing anything, so the rule is skipped
+    for rule in rules:
+        message = _acl_apply_rule(root, rule)
+        if message:
+            return None, message
+    # These rules make AWS write the root's resetchannels even without channel rules.
+    redis7 = any(isinstance(rule, list) or rule.startswith("%") or rule.lower() == "clearselectors"
+                 or (rule.startswith("-") and "|" in rule) for rule in [*stored, *rules])
+    return _acl_describe(root, redis7), None
+
+
 def _modify_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
@@ -3173,13 +3348,15 @@ def _modify_user(p):
     err = err or _access_string_error(_p(p, "AccessString"))
     if err:
         return err
+    appended = None
+    if _p(p, "AppendAccessString").split():
+        appended, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
+        if message:
+            return _error("InvalidParameterValue", xml_escape(message, {'"': "&quot;"}), 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
-    append = _p(p, "AppendAccessString").split()
-    if append:
-        # Command rules land at the end as on AWS; AWS also reorders key and channel
-        # rules and drops no-op ones, which MiniStack doesn't (nor does CreateUser).
-        user["AccessString"] = " ".join([user.get("AccessString", ""), *append]).strip()
+    if appended is not None:
+        user["AccessString"] = appended
     if auth:
         user["Authentication"] = auth
         user["_PasswordHashes"] = _password_hashes(p)
@@ -3313,7 +3490,7 @@ def _user_xml(u):
         f"<UserName>{u.get('UserName', '')}</UserName>"
         f"<Engine>{u.get('Engine', 'redis')}</Engine>"
         f"<Status>{u.get('Status', 'active')}</Status>"
-        f"<AccessString>{u.get('AccessString', '')}</AccessString>"
+        f"<AccessString>{xml_escape(u.get('AccessString', ''))}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
         + (f"<MinimumEngineVersion>{_minimum_engine_version(u)}</MinimumEngineVersion>"
            if _minimum_engine_version(u) else "")
