@@ -9403,7 +9403,7 @@ def _lambda_layer_create(logical_id, props, stack_name):
     import hashlib
     zip_data = None
     if s3_bucket and s3_key:
-        zip_data = _s3._get_object_data(s3_bucket, s3_key)
+        zip_data = _s3._get_object_data_for_caller(s3_bucket, s3_key)
 
     layer_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{layer_name}"
     version_arn = f"{layer_arn}:{ver}"
@@ -9535,7 +9535,7 @@ def _sfn_definition(props):
         if bucket and key:
             from ministack.services import s3 as _s3_svc
             try:
-                blob = _s3_svc._get_object_data(bucket, key, version_id=version)
+                blob = _s3_svc._get_object_data_for_caller(bucket, key, version_id=version)
             except Exception as e:
                 raise ValueError(
                     f"AWS::StepFunctions::StateMachine DefinitionS3Location fetch failed "
@@ -13756,11 +13756,16 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
         _ec_user_group_create, _ec_user_group_delete)
     if replaced:
         return replaced
-    # The group ends with the template's users, diffed against the live group (real AWS, us-east-1).
+    # A change to the set of users or to Engine leaves the group with the template's users, diffed against the live
+    # group; an update that changes only tags or the order of the users keeps changes made outside the stack (real
+    # AWS, us-east-1).
     live_users = list((_ec._user_groups.get(physical_id) or {}).get("UserIds") or [])
     new_users = list(new_props.get("UserIds") or [])
-    params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
-                        "UserIdsToRemove": [u for u in live_users if u not in new_users]})
+    params = {}
+    if (set(new_users) != set(old_props.get("UserIds") or [])
+            or new_props.get("Engine") != old_props.get("Engine")):
+        params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
+                            "UserIdsToRemove": [u for u in live_users if u not in new_users]})
     live_engine = (_ec._user_groups.get(physical_id) or {}).get("Engine")
     if new_props.get("Engine") and str(new_props["Engine"]) != live_engine:
         params["Engine"] = str(new_props["Engine"])

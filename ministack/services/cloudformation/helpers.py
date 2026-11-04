@@ -254,7 +254,7 @@ def _resolve_document(params, body_key, url_key, label):
             if len(parts) < 2:
                 return None, _error("ValidationError", f"Invalid {url_key}: {url}")
             bucket_name, key = parts[0], parts[1]
-            obj_data = _s3._get_object_data(bucket_name, key)
+            obj_data = _s3._get_object_data_for_caller(bucket_name, key)
             if obj_data is None:
                 return None, _error("ValidationError", f"{label} not found at {url}")
             if body_key == "TemplateBody" and len(obj_data) > TEMPLATE_URL_MAX_BYTES:

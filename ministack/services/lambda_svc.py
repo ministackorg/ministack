@@ -1302,7 +1302,7 @@ def s3_code_region_message(bucket: str, layer: bool = False) -> str | None:
     S3 part differently from functions. None when the bucket is local or absent."""
     from ministack.services import s3 as s3_svc
 
-    home = s3_svc.bucket_region(bucket)
+    home = s3_svc._bucket_region_for_caller(bucket)
     if home is None or home == get_region():
         return None
     s3_message = (f"The bucket is in this region: {home}. Please use this region to retry the request" if layer
@@ -1323,7 +1323,7 @@ def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) ->
     fetches that specific S3 object version instead of the latest."""
     try:
         from ministack.services import s3 as s3_svc
-        obj = s3_svc._get_object_data(bucket, key, version_id=version_id)
+        obj = s3_svc._get_object_data_for_caller(bucket, key, version_id=version_id)
         if obj is not None:
             return obj
     except Exception as e:
