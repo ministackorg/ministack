@@ -2043,6 +2043,110 @@ def _pg_connect(port, autocommit=True):
     return conn
 
 
+class _FakeBackendContainer:
+    def __init__(self, kwargs):
+        self.kwargs = kwargs
+        self.id = "fake-backend"
+        self.status = "running"
+        self.removed = False
+        network = kwargs.get("network")
+        self.attrs = {"NetworkSettings": {
+            "Networks": {network: {"IPAddress": self.ip}} if network else {},
+            "Ports": {"5432/tcp": [{"HostIp": "127.0.0.1", "HostPort": "40001"}]}
+            if "ports" in kwargs else {},
+        }}
+
+    ip = "172.18.0.9"
+
+    def reload(self):
+        pass
+
+    def remove(self, **_):
+        self.removed = True
+
+
+class _FakeDocker:
+    def __init__(self, container_cls=_FakeBackendContainer):
+        self.runs = []
+        self._container_cls = container_cls
+        self.containers = self
+
+    def get(self, name):
+        raise LookupError(name)
+
+    def run(self, **kwargs):
+        container = self._container_cls(kwargs)
+        self.runs.append(container)
+        return container
+
+
+class TestBackendContainerPublishing:
+    """The backend is a trust-auth superuser: nothing but the proxy may reach it."""
+
+    def _run(self, monkeypatch, network, container_cls=_FakeBackendContainer):
+        from ministack.services import dsql as dsql_mod
+        from ministack.services import rds
+
+        docker = _FakeDocker(container_cls)
+        dialled = []
+        monkeypatch.setattr(rds, "_get_docker", lambda: docker)
+        monkeypatch.setattr(rds, "_get_ministack_network", lambda _client: network)
+        monkeypatch.setattr(
+            rds, "_wait_for_database_ready",
+            lambda host, port, *_: dialled.append((host, port)) or True,
+        )
+        try:
+            return docker, dialled, dsql_mod._run_backend_container("publishtest")
+        finally:
+            dsql_mod._backend_containers.pop("publishtest", None)
+
+    def test_on_ministack_network_nothing_is_published(self, monkeypatch):
+        docker, dialled, endpoint = self._run(monkeypatch, "ministack-net")
+
+        assert "ports" not in docker.runs[0].kwargs
+        assert endpoint == dialled[0] == ("172.18.0.9", 5432)
+
+    def test_host_run_publishes_on_loopback_only(self, monkeypatch):
+        docker, dialled, endpoint = self._run(monkeypatch, None)
+
+        assert docker.runs[0].kwargs["ports"] == {"5432/tcp": ("127.0.0.1", None)}
+        assert endpoint == dialled[0] == ("127.0.0.1", 40001)
+
+    def test_no_address_on_the_network_degrades_and_removes_the_backend(
+        self, monkeypatch,
+    ):
+        class _NoAddress(_FakeBackendContainer):
+            ip = ""
+
+        from ministack.services import dsql as dsql_mod
+        from ministack.services import rds
+
+        docker = _FakeDocker(_NoAddress)
+        monkeypatch.setattr(rds, "_get_docker", lambda: docker)
+        monkeypatch.setattr(rds, "_get_ministack_network", lambda _client: "host")
+        monkeypatch.setattr(rds, "_wait_for_database_ready", lambda *_: True)
+        with pytest.raises(RuntimeError):
+            dsql_mod._run_backend_container("publishtest")
+
+        assert "ports" not in docker.runs[0].kwargs
+        assert docker.runs[0].removed
+        assert "publishtest" not in dsql_mod._backend_containers
+
+
+def _backend_host_ips(identifier):
+    import docker
+
+    client = docker.from_env()
+    try:
+        from ministack.services import dsql as dsql_mod
+
+        container = client.containers.get(dsql_mod._container_name(identifier))
+        bindings = container.attrs["NetworkSettings"]["Ports"].get("5432/tcp")
+        return {b["HostIp"] for b in bindings or []}
+    finally:
+        client.close()
+
+
 @requires_docker
 @pytest.mark.data_plane
 class TestContainersE2E:
@@ -2077,6 +2181,12 @@ class TestContainersE2E:
                     assert time.time() < deadline, "backend did not start in time"
                     await asyncio.sleep(0.5)
                 assert dsql_mod._clusters[identifier]["_has_backend"] is True, caplog.text
+                from ministack.services import rds
+
+                on_network = rds._get_ministack_network(rds._get_docker())
+                assert _backend_host_ips(identifier) == (
+                    set() if on_network else {"127.0.0.1"}
+                )
 
                 def _select_one():
                     conn = psycopg2.connect(
