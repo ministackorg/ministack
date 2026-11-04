@@ -4144,16 +4144,12 @@ def _global_writer_endpoint_aliases(cluster):
 
 
 def _global_member_certificate_names(cluster):
-    """The global endpoint, while this cluster is any member of a global cluster.
-
-    On AWS every member's server certificate lists it, the writer's and a
-    secondary's alike, and a switchover does not reissue it, so the name goes
-    into the certificate at launch whatever the member's role.
-    """
+    """The global endpoint while this cluster is any member of a global cluster, whatever its role."""
     global_cluster, member = _global_cluster_member_for_cluster(cluster)
-    if global_cluster and member:
-        return [_global_cluster_endpoint(global_cluster)]
-    return []
+    if not (global_cluster and member):
+        return []
+    name = _global_cluster_endpoint(global_cluster)
+    return [name] if name.isascii() else []  # a non-ASCII identifier can't be signed into a certificate
 
 
 def _global_writer_alias_rejoin(cluster, global_endpoint, is_writer):

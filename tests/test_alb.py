@@ -3255,3 +3255,60 @@ def test_elbv2_listener_certificates_follow_aws(elbv2, tls_lb):
     assert listed() == [{"CertificateArn": c1, "IsDefault": False}, {"CertificateArn": c0, "IsDefault": True}]
     assert elbv2.describe_listeners(ListenerArns=[listener])["Listeners"][0]["Certificates"] == [
         {"CertificateArn": c0}]
+
+
+def test_alb_host_resolves_through_route53_alias_records(elbv2, r53):
+    """A host with a public Route 53 alias record (exact or wildcard) reaches the ALB it targets, as AWS DNS
+    resolves it; the most specific name wins, a wildcard skips its apex, a private zone is ignored."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    domain = f"r53alb{suffix}.alb.localhost"
+    lbs = {}
+    for name in ("one", "two"):
+        lb = elbv2.create_load_balancer(Name=f"r53-{name}-{suffix}", Subnets=["subnet-aaa"])["LoadBalancers"][0]
+        elbv2.create_listener(LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80, DefaultActions=[
+            {"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200", "ContentType": "text/plain",
+                                                               "MessageBody": name}}])
+        lbs[name] = lb
+    zone = r53.create_hosted_zone(Name=domain, CallerReference=suffix)["HostedZone"]["Id"]
+    private = r53.create_hosted_zone(Name=f"p.{domain}", CallerReference=f"p{suffix}",
+                                     VPC={"VPCRegion": "us-east-1", "VPCId": "vpc-12345678"},
+                                     HostedZoneConfig={"PrivateZone": True})["HostedZone"]["Id"]
+
+    def alias(zone_id, name, lb, prefix=""):
+        r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch={"Changes": [{
+            "Action": "CREATE", "ResourceRecordSet": {"Name": name, "Type": "A", "AliasTarget": {
+                "HostedZoneId": lb["CanonicalHostedZoneId"], "DNSName": f"{prefix}{lb['DNSName']}.",
+                "EvaluateTargetHealth": False}}}]})
+
+    alias(zone, f"*.{domain}", lbs["one"], "dualstack.")
+    alias(zone, f"exact.{domain}", lbs["two"])
+    alias(zone, f"*.deep.{domain}", lbs["two"])
+    alias(private, f"*.p.{domain}", lbs["two"])
+    r53.change_resource_record_sets(HostedZoneId=zone, ChangeBatch={"Changes": [{"Action": "CREATE", "ResourceRecordSet": {
+        "Name": f"plain.{domain}", "Type": "A", "TTL": 60, "ResourceRecords": [{"Value": "10.0.0.1"}]}}]})
+
+    def body(host):
+        req = _req.Request(f"{_endpoint}/", method="GET")
+        req.add_header("Host", f"{host}:{_EXECUTE_PORT}")
+        try:
+            return _req.urlopen(req).read().decode()
+        except HTTPError as e:
+            return e.code
+
+    try:
+        assert body(f"svc.{domain}") == "one"
+        assert body(f"a.b.{domain}") == "one"
+        assert body(f"exact.{domain}") == "two"
+        assert body(f"x.deep.{domain}") == "two"
+        assert body(f"x.p.{domain}") == "one"  # the private zone's record is not used
+        assert body(domain) != "one"  # a wildcard does not answer for its apex
+        assert body(f"plain.{domain}") not in ("one", "two")  # its own non-alias record wins over the wildcard
+    finally:
+        for zone_id in (zone, private):
+            records = r53.list_resource_record_sets(HostedZoneId=zone_id)["ResourceRecordSets"]
+            changes = [{"Action": "DELETE", "ResourceRecordSet": rs} for rs in records if rs["Type"] == "A"]
+            if changes:
+                r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch={"Changes": changes})
+            r53.delete_hosted_zone(Id=zone_id)
+        for lb in lbs.values():
+            elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
