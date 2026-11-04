@@ -12,6 +12,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -7831,6 +7832,64 @@ def _cognito_user_pool_domain_delete(physical_id, props):
         _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
+def _cognito_branding_numbers(settings, defaults):
+    """A template's Settings with each string a number or boolean where Cognito's own setting is one,
+    as CloudFormation passes a String parameter's "8.0" on as 8.0 and "true" as true."""
+    if isinstance(settings, dict) and isinstance(defaults, dict):
+        return {k: _cognito_branding_numbers(v, defaults.get(k)) for k, v in settings.items()}
+    if not isinstance(settings, str):
+        return settings
+    if isinstance(defaults, bool):
+        return {"true": True, "false": False}.get(settings.lower(), settings)
+    if isinstance(defaults, (int, float)):
+        try:
+            number = float(settings)
+        except ValueError:
+            return settings
+        return number if math.isfinite(number) else settings
+    return settings
+
+
+def _cognito_managed_login_branding_values(props):
+    values = {k: props[k] for k in ("Settings", "Assets") if k in props}
+    if "Settings" in values:
+        values["Settings"] = _cognito_branding_numbers(values["Settings"], _cognito.DEFAULT_SETTINGS)
+    if "UseCognitoProvidedValues" in props:
+        values["UseCognitoProvidedValues"] = _cfn_bool(props["UseCognitoProvidedValues"])
+    return values
+
+
+def _cognito_managed_login_branding_create(logical_id, props, stack_name):
+    """Ref is "{UserPoolId}|{ManagedLoginBrandingId}" and GetAtt
+    ManagedLoginBrandingId the id alone, as on AWS."""
+    pid = props.get("UserPoolId", "")
+    status, _, body = _cognito._create_managed_login_branding({
+        "UserPoolId": pid, "ClientId": props.get("ClientId", ""),
+        **_cognito_managed_login_branding_values(props),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::ManagedLoginBranding create failed: {body!r}")
+    bid = json.loads(body)["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+    return f"{pid}|{bid}", {"ManagedLoginBrandingId": bid}
+
+
+def _cognito_managed_login_branding_update(physical_id, old_props, new_props, stack_name):
+    """Update in place; the engine replaces the branding for a new ClientId or UserPoolId."""
+    pid, _, bid = physical_id.partition("|")
+    status, _, body = _cognito._update_managed_login_branding({
+        "UserPoolId": pid, "ManagedLoginBrandingId": bid,
+        **_cognito_managed_login_branding_values(new_props),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::ManagedLoginBranding update failed: {body!r}")
+    return physical_id, {"ManagedLoginBrandingId": bid}
+
+
+def _cognito_managed_login_branding_delete(physical_id, props):
+    pid, _, bid = physical_id.partition("|")
+    _cognito._delete_managed_login_branding({"UserPoolId": pid, "ManagedLoginBrandingId": bid})
+
+
 # ===========================================================================
 # --- ECR resource provisioners ---
 
@@ -15318,6 +15377,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
+    "AWS::Cognito::ManagedLoginBranding": ("ClientId", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -15951,6 +16011,11 @@ _RESOURCE_HANDLERS = {
         "create": _cognito_user_pool_domain_create,
         "update": _cognito_user_pool_domain_update,
         "delete": _cognito_user_pool_domain_delete,
+    },
+    "AWS::Cognito::ManagedLoginBranding": {
+        "create": _cognito_managed_login_branding_create,
+        "update": _cognito_managed_login_branding_update,
+        "delete": _cognito_managed_login_branding_delete,
     },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,
