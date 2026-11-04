@@ -6387,8 +6387,8 @@ def test_registered_alb_origin_is_served_through_its_listener_rules(cloudfront, 
 
 
 def test_registered_alb_origin_in_another_region_is_served_through_its_listener(cloudfront):
-    """An origin naming a load balancer in another region than the distribution's reaches
-    that load balancer's listener (#2581)."""
+    """An origin naming a load balancer outside MINISTACK_REGION reaches that load
+    balancer's listener (#2581)."""
     import boto3
 
     elbv2 = boto3.client("elbv2", endpoint_url=ENDPOINT, region_name="us-east-2",
