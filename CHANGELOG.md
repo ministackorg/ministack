@@ -7,7 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Cognito — refresh token rotation** — a client's `RefreshTokenRotation` was accepted and dropped, so a refresh never returned a new refresh token. A client with rotation `ENABLED` now gets a new refresh token from `GetTokensFromRefreshToken` and `/oauth2/token`, and only the newest token of a sign-in refreshes: the one it replaced can be retried within `RetryGracePeriodSeconds` of its first refresh, each retry minting a newer one, and any other reuse answers `RefreshTokenReuseException` (`invalid_grant` at `/oauth2/token`) without revoking the rest. Revoking any token of the sign-in revokes them all, and a revoked or signed-out token is refused as AWS refuses it (a bare `invalid_grant` at `/oauth2/token`). A rotated token keeps the sign-in's expiry, `InitiateAuth` and `AdminInitiateAuth` refuse `REFRESH_TOKEN_AUTH` for such a client with `UnsupportedOperationException`, and the client settings are validated and stored as AWS answers them, kept when an update leaves them out; once rotation is turned off, a token that was replaced stays refused and the newest one refreshes. Contributed by @toby6578.
+
 ### Fixed
+- **Cognito — `GetTokensFromRefreshToken` needs a confidential client's secret** — with `AUTH=true` it refreshed for a client with a secret that sent none, or the wrong one. It now checks the token first and then answers "Client <id> is configured for secret but secret was not received" or "Unable to verify secret hash for client <id>", as AWS does for rotating and non-rotating clients alike; a public client's `ClientSecret` is ignored. Contributed by @toby6578.
+- **Cognito — expired refresh tokens** — a refresh token kept refreshing past its client's `RefreshTokenValidity`; it now answers `NotAuthorizedException` "Refresh Token has expired". Contributed by @toby6578.
 - **Aurora DSQL — the backend Postgres is no longer published on every interface** — with `DSQL_STRICT=1` each cluster's backing Postgres container (trust auth, `postgres` superuser, no password) was published on `0.0.0.0` and `::`, so anyone on the same network could read and change the database directly, bypassing the proxy, even when MiniStack's own ports are bound to `127.0.0.1`. A containerised MiniStack reaches the backend over its Docker network, so the port is no longer published; a MiniStack running on the host publishes it on `127.0.0.1` only. Contributed by @toby6578.
 
 ## [1.5.37] — 2026-11-03

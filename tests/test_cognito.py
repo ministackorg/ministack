@@ -12827,3 +12827,382 @@ def test_cognito_oidc_federated_user_has_identities_and_provider_group(cognito_i
         assert [u["Username"] for u in users] == ["TestOIDC_fed-sub"]
     finally:
         stop()
+
+
+# ---------------------------------------------------------------------------
+# Refresh token rotation (answers measured on AWS in eu-west-2, 2026-11-04)
+# ---------------------------------------------------------------------------
+
+_ROTATION_PASSWORD = "Probe-Passw0rd!"
+
+
+def _rotation_pool(cognito_idp, grace=30, **client_kwargs):
+    pid = cognito_idp.create_user_pool(PoolName=f"rotation-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="rotating", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+        RefreshTokenRotation={"Feature": "ENABLED", "RetryGracePeriodSeconds": grace}, **client_kwargs,
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="rotator", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="rotator", Password=_ROTATION_PASSWORD, Permanent=True)
+    return pid, cid
+
+
+def _signed_in_refresh_token(cognito_idp, cid):
+    return cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "rotator", "PASSWORD": _ROTATION_PASSWORD},
+    )["AuthenticationResult"]["RefreshToken"]
+
+
+def _refreshed(cognito_idp, cid, token):
+    return cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken=token)["AuthenticationResult"]
+
+
+def _refresh_error(cognito_idp, cid, token):
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken=token)
+    return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+
+def _jwt_claims(token):
+    return json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
+
+
+def test_refresh_token_rotation_only_the_newest_token_refreshes(cognito_idp):
+    """Each refresh returns a new token; the one it replaced can be retried within the
+    grace period, minting a newer one each time, and any other token is refused."""
+    pid, cid = _rotation_pool(cognito_idp)
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        second = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        retried = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        assert len({first, second, retried}) == 3
+        assert _refresh_error(cognito_idp, cid, second) == ("RefreshTokenReuseException", "Refresh token reuse detected")
+        newest = _refreshed(cognito_idp, cid, retried)["RefreshToken"]
+        assert _refreshed(cognito_idp, cid, newest)["RefreshToken"] not in (newest, retried)
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_grace_period_runs_from_the_first_refresh(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp, grace=2)
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        _refreshed(cognito_idp, cid, first)
+        started = time.time()
+        time.sleep(1.2)
+        retried = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        time.sleep(max(0, started + 2.2 - time.time()))
+        assert _refresh_error(cognito_idp, cid, first)[0] == "RefreshTokenReuseException"
+        assert _refreshed(cognito_idp, cid, retried)["RefreshToken"]
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_grace_period(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp, grace=1)
+    no_grace_cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="no-grace", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+        RefreshTokenRotation={"Feature": "ENABLED", "RetryGracePeriodSeconds": 0},
+    )["UserPoolClient"]["ClientId"]
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        latest = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        time.sleep(1.2)
+        assert _refresh_error(cognito_idp, cid, first) == ("RefreshTokenReuseException", "Refresh token reuse detected")
+        assert _refreshed(cognito_idp, cid, latest)["RefreshToken"]
+
+        first = _signed_in_refresh_token(cognito_idp, no_grace_cid)
+        latest = _refreshed(cognito_idp, no_grace_cid, first)["RefreshToken"]
+        assert _refresh_error(cognito_idp, no_grace_cid, first)[0] == "RefreshTokenReuseException"
+        assert _refreshed(cognito_idp, no_grace_cid, latest)["RefreshToken"], "a refused reuse leaves the family alone"
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_revoking_one_token_revokes_the_family(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp, grace=0)
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        latest = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        cognito_idp.revoke_token(ClientId=cid, Token=first)
+        assert _refresh_error(cognito_idp, cid, latest) == ("NotAuthorizedException", "")
+
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        latest = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        cognito_idp.revoke_token(ClientId=cid, Token=latest)
+        assert _refresh_error(cognito_idp, cid, latest) == ("NotAuthorizedException", "")
+        assert _refresh_error(cognito_idp, cid, first) == ("NotAuthorizedException", "")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_refuses_refresh_token_auth(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp)
+    try:
+        token = _signed_in_refresh_token(cognito_idp, cid)
+        for call in (
+            lambda flow: cognito_idp.initiate_auth(ClientId=cid, AuthFlow=flow, AuthParameters={"REFRESH_TOKEN": token}),
+            lambda flow: cognito_idp.admin_initiate_auth(
+                UserPoolId=pid, ClientId=cid, AuthFlow=flow, AuthParameters={"REFRESH_TOKEN": token}),
+        ):
+            for flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
+                with pytest.raises(ClientError) as exc:
+                    call(flow)
+                assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+                assert exc.value.response["Error"]["Message"] == "This API does not support refresh token rotation"
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_at_the_token_endpoint(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp, grace=0)
+
+    def refresh(token):
+        req = urllib.request.Request(
+            f"{ENDPOINT}/oauth2/token", method="POST",
+            data=_urlencode({"grant_type": "refresh_token", "client_id": cid, "refresh_token": token}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        status, body = refresh(first)
+        assert status == 200
+        assert body["refresh_token"] != first
+        assert refresh(first) == (400, {"error": "invalid_grant"})
+        assert refresh(body["refresh_token"])[0] == 200
+
+        revoked = _signed_in_refresh_token(cognito_idp, cid)
+        cognito_idp.revoke_token(ClientId=cid, Token=revoked)
+        assert refresh(revoked) == (400, {"error": "invalid_grant"})
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_keeps_the_sign_in_lifetime(cognito_idp):
+    """A rotated token expires when the sign-in's first token does, and an expired one no longer refreshes."""
+    pid, cid = _rotation_pool(cognito_idp, RefreshTokenValidity=4, TokenValidityUnits={"RefreshToken": "seconds"})
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        expires = _jwt_claims(first)["exp"]
+        time.sleep(max(0, expires - 2 - time.time()))
+        rotated = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        assert _jwt_claims(rotated)["exp"] == expires
+        time.sleep(max(0, expires + 0.5 - time.time()))
+        assert _refresh_error(cognito_idp, cid, rotated) == ("NotAuthorizedException", "Refresh Token has expired")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_client_settings(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName=f"rotation-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    try:
+        def create(**kwargs):
+            return cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c", **kwargs)["UserPoolClient"]
+
+        with pytest.raises(ClientError) as exc:
+            create(ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+                   RefreshTokenRotation={"Feature": "ENABLED", "RetryGracePeriodSeconds": 10})
+        assert exc.value.response["Error"]["Message"] == (
+            "ALLOW_REFRESH_TOKEN_AUTH is not a permitted ExplicitAuthFlow when refresh token rotation is enabled.")
+        with pytest.raises(ClientError) as exc:
+            create(RefreshTokenRotation={"Feature": "ENABLED", "RetryGracePeriodSeconds": 61})
+        assert exc.value.response["Error"]["Message"] == (
+            "1 validation error detected: Value '61' at 'refreshTokenRotation.retryGracePeriodSeconds' failed to "
+            "satisfy constraint: Member must have value less than or equal to 60")
+        assert "RefreshTokenRotation" not in create()
+        assert create(RefreshTokenRotation={"Feature": "DISABLED", "RetryGracePeriodSeconds": 20})[
+            "RefreshTokenRotation"] == {"Feature": "DISABLED", "RetryGracePeriodSeconds": 0}
+
+        client = create(ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"], RefreshTokenRotation={"Feature": "ENABLED"})
+        cid = client["ClientId"]
+        assert client["RefreshTokenRotation"] == {"Feature": "ENABLED", "RetryGracePeriodSeconds": 0}
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.update_user_pool_client(
+                UserPoolId=pid, ClientId=cid, ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"])
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        updated = cognito_idp.update_user_pool_client(
+            UserPoolId=pid, ClientId=cid, ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]
+        assert updated["RefreshTokenRotation"] == {"Feature": "ENABLED", "RetryGracePeriodSeconds": 0}
+        disabled = cognito_idp.update_user_pool_client(
+            UserPoolId=pid, ClientId=cid, ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+            RefreshTokenRotation={"Feature": "DISABLED"})["UserPoolClient"]
+        assert disabled["RefreshTokenRotation"] == {"Feature": "DISABLED", "RetryGracePeriodSeconds": 0}
+
+        from conftest import make_client
+        unvalidated = make_client("cognito-idp", {"parameter_validation": False})
+        for rotation, error in (
+            ({"Feature": "ENABLED", "RetryGracePeriodSeconds": -1}, ("InvalidParameterException",
+             "1 validation error detected: Value '-1' at 'refreshTokenRotation.retryGracePeriodSeconds' failed to "
+             "satisfy constraint: Member must have value greater than or equal to 0")),
+            ({"Feature": "BOGUS"}, ("InvalidParameterException",
+             "1 validation error detected: Value 'BOGUS' at 'refreshTokenRotation.feature' failed to satisfy "
+             "constraint: Member must satisfy enum value set: [ENABLED, DISABLED]")),
+            ({"RetryGracePeriodSeconds": 10}, ("InvalidParameterException",
+             "1 validation error detected: Value null at 'refreshTokenRotation.feature' failed to satisfy "
+             "constraint: Member must not be null")),
+            ({}, ("InvalidParameterException",
+             "1 validation error detected: Value null at 'refreshTokenRotation.feature' failed to satisfy "
+             "constraint: Member must not be null")),
+            ({"Feature": "ENABLED", "RetryGracePeriodSeconds": True}, ("SerializationException",
+             "TRUE_VALUE can not be converted to an Integer")),
+            ({"Feature": "BOGUS", "RetryGracePeriodSeconds": 61}, ("InvalidParameterException",
+             "2 validation errors detected: Value 'BOGUS' at 'refreshTokenRotation.feature' failed to satisfy constraint: "
+             "Member must satisfy enum value set: [ENABLED, DISABLED]; Value '61' at "
+             "'refreshTokenRotation.retryGracePeriodSeconds' failed to satisfy constraint: Member must have value less "
+             "than or equal to 60")),
+            ({"Feature": "ENABLED", "RetryGracePeriodSeconds": "abc"}, ("SerializationException",
+             "STRING_VALUE can not be converted to an Integer")),
+        ):
+            with pytest.raises(ClientError) as exc:
+                unvalidated.create_user_pool_client(UserPoolId=pid, ClientName="c", RefreshTokenRotation=rotation)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == error
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_turned_off_keeps_replaced_tokens_refused(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp, grace=0)
+    try:
+        first = _signed_in_refresh_token(cognito_idp, cid)
+        latest = _refreshed(cognito_idp, cid, first)["RefreshToken"]
+        cognito_idp.update_user_pool_client(
+            UserPoolId=pid, ClientId=cid, ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+            RefreshTokenRotation={"Feature": "DISABLED"})
+        assert _refresh_error(cognito_idp, cid, first) == ("NotAuthorizedException", "Refresh Token has been revoked")
+        assert "RefreshToken" not in _refreshed(cognito_idp, cid, latest)
+        assert cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                                         AuthParameters={"REFRESH_TOKEN": latest})["AuthenticationResult"]["AccessToken"]
+        req = urllib.request.Request(
+            f"{ENDPOINT}/oauth2/token", method="POST",
+            data=_urlencode({"grant_type": "refresh_token", "client_id": cid, "refresh_token": first}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with pytest.raises(urllib.error.HTTPError) as http:
+            urllib.request.urlopen(req)
+        assert json.loads(http.value.read()) == {"error": "invalid_grant"}
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_refresh_token_rotation_and_a_disabled_user(cognito_idp, auth_enabled):
+    pid, cid = _rotation_pool(cognito_idp, grace=0)
+    try:
+        token = _signed_in_refresh_token(cognito_idp, cid)
+        cognito_idp.admin_disable_user(UserPoolId=pid, Username="rotator")
+        if auth_enabled:
+            assert _refresh_error(cognito_idp, cid, token) == ("NotAuthorizedException", "User is disabled.")
+        cognito_idp.admin_enable_user(UserPoolId=pid, Username="rotator")
+        if auth_enabled:
+            assert _refresh_error(cognito_idp, cid, token) == ("NotAuthorizedException", "Refresh Token has been revoked")
+        assert _refreshed(cognito_idp, cid, _signed_in_refresh_token(cognito_idp, cid))["RefreshToken"]
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_get_tokens_from_refresh_token_needs_a_confidential_clients_secret(cognito_idp, auth_enabled):
+    pid = cognito_idp.create_user_pool(PoolName=f"secret-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    try:
+        client = cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="c", GenerateSecret=True,
+            ExplicitAuthFlows=["ALLOW_ADMIN_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"])["UserPoolClient"]
+        cid, secret = client["ClientId"], client["ClientSecret"]
+        cognito_idp.admin_create_user(UserPoolId=pid, Username="u", MessageAction="SUPPRESS")
+        cognito_idp.admin_set_user_password(UserPoolId=pid, Username="u", Password=_ROTATION_PASSWORD, Permanent=True)
+        secret_hash = base64.b64encode(hmac.new(secret.encode(), f"u{cid}".encode(), hashlib.sha256).digest()).decode()
+        token = cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": _ROTATION_PASSWORD, "SECRET_HASH": secret_hash},
+        )["AuthenticationResult"]["RefreshToken"]
+        if auth_enabled:
+            for refresh, kwargs, message in (
+                ("garbage", {}, "Invalid Refresh Token"),
+                (token, {}, f"Client {cid} is configured for secret but secret was not received"),
+                (token, {"ClientSecret": "w" * 32}, f"Unable to verify secret hash for client {cid}"),
+            ):
+                with pytest.raises(ClientError) as exc:
+                    cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken=refresh, **kwargs)
+                assert exc.value.response["Error"]["Message"] == message
+        assert "RefreshToken" not in cognito_idp.get_tokens_from_refresh_token(
+            ClientId=cid, RefreshToken=token, ClientSecret=secret)["AuthenticationResult"]
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_global_sign_out_revokes_the_family(cognito_idp):
+    pid, cid = _rotation_pool(cognito_idp, grace=0)
+    try:
+        signed_in = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "rotator", "PASSWORD": _ROTATION_PASSWORD})["AuthenticationResult"]
+        latest = _refreshed(cognito_idp, cid, signed_in["RefreshToken"])["RefreshToken"]
+        cognito_idp.global_sign_out(AccessToken=signed_in["AccessToken"])
+        assert _refresh_error(cognito_idp, cid, latest) == ("NotAuthorizedException", "Refresh Token has been revoked")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_refresh_token_rotation_client_secrets(auth_enabled, cognito_idp):
+    """A confidential rotating client must send its secret to GetTokensFromRefreshToken, and a public
+    one is refused REFRESH_TOKEN_AUTH before its token is read."""
+    pid, cid = _rotation_pool(cognito_idp, GenerateSecret=True)
+    try:
+        client = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+        secret_hash = base64.b64encode(hmac.new(
+            client["ClientSecret"].encode(), f"rotator{cid}".encode(), hashlib.sha256).digest()).decode()
+        token = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "rotator", "PASSWORD": _ROTATION_PASSWORD, "SECRET_HASH": secret_hash},
+        )["AuthenticationResult"]["RefreshToken"]
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken="garbage")
+            assert exc.value.response["Error"]["Message"] == "Invalid Refresh Token", "the token is checked before the secret"
+        for secret, message in ((None, f"Client {cid} is configured for secret but secret was not received"),
+                                ("w" * 32, f"Unable to verify secret hash for client {cid}")):
+            kwargs = {"ClientSecret": secret} if secret else {}
+            if auth_enabled:
+                with pytest.raises(ClientError) as exc:
+                    cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken=token, **kwargs)
+                assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                    "NotAuthorizedException", message)
+        refreshed = cognito_idp.get_tokens_from_refresh_token(
+            ClientId=cid, RefreshToken=token, ClientSecret=client["ClientSecret"])["AuthenticationResult"]
+        assert refreshed["RefreshToken"] != token
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+    pid, cid = _rotation_pool(cognito_idp)
+    try:
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": "garbage"})
+        assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_refresh_token_rotation_concurrent_refreshes_rotate_once(cognito_idp):
+    """With no grace period, only one of several refreshes of the same token succeeds."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    pid, cid = _rotation_pool(cognito_idp, grace=0)
+    try:
+        token = _signed_in_refresh_token(cognito_idp, cid)
+
+        def attempt(_):
+            try:
+                return bool(_refreshed(cognito_idp, cid, token)["RefreshToken"])
+            except ClientError:
+                return False
+
+        with ThreadPoolExecutor(8) as pool:
+            assert sum(pool.map(attempt, range(8))) == 1
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
