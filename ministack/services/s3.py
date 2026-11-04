@@ -1017,6 +1017,23 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     return _read_body(bucket_name, key, obj)
 
 
+def _get_object_data_for_caller(bucket_name: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Object bytes as the current account may read them, or None.
+
+    A bucket name identifies one bucket for every account. A bucket that another
+    account owns answers only when the owner's ACLs or bucket policy allow the
+    caller's GetObject, as for an S3 request."""
+    owner = _bucket_owner_for_caller(bucket_name)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return _get_object_data(bucket_name, key, version_id)
+    query_params = {"versionId": version_id} if version_id else {}
+    if not _foreign_bucket_allows(owner, bucket_name, key, "GET", query_params, caller):
+        return None
+    with request_scope(owner, get_region()):
+        return _get_object_data(bucket_name, key, version_id)
+
+
 _ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
 # The permissions that answer an object read, FULL_CONTROL included.
 _ACL_READ_PERMS = ("READ", "FULL_CONTROL")
@@ -1087,10 +1104,17 @@ def _bucket_owner_account(name: str) -> str | None:
     within a partition" — so a name identifies one bucket, whoever asks. The
     store stays account-scoped; this is the index over it.
     """
-    for account_id, bucket_name in _buckets._data:
+    # A copy of the keys: internal reads call this from worker threads.
+    for account_id, bucket_name in list(_buckets._data):
         if bucket_name == name:
             return account_id
     return None
+
+
+def _bucket_owner_for_caller(name: str) -> str | None:
+    """The account whose bucket *name* the current caller reads: its own, else the owner, or None."""
+    caller = get_account_id()
+    return caller if _buckets.contains_scoped(caller, None, name) else _bucket_owner_account(name)
 
 
 # A Multi-Region Access Point or an object through it: arn:aws:s3::<account>:accesspoint/<alias>[/object/<key>].
@@ -1256,6 +1280,15 @@ def bucket_region(name: str) -> str | None:
     if record is None:
         return None
     return record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _bucket_region_for_caller(name: str) -> str | None:
+    """Home region of the bucket *name* that the current caller reads, in the account that owns it."""
+    owner = _bucket_owner_for_caller(name)
+    if owner is None:
+        return None
+    with request_scope(owner, get_region()):
+        return bucket_region(name)
 
 
 _REGION_LABEL_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+$")

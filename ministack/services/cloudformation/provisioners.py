@@ -9403,7 +9403,7 @@ def _lambda_layer_create(logical_id, props, stack_name):
     import hashlib
     zip_data = None
     if s3_bucket and s3_key:
-        zip_data = _s3._get_object_data(s3_bucket, s3_key)
+        zip_data = _s3._get_object_data_for_caller(s3_bucket, s3_key)
 
     layer_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{layer_name}"
     version_arn = f"{layer_arn}:{ver}"
@@ -9535,7 +9535,7 @@ def _sfn_definition(props):
         if bucket and key:
             from ministack.services import s3 as _s3_svc
             try:
-                blob = _s3_svc._get_object_data(bucket, key, version_id=version)
+                blob = _s3_svc._get_object_data_for_caller(bucket, key, version_id=version)
             except Exception as e:
                 raise ValueError(
                     f"AWS::StepFunctions::StateMachine DefinitionS3Location fetch failed "
