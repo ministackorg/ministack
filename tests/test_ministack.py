@@ -1005,6 +1005,57 @@ def test_spawned_containers_carry_the_testcontainers_session_labels(monkeypatch)
 
 
 @pytest.mark.serial
+def test_testcontainers_labels_are_found_when_ministack_has_a_custom_hostname(monkeypatch, caplog):
+    """A custom hostname (``--hostname``, Compose ``hostname:``, ``WithHostname``) is not a name Docker knows the
+    container by; its id is then read from the bind mounts in ``/proc/self/mountinfo``. Not finding the container
+    at all is logged as a warning, since the spawned containers would then outlive the test run."""
+    import io
+    import logging
+
+    import docker
+
+    from ministack.core import container_reaper
+
+    cid = "669fceb311ae2c51e0aee8bc0970d3f539008c1e435a9ed44cb84bdb4bf26174"
+    mountinfo = (
+        "1 0 0:1 / / rw - overlay overlay rw\n"
+        f"2 1 254:1 /docker/containers/{cid}/hostname /etc/hostname rw - ext4 /dev/vda1 rw\n"
+        f"3 1 254:1 /docker/containers/{cid}/hosts /etc/hosts rw - ext4 /dev/vda1 rw\n")
+    own = {"org.testcontainers": "true", "org.testcontainers.resource-reaper-session": "s-dotnet"}
+    asked = []
+
+    def get(ref):
+        asked.append(ref)
+        if ref != cid:
+            raise docker.errors.NotFound(f"No such container: {ref}")
+        return type("Me", (), {"labels": own})()
+
+    client = type("C", (), {"containers": type("Cs", (), {"get": staticmethod(get)})()})()
+    real_open = open
+    monkeypatch.setattr(container_reaper, "open", lambda path, *a, **kw: io.StringIO(mountinfo)
+                        if path == "/proc/self/mountinfo" else real_open(path, *a, **kw), raising=False)
+    monkeypatch.setattr(container_reaper, "_testcontainers_labels", None)
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: path == "/.dockerenv")
+    monkeypatch.setenv("HOSTNAME", "ministack")
+    monkeypatch.setattr(docker, "from_env", lambda **_kw: client)
+    try:
+        labels = container_reaper.own_labels("lambda")
+        assert asked == ["ministack", cid]
+        assert labels["org.testcontainers.resource-reaper-session"] == "s-dotnet"
+    finally:
+        container_reaper._testcontainers_labels = None
+
+    mountinfo = "1 0 0:1 / / rw - overlay overlay rw\n"
+    caplog.set_level(logging.WARNING, logger="container_reaper")
+    try:
+        labels = container_reaper.own_labels("lambda")
+        assert not any(k.startswith("org.testcontainers") for k in labels)
+        assert "cannot find MiniStack's own container" in caplog.text
+    finally:
+        container_reaper._testcontainers_labels = None
+
+
+@pytest.mark.serial
 def test_reaper_reclaims_stopped_lambda_containers_the_pool_no_longer_holds(fake_docker, monkeypatch):
     """A Lambda container whose removal failed (a slow daemon) is reclaimed once stopped; pooled ones are kept."""
     from ministack.core import container_reaper

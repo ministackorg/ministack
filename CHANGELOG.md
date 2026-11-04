@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Aurora DSQL — the backend Postgres is no longer published on every interface** — with `DSQL_STRICT=1` each cluster's backing Postgres container (trust auth, `postgres` superuser, no password) was published on `0.0.0.0` and `::`, so anyone on the same network could read and change the database directly, bypassing the proxy, even when MiniStack's own ports are bound to `127.0.0.1`. A containerised MiniStack reaches the backend over its Docker network, so the port is no longer published; a MiniStack running on the host publishes it on `127.0.0.1` only. Contributed by @toby6578.
+- **Containers — Testcontainers session labels with a custom hostname** — a MiniStack container given its own hostname (`--hostname`, Compose `hostname:`, Testcontainers `WithHostname`) could not find itself by `$HOSTNAME`, so spawned containers lost the session labels Ryuk removes them by, with only a debug log. The container id is now also read from `/proc/self/mountinfo`, and not finding the container is logged as a warning. Contributed by @kharabasz.
 
 ## [1.5.37] — 2026-11-03
 

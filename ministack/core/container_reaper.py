@@ -34,6 +34,7 @@ port proves the previous owner is gone.
 import concurrent.futures
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -68,6 +69,19 @@ def instance_id() -> str:
 
 
 _testcontainers_labels: dict | None = None
+_MOUNTED_CONTAINER_ID = re.compile(r"containers/([0-9a-f]{64})/")
+
+
+def _own_container_refs() -> list:
+    """Names Docker may know MiniStack's own container by, most likely first. ``HOSTNAME`` is the short id unless
+    the container was given a hostname; the bind mounts of its ``hostname``/``hosts`` files carry the full id."""
+    refs = [os.environ.get("HOSTNAME", "")]
+    try:
+        with open("/proc/self/mountinfo") as f:
+            refs.extend(_MOUNTED_CONTAINER_ID.findall(f.read()))
+    except OSError:
+        pass
+    return list(dict.fromkeys(r for r in refs if r))
 
 
 def _inherited_testcontainers_labels() -> dict:
@@ -78,14 +92,25 @@ def _inherited_testcontainers_labels() -> dict:
     if _testcontainers_labels is None:
         found = {}
         if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+            me, error = None, "no container id found"
             try:
                 import docker
-                me = docker.from_env(timeout=5).containers.get(os.environ.get("HOSTNAME", ""))
+                client = docker.from_env(timeout=5)
+                for ref in _own_container_refs():
+                    try:
+                        me = client.containers.get(ref)
+                        break
+                    except Exception as exc:
+                        error = exc
+            except Exception as exc:
+                error = exc
+            if me is None:
+                logger.warning("reaper: cannot find MiniStack's own container (%s); spawned containers will not "
+                               "carry its Testcontainers session labels", error)
+            else:
                 found = {k: v for k, v in (me.labels or {}).items()
                          if k in ("org.testcontainers", "org.testcontainers.golang")
                          or (k.startswith("org.testcontainers.") and "session" in k.lower())}
-            except Exception as exc:
-                logger.debug("reaper: own container labels unavailable: %s", exc)
         _testcontainers_labels = found
     return _testcontainers_labels
 
