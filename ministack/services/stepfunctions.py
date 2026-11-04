@@ -2832,6 +2832,12 @@ def _run_distributed_map(state_def, raw_input, effective, items, max_conc, itera
     label = state_def.get("Label") or new_uuid()
     child_sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{sm_name}/{label}"
     map_run_arn = f"arn:aws:states:{region}:{account}:mapRun:{sm_name}/{label}:{new_uuid()}"
+    batcher = state_def.get("ItemBatcher")
+    item_selector = state_def.get("ItemSelector") or state_def.get("Parameters")
+    if batcher:
+        units = _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_jsonata)
+    else:
+        units = [(item, 1) for item in items]
     tolerated_pct = float(state_def.get("ToleratedFailurePercentage") or 0)
     tolerated_count = int(state_def.get("ToleratedFailureCount") or 0)
     zero = {k: 0 for k in ("pending", "running", "succeeded", "failed", "timedOut", "aborted", "total", "resultsWritten",
@@ -2840,24 +2846,20 @@ def _run_distributed_map(state_def, raw_input, effective, items, max_conc, itera
         "mapRunArn": map_run_arn, "executionArn": execution["executionArn"], "status": "RUNNING",
         "startDate": now_iso(), "maxConcurrency": max_conc, "toleratedFailurePercentage": tolerated_pct,
         "toleratedFailureCount": tolerated_count, "itemCounts": dict(zero, total=len(items), pending=len(items)),
-        "executionCounts": dict(zero, total=len(items), pending=len(items)), "redriveCount": 0,
+        "executionCounts": dict(zero, total=len(units), pending=len(units)), "redriveCount": 0,
         "_stateMachineArn": child_sm_arn,
     }
     _map_runs[map_run_arn] = run
-    item_selector = state_def.get("ItemSelector") or state_def.get("Parameters")
-    results = [None] * len(items)
-    failures = [None] * len(items)
+    results = [None] * len(units)
+    failures = [None] * len(units)
     lock = threading.Lock()
 
-    def run_child(idx, item):
-        item_ctx = copy.deepcopy(ctx)
-        item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
-        if not item_selector:
-            child_input = item
-        elif is_jsonata:
-            child_input = _apply_jsonata_template(item_selector, raw_input, item_ctx)
+    def run_child(idx, item, n_items):
+        if batcher:
+            # The item is a batch. A batched child's context has no Map key, as on AWS.
+            child_input, item_ctx = item, copy.deepcopy(ctx)
         else:
-            child_input = _resolve_params_obj(item_selector, effective, item_ctx)
+            child_input, item_ctx = _select_map_item(item_selector, idx, item, raw_input, effective, ctx, is_jsonata)
         name = new_uuid()
         child = {
             "executionArn": f"arn:aws:states:{region}:{account}:execution:{sm_name}/{label}:{name}",
@@ -2868,9 +2870,9 @@ def _run_distributed_map(state_def, raw_input, effective, items, max_conc, itera
         }
         _executions[child["executionArn"]] = child
         with lock:
-            for counts in (run["itemCounts"], run["executionCounts"]):
-                counts["pending"] -= 1
-                counts["running"] += 1
+            for counts, n in ((run["itemCounts"], n_items), (run["executionCounts"], 1)):
+                counts["pending"] -= n
+                counts["running"] += n
         try:
             results[idx] = _run_sub_machine(iterator.get("States", {}), iterator.get("StartAt"),
                                             child_input, child, item_ctx)
@@ -2883,15 +2885,17 @@ def _run_distributed_map(state_def, raw_input, effective, items, max_conc, itera
             outcome = "failed"
         child["stopDate"] = now_iso()
         with lock:
-            for counts in (run["itemCounts"], run["executionCounts"]):
-                counts["running"] -= 1
-                counts[outcome] += 1
+            for counts, n in ((run["itemCounts"], n_items), (run["executionCounts"], 1)):
+                counts["running"] -= n
+                counts[outcome] += n
 
-    workers = max_conc if max_conc > 0 else (min(len(items), 64) or 1)
+    workers = max_conc if max_conc > 0 else (min(len(units), 64) or 1)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures_wait([pool.submit(contextvars.copy_context().run, run_child, i, item) for i, item in enumerate(items)])
+        futures_wait([pool.submit(contextvars.copy_context().run, run_child, i, unit, n)
+                      for i, (unit, n) in enumerate(units)])
 
-    failed = sum(1 for f in failures if f is not None)
+    # A failed batch counts all of its items as failed, as on AWS.
+    failed = sum(units[i][1] for i, f in enumerate(failures) if f is not None)
     limits = []
     if "ToleratedFailureCount" in state_def:
         limits.append(failed > tolerated_count)
@@ -2913,6 +2917,56 @@ def _run_distributed_map(state_def, raw_input, effective, items, max_conc, itera
     output = _apply_output_path(state_def, output, ctx)
     _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
+
+
+def _select_map_item(item_selector, idx, item, raw_input, effective, ctx, is_jsonata):
+    """The child input for one Map item, and the context with $$.Map.Item that the ItemSelector reads."""
+    item_ctx = copy.deepcopy(ctx)
+    item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
+    if not item_selector:
+        return item, item_ctx
+    if is_jsonata:
+        return _apply_jsonata_template(item_selector, raw_input, item_ctx), item_ctx
+    return _resolve_params_obj(item_selector, effective, item_ctx), item_ctx
+
+
+def _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_jsonata):
+    """The ItemBatcher batches in item order, each as (child input, number of items). A batch ends at
+    MaxItemsPerBatch items, or before the compact UTF-8 JSON of the child input passes MaxInputBytesPerBatch."""
+    selected = [_select_map_item(item_selector, i, item, raw_input, effective, ctx, is_jsonata)[0]
+                for i, item in enumerate(items)]
+    max_items = _item_batcher_limit(batcher, "MaxItemsPerBatch", raw_input, effective, ctx, is_jsonata)
+    max_bytes = _item_batcher_limit(batcher, "MaxInputBytesPerBatch", raw_input, effective, ctx, is_jsonata)
+    envelope = {}
+    if "BatchInput" in batcher:
+        envelope["BatchInput"] = (_apply_jsonata_template(batcher["BatchInput"], raw_input, ctx) if is_jsonata
+                                  else _resolve_params_obj(batcher["BatchInput"], effective, ctx))
+    base = _json_bytes({**envelope, "Items": []})
+    batches, current, size = [], [], base
+    for item in selected:
+        item_size = _json_bytes(item)
+        new_size = size + item_size + (1 if current else 0)
+        if current and ((max_items and len(current) == max_items) or (max_bytes and new_size > max_bytes)):
+            batches.append(current)
+            current, new_size = [], base + item_size
+        current.append(item)
+        size = new_size
+    if current:
+        batches.append(current)
+    return [({**envelope, "Items": batch}, len(batch)) for batch in batches]
+
+
+def _item_batcher_limit(batcher, field, raw_input, effective, ctx, is_jsonata):
+    """An ItemBatcher limit from a JSONata expression, a <field>Path, or a value. None when it is not set."""
+    if is_jsonata and field in batcher:
+        return _jsonata_state_field(batcher, field, "number", raw_input, ctx)
+    if f"{field}Path" in batcher:
+        return _resolve_path_or_ctx(batcher[f"{field}Path"], effective, ctx)
+    return batcher.get(field)
+
+
+def _json_bytes(value):
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
