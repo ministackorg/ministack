@@ -16950,6 +16950,60 @@ def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
     assert list(launches.values()) == [[_GLOBAL_ALIAS_NAME]]
 
 
+def test_rds_every_global_member_certificate_lists_the_global_name(monkeypatch):
+    """On AWS each member's server certificate lists the global endpoint, a
+    secondary's included (AWS: tls-secondary-before-switchover); a cluster
+    outside a global cluster does not get it."""
+    m, gc, clusters, *_ = _global_alias_world(monkeypatch)
+    names = {}
+
+    def run(_client, _engine, kwargs, tls_names=()):
+        names[kwargs["name"]] = list(tls_names)
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(m, "_run_rds_container", run)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    for cid in ("a", "b"):
+        cluster = dict(clusters[cid], MasterUsername="admin",
+                       _MasterUserPassword="password123", DatabaseName="mydb")
+        m._start_cluster_shared_container(cid, cluster)
+    assert len(names) == 2
+    assert all(_GLOBAL_ALIAS_NAME in tls for tls in names.values())
+
+    names.clear()
+    solo = dict(clusters["a"], MasterUsername="admin", _MasterUserPassword="password123",
+                DatabaseName="mydb")
+    solo.pop("GlobalClusterIdentifier")
+    m._start_cluster_shared_container("a", solo)
+    assert [_GLOBAL_ALIAS_NAME in tls for tls in names.values()] == [False]
+
+    # Without a network that takes aliases the cluster names stay out of the
+    # certificate, and so does the global name.
+    names.clear()
+    monkeypatch.setattr(m, "_network_supports_aliases", lambda _network: False)
+    m._start_cluster_shared_container("a", dict(clusters["a"], MasterUsername="admin",
+                                                _MasterUserPassword="password123", DatabaseName="mydb"))
+    assert [_GLOBAL_ALIAS_NAME in tls for tls in names.values()] == [False]
+
+
+def test_rds_pg_reader_certificate_lists_the_global_name(monkeypatch):
+    """A hot-standby reader owns its container, and on AWS an instance's
+    certificate lists the global name whatever its role."""
+    m, _gc, clusters, *_ = _global_alias_world(monkeypatch)
+    names = []
+
+    def run(_client, _engine, _kwargs, tls_names=()):
+        names.append(list(tls_names))
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(m, "_run_rds_container", run)
+    monkeypatch.setattr(m, "_next_port", lambda: 25999)
+    cluster = dict(clusters["b"], MasterUsername="admin", _MasterUserPassword="password123",
+                   DatabaseName="mydb", _shared_internal_port=5432)
+    m._start_pg_reader_container("b-2", cluster)
+    assert len(names) == 1 and _GLOBAL_ALIAS_NAME in names[0]
+
+
 def _flip_global_writer(gc):
     for member in gc["GlobalClusterMembers"]:
         member["IsWriter"] = not member["IsWriter"]
@@ -17353,6 +17407,52 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
             (_wait_instance_gone, {"rds": rds, "instance_id": did}),
             (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
             *((rds.delete_global_cluster, {"GlobalClusterIdentifier": g}) for g in (gid, renamed)),
+        ):
+            try:
+                call(**kwargs)
+            except ClientError:
+                pass
+
+
+@pytest.mark.data_plane
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_rds_global_endpoint_verifies_against_the_server_certificate(rds, tmp_path):
+    """A client that verifies the hostname against the global endpoint, as
+    sslmode=verify-full does, connects: the certificate lists the global name
+    (AWS: tls-via-global)."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    suffix = uuid.uuid4().hex[:8]
+    gid, cid, did = f"gdbtls-{suffix}", f"gdbtls-{suffix}-c", f"gdbtls-{suffix}-i"
+    try:
+        rds.create_global_cluster(GlobalClusterIdentifier=gid, Engine="aurora-postgresql")
+        rds.create_db_cluster(
+            DBClusterIdentifier=cid, Engine="aurora-postgresql", DatabaseName="appdb",
+            MasterUsername="admin", MasterUserPassword=PASSWORD, GlobalClusterIdentifier=gid)
+        rds.create_db_instance(
+            DBInstanceIdentifier=did, DBClusterIdentifier=cid,
+            DBInstanceClass="db.r6g.large", Engine="aurora-postgresql")
+        endpoint = _wait_for_instance(rds, did)["Endpoint"]
+        global_name = rds.describe_global_clusters(
+            GlobalClusterIdentifier=gid)["GlobalClusters"][0]["Endpoint"]
+        dial_host, dial_port = _host_dialable(endpoint)
+        # libpq dials hostaddr and verifies the certificate against host.
+        connection = psycopg2.connect(
+            host=global_name, hostaddr=socket.gethostbyname(dial_host), port=dial_port, user="admin",
+            password=PASSWORD, dbname="appdb", sslmode="verify-full",
+            sslrootcert=_rds_ca_pem(tmp_path), connect_timeout=15)
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+            assert cursor.fetchone()[0] is True
+        finally:
+            connection.close()
+    finally:
+        for call, kwargs in (
+            (rds.remove_from_global_cluster, {"GlobalClusterIdentifier": gid, "DbClusterIdentifier": cid}),
+            (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
+            (_wait_instance_gone, {"rds": rds, "instance_id": did}),
+            (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
+            (rds.delete_global_cluster, {"GlobalClusterIdentifier": gid}),
         ):
             try:
                 call(**kwargs)
