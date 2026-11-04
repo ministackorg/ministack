@@ -11060,6 +11060,10 @@ def _apigw_v2_api_props(props, stack_name, logical_id):
     }
 
 
+def _apigw_v2_cors(cfg):
+    return {k[:1].lower() + k[1:]: v for k, v in cfg.items()}
+
+
 def _apigw_v2_api_create(logical_id, props, stack_name):
     api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
     protocol = props.get("ProtocolType", "HTTP")
@@ -11072,7 +11076,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
         **_apigw_v2_api_props(props, stack_name, logical_id),
     }
     if props.get("CorsConfiguration"):
-        api["corsConfiguration"] = props["CorsConfiguration"]
+        api["corsConfiguration"] = _apigw_v2_cors(props["CorsConfiguration"])
     _apigw_v2._apis[api_id] = api
     _apigw_v2._routes[api_id] = {}
     _apigw_v2._integrations[api_id] = {}
@@ -11105,7 +11109,7 @@ def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_
         return replaced
     payload = _apigw_v2_api_props(new_props, stack_name, logical_id or physical_id)
     if new_props.get("CorsConfiguration"):
-        payload["corsConfiguration"] = new_props["CorsConfiguration"]
+        payload["corsConfiguration"] = _apigw_v2_cors(new_props["CorsConfiguration"])
     resp = _apigw_v2._update_api(physical_id, payload)
     if resp[0] >= 400:
         raise ValueError(f"AWS::ApiGatewayV2::Api update failed: {resp[2]!r}")
@@ -12789,7 +12793,7 @@ def _asg_create(logical_id, props, stack_name):
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
-def _asg_mixed_instances_policy(policy):
+def _asg_mixed_instances_policy(policy, stored=None):
     from ministack.services.autoscaling import resolve_mixed_instances_policy
 
     if not policy:
@@ -12798,13 +12802,13 @@ def _asg_mixed_instances_policy(policy):
     for key in ("OnDemandBaseCapacity", "OnDemandPercentageAboveBaseCapacity", "SpotInstancePools"):
         if key in distribution:
             distribution[key] = int(distribution[key])
-    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution})
+    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution}, stored)
     if error:
         raise ValueError(error)
     return resolved
 
 
-def _asg_fields(props):
+def _asg_fields(props, stored_policy=None):
     """The group members a template sets, for create and update alike."""
     from ministack.services.autoscaling import _SOURCE_ERROR
 
@@ -12816,7 +12820,7 @@ def _asg_fields(props):
     return {
         "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
         "LaunchTemplate": _asg_launch_template(props.get("LaunchTemplate")),
-        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy")),
+        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy"), stored_policy),
         "MinSize": int(props.get("MinSize", 0)),
         "MaxSize": int(props.get("MaxSize", 0)),
         "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
@@ -12855,7 +12859,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     )
     if replaced is not None:
         return replaced
-    asg.update(_asg_fields(new_props))
+    asg.update(_asg_fields(new_props, asg.get("MixedInstancesPolicy")))
     # Tags from CreateOrUpdateTags stay.
     tags = _asg._tags.get(physical_id)
     if tags is None:

@@ -82,6 +82,7 @@ from ministack.core.responses import (
     get_request_client_ip,
     json_response,
     new_uuid,
+    to_output_shape,
 )
 from ministack.core.router import extract_access_key_id
 
@@ -1725,13 +1726,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
         "SnapStart": _snapstart_response(data.get("SnapStart")),
-        "LoggingConfig": data.get(
-            "LoggingConfig",
-            {
-                "LogFormat": "Text",
-                "LogGroup": f"/aws/lambda/{name}",
-            },
-        ),
+        "LoggingConfig": _logging_config(name, data.get("LoggingConfig")),
         "RuntimeVersionConfig": {
             "RuntimeVersionArn": "",
         },
@@ -2487,7 +2482,7 @@ def _create_function(data: dict):
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     runtime_or_image = config.get("Runtime") or ("image=" + image_uri if image_uri else "?")
     logger.info("Lambda function created: %s (%s)", name, runtime_or_image)
-    return json_response(response, 201)
+    return json_response(_fn_config_out(response), 201)
 
 
 def _get_function(name: str, qualifier: str | None = None):
@@ -2529,7 +2524,7 @@ def _get_function(name: str, qualifier: str | None = None):
         if func.get("s3_object_storage_mode") == "REFERENCE" and func.get("s3_object_ref"):
             code_info["ResolvedS3Object"] = func["s3_object_ref"]
     result: dict = {
-        "Configuration": effective_config,
+        "Configuration": _fn_config_out(effective_config),
         "Code": code_info,
         "Tags": func.get("tags", {}),
     }
@@ -2554,7 +2549,7 @@ def _get_function_config(name: str, qualifier: str | None = None):
             f"Function not found: {_func_arn(name)}",
             404,
         )
-    return json_response(effective_config)
+    return json_response(_fn_config_out(effective_config))
 
 
 def _list_function_event_invoke_configs(func_name: str, query_params: dict):
@@ -2571,8 +2566,28 @@ def _list_function_event_invoke_configs(func_name: str, query_params: dict):
     legacy = func.get("event_invoke_config")
     if legacy and "" not in configs:
         configs[""] = legacy
-    items = list(configs.values())
-    return json_response({"FunctionEventInvokeConfigs": items})
+    items, next_marker = _offset_marker_page(list(configs.values()), query_params)
+    result = {"FunctionEventInvokeConfigs": items}
+    if next_marker:
+        result["NextMarker"] = next_marker
+    return json_response(result)
+
+
+def _offset_marker_page(items: list, query_params: dict, cap: int | None = None):
+    """MaxItems / Marker over a list. Returns ``(page, next_marker)``."""
+    try:
+        start = max(int(base64.urlsafe_b64decode(_qp_first(query_params, "Marker").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        start = 0
+    try:
+        limit = max(int(_qp_first(query_params, "MaxItems")), 1)
+    except (TypeError, ValueError):
+        limit = cap or len(items)
+    if cap:
+        limit = min(limit, cap)
+    end = start + limit
+    next_marker = base64.urlsafe_b64encode(str(end).encode()).decode() if end < len(items) else None
+    return items[start:end], next_marker
 
 
 def _presigned_code_url(func_name: str) -> str:
@@ -2770,7 +2785,7 @@ def _list_functions(query_params: dict):
                 break
 
     page = all_names[start : start + max_items]
-    configs = [_functions[n]["config"] for n in page]
+    configs = [_fn_config_out(_functions[n]["config"]) for n in page]
     result: dict = {"Functions": configs}
     if start + max_items < len(all_names):
         result["NextMarker"] = page[-1] if page else ""
@@ -2946,9 +2961,9 @@ def _update_code(name: str, data: dict):
         func["versions"][str(ver_num)] = ver_record
         if _stamp_snapstart_published_version(ver_config):
             _snapstart_provision_version_async(name, ver_record)
-        return json_response({**func["config"], "Version": str(ver_num)})
+        return json_response(_fn_config_out({**func["config"], "Version": str(ver_num)}))
 
-    return json_response(func["config"])
+    return json_response(_fn_config_out(func["config"]))
 
 
 @_serialized_revision_update()
@@ -3030,6 +3045,8 @@ def _update_config(name: str, data: dict):
                 config["SnapStart"] = _snapstart_response(data["SnapStart"])
             elif key == "VpcConfig":
                 config[key] = _vpc_config_with_id(data[key])
+            elif key == "LoggingConfig":
+                config[key] = _logging_config(name, data[key])
             else:
                 config[key] = data[key]
     if "Architectures" in data:
@@ -3068,7 +3085,7 @@ def _update_config(name: str, data: dict):
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     if "Layers" in data:
         _sweep_extract_cache()
-    return json_response(config)
+    return json_response(_fn_config_out(config))
 
 
 # ---------------------------------------------------------------------------
@@ -6067,7 +6084,7 @@ def _publish_version(name: str, data: dict):
     # haven't changed since the last version": the latest version comes back.
     latest = max(func["versions"], key=int, default=None)
     if latest and func["versions"][latest].get("function_revision") == func["config"].get("RevisionId"):
-        return json_response(func["versions"][latest]["config"], 201)
+        return json_response(_fn_config_out(func["versions"][latest]["config"]), 201)
     ver_num = func["next_version"]
     func["next_version"] = ver_num + 1
 
@@ -6086,7 +6103,7 @@ def _publish_version(name: str, data: dict):
     func["versions"][str(ver_num)] = ver_record
     if _stamp_snapstart_published_version(ver_config):
         _snapstart_provision_version_async(name, ver_record)
-    return json_response(ver_config, 201)
+    return json_response(_fn_config_out(ver_config), 201)
 
 
 def _list_versions(name: str, query_params: dict):
@@ -6111,7 +6128,7 @@ def _list_versions(name: str, query_params: dict):
                 break
 
     page = versions[start : start + max_items]
-    result: dict = {"Versions": page}
+    result: dict = {"Versions": [_fn_config_out(v) for v in page]}
     if start + max_items < len(versions):
         result["NextMarker"] = page[-1]["Version"] if page else ""
     return json_response(result)
@@ -6625,7 +6642,7 @@ def _list_layer_versions(layer_name: str, query_params: dict):
                 break
 
     page = all_versions[start : start + max_items]
-    result: dict = {"LayerVersions": page}
+    result: dict = {"LayerVersions": [to_output_shape("lambda", "LayerVersionsListItem", v) for v in page]}
     if start + max_items < len(all_versions):
         result["NextMarker"] = str(page[-1]["Version"]) if page else ""
     return json_response(result)
@@ -6736,7 +6753,7 @@ def _list_layers(query_params: dict):
                 {
                     "LayerName": name,
                     "LayerArn": _layer_arn(name),
-                    "LatestMatchingVersion": {k: v for k, v in latest.items() if not k.startswith("_")},
+                    "LatestMatchingVersion": to_output_shape("lambda", "LayerVersionsListItem", latest),
                 }
             )
 
@@ -7268,6 +7285,18 @@ def esm_source_defaults(is_sqs: bool) -> dict:
     }
 
 
+def _logging_config(name: str, sent) -> dict:
+    """LoggingConfig as sent, over the default Text format and /aws/lambda/<name> group."""
+    out = {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}
+    if isinstance(sent, dict):
+        out.update({k: v for k, v in sent.items() if v})
+    return out
+
+
+def _fn_config_out(config: dict) -> dict:
+    return to_output_shape("lambda", "FunctionConfiguration", config)
+
+
 def _esm_response(esm: dict, state: str | None = None, modified_now: bool = False) -> dict:
     """Return ESM dict without internal-only fields.
 
@@ -7281,7 +7310,7 @@ def _esm_response(esm: dict, state: str | None = None, modified_now: bool = Fals
     it too. Callers cannot construct this ARN themselves, and ListTags is keyed
     on it, so omitting it leaves tags unreadable.
     """
-    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled", "Qualifier", "Tags")}
     if state:
         out["State"] = state
     if (not modified_now and isinstance(out.get("LastModified"), float)
@@ -7426,7 +7455,12 @@ def _create_esm(data: dict):
     # the poller can honor MaximumRecordAgeInSeconds + the OnFailure destination.
     for _opt in ("MaximumRetryAttempts", "MaximumRecordAgeInSeconds",
                  "BisectBatchOnFunctionError", "ParallelizationFactor",
-                 "DestinationConfig", "TumblingWindowInSeconds"):
+                 "DestinationConfig", "TumblingWindowInSeconds", "KMSKeyArn",
+                 "MetricsConfig", "LoggingConfig", "ProvisionedPollerConfig",
+                 "StartingPositionTimestamp", "Topics", "Queues",
+                 "SourceAccessConfigurations", "SelfManagedEventSource",
+                 "AmazonManagedKafkaEventSourceConfig", "SelfManagedKafkaEventSourceConfig",
+                 "DocumentDBEventSourceConfig"):
         if _opt in data:
             esm[_opt] = data[_opt]
     if event_source_spec.service != "sqs":
@@ -7506,6 +7540,15 @@ def _update_esm(esm_id: str, data: dict):
         "DestinationConfig",
         "FilterCriteria",
         "ScalingConfig",
+        "TumblingWindowInSeconds",
+        "KMSKeyArn",
+        "MetricsConfig",
+        "LoggingConfig",
+        "ProvisionedPollerConfig",
+        "SourceAccessConfigurations",
+        "AmazonManagedKafkaEventSourceConfig",
+        "SelfManagedKafkaEventSourceConfig",
+        "DocumentDBEventSourceConfig",
     ):
         if key in data:
             esm[key] = data[key]
@@ -8263,7 +8306,7 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
     if data.get("Cors"):
         cfg["Cors"] = data["Cors"]
     _function_urls[key] = cfg
-    return json_response(cfg, status=201)
+    return json_response({k: v for k, v in cfg.items() if k != "LastModifiedTime"}, status=201)
 
 
 def _get_function_url_config(func_name: str, qualifier: str | None):
@@ -8308,7 +8351,11 @@ def _delete_function_url_config(func_name: str, qualifier: str | None):
 
 def _list_function_url_configs(func_name: str, query_params: dict):
     configs = [v for k, v in _function_urls.items() if k == func_name or k.startswith(f"{func_name}:")]
-    return json_response({"FunctionUrlConfigs": configs})
+    configs, next_marker = _offset_marker_page(configs, query_params, cap=50)
+    result = {"FunctionUrlConfigs": configs}
+    if next_marker:
+        result["NextMarker"] = next_marker
+    return json_response(result)
 
 
 # ---------------------------------------------------------------------------

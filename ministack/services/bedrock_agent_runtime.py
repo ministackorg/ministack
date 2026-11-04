@@ -40,6 +40,7 @@ from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
     get_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("bedrock-agent-runtime")
@@ -62,11 +63,23 @@ def _camelize(obj):
     return obj
 
 
+_DOCUMENT_MEMBERS = frozenset(('document', 'jsonDocument', 'metadata', 'operationRequest', 'operationResponse', 'additionalModelRequestFields'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _json(payload: dict, status: int = 200, extra_headers: dict | None = None) -> tuple:
     headers = {"Content-Type": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
-    return status, headers, json.dumps(_camelize(payload)).encode()
+    return status, headers, json.dumps(_drop_none(_camelize(payload))).encode()
 
 
 def _empty(status: int = 200) -> tuple:
@@ -558,7 +571,7 @@ def _create_invocation(session_id: str, body) -> tuple:
         "Description": body_obj.get("description", ""),
     }
     _invocations[f"{session_id}/{inv_id}"] = rec
-    return _json(rec, status=201)
+    return _json(to_output_shape("bedrock-agent-runtime", "CreateInvocationResponse", _camelize(rec)), status=201)
 
 
 def _list_invocations(session_id: str, body) -> tuple:
@@ -676,13 +689,16 @@ def _get_flow_execution(flow_id: str, alias_id: str, exec_id: str) -> tuple:
     rec = _flow_executions.get(f"{flow_id}/{alias_id}/{exec_id}")
     if rec is None:
         return _not_found(f"Flow execution {exec_id} not found.")
-    return _json(rec)
+    view = {**rec, "FlowIdentifier": rec["FlowId"], "FlowAliasIdentifier": rec["FlowAliasId"],
+            "StartedAt": rec["CreatedAt"]}
+    return _json(to_output_shape("bedrock-agent-runtime", "GetFlowExecutionResponse", _camelize(view)))
 
 
 def _list_flow_executions(flow_id: str, query_params) -> tuple:
-    summaries = [r for k, r in _flow_executions.items()
-                  if k.startswith(f"{flow_id}/")]
-    return _json({"FlowExecutionSummaries": summaries})
+    summaries = [{**r, "FlowIdentifier": r["FlowId"], "FlowAliasIdentifier": r["FlowAliasId"]}
+                 for k, r in _flow_executions.items() if k.startswith(f"{flow_id}/")]
+    return _json(to_output_shape("bedrock-agent-runtime", "ListFlowExecutionsResponse",
+                                 _camelize({"FlowExecutionSummaries": summaries})))
 
 
 def _list_flow_execution_events(flow_id: str, alias_id: str, exec_id: str,

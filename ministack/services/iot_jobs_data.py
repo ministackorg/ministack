@@ -161,9 +161,17 @@ def _start_next(thing: str, payload: dict, *, peek: bool) -> tuple:
     (live-captured)."""
     if error := _iot_module._jobs_status_details_error(payload.get("statusDetails")):
         return error
+    pending = _iot_module.jobs_pending_for_thing(thing)
+    starts = not peek and bool(pending) and pending[0]["status"] == "QUEUED"
     execution = _iot_module.jobs_start_next_execution(
         thing, status_details=payload.get("statusDetails"), peek=peek
     )
+    step_timeout = payload.get("stepTimeoutInMinutes")
+    if execution is not None and starts and step_timeout is not None:
+        stored = _iot_module._job_executions[(thing, execution["jobId"])]
+        for target in (stored, execution):
+            target["stepTimeoutInMinutes"] = step_timeout
+            target["timeoutStartedAt"] = execution["startedAt"]
     if execution is None:
         # AWS returns an empty structure when nothing is pending.
         return json_response({})

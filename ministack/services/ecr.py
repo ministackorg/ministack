@@ -205,14 +205,27 @@ def _create_repository(data):
         "encryptionConfiguration": data.get("encryptionConfiguration", {"encryptionType": "AES256"}),
         "tags": data.get("tags", []),
     }
+    if data.get("imageTagMutabilityExclusionFilters"):
+        repo["imageTagMutabilityExclusionFilters"] = data["imageTagMutabilityExclusionFilters"]
     _repositories[name] = repo
     _images[name] = []
     return json_response({"repository": _repo_shape(repo)})
 
 
+def _paged(data, key, items):
+    try:
+        start = max(int(data.get("nextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    end = start + (data.get("maxResults") or 100)
+    body = {key: items[start:end]}
+    if end < len(items):
+        body["nextToken"] = str(end)
+    return json_response(body)
+
+
 def _describe_repositories(data):
     names = data.get("repositoryNames", [])
-    max_results = data.get("maxResults", 1000)
 
     if names:
         repos = []
@@ -221,10 +234,8 @@ def _describe_repositories(data):
                 return error_response_json("RepositoryNotFoundException",
                                            f"The repository with name '{n}' does not exist", 400)
             repos.append(_repositories[n])
-    else:
-        repos = list(_repositories.values())
-
-    return json_response({"repositories": [_repo_shape(r) for r in repos[:max_results]]})
+        return json_response({"repositories": [_repo_shape(r) for r in repos]})
+    return _paged(data, "repositories", [_repo_shape(r) for r in _repositories.values()])
 
 
 def _delete_repository(data):
@@ -376,7 +387,7 @@ def _list_images(data):
             continue
         result.append(img["imageId"])
 
-    return json_response({"imageIds": result})
+    return _paged(data, "imageIds", result)
 
 
 def _describe_images(data):
@@ -412,7 +423,9 @@ def _describe_images(data):
                 "application/vnd.docker.distribution.manifest.v2+json"),
         })
 
-    return json_response({"imageDetails": details})
+    if image_ids:
+        return json_response({"imageDetails": details})
+    return _paged(data, "imageDetails", details)
 
 
 def _get_authorization_token(data):
@@ -564,11 +577,19 @@ def _put_image_tag_mutability(data):
                                    f"The repository with name '{name}' does not exist", 400)
     mutability = data.get("imageTagMutability", "MUTABLE")
     _repositories[name]["imageTagMutability"] = mutability
-    return json_response({
+    filters = data.get("imageTagMutabilityExclusionFilters")
+    if filters:
+        _repositories[name]["imageTagMutabilityExclusionFilters"] = filters
+    else:
+        _repositories[name].pop("imageTagMutabilityExclusionFilters", None)
+    resp = {
         "registryId": _registry_id(),
         "repositoryName": name,
         "imageTagMutability": mutability,
-    })
+    }
+    if filters:
+        resp["imageTagMutabilityExclusionFilters"] = filters
+    return json_response(resp)
 
 
 def _put_image_scanning_configuration(data):
@@ -696,6 +717,8 @@ def _repo_shape(repo):
         "repositoryUri": repo["repositoryUri"],
         "createdAt": repo["createdAt"],
         "imageTagMutability": repo.get("imageTagMutability", "MUTABLE"),
+        **({"imageTagMutabilityExclusionFilters": repo["imageTagMutabilityExclusionFilters"]}
+           if repo.get("imageTagMutabilityExclusionFilters") else {}),
         "imageScanningConfiguration": repo.get("imageScanningConfiguration", {"scanOnPush": False}),
         "encryptionConfiguration": repo.get("encryptionConfiguration", {"encryptionType": "AES256"}),
     }

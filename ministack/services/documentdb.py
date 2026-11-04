@@ -356,7 +356,9 @@ def _next_port():
     """Allocate the next host port for published containers."""
     with _port_lock:
         port = _port_counter[0]
-        _port_counter[0] += 1
+        while not _rds._is_host_port_free(port):  # another container may already publish it
+            port += 1
+        _port_counter[0] = port + 1
         return port
 
 
@@ -392,7 +394,7 @@ def _launch_documentdb_container(name,
         "image": image,
         "detach": True,
         "environment": env,
-        "ports": {f"{container_port}/tcp": host_port},
+        "ports": {f"{container_port}/tcp": container_reaper.published_port(host_port)},
         "name": name,
         "labels": labels,
     }
@@ -904,6 +906,7 @@ def _create_db_instance(params):
     deletion_protection = _evaluate_params(params, "DeletionProtection") == "true"
     if cluster:
         deletion_protection = deletion_protection or bool(cluster.get("DeletionProtection"))
+    ca_certificate = _evaluate_params(params, "CACertificateIdentifier") or "rds-ca-rsa2048-g1"
 
     instance = {
         "DBInstanceIdentifier": db_id,
@@ -969,7 +972,7 @@ def _create_db_instance(params):
         "StorageEncrypted": _evaluate_params(params, "StorageEncrypted") == "true",
         "KmsKeyId": _evaluate_params(params, "KmsKeyId") or "",
         "DbiResourceId": dbi_resource_id,
-        "CACertificateIdentifier": "rds-ca-rsa2048-g1",
+        "CACertificateIdentifier": ca_certificate,
         "DomainMemberships": [],
         "CopyTagsToSnapshot": _evaluate_params(params, "CopyTagsToSnapshot") == "true",
         "MonitoringInterval": int(_evaluate_params(params, "MonitoringInterval") or "0"),
@@ -980,8 +983,8 @@ def _create_db_instance(params):
         "Timezone": "",
         "IAMDatabaseAuthenticationEnabled": (
             _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true"),
-        "PerformanceInsightsEnabled": False,
-        "PerformanceInsightsKMSKeyId": "",
+        "PerformanceInsightsEnabled": _evaluate_params(params, "EnablePerformanceInsights").lower() == "true",
+        "PerformanceInsightsKMSKeyId": _evaluate_params(params, "PerformanceInsightsKMSKeyId"),
         "PerformanceInsightsRetentionPeriod": 7,
         "EnabledCloudwatchLogsExports": [],
         "ProcessorFeatures": [],
@@ -994,7 +997,7 @@ def _create_db_instance(params):
         "NetworkType": "IPV4",
         "StorageThroughput": 0,
         "CertificateDetails": {
-            "CAIdentifier": "rds-ca-rsa2048-g1",
+            "CAIdentifier": ca_certificate,
             "ValidTill": "2061-01-01T00:00:00Z",
         },
         "IsStorageConfigUpgradeAvailable": False,
@@ -1183,10 +1186,11 @@ def _describe_db_instances(params):
         if filters:
             instances = _apply_instance_filters(instances, filters)
 
+    instances, marker_xml = _page(params, instances)
     members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances)
     return _xml(200, "DescribeDBInstancesResponse",
                 f"<DescribeDBInstancesResult><DBInstances>{members}"
-                f"</DBInstances></DescribeDBInstancesResult>")
+                f"</DBInstances>{marker_xml}</DescribeDBInstancesResult>")
 
 
 def _modify_db_instance(params):
@@ -1219,8 +1223,70 @@ def _modify_db_instance(params):
         instance["_MasterUserPassword"] = _evaluate_params(params, "MasterUserPassword")
     if _evaluate_params(params, "DeletionProtection"):
         instance["DeletionProtection"] = _evaluate_params(params, "DeletionProtection") == "true"
+    if _evaluate_params(params, "PromotionTier"):
+        instance["PromotionTier"] = int(_evaluate_params(params, "PromotionTier"))
+        for member in (_clusters.get(instance.get("DBClusterIdentifier")) or {}).get("DBClusterMembers", []):
+            if member.get("DBInstanceIdentifier") == instance["DBInstanceIdentifier"]:
+                member["PromotionTier"] = instance["PromotionTier"]
+    if _evaluate_params(params, "CACertificateIdentifier"):
+        instance["CACertificateIdentifier"] = _evaluate_params(params, "CACertificateIdentifier")
+        instance.setdefault("CertificateDetails", {"ValidTill": "2061-01-01T00:00:00Z"})["CAIdentifier"] = (
+            instance["CACertificateIdentifier"])
+    if _evaluate_params(params, "EnablePerformanceInsights"):
+        instance["PerformanceInsightsEnabled"] = _evaluate_params(params, "EnablePerformanceInsights").lower() == "true"
+    if _evaluate_params(params, "PerformanceInsightsKMSKeyId"):
+        instance["PerformanceInsightsKMSKeyId"] = _evaluate_params(params, "PerformanceInsightsKMSKeyId")
+    new_id = _evaluate_params(params, "NewDBInstanceIdentifier").lower()
+    if new_id and new_id != instance["DBInstanceIdentifier"]:
+        if new_id in _instances:
+            return _error("DBInstanceAlreadyExists", f"DB instance {new_id} already exists", 400)
+        _rename_instance(instance, new_id)
 
     return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
+
+
+def _rename_instance(instance, new_id):
+    old_id = instance["DBInstanceIdentifier"]
+    old_arn = instance["DBInstanceArn"]
+    new_arn = old_arn[:-len(old_id)] + new_id
+    del _instances[old_id]
+    instance["DBInstanceIdentifier"] = new_id
+    instance["DBInstanceArn"] = new_arn
+    _instances[new_id] = instance
+    if old_arn in _tags:
+        _tags[new_arn] = _tags.pop(old_arn)
+    for member in (_clusters.get(instance.get("DBClusterIdentifier")) or {}).get("DBClusterMembers", []):
+        if member.get("DBInstanceIdentifier") == old_id:
+            member["DBInstanceIdentifier"] = new_id
+
+
+def _rename_cluster(cluster, new_id):
+    old_id = cluster["DBClusterIdentifier"]
+    old_arn = cluster["DBClusterArn"]
+    new_arn = old_arn[:-len(old_id)] + new_id
+    del _clusters[old_id]
+    cluster["DBClusterIdentifier"] = new_id
+    cluster["DBClusterArn"] = new_arn
+    for key in ("Endpoint", "ReaderEndpoint"):
+        if cluster.get(key, "").startswith(f"{old_id}.cluster-"):
+            cluster[key] = new_id + cluster[key][len(old_id):]
+    _clusters[new_id] = cluster
+    if old_arn in _tags:
+        _tags[new_arn] = _tags.pop(old_arn)
+    for instance in _instances.values():
+        if instance.get("DBClusterIdentifier") == old_id:
+            instance["DBClusterIdentifier"] = new_id
+            if instance.get("_shared_cluster_id") == old_id:
+                instance["_shared_cluster_id"] = new_id
+
+
+def _serverless_v2_scaling(params):
+    config = {}
+    for member in ("MinCapacity", "MaxCapacity"):
+        value = _evaluate_params(params, f"ServerlessV2ScalingConfiguration.{member}")
+        if value:
+            config[member] = float(value)
+    return config
 
 
 def _coerce_scalar(field, value, current):
@@ -1323,7 +1389,8 @@ def _create_db_cluster(params):
         "DeletionProtection": _evaluate_params(params, "DeletionProtection") == "true",
         "IAMDatabaseAuthenticationEnabled": (
             _evaluate_params(params, "EnableIAMDatabaseAuthentication") == "true"),
-        "EnabledCloudwatchLogsExports": [],
+        "EnabledCloudwatchLogsExports": _parse_member_list(params, "EnableCloudwatchLogsExports"),
+        "StorageType": _evaluate_params(params, "StorageType") or "standard",
         "HttpEndpointEnabled": _evaluate_params(params, "EnableHttpEndpoint") == "true",
         "CopyTagsToSnapshot": _evaluate_params(params, "CopyTagsToSnapshot") == "true",
         "CrossAccountClone": False,
@@ -1342,6 +1409,8 @@ def _create_db_cluster(params):
         "_shared_storage_initialized": False,
         "_shared_container_epoch": 0,
     }
+    if _serverless_v2_scaling(params):
+        cluster["ServerlessV2ScalingConfiguration"] = _serverless_v2_scaling(params)
     _clusters[cluster_id] = cluster
 
     req_tags = _parse_tags(params)
@@ -1398,10 +1467,11 @@ def _describe_db_clusters(params):
         if filters:
             clusters = _apply_cluster_filters(clusters, filters)
 
+    clusters, marker_xml = _page(params, clusters)
     members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
     return _xml(200, "DescribeDBClustersResponse",
                 f"<DescribeDBClustersResult><DBClusters>{members}"
-                f"</DBClusters></DescribeDBClustersResult>")
+                f"</DBClusters>{marker_xml}</DescribeDBClustersResult>")
 
 
 def _modify_db_cluster(params):
@@ -1411,6 +1481,13 @@ def _modify_db_cluster(params):
     if not cluster:
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
 
+    parameter_group = _evaluate_params(params, "DBClusterParameterGroupName")
+    if (parameter_group and not parameter_group.startswith("default.")
+            and parameter_group not in _rds._db_cluster_param_groups):
+        return _error("DBClusterParameterGroupNotFound",
+                      f"DBClusterParameterGroup {parameter_group} not found.", 404)
+    if parameter_group:
+        cluster["DBClusterParameterGroup"] = parameter_group
     if _evaluate_params(params, "EngineVersion"):
         cluster["EngineVersion"] = _evaluate_params(params, "EngineVersion")
     if _evaluate_params(params, "MasterUserPassword"):
@@ -1439,6 +1516,21 @@ def _modify_db_cluster(params):
         cluster["VpcSecurityGroups"] = [
             {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
         ]
+    if _evaluate_params(params, "StorageType"):
+        cluster["StorageType"] = _evaluate_params(params, "StorageType")
+    if _serverless_v2_scaling(params):
+        cluster["ServerlessV2ScalingConfiguration"] = {
+            **(cluster.get("ServerlessV2ScalingConfiguration") or {}), **_serverless_v2_scaling(params)}
+    enabled = _parse_member_list(params, "CloudwatchLogsExportConfiguration.EnableLogTypes")
+    disabled = _parse_member_list(params, "CloudwatchLogsExportConfiguration.DisableLogTypes")
+    if enabled or disabled:
+        exports = [t for t in cluster.get("EnabledCloudwatchLogsExports", []) if t not in disabled]
+        cluster["EnabledCloudwatchLogsExports"] = exports + [t for t in enabled if t not in exports]
+    new_id = _evaluate_params(params, "NewDBClusterIdentifier").lower()
+    if new_id and new_id != cluster_id:
+        if new_id in _clusters:
+            return _error("DBClusterAlreadyExistsFault", f"DB cluster {new_id} already exists.", 400)
+        _rename_cluster(cluster, new_id)
 
     return _xml(200, "ModifyDBClusterResponse",
                 f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}"
@@ -1811,8 +1903,7 @@ def _instance_xml(i):
         <AvailabilityZone>{i.get('AvailabilityZone', f'{get_region()}a')}</AvailabilityZone>
         <DBSubnetGroup>
             <DBSubnetGroupName>{subnet.get('DBSubnetGroupName', 'default')}</DBSubnetGroupName>
-            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription', '')}
-            </DBSubnetGroupDescription>
+            <DBSubnetGroupDescription>{subnet.get('DBSubnetGroupDescription', '')}</DBSubnetGroupDescription>
             <VpcId>{subnet.get('VpcId', 'vpc-00000000')}</VpcId>
             <SubnetGroupStatus>{subnet.get('SubnetGroupStatus', 'Complete')}</SubnetGroupStatus>
             <Subnets>{subnet_xml}</Subnets>
@@ -1822,12 +1913,9 @@ def _instance_xml(i):
         <PendingModifiedValues>{pending_xml}</PendingModifiedValues>
         <LatestRestorableTime>{latest_restore}</LatestRestorableTime>
         <MultiAZ>{str(i.get('MultiAZ', False)).lower()}</MultiAZ>
-        <AutoMinorVersionUpgrade>
-            {str(i.get('AutoMinorVersionUpgrade', True)).lower()}
-        </AutoMinorVersionUpgrade>
+        <AutoMinorVersionUpgrade>{str(i.get('AutoMinorVersionUpgrade', True)).lower()}</AutoMinorVersionUpgrade>
         <ReadReplicaDBInstanceIdentifiers>{read_replica_xml}</ReadReplicaDBInstanceIdentifiers>
-        <ReadReplicaSourceDBInstanceIdentifier>{read_replica_source}
-        </ReadReplicaSourceDBInstanceIdentifier>
+        <ReadReplicaSourceDBInstanceIdentifier>{read_replica_source}</ReadReplicaSourceDBInstanceIdentifier>
         <ReadReplicaDBClusterIdentifiers/>
         <ReplicaMode>{i.get('ReplicaMode', '')}</ReplicaMode>
         <LicenseModel>{i.get('LicenseModel', 'general-public-license')}</LicenseModel>
@@ -1845,32 +1933,24 @@ def _instance_xml(i):
         <DomainMemberships/>
         <CopyTagsToSnapshot>{str(i.get('CopyTagsToSnapshot', False)).lower()}</CopyTagsToSnapshot>
         <MonitoringInterval>{i.get('MonitoringInterval', 0)}</MonitoringInterval>
-        <EnhancedMonitoringResourceArn>
-            {i.get('EnhancedMonitoringResourceArn', '')}
-        </EnhancedMonitoringResourceArn>
+        <EnhancedMonitoringResourceArn>{i.get('EnhancedMonitoringResourceArn', '')}</EnhancedMonitoringResourceArn>
         <MonitoringRoleArn>{i.get('MonitoringRoleArn', '')}</MonitoringRoleArn>
         <PromotionTier>{i.get('PromotionTier', 1)}</PromotionTier>
         <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
-        <IAMDatabaseAuthenticationEnabled>{iam_auth}
-        </IAMDatabaseAuthenticationEnabled>
-        <PerformanceInsightsEnabled>
-            {str(i.get('PerformanceInsightsEnabled', False)).lower()}
-        </PerformanceInsightsEnabled>
+        <IAMDatabaseAuthenticationEnabled>{iam_auth}</IAMDatabaseAuthenticationEnabled>
+        <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled', False)).lower()}</PerformanceInsightsEnabled>
+        {f"<PerformanceInsightsKMSKeyId>{i['PerformanceInsightsKMSKeyId']}</PerformanceInsightsKMSKeyId>" if i.get('PerformanceInsightsKMSKeyId') else ""}
         <EnabledCloudwatchLogsExports/>
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection', False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
         <TagList>{tag_xml}</TagList>
         {cert_xml}
-        <CustomerOwnedIpEnabled>
-            {str(i.get('CustomerOwnedIpEnabled', False)).lower()}
-        </CustomerOwnedIpEnabled>
+        <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled', False)).lower()}</CustomerOwnedIpEnabled>
         <BackupTarget>{i.get('BackupTarget', 'region')}</BackupTarget>
         <NetworkType>{i.get('NetworkType', 'IPV4')}</NetworkType>
         <StorageThroughput>{i.get('StorageThroughput', 0)}</StorageThroughput>
-        <IsStorageConfigUpgradeAvailable>
-            {str(i.get('IsStorageConfigUpgradeAvailable', False)).lower()}
-        </IsStorageConfigUpgradeAvailable>"""
+        <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable', False)).lower()}</IsStorageConfigUpgradeAvailable>"""
 
 
 def _cluster_xml(c):
@@ -1945,11 +2025,8 @@ def _cluster_xml(c):
         <StorageEncrypted>{str(c.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <KmsKeyId>{c.get('KmsKeyId', '')}</KmsKeyId>
         <DeletionProtection>{str(c.get('DeletionProtection', False)).lower()}</DeletionProtection>
-        <IAMDatabaseAuthenticationEnabled>{iam_auth}
-        </IAMDatabaseAuthenticationEnabled>
-        <HttpEndpointEnabled>
-            {str(c.get('HttpEndpointEnabled', False)).lower()}
-        </HttpEndpointEnabled>
+        <IAMDatabaseAuthenticationEnabled>{iam_auth}</IAMDatabaseAuthenticationEnabled>
+        <HttpEndpointEnabled>{str(c.get('HttpEndpointEnabled', False)).lower()}</HttpEndpointEnabled>
         <CopyTagsToSnapshot>{str(c.get('CopyTagsToSnapshot', False)).lower()}</CopyTagsToSnapshot>
         <CrossAccountClone>{str(c.get('CrossAccountClone', False)).lower()}</CrossAccountClone>
         <DbClusterResourceId>{c.get('DbClusterResourceId', '')}</DbClusterResourceId>
@@ -1959,7 +2036,23 @@ def _cluster_xml(c):
         <AllocatedStorage>{c.get('AllocatedStorage', 1)}</AllocatedStorage>
         <ActivityStreamStatus>{c.get('ActivityStreamStatus', 'stopped')}</ActivityStreamStatus>
         <NetworkType>{c.get('NetworkType', 'IPV4')}</NetworkType>
-        <EngineLifecycleSupport>{lifecycle}</EngineLifecycleSupport>"""
+        <EngineLifecycleSupport>{lifecycle}</EngineLifecycleSupport>{_cluster_optional_xml(c)}"""
+
+
+def _cluster_optional_xml(c):
+    xml = ""
+    if c.get("EnabledCloudwatchLogsExports"):
+        xml += ("<EnabledCloudwatchLogsExports>"
+                + "".join(f"<member>{_esc(t)}</member>" for t in c["EnabledCloudwatchLogsExports"])
+                + "</EnabledCloudwatchLogsExports>")
+    if c.get("StorageType") not in (None, "", "standard"):
+        xml += f"<StorageType>{_esc(c['StorageType'])}</StorageType>"
+    scaling = c.get("ServerlessV2ScalingConfiguration")
+    if scaling:
+        xml += ("<ServerlessV2ScalingConfiguration>"
+                + "".join(f"<{k}>{v}</{k}>" for k, v in scaling.items())
+                + "</ServerlessV2ScalingConfiguration>")
+    return xml
 
 
 # ---------------------------------------------------------------------------
@@ -1978,6 +2071,16 @@ def _evaluate_params(params, key, default=""):
     if isinstance(val, list):
         return val[0] if val else default
     return val
+
+
+def _page(params, items):
+    """MaxRecords (default 100, 20-100)/Marker offset paging; returns (page, Marker XML or "")."""
+    raw = _evaluate_params(params, "MaxRecords")
+    size = int(raw) if re.fullmatch(r"-?[0-9]+", raw or "") else 100
+    marker = _evaluate_params(params, "Marker")
+    start = int(marker) if marker.isdigit() else 0
+    end = start + min(max(size, 20), 100)
+    return items[start:end], (f"<Marker>{end}</Marker>" if end < len(items) else "")
 
 
 def _parse_tags(params):

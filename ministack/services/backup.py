@@ -34,6 +34,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    to_output_shape,
 )
 
 logger = logging.getLogger("backup")
@@ -206,7 +207,7 @@ def _describe_vault(name):
     v = _vaults.get(name)
     if v is None:
         return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 404)
-    return _ok(copy.copy(v))
+    return _ok(to_output_shape("backup", "DescribeBackupVaultOutput", v))
 
 
 def _delete_vault(name):
@@ -269,7 +270,6 @@ def _get_plan(plan_id):
     return _ok({
         "BackupPlanId": p["BackupPlanId"],
         "BackupPlanArn": p["BackupPlanArn"],
-        "BackupPlanName": p["BackupPlanName"],
         "CreationDate": p["CreationDate"],
         "LastExecutionDate": p["LastExecutionDate"],
         "VersionId": p["VersionId"],
@@ -342,7 +342,7 @@ def _list_plan_versions(plan_id):
     p = _plans.get(plan_id)
     if p is None:
         return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
-    return _ok({"BackupPlanVersionsList": p["Versions"]})
+    return _ok({"BackupPlanVersionsList": [to_output_shape("backup", "BackupPlansListMember", v) for v in p["Versions"]]})
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +444,8 @@ def _start_job(body):
         "BackupVaultArn": _vault_arn(vault_name) if vault_name else "",
         "ResourceArn": body.get("ResourceArn", ""),
         "IamRoleArn": body.get("IamRoleArn", ""),
-        "StartBy": now,
+        # StartWindowMinutes "is optional, and the default is 8 hours".
+        "StartBy": now + int(body.get("StartWindowMinutes") or 480) * 60,
         "CreationDate": now,
         "CompletionDate": now,
         "State": "COMPLETED",
@@ -456,6 +457,10 @@ def _start_job(body):
         "RecoveryPointTags": body.get("RecoveryPointTags", {}),
         "IdempotencyToken": body.get("IdempotencyToken", ""),
     }
+    if body.get("Lifecycle") is not None:
+        record["RecoveryPointLifecycle"] = body["Lifecycle"]
+    if body.get("BackupOptions") is not None:
+        record["BackupOptions"] = body["BackupOptions"]
     _jobs[job_id] = record
     # increment recovery point count on the vault
     if vault_name and vault_name in _vaults:
@@ -485,11 +490,22 @@ def _stop_job(job_id):
     return _no_content()
 
 
+
+def _shape_view(record, shape):
+    """The record's members that the backup output shape has."""
+    import botocore.session
+
+    global _BACKUP_MODEL
+    if "_BACKUP_MODEL" not in globals():
+        _BACKUP_MODEL = botocore.session.get_session().get_service_model("backup")
+    members = _BACKUP_MODEL.shape_for(shape).members
+    return {k: v for k, v in record.items() if k in members}
+
 def _describe_job(job_id):
     j = _jobs.get(job_id)
     if j is None:
         return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 404)
-    return _ok(copy.copy(j))
+    return _ok(_shape_view(j, "DescribeBackupJobOutput"))
 
 
 def _list_jobs(query):
@@ -503,7 +519,7 @@ def _list_jobs(query):
         items = [j for j in items if j["State"] == state_filter]
     if resource_filter:
         items = [j for j in items if j["ResourceArn"] == resource_filter]
-    return _paginate(items, query, "BackupJobs")
+    return _paginate([_shape_view(j, "BackupJob") for j in items], query, "BackupJobs")
 
 
 # ---------------------------------------------------------------------------
@@ -558,14 +574,28 @@ def _untag_resource(arn, body):
     return _no_content()
 
 
-def _list_tags(arn):
+def _list_tags(arn, query=None):
     try:
         tag_dict = _resolve_resource(arn)
     except ValueError as exc:
         return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
         return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
-    return _ok({"Tags": dict(tag_dict)})
+    query = query or {}
+    items = list(tag_dict.items())
+    try:
+        start = max(int(query.get("nextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(query.get("maxResults") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    out = {"Tags": dict(items[start:end])}
+    if end < len(items):
+        out["NextToken"] = str(end)
+    return _ok(out)
 
 
 # ---------------------------------------------------------------------------
@@ -952,7 +982,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if parts and parts[0] == "tags":
         arn = "/".join(parts[1:])
         if method == "GET":
-            return _list_tags(arn)
+            return _list_tags(arn, query)
         if method == "POST":
             return _tag_resource(arn, body)
 

@@ -90,6 +90,33 @@ def _inherited_testcontainers_labels() -> dict:
     return _testcontainers_labels
 
 
+_LOOPBACK = ("127.0.0.1", "::1", "localhost")
+_publish_on_loopback: bool | None = None
+
+
+def _gateway_on_loopback() -> bool:
+    """Whether MiniStack's own port is reachable on loopback only: its container's binding in Docker, else BIND_HOST."""
+    if not (os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")):
+        return os.environ.get("BIND_HOST", "0.0.0.0").strip().lower() in _LOOPBACK
+    try:
+        import docker
+        me = docker.from_env(timeout=5).containers.get(os.environ.get("HOSTNAME", ""))
+        port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+        bindings = (me.attrs.get("NetworkSettings", {}).get("Ports") or {}).get(f"{port}/tcp") or []
+        return bool(bindings) and all(b.get("HostIp") in _LOOPBACK for b in bindings)
+    except Exception as exc:
+        logger.debug("reaper: own port bindings unavailable: %s", exc)
+        return False
+
+
+def published_port(host_port):
+    """A docker-py ``ports`` value: on loopback when MiniStack's own port is, else every interface as before."""
+    global _publish_on_loopback
+    if _publish_on_loopback is None:
+        _publish_on_loopback = _gateway_on_loopback()
+    return ("127.0.0.1", host_port) if _publish_on_loopback else host_port
+
+
 def own_labels(service: str, **extra) -> dict:
     """Labels every MiniStack-created container must carry.
 

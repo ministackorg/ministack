@@ -112,7 +112,8 @@ def test_gzip_put_metric_data_stores_every_datapoint(cw):
 
     # Guard: if botocore stops compressing, this test no longer covers the bug.
     assert sent.get("encoding") in (b"gzip", "gzip"), sent
-    assert len(cw.list_metrics(Namespace=namespace)["Metrics"]) == 600
+    pages = cw.get_paginator("list_metrics").paginate(Namespace=namespace)
+    assert sum(len(page["Metrics"]) for page in pages) == 600
 
 
 def test_s3_put_object_keeps_gzip_body_and_metadata(s3):

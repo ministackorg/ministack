@@ -9390,15 +9390,15 @@ def test_lambda_durable_function_config_round_trip(lam):
         "Role": _LAMBDA_ROLE,
         "Handler": "index.handler",
         "Code": {"ZipFile": zip_b64},
-        "DurableConfig": {"Enabled": True},
+        "DurableConfig": {"ExecutionTimeout": 900},
     })
     try:
         assert code in (200, 201), body
-        assert body.get("DurableConfig") == {"Enabled": True}
+        assert body.get("DurableConfig") == {"ExecutionTimeout": 900}
         # Boto3 strips unknown fields, so verify the round-trip via raw HTTP.
         code, gf = _raw_durable("GET", f"/2015-03-31/functions/{fname}")
         assert code == 200
-        assert gf["Configuration"].get("DurableConfig") == {"Enabled": True}
+        assert gf["Configuration"].get("DurableConfig") == {"ExecutionTimeout": 900}
     finally:
         try:
             lam.delete_function(FunctionName=fname)
@@ -10913,14 +10913,14 @@ def test_lambda_durable_create_function_durable_config_round_trip_with_update(la
     code, _ = _raw_durable("POST", "/2015-03-31/functions", body={
         "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
         "Handler": "index.handler", "Code": {"ZipFile": zip_b64},
-        "DurableConfig": {"Enabled": True},
+        "DurableConfig": {"ExecutionTimeout": 900},
     })
     assert code == 201
     try:
         # Touch unrelated config.
         lam.update_function_configuration(FunctionName=fname, Timeout=60, MemorySize=256)
         code, body = _raw_durable("GET", f"/2015-03-31/functions/{fname}")
-        assert body["Configuration"].get("DurableConfig") == {"Enabled": True}, \
+        assert body["Configuration"].get("DurableConfig") == {"ExecutionTimeout": 900}, \
             f"DurableConfig lost after Update: {body['Configuration'].get('DurableConfig')}"
     finally:
         try:

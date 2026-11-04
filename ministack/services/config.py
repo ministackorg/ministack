@@ -23,6 +23,7 @@ for, plus minimal CRUD to keep reads coherent:
 JSON-protocol timestamps are INT epoch seconds. Stores are per account+region.
 """
 
+import base64
 import copy
 import json
 import logging
@@ -370,7 +371,15 @@ def _describe_config_rule_evaluation_status(data):
             statuses.append(_evaluation_status(rec))
     else:
         statuses = [_evaluation_status(r) for r in _config_rules.values()]
-    return json_response({"ConfigRulesEvaluationStatus": statuses})
+    try:
+        start = max(int(base64.b64decode(data.get("NextToken") or "", validate=True).decode() or 0), 0)
+    except ValueError:
+        start = 0
+    end = start + data["Limit"] if data.get("Limit") else len(statuses)
+    out = {"ConfigRulesEvaluationStatus": statuses[start:end]}
+    if end < len(statuses):
+        out["NextToken"] = base64.b64encode(str(end).encode()).decode()
+    return json_response(out)
 
 
 def _evaluation_status(rec):

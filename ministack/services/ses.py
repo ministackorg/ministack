@@ -797,15 +797,34 @@ def _verify_domain_dkim(params):
                 f"</VerifyDomainDkimResult>")
 
 
+def _token_page(params, items, default=None, cap=None):
+    """MaxItems / NextToken over a list. Returns ``(page, next_token_xml)``."""
+    try:
+        start = max(int(base64.urlsafe_b64decode(_p(params, "NextToken").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    try:
+        limit = max(int(_p(params, "MaxItems")), 1)
+    except (TypeError, ValueError):
+        limit = default or len(items)
+    if cap:
+        limit = min(limit, cap)
+    end = start + limit
+    if end < len(items):
+        token = base64.urlsafe_b64encode(str(end).encode()).decode()
+        return items[start:end], f"<NextToken>{token}</NextToken>"
+    return items[start:end], ""
+
+
 def _list_identities(params):
     identity_type = _p(params, "IdentityType")
-    members = ""
-    for identity, info in _identities.items():
-        if not identity_type or info["Type"] == identity_type:
-            members += f"<member>{identity}</member>"
+    names = [identity for identity, info in _identities.items()
+             if not identity_type or info["Type"] == identity_type]
+    names, token_xml = _token_page(params, names)
+    members = "".join(f"<member>{identity}</member>" for identity in names)
     return _xml(200, "ListIdentitiesResponse",
                 f"<ListIdentitiesResult>"
-                f"<Identities>{members}</Identities>"
+                f"<Identities>{members}</Identities>{token_xml}"
                 f"</ListIdentitiesResult>")
 
 
@@ -973,13 +992,14 @@ def _describe_configuration_set(params):
 
 
 def _list_configuration_sets(params):
+    sets, token_xml = _token_page(params, list(_configuration_sets.values()))
     members = "".join(
         f"<member><Name>{cs['Name']}</Name></member>"
-        for cs in _configuration_sets.values()
+        for cs in sets
     )
     return _xml(200, "ListConfigurationSetsResponse",
                 f"<ListConfigurationSetsResult>"
-                f"<ConfigurationSets>{members}</ConfigurationSets>"
+                f"<ConfigurationSets>{members}</ConfigurationSets>{token_xml}"
                 f"</ListConfigurationSetsResult>")
 
 
@@ -1030,14 +1050,15 @@ def _delete_template(params):
 
 
 def _list_templates(params):
+    templates, token_xml = _token_page(params, list(_templates.values()), default=10, cap=100)
     members = "".join(
         f"<member><Name>{_esc(t['TemplateName'])}</Name>"
         f"<CreatedTimestamp>{t['CreatedTimestamp']}</CreatedTimestamp></member>"
-        for t in _templates.values()
+        for t in templates
     )
     return _xml(200, "ListTemplatesResponse",
                 f"<ListTemplatesResult>"
-                f"<TemplatesMetadata>{members}</TemplatesMetadata>"
+                f"<TemplatesMetadata>{members}</TemplatesMetadata>{token_xml}"
                 f"</ListTemplatesResult>")
 
 

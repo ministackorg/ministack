@@ -246,6 +246,19 @@ def _delete_resource(data):
     return json_response({"ProgressEvent": event})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_resources(data):
     type_name = data.get("TypeName")
     if not type_name:
@@ -259,10 +272,11 @@ def _list_resources(data):
         for rec in _resources.values()
         if rec.get("TypeName") == type_name
     ]
-    return json_response({
-        "TypeName": type_name,
-        "ResourceDescriptions": descriptions,
-    })
+    page, nxt = _page(descriptions, data.get("MaxResults"), data.get("NextToken"))
+    resp = {"TypeName": type_name, "ResourceDescriptions": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _list_resource_requests(data):
@@ -276,7 +290,11 @@ def _list_resource_requests(data):
         if statuses and event.get("OperationStatus") not in statuses:
             continue
         summaries.append(event)
-    return json_response({"ResourceRequestStatusSummaries": summaries})
+    page, nxt = _page(summaries, data.get("MaxResults") or 20, data.get("NextToken"))
+    resp = {"ResourceRequestStatusSummaries": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _get_resource_request_status(data):

@@ -21,6 +21,8 @@ Supports:
   Account:        DescribeAccountPreferences, PutAccountPreferences
 """
 
+import base64
+import binascii
 import copy
 import fnmatch
 import ipaddress
@@ -123,13 +125,32 @@ def _create_file_system(body):
         record["AvailabilityZoneId"] = ec2._az_id_for_zone_name(body["AvailabilityZoneName"])
 
     _file_systems[fs_id] = record
+    if body.get("Backup", bool(body.get("AvailabilityZoneName"))):
+        _backup_policies[fs_id] = {"Status": "ENABLED"}
     return _json(201, _fs_response(record))
+
+
+def _page(items, query, key, in_token, out_token, limit_key):
+    marker = query.get(in_token)
+    try:
+        start = int(base64.urlsafe_b64decode(marker).decode()) if marker else 0
+        limit = int(query.get(limit_key) or 100)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return _error(400, "BadRequest", f"Invalid {in_token}.")
+    if start < 0 or limit < 1:
+        return _error(400, "BadRequest", f"Invalid {in_token}.")
+    end = start + limit
+    out = {key: items[start:end]}
+    if marker and in_token == "Marker":
+        out["Marker"] = marker
+    if end < len(items):
+        out[out_token] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return _json(200, out)
 
 
 def _describe_file_systems(query):
     fs_id = query.get("FileSystemId")
     creation_token = query.get("CreationToken")
-    max_items = int(query.get("MaxItems", 100))
 
     if fs_id and fs_id not in _file_systems:
         return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
@@ -142,7 +163,7 @@ def _describe_file_systems(query):
             continue
         results.append(_fs_response(fs))
 
-    return _json(200, {"FileSystems": results[:max_items]})
+    return _page(results, query, "FileSystems", "Marker", "NextMarker", "MaxItems")
 
 
 def _delete_file_system(fs_id):
@@ -480,7 +501,6 @@ def _create_mount_target(body):
 def _describe_mount_targets(query):
     fs_id = query.get("FileSystemId")
     mt_id = query.get("MountTargetId")
-    max_items = int(query.get("MaxItems", 100))
 
     if mt_id and mt_id not in _mount_targets:
         return _error(404, "MountTargetNotFound", f"Mount target '{mt_id}' does not exist.")
@@ -493,7 +513,7 @@ def _describe_mount_targets(query):
             continue
         results.append(_mt_response(mt))
 
-    return _json(200, {"MountTargets": results[:max_items]})
+    return _page(results, query, "MountTargets", "Marker", "NextMarker", "MaxItems")
 
 
 def _delete_mount_target(mt_id):
@@ -526,7 +546,7 @@ def _modify_mount_target_security_groups(mt_id, body):
 
 
 def _mt_response(mt):
-    return {k: v for k, v in mt.items() if k not in ("SecurityGroups", "IpAddressType")}
+    return {k: v for k, v in mt.items() if k not in ("SecurityGroups", "IpAddressType", "MountTargetArn")}
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +582,6 @@ def _create_access_point(body):
 def _describe_access_points(query):
     fs_id = query.get("FileSystemId")
     ap_id = query.get("AccessPointId")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for ap in _access_points.values():
@@ -572,7 +591,7 @@ def _describe_access_points(query):
             continue
         results.append(ap)
 
-    return _json(200, {"AccessPoints": results[:max_results]})
+    return _page(results, query, "AccessPoints", "NextToken", "NextToken", "MaxResults")
 
 
 def _delete_access_point(ap_id):
@@ -659,11 +678,11 @@ def _untag_resource(resource_id, keys):
     return _json(200, {})
 
 
-def _list_tags_for_resource(resource_id):
+def _list_tags_for_resource(resource_id, query=None):
     resource, err = _resolve_tag_resource(resource_id)
     if err:
         return err
-    return _json(200, {"Tags": resource.get("Tags", [])})
+    return _page(list(resource.get("Tags", [])), query or {}, "Tags", "NextToken", "NextToken", "MaxResults")
 
 
 def _find_resource(resource_id, resource_type=None):
@@ -931,7 +950,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if m:
         resource_id = m.group(1)
         if method == "GET":
-            return await _a(_list_tags_for_resource(resource_id))
+            return await _a(_list_tags_for_resource(resource_id, query))
         if method == "POST":
             return await _a(_tag_resource(resource_id, body))
         if method == "DELETE":

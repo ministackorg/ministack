@@ -41,6 +41,7 @@ clients can call DescribeDBInstances and other operations without ``Action=`` qu
 parameters.
 """
 
+import base64
 import contextlib
 import contextvars
 import copy
@@ -1294,7 +1295,7 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         image=image,
         detach=True,
         environment=env,
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         name=container_name,
         labels={
             **container_reaper.own_labels("rds"),
@@ -1583,7 +1584,7 @@ def _start_pg_reader_container(db_id, cluster):
         detach=True,
         environment=env,
         command=["sh", "-c", _PG_READER_BOOTSTRAP_SCRIPT],
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         name=_rds_docker_name(db_id),
         network=ms_network,
         labels=container_reaper.own_labels(
@@ -2449,7 +2450,7 @@ def _start_rds_container_for_instance(db_id, instance):
     container_kwargs = dict(
         image=image, detach=True,
         environment=env_vars,
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         name=container_name,
         labels={
             **container_reaper.own_labels("rds"),
@@ -4062,6 +4063,8 @@ def _is_host_port_free(port: int) -> bool:
     `containers.run`, but it closes the common case of stale or
     user-process bindings."""
     import socket
+    if port in _daemon_published_ports():
+        return False
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("0.0.0.0", port))
@@ -4070,6 +4073,26 @@ def _is_host_port_free(port: int) -> bool:
         return False
     finally:
         s.close()
+
+
+_published_cache = [0.0, frozenset()]
+
+
+def _daemon_published_ports() -> frozenset:
+    """Host ports the Docker daemon publishes for running containers, which a bind
+    probe inside MiniStack's own container cannot see (cached for two seconds)."""
+    if time.time() - _published_cache[0] < 2:
+        return _published_cache[1]
+    ports = frozenset()
+    docker_client = _get_docker()
+    if docker_client is not None:
+        try:
+            ports = frozenset(p["PublicPort"] for c in docker_client.api.containers()
+                              for p in c.get("Ports") or [] if p.get("PublicPort"))
+        except Exception as e:
+            logger.debug("RDS: published ports unavailable: %s", e)
+    _published_cache[0], _published_cache[1] = time.time(), ports
+    return ports
 
 
 # Docker refuses network-scoped aliases outside user-defined networks:
@@ -5177,7 +5200,7 @@ def _create_db_instance_impl(p):
                 container_kwargs = dict(
                     image=image, detach=True,
                     environment=env,
-                    ports={f"{container_port}/tcp": host_port},
+                    ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
                     name=_rds_docker_name(db_id),
                     labels={
                         **container_reaper.own_labels("rds"),
@@ -5279,7 +5302,7 @@ def _create_db_instance_impl(p):
         "_HostPort": host_port,
         "AllocatedStorage": allocated_storage,
         "InstanceCreateTime": _format_time(now_ts),
-        "PreferredBackupWindow": "03:00-04:00",
+        "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
         "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
         "DBSecurityGroups": [],
         "VpcSecurityGroups": vpc_sg_list,
@@ -5301,7 +5324,7 @@ def _create_db_instance_impl(p):
         "LicenseModel": _license_model(engine),
         "Iops": int(_p(p, "Iops") or "0") if _p(p, "Iops") else None,
         "OptionGroupMemberships": [{
-            "OptionGroupName": f"default:{engine}-{engine_version.split('.')[0]}",
+            "OptionGroupName": _p(p, "OptionGroupName") or f"default:{engine}-{engine_version.split('.')[0]}",
             "Status": "in-sync",
         }],
         "CharacterSetName": "",
@@ -5316,7 +5339,7 @@ def _create_db_instance_impl(p):
         "StorageEncrypted": _p(p, "StorageEncrypted") == "true",
         "KmsKeyId": _p(p, "KmsKeyId") or "",
         "DbiResourceId": dbi_resource_id,
-        "CACertificateIdentifier": "rds-ca-rsa2048-g1",
+        "CACertificateIdentifier": _p(p, "CACertificateIdentifier") or "rds-ca-rsa2048-g1",
         "DomainMemberships": [],
         "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
         "MonitoringInterval": int(_p(p, "MonitoringInterval") or "0"),
@@ -5331,18 +5354,18 @@ def _create_db_instance_impl(p):
         "PerformanceInsightsRetentionPeriod": int(
             _p(p, "PerformanceInsightsRetentionPeriod") or "7"
         ),
-        "EnabledCloudwatchLogsExports": [],
-        "ProcessorFeatures": [],
+        "EnabledCloudwatchLogsExports": _parse_member_list(p, "EnableCloudwatchLogsExports"),
+        "ProcessorFeatures": _parse_processor_features(p),
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
         "AssociatedRoles": [],
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
         "BackupTarget": "region",
-        "NetworkType": "IPV4",
-        "StorageThroughput": 0,
+        "NetworkType": _p(p, "NetworkType") or "IPV4",
+        "StorageThroughput": int(_p(p, "StorageThroughput") or "0"),
         "CertificateDetails": {
-            "CAIdentifier": "rds-ca-rsa2048-g1",
+            "CAIdentifier": _p(p, "CACertificateIdentifier") or "rds-ca-rsa2048-g1",
             "ValidTill": "2061-01-01T00:00:00Z",
         },
         "IsStorageConfigUpgradeAvailable": False,
@@ -5356,6 +5379,10 @@ def _create_db_instance_impl(p):
     _set_performance_insights(instance, p)
     if parent and parent.get("_PerformanceInsightsManaged"):
         _inherit_performance_insights(instance, parent)
+    if _p(p, "EngineLifecycleSupport") or engine in ("mysql", "postgres"):
+        instance["EngineLifecycleSupport"] = _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support"
+    if _p(p, "DedicatedLogVolume"):
+        instance["DedicatedLogVolume"] = _p(p, "DedicatedLogVolume") == "true"
     # Only a request that turns storage autoscaling on sets the threshold.
     if _p(p, "MaxAllocatedStorage"):
         instance["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
@@ -5727,8 +5754,11 @@ def _describe_db_instances(p):
         docdb_members = documentdb.instance_members_xml(filters)
 
     members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances) + docdb_members
+    members, marker_xml, page_error = _records_page(p, members, "DBInstance")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBInstancesResponse",
-        f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
+        f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances>{marker_xml}</DescribeDBInstancesResult>")
 
 
 def _rotate_instance_password(instance, old_pass, new_pass):
@@ -5788,7 +5818,109 @@ def _rotate_instance_password(instance, old_pass, new_pass):
 _IMMEDIATE_INSTANCE_SETTINGS = frozenset({
     "DeletionProtection", "CopyTagsToSnapshot", "PreferredBackupWindow", "PreferredMaintenanceWindow",
     "PubliclyAccessible", "MaxAllocatedStorage", "MonitoringInterval", "MonitoringRoleArn",
+    "AutoMinorVersionUpgrade", "NetworkType", "PromotionTier", "EngineLifecycleSupport",
 })
+
+
+def _parse_processor_features(params, prefix="ProcessorFeatures"):
+    for member in ("ProcessorFeature", "member"):
+        features, i = [], 1
+        while _p(params, f"{prefix}.{member}.{i}.Name"):
+            features.append({"Name": _p(params, f"{prefix}.{member}.{i}.Name"),
+                             "Value": _p(params, f"{prefix}.{member}.{i}.Value")})
+            i += 1
+        if features:
+            return features
+    return []
+
+
+def _apply_logs_export_configuration(resource, params):
+    enable = _parse_member_list(params, "CloudwatchLogsExportConfiguration.EnableLogTypes")
+    disable = set(_parse_member_list(params, "CloudwatchLogsExportConfiguration.DisableLogTypes"))
+    if not enable and not disable:
+        return
+    current = [t for t in resource.get("EnabledCloudwatchLogsExports") or [] if t not in disable]
+    resource["EnabledCloudwatchLogsExports"] = current + [t for t in enable if t not in current and t not in disable]
+
+
+def _subnet_group_record(name):
+    return _subnet_groups.get(name, {
+        "DBSubnetGroupName": name,
+        "DBSubnetGroupDescription": "default",
+        "SubnetGroupStatus": "Complete",
+        "Subnets": [],
+        "VpcId": "vpc-00000000",
+        "DBSubnetGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{name}",
+    })
+
+
+def _apply_instance_request_overrides(instance, p):
+    """Request fields CreateDBInstanceReadReplica and RestoreDBInstanceFromDBSnapshot set on the new instance."""
+    for param, key, kind in (
+        ("DBInstanceClass", "DBInstanceClass", str), ("AvailabilityZone", "AvailabilityZone", str),
+        ("MultiAZ", "MultiAZ", bool), ("StorageType", "StorageType", str), ("Iops", "Iops", int),
+        ("AllocatedStorage", "AllocatedStorage", int), ("StorageThroughput", "StorageThroughput", int),
+        ("PubliclyAccessible", "PubliclyAccessible", bool), ("KmsKeyId", "KmsKeyId", str),
+        ("MonitoringInterval", "MonitoringInterval", int), ("MonitoringRoleArn", "MonitoringRoleArn", str),
+        ("EnableIAMDatabaseAuthentication", "IAMDatabaseAuthenticationEnabled", bool),
+        ("DeletionProtection", "DeletionProtection", bool), ("CopyTagsToSnapshot", "CopyTagsToSnapshot", bool),
+        ("AutoMinorVersionUpgrade", "AutoMinorVersionUpgrade", bool), ("NetworkType", "NetworkType", str),
+        ("DedicatedLogVolume", "DedicatedLogVolume", bool), ("EngineLifecycleSupport", "EngineLifecycleSupport", str),
+        ("LicenseModel", "LicenseModel", str), ("BackupRetentionPeriod", "BackupRetentionPeriod", int),
+        ("PreferredBackupWindow", "PreferredBackupWindow", str),
+    ):
+        val = _p(p, param)
+        if val:
+            instance[key] = val == "true" if kind is bool else kind(val)
+    if _p(p, "Port"):
+        instance["Endpoint"] = {**instance.get("Endpoint", {}), "Port": int(_p(p, "Port"))}
+    if _p(p, "CACertificateIdentifier"):
+        instance["CACertificateIdentifier"] = _p(p, "CACertificateIdentifier")
+        instance["CertificateDetails"] = {**instance.get("CertificateDetails", {"ValidTill": "2061-01-01T00:00:00Z"}),
+                                          "CAIdentifier": _p(p, "CACertificateIdentifier")}
+    if _p(p, "DBSubnetGroupName"):
+        instance["DBSubnetGroup"] = _subnet_group_record(_p(p, "DBSubnetGroupName"))
+    if _p(p, "DBParameterGroupName"):
+        instance["DBParameterGroups"] = [{"DBParameterGroupName": _p(p, "DBParameterGroupName"),
+                                          "ParameterApplyStatus": "in-sync"}]
+    if _p(p, "OptionGroupName"):
+        instance["OptionGroupMemberships"] = [{"OptionGroupName": _p(p, "OptionGroupName"), "Status": "in-sync"}]
+    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    if vpc_sgs:
+        instance["VpcSecurityGroups"] = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs]
+    logs = _parse_member_list(p, "EnableCloudwatchLogsExports")
+    if logs:
+        instance["EnabledCloudwatchLogsExports"] = logs
+    features = _parse_processor_features(p)
+    if features:
+        instance["ProcessorFeatures"] = features
+    _set_performance_insights(instance, p)
+
+
+def _rename_db_instance(instance, new_id):
+    old_id = instance["DBInstanceIdentifier"]
+    old_arn = instance["DBInstanceArn"]
+    new_arn = f"{old_arn.rsplit(':', 1)[0]}:{new_id}"
+    del _instances[old_id]
+    instance["DBInstanceIdentifier"] = new_id
+    instance["DBInstanceArn"] = new_arn
+    if instance.get("_docker_container_id"):
+        # Respawn after restart must clear the container still named for the old identifier.
+        instance["_legacy_docker_container_name"] = _rds_docker_name(old_id)
+    _instances[new_id] = instance
+    if old_arn in _tags:
+        _tags[new_arn] = _tags.pop(old_arn)
+    for other in _instances.values():
+        replicas = other.get("ReadReplicaDBInstanceIdentifiers") or []
+        if old_id in replicas:
+            other["ReadReplicaDBInstanceIdentifiers"] = [new_id if r == old_id else r for r in replicas]
+        if other.get("ReadReplicaSourceDBInstanceIdentifier") == old_id:
+            other["ReadReplicaSourceDBInstanceIdentifier"] = new_id
+    cluster_id = instance.get("DBClusterIdentifier")
+    cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
+    for member in (cluster or {}).get("DBClusterMembers") or []:
+        if member.get("DBInstanceIdentifier") == old_id:
+            member["DBInstanceIdentifier"] = new_id
 
 
 def _modify_db_instance(p):
@@ -5823,6 +5955,15 @@ def _modify_db_instance(p):
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
 
+    new_id = _p(p, "NewDBInstanceIdentifier").lower()
+    if new_id == instance["DBInstanceIdentifier"]:
+        new_id = ""
+    prior_pending = dict(instance.get("PendingModifiedValues") or {})
+    if apply_immediately and not new_id:
+        new_id = prior_pending.get("DBInstanceIdentifier", "")
+    if new_id and new_id in _instances:
+        return _error("DBInstanceAlreadyExists", f"DBInstance {new_id} already exists.", 400)
+
     field_map = {
         "DBInstanceClass": "DBInstanceClass",
         "AllocatedStorage": "AllocatedStorage",
@@ -5842,13 +5983,28 @@ def _modify_db_instance(p):
         "MonitoringInterval": "MonitoringInterval",
         "MonitoringRoleArn": "MonitoringRoleArn",
         "CopyTagsToSnapshot": "CopyTagsToSnapshot",
+        "AutoMinorVersionUpgrade": "AutoMinorVersionUpgrade",
+        "LicenseModel": "LicenseModel",
+        "StorageThroughput": "StorageThroughput",
+        "NetworkType": "NetworkType",
+        "PromotionTier": "PromotionTier",
+        "EngineLifecycleSupport": "EngineLifecycleSupport",
+        "DedicatedLogVolume": "DedicatedLogVolume",
         # Aurora members take it from the DB cluster.
         "EnableIAMDatabaseAuthentication": (
             None if instance.get("DBClusterIdentifier") else "IAMDatabaseAuthenticationEnabled"
         ),
     }
 
-    pending = {}
+    # ApplyImmediately applies "the modifications in this request and any pending modifications".
+    if apply_immediately and prior_pending:
+        prior_pending.pop("DBInstanceIdentifier", None)
+        prior_subnet = prior_pending.pop("DBSubnetGroupName", None)
+        if prior_subnet:
+            instance["DBSubnetGroup"] = _subnet_group_record(prior_subnet)
+        instance.update(prior_pending)
+        prior_pending = {}
+    pending = dict(prior_pending)
     for param_key, instance_key in field_map.items():
         val = _p(p, param_key)
         if not val:
@@ -5856,15 +6012,18 @@ def _modify_db_instance(p):
         if instance_key is None:
             continue
         if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
-                         "MonitoringInterval", "Iops", "MaxAllocatedStorage"):
+                         "MonitoringInterval", "Iops", "MaxAllocatedStorage",
+                         "StorageThroughput", "PromotionTier"):
             val = int(val)
         elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection",
-                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
+                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication",
+                           "AutoMinorVersionUpgrade", "DedicatedLogVolume"):
             val = val == "true"
 
         # Not PendingModifiedValues members: AWS applies these whatever ApplyImmediately says.
         if apply_immediately or param_key in _IMMEDIATE_INSTANCE_SETTINGS:
             instance[instance_key] = val
+            pending.pop(instance_key, None)
         else:
             pending[instance_key] = val
     # A threshold equal to the allocated storage turns storage autoscaling off.
@@ -5888,8 +6047,33 @@ def _modify_db_instance(p):
             {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
         ]
 
-    if pending:
-        instance["PendingModifiedValues"] = pending
+    if _p(p, "PromotionTier") and instance.get("DBClusterIdentifier"):
+        cluster = _resolve_cluster_in_request_region(instance["DBClusterIdentifier"])
+        for member in (cluster or {}).get("DBClusterMembers") or []:
+            if member.get("DBInstanceIdentifier") == instance["DBInstanceIdentifier"]:
+                member["PromotionTier"] = instance["PromotionTier"]
+    if _p(p, "OptionGroupName"):
+        instance["OptionGroupMemberships"] = [{"OptionGroupName": _p(p, "OptionGroupName"), "Status": "in-sync"}]
+    # AWS restarts the database on a port change whatever ApplyImmediately says. A
+    # container-backed instance keeps listening where it was started, so only stubs move.
+    if _p(p, "DBPortNumber") and not instance.get("_docker_container_id"):
+        instance["Endpoint"] = {**instance.get("Endpoint", {}), "Port": int(_p(p, "DBPortNumber"))}
+    if _p(p, "DBSubnetGroupName"):
+        if apply_immediately:
+            instance["DBSubnetGroup"] = _subnet_group_record(_p(p, "DBSubnetGroupName"))
+        else:
+            pending["DBSubnetGroupName"] = _p(p, "DBSubnetGroupName")
+    _apply_logs_export_configuration(instance, p)
+    if not instance.get("DBClusterIdentifier"):
+        _set_performance_insights(instance, p)
+
+    instance["PendingModifiedValues"] = pending
+    if new_id:
+        if apply_immediately:
+            instance.get("PendingModifiedValues", {}).pop("DBInstanceIdentifier", None)
+            _rename_db_instance(instance, new_id)
+        else:
+            instance.setdefault("PendingModifiedValues", {})["DBInstanceIdentifier"] = new_id
 
     return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
 
@@ -6115,6 +6299,7 @@ def _create_read_replica(p):
         "TagList": [],
         "_docker_container_id": None,
     })
+    _apply_instance_request_overrides(replica, p)
     _instances[replica_id] = replica
     source.setdefault("ReadReplicaDBInstanceIdentifiers", []).append(replica_id)
 
@@ -6195,6 +6380,7 @@ def _restore_from_snapshot(p):
         "TagList": [],
         "_docker_container_id": None,
     }
+    _apply_instance_request_overrides(instance, p)
     _instances[db_id] = instance
     return _single_instance_response("RestoreDBInstanceFromDBSnapshotResponse",
                                      "RestoreDBInstanceFromDBSnapshotResult", instance)
@@ -6258,6 +6444,16 @@ def _serverlessv2_from_params(p):
         if raw not in (None, ""):
             out[field] = float(raw)
     return out or None
+
+
+def _apply_cluster_request_fields(cluster, p):
+    for param, kind in (("Iops", int), ("AutoMinorVersionUpgrade", bool), ("MonitoringInterval", int),
+                        ("MonitoringRoleArn", str), ("BacktrackWindow", int)):
+        if _p(p, param):
+            cluster[param] = _p(p, param) == "true" if kind is bool else kind(_p(p, param))
+    if _p(p, "EnableLocalWriteForwarding"):
+        cluster["LocalWriteForwardingStatus"] = (
+            "enabled" if _p(p, "EnableLocalWriteForwarding") == "true" else "disabled")
 
 
 def _create_db_cluster(p):
@@ -6469,7 +6665,7 @@ def _create_db_cluster_impl(p):
         "KmsKeyId": _p(p, "KmsKeyId") or "",
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
         "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
-        "EnabledCloudwatchLogsExports": [],
+        "EnabledCloudwatchLogsExports": _parse_member_list(p, "EnableCloudwatchLogsExports"),
         "HttpEndpointEnabled": _p(p, "EnableHttpEndpoint") == "true",
         "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
         "CrossAccountClone": False,
@@ -6495,6 +6691,9 @@ def _create_db_cluster_impl(p):
     if _set_performance_insights(cluster, p):
         cluster["_PerformanceInsightsManaged"] = True
         cluster["DatabaseInsightsMode"] = "standard"
+    if _p(p, "StorageType") or engine.startswith("aurora"):
+        cluster["StorageType"] = _p(p, "StorageType") or "aurora"
+    _apply_cluster_request_fields(cluster, p)
     _prepare_mysql_gtid_history(cluster)
     if (RDS_PUBLIC_ENDPOINT and _get_docker()
             and _docker_image_for_engine(engine, engine_version, master_user, master_pass, "mydb")[0]):
@@ -6636,8 +6835,11 @@ def _describe_db_clusters(p):
         docdb_members = documentdb.cluster_members_xml(filters)
 
     members = "".join(f"<DBCluster>{_cluster_xml(_cluster_view(c, True))}</DBCluster>" for c in clusters) + docdb_members
+    members, marker_xml, page_error = _records_page(p, members, "DBCluster")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClustersResponse",
-        f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
+        f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters>{marker_xml}</DescribeDBClustersResult>")
 
 
 def _generate_master_user_password():
@@ -6921,6 +7123,14 @@ def _modify_db_cluster_impl(p):
     if _p(p, "DBClusterParameterGroupName"):
         cluster["DBClusterParameterGroup"] = _p(p, "DBClusterParameterGroupName")
         _cluster_param_group(cluster["DBClusterParameterGroup"])
+    if _p(p, "StorageType"):
+        cluster["StorageType"] = _p(p, "StorageType")
+    if _p(p, "NetworkType"):
+        cluster["NetworkType"] = _p(p, "NetworkType")
+    if _p(p, "EngineLifecycleSupport"):
+        cluster["EngineLifecycleSupport"] = _p(p, "EngineLifecycleSupport")
+    _apply_cluster_request_fields(cluster, p)
+    _apply_logs_export_configuration(cluster, p)
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
     if vpc_sgs:
@@ -7043,8 +7253,11 @@ def _describe_db_snapshots(p):
             snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
 
     members = "".join(f"<DBSnapshot>{_snapshot_xml(s)}</DBSnapshot>" for s in snaps)
+    members, marker_xml, page_error = _records_page(p, members, "DBSnapshot")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBSnapshotsResponse",
-        f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots></DescribeDBSnapshotsResult>")
+        f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots>{marker_xml}</DescribeDBSnapshotsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -7134,8 +7347,11 @@ def _describe_subnet_groups(p):
     members = "".join(
         f"<DBSubnetGroup>{_subnet_group_xml(g)}</DBSubnetGroup>" for g in groups
     )
+    members, marker_xml, page_error = _records_page(p, members, "DBSubnetGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBSubnetGroupsResponse",
-        f"<DescribeDBSubnetGroupsResult><DBSubnetGroups>{members}</DBSubnetGroups></DescribeDBSubnetGroupsResult>")
+        f"<DescribeDBSubnetGroupsResult><DBSubnetGroups>{members}</DBSubnetGroups>{marker_xml}</DescribeDBSubnetGroupsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -7198,8 +7414,11 @@ def _describe_param_groups(p):
         <Description>{_esc(g['Description'])}</Description>
         <DBParameterGroupArn>{g.get('DBParameterGroupArn','')}</DBParameterGroupArn>
     </DBParameterGroup>""" for g in groups)
+    members, marker_xml, page_error = _records_page(p, members, "DBParameterGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBParameterGroupsResponse",
-        f"<DescribeDBParameterGroupsResult><DBParameterGroups>{members}</DBParameterGroups></DescribeDBParameterGroupsResult>")
+        f"<DescribeDBParameterGroupsResult><DBParameterGroups>{members}</DBParameterGroups>{marker_xml}</DescribeDBParameterGroupsResult>")
 
 
 def _describe_db_parameters(p):
@@ -7210,9 +7429,11 @@ def _describe_db_parameters(p):
 
     source_filter = _p(p, "Source")  # "user", "engine-default", or None (all)
     params_xml = _parameter_group_parameters_xml(pg, source_filter)
-
+    params_xml, marker_xml, page_error = _records_page(p, params_xml, "Parameter")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBParametersResponse",
-        f"<DescribeDBParametersResult><Parameters>{params_xml}</Parameters></DescribeDBParametersResult>")
+        f"<DescribeDBParametersResult><Parameters>{params_xml}</Parameters>{marker_xml}</DescribeDBParametersResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -7424,8 +7645,11 @@ def _describe_db_cluster_param_groups(p):
         <Description>{_esc(g['Description'])}</Description>
         <DBClusterParameterGroupArn>{g.get('DBClusterParameterGroupArn','')}</DBClusterParameterGroupArn>
     </DBClusterParameterGroup>""" for g in groups)
+    members, marker_xml, page_error = _records_page(p, members, "DBClusterParameterGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClusterParameterGroupsResponse",
-        f"<DescribeDBClusterParameterGroupsResult><DBClusterParameterGroups>{members}</DBClusterParameterGroups></DescribeDBClusterParameterGroupsResult>")
+        f"<DescribeDBClusterParameterGroupsResult><DBClusterParameterGroups>{members}</DBClusterParameterGroups>{marker_xml}</DescribeDBClusterParameterGroupsResult>")
 
 
 def _delete_db_cluster_param_group(p):
@@ -7447,8 +7671,11 @@ def _describe_db_cluster_parameters(p):
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
     members = _parameter_group_parameters_xml(pg, source_filter)
+    members, marker_xml, page_error = _records_page(p, members, "Parameter")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClusterParametersResponse",
-        f"<DescribeDBClusterParametersResult><Parameters>{members}</Parameters></DescribeDBClusterParametersResult>")
+        f"<DescribeDBClusterParametersResult><Parameters>{members}</Parameters>{marker_xml}</DescribeDBClusterParametersResult>")
 
 
 def _modify_db_cluster_param_group(p):
@@ -7599,8 +7826,11 @@ def _describe_db_cluster_snapshots(p):
 
     members = "".join(
         f"<DBClusterSnapshot>{_cluster_snapshot_xml(s)}</DBClusterSnapshot>" for s in snaps)
+    members, marker_xml, page_error = _records_page(p, members, "DBClusterSnapshot")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClusterSnapshotsResponse",
-        f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
+        f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots>{marker_xml}</DescribeDBClusterSnapshotsResult>")
 
 
 def _describe_db_cluster_snapshot_attributes(p):
@@ -8409,8 +8639,11 @@ def _describe_option_groups(p):
 
     members = "".join(
         f"<OptionGroup>{_option_group_xml(g)}</OptionGroup>" for g in groups)
+    members, marker_xml, page_error = _records_page(p, members, "OptionGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeOptionGroupsResponse",
-        f"<DescribeOptionGroupsResult><OptionGroupsList>{members}</OptionGroupsList></DescribeOptionGroupsResult>")
+        f"<DescribeOptionGroupsResult><OptionGroupsList>{members}</OptionGroupsList>{marker_xml}</DescribeOptionGroupsResult>")
 
 
 def _describe_option_group_options(p):
@@ -8654,11 +8887,14 @@ def _describe_global_clusters(p):
             snapshots.append(snapshot)
         gcs = snapshots
 
+    gcs, marker_xml, page_error = _offset_page(p, gcs)
+    if page_error:
+        return page_error
     members_xml = "".join(
         f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
-        f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")
+        f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters>{marker_xml}</DescribeGlobalClustersResult>")
 
 
 def _delete_global_cluster(p):
@@ -9963,8 +10199,11 @@ def _describe_engine_versions(p):
             <SupportsBabelfish>false</SupportsBabelfish>
             <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
         </DBEngineVersion>"""
+    members, marker_xml, page_error = _records_page(p, members, "DBEngineVersion")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBEngineVersionsResponse",
-        f"<DescribeDBEngineVersionsResult><DBEngineVersions>{members}</DBEngineVersions></DescribeDBEngineVersionsResult>")
+        f"<DescribeDBEngineVersionsResult><DBEngineVersions>{members}</DBEngineVersions>{marker_xml}</DescribeDBEngineVersionsResult>")
 
 
 def _describe_orderable_options(p):
@@ -10014,8 +10253,11 @@ def _describe_orderable_options(p):
             <SupportsClusters>false</SupportsClusters>
             <SupportedActivityStreamModes/>
         </OrderableDBInstanceOption>"""
+    members, marker_xml, page_error = _records_page(p, members, "OrderableDBInstanceOption", 1000)
+    if page_error:
+        return page_error
     return _xml(200, "DescribeOrderableDBInstanceOptionsResponse",
-        f"<DescribeOrderableDBInstanceOptionsResult><OrderableDBInstanceOptions>{members}</OrderableDBInstanceOptions></DescribeOrderableDBInstanceOptionsResult>")
+        f"<DescribeOrderableDBInstanceOptionsResult><OrderableDBInstanceOptions>{members}</OrderableDBInstanceOptions>{marker_xml}</DescribeOrderableDBInstanceOptionsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -10150,8 +10392,8 @@ def _instance_xml(i):
         <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
         {_performance_insights_details_xml(i)}
         {_database_insights_mode_xml(i)}
-        <EnabledCloudwatchLogsExports/>
-        <ProcessorFeatures/>
+        {_logs_exports_xml(i, always=True)}
+        <ProcessorFeatures>{"".join(f"<ProcessorFeature><Name>{_esc(f['Name'])}</Name><Value>{_esc(f['Value'])}</Value></ProcessorFeature>" for f in i.get('ProcessorFeatures') or [])}</ProcessorFeatures>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
         {f"<MaxAllocatedStorage>{i['MaxAllocatedStorage']}</MaxAllocatedStorage>" if i.get('MaxAllocatedStorage') else ""}
@@ -10161,7 +10403,16 @@ def _instance_xml(i):
         <BackupTarget>{i.get('BackupTarget','region')}</BackupTarget>
         <NetworkType>{i.get('NetworkType','IPV4')}</NetworkType>
         <StorageThroughput>{i.get('StorageThroughput',0)}</StorageThroughput>
+        {f"<DedicatedLogVolume>{str(i['DedicatedLogVolume']).lower()}</DedicatedLogVolume>" if 'DedicatedLogVolume' in i else ""}
+        {f"<EngineLifecycleSupport>{i['EngineLifecycleSupport']}</EngineLifecycleSupport>" if i.get('EngineLifecycleSupport') else ""}
         <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable',False)).lower()}</IsStorageConfigUpgradeAvailable>"""
+
+
+def _logs_exports_xml(resource, always=False):
+    logs = resource.get("EnabledCloudwatchLogsExports") or []
+    if not logs and not always:
+        return ""
+    return f"<EnabledCloudwatchLogsExports>{''.join(f'<member>{_esc(t)}</member>' for t in logs)}</EnabledCloudwatchLogsExports>"
 
 
 def _serverlessv2_xml(c):
@@ -10297,6 +10548,14 @@ def _cluster_xml(c):
         <AllocatedStorage>{c.get('AllocatedStorage',1)}</AllocatedStorage>
         <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
+        {f"<StorageType>{c['StorageType']}</StorageType>" if c.get('StorageType') else ""}
+        {f"<Iops>{c['Iops']}</Iops>" if c.get('Iops') is not None else ""}
+        {f"<AutoMinorVersionUpgrade>{str(c['AutoMinorVersionUpgrade']).lower()}</AutoMinorVersionUpgrade>" if 'AutoMinorVersionUpgrade' in c else ""}
+        {f"<MonitoringInterval>{c['MonitoringInterval']}</MonitoringInterval>" if 'MonitoringInterval' in c else ""}
+        {f"<MonitoringRoleArn>{c['MonitoringRoleArn']}</MonitoringRoleArn>" if c.get('MonitoringRoleArn') else ""}
+        {f"<BacktrackWindow>{c['BacktrackWindow']}</BacktrackWindow>" if 'BacktrackWindow' in c else ""}
+        {f"<LocalWriteForwardingStatus>{c['LocalWriteForwardingStatus']}</LocalWriteForwardingStatus>" if c.get('LocalWriteForwardingStatus') else ""}
+        {_logs_exports_xml(c)}
         {global_cluster_xml}
         {global_write_forwarding_xml}
         {master_user_secret_xml}
@@ -10320,12 +10579,9 @@ def _snapshot_xml(s):
         <VpcId>{s.get('VpcId','vpc-00000000')}</VpcId>
         <Port>{s.get('Port',5432)}</Port>
         <MasterUsername>{s.get('MasterUsername','admin')}</MasterUsername>
-        <DBName>{s.get('DBName','')}</DBName>
         <SnapshotType>{s.get('SnapshotType','manual')}</SnapshotType>
         <LicenseModel>{s.get('LicenseModel','general-public-license')}</LicenseModel>
         <StorageType>{s.get('StorageType','gp2')}</StorageType>
-        <DBInstanceClass>{s.get('DBInstanceClass','db.t3.micro')}</DBInstanceClass>
-        <StorageEncrypted>{str(s.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
         <KmsKeyId>{s.get('KmsKeyId','')}</KmsKeyId>
         <Encrypted>{str(s.get('Encrypted',False)).lower()}</Encrypted>
         <IAMDatabaseAuthenticationEnabled>{str(s.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
@@ -10972,6 +11228,29 @@ def _db_proxy_page(params, records, key_fn, label):
 
 def _marker_xml(next_marker):
     return f"<Marker>{_esc(next_marker)}</Marker>" if next_marker else ""
+
+
+def _offset_page(params, items, maximum=100):
+    """Apply MaxRecords / Marker to a list. Returns ``(page, marker_xml, error)``."""
+    max_records, error = _db_proxy_int_error(params, "MaxRecords", _DB_PROXY_MIN_MAX_RECORDS, maximum)
+    if error:
+        return None, None, error
+    limit = max_records or _DB_PROXY_DEFAULT_MAX_RECORDS
+    try:
+        start = max(int(base64.urlsafe_b64decode(_p(params, "Marker").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    end = start + limit
+    marker = base64.urlsafe_b64encode(str(end).encode()).decode() if end < len(items) else None
+    return items[start:end], _marker_xml(marker), None
+
+
+def _records_page(params, members_xml, tag, maximum=100):
+    """`_offset_page` over rendered, non-nested ``<tag>`` members."""
+    close = f"</{tag}>"
+    members = [m + close for m in members_xml.split(close)[:-1]]
+    page, marker_xml, error = _offset_page(params, members, maximum)
+    return ("".join(page) if page is not None else None), marker_xml, error
 
 
 def _parse_user_auth_configs(params, prefix="Auth"):

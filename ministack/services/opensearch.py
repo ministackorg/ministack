@@ -101,6 +101,17 @@ _MODELED_DOMAIN_PROPERTIES = (
     "SoftwareUpdateOptions",
 )
 
+_OPTIONAL_DOMAIN_OPTIONS = (
+    "IPAddressType",
+    "LogPublishingOptions",
+    "IdentityCenterOptions",
+    "AIMLOptions",
+    "DeploymentStrategyOptions",
+    "AutomatedSnapshotPauseOptions",
+    "UseCase",
+    "EngineMode",
+)
+
 # AWS allows lowercase letters, digits, hyphens; first character must be
 # lowercase letter; 3-28 chars.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
@@ -315,6 +326,24 @@ def _now() -> int:
     return int(time.time())
 
 
+def _auto_tune_input(rec: dict) -> dict:
+    stored = rec.get("_AutoTuneInput")
+    if stored is None:
+        stored = {"DesiredState": (rec.get("AutoTuneOptions") or {}).get("State", "DISABLED")}
+    return stored
+
+
+def _set_auto_tune(rec: dict, options) -> None:
+    """Store AutoTuneOptions(Input) and derive the DomainStatus AutoTuneOptionsOutput."""
+    merged = {**_auto_tune_input(rec), **copy.deepcopy(options or {})}
+    merged.setdefault("DesiredState", "DISABLED")
+    rec["_AutoTuneInput"] = merged
+    output = {"State": merged["DesiredState"]}
+    if "UseOffPeakWindow" in merged:
+        output["UseOffPeakWindow"] = merged["UseOffPeakWindow"]
+    rec["AutoTuneOptions"] = output
+
+
 # ---------------------------------------------------------------------------
 # Docker container management
 # ---------------------------------------------------------------------------
@@ -387,7 +416,7 @@ def start_engine_container(docker, name: str, labels: dict, host_port=None, volu
     """
     run_kwargs = dict(
         image=apply_image_prefix(DEFAULT_IMAGE), detach=True,
-        ports={"9200/tcp": host_port},
+        ports={"9200/tcp": container_reaper.published_port(host_port)},
         name=name,
         labels=labels,
         environment={
@@ -449,11 +478,16 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         )
         return stub_host, stub_port, None, None, None
 
+    from ministack.services.rds import _is_host_port_free
     with _state_lock:
         host_port = _port_counter[0]
-        _port_counter[0] += 1
+        while not _is_host_port_free(host_port):  # another container may already publish it
+            host_port += 1
+        _port_counter[0] = host_port + 1
         dash_host_port = _dashboards_port_counter[0]
-        _dashboards_port_counter[0] += 1
+        while not _is_host_port_free(dash_host_port):
+            dash_host_port += 1
+        _dashboards_port_counter[0] = dash_host_port + 1
 
     labels = {
         # Standard label so the boot/shutdown orphan reap finds these; the
@@ -482,7 +516,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
             dash_kwargs = dict(
                 image=apply_image_prefix(DASHBOARDS_IMAGE),
                 detach=True,
-                ports={"5601/tcp": dash_host_port},
+                ports={"5601/tcp": container_reaper.published_port(dash_host_port)},
                 name=_dashboards_container_name(domain_name),
                 labels={**labels, "com.ministack.role": "dashboards"},
                 environment={
@@ -689,7 +723,6 @@ def _new_domain_record(name, payload):
             "AdvancedSecurityOptions",
             {"Enabled": False, "InternalUserDatabaseEnabled": False},
         ),
-        "AutoTuneOptions": payload.get("AutoTuneOptions", {"State": "DISABLED"}),
         "ChangeProgressDetails": {},
         "OffPeakWindowOptions": payload.get(
             "OffPeakWindowOptions", {"Enabled": False}
@@ -704,6 +737,11 @@ def _new_domain_record(name, payload):
         "_DashboardsContainerId": dash_cid,
     }
     _set_vpc_options(rec, payload.get("VPCOptions"))
+    rec["_AutoTuneInput"] = {}
+    _set_auto_tune(rec, payload.get("AutoTuneOptions"))
+    for key in _OPTIONAL_DOMAIN_OPTIONS:
+        if key in payload:
+            rec[key] = copy.deepcopy(payload[key])
     if dash_endpoint:
         rec["DashboardEndpoint"] = dash_endpoint
     if _deferred:
@@ -784,13 +822,21 @@ def _domain_config(rec: dict) -> dict:
             for k, v in rec["AdvancedSecurityOptions"].items()
             if k != "MasterUserOptions"
         }),
-        "AutoTuneOptions": wrap(rec["AutoTuneOptions"]),
+        "AutoTuneOptions": {
+            "Options": copy.deepcopy(_auto_tune_input(rec)),
+            "Status": {"CreationDate": create, "UpdateDate": update, "UpdateVersion": 1,
+                       "State": rec["AutoTuneOptions"].get("State", "DISABLED"),
+                       "PendingDeletion": False},
+        },
         "ChangeProgressDetails": rec.get("ChangeProgressDetails", {}),
         "OffPeakWindowOptions": wrap(rec["OffPeakWindowOptions"]),
         "SoftwareUpdateOptions": wrap(rec["SoftwareUpdateOptions"]),
     }
     if rec.get("VPCOptions"):
         config["VPCOptions"] = wrap(rec["VPCOptions"])
+    for key in _OPTIONAL_DOMAIN_OPTIONS:
+        if key in rec:
+            config[key] = wrap(copy.deepcopy(rec[key]))
     return config
 
 
@@ -918,6 +964,8 @@ def update_domain_from_cloudformation(name, payload, compatibility_properties):
                 _set_vpc_options(rec, wanted)
             else:
                 rec[key] = copy.deepcopy(wanted)
+                if key == "AutoTuneOptions":
+                    rec.pop("_AutoTuneInput", None)
                 if key == "EngineVersion":
                     rec["ServiceSoftwareOptions"]["CurrentVersion"] = wanted
 
@@ -1064,11 +1112,14 @@ def _update_domain_config(name, payload):
         "DomainEndpointOptions", "AdvancedSecurityOptions",
         "EncryptionAtRestOptions", "NodeToNodeEncryptionOptions",
         "AutoTuneOptions", "OffPeakWindowOptions", "SoftwareUpdateOptions",
+        *_OPTIONAL_DOMAIN_OPTIONS,
     }
     for k, v in payload.items():
         if k in updatable:
             if k == "VPCOptions":
                 _set_vpc_options(rec, v)
+            elif k == "AutoTuneOptions":
+                _set_auto_tune(rec, v)
             else:
                 rec[k] = copy.deepcopy(v)
     rec["_UpdatedTime"] = _now()
@@ -1111,8 +1162,25 @@ def _describe_domain_change_progress(name, query_params):
     return _json(200, {"ChangeProgressStatus": progress})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_versions(query_params):
-    return _json(200, {"Versions": list(_SUPPORTED_VERSIONS)})
+    versions, nxt = _page(list(_SUPPORTED_VERSIONS), _qp(query_params, "maxResults"), _qp(query_params, "nextToken"))
+    resp = {"Versions": versions}
+    if nxt:
+        resp["NextToken"] = nxt
+    return _json(200, resp)
 
 
 def _get_compatible_versions(query_params):

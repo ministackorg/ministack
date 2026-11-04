@@ -200,13 +200,13 @@ def _validation_options(domain, method):
 
 
 def _cert_shape(cert):
-    return {
+    shape = {
         "CertificateArn": cert["CertificateArn"],
         "DomainName": cert["DomainName"],
         "SubjectAlternativeNames": cert.get("SubjectAlternativeNames", [cert["DomainName"]]),
         "Status": cert["Status"],
         "Type": cert.get("Type", "AMAZON_ISSUED"),
-        "KeyAlgorithm": "RSA_2048",
+        "KeyAlgorithm": cert.get("KeyAlgorithm", "RSA_2048"),
         "SignatureAlgorithm": "SHA256WITHRSA",
         "InUseBy": cert.get("InUseBy", []) + _signing_profiles_using(cert["CertificateArn"]),
         "CreatedAt": _epoch(cert["CreatedAt"]),
@@ -215,8 +215,12 @@ def _cert_shape(cert):
         "NotAfter": _epoch(cert.get("NotAfter", _future_iso(365 * 24 * 3600))),
         "DomainValidationOptions": cert.get("DomainValidationOptions", []),
         "Options": cert.get("Options", {}),
-        "Tags": cert.get("Tags", []),
     }
+    if cert.get("CertificateAuthorityArn"):
+        shape["CertificateAuthorityArn"] = cert["CertificateAuthorityArn"]
+    if cert.get("ManagedBy"):
+        shape["ManagedBy"] = cert["ManagedBy"]
+    return shape
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -249,14 +253,40 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+_OPTION_ENUMS = (("ValidationMethod", "validationMethod", ("HTTP", "DNS", "EMAIL")),
+                 ("CertificateTransparencyLoggingPreference", "certificateTransparencyLoggingPreference",
+                  ("ENABLED", "DISABLED")),
+                 ("Export", "export", ("ENABLED", "DISABLED")))
+
+
+def _options_error(options):
+    errors = [f"Value '{(options or {})[k]}' at 'options.{wire}' failed to satisfy constraint: "
+              f"Member must satisfy enum value set: [{', '.join(allowed)}]"
+              for k, wire, allowed in _OPTION_ENUMS
+              if (options or {}).get(k) is not None and options[k] not in allowed]
+    if not errors:
+        return None
+    count = "1 validation error" if len(errors) == 1 else f"{len(errors)} validation errors"
+    return error_response_json("ValidationException", f"{count} detected: {'; '.join(errors)}", 400)
+
+
+def _stored_options(options):
+    """The options DescribeCertificate shows; ValidationMethod and null members are not stored."""
+    return {k: v for k, v in (options or {}).items()
+            if k in ("CertificateTransparencyLoggingPreference", "Export") and v is not None}
+
+
 def _request_certificate(data):
     domain = data.get("DomainName", "")
     if not domain:
         return error_response_json("InvalidParameterException", "DomainName is required", 400)
+    if err := _options_error(data.get("Options")):
+        return err
     method = data.get("ValidationMethod", "DNS")
     sans = data.get("SubjectAlternativeNames", [domain])
     if domain not in sans:
         sans = [domain] + sans
+    ca_arn = data.get("CertificateAuthorityArn")
     arn = _cert_arn()
     now = now_iso()
     _certificates[arn] = {
@@ -264,15 +294,19 @@ def _request_certificate(data):
         "DomainName": domain,
         "SubjectAlternativeNames": sans,
         "Status": "ISSUED",
-        "Type": "AMAZON_ISSUED",
+        "Type": "PRIVATE" if ca_arn else "AMAZON_ISSUED",
         "CreatedAt": now,
         "IssuedAt": now,
         "NotBefore": now,
         "NotAfter": _future_iso(365 * 24 * 3600),
-        "DomainValidationOptions": [_validation_options(d, method) for d in sans],
+        "DomainValidationOptions": [] if ca_arn else [_validation_options(d, method) for d in sans],
         "ValidationMethod": method,
         "Tags": data.get("Tags", []),
-        "Options": {},
+        "Options": {"CertificateTransparencyLoggingPreference": "ENABLED", "Export": "DISABLED",
+                    **_stored_options(data.get("Options"))},
+        "KeyAlgorithm": data.get("KeyAlgorithm", "RSA_2048"),
+        "CertificateAuthorityArn": ca_arn,
+        "ManagedBy": data.get("ManagedBy"),
         "_pem_body": _synthetic_pem(domain),
         "_pem_chain": "",
         "_private_key": "",
@@ -289,6 +323,19 @@ def _describe_certificate(data):
     return json_response({"Certificate": _cert_shape(cert)})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_certificates(data):
     statuses = data.get("CertificateStatuses", [])
     summaries = []
@@ -302,13 +349,11 @@ def _list_certificates(data):
             "DomainName": cert["DomainName"],
             "Status": cert["Status"],
         })
-    # Real AWS omits NextToken when there's no next page. boto3 strips
-    # null fields client-side so it tolerates `"NextToken": null`, but
-    # other SDKs (Java, Go, raw HTTP) and pagination loops checking
-    # `if "NextToken" in response` see the literal null and loop
-    # forever. ACM emulator currently emits a single page, so always
-    # omit the key.
-    return json_response({"CertificateSummaryList": summaries})
+    page, nxt = _page(summaries, data.get("MaxItems"), data.get("NextToken"))
+    resp = {"CertificateSummaryList": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _signing_profiles_using(arn):
@@ -400,7 +445,7 @@ def _import_certificate(data):
         "NotAfter": _future_iso(365 * 24 * 3600),
         "DomainValidationOptions": [],
         "Tags": data.get("Tags", existing.get("Tags", [])),
-        "Options": existing.get("Options", {}),
+        "Options": {"CertificateTransparencyLoggingPreference": "DISABLED", "Export": "DISABLED"},
         "_pem_body": cert_body,
         "_pem_chain": cert_chain,
         "_private_key": private_key,
@@ -443,7 +488,15 @@ def _update_options(data):
     cert = _get_local_certificate(arn)
     if not cert:
         return _certificate_not_found(arn)
-    cert["Options"] = data.get("Options", {})
+    if err := _options_error(data.get("Options")):
+        return err
+    sent = _stored_options(data.get("Options"))
+    if cert.get("Type") == "IMPORTED" and sent:
+        return error_response_json("InvalidStateException",
+                                   "The UpdateCertificateOptions command is not permitted for imported certificates.", 400)
+    if "Export" in sent and sent["Export"] != cert.get("Options", {}).get("Export"):
+        return error_response_json("ValidationException", "Export option for certificates cannot be updated", 400)
+    cert["Options"] = {**cert.get("Options", {}), **sent}
     return json_response({})
 
 

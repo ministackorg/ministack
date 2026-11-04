@@ -226,11 +226,16 @@ def _partition_key_to_hash(partition_key: str) -> int:
     return int(hashlib.md5(partition_key.encode("utf-8")).hexdigest(), 16)
 
 
+def _open_shards(stream):
+    return {sid: sh for sid, sh in stream["shards"].items() if not sh.get("ending_sequence_number")}
+
+
 def _route_to_shard(hash_key_int: int, stream: dict) -> str:
-    for sid, shard in stream["shards"].items():
+    shards = _open_shards(stream)
+    for sid, shard in shards.items():
         if int(shard["starting_hash_key"]) <= hash_key_int <= int(shard["ending_hash_key"]):
             return sid
-    return next(iter(stream["shards"]))
+    return next(iter(shards))
 
 
 def _kinesis_resource_tail(value, resource_type):
@@ -459,10 +464,16 @@ def _create_stream(data):
         "StreamModeDetails": {"StreamMode": mode},
         "RetentionPeriodHours": 24,
         "shards": _build_shards(shard_count),
-        "tags": {},
+        "tags": dict(data.get("Tags") or {}),
         "CreationTimestamp": int(time.time()),
         "EncryptionType": "NONE",
     }
+    if data.get("WarmThroughputMiBps") is not None:
+        _streams[name]["WarmThroughputMiBps"] = data["WarmThroughputMiBps"]
+    if data.get("MaxRecordSizeInKiB") is not None:
+        _streams[name]["MaxRecordSizeInKiB"] = data["MaxRecordSizeInKiB"]
+    if data.get("RecordDistributionStrategy") is not None:
+        _streams[name]["RecordDistributionStrategy"] = data["RecordDistributionStrategy"]
     return json_response({})
 
 
@@ -518,17 +529,28 @@ def _describe_stream_summary(data):
         "StreamModeDetails": stream.get("StreamModeDetails", {"StreamMode": "PROVISIONED"}),
         "RetentionPeriodHours": stream["RetentionPeriodHours"],
         "StreamCreationTimestamp": stream["CreationTimestamp"],
-        "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
+        "EnhancedMonitoring": [{"ShardLevelMetrics": list(stream.get("ShardLevelMetrics", []))}],
         "EncryptionType": stream.get("EncryptionType", "NONE"),
         **({"KeyId": stream["KeyId"]} if stream.get("KeyId") else {}),
-        "OpenShardCount": len(stream["shards"]),
+        "OpenShardCount": len(_open_shards(stream)),
         "ConsumerCount": consumer_count,
+        **({"WarmThroughput": {"TargetMiBps": stream["WarmThroughputMiBps"],
+                               "CurrentMiBps": stream["WarmThroughputMiBps"]}}
+           if "WarmThroughputMiBps" in stream else {}),
+        **({"MaxRecordSizeInKiB": stream["MaxRecordSizeInKiB"]} if "MaxRecordSizeInKiB" in stream else {}),
+        **({"RecordDistributionStrategy": stream.get("RecordDistributionStrategy", "USER_PARTITION_KEY")}
+           if stream.get("StreamModeDetails", {}).get("StreamMode") == "ON_DEMAND" else {}),
     }})
 
 
 def _list_streams(data):
-    limit = data.get("Limit", 100)
+    limit = min(int(data.get("Limit") or 100), 100)
     exclusive_start = data.get("ExclusiveStartStreamName")
+    if data.get("NextToken"):
+        try:
+            exclusive_start = base64.urlsafe_b64decode(data["NextToken"].encode("ascii")).decode("utf-8")
+        except (ValueError, UnicodeError):
+            return error_response_json("InvalidArgumentException", "Invalid NextToken", 400)
     names = sorted(_streams.keys())
     if exclusive_start:
         names = [n for n in names if n > exclusive_start]
@@ -544,7 +566,10 @@ def _list_streams(data):
             "StreamModeDetails": s.get("StreamModeDetails", {"StreamMode": "PROVISIONED"}),
             "StreamCreationTimestamp": s["CreationTimestamp"],
         })
-    return json_response({"StreamNames": page, "StreamSummaries": summaries, "HasMoreStreams": has_more})
+    out = {"StreamNames": page, "StreamSummaries": summaries, "HasMoreStreams": has_more}
+    if has_more:
+        out["NextToken"] = base64.urlsafe_b64encode(page[-1].encode("utf-8")).decode("ascii")
+    return json_response(out)
 
 
 _LIST_SHARDS_TOKEN_TTL = 300  # AWS contract: tokens expire after 300 seconds.
@@ -723,7 +748,6 @@ def _put_records(data):
         results.append({
             "SequenceNumber": seq,
             "ShardId": sid,
-            "EncryptionType": stream.get("EncryptionType", "NONE"),
         })
         try:
             raw = base64.b64decode(rd) if rd else b""
@@ -855,6 +879,12 @@ def _get_records(data):
     # matching AWS behavior: each GetRecords call returns a NextShardIterator.
     # The old iterator remains valid until it expires naturally (5 min TTL),
     # allowing client retries to succeed.
+    if shard.get("ending_sequence_number") and new_pos >= len(shard["records"]):
+        return json_response({
+            "Records": out_records,
+            "MillisBehindLatest": millis_behind,
+            "ChildShards": _child_shards(stream, state["shard_id"]),
+        })
     next_token = new_uuid()
     _shard_iterators[next_token] = {
         "stream": state["stream"],
@@ -968,6 +998,7 @@ def _merge_shards(data):
     new_start = str(min(int(s1["starting_hash_key"]), int(s2["starting_hash_key"])))
     new_end = str(max(int(s1["ending_hash_key"]), int(s2["ending_hash_key"])))
 
+    s1["ending_sequence_number"] = s2["ending_sequence_number"] = _next_sequence_number()
     new_idx = _max_shard_index(stream) + 1
     new_sid = f"shardId-{new_idx:012d}"
     stream["shards"][new_sid] = {
@@ -978,8 +1009,6 @@ def _merge_shards(data):
         "parent_shard_id": s1_id,
         "adjacent_parent_shard_id": s2_id,
     }
-    del stream["shards"][s1_id]
-    del stream["shards"][s2_id]
     return json_response({})
 
 
@@ -1001,6 +1030,7 @@ def _split_shard(data):
         return error_response_json("ValidationException",
                                    "NewStartingHashKey must be within the shard range", 400)
 
+    old["ending_sequence_number"] = _next_sequence_number()
     base = _max_shard_index(stream) + 1
     c1 = f"shardId-{base:012d}"
     c2 = f"shardId-{base + 1:012d}"
@@ -1020,7 +1050,6 @@ def _split_shard(data):
         "parent_shard_id": shard_id,
         "adjacent_parent_shard_id": None,
     }
-    del stream["shards"][shard_id]
     return json_response({})
 
 
@@ -1035,8 +1064,18 @@ def _update_shard_count(data):
     if target < 1:
         return error_response_json("ValidationException", "TargetShardCount must be >= 1", 400)
 
-    current = len(stream["shards"])
-    stream["shards"] = _build_shards(target)
+    parents = sorted(_open_shards(stream).items(), key=lambda kv: int(kv[1]["starting_hash_key"]))
+    current = len(parents)
+    for _, parent in parents:
+        parent["ending_sequence_number"] = _next_sequence_number()
+    children = _build_shards(target, _max_shard_index(stream) + 1)
+    for child in children.values():
+        lo, hi = int(child["starting_hash_key"]), int(child["ending_hash_key"])
+        overlapping = [sid for sid, sh in parents
+                       if int(sh["starting_hash_key"]) <= hi and int(sh["ending_hash_key"]) >= lo]
+        child["parent_shard_id"] = overlapping[0]
+        child["adjacent_parent_shard_id"] = overlapping[1] if len(overlapping) > 1 else None
+    stream["shards"].update(children)
     return json_response({
         "StreamName": stream["StreamName"],
         "CurrentShardCount": current,
@@ -1278,20 +1317,13 @@ def _subscribe_to_shard(data, is_cbor):
                                           f"Stream {stream_name} or consumer {consumer_arn} not found"))
                     return
                 shard = stream["shards"].get(shard_id)
-                if shard is None:
-                    children = [{"ShardId": sid, "ParentShards": [p for p in (s.get("parent_shard_id"),
-                                                                              s.get("adjacent_parent_shard_id")) if p],
-                                 "HashKeyRange": {"StartingHashKey": s["starting_hash_key"],
-                                                  "EndingHashKey": s["ending_hash_key"]}}
-                                for sid, s in sorted(stream["shards"].items())
-                                if shard_id in (s.get("parent_shard_id"), s.get("adjacent_parent_shard_id"))]
+                batch = [r for r in shard["records"]
+                         if after_sequence is None or r["SequenceNumber"] > after_sequence] if shard else []
+                if shard is None or (shard.get("ending_sequence_number") and not batch):
                     await chunk(event("SubscribeToShardEvent", {
                         "Records": [], "ContinuationSequenceNumber": continuation,
-                        "MillisBehindLatest": 0, "ChildShards": children}))
+                        "MillisBehindLatest": 0, "ChildShards": _child_shards(stream, shard_id)}))
                     return
-                records = shard["records"]
-                batch = [r for r in records
-                         if after_sequence is None or r["SequenceNumber"] > after_sequence]
                 if batch or not last_sent or time.time() - last_sent >= _SUBSCRIPTION_IDLE_SECONDS:
                     encryption = stream.get("EncryptionType", "NONE")
                     if batch:
@@ -1374,6 +1406,15 @@ def _disable_enhanced_monitoring(data):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _child_shards(stream, shard_id):
+    return [{"ShardId": sid,
+             "ParentShards": [p for p in (s.get("parent_shard_id"), s.get("adjacent_parent_shard_id")) if p],
+             "HashKeyRange": {"StartingHashKey": s["starting_hash_key"],
+                              "EndingHashKey": s["ending_hash_key"]}}
+            for sid, s in sorted(stream["shards"].items())
+            if shard_id in (s.get("parent_shard_id"), s.get("adjacent_parent_shard_id"))]
+
+
 def _shard_out(shard_id, shard):
     result = {
         "ShardId": shard_id,
@@ -1383,6 +1424,8 @@ def _shard_out(shard_id, shard):
         },
         "SequenceNumberRange": {
             "StartingSequenceNumber": shard["starting_sequence_number"],
+            **({"EndingSequenceNumber": shard["ending_sequence_number"]}
+               if shard.get("ending_sequence_number") else {}),
         },
     }
     if shard.get("parent_shard_id"):
@@ -1404,7 +1447,7 @@ def _stream_desc(stream, shard_ids=None):
         "StreamCreationTimestamp": stream["CreationTimestamp"],
         "Shards": [_shard_out(sid, stream["shards"][sid]) for sid in shard_ids],
         "HasMoreShards": False,
-        "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
+        "EnhancedMonitoring": [{"ShardLevelMetrics": list(stream.get("ShardLevelMetrics", []))}],
         "EncryptionType": stream.get("EncryptionType", "NONE"),
         # KeyId accompanies EncryptionType on AWS, and is omitted entirely when
         # the stream is not encrypted. Storing it without echoing it here leaves

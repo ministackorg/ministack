@@ -28,6 +28,8 @@ import functools
 import hashlib
 import ipaddress
 import json
+import string
+import random
 import logging
 import operator
 import os
@@ -52,6 +54,7 @@ from ministack.core.responses import (
     request_scope,
     set_request_account_id,
     set_request_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("events")
@@ -415,7 +418,7 @@ def _list_event_buses(data):
             if policy:
                 entry["Policy"] = json.dumps(policy, separators=(",", ":"))
             buses.append(entry)
-    return json_response({"EventBuses": buses})
+    return _offset_page(data, "EventBuses", buses)
 
 
 def _describe_event_bus(data):
@@ -580,6 +583,18 @@ def _opaque_offset_decode(token: str) -> int:
         return 0
 
 
+def _offset_page(data, key, items, limit_key="Limit"):
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    try:
+        limit = int(data.get(limit_key) or len(items) or 1)
+    except (TypeError, ValueError):
+        limit = len(items) or 1
+    resp = {key: items[start:start + max(limit, 1)]}
+    if start + max(limit, 1) < len(items):
+        resp["NextToken"] = _opaque_offset_encode(start + max(limit, 1))
+    return json_response(resp)
+
+
 def _list_rules(data):
     prefix = data.get("NamePrefix", "")
     bus = data.get("EventBusName", "default")
@@ -593,7 +608,7 @@ def _list_rules(data):
             continue
         if prefix and not r["Name"].startswith(prefix):
             continue
-        rules.append(_rule_out(r))
+        rules.append(to_output_shape("events", "Rule", _rule_out(r)))
     rules.sort(key=lambda x: x["Name"])
     start = _opaque_offset_decode(data.get("NextToken", ""))
     page = rules[start:start + limit]
@@ -763,7 +778,7 @@ def _list_targets_by_rule(data):
     bus = data.get("EventBusName", "default")
     key = _rule_key(rule_name, bus)
     targets = _targets.get(key, [])
-    return json_response({"Targets": targets})
+    return _offset_page(data, "Targets", list(targets))
 
 
 def _list_rule_names_by_target(data):
@@ -1167,8 +1182,47 @@ def _foreign_bus_denial(entries):
     return None
 
 
+def _endpoint_by_id(endpoint_id):
+    """The caller's global endpoint with *endpoint_id*, in whatever region it was created."""
+    return next((ep for (account, _region, _name), ep in _endpoints.all_items()
+                 if account == get_account_id() and ep.get("EndpointId") == endpoint_id), None)
+
+
+def _put_events_through_endpoint(data, endpoint):
+    """PutEvents to a healthy global endpoint: delivered in its primary region with the endpoint in
+    ``resources``, and, with replication enabled, copied to the secondary region's bus of the same name."""
+    primary = parse_arn(endpoint["Arn"]).region
+    entries = [{**e, "Resources": list(e.get("Resources") or []) + [endpoint["Arn"]]}
+               for e in data.get("Entries", [])]
+    with request_scope(get_account_id(), primary):
+        status, headers, body = _put_events({**data, "Entries": entries, "EndpointId": None})
+    secondary = (((endpoint.get("RoutingConfig") or {}).get("FailoverConfig") or {})
+                 .get("Secondary") or {}).get("Route")
+    if (status != 200 or not secondary or secondary == primary
+            or (endpoint.get("ReplicationConfig") or {}).get("State", "ENABLED") != "ENABLED"):
+        return status, headers, body
+    sent = json.loads(body).get("Entries", [])
+    for entry, result in zip(entries, sent):
+        if "EventId" not in result:
+            continue
+        bus_name, _ = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
+        record = {
+            "EventId": new_uuid(), "Source": entry.get("Source", ""), "DetailType": entry.get("DetailType", ""),
+            "Detail": entry.get("Detail", "{}"), "EventBusName": bus_name, "Time": int(_now_ts()),
+            "Resources": entry["Resources"], "Account": get_account_id(), "Region": primary,
+        }
+        with request_scope(get_account_id(), secondary):
+            _events_log_list().append(record)
+            view = _pattern_event_view(record)
+            _dispatch_event(record, view)
+            _archive_event(record, view)
+    return status, headers, body
+
+
 def _put_events(data, allow_aws_source=False):
     """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
+    if data.get("EndpointId") and (endpoint := _endpoint_by_id(data["EndpointId"])):
+        return _put_events_through_endpoint(data, endpoint)
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -3392,7 +3446,7 @@ def _describe_archive(data):
     archive = _archives.get(name)
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
-    return json_response(archive)
+    return json_response(to_output_shape("events", "DescribeArchiveResponse", archive))
 
 
 def _update_archive(data):
@@ -3445,7 +3499,7 @@ def _list_archives(data):
         if state and archive.get("State") != state:
             continue
         results.append({k: archive[k] for k in _ARCHIVE_SUMMARY_KEYS if k in archive})
-    return json_response({"Archives": results})
+    return _offset_page(data, "Archives", results)
 
 
 # ---------------------------------------------------------------------------
@@ -3569,12 +3623,11 @@ def _list_replays(data):
             continue
         results.append({
             "ReplayName": rep["ReplayName"],
-            "ReplayArn": rep["ReplayArn"],
             "State": rep["State"],
             "EventSourceArn": rep.get("EventSourceArn", ""),
             "ReplayStartTime": rep.get("ReplayStartTime", ""),
         })
-    return json_response({"Replays": results})
+    return _offset_page(data, "Replays", results)
 
 
 def _cancel_replay(data):
@@ -3610,6 +3663,8 @@ def _create_endpoint(data):
                                    f"Endpoint {name} already exists", 400)
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:endpoint/{name}"
     now = _now_ts()
+    endpoint_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "." + \
+        "".join(random.choices(string.ascii_lowercase, k=3))
     _endpoints[name] = {
         "Name": name,
         "Description": data.get("Description", ""),
@@ -3618,7 +3673,8 @@ def _create_endpoint(data):
         "EventBuses": data.get("EventBuses", []),
         "RoleArn": data.get("RoleArn", ""),
         "Arn": arn,
-        "EndpointUrl": f"https://{name}.global-events.{get_region()}.amazonaws.com",
+        "EndpointId": endpoint_id,
+        "EndpointUrl": f"https://{endpoint_id}.endpoint.events.amazonaws.com",
         "State": "ACTIVE",
         "CreationTime": now,
         "LastModifiedTime": now,
@@ -3658,7 +3714,7 @@ def _describe_endpoint(data):
         "ReplicationConfig": ep.get("ReplicationConfig", {}),
         "EventBuses": ep.get("EventBuses", []),
         "RoleArn": ep.get("RoleArn", ""),
-        "EndpointId": ep["Name"],
+        "EndpointId": ep.get("EndpointId", ep["Name"]),
         "EndpointUrl": ep["EndpointUrl"],
         "State": ep["State"],
         "StateReason": "",
@@ -3684,7 +3740,7 @@ def _list_endpoints(data):
             "State": ep["State"],
             "CreationTime": ep["CreationTime"],
         })
-    return json_response({"Endpoints": results})
+    return _offset_page(data, "Endpoints", results, "MaxResults")
 
 
 def _update_endpoint(data):
@@ -3705,7 +3761,7 @@ def _update_endpoint(data):
         "ReplicationConfig": ep["ReplicationConfig"],
         "EventBuses": ep["EventBuses"],
         "RoleArn": ep["RoleArn"],
-        "EndpointId": ep["Name"],
+        "EndpointId": ep.get("EndpointId", ep["Name"]),
         "EndpointUrl": ep["EndpointUrl"],
         "State": ep["State"],
     })
@@ -3772,7 +3828,6 @@ def _describe_partner_event_source(data):
             return json_response({
                 "Name": rec["Name"],
                 "Arn": rec["EventSourceArn"],
-                "State": "ACTIVE",
             })
     return error_response_json("ResourceNotFoundException",
                                f"Partner event source {name} does not exist.", 400)
@@ -3787,14 +3842,13 @@ def _list_partner_event_sources(data):
         results.append({
             "Name": rec["Name"],
             "Arn": rec["EventSourceArn"],
-            "State": "ACTIVE",
         })
-    return json_response({"PartnerEventSources": results})
+    return _offset_page(data, "PartnerEventSources", results)
 
 
 def _list_partner_event_source_accounts(data):
     _ = data.get("EventSourceName", "")
-    return json_response({"PartnerEventSourceAccounts": [], "NextToken": ""})
+    return json_response({"PartnerEventSourceAccounts": []})
 
 
 def _list_event_sources(data):
@@ -4005,11 +4059,28 @@ def _create_connection(data):
         "LastModifiedTime": now,
         "LastAuthorizedTime": now,
     }
+    _apply_connection_extras(_connections[name], data)
     return json_response({
         "ConnectionArn": arn,
         "ConnectionState": "AUTHORIZED",
         "CreationTime": now,
     })
+
+
+def _apply_connection_extras(conn, data):
+    if data.get("KmsKeyIdentifier"):
+        conn["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+    connectivity = data.get("InvocationConnectivityParameters")
+    if isinstance(connectivity, dict) and isinstance(connectivity.get("ResourceParameters"), dict):
+        config_arn = connectivity["ResourceParameters"].get("ResourceConfigurationArn")
+        current = (conn.get("InvocationConnectivityParameters") or {}).get("ResourceParameters", {})
+        association = current.get("ResourceAssociationArn") if current.get("ResourceConfigurationArn") == config_arn else None
+        conn["InvocationConnectivityParameters"] = {"ResourceParameters": {
+            "ResourceConfigurationArn": config_arn,
+            "ResourceAssociationArn": association or (
+                f"arn:aws:vpc-lattice:{get_region()}:{get_account_id()}:servicenetworkresourceassociation/"
+                f"snra-{new_uuid().replace('-', '')[:17]}"),
+        }}
 
 
 def _describe_connection(data):
@@ -4018,7 +4089,7 @@ def _describe_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
-    return json_response(conn)
+    return json_response(to_output_shape("events", "DescribeConnectionResponse", conn))
 
 
 def _delete_connection(data):
@@ -4054,7 +4125,25 @@ def _list_connections(data):
             "LastModifiedTime": conn["LastModifiedTime"],
             "LastAuthorizedTime": conn.get("LastAuthorizedTime", ""),
         })
-    return json_response({"Connections": results})
+    return _offset_page(data, "Connections", results)
+
+
+_AUTH_TYPE_BLOCKS = {
+    "BASIC": "BasicAuthParameters",
+    "API_KEY": "ApiKeyAuthParameters",
+    "OAUTH_CLIENT_CREDENTIALS": "OAuthParameters",
+}
+
+
+def _merge_auth_params(stored, sent):
+    if not isinstance(sent, dict):
+        return sent
+    for key, value in sent.items():
+        if isinstance(value, dict) and isinstance(stored.get(key), dict):
+            stored[key] = _merge_auth_params(stored[key], value)
+        else:
+            stored[key] = copy.deepcopy(value)
+    return stored
 
 
 def _update_connection(data):
@@ -4073,9 +4162,17 @@ def _update_connection(data):
             return endpoint_error
     conn = _connections[name]
     now = _now_ts()
-    for key in ("AuthorizationType", "AuthParameters", "Description"):
+    if "AuthParameters" in data:
+        stored = copy.deepcopy(conn.get("AuthParameters")) if isinstance(conn.get("AuthParameters"), dict) else {}
+        new_type = data.get("AuthorizationType")
+        if new_type and new_type != conn.get("AuthorizationType"):
+            for block in _AUTH_TYPE_BLOCKS.values():
+                stored.pop(block, None)
+        conn["AuthParameters"] = _merge_auth_params(stored, data["AuthParameters"])
+    for key in ("AuthorizationType", "Description"):
         if key in data:
             conn[key] = data[key]
+    _apply_connection_extras(conn, data)
     if "AuthParameters" in data or "AuthorizationType" in data:
         # Re-authorization: the new credentials, not the cached token, decide
         # what the next invocation carries. A description-only update does not
@@ -4197,7 +4294,7 @@ def _list_api_destinations(data):
             "CreationTime": dest["CreationTime"],
             "LastModifiedTime": dest["LastModifiedTime"],
         })
-    return json_response({"ApiDestinations": results})
+    return _offset_page(data, "ApiDestinations", results)
 
 
 def _update_api_destination(data):

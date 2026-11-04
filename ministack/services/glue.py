@@ -35,8 +35,11 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("glue")
@@ -62,6 +65,22 @@ GLUE_DOCKER_IMAGE_OVERRIDE = os.environ.get("GLUE_DOCKER_IMAGE", "")
 
 _docker = None
 _ministack_network = None
+
+
+_DOCUMENT_MEMBERS = frozenset(('Type', 'InitialDefault', 'WriteDefault', 'Records'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def _get_docker():
@@ -902,6 +921,9 @@ def _create_database(data):
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
+    for k in ("CreateTableDefaultPermissions", "TargetDatabase", "FederatedDatabase"):
+        if db_input.get(k) is not None:
+            _databases[name][k] = db_input[k]
     if data.get("Tags"):
         _tags[_arn("database", name)] = dict(data["Tags"])
     return json_response({})
@@ -941,7 +963,8 @@ def _update_database(data):
     db_input = data.get("DatabaseInput", {})
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
-    safe_keys = {"Description", "LocationUri", "Parameters"}
+    safe_keys = {"Description", "LocationUri", "Parameters", "CreateTableDefaultPermissions", "TargetDatabase",
+                 "FederatedDatabase"}
     for k in safe_keys:
         if k in db_input:
             _databases[name][k] = db_input[k]
@@ -967,7 +990,7 @@ def _create_table(data):
         "Owner": table_input.get("Owner", ""),
         "CreateTime": int(time.time()),
         "UpdateTime": int(time.time()),
-        "LastAccessTime": int(time.time()),
+        "LastAccessTime": table_input.get("LastAccessTime", int(time.time())),
         "StorageDescriptor": table_input.get("StorageDescriptor", {}),
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
@@ -983,6 +1006,9 @@ def _create_table(data):
         # botocore Table output shape.
         "VersionId": "1",
     }
+    for k in ("LastAnalyzedTime", "Retention", "TargetTable", "FederatedTable"):
+        if table_input.get(k) is not None:
+            _tables[key][k] = table_input[k]
     return json_response({})
 
 
@@ -1049,6 +1075,11 @@ def _update_table(data):
         "ViewExpandedText",
         "ViewDefinition",
         "IsMultiDialectView",
+        "LastAccessTime",
+        "LastAnalyzedTime",
+        "Retention",
+        "TargetTable",
+        "FederatedTable",
     }
     for k in safe_keys:
         if k in table_input:
@@ -1304,7 +1335,7 @@ def _create_partition(data):
             "DatabaseName": db_name,
             "TableName": table_name,
             "CreationTime": int(time.time()),
-            "LastAccessTime": int(time.time()),
+            "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
             "CatalogId": get_account_id(),
         }
     )
@@ -1425,7 +1456,7 @@ def _batch_update_partition(data):
                 "DatabaseName": db_name,
                 "TableName": table_name,
                 "CreationTime": creation_time,
-                "LastAccessTime": int(time.time()),
+                "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
                 "CatalogId": get_account_id(),
             }
         )
@@ -1669,6 +1700,8 @@ def _create_crawler(data):
         "Configuration": data.get("Configuration", ""),
         "CrawlerSecurityConfiguration": data.get("CrawlerSecurityConfiguration", ""),
     }
+    if data.get("LakeFormationConfiguration") is not None:
+        _crawlers[name]["LakeFormationConfiguration"] = data["LakeFormationConfiguration"]
     return json_response({})
 
 
@@ -1708,6 +1741,7 @@ def _update_crawler(data):
         "SchemaChangePolicy",
         "RecrawlPolicy",
         "LineageConfiguration",
+        "LakeFormationConfiguration",
         "Configuration",
         "CrawlerSecurityConfiguration",
     }
@@ -1797,6 +1831,21 @@ def _get_crawler_metrics(data):
 # ---- Jobs ----
 
 
+_JOB_OPTIONAL_FIELDS = (
+    "JobRunQueuingEnabled", "LogUri", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+    "NotificationProperty", "CodeGenConfigurationNodes", "ExecutionClass", "SourceControlDetails",
+    "MaintenanceWindow",
+)
+
+
+def _default_job_timeout(glue_version):
+    """2,880 minutes for Glue 4.0 and earlier, 480 for 5.0 and later (botocore CreateJob Timeout)."""
+    try:
+        return 480 if float(glue_version) >= 5.0 else 2880
+    except (TypeError, ValueError):
+        return 2880
+
+
 def _create_job(data):
     name = data.get("Name")
     if not name:
@@ -1812,16 +1861,21 @@ def _create_job(data):
         "NonOverridableArguments": data.get("NonOverridableArguments", {}),
         "Connections": data.get("Connections", {}),
         "MaxRetries": data.get("MaxRetries", 0),
-        "Timeout": data.get("Timeout", 2880),
-        "GlueVersion": data.get("GlueVersion", "3.0"),
-        "NumberOfWorkers": data.get("NumberOfWorkers", 2),
-        "WorkerType": data.get("WorkerType", "G.1X"),
-        "MaxCapacity": data.get("MaxCapacity"),
+        "GlueVersion": data.get("GlueVersion", "5.1"),
+        "JobMode": data.get("JobMode", "SCRIPT"),
+        "ExecutionProperty": data.get("ExecutionProperty") or {"MaxConcurrentRuns": 1},
         "SecurityConfiguration": data.get("SecurityConfiguration", ""),
         "Tags": data.get("Tags", {}),
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    _jobs[name]["Timeout"] = data.get("Timeout", _default_job_timeout(_jobs[name]["GlueVersion"]))
+    for k in _JOB_OPTIONAL_FIELDS:
+        if data.get(k) is not None:
+            _jobs[name][k] = data[k]
+    if ("MaxCapacity" not in _jobs[name] and "WorkerType" not in _jobs[name]
+            and _jobs[name]["Command"].get("Name") == "pythonshell"):
+        _jobs[name]["MaxCapacity"] = 0.0625
     _job_runs[name] = []
     return json_response({"Name": name})
 
@@ -1838,11 +1892,11 @@ def _get_job(data):
     job = _jobs.get(name)
     if not job:
         return error_response_json("EntityNotFoundException", f"Job {name} not found", 400)
-    return json_response({"Job": job})
+    return json_response(to_output_shape("glue", "GetJobResponse", {"Job": job}))
 
 
 def _get_jobs(data):
-    return json_response({"Jobs": list(_jobs.values())})
+    return json_response(to_output_shape("glue", "GetJobsResponse", {"Jobs": list(_jobs.values())}))
 
 
 def _update_job(data):
@@ -1864,6 +1918,16 @@ def _update_job(data):
         "WorkerType",
         "MaxCapacity",
         "SecurityConfiguration",
+        "JobMode",
+        "JobRunQueuingEnabled",
+        "LogUri",
+        "ExecutionProperty",
+        "AllocatedCapacity",
+        "NotificationProperty",
+        "CodeGenConfigurationNodes",
+        "ExecutionClass",
+        "SourceControlDetails",
+        "MaintenanceWindow",
     }
     for k in updatable:
         if k in job_update:
@@ -1944,16 +2008,19 @@ def _start_job_run(data):
         "Arguments": args,
         "ErrorMessage": "",
         "PredecessorRuns": [],
-        "AllocatedCapacity": job.get("MaxCapacity") or job.get("NumberOfWorkers", 2),
         "ExecutionTime": 0,
-        "Timeout": job.get("Timeout", 2880),
-        "MaxCapacity": job.get("MaxCapacity"),
-        "WorkerType": job.get("WorkerType", "G.1X"),
-        "NumberOfWorkers": job.get("NumberOfWorkers", 2),
-        "SecurityConfiguration": job.get("SecurityConfiguration", ""),
-        "GlueVersion": job.get("GlueVersion", "3.0"),
+        "Timeout": data.get("Timeout") or job.get("Timeout", 2880),
+        "SecurityConfiguration": data.get("SecurityConfiguration") or job.get("SecurityConfiguration", ""),
+        "GlueVersion": job.get("GlueVersion", "5.1"),
         "Attempt": 0,
     }
+    if job.get("JobMode"):
+        run["JobMode"] = job["JobMode"]
+    for k in ("JobRunQueuingEnabled", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+              "NotificationProperty", "ExecutionClass", "MaintenanceWindow", "ExecutionRoleSessionPolicy"):
+        value = data.get(k) if data.get(k) is not None else job.get(k)
+        if value is not None:
+            run[k] = value
 
     if job_name not in _job_runs:
         _job_runs[job_name] = []
@@ -1978,12 +2045,13 @@ def _start_job_run(data):
             except Exception:
                 logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
 
+        run_job = {**job, "Timeout": run["Timeout"]}
         if use_docker:
-            _execute_spark_docker(run, job, job_name, script_args, resolved, docker_client)
+            _execute_spark_docker(run, run_job, job_name, script_args, resolved, docker_client)
         elif _is_spark_job(job):
             run["JobRunState"] = "SUCCEEDED"
         elif resolved and resolved.endswith(".py"):
-            _execute_subprocess(run, job, script_args, resolved)
+            _execute_subprocess(run, run_job, script_args, resolved)
         else:
             run["JobRunState"] = "SUCCEEDED"
 
@@ -2628,6 +2696,8 @@ def _create_trigger(data):
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    if data.get("EventBatchingCondition") is not None:
+        _triggers[name]["EventBatchingCondition"] = data["EventBatchingCondition"]
     if data.get("StartOnCreation", False):
         _triggers[name]["State"] = "ACTIVATED"
     if data.get("Tags"):
@@ -2641,7 +2711,7 @@ def _get_trigger(data):
     trigger = _triggers.get(name)
     if not trigger:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
-    return json_response({"Trigger": trigger})
+    return json_response(to_output_shape("glue", "GetTriggerResponse", {"Trigger": trigger}))
 
 
 def _delete_trigger(data):
@@ -2658,12 +2728,12 @@ def _update_trigger(data):
     if name not in _triggers:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
     trigger_update = data.get("TriggerUpdate", {})
-    updatable = {"Schedule", "Predicate", "Actions", "Description"}
+    updatable = {"Schedule", "Predicate", "Actions", "Description", "EventBatchingCondition"}
     for k in updatable:
         if k in trigger_update:
             _triggers[name][k] = trigger_update[k]
     _triggers[name]["LastModifiedOn"] = int(time.time())
-    return json_response({"Trigger": _triggers[name]})
+    return json_response(to_output_shape("glue", "UpdateTriggerResponse", {"Trigger": _triggers[name]}))
 
 
 def _start_trigger(data):
@@ -2700,7 +2770,8 @@ def _batch_get_triggers(data):
     requested = data.get("TriggerNames", [])
     found = [_triggers[n] for n in requested if n in _triggers]
     not_found = [n for n in requested if n not in _triggers]
-    return json_response({"Triggers": found, "TriggersNotFound": not_found})
+    return json_response(to_output_shape("glue", "BatchGetTriggersResponse",
+                                         {"Triggers": found, "TriggersNotFound": not_found}))
 
 
 def _get_triggers(data):
@@ -2712,7 +2783,7 @@ def _get_triggers(data):
             if not any(a.get("JobName") == dependent_job for a in actions):
                 continue
         triggers.append(trigger)
-    return json_response({"Triggers": triggers})
+    return json_response(to_output_shape("glue", "GetTriggersResponse", {"Triggers": triggers}))
 
 
 # ---- Workflows ----
@@ -2790,7 +2861,7 @@ def _start_workflow_run(data):
             "FailedActions": 0,
             "TimeoutActions": 0,
         },
-        "WorkflowRunProperties": dict(_workflows[name].get("DefaultRunProperties", {})),
+        "WorkflowRunProperties": {**_workflows[name].get("DefaultRunProperties", {}), **(data.get("RunProperties") or {})},
     }
     _workflow_runs.setdefault(name, []).append(run)
     return json_response({"RunId": run_id})
@@ -2806,13 +2877,14 @@ def _udf_key(db_name: str, func_name: str) -> str:
 def _udf_record(db_name: str, fn_input: dict) -> dict:
     """Build a UserDefinedFunction record matching the botocore output shape:
     UserDefinedFunction { FunctionName, DatabaseName, ClassName, OwnerName,
-    OwnerType, CreateTime, ResourceUris, CatalogId }."""
+    FunctionType, OwnerType, CreateTime, ResourceUris, CatalogId }."""
     return {
         "FunctionName": fn_input.get("FunctionName"),
         "DatabaseName": db_name,
         "ClassName": fn_input.get("ClassName"),
         "OwnerName": fn_input.get("OwnerName"),
         "OwnerType": fn_input.get("OwnerType"),
+        **({"FunctionType": fn_input["FunctionType"]} if fn_input.get("FunctionType") else {}),
         "CreateTime": int(time.time()),
         "ResourceUris": fn_input.get("ResourceUris", []),
         "CatalogId": get_account_id(),
@@ -2846,7 +2918,7 @@ def _update_user_defined_function(data):
         )
     fn_input = data.get("FunctionInput") or {}
     existing = _user_defined_functions[key]
-    for field in ("ClassName", "OwnerName", "OwnerType", "ResourceUris"):
+    for field in ("ClassName", "OwnerName", "OwnerType", "FunctionType", "ResourceUris"):
         if field in fn_input:
             existing[field] = fn_input[field]
     # AWS allows renaming the function via FunctionInput.FunctionName.

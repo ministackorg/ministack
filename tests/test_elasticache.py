@@ -1239,8 +1239,8 @@ def test_elasticache_events_are_region_scoped():
         east_events = east.describe_events(SourceIdentifier=cid)["Events"]
         west_events = west.describe_events(SourceIdentifier=cid)["Events"]
         assert [e["Message"] for e in east_events] == [
-            "Cache cluster created",
             "Cache cluster deleted",
+            "Cache cluster created",
         ]
         assert [e["Message"] for e in west_events] == ["Cache cluster created"]
     finally:

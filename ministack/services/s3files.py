@@ -554,7 +554,7 @@ def _list_mount_targets(query_params):
         else:
             items = []
 
-    summaries = [_mt_response(mt) for mt in items]
+    summaries = [{k: v for k, v in _mt_response(mt).items() if k != "securityGroups"} for mt in items]
     page, nxt = _paginate(summaries, max_results, next_token)
     out = {"mountTargets": page}
     if nxt:

@@ -66,6 +66,7 @@ Supports:
                    configuration; group and endpoint policies (control plane only)
 """
 
+import base64
 import copy
 import hashlib
 import logging
@@ -726,10 +727,56 @@ def _matches_iam_instance_profile_association_filters(assoc, filters):
     return True
 
 
-def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_name="", user_data="", sg_ids=None, requested_private_ip=None, iam_profile=None):
+def _instance_volume(instance_id, device, az, now, ebs):
+    vol_id = _new_volume_id()
+    vol_type = ebs.get("VolumeType") or "gp3"
+    snapshot_id = ebs.get("SnapshotId") or ""
+    size = ebs.get("VolumeSize") or _snapshots.get(snapshot_id, {}).get("VolumeSize") or 8
+    delete_on_termination = ebs.get("DeleteOnTermination", True)
+    _volumes[vol_id] = {
+        "VolumeId": vol_id,
+        "Size": int(size),
+        "AvailabilityZone": az,
+        "State": "in-use",
+        "VolumeType": vol_type,
+        "SnapshotId": snapshot_id,
+        "Iops": ebs.get("Iops") or (3000 if vol_type in ("gp3", "io1", "io2") else 0),
+        "Encrypted": bool(ebs.get("Encrypted") or ebs.get("KmsKeyId")),
+        "CreateTime": now,
+        "Attachments": [{
+            "VolumeId": vol_id,
+            "InstanceId": instance_id,
+            "Device": device,
+            "State": "attached",
+            "AttachTime": now,
+            "DeleteOnTermination": delete_on_termination,
+        }],
+        "MultiAttachEnabled": False,
+        "Throughput": ebs.get("Throughput") or (125 if vol_type == "gp3" else 0),
+    }
+    if ebs.get("KmsKeyId"):
+        _volumes[vol_id]["KmsKeyId"] = ebs["KmsKeyId"]
+    return {
+        "DeviceName": device,
+        "Ebs": {
+            "VolumeId": vol_id,
+            "Status": "attached",
+            "AttachTime": now,
+            "DeleteOnTermination": delete_on_termination,
+        },
+    }
+
+
+def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_name="", user_data="", sg_ids=None, requested_private_ip=None, iam_profile=None, launch=None):
     now = _now_ts()
     if not sg_ids:
         sg_ids = [_DEFAULT_SG_ID]
+    launch = launch or {}
+    placement = dict(launch.get("Placement") or {})
+    placement.setdefault("AvailabilityZone",
+                         _subnets.get(subnet_id, {}).get("AvailabilityZone") or f"{get_region()}a")
+    placement.setdefault("Tenancy", "default")
+    requested_bdms = {b["DeviceName"]: b for b in launch.get("BlockDeviceMappings") or []}
     created = []
     for _ in range(count):
         instance_id = _new_instance_id()
@@ -740,37 +787,13 @@ def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_na
         # specified BlockDeviceMappings. Cloud Custodian, AWS Config, and policy
         # tools rely on the BDM presence to classify instance storage.
         root_device = "/dev/xvda"
-        vol_id = _new_volume_id()
-        _volumes[vol_id] = {
-            "VolumeId": vol_id,
-            "Size": 8,
-            "AvailabilityZone": f"{get_region()}a",
-            "State": "in-use",
-            "VolumeType": "gp3",
-            "SnapshotId": "",
-            "Iops": 3000,
-            "Encrypted": False,
-            "CreateTime": now,
-            "Attachments": [{
-                "VolumeId": vol_id,
-                "InstanceId": instance_id,
-                "Device": root_device,
-                "State": "attached",
-                "AttachTime": now,
-                "DeleteOnTermination": True,
-            }],
-            "MultiAttachEnabled": False,
-            "Throughput": 125,
-        }
-        block_device_mappings = [{
-            "DeviceName": root_device,
-            "Ebs": {
-                "VolumeId": vol_id,
-                "Status": "attached",
-                "AttachTime": now,
-                "DeleteOnTermination": True,
-            },
-        }]
+        root_ebs = (requested_bdms.get(root_device) or {}).get("Ebs") or {}
+        block_device_mappings = [_instance_volume(instance_id, root_device, placement["AvailabilityZone"], now, root_ebs)]
+        for device, bdm in requested_bdms.items():
+            if device == root_device or "NoDevice" in bdm or bdm.get("VirtualName") or not bdm.get("Ebs"):
+                continue
+            block_device_mappings.append(
+                _instance_volume(instance_id, device, placement["AvailabilityZone"], now, bdm["Ebs"]))
         inst = {
             "InstanceId": instance_id,
             "ImageId": image_id,
@@ -796,14 +819,29 @@ def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_na
             "RootDeviceName": root_device,
             "Hypervisor": "xen",
             "Virtualization": "hvm",
-            "Placement": {"AvailabilityZone": f"{get_region()}a", "Tenancy": "default"},
-            "Monitoring": {"State": "disabled"},
+            "Placement": dict(placement),
+            "Monitoring": {"State": "enabled" if (launch.get("Monitoring") or {}).get("Enabled") else "disabled"},
             "AmiLaunchIndex": 0,
             "UserData": user_data,
             "LaunchTime": now,
             "BlockDeviceMappings": block_device_mappings,
             "IamInstanceProfile": iam_profile,
+            "EbsOptimized": bool(launch.get("EbsOptimized")),
+            "DisableApiTermination": bool(launch.get("DisableApiTermination")),
+            "DisableApiStop": bool(launch.get("DisableApiStop")),
+            "InstanceInitiatedShutdownBehavior": launch.get("InstanceInitiatedShutdownBehavior") or "stop",
+            "MetadataOptions": {
+                "HttpEndpoint": "enabled", "HttpProtocolIpv6": "disabled", "InstanceMetadataTags": "disabled",
+                **(launch.get("MetadataOptions") or {}), "State": "applied",
+            },
+            "HibernationOptions": {"Configured": bool((launch.get("HibernationOptions") or {}).get("Configured"))},
         }
+        for key in ("CpuOptions", "EnclaveOptions", "MaintenanceOptions", "PrivateDnsNameOptions",
+                    "CapacityReservationSpecification", "CreditSpecification"):
+            if launch.get(key):
+                inst[key] = copy.deepcopy(launch[key])
+        if (launch.get("InstanceMarketOptions") or {}).get("MarketType") == "spot":
+            inst["InstanceLifecycle"] = "spot"
         _instances[instance_id] = inst
         if iam_profile:
             _upsert_iam_instance_profile_association(instance_id, iam_profile)
@@ -812,26 +850,45 @@ def _launch_instances_internal(image_id, instance_type, subnet_id, count, key_na
 
 
 def _run_instances(p):
-    image_id = _p(p, "ImageId") or "ami-00000000"
-    instance_type = _p(p, "InstanceType") or "t2.micro"
+    lt_spec = {k: _p(p, f"LaunchTemplate.{k}") for k in ("LaunchTemplateId", "LaunchTemplateName", "Version")}
+    lt_data, _lt, err = _resolve_launch_template_data(lt_spec)
+    if err:
+        return err
+    launch = copy.deepcopy(lt_data or {})
+    launch.update(_parse_lt_data(p, prefix=""))
+    image_id = launch.get("ImageId") or "ami-00000000"
+    instance_type = launch.get("InstanceType") or "t2.micro"
     min_count = int(_p(p, "MinCount") or "1")
     max_count = int(_p(p, "MaxCount") or "1")
     if min_count > max_count:
         return _error("InvalidParameterCombination",
                       f"Value ({min_count}) for parameter MinCount is not valid. "
                       f"MinCount must not exceed MaxCount.", 400)
-    key_name = _p(p, "KeyName") or ""
-    subnet_id = _p(p, "SubnetId") or _DEFAULT_SUBNET_ID
-    user_data = _p(p, "UserData") or ""
+    key_name = launch.get("KeyName") or ""
+    nis = launch.get("NetworkInterfaces") or []
+    subnet_id = _p(p, "SubnetId") or (nis[0].get("SubnetId") if nis else "") or _DEFAULT_SUBNET_ID
+    user_data = launch.get("UserData") or ""
 
-    sg_ids = _parse_member_list(p, "SecurityGroupId")
+    sg_ids = list(launch.get("SecurityGroupIds") or [])
+    if not sg_ids and nis:
+        sg_ids = list(nis[0].get("Groups") or [])
+    if launch.get("SecurityGroups"):
+        vpc_id = _subnets.get(subnet_id, {}).get("VpcId", _DEFAULT_VPC_ID)
+        for name in launch["SecurityGroups"]:
+            match = next((g["GroupId"] for g in _security_groups.values()
+                          if g.get("GroupName") == name and g.get("VpcId") == vpc_id), None)
+            if not match:
+                return _error("InvalidGroup.NotFound",
+                              f"The security group '{name}' does not exist in VPC '{vpc_id}'", 400)
+            if match not in sg_ids:
+                sg_ids.append(match)
     if not sg_ids:
         sg_ids = [_DEFAULT_SG_ID]
 
     # Optional caller-provided values: respect them if set; fall back to defaults otherwise.
-    requested_private_ip = _p(p, "PrivateIpAddress")
-    iam_arn = _p(p, "IamInstanceProfile.Arn")
-    iam_name = _p(p, "IamInstanceProfile.Name")
+    requested_private_ip = _p(p, "PrivateIpAddress") or (nis[0].get("PrivateIpAddress") if nis else None)
+    iam_arn = (launch.get("IamInstanceProfile") or {}).get("Arn")
+    iam_name = (launch.get("IamInstanceProfile") or {}).get("Name")
     iam_profile = None
     if iam_arn or iam_name:
         iam_profile, err = _resolve_iam_instance_profile(
@@ -851,7 +908,8 @@ def _run_instances(p):
         user_data=user_data,
         sg_ids=sg_ids,
         requested_private_ip=requested_private_ip,
-        iam_profile=iam_profile
+        iam_profile=iam_profile,
+        launch=launch,
     )
 
     # A registered AMI boots each record as a real container. Unregistered ids
@@ -929,6 +987,11 @@ def _run_instances(p):
             for inst in created:
                 _tags[inst["InstanceId"]] = spec_tags[:]
         i += 1
+    lt_instance_tags = [t for ts in (lt_data or {}).get("TagSpecifications") or []
+                        if ts.get("ResourceType") == "instance" for t in ts.get("Tags", [])]
+    if lt_instance_tags:
+        for inst in created:
+            _tags.setdefault(inst["InstanceId"], [dict(t) for t in lt_instance_tags])
 
     items = "".join(_instance_xml(i) for i in created)
     inner = f"""<instancesSet>{items}</instancesSet>
@@ -987,6 +1050,9 @@ def _describe_instances(p):
             continue
         results.append(inst)
 
+    next_xml = ""
+    if not filter_ids:
+        results, next_xml = _page(p, results)
     items = "".join(
         f"""<item>
             <reservationId>r-{inst['InstanceId'][2:]}</reservationId>
@@ -996,7 +1062,7 @@ def _describe_instances(p):
         </item>"""
         for inst in results
     )
-    return _xml(200, "DescribeInstancesResponse", f"<reservationSet>{items}</reservationSet>")
+    return _xml(200, "DescribeInstancesResponse", f"<reservationSet>{items}</reservationSet>{next_xml}")
 
 
 def _describe_instance_status(p):
@@ -1031,9 +1097,12 @@ def _describe_instance_status(p):
             </instanceStatus>
         </item>""")
 
+    next_xml = ""
+    if not filter_ids:
+        results, next_xml = _page(p, results)
     items = "".join(results)
     return _xml(200, "DescribeInstanceStatusResponse",
-                f"<instanceStatusSet>{items}</instanceStatusSet>")
+                f"<instanceStatusSet>{items}</instanceStatusSet>{next_xml}")
 
 
 def _associate_iam_instance_profile(p):
@@ -1097,10 +1166,11 @@ def _describe_iam_instance_profile_associations(p):
             continue
         items.append(_iam_instance_profile_association_xml(assoc))
 
+    items, next_xml = _page(p, items, (5, 1000))
     return _xml(
         200,
         "DescribeIamInstanceProfileAssociationsResponse",
-        f"<iamInstanceProfileAssociationSet>{''.join(items)}</iamInstanceProfileAssociationSet>",
+        f"<iamInstanceProfileAssociationSet>{''.join(items)}</iamInstanceProfileAssociationSet>{next_xml}",
     )
 
 
@@ -1292,6 +1362,20 @@ _STUB_AMIS = [
 ]
 
 
+_IMAGE_OPTION_MEMBERS = ("KernelId", "RamdiskId", "SriovNetSupport", "BootMode", "TpmSupport", "ImdsSupport")
+
+
+def _image_options_xml(view):
+    out = ""
+    if "EnaSupport" in view:
+        out += f"<enaSupport>{'true' if view['EnaSupport'] else 'false'}</enaSupport>"
+    for member in _IMAGE_OPTION_MEMBERS:
+        if view.get(member):
+            tag = member[0].lower() + member[1:]
+            out += f"<{tag}>{_esc(view[member])}</{tag}>"
+    return out
+
+
 def _image_view(image):
     """Registered image as the flat shape the filter and renderer share."""
     root_type = image.get("RootDeviceType") or ("instance-store" if image.get("ImageLocation") else "ebs")
@@ -1315,6 +1399,7 @@ def _image_view(image):
                      else "false"),
         "LaunchPermissions": image.get("LaunchPermissions") or [],
         "Backed": True,
+        **{k: image[k] for k in ("EnaSupport",) + _IMAGE_OPTION_MEMBERS if k in image},
     }
 
 
@@ -1475,16 +1560,16 @@ def _describe_images(p):
     seen = {v["ImageId"] for v in views}
     views += [_stub_image_view(*stub) for stub in _STUB_AMIS if stub[0] not in seen]
 
+    views = [
+        view for view in views
+        if (not filter_ids or view["ImageId"] in filter_ids)
+        and (not owners or _image_owner_matches(view, owners))
+        and (not executable_by or _image_executable_by_matches(view, executable_by))
+        and (not filters or _image_matches_filters(view, filters))
+    ]
+    views, next_xml = _page(p, views)
     items = ""
     for view in views:
-        if filter_ids and view["ImageId"] not in filter_ids:
-            continue
-        if owners and not _image_owner_matches(view, owners):
-            continue
-        if executable_by and not _image_executable_by_matches(view, executable_by):
-            continue
-        if filters and not _image_matches_filters(view, filters):
-            continue
         # RootDeviceName + BlockDeviceMappings are required by Terraform's AWS
         # provider on aws_instance — it resolves them from DescribeImages before
         # RunInstances and fails with "finding Root Device Name for AMI" if absent.
@@ -1514,9 +1599,10 @@ def _describe_images(p):
             {_image_bdm_xml(view)}
             <virtualizationType>{view['VirtualizationType']}</virtualizationType>
             <hypervisor>xen</hypervisor>
+            {_image_options_xml(view)}
             {tag_xml}
         </item>"""
-    return _xml(200, "DescribeImagesResponse", f"<imagesSet>{items}</imagesSet>")
+    return _xml(200, "DescribeImagesResponse", f"<imagesSet>{items}</imagesSet>{next_xml}")
 
 
 # ---------------------------------------------------------------------------
@@ -1583,7 +1669,7 @@ def _describe_security_groups(p):
                 return _error("InvalidGroupId.Malformed", f'Invalid id: "{gid}"', 400)
             if gid not in _security_groups:
                 return _error("InvalidGroup.NotFound", f"The security group '{gid}' does not exist", 400)
-    items = ""
+    items = []
     for sg in _security_groups.values():
         if filter_ids and sg["GroupId"] not in filter_ids:
             continue
@@ -1595,9 +1681,10 @@ def _describe_security_groups(p):
         name_filter = filters.get("group-name", [])
         if name_filter and sg.get("GroupName", "") not in name_filter:
             continue
-        items += _sg_xml(sg)
+        items.append(_sg_xml(sg))
+    items, next_xml = _page(p, items, (5, 1000))
     return _xml(200, "DescribeSecurityGroupsResponse",
-                f"<securityGroupInfo>{items}</securityGroupInfo>")
+                f"<securityGroupInfo>{''.join(items)}</securityGroupInfo>{next_xml}")
 
 
 def _sg_rule_id(sg_id, is_egress, rule):
@@ -1701,6 +1788,20 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
                   f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
+    for prefix in rule.get("PrefixListIds", []):
+        prefix_id = prefix.get("PrefixListId", "") if isinstance(prefix, dict) else str(prefix)
+        items += (f"<item>"
+                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
+                  f"<groupId>{sg_id}</groupId>"
+                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
+                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
+                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
+                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<prefixListId>{_esc(prefix_id)}</prefixListId>"
+                  f"{desc_xml}"
+                  f"{suffix}"
+                  f"</item>")
     for pair in rule.get("UserIdGroupPairs", []):
         ref_gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
         items += (f"<item>"
@@ -1780,8 +1881,9 @@ def _strip_descriptions(rule):
         k: v for k, v in dict(rule).items()
         if k not in ("SecurityGroupRuleId", "Description")
     }
-    for key in ("IpRanges", "Ipv6Ranges"):
-        r[key] = [{k: v for k, v in entry.items() if k != "Description"} for entry in r.get(key, [])]
+    for key in ("IpRanges", "Ipv6Ranges", "PrefixListIds"):
+        r[key] = [{k: v for k, v in entry.items() if k != "Description"} if isinstance(entry, dict) else entry
+                  for entry in r.get(key, [])]
     return r
 
 
@@ -1977,19 +2079,26 @@ def _create_key_pair(p):
     if name in _key_pairs:
         return _error("InvalidKeyPair.Duplicate",
                       f"The key pair '{name}' already exists", 400)
+    key_type = _p(p, "KeyType") or "rsa"
     fingerprint = ":".join(f"{random.randint(0,255):02x}" for _ in range(20))
-    material = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA(stub)\n-----END RSA PRIVATE KEY-----"
+    if key_type == "ed25519":
+        material = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA(stub)\n-----END OPENSSH PRIVATE KEY-----"
+    else:
+        material = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA(stub)\n-----END RSA PRIVATE KEY-----"
     _key_pairs[name] = {
         "KeyName": name,
         "KeyFingerprint": fingerprint,
         "KeyPairId": f"key-{new_uuid().replace('-','')[:17]}",
+        "KeyType": key_type,
+        "CreateTime": _now_ts(),
     }
     _parse_tag_specs(p, "key-pair", _key_pairs[name]['KeyPairId'])
     return _xml(200, "CreateKeyPairResponse", f"""
         <keyName>{name}</keyName>
         <keyFingerprint>{fingerprint}</keyFingerprint>
         <keyMaterial>{material}</keyMaterial>
-        <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>""")
+        <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>
+        {_tag_set_xml(_key_pairs[name]['KeyPairId'])}""")
 
 
 def _delete_key_pair(p):
@@ -2004,14 +2113,22 @@ def _describe_key_pairs(p):
         for kn in filter_names:
             if kn not in _key_pairs:
                 return _error("InvalidKeyPair.NotFound", f"The key pair '{kn}' does not exist", 400)
+    include_public_key = _p(p, "IncludePublicKey").lower() == "true"
     items = ""
     for kp in _key_pairs.values():
         if filter_names and kp["KeyName"] not in filter_names:
             continue
+        extra = f"<keyType>{_esc(kp.get('KeyType', 'rsa'))}</keyType>"
+        if kp.get("CreateTime"):
+            extra += f"<createTime>{kp['CreateTime']}</createTime>"
+        if include_public_key and kp.get("PublicKey"):
+            extra += f"<publicKey>{_esc(kp['PublicKey'])}</publicKey>"
         items += f"""<item>
             <keyName>{kp['KeyName']}</keyName>
             <keyFingerprint>{kp['KeyFingerprint']}</keyFingerprint>
             <keyPairId>{kp['KeyPairId']}</keyPairId>
+            {extra}
+            {_tag_set_xml(kp['KeyPairId'])}
         </item>"""
     return _xml(200, "DescribeKeyPairsResponse", f"<keySet>{items}</keySet>")
 
@@ -2021,15 +2138,25 @@ def _import_key_pair(p):
     if not name:
         return _error("MissingParameter", "KeyName is required", 400)
     fingerprint = ":".join(f"{random.randint(0,255):02x}" for _ in range(20))
+    public_key = _p(p, "PublicKeyMaterial")
+    try:
+        public_key = base64.b64decode(public_key, validate=True).decode().strip()
+    except (ValueError, UnicodeDecodeError):
+        public_key = public_key.strip()
     _key_pairs[name] = {
         "KeyName": name,
         "KeyFingerprint": fingerprint,
         "KeyPairId": f"key-{new_uuid().replace('-','')[:17]}",
+        "KeyType": "ed25519" if public_key.startswith("ssh-ed25519") else "rsa",
+        "CreateTime": _now_ts(),
+        "PublicKey": public_key,
     }
+    _parse_tag_specs(p, "key-pair", _key_pairs[name]['KeyPairId'])
     return _xml(200, "ImportKeyPairResponse", f"""
         <keyName>{name}</keyName>
         <keyFingerprint>{fingerprint}</keyFingerprint>
-        <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>""")
+        <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>
+        {_tag_set_xml(_key_pairs[name]['KeyPairId'])}""")
 
 
 # ---------------------------------------------------------------------------
@@ -2211,6 +2338,11 @@ def _register_image(p):
         "CreationDate": _now_ts(),
         "OwnerId": get_account_id(),
     }
+    for member in _IMAGE_OPTION_MEMBERS:
+        if _p(p, member):
+            _images[image_id][member] = _p(p, member)
+    if _p(p, "EnaSupport"):
+        _images[image_id]["EnaSupport"] = _p(p, "EnaSupport").lower() == "true"
     _parse_tag_specs(p, "image", image_id)
     return _xml(200, "RegisterImageResponse", f"<imageId>{image_id}</imageId>")
 
@@ -2269,6 +2401,15 @@ def _modify_image_attribute(p):
             remove = flat
         else:
             add = flat
+    description = _p(p, "Description.Value") or (
+        _p(p, "Value") if _p(p, "Attribute") == "description" else "")
+    imds = _p(p, "ImdsSupport.Value") or (_p(p, "Value") if _p(p, "Attribute") == "imdsSupport" else "")
+    if not add and not remove and (description or imds):
+        if description:
+            image["Description"] = description
+        if imds:
+            image["ImdsSupport"] = imds
+        return _xml(200, "ModifyImageAttributeResponse", "<return>true</return>")
     if not add and not remove:
         return _error("InvalidParameterCombination",
                       "The request must contain launch permissions to add or remove", 400)
@@ -2306,6 +2447,12 @@ def _describe_image_attribute(p):
         return _xml(200, "DescribeImageAttributeResponse",
                     f"<imageId>{image_id}</imageId>"
                     f"<description><value>{_esc(image.get('Description') or '')}</value></description>")
+    attr_members = {"kernel": "KernelId", "ramdisk": "RamdiskId", "sriovNetSupport": "SriovNetSupport",
+                    "bootMode": "BootMode", "tpmSupport": "TpmSupport", "imdsSupport": "ImdsSupport"}
+    if attribute in attr_members:
+        value = image.get(attr_members[attribute])
+        body = f"<{attribute}><value>{_esc(value)}</value></{attribute}>" if value else f"<{attribute}/>"
+        return _xml(200, "DescribeImageAttributeResponse", f"<imageId>{image_id}</imageId>{body}")
     return _error("InvalidParameterValue",
                   f"Value ({attribute}) for parameter attribute is invalid.", 400)
 
@@ -2716,6 +2863,7 @@ def _placement_group_inner_xml(pg, tag="placementGroup"):
         <groupId>{pg['GroupId']}</groupId>
         <groupArn>{pg['GroupArn']}</groupArn>
         {partition_xml}
+        {f"<spreadLevel>{_esc(pg['SpreadLevel'])}</spreadLevel>" if pg.get("SpreadLevel") else ""}
         {_tag_set_xml(pg['GroupId'])}
     </{tag}>"""
 
@@ -2738,6 +2886,8 @@ def _create_placement_group(p):
         "GroupArn": _placement_group_arn(name),
         "PartitionCount": int(partition_count) if partition_count else 0,
     }
+    if _p(p, "SpreadLevel"):
+        record["SpreadLevel"] = _p(p, "SpreadLevel")
     _placement_groups[name] = record
     # Tags key off the group id so DescribeTags / tag: filters treat placement
     # groups like every other tagged EC2 resource.
@@ -2794,14 +2944,15 @@ def _describe_vpcs(p):
             if vid not in _vpcs:
                 return _error("InvalidVpcID.NotFound", f"The vpc ID '{vid}' does not exist", 400)
     filters = _parse_filters(p)
-    items = ""
+    items = []
     for vpc in _vpcs.values():
         if filter_ids and vpc["VpcId"] not in filter_ids:
             continue
         if not _matches_vpc_filters(vpc, filters):
             continue
-        items += _vpc_xml(vpc)
-    return _xml(200, "DescribeVpcsResponse", f"<vpcSet>{items}</vpcSet>")
+        items.append(_vpc_xml(vpc))
+    items, next_xml = _page(p, items, (5, 1000))
+    return _xml(200, "DescribeVpcsResponse", f"<vpcSet>{''.join(items)}</vpcSet>{next_xml}")
 
 
 def _matches_vpc_filters(vpc, filters):
@@ -2989,14 +3140,15 @@ def _describe_subnets(p):
         for sid in filter_ids:
             if sid not in _subnets:
                 return _error("InvalidSubnetID.NotFound", f"The subnet ID '{sid}' does not exist", 400)
-    items = ""
+    items = []
     for subnet in _subnets.values():
         if filter_ids and subnet["SubnetId"] not in filter_ids:
             continue
         if not _matches_subnet_filters(subnet, filters):
             continue
-        items += _subnet_xml(subnet)
-    return _xml(200, "DescribeSubnetsResponse", f"<subnetSet>{items}</subnetSet>")
+        items.append(_subnet_xml(subnet))
+    items, next_xml = _page(p, items, (5, 1000))
+    return _xml(200, "DescribeSubnetsResponse", f"<subnetSet>{''.join(items)}</subnetSet>{next_xml}")
 
 
 def _matches_subnet_filters(subnet, filters):
@@ -3093,7 +3245,7 @@ def _describe_internet_gateways(p):
         for gid in filter_ids:
             if gid not in _internet_gateways:
                 return _error("InvalidInternetGatewayID.NotFound", f"The internet gateway ID '{gid}' does not exist", 400)
-    items = ""
+    items = []
     for igw in _internet_gateways.values():
         if filter_ids and igw["InternetGatewayId"] not in filter_ids:
             continue
@@ -3108,9 +3260,10 @@ def _describe_internet_gateways(p):
             continue
         if filters.get("attachment.state") and not any(a.get("State") in filters["attachment.state"] for a in attachments):
             continue
-        items += _igw_xml(igw)
+        items.append(_igw_xml(igw))
+    items, next_xml = _page(p, items, (5, 1000))
     return _xml(200, "DescribeInternetGatewaysResponse",
-                f"<internetGatewaySet>{items}</internetGatewaySet>")
+                f"<internetGatewaySet>{''.join(items)}</internetGatewaySet>{next_xml}")
 
 
 def _attach_internet_gateway(p):
@@ -3146,7 +3299,7 @@ def _modify_vpc_attribute(p):
     if vpc_id not in _vpcs:
         return _error("InvalidVpcID.NotFound", f"The vpc ID '{vpc_id}' does not exist", 400)
     # EnableDnsSupport / EnableDnsHostnames — store but don't enforce
-    for attr in ("EnableDnsSupport.Value", "EnableDnsHostnames.Value"):
+    for attr in ("EnableDnsSupport.Value", "EnableDnsHostnames.Value", "EnableNetworkAddressUsageMetrics.Value"):
         val = _p(p, attr)
         if val:
             _vpcs[vpc_id][attr.split(".")[0]] = val.lower() == "true"
@@ -3169,7 +3322,9 @@ def _describe_vpc_attribute(p):
                     f"<vpcId>{vpc_id}</vpcId><enableDnsHostnames><value>{'true' if val else 'false'}</value></enableDnsHostnames>")
     elif attribute == "enableNetworkAddressUsageMetrics":
         return _xml(200, "DescribeVpcAttributeResponse",
-                    f"<vpcId>{vpc_id}</vpcId><enableNetworkAddressUsageMetrics><value>false</value></enableNetworkAddressUsageMetrics>")
+                    f"<vpcId>{vpc_id}</vpcId><enableNetworkAddressUsageMetrics><value>"
+                    f"{'true' if vpc.get('EnableNetworkAddressUsageMetrics') else 'false'}"
+                    "</value></enableNetworkAddressUsageMetrics>")
     return _xml(200, "DescribeVpcAttributeResponse", f"<vpcId>{vpc_id}</vpcId>")
 
 
@@ -3201,6 +3356,8 @@ def _modify_subnet_attribute(p):
     val = _p(p, "MapPublicIpOnLaunch.Value")
     if val:
         subnet["MapPublicIpOnLaunch"] = val.lower() == "true"
+    if _p(p, "EnableDns64.Value"):
+        subnet["EnableDns64"] = _p(p, "EnableDns64.Value").lower() == "true"
     options = dict(_subnet_dns_name_options(subnet))
     hostname_type = _p(p, "PrivateDnsHostnameTypeOnLaunch")
     if hostname_type:
@@ -3278,9 +3435,10 @@ def _describe_route_tables(p):
         if vpc_filter and rtb.get("VpcId", "") not in vpc_filter:
             continue
         results.append(rtb)
+    results, next_xml = _page(p, results, (5, 100))
     items = "".join(_rtb_fields_xml(rtb) for rtb in results)
     return _xml(200, "DescribeRouteTablesResponse",
-                f"<routeTableSet>{items}</routeTableSet>")
+                f"<routeTableSet>{items}</routeTableSet>{next_xml}")
 
 
 def _associate_route_table(p):
@@ -3312,26 +3470,40 @@ def _disassociate_route_table(p):
     return _xml(200, "DisassociateRouteTableResponse", "<return>true</return>")
 
 
+_ROUTE_DESTINATIONS = ("DestinationCidrBlock", "DestinationIpv6CidrBlock", "DestinationPrefixListId")
+_ROUTE_TARGETS = (
+    "GatewayId", "NatGatewayId", "InstanceId", "VpcPeeringConnectionId", "TransitGatewayId",
+    "NetworkInterfaceId", "VpcEndpointId", "EgressOnlyInternetGatewayId", "CarrierGatewayId",
+    "LocalGatewayId", "CoreNetworkArn", "OdbNetworkArn",
+)
+
+
+def _route_destination(p):
+    for key in _ROUTE_DESTINATIONS:
+        if _p(p, key):
+            return key, _p(p, key)
+    return "DestinationCidrBlock", ""
+
+
+def _set_route_target(route, p):
+    for key in _ROUTE_TARGETS:
+        route.pop(key, None)
+    for key in _ROUTE_TARGETS:
+        if _p(p, key):
+            route[key] = _p(p, key)
+            return
+    route["GatewayId"] = "local"
+
+
 def _create_route(p):
     rtb_id = _p(p, "RouteTableId")
     rtb = _route_tables.get(rtb_id)
     if not rtb:
         return _error("InvalidRouteTableID.NotFound",
                       f"The route table '{rtb_id}' does not exist", 400)
-    dest = _p(p, "DestinationCidrBlock")
-    route = {"DestinationCidrBlock": dest, "State": "active", "Origin": "CreateRoute"}
-    if _p(p, "GatewayId"):
-        route["GatewayId"] = _p(p, "GatewayId")
-    elif _p(p, "NatGatewayId"):
-        route["NatGatewayId"] = _p(p, "NatGatewayId")
-    elif _p(p, "InstanceId"):
-        route["InstanceId"] = _p(p, "InstanceId")
-    elif _p(p, "VpcPeeringConnectionId"):
-        route["VpcPeeringConnectionId"] = _p(p, "VpcPeeringConnectionId")
-    elif _p(p, "TransitGatewayId"):
-        route["TransitGatewayId"] = _p(p, "TransitGatewayId")
-    else:
-        route["GatewayId"] = "local"
+    dest_key, dest = _route_destination(p)
+    route = {dest_key: dest, "State": "active", "Origin": "CreateRoute"}
+    _set_route_target(route, p)
     rtb["Routes"].append(route)
     return _xml(200, "CreateRouteResponse", "<return>true</return>")
 
@@ -3342,20 +3514,10 @@ def _replace_route(p):
     if not rtb:
         return _error("InvalidRouteTableID.NotFound",
                       f"The route table '{rtb_id}' does not exist", 400)
-    dest = _p(p, "DestinationCidrBlock")
+    dest_key, dest = _route_destination(p)
     for route in rtb["Routes"]:
-        if route.get("DestinationCidrBlock") == dest:
-            route.pop("GatewayId", None)
-            route.pop("NatGatewayId", None)
-            route.pop("InstanceId", None)
-            if _p(p, "GatewayId"):
-                route["GatewayId"] = _p(p, "GatewayId")
-            elif _p(p, "NatGatewayId"):
-                route["NatGatewayId"] = _p(p, "NatGatewayId")
-            elif _p(p, "InstanceId"):
-                route["InstanceId"] = _p(p, "InstanceId")
-            else:
-                route["GatewayId"] = "local"
+        if route.get(dest_key) == dest:
+            _set_route_target(route, p)
             break
     return _xml(200, "ReplaceRouteResponse", "<return>true</return>")
 
@@ -3366,8 +3528,8 @@ def _delete_route(p):
     if not rtb:
         return _error("InvalidRouteTableID.NotFound",
                       f"The route table '{rtb_id}' does not exist", 400)
-    dest = _p(p, "DestinationCidrBlock")
-    rtb["Routes"] = [r for r in rtb["Routes"] if r.get("DestinationCidrBlock") != dest]
+    dest_key, dest = _route_destination(p)
+    rtb["Routes"] = [r for r in rtb["Routes"] if r.get(dest_key) != dest]
     return _xml(200, "DeleteRouteResponse", "<return>true</return>")
 
 
@@ -3382,7 +3544,20 @@ def _create_network_interface(p):
     if not sg_ids:
         sg_ids = [_DEFAULT_SG_ID]
     eni_id = "eni-" + "".join(random.choices(string.hexdigits[:16], k=17))
-    private_ip = _random_ip("10.0")
+    private_ips = []
+    j = 1
+    while _p(p, f"PrivateIpAddresses.{j}.PrivateIpAddress"):
+        private_ips.append({"PrivateIpAddress": _p(p, f"PrivateIpAddresses.{j}.PrivateIpAddress"),
+                            "Primary": _p(p, f"PrivateIpAddresses.{j}.Primary").lower() == "true"})
+        j += 1
+    private_ip = _p(p, "PrivateIpAddress") or next(
+        (e["PrivateIpAddress"] for e in private_ips if e["Primary"]), None) or (
+        private_ips[0]["PrivateIpAddress"] if private_ips else _random_ip("10.0"))
+    private_ips = [{"PrivateIpAddress": private_ip, "Primary": True}] + [
+        {"PrivateIpAddress": e["PrivateIpAddress"], "Primary": False}
+        for e in private_ips if e["PrivateIpAddress"] != private_ip]
+    for _ in range(int(_p(p, "SecondaryPrivateIpAddressCount") or 0)):
+        private_ips.append({"PrivateIpAddress": _random_ip("10.0"), "Primary": False})
     az = _subnets.get(subnet_id, {}).get("AvailabilityZone", f"{get_region()}a")
     _network_interfaces[eni_id] = {
         "NetworkInterfaceId": eni_id,
@@ -3393,7 +3568,8 @@ def _create_network_interface(p):
         "OwnerId": get_account_id(),
         "Status": "available",
         "PrivateIpAddress": private_ip,
-        "InterfaceType": "interface",
+        "PrivateIpAddresses": private_ips,
+        "InterfaceType": _p(p, "InterfaceType") or "interface",
         "SourceDestCheck": True,
         "MacAddress": ":".join(f"{random.randint(0,255):02x}" for _ in range(6)),
         "Groups": [
@@ -3402,6 +3578,7 @@ def _create_network_interface(p):
         ],
         "Attachment": None,
     }
+    _parse_tag_specs(p, "network-interface", eni_id)
     return _xml(200, "CreateNetworkInterfaceResponse",
                 _eni_fields_xml(_network_interfaces[eni_id], tag="networkInterface"))
 
@@ -3417,13 +3594,12 @@ def _delete_network_interface(p):
 
 def _describe_network_interfaces(p):
     filter_ids = _parse_member_list(p, "NetworkInterfaceId")
-    items = "".join(
-        _eni_fields_xml(eni)
-        for eni in _network_interfaces.values()
-        if not filter_ids or eni["NetworkInterfaceId"] in filter_ids
-    )
+    enis = [eni for eni in _network_interfaces.values()
+            if not filter_ids or eni["NetworkInterfaceId"] in filter_ids]
+    enis, next_xml = (enis, "") if filter_ids else _page(p, enis, (5, 1000))
+    items = "".join(_eni_fields_xml(eni) for eni in enis)
     return _xml(200, "DescribeNetworkInterfacesResponse",
-                f"<networkInterfaceSet>{items}</networkInterfaceSet>")
+                f"<networkInterfaceSet>{items}</networkInterfaceSet>{next_xml}")
 
 
 def _attach_network_interface(p):
@@ -3475,7 +3651,9 @@ def _create_vpc_endpoint(p):
         "RouteTableIds": _parse_member_list(p, "RouteTableId"),
         "SubnetIds": _parse_member_list(p, "SubnetId"),
         "OwnerId": get_account_id(),
+        "GroupIds": _parse_member_list(p, "SecurityGroupId"),
     }
+    _apply_vpce_options(_vpc_endpoints[vpce_id], p)
     _parse_tag_specs(p, "vpc-endpoint", vpce_id)
     return _xml(200, "CreateVpcEndpointResponse",
                 _vpce_fields_xml(_vpc_endpoints[vpce_id], tag="vpcEndpoint"))
@@ -3491,13 +3669,12 @@ def _delete_vpc_endpoints(p):
 
 def _describe_vpc_endpoints(p):
     filter_ids = _parse_member_list(p, "VpcEndpointId")
-    items = "".join(
-        _vpce_fields_xml(ep)
-        for ep in _vpc_endpoints.values()
-        if not filter_ids or ep["VpcEndpointId"] in filter_ids
-    )
+    eps = [ep for ep in _vpc_endpoints.values()
+           if not filter_ids or ep["VpcEndpointId"] in filter_ids]
+    eps, next_xml = _page(p, eps, (1, 1000))
+    items = "".join(_vpce_fields_xml(ep) for ep in eps)
     return _xml(200, "DescribeVpcEndpointsResponse",
-                f"<vpcEndpointSet>{items}</vpcEndpointSet>")
+                f"<vpcEndpointSet>{items}</vpcEndpointSet>{next_xml}")
 
 
 # Services available as VPC endpoints. s3 and dynamodb are Gateway endpoints
@@ -3534,6 +3711,7 @@ def _describe_vpc_endpoint_services(p):
             continue
         selected.append((name, stype))
 
+    selected, next_xml = _page(p, selected, (1, 1000))
     name_items = "".join(f"<item>{n}</item>" for n, _ in selected)
     az_items = "".join(f"<item>{az}</item>" for az in azs)
 
@@ -3563,6 +3741,7 @@ def _describe_vpc_endpoint_services(p):
     return _xml(200, "DescribeVpcEndpointServicesResponse", f"""
         <serviceNameSet>{name_items}</serviceNameSet>
         <serviceDetailSet>{''.join(detail_items)}</serviceDetailSet>
+        {next_xml}
     """)
 
 
@@ -3659,7 +3838,9 @@ def _describe_regions(p):
 def _allocate_address(p):
     domain = _p(p, "Domain") or "vpc"
     allocation_id = f"eipalloc-{new_uuid().replace('-','')[:17]}"
-    public_ip = _random_ip("52.")
+    public_ip = _p(p, "Address") or _random_ip("52.")
+    pool = _p(p, "PublicIpv4Pool") or "amazon"
+    border_group = _p(p, "NetworkBorderGroup") or get_region()
     _addresses[allocation_id] = {
         "AllocationId": allocation_id,
         "PublicIp": public_ip,
@@ -3668,12 +3849,16 @@ def _allocate_address(p):
         "InstanceId": None,
         "NetworkInterfaceId": None,
         "PrivateIpAddress": None,
+        "PublicIpv4Pool": pool,
+        "NetworkBorderGroup": border_group,
     }
     _parse_tag_specs(p, "elastic-ip", allocation_id)
     return _xml(200, "AllocateAddressResponse", f"""
         <publicIp>{public_ip}</publicIp>
         <domain>{domain}</domain>
-        <allocationId>{allocation_id}</allocationId>""")
+        <allocationId>{allocation_id}</allocationId>
+        <publicIpv4Pool>{_esc(pool)}</publicIpv4Pool>
+        <networkBorderGroup>{_esc(border_group)}</networkBorderGroup>""")
 
 
 def _release_address(p):
@@ -3695,8 +3880,15 @@ def _associate_address(p):
         return _error("InvalidAllocationID.NotFound",
                       f"The allocation ID '{allocation_id}' does not exist", 400)
     association_id = f"eipassoc-{new_uuid().replace('-','')[:17]}"
+    eni_id = _p(p, "NetworkInterfaceId")
+    eni = _network_interfaces.get(eni_id) if eni_id else None
+    if eni and not instance_id:
+        instance_id = (eni.get("Attachment") or {}).get("InstanceId")
     addr["AssociationId"] = association_id
-    addr["InstanceId"] = instance_id
+    addr["InstanceId"] = instance_id or None
+    addr["NetworkInterfaceId"] = eni_id or None
+    addr["PrivateIpAddress"] = _p(p, "PrivateIpAddress") or (
+        eni.get("PrivateIpAddress") if eni else _instances.get(instance_id, {}).get("PrivateIpAddress")) or None
     return _xml(200, "AssociateAddressResponse",
                 f"<return>true</return><associationId>{association_id}</associationId>")
 
@@ -3707,6 +3899,8 @@ def _disassociate_address(p):
         if addr.get("AssociationId") == association_id:
             addr["AssociationId"] = None
             addr["InstanceId"] = None
+            addr["NetworkInterfaceId"] = None
+            addr["PrivateIpAddress"] = None
             break
     return _xml(200, "DisassociateAddressResponse", "<return>true</return>")
 
@@ -3719,6 +3913,12 @@ def _describe_addresses(p):
             continue
         assoc = f"<associationId>{addr['AssociationId']}</associationId>" if addr["AssociationId"] else ""
         inst = f"<instanceId>{addr['InstanceId']}</instanceId>" if addr["InstanceId"] else ""
+        for key, tag in (("NetworkInterfaceId", "networkInterfaceId"), ("PrivateIpAddress", "privateIpAddress"),
+                         ("PublicIpv4Pool", "publicIpv4Pool"), ("NetworkBorderGroup", "networkBorderGroup")):
+            if addr.get(key):
+                inst += f"<{tag}>{_esc(addr[key])}</{tag}>"
+        if addr.get("NetworkInterfaceId"):
+            inst += f"<networkInterfaceOwnerId>{get_account_id()}</networkInterfaceOwnerId>"
         items += f"""<item>
             <allocationId>{addr['AllocationId']}</allocationId>
             <publicIp>{addr['PublicIp']}</publicIp>
@@ -3779,7 +3979,7 @@ def _describe_tags(p):
     filter_keys = set(filters.get("key", []))
     filter_values = set(filters.get("value", []))
 
-    items = ""
+    items = []
     for rid, tag_list in _tags.items():
         if filter_resource_ids and rid not in filter_resource_ids:
             continue
@@ -3791,13 +3991,14 @@ def _describe_tags(p):
                 continue
             if filter_values and tag.get("Value", "") not in filter_values:
                 continue
-            items += f"""<item>
+            items.append(f"""<item>
                 <resourceId>{rid}</resourceId>
                 <resourceType>{resource_type}</resourceType>
                 <key>{_esc(tag['Key'])}</key>
                 <value>{_esc(tag['Value'])}</value>
-            </item>"""
-    return _xml(200, "DescribeTagsResponse", f"<tagSet>{items}</tagSet>")
+            </item>""")
+    items, next_xml = _page(p, items, (5, 1000))
+    return _xml(200, "DescribeTagsResponse", f"<tagSet>{''.join(items)}</tagSet>{next_xml}")
 
 
 # ---------------------------------------------------------------------------
@@ -3828,12 +4029,14 @@ def _create_volume(p):
         "VolumeType": vol_type,
         "SnapshotId": snapshot_id,
         "Iops": int(iops) if iops else (3000 if vol_type in ("gp3", "io1", "io2") else 0),
-        "Encrypted": encrypted.lower() == "true",
+        "Encrypted": encrypted.lower() == "true" or bool(_p(p, "KmsKeyId")),
         "CreateTime": now,
         "Attachments": [],
-        "MultiAttachEnabled": False,
-        "Throughput": 125 if vol_type == "gp3" else 0,
+        "MultiAttachEnabled": _p(p, "MultiAttachEnabled").lower() == "true",
+        "Throughput": int(_p(p, "Throughput")) if _p(p, "Throughput") else (125 if vol_type == "gp3" else 0),
     }
+    if _p(p, "KmsKeyId"):
+        _volumes[vol_id]["KmsKeyId"] = _p(p, "KmsKeyId")
     # Process TagSpecifications
     i = 1
     while _p(p, f"TagSpecification.{i}.ResourceType"):
@@ -3897,7 +4100,7 @@ def _describe_volumes(p):
         for vid in filter_ids:
             if vid not in _volumes:
                 return _error("InvalidVolume.NotFound", f"The volume '{vid}' does not exist", 400)
-    items = ""
+    items = []
     for vol in _volumes.values():
         if filter_ids and vol["VolumeId"] not in filter_ids:
             continue
@@ -3905,17 +4108,18 @@ def _describe_volumes(p):
             continue
         if not _volume_matches_filters(vol, filters):
             continue
-        items += f"<item>{_volume_inner_xml(vol)}</item>"
-    return _xml(200, "DescribeVolumesResponse", f"<volumeSet>{items}</volumeSet>")
+        items.append(f"<item>{_volume_inner_xml(vol)}</item>")
+    items, next_xml = _page(p, items)
+    return _xml(200, "DescribeVolumesResponse", f"<volumeSet>{''.join(items)}</volumeSet>{next_xml}")
 
 
 def _describe_volume_status(p):
     filter_ids = _parse_member_list(p, "VolumeId")
-    items = ""
+    items = []
     for vol in _volumes.values():
         if filter_ids and vol["VolumeId"] not in filter_ids:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
             <volumeId>{vol['VolumeId']}</volumeId>
             <availabilityZone>{vol['AvailabilityZone']}</availabilityZone>
             <volumeStatus>
@@ -3924,8 +4128,9 @@ def _describe_volume_status(p):
             </volumeStatus>
             <actionsSet/>
             <eventsSet/>
-        </item>"""
-    return _xml(200, "DescribeVolumeStatusResponse", f"<volumeStatusSet>{items}</volumeStatusSet>")
+        </item>""")
+    items, next_xml = _page(p, items)
+    return _xml(200, "DescribeVolumeStatusResponse", f"<volumeStatusSet>{''.join(items)}</volumeStatusSet>{next_xml}")
 
 
 def _attach_volume(p):
@@ -3980,6 +4185,10 @@ def _modify_volume(p):
         vol["VolumeType"] = _p(p, "VolumeType")
     if _p(p, "Iops"):
         vol["Iops"] = int(_p(p, "Iops"))
+    if _p(p, "Throughput"):
+        vol["Throughput"] = int(_p(p, "Throughput"))
+    if _p(p, "MultiAttachEnabled"):
+        vol["MultiAttachEnabled"] = _p(p, "MultiAttachEnabled").lower() == "true"
     now = _now_ts()
     return _xml(200, "ModifyVolumeResponse", f"""
         <volumeModification>
@@ -3988,6 +4197,7 @@ def _modify_volume(p):
             <targetSize>{vol['Size']}</targetSize>
             <targetVolumeType>{vol['VolumeType']}</targetVolumeType>
             <targetIops>{vol['Iops']}</targetIops>
+            {_volume_target_extras_xml(vol)}
             <startTime>{now}</startTime>
             <endTime>{now}</endTime>
             <progress>100</progress>
@@ -3996,37 +4206,53 @@ def _modify_volume(p):
 
 def _describe_volumes_modifications(p):
     filter_ids = _parse_member_list(p, "VolumeId")
-    items = ""
+    items = []
     for vol in _volumes.values():
         if filter_ids and vol["VolumeId"] not in filter_ids:
             continue
         now = _now_ts()
-        items += f"""<item>
+        items.append(f"""<item>
             <volumeId>{vol['VolumeId']}</volumeId>
             <modificationState>completed</modificationState>
             <targetSize>{vol['Size']}</targetSize>
             <targetVolumeType>{vol['VolumeType']}</targetVolumeType>
             <targetIops>{vol['Iops']}</targetIops>
+            {_volume_target_extras_xml(vol)}
             <startTime>{now}</startTime>
             <endTime>{now}</endTime>
             <progress>100</progress>
-        </item>"""
-    return _xml(200, "DescribeVolumesModificationsResponse", f"<volumeModificationSet>{items}</volumeModificationSet>")
+        </item>""")
+    items, next_xml = _page(p, items, (1, 500))
+    return _xml(200, "DescribeVolumesModificationsResponse", f"<volumeModificationSet>{''.join(items)}</volumeModificationSet>{next_xml}")
 
 
 def _enable_volume_io(p):
     return _xml(200, "EnableVolumeIOResponse", "<return>true</return>")
 
 
+def _volume_target_extras_xml(vol):
+    out = f"<targetMultiAttachEnabled>{'true' if vol.get('MultiAttachEnabled') else 'false'}</targetMultiAttachEnabled>"
+    if vol.get("Throughput"):
+        out = f"<targetThroughput>{vol['Throughput']}</targetThroughput>" + out
+    return out
+
+
 def _modify_volume_attribute(p):
+    vol_id = _p(p, "VolumeId")
+    vol = _volumes.get(vol_id)
+    if not vol:
+        return _error("InvalidVolume.NotFound", f"The volume '{vol_id}' does not exist.", 400)
+    if _p(p, "AutoEnableIO.Value"):
+        vol["AutoEnableIO"] = _p(p, "AutoEnableIO.Value").lower() == "true"
     return _xml(200, "ModifyVolumeAttributeResponse", "<return>true</return>")
 
 
 def _describe_volume_attribute(p):
     vol_id = _p(p, "VolumeId")
+    auto_enable = (_volumes.get(vol_id) or {}).get("AutoEnableIO", False)
     return _xml(200, "DescribeVolumeAttributeResponse", f"""
         <volumeId>{vol_id}</volumeId>
-        <autoEnableIO><value>false</value></autoEnableIO>""")
+        <autoEnableIO><value>{'true' if auto_enable else 'false'}</value></autoEnableIO>""")
 
 
 def _volume_inner_xml(vol):
@@ -4050,6 +4276,8 @@ def _volume_inner_xml(vol):
         {snap}
         {iops}
         <encrypted>{'true' if vol['Encrypted'] else 'false'}</encrypted>
+        {f"<kmsKeyId>{_esc(vol['KmsKeyId'])}</kmsKeyId>" if vol.get("KmsKeyId") else ""}
+        {f"<throughput>{vol['Throughput']}</throughput>" if vol.get("Throughput") else ""}
         <multiAttachEnabled>{'true' if vol['MultiAttachEnabled'] else 'false'}</multiAttachEnabled>
         <attachmentSet>{attachments}</attachmentSet>
         {_tag_set_xml(vol['VolumeId'])}"""
@@ -4079,6 +4307,8 @@ def _create_snapshot(p):
         "Encrypted": vol["Encrypted"],
         "StorageTier": "standard",
     }
+    if vol.get("KmsKeyId"):
+        _snapshots[snap_id]["KmsKeyId"] = vol["KmsKeyId"]
     # Process TagSpecifications
     i = 1
     while _p(p, f"TagSpecification.{i}.ResourceType"):
@@ -4131,7 +4361,7 @@ def _describe_snapshots(p):
         for sid in filter_ids:
             if sid not in _snapshots:
                 return _error("InvalidSnapshot.NotFound", f"The snapshot '{sid}' does not exist", 400)
-    items = ""
+    items = []
     for snap in _snapshots.values():
         if filter_ids and snap["SnapshotId"] not in filter_ids:
             continue
@@ -4141,8 +4371,9 @@ def _describe_snapshots(p):
             continue
         if not _snapshot_matches_filters(snap, filters):
             continue
-        items += f"<item>{_snapshot_inner_xml(snap)}</item>"
-    return _xml(200, "DescribeSnapshotsResponse", f"<snapshotSet>{items}</snapshotSet>")
+        items.append(f"<item>{_snapshot_inner_xml(snap)}</item>")
+    items, next_xml = _page(p, items)
+    return _xml(200, "DescribeSnapshotsResponse", f"<snapshotSet>{''.join(items)}</snapshotSet>{next_xml}")
 
 
 def _copy_snapshot(p):
@@ -4160,7 +4391,13 @@ def _copy_snapshot(p):
         "Description": description or source["Description"],
         "StartTime": now,
     }
-    return _xml(200, "CopySnapshotResponse", f"<snapshotId>{new_snap_id}</snapshotId>")
+    if _p(p, "Encrypted").lower() == "true" or _p(p, "KmsKeyId"):
+        _snapshots[new_snap_id]["Encrypted"] = True
+    if _p(p, "KmsKeyId"):
+        _snapshots[new_snap_id]["KmsKeyId"] = _p(p, "KmsKeyId")
+    _parse_tag_specs(p, "snapshot", new_snap_id)
+    return _xml(200, "CopySnapshotResponse",
+                f"<snapshotId>{new_snap_id}</snapshotId>{_tag_set_xml(new_snap_id)}")
 
 
 def _modify_snapshot_attribute(p):
@@ -4169,14 +4406,22 @@ def _modify_snapshot_attribute(p):
     if not snap:
         return _error("InvalidSnapshot.NotFound", f"Snapshot '{snap_id}' not found", 400)
     op = _p(p, "OperationType")
-    user_ids = _parse_member_list(p, "UserId")
     perms = snap.setdefault("CreateVolumePermissions", [])
-    if op == "add":
-        for uid in user_ids:
-            if not any(pp.get("UserId") == uid for pp in perms):
-                perms.append({"UserId": uid})
-    elif op == "remove":
-        perms[:] = [pp for pp in perms if pp.get("UserId") not in user_ids]
+
+    def _entries(prefix, flat_op):
+        out = [{"UserId": u} for u in _parse_member_list(p, "UserId")] if op == flat_op else []
+        out += [{"Group": g} for g in _parse_member_list(p, "UserGroup")] if op == flat_op else []
+        i = 1
+        while _p(p, f"{prefix}.{i}.UserId") or _p(p, f"{prefix}.{i}.Group"):
+            out.append({k: _p(p, f"{prefix}.{i}.{k}") for k in ("UserId", "Group") if _p(p, f"{prefix}.{i}.{k}")})
+            i += 1
+        return out
+
+    for entry in _entries("CreateVolumePermission.Add", "add"):
+        if entry not in perms:
+            perms.append(entry)
+    removals = _entries("CreateVolumePermission.Remove", "remove")
+    perms[:] = [pp for pp in perms if pp not in removals]
     return _xml(200, "ModifySnapshotAttributeResponse", "<return>true</return>")
 
 
@@ -4186,7 +4431,9 @@ def _describe_snapshot_attribute(p):
     perms_xml = ""
     if snap:
         for pp in snap.get("CreateVolumePermissions", []):
-            perms_xml += f"<item><userId>{pp['UserId']}</userId></item>"
+            perms_xml += "<item>" + "".join(
+                f"<{tag}>{_esc(pp[k])}</{tag}>" for k, tag in (("UserId", "userId"), ("Group", "group")) if pp.get(k)
+            ) + "</item>"
     return _xml(200, "DescribeSnapshotAttributeResponse", f"""
         <snapshotId>{snap_id}</snapshotId>
         <createVolumePermission>{perms_xml}</createVolumePermission>""")
@@ -4203,6 +4450,7 @@ def _snapshot_inner_xml(snap):
         <volumeSize>{snap['VolumeSize']}</volumeSize>
         <description>{_esc(snap['Description'])}</description>
         <encrypted>{'true' if snap['Encrypted'] else 'false'}</encrypted>
+        {f"<kmsKeyId>{_esc(snap['KmsKeyId'])}</kmsKeyId>" if snap.get("KmsKeyId") else ""}
         <storageTier>{snap['StorageTier']}</storageTier>
         {_tag_set_xml(snap['SnapshotId'])}"""
 
@@ -4210,6 +4458,99 @@ def _snapshot_inner_xml(snap):
 # ---------------------------------------------------------------------------
 # XML helpers
 # ---------------------------------------------------------------------------
+
+_PLACEMENT_MEMBERS = (
+    ("AvailabilityZoneId", "availabilityZoneId", str), ("Affinity", "affinity", str),
+    ("GroupName", "groupName", str), ("PartitionNumber", "partitionNumber", int),
+    ("HostId", "hostId", str), ("Tenancy", "tenancy", str), ("SpreadDomain", "spreadDomain", str),
+    ("HostResourceGroupArn", "hostResourceGroupArn", str), ("GroupId", "groupId", str),
+    ("AvailabilityZone", "availabilityZone", str),
+)
+_CPU_OPTIONS_MEMBERS = (
+    ("CoreCount", "coreCount", int), ("ThreadsPerCore", "threadsPerCore", int),
+    ("AmdSevSnp", "amdSevSnp", str), ("NestedVirtualization", "nestedVirtualization", str),
+)
+_CAPACITY_RESERVATION_MEMBERS = (
+    ("CapacityReservationPreference", "capacityReservationPreference", str),
+    ("CapacityReservationTarget", "capacityReservationTarget", (
+        ("CapacityReservationId", "capacityReservationId", str),
+        ("CapacityReservationResourceGroupArn", "capacityReservationResourceGroupArn", str),
+    )),
+)
+_PRIVATE_DNS_NAME_MEMBERS = (
+    ("HostnameType", "hostnameType", str),
+    ("EnableResourceNameDnsARecord", "enableResourceNameDnsARecord", bool),
+    ("EnableResourceNameDnsAAAARecord", "enableResourceNameDnsAAAARecord", bool),
+)
+_LT_STRUCTS = (
+    ("Placement", "placement", _PLACEMENT_MEMBERS),
+    ("CreditSpecification", "creditSpecification", (("CpuCredits", "cpuCredits", str),)),
+    ("CpuOptions", "cpuOptions", _CPU_OPTIONS_MEMBERS),
+    ("InstanceMarketOptions", "instanceMarketOptions", (
+        ("MarketType", "marketType", str),
+        ("SpotOptions", "spotOptions", (
+            ("MaxPrice", "maxPrice", str), ("SpotInstanceType", "spotInstanceType", str),
+            ("BlockDurationMinutes", "blockDurationMinutes", int), ("ValidUntil", "validUntil", str),
+            ("InstanceInterruptionBehavior", "instanceInterruptionBehavior", str),
+        )),
+    )),
+    ("CapacityReservationSpecification", "capacityReservationSpecification", _CAPACITY_RESERVATION_MEMBERS),
+    ("HibernationOptions", "hibernationOptions", (("Configured", "configured", bool),)),
+    ("EnclaveOptions", "enclaveOptions", (("Enabled", "enabled", bool),)),
+    ("MaintenanceOptions", "maintenanceOptions", (("AutoRecovery", "autoRecovery", str),)),
+    ("PrivateDnsNameOptions", "privateDnsNameOptions", _PRIVATE_DNS_NAME_MEMBERS),
+)
+_LT_NI_SCALARS = (
+    ("AssociateCarrierIpAddress", "associateCarrierIpAddress", bool),
+    ("DeleteOnTermination", "deleteOnTermination", bool),
+    ("InterfaceType", "interfaceType", str),
+    ("Ipv6AddressCount", "ipv6AddressCount", int),
+    ("NetworkInterfaceId", "networkInterfaceId", str),
+    ("PrivateIpAddress", "privateIpAddress", str),
+    ("SecondaryPrivateIpAddressCount", "secondaryPrivateIpAddressCount", int),
+    ("NetworkCardIndex", "networkCardIndex", int),
+    ("Ipv4PrefixCount", "ipv4PrefixCount", int),
+    ("Ipv6PrefixCount", "ipv6PrefixCount", int),
+    ("PrimaryIpv6", "primaryIpv6", bool),
+    ("EnaQueueCount", "enaQueueCount", int),
+)
+
+
+def _parse_struct(params, prefix, members):
+    out = {}
+    for name, _tag, kind in members:
+        key = f"{prefix}.{name}"
+        if isinstance(kind, tuple):
+            sub = _parse_struct(params, key, kind)
+            if sub:
+                out[name] = sub
+            continue
+        raw = _p(params, key)
+        if not raw:
+            continue
+        if kind is bool:
+            out[name] = raw.lower() == "true"
+        elif kind is int:
+            out[name] = int(raw)
+        else:
+            out[name] = raw
+    return out
+
+
+def _struct_xml(data, members):
+    out = ""
+    for name, tag, kind in members:
+        if data.get(name) is None:
+            continue
+        value = data[name]
+        if isinstance(kind, tuple):
+            out += f"<{tag}>{_struct_xml(value, kind)}</{tag}>"
+        elif kind is bool:
+            out += f"<{tag}>{'true' if value else 'false'}</{tag}>"
+        else:
+            out += f"<{tag}>{_esc(str(value))}</{tag}>"
+    return out
+
 
 def _instance_xml(inst):
     sgs = "".join(
@@ -4230,10 +4571,7 @@ def _instance_xml(inst):
         <instanceType>{inst['InstanceType']}</instanceType>
         <keyName>{inst.get('KeyName','')}</keyName>
         <launchTime>{inst['LaunchTime']}</launchTime>
-        <placement>
-            <availabilityZone>{inst['Placement']['AvailabilityZone']}</availabilityZone>
-            <tenancy>{inst['Placement']['Tenancy']}</tenancy>
-        </placement>
+        <placement>{_struct_xml(inst['Placement'], _PLACEMENT_MEMBERS)}</placement>
         <privateDnsName>{inst['PrivateDnsName']}</privateDnsName>
         <privateIpAddress>{inst['PrivateIpAddress']}</privateIpAddress>
         <!-- public address wire tags are dnsName/ipAddress (not publicDnsName/
@@ -4253,7 +4591,37 @@ def _instance_xml(inst):
         <groupSet>{sgs}</groupSet>
         <tagSet>{tags}</tagSet>
         <amiLaunchIndex>{inst['AmiLaunchIndex']}</amiLaunchIndex>
+        {_instance_options_xml(inst)}
     </item>"""
+
+
+_INSTANCE_OPTION_STRUCTS = (
+    ("CpuOptions", "cpuOptions", _CPU_OPTIONS_MEMBERS),
+    ("CapacityReservationSpecification", "capacityReservationSpecification", _CAPACITY_RESERVATION_MEMBERS),
+    ("HibernationOptions", "hibernationOptions", (("Configured", "configured", bool),)),
+    ("MetadataOptions", "metadataOptions", (
+        ("State", "state", str), ("HttpTokens", "httpTokens", str),
+        ("HttpPutResponseHopLimit", "httpPutResponseHopLimit", int), ("HttpEndpoint", "httpEndpoint", str),
+        ("HttpProtocolIpv6", "httpProtocolIpv6", str), ("InstanceMetadataTags", "instanceMetadataTags", str),
+    )),
+    ("EnclaveOptions", "enclaveOptions", (("Enabled", "enabled", bool),)),
+    ("MaintenanceOptions", "maintenanceOptions", (
+        ("AutoRecovery", "autoRecovery", str), ("RebootMigration", "rebootMigration", str),
+    )),
+    ("PrivateDnsNameOptions", "privateDnsNameOptions", _PRIVATE_DNS_NAME_MEMBERS),
+)
+
+
+def _instance_options_xml(inst):
+    out = ""
+    if "EbsOptimized" in inst:
+        out += f"<ebsOptimized>{'true' if inst['EbsOptimized'] else 'false'}</ebsOptimized>"
+    if inst.get("InstanceLifecycle"):
+        out += f"<instanceLifecycle>{_esc(inst['InstanceLifecycle'])}</instanceLifecycle>"
+    for key, tag, members in _INSTANCE_OPTION_STRUCTS:
+        if inst.get(key):
+            out += f"<{tag}>{_struct_xml(inst[key], members)}</{tag}>"
+    return out
 
 
 def _iam_instance_profile_xml(iip, tag="iamInstanceProfile"):
@@ -4383,9 +4751,6 @@ def _vpc_fields_xml(vpc, tag="item"):
         <instanceTenancy>{vpc['InstanceTenancy']}</instanceTenancy>
         <isDefault>{'true' if vpc['IsDefault'] else 'false'}</isDefault>
         <ownerId>{vpc['OwnerId']}</ownerId>
-        {'<defaultNetworkAclId>' + vpc.get('DefaultNetworkAclId', '') + '</defaultNetworkAclId>' if vpc.get('DefaultNetworkAclId') else ''}
-        {'<defaultSecurityGroupId>' + vpc.get('DefaultSecurityGroupId', '') + '</defaultSecurityGroupId>' if vpc.get('DefaultSecurityGroupId') else ''}
-        {'<mainRouteTableId>' + vpc.get('MainRouteTableId', '') + '</mainRouteTableId>' if vpc.get('MainRouteTableId') else ''}
         {_tag_set_xml(vpc['VpcId'])}
     </{tag}>"""
 
@@ -4508,6 +4873,10 @@ def _eni_fields_xml(eni, tag="item"):
             <attachTime>{a.get('AttachTime','')}</attachTime>
         </attachment>"""
     private_ip = eni['PrivateIpAddress']
+    private_ips = "".join(
+        f"<item><privateIpAddress>{_esc(e['PrivateIpAddress'])}</privateIpAddress>"
+        f"<primary>{'true' if e.get('Primary') else 'false'}</primary></item>"
+        for e in eni.get("PrivateIpAddresses") or [{"PrivateIpAddress": private_ip, "Primary": True}])
     return f"""<{tag}>
         <networkInterfaceId>{eni['NetworkInterfaceId']}</networkInterfaceId>
         <subnetId>{eni['SubnetId']}</subnetId>
@@ -4521,20 +4890,55 @@ def _eni_fields_xml(eni, tag="item"):
         <interfaceType>{eni.get('InterfaceType', 'interface')}</interfaceType>
         <macAddress>{eni['MacAddress']}</macAddress>
         <groupSet>{groups}</groupSet>
-        <privateIpAddressesSet>
-            <item>
-                <privateIpAddress>{private_ip}</privateIpAddress>
-                <primary>true</primary>
-            </item>
-        </privateIpAddressesSet>
+        <privateIpAddressesSet>{private_ips}</privateIpAddressesSet>
         {attachment}
         {_tag_set_xml(eni['NetworkInterfaceId'])}
     </{tag}>"""
 
 
+_VPCE_DNS_OPTION_MEMBERS = (
+    ("DnsRecordIpType", "dnsRecordIpType", str),
+    ("PrivateDnsOnlyForInboundResolverEndpoint", "privateDnsOnlyForInboundResolverEndpoint", bool),
+    ("PrivateDnsPreference", "privateDnsPreference", str),
+)
+
+
+def _apply_vpce_options(ep, p):
+    if _p(p, "PolicyDocument"):
+        ep["PolicyDocument"] = _p(p, "PolicyDocument")
+    if _p(p, "PrivateDnsEnabled"):
+        ep["PrivateDnsEnabled"] = _p(p, "PrivateDnsEnabled").lower() == "true"
+    if _p(p, "IpAddressType"):
+        ep["IpAddressType"] = _p(p, "IpAddressType")
+    dns = _parse_struct(p, "DnsOptions", _VPCE_DNS_OPTION_MEMBERS)
+    domains = _parse_member_list(p, "DnsOptions.PrivateDnsSpecifiedDomain")
+    if domains:
+        dns["PrivateDnsSpecifiedDomains"] = domains
+    if dns:
+        ep.setdefault("DnsOptions", {}).update(dns)
+
+
 def _vpce_fields_xml(ep, tag="item"):
     rtb_ids = "".join(f"<item>{r}</item>" for r in ep.get("RouteTableIds", []))
     subnet_ids = "".join(f"<item>{s}</item>" for s in ep.get("SubnetIds", []))
+    extra = ""
+    if ep.get("PolicyDocument"):
+        extra += f"<policyDocument>{_esc(ep['PolicyDocument'])}</policyDocument>"
+    if ep.get("GroupIds"):
+        extra += "<groupSet>" + "".join(
+            f"<item><groupId>{_esc(g)}</groupId>"
+            f"<groupName>{_esc(_security_groups.get(g, {}).get('GroupName', g))}</groupName></item>"
+            for g in ep["GroupIds"]) + "</groupSet>"
+    if ep.get("IpAddressType"):
+        extra += f"<ipAddressType>{_esc(ep['IpAddressType'])}</ipAddressType>"
+    if ep.get("DnsOptions"):
+        dns = ep["DnsOptions"]
+        domains = "".join(f"<item>{_esc(d)}</item>" for d in dns.get("PrivateDnsSpecifiedDomains") or [])
+        extra += (f"<dnsOptions>{_struct_xml(dns, _VPCE_DNS_OPTION_MEMBERS)}"
+                  + (f"<privateDnsSpecifiedDomainSet>{domains}</privateDnsSpecifiedDomainSet>" if domains else "")
+                  + "</dnsOptions>")
+    if "PrivateDnsEnabled" in ep:
+        extra += f"<privateDnsEnabled>{'true' if ep['PrivateDnsEnabled'] else 'false'}</privateDnsEnabled>"
     return f"""<{tag}>
         <vpcEndpointId>{ep['VpcEndpointId']}</vpcEndpointId>
         <vpcEndpointType>{ep['VpcEndpointType']}</vpcEndpointType>
@@ -4544,6 +4948,7 @@ def _vpce_fields_xml(ep, tag="item"):
         <ownerId>{ep['OwnerId']}</ownerId>
         <routeTableIdSet>{rtb_ids}</routeTableIdSet>
         <subnetIdSet>{subnet_ids}</subnetIdSet>
+        {extra}
         {_tag_set_xml(ep['VpcEndpointId'])}
     </{tag}>"""
 
@@ -4587,6 +4992,20 @@ def _parse_member_list(params, prefix):
         items.append(val)
         i += 1
     return items
+
+
+def _page(p, items, bounds=None, default=None):
+    """MaxResults/NextToken offset paging; returns (page, nextToken XML or "")."""
+    raw = _p(p, "MaxResults")
+    size = int(raw) if re.fullmatch(r"-?[0-9]+", raw or "") else default
+    token = _p(p, "NextToken")
+    start = int(token) if token.isdigit() else 0
+    if size is None:
+        return items[start:], ""
+    low, high = bounds or (1, None)
+    size = max(size, low) if high is None else min(max(size, low), high)
+    end = start + size
+    return items[start:end], (f"<nextToken>{end}</nextToken>" if end < len(items) else "")
 
 
 def _parse_tags(params):
@@ -4761,6 +5180,14 @@ def _parse_ip_permissions(params, prefix):
             rule["Ipv6Ranges"].append(entry)
             j += 1
         j = 1
+        while _p(params, f"{prefix}.{i}.PrefixListIds.{j}.PrefixListId"):
+            entry = {"PrefixListId": _p(params, f"{prefix}.{i}.PrefixListIds.{j}.PrefixListId")}
+            desc = _p(params, f"{prefix}.{i}.PrefixListIds.{j}.Description")
+            if desc:
+                entry["Description"] = desc
+            rule["PrefixListIds"].append(entry)
+            j += 1
+        j = 1
         while True:
             gid = _p(params, f"{prefix}.{i}.Groups.{j}.GroupId")
             gname = _p(params, f"{prefix}.{i}.Groups.{j}.GroupName")
@@ -4910,6 +5337,33 @@ def _create_nat_gateway(params):
     subnet = _subnets.get(subnet_id)
     vpc_id = subnet["VpcId"] if subnet else _DEFAULT_VPC_ID
     tags = _parse_tags(params)
+    eni_id = "eni-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    private_ip = _p(params, "PrivateIpAddress") or _random_ip("10.0")
+    nat_address = {"NetworkInterfaceId": eni_id, "PrivateIp": private_ip,
+                   "IsPrimary": True, "Status": "succeeded"}
+    eip = _addresses.get(alloc_id) if alloc_id else None
+    if alloc_id:
+        nat_address["AllocationId"] = alloc_id
+        nat_address["AssociationId"] = f"eipassoc-{new_uuid().replace('-','')[:17]}"
+    if eip:
+        nat_address["PublicIp"] = eip["PublicIp"]
+        eip.update({"AssociationId": nat_address["AssociationId"], "NetworkInterfaceId": eni_id,
+                    "PrivateIpAddress": private_ip})
+    _network_interfaces[eni_id] = {
+        "NetworkInterfaceId": eni_id,
+        "SubnetId": subnet_id,
+        "VpcId": vpc_id,
+        "AvailabilityZone": (subnet or {}).get("AvailabilityZone", f"{get_region()}a"),
+        "Description": f"Interface for NAT Gateway {nat_id}",
+        "OwnerId": get_account_id(),
+        "Status": "in-use",
+        "PrivateIpAddress": private_ip,
+        "InterfaceType": "nat_gateway",
+        "SourceDestCheck": False,
+        "MacAddress": ":".join(f"{random.randint(0,255):02x}" for _ in range(6)),
+        "Groups": [],
+        "Attachment": None,
+    }
     record = {
         "NatGatewayId": nat_id,
         "SubnetId": subnet_id,
@@ -4919,6 +5373,7 @@ def _create_nat_gateway(params):
         "State": "available",
         "CreateTime": _now_ts(),
         "Tags": tags,
+        "NatGatewayAddresses": [nat_address],
     }
     _nat_gateways[nat_id] = record
     if tags:
@@ -4931,16 +5386,28 @@ def _create_nat_gateway(params):
         <state>available</state>
         <connectivityType>{connectivity}</connectivityType>
         <createTime>{_now_ts()}</createTime>
-        <natGatewayAddressSet/>
+        <natGatewayAddressSet>{_nat_addresses_xml(record)}</natGatewayAddressSet>
         {_tag_set_xml(nat_id)}
     </natGateway>"""
     return _xml(200, "CreateNatGatewayResponse", inner)
 
 
+_NAT_ADDRESS_MEMBERS = (
+    ("AllocationId", "allocationId", str), ("NetworkInterfaceId", "networkInterfaceId", str),
+    ("PrivateIp", "privateIp", str), ("PublicIp", "publicIp", str), ("AssociationId", "associationId", str),
+    ("IsPrimary", "isPrimary", bool), ("Status", "status", str),
+)
+
+
+def _nat_addresses_xml(nat):
+    return "".join(f"<item>{_struct_xml(a, _NAT_ADDRESS_MEMBERS)}</item>"
+                   for a in nat.get("NatGatewayAddresses") or [])
+
+
 def _describe_nat_gateways(params):
     filters = _parse_filters(params)
     ids = _parse_member_list(params, "NatGatewayId")
-    items = ""
+    items = []
     for nat in _nat_gateways.values():
         if ids and nat["NatGatewayId"] not in ids:
             continue
@@ -4952,18 +5419,19 @@ def _describe_nat_gateways(params):
             continue
         if filters.get("subnet-id") and nat["SubnetId"] not in filters["subnet-id"]:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
             <natGatewayId>{nat['NatGatewayId']}</natGatewayId>
             <subnetId>{nat['SubnetId']}</subnetId>
             <vpcId>{nat['VpcId']}</vpcId>
             <state>{nat['State']}</state>
             <connectivityType>{nat['ConnectivityType']}</connectivityType>
             <createTime>{nat['CreateTime']}</createTime>
-            <natGatewayAddressSet/>
+            <natGatewayAddressSet>{_nat_addresses_xml(nat)}</natGatewayAddressSet>
             {_tag_set_xml(nat['NatGatewayId'])}
-        </item>"""
+        </item>""")
+    items, next_xml = _page(params, items, (5, 1000))
     return _xml(200, "DescribeNatGatewaysResponse",
-                f"<natGatewaySet>{items}</natGatewaySet>")
+                f"<natGatewaySet>{''.join(items)}</natGatewaySet>{next_xml}")
 
 
 def _delete_nat_gateway(params):
@@ -4971,6 +5439,11 @@ def _delete_nat_gateway(params):
     if nat_id not in _nat_gateways:
         return _error("NatGatewayNotFound", f"NatGateway {nat_id} not found", 400)
     _nat_gateways[nat_id]["State"] = "deleted"
+    for address in _nat_gateways[nat_id].get("NatGatewayAddresses") or []:
+        _network_interfaces.pop(address.get("NetworkInterfaceId"), None)
+        eip = _addresses.get(address.get("AllocationId"))
+        if eip and eip.get("NetworkInterfaceId") == address.get("NetworkInterfaceId"):
+            eip.update({"AssociationId": None, "NetworkInterfaceId": None, "PrivateIpAddress": None})
     return _xml(200, "DeleteNatGatewayResponse",
                 f"<natGatewayId>{nat_id}</natGatewayId>")
 
@@ -4990,8 +5463,23 @@ def _network_acl_entry_xml(entry):
             <protocol>{entry['Protocol']}</protocol>
             <ruleAction>{entry['RuleAction']}</ruleAction>
             <egress>{'true' if entry['Egress'] else 'false'}</egress>
-            {cidr}
+            {cidr}{_struct_xml(entry, _NACL_ENTRY_STRUCTS)}
         </item>"""
+
+
+_NACL_ENTRY_STRUCTS = (
+    ("IcmpTypeCode", "icmpTypeCode", (("Code", "code", int), ("Type", "type", int))),
+    ("PortRange", "portRange", (("From", "from", int), ("To", "to", int))),
+)
+
+
+def _nacl_entry_extras(params, entry):
+    icmp = _parse_struct(params, "Icmp", (("Code", "code", int), ("Type", "type", int)))
+    if icmp:
+        entry["IcmpTypeCode"] = icmp
+    ports = _parse_struct(params, "PortRange", (("From", "from", int), ("To", "to", int)))
+    if ports:
+        entry["PortRange"] = ports
 
 def _create_network_acl(params):
     vpc_id = _p(params, "VpcId")
@@ -5027,7 +5515,7 @@ def _create_network_acl(params):
 def _describe_network_acls(params):
     filters = _parse_filters(params)
     ids = _parse_member_list(params, "NetworkAclId")
-    items = ""
+    items = []
     for acl in _network_acls.values():
         if ids and acl["NetworkAclId"] not in ids:
             continue
@@ -5045,7 +5533,7 @@ def _describe_network_acls(params):
             <networkAclId>{acl['NetworkAclId']}</networkAclId>
             <subnetId>{a['SubnetId']}</subnetId>
         </item>""" for a in acl["Associations"])
-        items += f"""<item>
+        items.append(f"""<item>
             <networkAclId>{acl['NetworkAclId']}</networkAclId>
             <vpcId>{acl['VpcId']}</vpcId>
             <default>{'true' if acl['IsDefault'] else 'false'}</default>
@@ -5053,9 +5541,10 @@ def _describe_network_acls(params):
             <associationSet>{assocs}</associationSet>
             {_tag_set_xml(acl['NetworkAclId'])}
             <ownerId>{acl['OwnerId']}</ownerId>
-        </item>"""
+        </item>""")
+    items, next_xml = _page(params, items, (5, 1000))
     return _xml(200, "DescribeNetworkAclsResponse",
-                f"<networkAclSet>{items}</networkAclSet>")
+                f"<networkAclSet>{''.join(items)}</networkAclSet>{next_xml}")
 
 
 def _delete_network_acl(params):
@@ -5084,6 +5573,7 @@ def _create_network_acl_entry(params):
         entry["Ipv6CidrBlock"] = ipv6_cidr_block
     else:
         entry["CidrBlock"] = "0.0.0.0/0"
+    _nacl_entry_extras(params, entry)
     _network_acls[acl_id]["Entries"].append(entry)
     return _xml(200, "CreateNetworkAclEntryResponse", "<return>true</return>")
 
@@ -5123,6 +5613,7 @@ def _replace_network_acl_entry(params):
         entry["Ipv6CidrBlock"] = ipv6_cidr_block
     else:
         entry["CidrBlock"] = "0.0.0.0/0"
+    _nacl_entry_extras(params, entry)
     acl["Entries"].append(entry)
     return _xml(200, "ReplaceNetworkAclEntryResponse", "<return>true</return>")
 
@@ -5133,11 +5624,14 @@ def _replace_network_acl_association(params):
     if new_acl_id not in _network_acls:
         return _error("InvalidNetworkAclID.NotFound", f"The network ACL '{new_acl_id}' does not exist", 400)
     new_assoc_id = "aclassoc-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    subnet_id = ""
     # Remove old association from whichever ACL owns it
     for acl in _network_acls.values():
+        for a in acl["Associations"]:
+            if a["NetworkAclAssociationId"] == assoc_id:
+                subnet_id = a.get("SubnetId", "")
         acl["Associations"] = [a for a in acl["Associations"]
                                 if a["NetworkAclAssociationId"] != assoc_id]
-    subnet_id = ""
     _network_acls[new_acl_id]["Associations"].append({
         "NetworkAclAssociationId": new_assoc_id,
         "SubnetId": subnet_id,
@@ -5168,7 +5662,15 @@ def _create_flow_logs(params):
             "LogDestination": log_dest,
             "FlowLogStatus": "ACTIVE",
             "CreationTime": _now_ts(),
+            "MaxAggregationInterval": int(_p(params, "MaxAggregationInterval") or 600),
         }
+        for member in ("DeliverLogsPermissionArn", "DeliverCrossAccountRole", "LogGroupName", "LogFormat"):
+            if _p(params, member):
+                _flow_logs[fl_id][member] = _p(params, member)
+        options = _parse_struct(params, "DestinationOptions", _FLOW_LOG_DESTINATION_MEMBERS)
+        if options or log_dest_type == "s3":
+            _flow_logs[fl_id]["DestinationOptions"] = {
+                "FileFormat": "plain-text", "HiveCompatiblePartitions": False, "PerHourPartition": False, **options}
         _parse_tag_specs(params, "flow-log", fl_id)
         created.append(fl_id)
     ids_xml = "".join(f"<item>{fid}</item>" for fid in created)
@@ -5176,10 +5678,31 @@ def _create_flow_logs(params):
                 f"<flowLogIdSet>{ids_xml}</flowLogIdSet><unsuccessful/>")
 
 
+_FLOW_LOG_DESTINATION_MEMBERS = (
+    ("FileFormat", "fileFormat", str),
+    ("HiveCompatiblePartitions", "hiveCompatiblePartitions", bool),
+    ("PerHourPartition", "perHourPartition", bool),
+)
+
+
+def _flow_log_extras_xml(fl):
+    out = ""
+    for member, tag in (("DeliverLogsPermissionArn", "deliverLogsPermissionArn"),
+                        ("DeliverCrossAccountRole", "deliverCrossAccountRole"),
+                        ("LogGroupName", "logGroupName"), ("LogFormat", "logFormat")):
+        if fl.get(member):
+            out += f"<{tag}>{_esc(fl[member])}</{tag}>"
+    if fl.get("MaxAggregationInterval"):
+        out += f"<maxAggregationInterval>{fl['MaxAggregationInterval']}</maxAggregationInterval>"
+    if fl.get("DestinationOptions"):
+        out += f"<destinationOptions>{_struct_xml(fl['DestinationOptions'], _FLOW_LOG_DESTINATION_MEMBERS)}</destinationOptions>"
+    return out
+
+
 def _describe_flow_logs(params):
     ids = _parse_member_list(params, "FlowLogId")
     filters = _parse_filters(params)
-    items = ""
+    items = []
     for fl in _flow_logs.values():
         if ids and fl["FlowLogId"] not in ids:
             continue
@@ -5187,7 +5710,7 @@ def _describe_flow_logs(params):
             continue
         if filters.get("resource-id") and fl["ResourceId"] not in filters["resource-id"]:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
             <flowLogId>{fl['FlowLogId']}</flowLogId>
             <resourceId>{fl['ResourceId']}</resourceId>
             <trafficType>{fl['TrafficType']}</trafficType>
@@ -5195,9 +5718,11 @@ def _describe_flow_logs(params):
             <logDestination>{fl.get('LogDestination','')}</logDestination>
             <flowLogStatus>{fl['FlowLogStatus']}</flowLogStatus>
             <creationTime>{fl['CreationTime']}</creationTime>
+            {_flow_log_extras_xml(fl)}
             {_tag_set_xml(fl['FlowLogId'])}
-        </item>"""
-    return _xml(200, "DescribeFlowLogsResponse", f"<flowLogSet>{items}</flowLogSet>")
+        </item>""")
+    items, next_xml = _page(params, items)
+    return _xml(200, "DescribeFlowLogsResponse", f"<flowLogSet>{''.join(items)}</flowLogSet>{next_xml}")
 
 
 def _delete_flow_logs(params):
@@ -5270,7 +5795,7 @@ def _accept_vpc_peering_connection(params):
 def _describe_vpc_peering_connections(params):
     ids = _parse_member_list(params, "VpcPeeringConnectionId")
     filters = _parse_filters(params)
-    items = ""
+    items = []
     for pcx in _vpc_peering.values():
         if ids and pcx["VpcPeeringConnectionId"] not in ids:
             continue
@@ -5278,15 +5803,16 @@ def _describe_vpc_peering_connections(params):
             continue
         if filters.get("status-code") and pcx["Status"]["Code"] not in filters["status-code"]:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
             <vpcPeeringConnectionId>{pcx['VpcPeeringConnectionId']}</vpcPeeringConnectionId>
             <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId><region>{pcx['RequesterVpcInfo']['Region']}</region></requesterVpcInfo>
             <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['AccepterVpcInfo']['OwnerId']}</ownerId><region>{pcx['AccepterVpcInfo']['Region']}</region></accepterVpcInfo>
             <status><code>{pcx['Status']['Code']}</code><message>{pcx['Status']['Message']}</message></status>
             {_tag_set_xml(pcx['VpcPeeringConnectionId'])}
-        </item>"""
+        </item>""")
+    items, next_xml = _page(params, items, (5, 1000))
     return _xml(200, "DescribeVpcPeeringConnectionsResponse",
-                f"<vpcPeeringConnectionSet>{items}</vpcPeeringConnectionSet>")
+                f"<vpcPeeringConnectionSet>{''.join(items)}</vpcPeeringConnectionSet>{next_xml}")
 
 
 def _delete_vpc_peering_connection(params):
@@ -5360,7 +5886,7 @@ def _associate_dhcp_options(params):
 
 def _describe_dhcp_options(params):
     ids = _parse_member_list(params, "DhcpOptionsId")
-    items = ""
+    items = []
     for dopt in _dhcp_options.values():
         if ids and dopt["DhcpOptionsId"] not in ids:
             continue
@@ -5368,13 +5894,14 @@ def _describe_dhcp_options(params):
             <key>{c['Key']}</key>
             <valueSet>{"".join(f'<item><value>{v}</value></item>' for v in c['Values'])}</valueSet>
         </item>""" for c in dopt["DhcpConfigurations"])
-        items += f"""<item>
+        items.append(f"""<item>
             <dhcpOptionsId>{dopt['DhcpOptionsId']}</dhcpOptionsId>
             <dhcpConfigurationSet>{configs_xml}</dhcpConfigurationSet>
             <ownerId>{dopt['OwnerId']}</ownerId>
             {_tag_set_xml(dopt['DhcpOptionsId'])}
-        </item>"""
-    return _xml(200, "DescribeDhcpOptionsResponse", f"<dhcpOptionsSet>{items}</dhcpOptionsSet>")
+        </item>""")
+    items, next_xml = _page(params, items, (5, 1000))
+    return _xml(200, "DescribeDhcpOptionsResponse", f"<dhcpOptionsSet>{''.join(items)}</dhcpOptionsSet>{next_xml}")
 
 
 def _delete_dhcp_options(params):
@@ -5421,11 +5948,11 @@ def _create_egress_only_igw(params):
 
 def _describe_egress_only_igws(params):
     ids = _parse_member_list(params, "EgressOnlyInternetGatewayId")
-    items = ""
+    items = []
     for eigw in _egress_igws.values():
         if ids and eigw["EgressOnlyInternetGatewayId"] not in ids:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
             <egressOnlyInternetGatewayId>{eigw['EgressOnlyInternetGatewayId']}</egressOnlyInternetGatewayId>
             <attachmentSet>
                 <item>
@@ -5434,9 +5961,10 @@ def _describe_egress_only_igws(params):
                 </item>
             </attachmentSet>
             {_tag_set_xml(eigw['EgressOnlyInternetGatewayId'])}
-        </item>"""
+        </item>""")
+    items, next_xml = _page(params, items, (5, 255))
     return _xml(200, "DescribeEgressOnlyInternetGatewaysResponse",
-                f"<egressOnlyInternetGatewaySet>{items}</egressOnlyInternetGatewaySet>")
+                f"<egressOnlyInternetGatewaySet>{''.join(items)}</egressOnlyInternetGatewaySet>{next_xml}")
 
 
 def _delete_egress_only_igw(params):
@@ -5497,9 +6025,13 @@ def _modify_vpc_endpoint(p):
         ep["SubnetIds"] = list(set(ep.get("SubnetIds", []) + add_subnets))
     if rm_subnets:
         ep["SubnetIds"] = [s for s in ep.get("SubnetIds", []) if s not in rm_subnets]
-    policy = _p(p, "PolicyDocument")
-    if policy:
-        ep["PolicyDocument"] = policy
+    add_sgs = _parse_member_list(p, "AddSecurityGroupId")
+    rm_sgs = _parse_member_list(p, "RemoveSecurityGroupId")
+    groups = [g for g in ep.get("GroupIds", []) if g not in rm_sgs]
+    ep["GroupIds"] = groups + [g for g in add_sgs if g not in groups]
+    if _p(p, "ResetPolicy").lower() == "true":
+        ep.pop("PolicyDocument", None)
+    _apply_vpce_options(ep, p)
     return _xml(200, "ModifyVpcEndpointResponse", "<return>true</return>")
 
 
@@ -5636,7 +6168,7 @@ def _get_aws_managed_prefix_lists() -> list[dict]:
 def _describe_prefix_lists(p):
     filter_ids = _parse_member_list(p, "PrefixListId")
     filters = _parse_filters(p)
-    items = ""
+    items = []
     # Built-in AWS service prefix lists
     for aws_pl in _get_aws_managed_prefix_lists():
         pl_id = aws_pl["PrefixListId"]
@@ -5648,11 +6180,11 @@ def _describe_prefix_lists(p):
             continue
         if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
             <prefixListId>{pl_id}</prefixListId>
             <prefixListName>{name}</prefixListName>
             <cidrSet><item>{cidr}</item></cidrSet>
-        </item>"""
+        </item>""")
     # User-created managed prefix lists
     for pl in _prefix_lists.values():
         if filter_ids and pl["PrefixListId"] not in filter_ids:
@@ -5662,12 +6194,13 @@ def _describe_prefix_lists(p):
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
         entries = "".join(f"<item>{e['Cidr']}</item>" for e in pl.get("Entries", []))
-        items += f"""<item>
+        items.append(f"""<item>
             <prefixListId>{pl['PrefixListId']}</prefixListId>
             <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
             <cidrSet>{entries}</cidrSet>
-        </item>"""
-    return _xml(200, "DescribePrefixListsResponse", f"<prefixListSet>{items}</prefixListSet>")
+        </item>""")
+    items, next_xml = _page(p, items)
+    return _xml(200, "DescribePrefixListsResponse", f"<prefixListSet>{''.join(items)}</prefixListSet>{next_xml}")
 
 
 # ---------------------------------------------------------------------------
@@ -5696,13 +6229,14 @@ def _create_managed_prefix_list(p):
     }
     if tags:
         _tags[pl_id] = tags
+    _parse_tag_specs(p, "prefix-list", pl_id)
     return _xml(200, "CreateManagedPrefixListResponse", _prefix_list_xml(_prefix_lists[pl_id], tag="prefixList"))
 
 
 def _describe_managed_prefix_lists(p):
     filter_ids = _parse_member_list(p, "PrefixListId")
     filters = _parse_filters(p)
-    items = ""
+    items = []
     # AWS managed prefix lists
     for aws_pl in _get_aws_managed_prefix_lists():
         pl_id = aws_pl["PrefixListId"]
@@ -5715,7 +6249,7 @@ def _describe_managed_prefix_lists(p):
             continue
         if filters.get("owner-id") and "AWS" not in filters["owner-id"]:
             continue
-        items += f"""<item>
+        items.append(f"""<item>
         <prefixListId>{pl_id}</prefixListId>
         <prefixListName>{name}</prefixListName>
         <state>create-complete</state>
@@ -5725,7 +6259,7 @@ def _describe_managed_prefix_lists(p):
         <prefixListArn>arn:aws:ec2:{get_region()}:aws:prefix-list/{pl_id}</prefixListArn>
         <ownerId>AWS</ownerId>
         <tagSet/>
-    </item>"""
+    </item>""")
     # User-created managed prefix lists
     for pl in _prefix_lists.values():
         if filter_ids and pl["PrefixListId"] not in filter_ids:
@@ -5736,8 +6270,9 @@ def _describe_managed_prefix_lists(p):
             continue
         if filters.get("owner-id") and pl.get("OwnerId", get_account_id()) not in filters["owner-id"]:
             continue
-        items += _prefix_list_xml(pl)
-    return _xml(200, "DescribeManagedPrefixListsResponse", f"<prefixListSet>{items}</prefixListSet>")
+        items.append(_prefix_list_xml(pl))
+    items, next_xml = _page(p, items, (1, 100))
+    return _xml(200, "DescribeManagedPrefixListsResponse", f"<prefixListSet>{''.join(items)}</prefixListSet>{next_xml}")
 
 
 def _get_managed_prefix_list_entries(p):
@@ -5756,11 +6291,12 @@ def _get_managed_prefix_list_entries(p):
     pl = _prefix_lists.get(pl_id)
     if not pl:
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
+    page, next_xml = _page(p, pl.get("Entries", []), (1, 100))
     entries = "".join(f"""<item>
         <cidr>{e['Cidr']}</cidr>
         <description>{e.get('Description','')}</description>
-    </item>""" for e in pl.get("Entries", []))
-    return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>")
+    </item>""" for e in page)
+    return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>{next_xml}")
 
 
 def _modify_managed_prefix_list(p):
@@ -5838,6 +6374,7 @@ def _create_vpn_gateway(p):
     }
     if tags:
         _tags[vgw_id] = tags
+    _parse_tag_specs(p, "vpn-gateway", vgw_id)
     return _xml(200, "CreateVpnGatewayResponse", _vgw_xml(_vpn_gateways[vgw_id], tag="vpnGateway"))
 
 
@@ -5945,8 +6482,12 @@ def _create_customer_gateway(p):
         "CustomerGatewayId": cgw_id, "BgpAsn": bgp_asn, "IpAddress": ip_address,
         "Type": gw_type, "State": "available", "Tags": tags, "OwnerId": get_account_id(),
     }
+    for member in ("DeviceName", "CertificateArn", "BgpAsnExtended"):
+        if _p(p, member):
+            _customer_gateways[cgw_id][member] = _p(p, member)
     if tags:
         _tags[cgw_id] = tags
+    _parse_tag_specs(p, "customer-gateway", cgw_id)
     return _xml(200, "CreateCustomerGatewayResponse", _cgw_xml(_customer_gateways[cgw_id], tag="customerGateway"))
 
 
@@ -5975,6 +6516,8 @@ def _cgw_xml(cgw, tag="item"):
         <ipAddress>{cgw['IpAddress']}</ipAddress>
         <type>{cgw['Type']}</type>
         <state>{cgw['State']}</state>
+        {"".join(f"<{m[0].lower() + m[1:]}>{_esc(cgw[m])}</{m[0].lower() + m[1:]}>"
+                 for m in ("CertificateArn", "DeviceName", "BgpAsnExtended") if cgw.get(m))}
         {_tag_set_xml(cgw['CustomerGatewayId'])}
     </{tag}>"""
 
@@ -5995,12 +6538,85 @@ def _create_vpn_connection(p):
         "VpnConnectionId": vpn_id, "State": "available", "Type": conn_type,
         "CustomerGatewayId": cgw_id, "VpnGatewayId": vgw_id,
         "TransitGatewayId": tgw_id, "Category": "VPN",
-        "Options": {"StaticRoutesOnly": static_only.lower() == "true"},
+        "Options": {**_parse_struct(p, "Options", _VPN_OPTION_MEMBERS),
+                    "StaticRoutesOnly": static_only.lower() == "true"},
         "Routes": [], "Tags": tags, "OwnerId": get_account_id(),
     }
+    tunnels = []
+    i = 1
+    while any(k.startswith(f"Options.TunnelOptions.{i}.") for k in p):
+        tunnel = _parse_struct(p, f"Options.TunnelOptions.{i}", _VPN_TUNNEL_WIRE_MEMBERS)
+        for wire, member in (("DPDTimeoutSeconds", "DpdTimeoutSeconds"), ("DPDTimeoutAction", "DpdTimeoutAction")):
+            if wire in tunnel:
+                tunnel[member] = tunnel.pop(wire)
+        for member, wire, _tag, kind in _VPN_TUNNEL_LISTS:
+            values, j = [], 1
+            while _p(p, f"Options.TunnelOptions.{i}.{wire}.{j}.Value"):
+                values.append({"Value": kind(_p(p, f"Options.TunnelOptions.{i}.{wire}.{j}.Value"))})
+                j += 1
+            if values:
+                tunnel[member] = values
+        tunnels.append(tunnel)
+        i += 1
+    if tunnels:
+        _vpn_connections[vpn_id]["Options"]["TunnelOptions"] = tunnels
     if tags:
         _tags[vpn_id] = tags
+    _parse_tag_specs(p, "vpn-connection", vpn_id)
     return _xml(200, "CreateVpnConnectionResponse", _vpn_conn_xml(_vpn_connections[vpn_id], tag="vpnConnection"))
+
+
+_VPN_OPTION_MEMBERS = (
+    ("EnableAcceleration", "enableAcceleration", bool),
+    ("LocalIpv4NetworkCidr", "localIpv4NetworkCidr", str),
+    ("RemoteIpv4NetworkCidr", "remoteIpv4NetworkCidr", str),
+    ("LocalIpv6NetworkCidr", "localIpv6NetworkCidr", str),
+    ("RemoteIpv6NetworkCidr", "remoteIpv6NetworkCidr", str),
+    ("OutsideIpAddressType", "outsideIpAddressType", str),
+    ("TransportTransitGatewayAttachmentId", "transportTransitGatewayAttachmentId", str),
+    ("TunnelInsideIpVersion", "tunnelInsideIpVersion", str),
+    ("TunnelBandwidth", "tunnelBandwidth", str),
+)
+_VPN_TUNNEL_MEMBERS = (
+    ("TunnelInsideCidr", "tunnelInsideCidr", str),
+    ("TunnelInsideIpv6Cidr", "tunnelInsideIpv6Cidr", str),
+    ("PreSharedKey", "preSharedKey", str),
+    ("Phase1LifetimeSeconds", "phase1LifetimeSeconds", int),
+    ("Phase2LifetimeSeconds", "phase2LifetimeSeconds", int),
+    ("RekeyMarginTimeSeconds", "rekeyMarginTimeSeconds", int),
+    ("RekeyFuzzPercentage", "rekeyFuzzPercentage", int),
+    ("ReplayWindowSize", "replayWindowSize", int),
+    ("DpdTimeoutSeconds", "dpdTimeoutSeconds", int),
+    ("DpdTimeoutAction", "dpdTimeoutAction", str),
+    ("StartupAction", "startupAction", str),
+    ("LogOptions", "logOptions", (("CloudWatchLogOptions", "cloudWatchLogOptions", (
+        ("LogEnabled", "logEnabled", bool),
+        ("LogGroupArn", "logGroupArn", str),
+        ("LogOutputFormat", "logOutputFormat", str),
+        ("BgpLogEnabled", "bgpLogEnabled", bool),
+        ("BgpLogGroupArn", "bgpLogGroupArn", str),
+        ("BgpLogOutputFormat", "bgpLogOutputFormat", str),
+    )),)),
+    ("EnableTunnelLifecycleControl", "enableTunnelLifecycleControl", bool),
+)
+_VPN_TUNNEL_LISTS = (
+    ("Phase1EncryptionAlgorithms", "Phase1EncryptionAlgorithm", "phase1EncryptionAlgorithmSet", str),
+    ("Phase2EncryptionAlgorithms", "Phase2EncryptionAlgorithm", "phase2EncryptionAlgorithmSet", str),
+    ("Phase1IntegrityAlgorithms", "Phase1IntegrityAlgorithm", "phase1IntegrityAlgorithmSet", str),
+    ("Phase2IntegrityAlgorithms", "Phase2IntegrityAlgorithm", "phase2IntegrityAlgorithmSet", str),
+    ("Phase1DHGroupNumbers", "Phase1DHGroupNumber", "phase1DHGroupNumberSet", int),
+    ("Phase2DHGroupNumbers", "Phase2DHGroupNumber", "phase2DHGroupNumberSet", int),
+    ("IkeVersions", "IKEVersion", "ikeVersionSet", str),
+)
+_VPN_TUNNEL_WIRE_MEMBERS = tuple(
+    (("DPDTimeoutSeconds" if n == "DpdTimeoutSeconds" else "DPDTimeoutAction" if n == "DpdTimeoutAction" else n), t, k)
+    for n, t, k in _VPN_TUNNEL_MEMBERS)
+
+
+def _vpn_tunnel_lists_xml(tunnel):
+    return "".join(
+        f"<{tag}>" + "".join(f"<item><value>{_esc(str(v['Value']))}</value></item>" for v in tunnel[member]) + f"</{tag}>"
+        for member, _wire, tag, _kind in _VPN_TUNNEL_LISTS if tunnel.get(member))
 
 
 def _vpn_conn_xml(vpn, tag="item"):
@@ -6016,7 +6632,10 @@ def _vpn_conn_xml(vpn, tag="item"):
         <vpnGatewayId>{vpn['VpnGatewayId']}</vpnGatewayId>
         <transitGatewayId>{vpn['TransitGatewayId']}</transitGatewayId>
         <category>{vpn['Category']}</category>
-        <options><staticRoutesOnly>{'true' if vpn['Options']['StaticRoutesOnly'] else 'false'}</staticRoutesOnly></options>
+        <options><staticRoutesOnly>{'true' if vpn['Options']['StaticRoutesOnly'] else 'false'}</staticRoutesOnly>{_struct_xml(vpn['Options'], _VPN_OPTION_MEMBERS)}{
+            "<tunnelOptionSet>" + "".join(f"<item>{_struct_xml(t, _VPN_TUNNEL_MEMBERS)}{_vpn_tunnel_lists_xml(t)}</item>"
+                                          for t in vpn['Options']['TunnelOptions']) + "</tunnelOptionSet>"
+            if vpn['Options'].get('TunnelOptions') else ""}</options>
         <routes>{routes}</routes>
         {_tag_set_xml(vpn['VpnConnectionId'])}
     </{tag}>"""
@@ -6085,20 +6704,30 @@ def _describe_instance_attribute(p):
         return _error("InvalidInstanceID.NotFound",
                       f"The instance ID '{instance_id}' does not exist", 400)
 
+    def _bool(value):
+        return "true" if value else "false"
+
     if attribute == "instanceInitiatedShutdownBehavior":
-        value_xml = "<instanceInitiatedShutdownBehavior><value>stop</value></instanceInitiatedShutdownBehavior>"
+        value_xml = ("<instanceInitiatedShutdownBehavior><value>"
+                     f"{_esc(inst.get('InstanceInitiatedShutdownBehavior', 'stop'))}"
+                     "</value></instanceInitiatedShutdownBehavior>")
     elif attribute == "disableApiTermination":
-        value_xml = "<disableApiTermination><value>false</value></disableApiTermination>"
+        value_xml = f"<disableApiTermination><value>{_bool(inst.get('DisableApiTermination'))}</value></disableApiTermination>"
+    elif attribute == "disableApiStop":
+        value_xml = f"<disableApiStop><value>{_bool(inst.get('DisableApiStop'))}</value></disableApiStop>"
+    elif attribute == "enclaveOptions":
+        value_xml = f"<enclaveOptions><enabled>{_bool((inst.get('EnclaveOptions') or {}).get('Enabled'))}</enabled></enclaveOptions>"
     elif attribute == "instanceType":
         value_xml = f"<instanceType><value>{inst.get('InstanceType', 't2.micro')}</value></instanceType>"
     elif attribute == "userData":
-        value_xml = "<userData/>"
+        value_xml = (f"<userData><value>{_esc(inst['UserData'])}</value></userData>"
+                     if inst.get("UserData") else "<userData/>")
     elif attribute == "rootDeviceName":
         value_xml = f"<rootDeviceName><value>{inst.get('RootDeviceName', '/dev/xvda')}</value></rootDeviceName>"
     elif attribute == "blockDeviceMapping":
-        value_xml = "<blockDeviceMapping/>"
+        value_xml = f"<blockDeviceMapping>{_inst_bdm_xml(inst)}</blockDeviceMapping>"
     elif attribute == "sourceDestCheck":
-        value_xml = "<sourceDestCheck><value>true</value></sourceDestCheck>"
+        value_xml = f"<sourceDestCheck><value>{_bool(inst.get('SourceDestCheck', True))}</value></sourceDestCheck>"
     elif attribute == "groupSet":
         sgs = "".join(
             f"<item><groupId>{sg['GroupId']}</groupId><groupName>{sg['GroupName']}</groupName></item>"
@@ -6106,7 +6735,7 @@ def _describe_instance_attribute(p):
         )
         value_xml = f"<groupSet>{sgs}</groupSet>"
     elif attribute == "ebsOptimized":
-        value_xml = "<ebsOptimized><value>false</value></ebsOptimized>"
+        value_xml = f"<ebsOptimized><value>{_bool(inst.get('EbsOptimized'))}</value></ebsOptimized>"
     elif attribute == "enaSupport":
         value_xml = "<enaSupport><value>true</value></enaSupport>"
     elif attribute == "sriovNetSupport":
@@ -6127,12 +6756,12 @@ def _describe_instance_types(p):
         "t3.micro", "t3.small", "t3.medium", "t3.large",
         "m5.large", "m5.xlarge", "c5.large", "c5.xlarge",
     ]
-    items = ""
+    items = []
     for itype in all_types:
         family = itype.split(".")[0]
         vcpus = 2 if "micro" in itype else 4 if "small" in itype else 8
         mem_mib = 1024 if "micro" in itype else 2048 if "small" in itype else 4096
-        items += f"""<item>
+        items.append(f"""<item>
             <instanceType>{itype}</instanceType>
             <currentGeneration>true</currentGeneration>
             <freeTierEligible>{'true' if itype == 't2.micro' else 'false'}</freeTierEligible>
@@ -6190,26 +6819,42 @@ def _describe_instance_types(p):
             <burstablePerformanceSupported>{'true' if family in ('t2','t3','t4g') else 'false'}</burstablePerformanceSupported>
             <dedicatedHostsSupported>false</dedicatedHostsSupported>
             <autoRecoverySupported>true</autoRecoverySupported>
-        </item>"""
+        </item>""")
 
+    items, next_xml = _page(p, items, (5, 100))
     return _xml(200, "DescribeInstanceTypesResponse",
-                f"<instanceTypeSet>{items}</instanceTypeSet>")
+                f"<instanceTypeSet>{''.join(items)}</instanceTypeSet>{next_xml}")
 
 
 def _describe_instance_credit_specifications(p):
     instance_ids = _parse_member_list(p, "InstanceId")
+    ids, next_xml = (instance_ids, "") if instance_ids else _page(p, list(_instances.keys()), (5, 1000))
     items = "".join(
-        f"<item><instanceId>{iid}</instanceId><cpuCredits>standard</cpuCredits></item>"
-        for iid in (instance_ids or list(_instances.keys()))
+        f"<item><instanceId>{iid}</instanceId><cpuCredits>"
+        f"{_esc((_instances.get(iid, {}).get('CreditSpecification') or {}).get('CpuCredits', 'standard'))}"
+        "</cpuCredits></item>"
+        for iid in ids
     )
     return _xml(200, "DescribeInstanceCreditSpecificationsResponse",
-                f"<instanceCreditSpecificationSet>{items}</instanceCreditSpecificationSet>")
+                f"<instanceCreditSpecificationSet>{items}</instanceCreditSpecificationSet>{next_xml}")
 
 
 def _modify_instance_maintenance_options(p):
     instance_id = _p(p, "InstanceId")
-    return _xml(200, "ModifyInstanceMaintenanceOptionsResponse",
-                f"<instanceId>{instance_id}</instanceId><autoRecovery>default</autoRecovery>")
+    inst = _instances.get(instance_id)
+    if not inst:
+        return _error("InvalidInstanceID.NotFound",
+                      f"The instance ID '{instance_id}' does not exist", 400)
+    options = inst.setdefault("MaintenanceOptions", {})
+    for member in ("AutoRecovery", "RebootMigration"):
+        if _p(p, member):
+            options[member] = _p(p, member)
+    options.setdefault("AutoRecovery", "default")
+    body = f"<instanceId>{_esc(instance_id)}</instanceId>"
+    for member, tag in (("AutoRecovery", "autoRecovery"), ("RebootMigration", "rebootMigration")):
+        if options.get(member):
+            body += f"<{tag}>{_esc(options[member])}</{tag}>"
+    return _xml(200, "ModifyInstanceMaintenanceOptionsResponse", body)
 
 
 def _describe_instance_topology(p):
@@ -6226,13 +6871,10 @@ def _describe_capacity_reservations(p):
 
 def _describe_addresses_attribute(p):
     alloc_id = _p(p, "AllocationId") or _parse_member_list(p, "AllocationId")
-    items = ""
-    if isinstance(alloc_id, list):
-        for aid in alloc_id:
-            items += f"<item><allocationId>{aid}</allocationId><ptrRecord></ptrRecord></item>"
-    elif alloc_id:
-        items = f"<item><allocationId>{alloc_id}</allocationId><ptrRecord></ptrRecord></item>"
-    return _xml(200, "DescribeAddressesAttributeResponse", f"<addressSet>{items}</addressSet>")
+    alloc_ids = alloc_id if isinstance(alloc_id, list) else [alloc_id] if alloc_id else []
+    alloc_ids, next_xml = _page(p, alloc_ids, (1, 1000))
+    items = "".join(f"<item><allocationId>{aid}</allocationId><ptrRecord></ptrRecord></item>" for aid in alloc_ids)
+    return _xml(200, "DescribeAddressesAttributeResponse", f"<addressSet>{items}</addressSet>{next_xml}")
 
 
 def _describe_security_group_rules(p):
@@ -6254,7 +6896,7 @@ def _describe_security_group_rules(p):
     tag_filters = {k[len("tag:"):]: set(v) for k, v in filters.items() if k.startswith("tag:")}
     tag_key_filter = set(filters.get("tag-key", []))
 
-    items = ""
+    items = []
     for sg_id, sg in groups:
         if not sg:
             continue
@@ -6269,8 +6911,9 @@ def _describe_security_group_rules(p):
                         continue
                     if tag_key_filter and not (tag_key_filter & set(tmap)):
                         continue
-                items += _sg_rule_xml(sg_id, rule, is_egress=is_egress)
-    return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{items}</securityGroupRuleSet>")
+                items.append(_sg_rule_xml(sg_id, rule, is_egress=is_egress))
+    items, next_xml = _page(p, items, (5, 1000))
+    return _xml(200, "DescribeSecurityGroupRulesResponse", f"<securityGroupRuleSet>{''.join(items)}</securityGroupRuleSet>{next_xml}")
 
 
 def _modify_security_group_rules(p):
@@ -6303,7 +6946,7 @@ def _modify_security_group_rules(p):
             "cidr_ipv4": _p(p, f"{base}.CidrIpv4", None),
             "cidr_ipv6": _p(p, f"{base}.CidrIpv6", None),
             "prefix_list_id": _p(p, f"{base}.PrefixListId", None),
-            "referenced_group_id": _p(p, f"{base}.ReferencedGroupInfo.GroupId", None),
+            "referenced_group_id": _p(p, f"{base}.ReferencedGroupId", None),
         })
         i += 1
 
@@ -6503,24 +7146,25 @@ _INSTANCE_TYPE_AND_REQUIREMENTS = ("Either the instance type or the instance req
 
 def _parse_lt_data(params, prefix="LaunchTemplateData"):
     """Extract LaunchTemplateData from EC2 Query API params."""
+    pre = f"{prefix}." if prefix else ""
     data = {}
-    img = _p(params, f"{prefix}.ImageId")
+    img = _p(params, f"{pre}ImageId")
     if img:
         data["ImageId"] = img
-    itype = _p(params, f"{prefix}.InstanceType")
+    itype = _p(params, f"{pre}InstanceType")
     if itype:
         data["InstanceType"] = itype
-    key = _p(params, f"{prefix}.KeyName")
+    key = _p(params, f"{pre}KeyName")
     if key:
         data["KeyName"] = key
-    ud = _p(params, f"{prefix}.UserData")
+    ud = _p(params, f"{pre}UserData")
     if ud:
         data["UserData"] = ud
     # Security group IDs
     sg_ids = []
     i = 1
     while True:
-        sg = _p(params, f"{prefix}.SecurityGroupId.{i}")
+        sg = _p(params, f"{pre}SecurityGroupId.{i}")
         if not sg:
             break
         sg_ids.append(sg)
@@ -6531,7 +7175,7 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     sg_names = []
     i = 1
     while True:
-        sg = _p(params, f"{prefix}.SecurityGroup.{i}")
+        sg = _p(params, f"{pre}SecurityGroup.{i}")
         if not sg:
             break
         sg_names.append(sg)
@@ -6542,30 +7186,37 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     bdms = []
     i = 1
     while True:
-        dev = _p(params, f"{prefix}.BlockDeviceMapping.{i}.DeviceName")
+        dev = _p(params, f"{pre}BlockDeviceMapping.{i}.DeviceName")
         if not dev:
             break
         bdm = {"DeviceName": dev}
+        if _p(params, f"{pre}BlockDeviceMapping.{i}.VirtualName"):
+            bdm["VirtualName"] = _p(params, f"{pre}BlockDeviceMapping.{i}.VirtualName")
+        if f"{pre}BlockDeviceMapping.{i}.NoDevice" in params:
+            bdm["NoDevice"] = _p(params, f"{pre}BlockDeviceMapping.{i}.NoDevice")
         ebs = {}
-        vol_size = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.VolumeSize")
+        kms = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.KmsKeyId")
+        if kms:
+            ebs["KmsKeyId"] = kms
+        vol_size = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.VolumeSize")
         if vol_size:
             ebs["VolumeSize"] = int(vol_size)
-        vol_type = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.VolumeType")
+        vol_type = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.VolumeType")
         if vol_type:
             ebs["VolumeType"] = vol_type
-        encrypted = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.Encrypted")
+        encrypted = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.Encrypted")
         if encrypted:
             ebs["Encrypted"] = encrypted.lower() == "true"
-        delete_on = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.DeleteOnTermination")
+        delete_on = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.DeleteOnTermination")
         if delete_on:
             ebs["DeleteOnTermination"] = delete_on.lower() == "true"
-        snap = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.SnapshotId")
+        snap = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.SnapshotId")
         if snap:
             ebs["SnapshotId"] = snap
-        iops = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.Iops")
+        iops = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.Iops")
         if iops:
             ebs["Iops"] = int(iops)
-        throughput = _p(params, f"{prefix}.BlockDeviceMapping.{i}.Ebs.Throughput")
+        throughput = _p(params, f"{pre}BlockDeviceMapping.{i}.Ebs.Throughput")
         if throughput:
             ebs["Throughput"] = int(throughput)
         if ebs:
@@ -6578,27 +7229,40 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     nis = []
     i = 1
     while True:
-        dev_idx = _p(params, f"{prefix}.NetworkInterface.{i}.DeviceIndex")
-        if not dev_idx and not _p(params, f"{prefix}.NetworkInterface.{i}.SubnetId"):
+        dev_idx = _p(params, f"{pre}NetworkInterface.{i}.DeviceIndex")
+        if not dev_idx and not _p(params, f"{pre}NetworkInterface.{i}.SubnetId") \
+                and not _p(params, f"{pre}NetworkInterface.{i}.NetworkInterfaceId"):
             break
         ni = {}
         if dev_idx:
             ni["DeviceIndex"] = int(dev_idx)
-        sub = _p(params, f"{prefix}.NetworkInterface.{i}.SubnetId")
+        sub = _p(params, f"{pre}NetworkInterface.{i}.SubnetId")
         if sub:
             ni["SubnetId"] = sub
-        assoc_pub = _p(params, f"{prefix}.NetworkInterface.{i}.AssociatePublicIpAddress")
+        assoc_pub = _p(params, f"{pre}NetworkInterface.{i}.AssociatePublicIpAddress")
         if assoc_pub:
             ni["AssociatePublicIpAddress"] = assoc_pub.lower() == "true"
-        desc = _p(params, f"{prefix}.NetworkInterface.{i}.Description")
+        desc = _p(params, f"{pre}NetworkInterface.{i}.Description")
         if desc:
             ni["Description"] = desc
+        ni.update(_parse_struct(params, f"{pre}NetworkInterface.{i}", _LT_NI_SCALARS))
+        private_ips = []
+        j = 1
+        while _p(params, f"{pre}NetworkInterface.{i}.PrivateIpAddresses.{j}.PrivateIpAddress"):
+            entry = {"PrivateIpAddress": _p(params, f"{pre}NetworkInterface.{i}.PrivateIpAddresses.{j}.PrivateIpAddress")}
+            primary = _p(params, f"{pre}NetworkInterface.{i}.PrivateIpAddresses.{j}.Primary")
+            if primary:
+                entry["Primary"] = primary.lower() == "true"
+            private_ips.append(entry)
+            j += 1
+        if private_ips:
+            ni["PrivateIpAddresses"] = private_ips
         groups = []
         j = 1
         while True:
-            g = _p(params, f"{prefix}.NetworkInterface.{i}.Groups.SecurityGroupId.{j}")
+            g = _p(params, f"{pre}NetworkInterface.{i}.Groups.SecurityGroupId.{j}")
             if not g:
-                g = _p(params, f"{prefix}.NetworkInterface.{i}.SecurityGroupId.{j}")
+                g = _p(params, f"{pre}NetworkInterface.{i}.SecurityGroupId.{j}")
             if not g:
                 break
             groups.append(g)
@@ -6610,8 +7274,8 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     if nis:
         data["NetworkInterfaces"] = nis
     # IamInstanceProfile
-    iam_arn = _p(params, f"{prefix}.IamInstanceProfile.Arn")
-    iam_name = _p(params, f"{prefix}.IamInstanceProfile.Name")
+    iam_arn = _p(params, f"{pre}IamInstanceProfile.Arn")
+    iam_name = _p(params, f"{pre}IamInstanceProfile.Name")
     if iam_arn or iam_name:
         iip = {}
         if iam_arn:
@@ -6623,31 +7287,31 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     tag_specs = []
     i = 1
     while True:
-        rtype = _p(params, f"{prefix}.TagSpecification.{i}.ResourceType")
+        rtype = _p(params, f"{pre}TagSpecification.{i}.ResourceType")
         if not rtype:
             break
         ts = {"ResourceType": rtype, "Tags": []}
         j = 1
         while True:
-            tk = _p(params, f"{prefix}.TagSpecification.{i}.Tag.{j}.Key")
+            tk = _p(params, f"{pre}TagSpecification.{i}.Tag.{j}.Key")
             if not tk:
                 break
-            ts["Tags"].append({"Key": tk, "Value": _p(params, f"{prefix}.TagSpecification.{i}.Tag.{j}.Value", "")})
+            ts["Tags"].append({"Key": tk, "Value": _p(params, f"{pre}TagSpecification.{i}.Tag.{j}.Value", "")})
             j += 1
         tag_specs.append(ts)
         i += 1
     if tag_specs:
         data["TagSpecifications"] = tag_specs
     # Monitoring
-    monitoring = _p(params, f"{prefix}.Monitoring.Enabled")
+    monitoring = _p(params, f"{pre}Monitoring.Enabled")
     if monitoring:
         data["Monitoring"] = {"Enabled": monitoring.lower() == "true"}
     # DisableApiTermination
-    disable_api = _p(params, f"{prefix}.DisableApiTermination")
+    disable_api = _p(params, f"{pre}DisableApiTermination")
     if disable_api:
         data["DisableApiTermination"] = disable_api.lower() == "true"
     # EbsOptimized
-    ebs_opt = _p(params, f"{prefix}.EbsOptimized")
+    ebs_opt = _p(params, f"{pre}EbsOptimized")
     if ebs_opt:
         data["EbsOptimized"] = ebs_opt.lower() == "true"
     # MetadataOptions — the IMDS settings of
@@ -6655,18 +7319,25 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     # refresh report them as newly added.
     metadata = {}
     for member in ("HttpTokens", "HttpEndpoint", "HttpProtocolIpv6", "InstanceMetadataTags"):
-        value = _p(params, f"{prefix}.MetadataOptions.{member}")
+        value = _p(params, f"{pre}MetadataOptions.{member}")
         if value:
             metadata[member] = value
-    hop_limit = _p(params, f"{prefix}.MetadataOptions.HttpPutResponseHopLimit")
+    hop_limit = _p(params, f"{pre}MetadataOptions.HttpPutResponseHopLimit")
     if hop_limit:
         metadata["HttpPutResponseHopLimit"] = int(hop_limit)
     if metadata:
         data["MetadataOptions"] = metadata
     # InstanceInitiatedShutdownBehavior (stop | terminate)
-    shutdown = _p(params, f"{prefix}.InstanceInitiatedShutdownBehavior")
+    shutdown = _p(params, f"{pre}InstanceInitiatedShutdownBehavior")
     if shutdown:
         data["InstanceInitiatedShutdownBehavior"] = shutdown
+    disable_stop = _p(params, f"{pre}DisableApiStop")
+    if disable_stop:
+        data["DisableApiStop"] = disable_stop.lower() == "true"
+    for key, _tag, members in _LT_STRUCTS:
+        parsed = _parse_struct(params, f"{pre}{key}", members)
+        if parsed:
+            data[key] = parsed
     requirements = _parse_instance_requirements(params, prefix)
     if requirements:
         data["InstanceRequirements"] = requirements
@@ -6698,9 +7369,15 @@ def _lt_data_xml(data):
         inner = ""
         for bdm in data["BlockDeviceMappings"]:
             inner += f"<item><deviceName>{_esc(bdm['DeviceName'])}</deviceName>"
+            if bdm.get("VirtualName"):
+                inner += f"<virtualName>{_esc(bdm['VirtualName'])}</virtualName>"
+            if "NoDevice" in bdm:
+                inner += f"<noDevice>{_esc(bdm['NoDevice'])}</noDevice>"
             if "Ebs" in bdm:
                 ebs = bdm["Ebs"]
                 inner += "<ebs>"
+                if "KmsKeyId" in ebs:
+                    inner += f"<kmsKeyId>{_esc(ebs['KmsKeyId'])}</kmsKeyId>"
                 if "VolumeSize" in ebs:
                     inner += f"<volumeSize>{ebs['VolumeSize']}</volumeSize>"
                 if "VolumeType" in ebs:
@@ -6731,8 +7408,14 @@ def _lt_data_xml(data):
             if "Description" in ni:
                 inner += f"<description>{_esc(ni['Description'])}</description>"
             if "Groups" in ni:
-                gi = "".join(f"<item>{_esc(g)}</item>" for g in ni["Groups"])
+                gi = "".join(f"<groupId>{_esc(g)}</groupId>" for g in ni["Groups"])
                 inner += f"<groupSet>{gi}</groupSet>"
+            inner += _struct_xml(ni, _LT_NI_SCALARS)
+            if ni.get("PrivateIpAddresses"):
+                inner += "<privateIpAddressesSet>" + "".join(
+                    "<item>" + _struct_xml(e, (("Primary", "primary", bool),
+                                               ("PrivateIpAddress", "privateIpAddress", str))) + "</item>"
+                    for e in ni["PrivateIpAddresses"]) + "</privateIpAddressesSet>"
             inner += "</item>"
         xml += f"<networkInterfaceSet>{inner}</networkInterfaceSet>"
     if data.get("IamInstanceProfile"):
@@ -6772,6 +7455,11 @@ def _lt_data_xml(data):
                 "</instanceInitiatedShutdownBehavior>")
     if data.get("InstanceRequirements"):
         xml += f"<instanceRequirements>{_instance_requirements_xml(data['InstanceRequirements'])}</instanceRequirements>"
+    if data.get("DisableApiStop") is not None:
+        xml += f"<disableApiStop>{str(data['DisableApiStop']).lower()}</disableApiStop>"
+    for key, tag, members in _LT_STRUCTS:
+        if data.get(key):
+            xml += f"<{tag}>{_struct_xml(data[key], members)}</{tag}>"
     return xml
 
 
@@ -6916,7 +7604,7 @@ def _describe_launch_templates(p):
     lt_ids = _parse_member_list(p, "LaunchTemplateId")
     lt_names = _parse_member_list(p, "LaunchTemplateName")
     filters = _parse_filters(p)
-    items = ""
+    items = []
     for lt in _launch_templates.values():
         if lt_ids and lt["LaunchTemplateId"] not in lt_ids:
             continue
@@ -6931,7 +7619,7 @@ def _describe_launch_templates(p):
         tags_xml = ""
         for t in lt.get("Tags", _tags.get(lt["LaunchTemplateId"], [])):
             tags_xml += f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
-        items += f"""<item>
+        items.append(f"""<item>
             <launchTemplateId>{lt['LaunchTemplateId']}</launchTemplateId>
             <launchTemplateName>{_esc(lt['LaunchTemplateName'])}</launchTemplateName>
             <createTime>{lt['CreateTime']}</createTime>
@@ -6939,9 +7627,10 @@ def _describe_launch_templates(p):
             <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
             <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
             <tagSet>{tags_xml}</tagSet>
-        </item>"""
+        </item>""")
+    items, next_xml = _page(p, items, (1, 200))
     return _xml(200, "DescribeLaunchTemplatesResponse",
-                f"<launchTemplates>{items}</launchTemplates>")
+                f"<launchTemplates>{''.join(items)}</launchTemplates>{next_xml}")
 
 
 def _describe_launch_template_versions(p):
@@ -6977,9 +7666,10 @@ def _describe_launch_template_versions(p):
                     if str(v["VersionNumber"]) == rv:
                         filtered.append(v)
         versions = filtered
+    versions, next_xml = _page(p, versions, (1, 200))
     items = "".join(_lt_version_xml(v) for v in versions)
     return _xml(200, "DescribeLaunchTemplateVersionsResponse",
-                f"<launchTemplateVersionSet>{items}</launchTemplateVersionSet>")
+                f"<launchTemplateVersionSet>{items}</launchTemplateVersionSet>{next_xml}")
 
 
 def _modify_launch_template(p):
@@ -7116,6 +7806,67 @@ def _resolve_launch_template_data(spec):
     return (version or {}).get("LaunchTemplateData", {}) or {}, lt, None
 
 
+_FLEET_OVERRIDE_MEMBERS = (
+    ("InstanceType", "instanceType", str),
+    ("MaxPrice", "maxPrice", str),
+    ("SubnetId", "subnetId", str),
+    ("AvailabilityZone", "availabilityZone", str),
+    ("WeightedCapacity", "weightedCapacity", str),
+    ("Priority", "priority", str),
+    ("Placement", "placement", (("GroupName", "groupName", str),)),
+    ("ImageId", "imageId", str),
+    ("AvailabilityZoneId", "availabilityZoneId", str),
+)
+_FLEET_SPOT_OPTION_MEMBERS = (
+    ("AllocationStrategy", "allocationStrategy", str),
+    ("MaintenanceStrategies", "maintenanceStrategies", (("CapacityRebalance", "capacityRebalance", (
+        ("ReplacementStrategy", "replacementStrategy", str),
+        ("TerminationDelay", "terminationDelay", int),
+    )),)),
+    ("InstanceInterruptionBehavior", "instanceInterruptionBehavior", str),
+    ("InstancePoolsToUseCount", "instancePoolsToUseCount", int),
+    ("SingleInstanceType", "singleInstanceType", bool),
+    ("SingleAvailabilityZone", "singleAvailabilityZone", bool),
+    ("MinTargetCapacity", "minTargetCapacity", int),
+    ("MaxTotalPrice", "maxTotalPrice", str),
+)
+_FLEET_ON_DEMAND_OPTION_MEMBERS = (
+    ("AllocationStrategy", "allocationStrategy", str),
+    ("CapacityReservationOptions", "capacityReservationOptions", (("UsageStrategy", "usageStrategy", str),)),
+    ("SingleInstanceType", "singleInstanceType", bool),
+    ("SingleAvailabilityZone", "singleAvailabilityZone", bool),
+    ("MinTargetCapacity", "minTargetCapacity", int),
+    ("MaxTotalPrice", "maxTotalPrice", str),
+)
+_FLEET_SCALAR_MEMBERS = (
+    ("ClientToken", "clientToken", str),
+    ("ExcessCapacityTerminationPolicy", "excessCapacityTerminationPolicy", str),
+    ("TerminateInstancesWithExpiration", "terminateInstancesWithExpiration", bool),
+    ("ValidFrom", "validFrom", str),
+    ("ValidUntil", "validUntil", str),
+    ("ReplaceUnhealthyInstances", "replaceUnhealthyInstances", bool),
+    ("Context", "context", str),
+)
+
+
+def _fleet_launch_template_configs_xml(configs):
+    items = ""
+    for cfg in configs:
+        spec = {k: v for k, v in (cfg.get("LaunchTemplateSpecification") or {}).items() if v}
+        spec_xml = _struct_xml(spec, (("LaunchTemplateId", "launchTemplateId", str),
+                                      ("LaunchTemplateName", "launchTemplateName", str),
+                                      ("Version", "version", str)))
+        overrides = "".join(
+            f"<item>{_struct_xml(ov, _FLEET_OVERRIDE_MEMBERS)}"
+            + (f"<instanceRequirements>{_instance_requirements_xml(ov['InstanceRequirements'])}</instanceRequirements>"
+               if ov.get("InstanceRequirements") else "")
+            + "</item>"
+            for ov in cfg.get("Overrides") or [])
+        items += (f"<item><launchTemplateSpecification>{spec_xml}</launchTemplateSpecification>"
+                  + (f"<overrides>{overrides}</overrides>" if overrides else "") + "</item>")
+    return items
+
+
 def _create_fleet(p):
     fleet_type = _p(p, "Type") or "maintain"
     total_capacity = int(
@@ -7130,7 +7881,16 @@ def _create_fleet(p):
         _p(p, "TargetCapacitySpecification.DefaultTargetCapacityType") or "on-demand"
     ).lower()
     is_spot = default_capacity_type == "spot"
-    lifecycle = "spot" if is_spot else "on-demand"
+    # TotalTargetCapacity is "filled using the default target capacity type":
+    # an explicit OnDemand/Spot split is kept, the remainder goes to the default type.
+    sent_on_demand = _p(p, "TargetCapacitySpecification.OnDemandTargetCapacity")
+    sent_spot = _p(p, "TargetCapacitySpecification.SpotTargetCapacity")
+    spot_capacity = int(sent_spot) if sent_spot else 0
+    on_demand_capacity = int(sent_on_demand) if sent_on_demand else 0
+    if is_spot and not sent_spot:
+        spot_capacity = max(total_capacity - on_demand_capacity, 0)
+    elif not is_spot and not sent_on_demand:
+        on_demand_capacity = max(total_capacity - spot_capacity, 0)
 
     # Parse LaunchTemplateConfigs
     configs = []
@@ -7140,18 +7900,15 @@ def _create_fleet(p):
         lt_name = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.LaunchTemplateName")
         version = _p(p, f"LaunchTemplateConfigs.{i}.LaunchTemplateSpecification.Version")
 
-        # Overrides
         overrides = []
         j = 1
-        while True:
-            itype = _p(p, f"LaunchTemplateConfigs.{i}.Overrides.{j}.InstanceType")
-            sub_id = _p(p, f"LaunchTemplateConfigs.{i}.Overrides.{j}.SubnetId")
-            if not itype and not sub_id:
-                break
-            overrides.append({
-                "InstanceType": itype,
-                "SubnetId": sub_id
-            })
+        while any(k.startswith(f"LaunchTemplateConfigs.{i}.Overrides.{j}.") for k in p):
+            ov_prefix = f"LaunchTemplateConfigs.{i}.Overrides.{j}"
+            ov = _parse_struct(p, ov_prefix, _FLEET_OVERRIDE_MEMBERS)
+            requirements = _parse_instance_requirements(p, ov_prefix)
+            if requirements:
+                ov["InstanceRequirements"] = requirements
+            overrides.append(ov)
             j += 1
 
         if not lt_id and not lt_name and not overrides:
@@ -7188,6 +7945,8 @@ def _create_fleet(p):
                     slot["instance_type"] = ov["InstanceType"]
                 if ov.get("SubnetId"):
                     slot["subnet_id"] = ov["SubnetId"]
+                if ov.get("ImageId"):
+                    slot["image_id"] = ov["ImageId"]
                 slots.append(slot)
         else:
             slots.append(base)
@@ -7222,10 +7981,13 @@ def _create_fleet(p):
     # AWS launches synchronously and returns Instances only when Type=instant.
     # For maintain/request, fleets fulfil asynchronously — return FleetId alone.
     instance_items = []
+    spot_launches = 0
     if fleet_type == "instant":
         # Round-robin distribute total_capacity across slots.
-        slot_buckets = [[] for _ in slots]
-        for k in range(total_capacity):
+        slot_buckets = {}
+        spot_launches = min(spot_capacity, total_capacity)
+        launch_lifecycles = ["on-demand"] * (total_capacity - spot_launches) + ["spot"] * spot_launches
+        for k, lifecycle in enumerate(launch_lifecycles):
             slot_idx = k % len(slots)
             slot = slots[slot_idx]
             launched = _launch_instances_internal(
@@ -7238,10 +8000,9 @@ def _create_fleet(p):
                 sg_ids=slot["sg_ids"],
                 iam_profile=slot["iam_profile"],
             )
-            slot_buckets[slot_idx].extend(launched)
-        for slot, launched in zip(slots, slot_buckets):
-            if not launched:
-                continue
+            slot_buckets.setdefault((slot_idx, lifecycle), []).extend(launched)
+        for (slot_idx, lifecycle), launched in slot_buckets.items():
+            slot = slots[slot_idx]
             # The slot's launch template contributes its own instance tags; the
             # request's TagSpecifications (instant fleets only, per the model)
             # are layered on top. On a duplicate key the request wins — that
@@ -7272,17 +8033,27 @@ def _create_fleet(p):
         "CreateTime": now_iso,
         "Type": fleet_type,
         "FulfilledCapacity": fulfilled_total,
-        "FulfilledOnDemandCapacity": fulfilled_total if not is_spot else 0.0,
+        "FulfilledOnDemandCapacity": float(total_capacity - spot_launches) if fleet_type == "instant" else 0.0,
         "TargetCapacitySpecification": {
             "TotalTargetCapacity": total_capacity,
-            "OnDemandTargetCapacity": total_capacity if not is_spot else 0,
-            "SpotTargetCapacity": total_capacity if is_spot else 0,
+            "OnDemandTargetCapacity": on_demand_capacity,
+            "SpotTargetCapacity": spot_capacity,
             "DefaultTargetCapacityType": default_capacity_type,
         },
         "LaunchTemplateConfigs": configs,
         "Instances": instance_items,
         "Tags": fleet_tags,
+        "SpotOptions": {"AllocationStrategy": "lowest-price", "InstanceInterruptionBehavior": "terminate",
+                        **_parse_struct(p, "SpotOptions", _FLEET_SPOT_OPTION_MEMBERS)},
+        "OnDemandOptions": {"AllocationStrategy": "lowest-price",
+                            **_parse_struct(p, "OnDemandOptions", _FLEET_ON_DEMAND_OPTION_MEMBERS)},
     }
+    for name, _tag, kind in _FLEET_SCALAR_MEMBERS:
+        if _p(p, name):
+            fleet_record[name] = _p(p, name).lower() == "true" if kind is bool else _p(p, name)
+    unit_type = _p(p, "TargetCapacitySpecification.TargetCapacityUnitType")
+    if unit_type:
+        fleet_record["TargetCapacitySpecification"]["TargetCapacityUnitType"] = unit_type
     _fleets[fleet_id] = fleet_record
 
     inner_parts = [f"<fleetId>{_esc(fleet_id)}</fleetId>"]
@@ -7343,6 +8114,7 @@ def _describe_fleets(p):
     else:
         results = list(_fleets.values())
 
+    results, next_xml = _page(p, results)
     items = []
     for f in results:
         instances_xml_str = _fleet_instances_xml(f["Instances"])
@@ -7360,15 +8132,20 @@ def _describe_fleets(p):
                 <onDemandTargetCapacity>{int(tcs['OnDemandTargetCapacity'])}</onDemandTargetCapacity>
                 <spotTargetCapacity>{int(tcs['SpotTargetCapacity'])}</spotTargetCapacity>
                 <defaultTargetCapacityType>{_esc(tcs['DefaultTargetCapacityType'])}</defaultTargetCapacityType>
+                {f"<targetCapacityUnitType>{_esc(tcs['TargetCapacityUnitType'])}</targetCapacityUnitType>" if tcs.get('TargetCapacityUnitType') else ""}
             </targetCapacitySpecification>
             <type>{_esc(f['Type'])}</type>
+            {_struct_xml(f, _FLEET_SCALAR_MEMBERS)}
+            <launchTemplateConfigs>{_fleet_launch_template_configs_xml(f.get('LaunchTemplateConfigs') or [])}</launchTemplateConfigs>
+            {f"<spotOptions>{_struct_xml(f['SpotOptions'], _FLEET_SPOT_OPTION_MEMBERS)}</spotOptions>" if f.get('SpotOptions') else ""}
+            {f"<onDemandOptions>{_struct_xml(f['OnDemandOptions'], _FLEET_ON_DEMAND_OPTION_MEMBERS)}</onDemandOptions>" if f.get('OnDemandOptions') else ""}
             <fleetInstanceSet>{instances_xml_str}</fleetInstanceSet>
             <errorSet/>
             {tag_set_xml}
         </item>""")
 
     fleet_set_xml = "".join(items)
-    return _xml(200, "DescribeFleetsResponse", f"<fleetSet>{fleet_set_xml}</fleetSet>")
+    return _xml(200, "DescribeFleetsResponse", f"<fleetSet>{fleet_set_xml}</fleetSet>{next_xml}")
 
 
 # ---------------------------------------------------------------------------

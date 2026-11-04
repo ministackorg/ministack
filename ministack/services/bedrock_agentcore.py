@@ -1355,7 +1355,8 @@ def _create_agent_runtime(body):
     for opt in ("description", "protocolConfiguration", "environmentVariables",
                 "authorizerConfiguration", "requestHeaderConfiguration",
                 "lifecycleConfiguration", "metadataConfiguration",
-                "filesystemConfigurations"):
+                "filesystemConfigurations", "capacityProviderConfiguration",
+                "platformVersion"):
         if opt in data:
             record[opt] = data[opt]
     record["_versions"] = {version: _version_snapshot(record)}
@@ -1457,7 +1458,8 @@ def _update_agent_runtime(runtime_id, body):
     for opt in ("description", "protocolConfiguration", "environmentVariables",
                 "authorizerConfiguration", "requestHeaderConfiguration",
                 "lifecycleConfiguration", "metadataConfiguration",
-                "filesystemConfigurations"):
+                "filesystemConfigurations", "capacityProviderConfiguration",
+                "platformVersion"):
         if opt in data:
             record[opt] = data[opt]
 

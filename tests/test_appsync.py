@@ -1490,18 +1490,18 @@ def test_appsync_update_preserves_creation_time(monkeypatch):
 
     resp = _appsync._create_graphql_api({"name": "ctime", "authenticationType": "API_KEY"})
     api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
-    created = _json_mod.loads(
-        _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE", "description": "one"})[2]
-    )["dataSource"]
+    _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE", "description": "one"})
+    created = dict(_appsync._data_sources[api_id]["DS"])
 
     clock["t"] += 3600
     updated = _json_mod.loads(
         _appsync._update_data_source(api_id, "DS", {"type": "NONE", "description": "two"})[2]
     )["dataSource"]
+    stored = _appsync._data_sources[api_id]["DS"]
 
     assert updated["description"] == "two"
-    assert updated["createdAt"] == created["createdAt"], "createdAt was restamped by the update"
-    assert updated["lastUpdatedAt"] == clock["t"], "lastUpdatedAt should advance"
+    assert stored["createdAt"] == created["createdAt"], "createdAt was restamped by the update"
+    assert stored["lastUpdatedAt"] == clock["t"], "lastUpdatedAt should advance"
 
 
 def test_appsync_graphql_api_echoes_its_tags(appsync):

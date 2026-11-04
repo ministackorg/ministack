@@ -18300,3 +18300,17 @@ def test_rds_aurora_postgresql_lists_the_current_minors(rds, version):
     listed = rds.describe_db_engine_versions(Engine="aurora-postgresql", EngineVersion=version)["DBEngineVersions"]
     assert [(v["EngineVersion"], v["DBParameterGroupFamily"]) for v in listed] == [
         (version, f"aurora-postgresql{version.split('.')[0]}")]
+
+
+def test_host_port_probe_sees_ports_the_daemon_publishes(monkeypatch):
+    """Inside MiniStack's container a bind probe can't see another container's published port; the daemon can."""
+    import types
+
+    from ministack.services import rds as m
+
+    fake = types.SimpleNamespace(api=types.SimpleNamespace(containers=lambda: [
+        {"Ports": [{"PrivatePort": 6379, "PublicPort": 16381, "Type": "tcp"}]}, {"Ports": []}]))
+    monkeypatch.setattr(m, "_get_docker", lambda: fake)
+    monkeypatch.setattr(m, "_published_cache", [0.0, frozenset()])
+    assert not m._is_host_port_free(16381)
+    assert m._is_host_port_free(16382)

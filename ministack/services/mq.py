@@ -483,6 +483,12 @@ def _ensure_activemq_broker(broker: dict):
         return _err(400, "BrokerId", ERROR_MESSAGES["ACTIVEMQ_ONLY_OP"])
     return None
 
+def _ldap_output(metadata: dict) -> dict:
+    out = copy.deepcopy(metadata)
+    out.pop("serviceAccountPassword", None)
+    return out
+
+
 def _validate_password(password: str):
     """Validate password meets AWS MQ requirements."""
     if len(password) < 4 or INVALID_PASSWORD_CHARS_PATTERN.search(password):
@@ -510,6 +516,22 @@ def _create_broker(body: dict) -> tuple:
     deployment_mode = str(body.get("deploymentMode", "SINGLE_INSTANCE")).upper()
     host_instance_type = body.get("hostInstanceType", "mq.m5.large")
 
+    users_map = {}
+    for user in body.get("users") or []:
+        username = str(user.get("username", ""))
+        password = str(user.get("password", ""))
+        pw_err = _validate_password(password)
+        if pw_err:
+            return pw_err
+        users_map[username] = {
+            "username": username,
+            "password": password,
+            "consoleAccess": bool(user.get("consoleAccess", False)),
+            "groups": list(user.get("groups") or []),
+            "replicationUser": bool(user.get("replicationUser", False)),
+            "_createdAt": time.time_ns(),
+        }
+
     # Create broker in state
     broker_id = new_uuid()
     broker_arn = _make_broker_arn(broker_id)
@@ -529,10 +551,20 @@ def _create_broker(body: dict) -> tuple:
         "created": created,
         "_createdAt": time.time_ns(),
         "brokerInstances": [{"consoleURL": "https://localhost:15671", "endpoints": ["amqps://localhost:5671"], "ipAddress": "127.0.0.1"}],
+        "authenticationStrategy": body.get("authenticationStrategy") or "SIMPLE",
+        "encryptionOptions": copy.deepcopy(body.get("encryptionOptions") or {"useAwsOwnedKey": True}),
     }
+    broker = _brokers[broker_id]
+    if body.get("configuration"):
+        broker["configurations"] = {"current": copy.deepcopy(body["configuration"]), "history": []}
+    if body.get("ldapServerMetadata"):
+        broker["ldapServerMetadata"] = _ldap_output(body["ldapServerMetadata"])
+    for key in ("logs", "maintenanceWindowStartTime", "securityGroups", "subnetIds", "storageType", "storageSize", "dataReplicationMode"):
+        if body.get(key) is not None:
+            broker[key] = copy.deepcopy(body[key])
     _name_index[broker_name] = broker_id
     _tags[broker_arn] = dict(body.get("tags") or {})
-    _users[broker_id] = {}
+    _users[broker_id] = users_map
 
     return _ok({"brokerId": broker_id, "brokerArn": broker_arn})
 
@@ -555,7 +587,6 @@ def _list_brokers(query_params: dict) -> tuple:
                 "brokerState": b["brokerState"],
                 "deploymentMode": b["deploymentMode"],
                 "engineType": b["engineType"],
-                "engineVersion": b["engineVersion"],
                 "hostInstanceType": b["hostInstanceType"],
                 "created": b["created"],
                 "_createdAt": b.get("_createdAt", 0),
@@ -583,6 +614,7 @@ def _describe_broker(broker_id: str) -> tuple:
     out = copy.deepcopy(broker)
     out.pop("_createdAt", None)
     out["tags"] = dict(_tags.get(broker["brokerArn"], {}))
+    out["users"] = [{"username": u} for u in _users.get(broker_id, {})]
     return _ok(out)
 
 
@@ -613,10 +645,8 @@ def _update_broker(broker_id: str, body: dict) -> tuple:
     field_map = {
         "authenticationStrategy": "authenticationStrategy",
         "autoMinorVersionUpgrade": "autoMinorVersionUpgrade",
-        "configuration": "configuration",
         "engineVersion": "engineVersion",
         "hostInstanceType": "hostInstanceType",
-        "ldapServerMetadata": "ldapServerMetadata",
         "logs": "logs",
         "maintenanceWindowStartTime": "maintenanceWindowStartTime",
         "securityGroups": "securityGroups",
@@ -628,6 +658,12 @@ def _update_broker(broker_id: str, body: dict) -> tuple:
         if src in body:
             broker[dst] = copy.deepcopy(body[src])
             out[dst] = copy.deepcopy(body[src])
+    if body.get("configuration"):
+        broker.setdefault("configurations", {"history": []})["pending"] = copy.deepcopy(body["configuration"])
+        out["configuration"] = copy.deepcopy(body["configuration"])
+    if body.get("ldapServerMetadata"):
+        broker["ldapServerMetadata"] = _ldap_output(body["ldapServerMetadata"])
+        out["ldapServerMetadata"] = _ldap_output(body["ldapServerMetadata"])
 
     return _ok(out)
 
@@ -848,9 +884,6 @@ def _list_users(broker_id: str, query_params: dict) -> tuple:
         [
             {
                 "username": u["username"],
-                "consoleAccess": bool(u.get("consoleAccess", False)),
-                "groups": list(u.get("groups", [])),
-                "replicationUser": bool(u.get("replicationUser", False)),
                 "_createdAt": u.get("_createdAt", 0),
             }
             for u in users_map.values()

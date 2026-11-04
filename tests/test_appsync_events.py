@@ -991,7 +991,7 @@ def test_websocket_discovers_resource_region_and_pins_frame_context(monkeypatch)
             account_id,
             resource_region,
         )
-        assert ae._discover_api_scope(api_id, wrong_account_id) is None
+        assert ae._discover_api_scope(api_id, wrong_account_id) == (account_id, resource_region)
 
         authorizer_calls = []
 

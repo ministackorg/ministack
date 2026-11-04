@@ -262,8 +262,7 @@ def _run_backend_container(identifier):
     if ms_network:
         container_kwargs["network"] = ms_network
     else:
-        # Only a host-run MiniStack dials a published port. The backend is a
-        # passwordless superuser, so it must never listen beyond loopback.
+        # A passwordless superuser: published on loopback only, for a host-run MiniStack.
         container_kwargs["ports"] = {"5432/tcp": ("127.0.0.1", None)}
     if DSQL_PERSIST:
         container_kwargs["volumes"] = {

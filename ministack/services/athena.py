@@ -35,9 +35,12 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
     set_request_region,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("athena")
@@ -46,6 +49,19 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "mock"
 ATHENA_DATA_DIR = S3_DATA_DIR
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def get_athena_engine():
@@ -844,11 +860,22 @@ def _start_query_execution(data):
             extra={"AthenaErrorCode": "MALFORMED_QUERY"},
         )
 
+    wg_rc = wg_config.get("ResultConfiguration", {})
+    client_rc = data.get("ResultConfiguration", {})
+    result_config = {"OutputLocation": f"{output_location}{query_id}.csv"}
+    for key in ("EncryptionConfiguration", "ExpectedBucketOwner", "AclConfiguration"):
+        if wg_config.get("EnforceWorkGroupConfiguration"):
+            value = wg_rc.get(key, client_rc.get(key))
+        else:
+            value = client_rc.get(key, wg_rc.get(key))
+        if value is not None:
+            result_config[key] = value
+
     execution = {
         "QueryExecutionId": query_id,
         "Query": query,
         "StatementType": _detect_statement_type(query),
-        "ResultConfiguration": {"OutputLocation": f"{output_location}{query_id}.csv"},
+        "ResultConfiguration": result_config,
         "QueryExecutionContext": {"Database": db, "Catalog": catalog},
         "Status": {
             "State": "QUEUED",
@@ -874,6 +901,10 @@ def _start_query_execution(data):
         "_column_types": None,
         "_error": None,
     }
+    if data.get("ResultReuseConfiguration"):
+        execution["ResultReuseConfiguration"] = data["ResultReuseConfiguration"]
+    if data.get("ExecutionParameters"):
+        execution["ExecutionParameters"] = data["ExecutionParameters"]
     _executions[query_id] = execution
 
     asyncio.create_task(_execute_query(query_id, query, db, ddl, catalog))
@@ -1535,9 +1566,7 @@ def _get_workgroup(data):
         return error_response_json(
             "InvalidRequestException", f"WorkGroup {name} not found", 400
         )
-    out = dict(wg)
-    out.setdefault("WorkGroupConfiguration", out.get("Configuration", {}))
-    return json_response({"WorkGroup": out})
+    return json_response({"WorkGroup": to_output_shape("athena", "WorkGroup", wg)})
 
 
 def _list_workgroups(data):

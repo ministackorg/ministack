@@ -93,10 +93,12 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     get_request_client_ip,
-    json_response,
     new_uuid,
     set_request_account_id,
     set_request_region,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("cognito")
@@ -245,6 +247,22 @@ _POOL_KEYS_DIR = os.path.join(_STATE_DIR, "cognito-pool-keys")
 _POOL_KEY_USES = ("access", "id")
 _pool_keys: dict = {}  # (pool id, use) -> (private key, JWK), a cache of the key files
 _pool_keys_lock = threading.Lock()
+
+
+_DOCUMENT_MEMBERS = frozenset(('Settings', 'CredentialCreationOptions'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def _pool_signing_key(pool_id: str, use: str):
@@ -3139,6 +3157,8 @@ def _update_user_pool(data):
     for k in updatable:
         if k in data:
             pool[k] = data[k]
+    if data.get("PoolName"):
+        pool["Name"] = data["PoolName"]
     if "EmailConfiguration" in data:
         pool["EmailConfiguration"] = _email_configuration_out(data["EmailConfiguration"])
     pool["LastModifiedDate"] = _now_epoch()
@@ -3265,6 +3285,7 @@ def _create_user_pool_client(data):
         "EnableTokenRevocation": data.get("EnableTokenRevocation", True),
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),
+        "RefreshTokenRotation": data.get("RefreshTokenRotation"),
     }
     pool["_clients"][cid] = client
     out = {k: v for k, v in client.items() if v is not None}
@@ -3331,7 +3352,7 @@ def _update_user_pool_client(data):
         "SupportedIdentityProviders", "CallbackURLs", "LogoutURLs", "DefaultRedirectURI",
         "AllowedOAuthFlows", "AllowedOAuthScopes", "AllowedOAuthFlowsUserPoolClient",
         "AnalyticsConfiguration", "PreventUserExistenceErrors", "EnableTokenRevocation",
-        "EnablePropagateAdditionalUserContextData", "AuthSessionValidity",
+        "EnablePropagateAdditionalUserContextData", "AuthSessionValidity", "RefreshTokenRotation",
     }
     for k in updatable:
         if k in data:

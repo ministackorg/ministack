@@ -740,8 +740,11 @@ def _list_subscriptions_by_topic(params):
     if err is not None:
         return err
     topic_arn = topic["arn"]
+    next_token = _p(params, "NextToken")
+    start = int(next_token) if next_token.isdigit() else 0
+    subs = topic["subscriptions"]
     members = ""
-    for sub in topic["subscriptions"]:
+    for sub in subs[start:start + 100]:
         members += (
             "<member>"
             f"<SubscriptionArn>{sub['arn']}</SubscriptionArn>"
@@ -751,8 +754,9 @@ def _list_subscriptions_by_topic(params):
             f"<Endpoint>{_xml_escape(sub['endpoint'])}</Endpoint>"
             "</member>"
         )
+    next_token_xml = f"<NextToken>{start + 100}</NextToken>" if start + 100 < len(subs) else ""
     return _xml(200, "ListSubscriptionsByTopicResponse",
-                f"<ListSubscriptionsByTopicResult><Subscriptions>{members}</Subscriptions></ListSubscriptionsByTopicResult>")
+                f"<ListSubscriptionsByTopicResult><Subscriptions>{members}</Subscriptions>{next_token_xml}</ListSubscriptionsByTopicResult>")
 
 
 def _get_subscription_attributes(params):

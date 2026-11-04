@@ -704,13 +704,24 @@ def _create_key(data):
     return json_response({"KeyMetadata": _key_metadata(rec)})
 
 
+def _marker_page(data, items, key_fn, default_limit, result_key):
+    start = 0
+    marker = data.get("Marker")
+    if marker:
+        ids = [key_fn(i) for i in items]
+        if marker not in ids:
+            return error_response_json("InvalidMarkerException", "Invalid marker.", 400)
+        start = ids.index(marker)
+    limit = data.get("Limit") or default_limit
+    resp = {result_key: items[start:start + limit], "Truncated": start + limit < len(items)}
+    if resp["Truncated"]:
+        resp["NextMarker"] = key_fn(items[start + limit])
+    return json_response(resp)
+
+
 def _list_keys(data):
-    limit = data.get("Limit", 1000)
     keys = [{"KeyId": r["KeyId"], "KeyArn": r["Arn"]} for r in _keys.values()]
-    return json_response({
-        "Keys": keys[:limit],
-        "Truncated": len(keys) > limit,
-    })
+    return _marker_page(data, keys, lambda k: k["KeyId"], 100, "Keys")
 
 
 def _describe_key(data):
@@ -1623,7 +1634,7 @@ def _list_aliases(data):
             "CreationDate": dates["CreationDate"],
             "LastUpdatedDate": dates["LastUpdatedDate"],
         })
-    return json_response({"Aliases": items, "Truncated": False})
+    return _marker_page(data, items, lambda a: a["AliasArn"], 50, "Aliases")
 
 
 def _update_alias(data):
@@ -1733,8 +1744,15 @@ def _create_grant(data):
             400,
         )
     grantee = data.get("GranteePrincipal")
-    if not grantee:
-        return error_response_json("ValidationException", "GranteePrincipal is required.", 400)
+    service_grantee = data.get("GranteeServicePrincipal")
+    if bool(grantee) == bool(service_grantee):
+        return error_response_json(
+            "ValidationException",
+            "You must specify either GranteePrincipal or GranteeServicePrincipal, but not both.", 400)
+    if data.get("RetiringPrincipal") and data.get("RetiringServicePrincipal"):
+        return error_response_json(
+            "ValidationException",
+            "You can specify either RetiringPrincipal or RetiringServicePrincipal, but not both.", 400)
     operations = data.get("Operations")
     message = _grant_operation_error(rec, operations)
     if message:
@@ -1745,8 +1763,10 @@ def _create_grant(data):
     grant = {
         "KeyId": rec["Arn"],
         "Name": data.get("Name") or "",
-        "GranteePrincipal": grantee,
+        "GranteePrincipal": grantee or None,
+        "GranteeServicePrincipal": service_grantee or None,
         "RetiringPrincipal": data.get("RetiringPrincipal"),
+        "RetiringServicePrincipal": data.get("RetiringServicePrincipal"),
         "IssuingAccount": f"arn:aws:iam::{get_account_id()}:root",
         "Operations": list(operations),
         "Constraints": data.get("Constraints") or None,
@@ -1764,7 +1784,7 @@ def _create_grant(data):
     grant_id = hashlib.sha256(new_uuid().encode()).hexdigest()
     grant.update({"GrantId": grant_id, "CreationDate": int(time.time()), "_tokens": [token]})
     _grants[grant_id] = grant
-    logger.info("Created grant %s on %s for %s", grant_id, rec["KeyId"], grantee)
+    logger.info("Created grant %s on %s for %s", grant_id, rec["KeyId"], grantee or service_grantee)
     return json_response({"GrantId": grant_id, "GrantToken": token})
 
 
@@ -1788,7 +1808,9 @@ def _list_grants(data):
     if data.get("GrantId"):
         grants = [g for g in grants if g["GrantId"] == data["GrantId"]]
     if data.get("GranteePrincipal"):
-        grants = [g for g in grants if g["GranteePrincipal"] == data["GranteePrincipal"]]
+        grants = [g for g in grants if g.get("GranteePrincipal") == data["GranteePrincipal"]]
+    if data.get("GranteeServicePrincipal"):
+        grants = [g for g in grants if g.get("GranteeServicePrincipal") == data["GranteeServicePrincipal"]]
 
     start = 0
     marker = data.get("Marker")
@@ -1934,7 +1956,7 @@ def _list_key_policies(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return _key_not_found(data.get('KeyId', ''))
-    return json_response({"PolicyNames": ["default"], "Truncated": False})
+    return _marker_page(data, ["default"], lambda n: n, 100, "PolicyNames")
 
 
 # ---- Enable / Disable / Schedule Deletion ----
@@ -2358,7 +2380,7 @@ def _list_resource_tags(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return _key_not_found(data.get('KeyId', ''))
-    return json_response({"Tags": rec.get("Tags", []), "Truncated": False})
+    return _marker_page(data, list(rec.get("Tags", [])), lambda t: t["TagKey"], 50, "Tags")
 
 
 def _generate_random(data):

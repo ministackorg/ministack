@@ -147,11 +147,32 @@ def _ensure_org():
 
 
 def _public_account(a: dict) -> dict:
-    return {k: v for k, v in a.items() if not k.startswith("_")}
+    return {k: v for k, v in a.items() if not k.startswith("_") and k != "Path"}
 
 
 def _public_ou(o: dict) -> dict:
     return {k: v for k, v in o.items() if not k.startswith("_")}
+
+
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
+def _paged(key, items, payload):
+    page, nxt = _page(items, payload.get("MaxResults"), payload.get("NextToken"))
+    out = {key: page}
+    if nxt:
+        out["NextToken"] = nxt
+    return _json(200, out)
 
 
 def _describe_organization(_payload):
@@ -159,16 +180,14 @@ def _describe_organization(_payload):
     return _json(200, {"Organization": dict(_orgs["self"])})
 
 
-def _list_roots(_payload):
+def _list_roots(payload):
     _ensure_org()
-    return _json(200, {"Roots": list(_roots.values())})
+    return _paged("Roots", list(_roots.values()), payload)
 
 
-def _list_accounts(_payload):
+def _list_accounts(payload):
     _ensure_org()
-    return _json(200, {
-        "Accounts": [_public_account(a) for a in _accounts.values()],
-    })
+    return _paged("Accounts", [_public_account(a) for a in _accounts.values()], payload)
 
 
 def _describe_account(payload):
@@ -187,7 +206,7 @@ def _list_organizational_units_for_parent(payload):
     _ensure_org()
     parent_id = payload.get("ParentId") or ""
     out = [_public_ou(o) for o in _ous.values() if o.get("_ParentId") == parent_id]
-    return _json(200, {"OrganizationalUnits": out})
+    return _paged("OrganizationalUnits", out, payload)
 
 
 def _list_accounts_for_parent(payload):
@@ -195,7 +214,7 @@ def _list_accounts_for_parent(payload):
     parent_id = payload.get("ParentId") or ""
     out = [_public_account(a) for a in _accounts.values()
            if a.get("_ParentId") == parent_id]
-    return _json(200, {"Accounts": out})
+    return _paged("Accounts", out, payload)
 
 
 def _list_parents(payload):
@@ -215,7 +234,7 @@ def _list_parents(payload):
         )
     parent_id = rec.get("_ParentId")
     parent_type = "ROOT" if str(parent_id).startswith("r-") else "ORGANIZATIONAL_UNIT"
-    return _json(200, {"Parents": [{"Id": parent_id, "Type": parent_type}]})
+    return _paged("Parents", [{"Id": parent_id, "Type": parent_type}], payload)
 
 
 def _create_organizational_unit(payload):
@@ -577,7 +596,7 @@ def _list_policies(payload):
     if not policy_filter:
         return error_response_json("InvalidInputException", "Filter is required", 400)
     out = [_policy_summary(p) for p in _policies.values() if p["Type"] == policy_filter]
-    return _json(200, {"Policies": out})
+    return _paged("Policies", out, payload)
 
 
 def _attach_policy(payload):
@@ -634,7 +653,7 @@ def _list_policies_for_target(payload):
                                    400)
     out = [_policy_summary(p) for pid, p in _policies.items()
            if p["Type"] == policy_filter and target_id in (_attachments.get(pid) or [])]
-    return _json(200, {"Policies": out})
+    return _paged("Policies", out, payload)
 
 
 def _list_targets_for_policy(payload):
@@ -653,7 +672,7 @@ def _list_targets_for_policy(payload):
             "Name": record.get("Name", ""),
             "Type": target_type,
         })
-    return _json(200, {"Targets": targets})
+    return _paged("Targets", targets, payload)
 
 
 def _set_policy_type(payload, enable):

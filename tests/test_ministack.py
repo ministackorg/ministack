@@ -1756,3 +1756,43 @@ def test_auth_contracts_are_excluded_from_existing_shards(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     counts = json.loads((tmp_path / ".pytest_collect_plan.json").read_text())
     assert counts == {"test_lanes.py": {"parallel": 1, "serial": 1, "data_plane": 1}}
+
+
+@pytest.mark.parametrize("bind_host, loopback", [
+    (None, False), ("0.0.0.0", False), ("127.0.0.1", True), ("localhost", True), ("::1", True), ("10.0.0.5", False),
+])
+def test_published_ports_follow_a_host_run_gateway(monkeypatch, bind_host, loopback):
+    """A host-run MiniStack publishes the containers it starts on loopback only when BIND_HOST is loopback."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(container_reaper, "_publish_on_loopback", None)
+    if bind_host is None:
+        monkeypatch.delenv("BIND_HOST", raising=False)
+    else:
+        monkeypatch.setenv("BIND_HOST", bind_host)
+    assert container_reaper.published_port(15432) == (("127.0.0.1", 15432) if loopback else 15432)
+
+
+@pytest.mark.parametrize("bindings, loopback", [
+    ([{"HostIp": "127.0.0.1", "HostPort": "4566"}], True),
+    ([{"HostIp": "127.0.0.1", "HostPort": "4566"}, {"HostIp": "::1", "HostPort": "4566"}], True),
+    ([{"HostIp": "0.0.0.0", "HostPort": "4566"}, {"HostIp": "::", "HostPort": "4566"}], False),
+    ([], False),
+    (None, False),
+])
+def test_published_ports_follow_a_containerised_gateway(monkeypatch, bindings, loopback):
+    """In Docker, MiniStack publishes the containers it starts the way its own 4566 is published."""
+    import sys
+    import types
+
+    from ministack.core import container_reaper
+
+    me = types.SimpleNamespace(attrs={"NetworkSettings": {"Ports": {"4566/tcp": bindings}}})
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda _name: me))
+    monkeypatch.setitem(sys.modules, "docker", types.SimpleNamespace(from_env=lambda **_: client))
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda p: p == "/.dockerenv")
+    monkeypatch.setattr(container_reaper, "_publish_on_loopback", None)
+    monkeypatch.delenv("GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("EDGE_PORT", raising=False)
+    assert container_reaper.published_port(None) == (("127.0.0.1", None) if loopback else None)

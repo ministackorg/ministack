@@ -265,9 +265,18 @@ def _new_id():
     return new_uuid().replace("-", "")[:10]
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _v1_response(data, status=200):
     """API Gateway v1 uses application/json."""
-    return status, {"Content-Type": "application/json"}, json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, json.dumps(_drop_none(data), ensure_ascii=False).encode("utf-8")
 
 
 def _encode_rest_api_policy(policy):
@@ -973,22 +982,16 @@ def _anonymous_policy_error(api_id, stage_name, method, path, account_id, region
 
 
 def find_domain_scope(domain_name):
-    """Return (account_id, region, stored_name) owning a custom domain within
-    the ambient account.
+    """Return (account_id, region, stored_name) owning a custom domain, the ambient account first.
 
-    Host headers are case-insensitive, so the comparison lowercases both
-    sides; ``stored_name`` is the exact key the control plane stored, which
-    the child-store lookup needs. A data-plane request addressed by a custom
-    domain carries no signed scope, so like ``find_api_scope`` this resolves
-    within the ambient account. EDGE global name uniqueness across accounts
-    stays unenforced (see the module docstring) — the ambient default covers
-    the single-account case a local stack actually runs."""
+    Host headers are case-insensitive; ``stored_name`` is the exact key the control plane stored.
+    A request addressed by a custom domain carries no signed scope, so every account is searched."""
     account_id = get_account_id()
     wanted = domain_name.lower()
-    for (stored_account, region, stored_domain), _rec in _domain_names.all_items():
-        if stored_account == account_id and stored_domain.lower() == wanted:
-            return stored_account, region, stored_domain
-    return None
+    matches = [(stored_account, region, stored_domain)
+               for (stored_account, region, stored_domain), _rec in _domain_names.all_items()
+               if stored_domain.lower() == wanted]
+    return next((m for m in matches if m[0] == account_id), matches[0] if matches else None)
 
 
 def resolve_base_path_mapping(domain_name, path):
@@ -3707,6 +3710,9 @@ def _create_rest_api(data):
         "tags": data.get("tags", {}),
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
     }
+    for k in ("securityPolicy", "endpointAccessMode"):
+        if data.get(k):
+            api[k] = data[k]
     _rest_apis[api_id] = api
     _resources[api_id] = {}
     _stages_v1[api_id] = {}
@@ -3968,9 +3974,17 @@ def _import_path_item(api_id, path, path_item, scheme_map=None, default_security
             resource_id = child
 
     for method, operation in path_item.items():
-        if method.lower() in _OPENAPI_HTTP_METHODS:
-            _import_operation(api_id, resource_id, method.upper(), operation,
-                              scheme_map, default_security)
+        if method == "x-amazon-apigateway-any-method":
+            http_method = "ANY"
+        elif method.lower() in _OPENAPI_HTTP_METHODS:
+            http_method = method.upper()
+        else:
+            continue
+        _import_operation(api_id, resource_id, http_method, operation,
+                          scheme_map, default_security)
+
+
+_OPENAPI_PARAM_SOURCES = {"path": "path", "query": "querystring", "header": "header"}
 
 
 def _import_operation(api_id, resource_id, http_method, operation,
@@ -3978,8 +3992,15 @@ def _import_operation(api_id, resource_id, http_method, operation,
     security = (operation or {}).get("security")
     if security is None:
         security = default_security
-    _put_method(api_id, resource_id, http_method,
-                _method_security(security, scheme_map or {}))
+    method_data = _method_security(security, scheme_map or {})
+    request_params = {
+        f"method.request.{_OPENAPI_PARAM_SOURCES[param['in']]}.{param['name']}": bool(param.get("required"))
+        for param in (operation or {}).get("parameters") or []
+        if param.get("in") in _OPENAPI_PARAM_SOURCES and param.get("name")
+    }
+    if request_params:
+        method_data["requestParameters"] = request_params
+    _put_method(api_id, resource_id, http_method, method_data)
 
     integration = (operation or {}).get("x-amazon-apigateway-integration")
     if integration:
@@ -4506,6 +4527,9 @@ def _put_integration(api_id, resource_id, http_method, data):
         "contentHandling": data.get("contentHandling"),
         "integrationResponses": {},
     }
+    for k in ("connectionId", "tlsConfig", "responseTransferMode", "integrationTarget"):
+        if data.get(k) is not None:
+            integration[k] = data[k]
     method_obj["methodIntegration"] = integration
     # Real AWS returns HTTP 201 Created for PutIntegration.
     return _v1_response(integration, 201)
@@ -4601,7 +4625,7 @@ def _delete_integration_response(api_id, resource_id, http_method, status_code):
 # ---- Helpers ----
 
 def _build_api_summary(api_id):
-    """Build the apiSummary structure: {path: {httpMethod: {authorizationScopes, apiKeyRequired}}}."""
+    """Build the apiSummary structure: {path: {httpMethod: MethodSnapshot}}."""
     summary = {}
     for resource in _resources.get(api_id, {}).values():
         path = resource.get("path", "/")
@@ -4609,7 +4633,7 @@ def _build_api_summary(api_id):
             if path not in summary:
                 summary[path] = {}
             summary[path][http_method] = {
-                "authorizationScopes": [],
+                "authorizationType": method_obj.get("authorizationType", "NONE"),
                 "apiKeyRequired": method_obj.get("apiKeyRequired", False),
             }
     return summary
@@ -4724,6 +4748,8 @@ def _create_stage(api_id, data):
         "tags": data.get("tags", {}),
         "documentationVersion": data.get("documentationVersion"),
     }
+    if data.get("canarySettings"):
+        stage["canarySettings"] = data["canarySettings"]
     _stages_v1.setdefault(api_id, {})[stage_name] = stage
     return _v1_response(stage, 201)
 

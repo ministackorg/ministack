@@ -960,7 +960,6 @@ def _describe_change_set(params):
         f"<ExecutionStatus>{cs['ExecutionStatus']}</ExecutionStatus>"
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
-        f"<ChangeSetType>{cs.get('ChangeSetType', '')}</ChangeSetType>"
         f"{import_existing_xml}"
         "<Capabilities>"
         + "".join(f"<member>{_esc(c)}</member>" for c in cs.get("Capabilities", []))
