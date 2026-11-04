@@ -2524,7 +2524,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
 def _acl_setuser(user, deny=()):
     """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
     An iam user's token is not checked, as with AUTH=false elsewhere."""
-    tokens = user.get("AccessString", "").split()
+    tokens = _acl_split(user.get("AccessString", ""))  # as stored: NBSP stays inside a pattern
     # A string without channel rules gets all channels (real AWS, us-west-2: "on ~* +@all" is
     # "user app on ... ~* &* +@all" on the engine); reset alone would leave none. A string with a
     # selector and no root channel rule gets none outside its selectors (real AWS, us-east-2, every
@@ -3103,7 +3103,7 @@ def _password_hashes(p):
 # with valkey/valkey-bundle:8.1's JSON and Bloom commands and the ones valkey/valkey:9.0 adds, and the categories of the engine's
 # `ACL CAT` on AWS (real AWS, us-west-2, Valkey 8.1). `all` is no category but is accepted.
 _ACL_COMMANDS = frozenset((
-    "acl append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.load bf.madd bf.mexists "
+    "acl append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists "
     "bf.reserve bgrewriteaof bgsave bitcount bitfield bitfield_ro bitop bitpos blmove blmpop blpop brpop "
     "brpoplpush bzmpop bzpopmax bzpopmin client cluster command commandlog config copy dbsize debug decr "
     "decrby del discard dump echo eval eval_ro evalsha evalsha_ro exec exists expire expireat expiretime "
@@ -3121,7 +3121,7 @@ _ACL_COMMANDS = frozenset((
     "rpoplpush rpush rpushx sadd save scan scard script sdiff sdiffstore select set setbit setex setnx "
     "setrange shutdown sinter sintercard sinterstore sismember slaveof slowlog smembers smismember smove "
     "sort sort_ro spop spublish srandmember srem sscan ssubscribe strlen subscribe substr sunion "
-    "sunionstore sunsubscribe swapdb sync time touch ttl type unlink unsubscribe unwatch wait waitaof "
+    "sunionstore sunsubscribe swapdb sync time touch ttl type unlink unsubscribe unwatch wait "
     "watch xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup xrevrange "
     "xsetid xtrim zadd zcard zcount zdiff zdiffstore zincrby zinter zintercard zinterstore zlexcount "
     "zmpop zmscore zpopmax zpopmin zrandmember zrange zrangebylex zrangebyscore zrangestore zrank zrem "
@@ -3132,7 +3132,7 @@ _ACL_COMMANDS = frozenset((
 # valkey/valkey:7.2-9.0 images' command lists); they are left out of its ACL, where they couldn't run.
 _ACL_COMMANDS_SINCE = (
     ((7, 0), "blmpop bzmpop eval_ro evalsha_ro expiretime fcall fcall_ro function lcs lmpop pexpiretime quit "
-             "sintercard sort_ro spublish ssubscribe sunsubscribe waitaof zintercard zmpop"),
+             "sintercard sort_ro spublish ssubscribe sunsubscribe zintercard zmpop"),
     ((8, 1), "commandlog"),
     ((9, 0), "delifeq hexpire hexpireat hexpiretime hgetex hpersist hpexpire hpexpireat hpexpiretime hpttl "
              "hsetex httl"),
@@ -3140,8 +3140,8 @@ _ACL_COMMANDS_SINCE = (
 _ACL_COMMANDS |= {c for _since, names in _ACL_COMMANDS_SINCE for c in names.split()}
 _ACL_CATEGORIES = frozenset((
     "all keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast "
-    "slow blocking dangerous connection transaction scripting json bloom").split())
-_ACL_MODULE_NAMES = frozenset({"json", "bloom"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
+    "slow blocking dangerous connection transaction scripting json bloom search").split())
+_ACL_MODULE_NAMES = frozenset({"json", "bloom", "search"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
 _ACL_KEYWORDS = frozenset((
     "on off nopass resetpass reset allkeys allchannels resetkeys resetchannels allcommands nocommands "
     "clearselectors").split())
@@ -3179,10 +3179,14 @@ def _minimum_engine_version(user):
     if user.get("_builtin"):
         return "6.0"
     if user.get("Engine") == "valkey":
-        return "7.2"
-    if user.get("Authentication", {}).get("Type") == "iam":
-        return "7.0"
-    return None
+        floor = "7.2"
+    elif user.get("Authentication", {}).get("Type") == "iam":
+        floor = "7.0"
+    else:
+        floor = "6.0"  # password and no-password Redis users alike (us-east-2, issue #2551)
+    # An append's rules can need a later engine (real AWS, issue #2551: +hgetex reports 9.0).
+    version = user.get("_AclVersion")
+    return version if version and _acl_version_key(version) > _acl_version_key(floor) else floor
 
 
 def _create_user(p):
@@ -3258,6 +3262,426 @@ def _delete_user(p):
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
 
 
+_ACL_SELECTOR_KEYWORDS = frozenset((
+    "allkeys", "resetkeys", "allchannels", "resetchannels", "allcommands", "nocommands"))
+_ACL_ROOT_KEYWORDS = _ACL_SELECTOR_KEYWORDS | {"on", "off", "clearselectors"}
+_ACL_PATTERN_AFTER_STAR = ("Adding a pattern '{}' after the * pattern (or the '{}' flag) is not valid and does not "
+                           "have any effect. Try '{}' to start with an empty list of {}")
+
+
+# What real AWS answered for each rule on its own (us-east-2, issue #2551, rounds 13-15): the engine
+# version MinimumEngineVersion reports for it (rules not listed need no more than the engine's floor);
+# a user without channel rules gets `&*` written for a 6.2 rule and `resetchannels` from 7.0.
+_ACL_RULE_VERSIONS = {
+    **dict.fromkeys((
+        "@json blmove copy failover geosearch geosearchstore getdel getex hrandfield json.arrappend "
+        "json.arrindex json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.debug json.del "
+        "json.forget json.get json.mget json.numincrby json.nummultby json.objkeys json.objlen json.resp "
+        "json.set json.strappend json.strlen json.toggle json.type lmove lpos reset smismember xautoclaim "
+        "zdiff zdiffstore zinter zmscore zrandmember zrangestore zunion "
+    ).split(), "6.2"),
+    **{c: ".".join(map(str, since)) for since, names in _ACL_COMMANDS_SINCE for c in names.split()},
+    **dict.fromkeys((
+        "@bloom bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve json.mset "
+    ).split(), "8.1"),
+    **dict.fromkeys((
+        "@search "
+    ).split(), "8.2"),
+}
+# The subcommands AWS accepts in a -command|subcommand rule, and those needing more than 7.0 there.
+_ACL_SUBCOMMANDS = frozenset((
+    "acl|cat acl|deluser acl|dryrun acl|genpass acl|getuser acl|help acl|list acl|load acl|log acl|save "
+    "acl|setuser acl|users acl|whoami client|caching client|capa client|getname client|getredir "
+    "client|help client|id client|info client|kill client|list client|no-evict client|no-touch "
+    "client|pause client|reply client|setinfo client|setname client|tracking client|trackinginfo "
+    "client|unblock client|unpause cluster|addslots cluster|addslotsrange cluster|bumpepoch "
+    "cluster|count-failure-reports cluster|countkeysinslot cluster|delslots cluster|delslotsrange "
+    "cluster|failover cluster|flushslot cluster|flushslots cluster|forget cluster|getkeysinslot "
+    "cluster|help cluster|info cluster|keyslot cluster|links cluster|meet cluster|myid cluster|myshardid "
+    "cluster|nodes cluster|replicas cluster|replicate cluster|reset cluster|saveconfig "
+    "cluster|set-config-epoch cluster|setslot cluster|shards cluster|slaves cluster|slot-stats "
+    "cluster|slots commandlog|get commandlog|help commandlog|len commandlog|reset command|count "
+    "command|docs command|getkeys command|getkeysandflags command|help command|info command|list "
+    "config|get config|help config|resetstat config|rewrite config|set function|delete function|dump "
+    "function|flush function|help function|kill function|list function|load function|restore "
+    "function|stats latency|doctor latency|graph latency|help latency|histogram latency|history "
+    "latency|latest latency|reset memory|doctor memory|help memory|malloc-stats memory|purge memory|stats "
+    "memory|usage module|help module|list module|load module|loadex module|unload object|encoding "
+    "object|freq object|help object|idletime object|refcount pubsub|channels pubsub|help pubsub|numpat "
+    "pubsub|numsub pubsub|shardchannels pubsub|shardnumsub script|debug script|exists script|flush "
+    "script|help script|kill script|load script|show slowlog|get slowlog|help slowlog|len slowlog|reset "
+    "xgroup|create xgroup|createconsumer xgroup|delconsumer xgroup|destroy xgroup|help xgroup|setid "
+    "xinfo|consumers xinfo|groups xinfo|help xinfo|stream "
+).split())
+_ACL_SUBCOMMAND_VERSIONS = {
+    **dict.fromkeys("client|no-touch client|setinfo cluster|myshardid".split(), "7.2"),
+    **dict.fromkeys("client|capa cluster|slot-stats script|show".split(), "8.0"),
+    **dict.fromkeys("commandlog|get commandlog|help commandlog|len commandlog|reset".split(), "8.1"),
+    **dict.fromkeys("cluster|flushslot".split(), "9.0"),
+}
+# The commands each category holds as AWS counts them for subcommand rules (us-east-2, issue #2551):
+# +command|sub is refused after +@category, and -command|sub accepted.
+_ACL_CATEGORY_COMMANDS = {
+    "admin": frozenset((
+        "acl bgrewriteaof bgsave client cluster commandlog config debug failover json.debug lastsave "
+        "latency module monitor pfdebug pfselftest psync replconf replicaof save shutdown slaveof "
+        "slowlog sync"
+    ).split()),
+    "bitmap": frozenset("bitcount bitfield bitfield_ro bitop bitpos getbit setbit".split()),
+    "blocking": frozenset("blmove blmpop blpop brpop brpoplpush bzmpop bzpopmax bzpopmin xread xreadgroup".split()),
+    "bloom": frozenset("bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve".split()),
+    "connection": frozenset("auth client command echo hello ping quit reset".split()),
+    "dangerous": frozenset((
+        "acl bgrewriteaof bgsave client cluster commandlog config debug failover flushall flushdb "
+        "info keys lastsave latency migrate module monitor pfdebug pfselftest psync replconf "
+        "replicaof restore restore-asking role save shutdown slaveof slowlog sort sort_ro swapdb sync"
+    ).split()),
+    "fast": frozenset((
+        "append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve "
+        "bitfield_ro bzpopmax bzpopmin dbsize decr decrby delifeq discard echo exists expire expireat "
+        "expiretime get getbit getdel getex getset hdel hello hexists hexpire hexpireat hexpiretime "
+        "hget hgetex hincrby hincrbyfloat hlen hmget hmset hpersist hpexpire hpexpireat hpexpiretime "
+        "hpttl hset hsetex hsetnx hstrlen httl incr incrby incrbyfloat json.arrappend json.arrindex "
+        "json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.del json.forget json.get "
+        "json.mget json.numincrby json.nummultby json.objkeys json.objlen json.resp json.strappend "
+        "json.strlen json.toggle json.type lastsave llen lolwut lpop lpush lpushx mget move multi "
+        "persist pexpire pexpireat pexpiretime pfadd ping pttl publish quit readonly readwrite "
+        "renamenx reset role rpop rpush rpushx sadd scard select setnx sismember smismember smove "
+        "spop spublish srem strlen swapdb time touch ttl type unlink unwatch watch xack xadd "
+        "xautoclaim xclaim xdel xlen xsetid zadd zcard zcount zincrby zlexcount zmscore zpopmax "
+        "zpopmin zrank zrem zrevrank zscore"
+    ).split()),
+    "geo": frozenset((
+        "geoadd geodist geohash geopos georadius georadius_ro georadiusbymember georadiusbymember_ro "
+        "geosearch geosearchstore"
+    ).split()),
+    "hash": frozenset((
+        "hdel hexists hexpire hexpireat hexpiretime hget hgetall hgetex hincrby hincrbyfloat hkeys "
+        "hlen hmget hmset hpersist hpexpire hpexpireat hpexpiretime hpttl hrandfield hscan hset "
+        "hsetex hsetnx hstrlen httl hvals"
+    ).split()),
+    "hyperloglog": frozenset("pfadd pfcount pfmerge pfselftest".split()),
+    "json": frozenset((
+        "json.arrappend json.arrindex json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear "
+        "json.debug json.del json.forget json.get json.mget json.mset json.numincrby json.nummultby "
+        "json.objkeys json.objlen json.resp json.set json.strappend json.strlen json.toggle json.type"
+    ).split()),
+    "keyspace": frozenset((
+        "copy dbsize del dump exists expire expireat expiretime flushall flushdb keys migrate move "
+        "object persist pexpire pexpireat pexpiretime pttl randomkey rename renamenx restore "
+        "restore-asking scan swapdb touch ttl type unlink"
+    ).split()),
+    "list": frozenset((
+        "blmove blmpop blpop brpop brpoplpush lindex linsert llen lmove lmpop lpop lpos lpush lpushx "
+        "lrange lrem lset ltrim rpop rpoplpush rpush rpushx sort sort_ro"
+    ).split()),
+    "pubsub": frozenset((
+        "psubscribe publish pubsub punsubscribe spublish ssubscribe subscribe sunsubscribe "
+        "unsubscribe"
+    ).split()),
+    "read": frozenset((
+        "bf.card bf.exists bf.info bf.mexists bitcount bitfield_ro bitpos dbsize dump exists "
+        "expiretime geodist geohash geopos georadius_ro georadiusbymember_ro geosearch get getbit "
+        "getrange hexists hexpiretime hget hgetall hkeys hlen hmget hpexpiretime hpttl hrandfield "
+        "hscan hstrlen httl hvals json.arrindex json.arrlen json.debug json.get json.mget "
+        "json.objkeys json.objlen json.resp json.strlen json.type keys lcs lindex llen lolwut lpos "
+        "lrange memory mget object pexpiretime pfcount pttl randomkey scan scard sdiff sinter "
+        "sintercard sismember smembers smismember sort_ro srandmember sscan strlen substr sunion "
+        "touch ttl type xinfo xlen xpending xrange xread xrevrange zcard zcount zdiff zinter "
+        "zintercard zlexcount zmscore zrandmember zrange zrangebylex zrangebyscore zrank zrevrange "
+        "zrevrangebylex zrevrangebyscore zrevrank zscan zscore zunion"
+    ).split()),
+    "scripting": frozenset("eval eval_ro evalsha evalsha_ro fcall fcall_ro function script".split()),
+    "set": frozenset((
+        "sadd scard sdiff sdiffstore sinter sintercard sinterstore sismember smembers smismember "
+        "smove sort sort_ro spop srandmember srem sscan sunion sunionstore"
+    ).split()),
+    "slow": frozenset((
+        "acl bgrewriteaof bgsave bitcount bitfield bitop bitpos blmove blmpop blpop brpop brpoplpush "
+        "bzmpop client cluster command commandlog config copy debug del dump eval eval_ro evalsha "
+        "evalsha_ro exec failover fcall fcall_ro flushall flushdb function geoadd geodist geohash "
+        "geopos georadius georadius_ro georadiusbymember georadiusbymember_ro geosearch "
+        "geosearchstore getrange hgetall hkeys hrandfield hscan hvals info json.debug json.mset "
+        "json.set keys latency lcs lindex linsert lmove lmpop lpos lrange lrem lset ltrim memory "
+        "migrate module monitor mset msetnx object pfcount pfdebug pfmerge pfselftest psetex "
+        "psubscribe psync pubsub punsubscribe randomkey rename replconf replicaof restore "
+        "restore-asking rpoplpush save scan script sdiff sdiffstore set setbit setex setrange "
+        "shutdown sinter sintercard sinterstore slaveof slowlog smembers sort sort_ro srandmember "
+        "sscan ssubscribe subscribe substr sunion sunionstore sunsubscribe sync unsubscribe wait "
+        "xgroup xinfo xpending xrange xread xreadgroup xrevrange xtrim zdiff zdiffstore zinter "
+        "zintercard zinterstore zmpop zrandmember zrange zrangebylex zrangebyscore zrangestore "
+        "zremrangebylex zremrangebyrank zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore "
+        "zscan zunion zunionstore"
+    ).split()),
+    "sortedset": frozenset((
+        "bzmpop bzpopmax bzpopmin sort sort_ro zadd zcard zcount zdiff zdiffstore zincrby zinter "
+        "zintercard zinterstore zlexcount zmpop zmscore zpopmax zpopmin zrandmember zrange "
+        "zrangebylex zrangebyscore zrangestore zrank zrem zremrangebylex zremrangebyrank "
+        "zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore zrevrank zscan zscore zunion "
+        "zunionstore"
+    ).split()),
+    "stream": frozenset((
+        "xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup "
+        "xrevrange xsetid xtrim"
+    ).split()),
+    "string": frozenset((
+        "append decr decrby delifeq get getdel getex getrange getset incr incrby incrbyfloat lcs mget "
+        "mset msetnx psetex set setex setnx setrange strlen substr"
+    ).split()),
+    "transaction": frozenset("discard exec multi unwatch watch".split()),
+    "write": frozenset((
+        "append bf.add bf.insert bf.madd bf.reserve bitfield bitop blmove blmpop blpop brpop "
+        "brpoplpush bzmpop bzpopmax bzpopmin copy decr decrby del delifeq expire expireat flushall "
+        "flushdb function geoadd georadius georadiusbymember geosearchstore getdel getex getset hdel "
+        "hexpire hexpireat hgetex hincrby hincrbyfloat hmset hpersist hpexpire hpexpireat hset hsetex "
+        "hsetnx incr incrby incrbyfloat json.arrappend json.arrinsert json.arrpop json.arrtrim "
+        "json.clear json.del json.forget json.mset json.numincrby json.nummultby json.set "
+        "json.strappend json.toggle linsert lmove lmpop lpop lpush lpushx lrem lset ltrim migrate "
+        "move mset msetnx persist pexpire pexpireat pfadd pfdebug pfmerge psetex rename renamenx "
+        "restore restore-asking rpop rpoplpush rpush rpushx sadd sdiffstore set setbit setex setnx "
+        "setrange sinterstore smove sort spop srem sunionstore swapdb unlink xack xadd xautoclaim "
+        "xclaim xdel xgroup xreadgroup xsetid xtrim zadd zdiffstore zincrby zinterstore zmpop zpopmax "
+        "zpopmin zrangestore zrem zremrangebylex zremrangebyrank zremrangebyscore zunionstore"
+    ).split()),
+}
+# +command|arg needs a later engine when it follows +@category for these pairs, unless a later rule took the
+# command away again (us-east-2, issue #2551).
+_ACL_CATEGORY_ARG_VERSIONS = {
+    **dict.fromkeys((("read", c) for c in "echo lastsave role time".split()), "6.2"),
+    **dict.fromkeys((("keyspace", c) for c in "asking readonly readwrite select wait".split()), "7.0"),
+}
+_ACL_WHITESPACE = " \t\n\r\x0b\x0c"  # AWS splits rules on these only; NBSP and other spaces stay in a rule
+
+
+_XML_QUOTE = {'"': "&quot;"}  # AWS's user bodies escape `"` as well as & < >
+
+
+def _acl_split(text):
+    return [w for w in "".join(" " if c in _ACL_WHITESPACE else c for c in text).split(" ") if w]
+
+
+def _acl_rules(access):
+    """An access string's rules, each selector as a list of its rules; None if a selector is empty or
+    unclosed. A selector runs from a `(` that starts a rule to the next `)`, so `(~x +get)(~y +set)`
+    is two."""
+    rules, word, i = [], "", 0
+    while i < len(access):
+        if access[i] == "(" and not word:
+            end = access.find(")", i)
+            inner = _acl_split(access[i + 1:end]) if end >= 0 else []
+            if not inner:
+                return None
+            rules.append(inner)
+            i = end + 1
+            continue
+        if access[i] in _ACL_WHITESPACE:
+            rules += [word] if word else []
+            word = ""
+        else:
+            word += access[i]
+        i += 1
+    return rules + ([word] if word else [])
+
+
+def _acl_key(rule):
+    """A key rule as AWS stores it (`%RW~` becomes `~`), or None if `rule` is not a key pattern."""
+    if rule.startswith("~") and len(rule) > 1:
+        return rule
+    perm, _, pattern = rule[1:].partition("~")
+    if rule.startswith("%") and pattern and perm.upper() in ("R", "W", "RW"):
+        return f"~{pattern}" if perm.upper() == "RW" else rule
+    return None
+
+
+def _acl_refusal(rule, keywords):
+    """The message refusing one rule on its own, before any rule is applied."""
+    message = _acl_aws_refusal(rule, keywords)
+    if message is None and any(c < " " or c in "\ufffe\uffff" or "\ud800" <= c <= "\udfff" for c in rule):
+        # MiniStack-only: XML can't carry these. AWS stores `~a\x1cb`, then fails every DescribeUsers in the
+        # region with InternalFailure until the user is deleted (us-east-2, round 23), which isn't emulated.
+        return "The access-string is invalid."
+    return message
+
+
+def _acl_aws_refusal(rule, keywords):
+    """AWS's message refusing one rule on its own."""
+    low = rule.lower()
+    if low == "reset":
+        return "reset rule is not supported in Elasticache user api."
+    if low in ("nopass", "resetpass") or rule[0] in "><#!":
+        return ("Password rules are not supported in Elasticache access string. "
+                "Please use Passwords parameter to set/modify user password.")
+    if low in ("sanitize-payload", "skip-sanitize-payload"):
+        return "sanitize-payload and skip-sanitize-payload rules are not supported in user api."
+    if rule[0] in "+-" and low[1:2] == "@":
+        return None if low[2:] in _ACL_CATEGORIES else (
+            "Access string contains invalid category(s). Please verify the list of available category in user-api.")
+    if rule[0] in "+-":
+        command, bar, subcommand = low[1:].partition("|")
+        # -command|subcommand must name a real subcommand; +command|anything only a non-empty one.
+        valid = not bar or (low[1:] in _ACL_SUBCOMMANDS if rule[0] == "-" else subcommand)
+        return None if command in _ACL_COMMANDS and valid else (
+            "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
+    if rule.startswith("~") and "\u2028" in rule:  # NBSP and em space stay in a pattern (us-east-2, round 23)
+        return "The access-string is invalid."
+    if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
+        return None
+    return "The access-string is invalid."
+
+
+def _acl_apply(scope, rule):
+    """Apply one rule to a root or selector scope; AWS's message if it is refused."""
+    low = rule.lower()
+    key = _acl_key(rule)
+    if low in ("on", "off"):
+        scope["flag"] = low
+    elif low == "allkeys" or key == "~*":
+        scope["allkeys"], scope["keys"] = True, []
+    elif low == "resetkeys":
+        scope["allkeys"], scope["keys"] = False, []
+    elif key:
+        if scope["allkeys"]:
+            return _ACL_PATTERN_AFTER_STAR.format(rule, "allkeys", "resetkeys", "patterns")
+        if key not in scope["keys"]:
+            scope["keys"].append(key)
+    elif low == "allchannels" or rule == "&*":
+        scope["channels"], scope["patterns"] = "all", []
+    elif low == "resetchannels":
+        scope["channels"], scope["patterns"] = "reset", []
+    elif rule.startswith("&"):
+        if scope["channels"] == "all":
+            return _ACL_PATTERN_AFTER_STAR.format(rule, "allchannels", "resetchannels", "channels")
+        scope["channels"] = "reset"
+        if rule not in scope["patterns"]:
+            scope["patterns"].append(rule)
+    elif low in ("allcommands", "+@all", "nocommands", "-@all"):
+        scope["base"], scope["commands"] = ("+" if low in ("allcommands", "+@all") else "-"), []
+    elif low == "clearselectors":
+        scope["selectors"] = []
+    else:
+        sign, name = low[0], low[1:]
+        family = name.split("|")[0]
+        if "|" in name:
+            # +command|sub is refused once the command is fully added, and -command|sub until something
+            # granted it; a -@category takes the first away but not the second.
+            full = granted = scope["base"] == "+"
+            version = None
+            for command in scope["commands"]:
+                if command[1:] == family:
+                    full = granted = command[0] == "+"
+                    version = None
+                elif command[1] == "@" and family in _ACL_CATEGORY_COMMANDS.get(command[2:], ()):
+                    full = command[0] == "+"
+                    granted = granted or full
+                    version = None
+                elif command[1] == "@" and (command[2:], family) in _ACL_CATEGORY_ARG_VERSIONS:
+                    version = _ACL_CATEGORY_ARG_VERSIONS[command[2:], family] if command[0] == "+" else None
+            if sign == "+" and full:
+                return (f"Adding a subcommand({low}) of a command already fully added is not allowed. "
+                        "Remove the command to start. Example: -DEBUG +DEBUG|DIGEST")
+            if sign == "-" and not granted:
+                return (f"Removing a subcommand({low}) of a command not fully added is not allowed. "
+                        "Add the command to start. Example: +DEBUG -DEBUG|DIGEST")
+            if sign == "+" and version:
+                scope["versions"].append(version)
+        # A rule replaces its earlier one (a whole command also its subcommands'), and is dropped
+        # when it repeats the +@all/-@all base without touching a remaining rule.
+        scope["commands"] = [c for c in scope["commands"]
+                             if c[1:] != name and ("|" in name or not c[1:].startswith(f"{name}|"))]
+        if sign != scope["base"] or any(name[0] == "@" or c[1] == "@" or c[1:].split("|")[0] == family
+                                        for c in scope["commands"]):
+            scope["commands"].append(f"{sign}{name}")
+    return None
+
+
+def _acl_scope(flag=None):
+    return {"flag": flag, "allkeys": False, "keys": [], "channels": None, "patterns": [],
+            "base": "-", "commands": [], "selectors": [], "versions": []}
+
+
+def _acl_describe(scope, default_channels):
+    parts = [scope["flag"]] if scope["flag"] else []
+    parts += ["~*"] if scope["allkeys"] else scope["keys"]
+    if scope["channels"] == "all":
+        parts.append("&*")
+    elif scope["channels"]:
+        parts += ["resetchannels", *scope["patterns"]]
+    elif default_channels:
+        parts.append(default_channels)
+    parts += [f"{scope['base']}@all", *scope["commands"], *scope["selectors"]]
+    return " ".join(parts)
+
+
+def _acl_apply_rule(root, rule):
+    """Apply a root rule or a selector to ``root``; AWS's message if it is refused."""
+    if not isinstance(rule, list):
+        return _acl_apply(root, rule)
+    selector = _acl_scope()
+    for inner in rule:
+        message = _acl_apply(selector, inner)
+        if message:
+            return message
+    root["selectors"].append(f"({_acl_describe(selector, 'resetchannels')})")
+    root["versions"] += selector["versions"]
+    return None
+
+
+def _acl_version_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def _acl_version(rule):
+    """The engine version AWS reports for one rule or selector, or None if it needs no more than the floor."""
+    if isinstance(rule, list):
+        return max(["7.0", *filter(None, map(_acl_version, rule))], key=_acl_version_key)
+    low = rule.lower()
+    if rule.startswith("%") or low == "clearselectors" or (rule.startswith("&") and rule != "&*"):
+        return "7.0"
+    if low in ("resetchannels", "allchannels", "&*"):
+        return "6.2"
+    if rule[0] not in "+-":
+        return None
+    command, bar, _ = low[1:].partition("|")
+    if bar and rule[0] == "-":
+        return _ACL_SUBCOMMAND_VERSIONS.get(low[1:], "7.0")
+    return _ACL_RULE_VERSIONS.get(command)
+
+
+def _acl_refused(rule):
+    keywords = _ACL_SELECTOR_KEYWORDS if isinstance(rule, list) else _ACL_ROOT_KEYWORDS
+    return next(filter(None, (_acl_refusal(inner, keywords) for inner in (rule if isinstance(rule, list) else [rule]))),
+                None)
+
+
+def _append_access_string(access, append):
+    """(AccessString, version, None): the stored AccessString with AppendAccessString's rules applied,
+    written as AWS stores it (real-AWS captures in issue #2551), with the engine version its rules need
+    (None for the floor); or (None, None, AWS's message) refusing the appended rules."""
+    rules = _acl_rules(append)
+    if rules is None:
+        return None, None, "The access-string is invalid."
+    message = next(filter(None, map(_acl_refused, rules)), None)
+    if message:
+        return None, None, message
+    # MiniStack-only: a stored rule AWS would have refused (CreateUser here doesn't check them all)
+    # is skipped rather than failing every later append.
+    stored = _acl_rules(access)
+    stored = [rule for rule in (_acl_split(access) if stored is None else stored) if not _acl_refused(rule)]
+    root = _acl_scope(flag="off")
+    for rule in stored:
+        _acl_apply_rule(root, rule)  # a refusal returns before changing anything, so the rule is skipped
+    for rule in rules:
+        message = _acl_apply_rule(root, rule)
+        if message:
+            return None, None, message
+    # Every rule present counts, even one a later rule replaced or dropped (rounds 5, 9 and 16), and so do
+    # the category pairs the rules met on the way (rounds 19 and 20).
+    version = max(filter(None, [*map(_acl_version, [*stored, *rules]), *root["versions"]]),
+                  key=_acl_version_key, default=None)
+    default = None if not version else "&*" if version == "6.2" else "resetchannels"
+    return _acl_describe(root, default), version, None
+
+
 def _modify_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
@@ -3267,11 +3691,22 @@ def _modify_user(p):
         return _error("InvalidParameterValue", "default user can't be modified.", 400)
 
     auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
+    if not err and _p(p, "AccessString") and _p(p, "AppendAccessString"):
+        err = _error("InvalidParameterCombination",
+                     "Both AccessString and AppendAccessString provided together. Pass either one of them.", 400)
     err = err or _access_string_error(_p(p, "AccessString"))
     if err:
         return err
+    appended = None
+    if _acl_split(_p(p, "AppendAccessString")):
+        appended, version, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
+        if message:
+            return _error("InvalidParameterValue", message, 400)
     if _p(p, "AccessString"):
         user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
+        user.pop("_AclVersion", None)
+    if appended is not None:
+        user["AccessString"], user["_AclVersion"] = appended, version
     if auth:
         user["Authentication"] = auth
         user["_PasswordHashes"] = _password_hashes(p)
@@ -3497,7 +3932,7 @@ def _user_xml(u):
         f"<UserName>{xml_escape(str(u.get('UserName', '')))}</UserName>"
         f"<Engine>{xml_escape(str(u.get('Engine', 'redis')))}</Engine>"
         f"<Status>{xml_escape(str(u.get('Status', 'active')))}</Status>"
-        f"<AccessString>{xml_escape(u.get('AccessString', ''))}</AccessString>"
+        f"<AccessString>{xml_escape(u.get('AccessString', ''), _XML_QUOTE)}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
         + (f"<MinimumEngineVersion>{xml_escape(str(_minimum_engine_version(u)))}</MinimumEngineVersion>"
            if _minimum_engine_version(u) else "")
