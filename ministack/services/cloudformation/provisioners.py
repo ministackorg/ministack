@@ -13766,6 +13766,9 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
             or new_props.get("Engine") != old_props.get("Engine")):
         params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
                             "UserIdsToRemove": [u for u in live_users if u not in new_users]})
+    live_engine = (_ec._user_groups.get(physical_id) or {}).get("Engine")
+    if new_props.get("Engine") and str(new_props["Engine"]) != live_engine:
+        params["Engine"] = str(new_props["Engine"])
     if params:
         _ec_call(_ec._modify_user_group, {"UserGroupId": physical_id, **params},
                  "AWS::ElastiCache::UserGroup", "update")

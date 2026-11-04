@@ -37392,7 +37392,7 @@ def _ec_cache_stack(s, *, rg_description="sessions", num_cache_clusters=2,
                 "maxmemory-policy": "allkeys-lru", "timeout": "300"},
         }},
         "User": {"Type": "AWS::ElastiCache::User", "Properties": {
-            "UserId": f"app-{s}", "UserName": f"app-{s}", "Engine": "redis",
+            "UserId": f"app-{s}", "UserName": "default", "Engine": "redis",
             "AccessString": access_string, "Passwords": ["correct-horse-battery"],
         }},
         "Users": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
@@ -37601,6 +37601,96 @@ def test_cfn_elasticache_stack_create_and_delete(cfn, ec):
     assert _ec_error_code(lambda: ec.describe_users(UserId=f"app-{s}")) == "UserNotFound"
     assert _ec_error_code(lambda: ec.describe_user_groups(
         UserGroupId=f"users-{s}")) == "UserGroupNotFound"
+
+
+def _ec_user_group_stack(s, *, with_default, default_in_group, engine="redis"):
+    resources = {
+        "Iam": {"Type": "AWS::ElastiCache::User", "Properties": {
+            "UserId": f"{s}-iam", "UserName": f"{s}-iam", "Engine": "redis", "AccessString": "on ~* +@all",
+            "AuthenticationMode": {"Type": "iam"}}},
+        "Group": {"Type": "AWS::ElastiCache::UserGroup", "Properties": {
+            "UserGroupId": f"{s}-ug", "Engine": engine,
+            "UserIds": ([{"Ref": "Def"}] if default_in_group else []) + [{"Ref": "Iam"}]}},
+    }
+    if with_default:
+        resources["Def"] = {"Type": "AWS::ElastiCache::User", "Properties": {
+            "UserId": f"{s}-def", "UserName": "default", "Engine": "redis", "AccessString": "on ~* +@all",
+            "AuthenticationMode": {"Type": "password", "Passwords": ["msc-capture-default-password-1"]}}}
+    return {"Resources": resources}
+
+
+def test_cfn_elasticache_redis_user_group_needs_default_user(cfn, ec):
+    """A Redis user group without a `default` user fails the stack's create and rolls it back, and an
+    update taking `default` out of the group fails and rolls back (real AWS, us-east-2, round5-cfn.py:
+    cfn1-describe ROLLBACK_COMPLETE, cfn1-events Group CREATE_FAILED; cfn2-describe-after-update
+    UPDATE_ROLLBACK_COMPLETE, cfn2-events Group UPDATE_FAILED). The reason text and the group's members
+    afterwards are MiniStack checks."""
+    s = f"ecdu-{_uuid_mod.uuid4().hex[:8]}"
+    bad, good = f"{s}-1", f"{s}-2"
+    try:
+        cfn.create_stack(StackName=bad, TemplateBody=json.dumps(
+            _ec_user_group_stack(bad, with_default=False, default_in_group=False)))
+        assert _wait_stack(cfn, bad, timeout=120)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert any("Redis user group needs to contain a user with the user name default." in r
+                   for r in _ec_reasons(cfn, bad, "Group"))
+
+        _ec_create(cfn, good, _ec_user_group_stack(good, with_default=True, default_in_group=True))
+        cfn.update_stack(StackName=good, TemplateBody=json.dumps(
+            _ec_user_group_stack(good, with_default=True, default_in_group=False)))
+        assert _wait_stack(cfn, good, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any("Redis user group needs to contain a user with the user name default." in r
+                   for r in _ec_reasons(cfn, good, "Group"))
+        group = ec.describe_user_groups(UserGroupId=f"{good}-ug")["UserGroups"][0]
+        assert group["UserIds"] == [f"{good}-def", f"{good}-iam"]
+    finally:
+        _delete_cfn_test_stack(cfn, bad)
+        _delete_cfn_test_stack(cfn, good)
+
+
+def test_cfn_elasticache_user_group_engine_change_to_valkey_drops_default_user(cfn, ec):
+    """An update that changes the group's Engine to Valkey while taking `default` out completes (real AWS,
+    us-east-2, round7-modify-engine.py: cfn-valkey-describe UPDATE_COMPLETE, cfn-valkey-group)."""
+    s = f"ecde-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _ec_create(cfn, s, _ec_user_group_stack(s, with_default=True, default_in_group=True))
+        _ec_update(cfn, s, _ec_user_group_stack(s, with_default=True, default_in_group=False, engine="valkey"))
+        group = ec.describe_user_groups(UserGroupId=f"{s}-ug")["UserGroups"][0]
+        assert (group["Engine"], group["UserIds"]) == ("valkey", [f"{s}-iam"])
+    finally:
+        _delete_cfn_test_stack(cfn, s)
+
+
+def test_cfn_elasticache_user_group_engine_change_then_drop_default_user(cfn, ec):
+    """An update changing only the group's Engine to Valkey completes and keeps its users, and a later
+    update dropping `default` completes too (real AWS, us-east-2, round8-engine-sequence.py:
+    cfn-seq-describe-after-engine, cfn-seq-group-after-engine, cfn-seq-describe-after-drop,
+    cfn-seq-group-after-drop)."""
+    s = f"ecds-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _ec_create(cfn, s, _ec_user_group_stack(s, with_default=True, default_in_group=True))
+        _ec_update(cfn, s, _ec_user_group_stack(s, with_default=True, default_in_group=True, engine="valkey"))
+        group = ec.describe_user_groups(UserGroupId=f"{s}-ug")["UserGroups"][0]
+        assert (group["Engine"], group["UserIds"]) == ("valkey", [f"{s}-def", f"{s}-iam"])
+        _ec_update(cfn, s, _ec_user_group_stack(s, with_default=True, default_in_group=False, engine="valkey"))
+        group = ec.describe_user_groups(UserGroupId=f"{s}-ug")["UserGroups"][0]
+        assert (group["Engine"], group["UserIds"]) == ("valkey", [f"{s}-iam"])
+    finally:
+        _delete_cfn_test_stack(cfn, s)
+
+
+def test_cfn_elasticache_user_group_engine_redis_case_keeps_default_user(cfn, ec):
+    """An update changing Engine to `Redis` while dropping `default` fails and rolls back (real AWS,
+    us-east-2, round12-attached-cfn.py: cfn-rcase-describe UPDATE_ROLLBACK_COMPLETE, cfn-rcase-group)."""
+    s = f"ecdr-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        _ec_create(cfn, s, _ec_user_group_stack(s, with_default=True, default_in_group=True))
+        cfn.update_stack(StackName=s, TemplateBody=json.dumps(
+            _ec_user_group_stack(s, with_default=True, default_in_group=False, engine="Redis")))
+        assert _wait_stack(cfn, s, timeout=120)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        group = ec.describe_user_groups(UserGroupId=f"{s}-ug")["UserGroups"][0]
+        assert (group["Engine"], group["UserIds"]) == ("redis", [f"{s}-def", f"{s}-iam"])
+    finally:
+        _delete_cfn_test_stack(cfn, s)
 
 
 def test_cfn_elasticache_update_in_place(cfn, ec):
