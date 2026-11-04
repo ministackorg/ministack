@@ -2657,6 +2657,7 @@ _UNSIGNED_IDP_ACTIONS = {
     "ForgotPassword",
     "GetTokensFromRefreshToken",
     "GetUser",
+    "GetUserAttributeVerificationCode",
     "GlobalSignOut",
     "InitiateAuth",
     "ResendConfirmationCode",
@@ -2667,6 +2668,7 @@ _UNSIGNED_IDP_ACTIONS = {
     "UpdateAuthEventFeedback",
     "UpdateUserAttributes",
     "VerifySoftwareToken",
+    "VerifyUserAttribute",
 }
 
 _UNSIGNED_IDENTITY_ACTIONS = {
@@ -2937,6 +2939,8 @@ async def _dispatch_idp(action: str, data: dict):
         "ChangePassword": _change_password,
         "GetUser": _get_user,
         "UpdateUserAttributes": _update_user_attributes,
+        "GetUserAttributeVerificationCode": _get_user_attribute_verification_code,
+        "VerifyUserAttribute": _verify_user_attribute,
         "DeleteUser": _delete_user,
         # Groups
         "CreateGroup": _create_group,
@@ -3093,12 +3097,21 @@ def _sms_configuration_error(auto_verified, sms_configuration):
     return None
 
 
+def _update_settings_error(auto_verified, update_settings):
+    kept = (update_settings or {}).get("AttributesRequireVerificationBeforeUpdate") or []
+    if not set(kept) <= set(auto_verified or []):
+        return error_response_json("InvalidParameterException",
+                                   "All attributes in AttributesRequireVerificationBeforeUpdate must exist in AutoVerifiedAttributes", 400)
+    return None
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
-    err = _custom_sender_key_error(data.get("LambdaConfig")) or _sms_configuration_error(
-        data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+    err = (_custom_sender_key_error(data.get("LambdaConfig"))
+           or _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+           or _update_settings_error(data.get("AutoVerifiedAttributes"), data.get("UserAttributeUpdateSettings")))
     if err:
         return err
 
@@ -3227,7 +3240,10 @@ def _update_user_pool(data):
         err = _custom_sender_key_error(data["LambdaConfig"])
         if err:
             return err
-    err = _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+    err = _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration")) or _update_settings_error(
+        # Measured: an omitted AutoVerifiedAttributes counts as none, an omitted setting as the stored one.
+        data.get("AutoVerifiedAttributes", []),
+        data.get("UserAttributeUpdateSettings", pool.get("UserAttributeUpdateSettings")))
     if err:
         return err
     # An omitted tier keeps the pool's plan; omitted add-ons stay out of the check, AWS resets them.
@@ -4455,7 +4471,7 @@ def _deliver_invitation_email(pool, username, attr_dict, subject, body, sender=N
     )
 
 
-def _send_verification_email(pool, username, attr_dict, code, attribute_name="email", sender=None):
+def _send_verification_email(pool, username, attr_dict, code, attribute_name="email", sender=None, by_link=None):
     email = (attr_dict or {}).get("email")
     if not email:
         return None
@@ -4463,9 +4479,10 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
         return None
     # CONFIRM_WITH_LINK means body uses {##...##} link placeholder; we still
     # interpolate {####} as the verification code for compatibility.
-    by_link = (pool.get("VerificationMessageTemplate") or {}).get(
-        "DefaultEmailOption"
-    ) == "CONFIRM_WITH_LINK"
+    if by_link is None:
+        by_link = (pool.get("VerificationMessageTemplate") or {}).get(
+            "DefaultEmailOption"
+        ) == "CONFIRM_WITH_LINK"
     subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
     display = _template_username(pool, username, attr_dict)
     subject = _expand_template(subject_tpl, display, code)
@@ -4930,10 +4947,9 @@ def _admin_update_user_attributes(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["Attributes"] = _merge_attributes(
-        user.get("Attributes", []),
-        data.get("UserAttributes", []),
-    )
+    _sent, err = _apply_attribute_update(pool, user, data.get("UserAttributes", []), None, data.get("ClientMetadata"))
+    if err:
+        return err
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
 
@@ -6272,7 +6288,15 @@ def _code_error(issued, code):
 
 
 def _confirmation_code_error(action: str, data: dict):
-    """The error for a ConfirmSignUp or ConfirmForgotPassword the issued code does not allow, or None."""
+    """The error for a ConfirmSignUp, ConfirmForgotPassword or VerifyUserAttribute the issued code does not allow, or None."""
+    if action == "VerifyUserAttribute":
+        user, _pool = _user_pool_for_access_token(data.get("AccessToken", ""))
+        attr = data.get("AttributeName")
+        if (not user or attr not in _VERIFIABLE_ATTRIBUTES
+                or not (_attr_list_to_dict(user.get("Attributes", [])).get(attr)
+                        or (user.get("_pending_attributes") or {}).get(attr))):
+            return None
+        return _code_error((user.get("_attribute_codes") or {}).get(attr), data.get("Code"))
     if action not in ("ConfirmSignUp", "ConfirmForgotPassword"):
         return None
     pool, _pid = _pool_for_client(data.get("ClientId"))
@@ -6444,15 +6468,168 @@ def _update_user_attributes(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    user, _pool = _user_pool_for_access_token(access_token)
+    user, pool = _user_pool_for_access_token(access_token)
     if not user:
         return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
-    user["Attributes"] = _merge_attributes(
-        user.get("Attributes", []),
-        data.get("UserAttributes", []),
-    )
+    updates = data.get("UserAttributes", [])
+    verified = next((u["Name"] for u in updates if u.get("Name") in ("email_verified", "phone_number_verified")), None)
+    if verified:
+        return error_response_json("InvalidParameterException", f"Cannot modify the non-mutable attribute {verified}", 400)
+    sent, err = _apply_attribute_update(pool, user, updates,
+                                        _token_claims(access_token).get("client_id"), data.get("ClientMetadata"))
+    if err:
+        return err
     user["UserLastModifiedDate"] = _now_epoch()
-    return json_response({"CodeDeliveryDetailsList": []})
+    if not sent:
+        return json_response({})
+    return json_response({"CodeDeliveryDetailsList": [_code_delivery(attribute, value) for attribute, value in sent]})
+
+
+_VERIFIABLE_ATTRIBUTES = ("email", "phone_number")
+_ATTRIBUTE_VERIFICATION_CODE = "123456"
+
+
+def _alias_key(pool, value):
+    if (pool.get("UsernameConfiguration") or {}).get("CaseSensitive") is False:
+        return value.lower()
+    return value
+
+
+def _alias_taken(pool, user, attribute, value):
+    """Another user in a pool that signs in by this attribute already holds the value, verified or not."""
+    if attribute not in (pool.get("UsernameAttributes") or []):
+        return False
+    wanted = _alias_key(pool, value)
+    return any(other is not user and _alias_key(pool, _attr_list_to_dict(other.get("Attributes", [])).get(attribute) or "") == wanted
+               for other in pool["_users"].values())
+
+
+def _alias_exists(attribute):
+    return error_response_json("AliasExistsException", f"An account with the given {attribute} already exists.", 400)
+
+
+def _is_true(value):
+    return str(value or "").lower() == "true"
+
+
+def _take_email_alias(pool, user, email):
+    """In a pool with an email alias, the address a user has just verified stops being verified for anyone else."""
+    if "email" not in (pool.get("AliasAttributes") or []):
+        return
+    for other in pool["_users"].values():
+        attrs = _attr_list_to_dict(other.get("Attributes", []))
+        if other is not user and attrs.get("email") == email and _is_true(attrs.get("email_verified")):
+            other["Attributes"] = _merge_attributes(other["Attributes"], [{"Name": "email_verified", "Value": "false"}])
+
+
+def _apply_attribute_update(pool, user, updates, client_id, client_metadata):
+    """Merge an attribute update. Returns ((attribute, value) for each code sent; an error).
+
+    A changed email or phone number is unverified until verified, unless an
+    admin's update sets it verified, and a pool that auto-verifies it sends the
+    new value a code, which replaces any earlier one. An attribute in
+    AttributesRequireVerificationBeforeUpdate keeps its old value, which still
+    signs in, until the new one is verified. The pending value and its code
+    outlive a later change back and an admin's verified update; a later change
+    replaces them. The other attributes apply at once.
+    """
+    current = _attr_list_to_dict(user.get("Attributes", []))
+    given = _attr_list_to_dict(updates)
+    kept = set((pool.get("UserAttributeUpdateSettings") or {}).get("AttributesRequireVerificationBeforeUpdate") or [])
+    marked = {a for a in _VERIFIABLE_ATTRIBUTES if _is_true(given.get(f"{a}_verified"))}
+    changed = [a for a in _VERIFIABLE_ATTRIBUTES if given.get(a) and given[a] != current.get(a)]
+    held = {a for a in changed if a in kept and a not in marked}
+    taken = next((a for a in changed if a not in held and _alias_taken(pool, user, a, given[a])), None)
+    if taken:
+        return None, _alias_exists(taken)
+    merged = [u for u in updates if u.get("Name") not in held]
+    merged += [{"Name": f"{a}_verified", "Value": "false"} for a in changed if a not in held and a not in marked]
+    user["Attributes"] = _merge_attributes(user.get("Attributes", []), merged)
+    if "email" in marked:
+        _take_email_alias(pool, user, _attr_list_to_dict(user["Attributes"]).get("email"))
+    pending = user.setdefault("_pending_attributes", {})
+    codes = user.setdefault("_attribute_codes", {})
+    code_for = user.setdefault("_attribute_code_for", {})
+    sent = []
+    for attribute in changed:
+        if attribute in held:
+            pending[attribute] = given[attribute]
+        elif attribute in kept:
+            continue
+        codes.pop(attribute, None)
+        if attribute in marked or attribute not in (pool.get("AutoVerifiedAttributes") or []):
+            continue
+        codes[attribute] = _ATTRIBUTE_VERIFICATION_CODE
+        code_for[attribute] = given[attribute]
+        sent.append((attribute, given[attribute]))
+        if attribute == "email":
+            # The code goes to the new address; a pending one leaves email_verified as it was.
+            attrs = {**_attr_list_to_dict(user["Attributes"]), "email": given["email"]}
+            _send_verification_email(pool, user["Username"], attrs, _ATTRIBUTE_VERIFICATION_CODE, by_link=False, sender={
+                "trigger": "UpdateUserAttribute", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+                "client_id": client_id, "client_metadata": client_metadata})
+    return sent, None
+
+
+def _get_user_attribute_verification_code(data):
+    access_token = data.get("AccessToken", "")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    attr = data.get("AttributeName")
+    if attr not in _VERIFIABLE_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException", "Invalid attribute name. Only phone_number and email can be verified.", 400)
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    if not attrs.get(attr):
+        message = ("User does not have a valid registered phone number" if attr == "phone_number"
+                   else "User does not have a valid registered email")
+        return error_response_json("InvalidParameterException", message, 400)
+    if attr == "phone_number" and not pool.get("SmsConfiguration"):
+        return error_response_json("InvalidParameterException", (
+            "Invalid phone number provided/Unable to send the message. User pool does not have SMS configuration "
+            "to send messages."), 400)
+    # A code requested while a change is pending is for the current value, and replaces the pending one's.
+    user.setdefault("_attribute_codes", {})[attr] = _ATTRIBUTE_VERIFICATION_CODE
+    user.setdefault("_attribute_code_for", {})[attr] = attrs[attr]
+    if attr == "email":
+        _send_verification_email(pool, user["Username"], attrs, _ATTRIBUTE_VERIFICATION_CODE, by_link=False, sender={
+            "trigger": "VerifyUserAttribute", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": _token_claims(access_token).get("client_id"), "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attr, attrs[attr])})
+
+
+def _verify_user_attribute(data):
+    """Mark the attribute verified, and move a pending value to the one its code went to.
+    The code itself is checked only with AUTH=true, as for ConfirmSignUp."""
+    access_token = data.get("AccessToken", "")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    attr = data.get("AttributeName")
+    if attr not in _VERIFIABLE_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException", "Invalid attribute name. Only phone_number and email can be verified.", 400)
+    pending = (user.get("_pending_attributes") or {}).get(attr)
+    if not (_attr_list_to_dict(user.get("Attributes", [])).get(attr) or pending):
+        return error_response_json(
+            "InvalidParameterException", f"Unable to verify attribute: {attr} no value set to verify", 400)
+    moving = pending and (user.get("_attribute_code_for") or {}).get(attr) == pending
+    if moving and _alias_taken(pool, user, attr, pending):
+        return _alias_exists(attr)
+    (user.get("_attribute_codes") or {}).pop(attr, None)
+    updates = [{"Name": f"{attr}_verified", "Value": "true"}]
+    if moving:
+        updates.append({"Name": attr, "Value": user["_pending_attributes"].pop(attr)})
+    user["Attributes"] = _merge_attributes(user.get("Attributes", []), updates)
+    if attr == "email":
+        _take_email_alias(pool, user, _attr_list_to_dict(user["Attributes"]).get("email"))
+    user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({})
 
 
 def _delete_user(data):
