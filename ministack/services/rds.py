@@ -1367,7 +1367,10 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     try:
         container = _run_rds_container(
             docker_client, engine, container_kwargs,
-            tls_names=list(endpoint_aliases) + [container_kwargs.get("name") or ""],
+            # The first name becomes the CN, so the global name goes last.
+            tls_names=list(endpoint_aliases)
+            + [container_kwargs.get("name") or ""]
+            + (_global_member_certificate_names(cluster) if aliasable else []),
         )
     except Exception as e:
         cluster["_shared_container_ready"] = False
@@ -1600,7 +1603,8 @@ def _start_pg_reader_container(db_id, cluster):
         container = _run_rds_container(
             docker_client, engine, container_kwargs,
             tls_names=_cluster_endpoint_aliases(cluster)
-            + [container_kwargs.get("name") or ""],
+            + [container_kwargs.get("name") or ""]
+            + _global_member_certificate_names(cluster),
         )
     except Exception as e:
         logger.warning(
@@ -4135,6 +4139,19 @@ def _global_writer_endpoint_aliases(cluster):
     """
     global_cluster, member = _global_cluster_member_for_cluster(cluster)
     if global_cluster and member and member.get("IsWriter"):
+        return [_global_cluster_endpoint(global_cluster)]
+    return []
+
+
+def _global_member_certificate_names(cluster):
+    """The global endpoint, while this cluster is any member of a global cluster.
+
+    On AWS every member's server certificate lists it, the writer's and a
+    secondary's alike, and a switchover does not reissue it, so the name goes
+    into the certificate at launch whatever the member's role.
+    """
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if global_cluster and member:
         return [_global_cluster_endpoint(global_cluster)]
     return []
 

@@ -10587,6 +10587,153 @@ def test_sfn_inline_map_field_error_names_the_maps_own_entered_event(sfn):
                            "ExecutionFailed"]
 
 
+# The input of the AWS ItemBatcher cases. Item 3 is the only item with fail=true.
+_BATCHER_ITEMS = [
+    {"id": 1, "fail": False, "pad": "a" * 10},
+    {"id": 2, "fail": False, "pad": "b" * 30},
+    {"id": 3, "fail": True, "pad": "c" * 50},
+    {"id": 4, "fail": False, "pad": "d" * 10},
+    {"id": 5, "fail": False, "pad": "e" * 70},
+]
+_BATCHER_INPUT = {"org": "org-123", "batch_size": 2, "items": _BATCHER_ITEMS}
+# 3 strings of 40 bytes each as JSON, as in the AWS byte probes.
+_STR3 = ["a" * 38, "b" * 38, "c" * 38]
+
+
+def _run_batched_map(sfn, map_state, payload, query_language=None):
+    """Runs a DISTRIBUTED Map whose children return their input. Returns the execution and its Map Run."""
+    processor = {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"},
+                 "StartAt": "Echo", "States": {"Echo": {"Type": "Pass", "End": True}}}
+    definition = {"StartAt": "Map", "States": {"Map": {"ItemProcessor": processor, **map_state,
+                                                       "Type": "Map", "End": True}}}
+    if query_language:
+        definition["QueryLanguage"] = query_language
+    arn = sfn.create_state_machine(name=f"dmap-batcher-{_uuid_mod.uuid4().hex[:8]}", definition=json.dumps(definition),
+                                   roleArn="arn:aws:iam::000000000000:role/r")["stateMachineArn"]
+    execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(payload))["executionArn"]
+    desc = _wait_sfn(sfn, execution, timeout=20)
+    (map_run,) = sfn.list_map_runs(executionArn=execution)["mapRuns"]
+    return desc, sfn.describe_map_run(mapRunArn=map_run["mapRunArn"])
+
+
+def _batch_sizes(sfn, batcher, items, limit):
+    """The number of items in each batch, with MaxInputBytesPerBatchPath as in the AWS byte probes."""
+    map_state = {"ItemsPath": "$.items", "ItemBatcher": {**batcher, "MaxInputBytesPerBatchPath": "$.limit"}}
+    desc, _ = _run_batched_map(sfn, map_state, {"limit": limit, "items": items})
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    return [len(batch["Items"]) for batch in json.loads(desc["output"])]
+
+
+@pytest.mark.parametrize("batcher, batches", [
+    ({"MaxItemsPerBatch": 2}, [[1, 2], [3, 4], [5]]),
+    ({"MaxInputBytesPerBatch": 120}, [[1, 2], [3], [4], [5]]),
+], ids=["MaxItemsPerBatch", "MaxInputBytesPerBatch"])
+def test_sfn_item_batcher_batches_the_items(sfn, batcher, batches):
+    """AWS cases count and bytes: each child gets one batch, and the Map Run counts items and batches."""
+    desc, map_run = _run_batched_map(sfn, {"ItemsPath": "$.items", "ItemBatcher": batcher}, _BATCHER_INPUT)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert json.loads(desc["output"]) == [{"Items": [_BATCHER_ITEMS[i - 1] for i in batch]} for batch in batches]
+    assert (map_run["itemCounts"]["total"], map_run["itemCounts"]["succeeded"]) == (5, 5)
+    assert (map_run["executionCounts"]["total"], map_run["executionCounts"]["succeeded"]) == (len(batches),) * 2
+
+
+def test_sfn_item_batcher_adds_batch_input_to_each_batch(sfn):
+    """AWS case batchinput: ItemSelector runs on each item before batching, with the index in the full list."""
+    map_state = {"ItemsPath": "$.items",
+                 "ItemSelector": {"id.$": "$$.Map.Item.Value.id", "index.$": "$$.Map.Item.Index", "org.$": "$.org"},
+                 "ItemBatcher": {"MaxItemsPerBatchPath": "$.batch_size",
+                                 "BatchInput": {"organization_id.$": "$.org", "static": "fixed-value"}}}
+    desc, _ = _run_batched_map(sfn, map_state, _BATCHER_INPUT)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    selected = [{"id": i + 1, "index": i, "org": "org-123"} for i in range(5)]
+    batch_input = {"organization_id": "org-123", "static": "fixed-value"}
+    assert json.loads(desc["output"]) == [{"BatchInput": batch_input, "Items": selected[0:2]},
+                                          {"BatchInput": batch_input, "Items": selected[2:4]},
+                                          {"BatchInput": batch_input, "Items": selected[4:]}]
+
+
+@pytest.mark.parametrize("batcher, items, limit, sizes", [
+    ({}, _STR3, 92, [1, 1, 1]),
+    ({}, _STR3, 93, [2, 1]),
+    ({}, _STR3, 133, [2, 1]),
+    ({}, _STR3, 134, [3]),
+    ({"BatchInput": {"note": "n" * 50}}, _STR3[:2], 167, [1, 1]),
+    ({"BatchInput": {"note": "n" * 50}}, _STR3[:2], 168, [2]),
+    ({}, ["é" * 19] * 2, 60, [1, 1]),
+    ({}, ["é" * 19] * 2, 98, [2]),
+    ({}, [{f"k{i}": i for i in range(10)}] * 2, 160, [2]),
+], ids=["str3-92", "str3-93", "str3-133", "str3-134", "bi2-167", "bi2-168", "utf8-60", "utf8-98", "ws-160"])
+def test_sfn_item_batcher_counts_the_compact_utf8_bytes_of_the_child_input(sfn, batcher, items, limit, sizes):
+    """AWS byte probes: the size is the compact UTF-8 JSON of the child input, with the envelope and BatchInput."""
+    assert _batch_sizes(sfn, batcher, items, limit) == sizes
+
+
+def test_sfn_item_batcher_puts_an_oversize_item_in_its_own_batch(sfn):
+    """AWS probe oversize: the 100-byte item gets a batch by itself, and the Map does not fail."""
+    assert _batch_sizes(sfn, {}, ["a" * 38, "b" * 98, "c" * 38], 90) == [1, 1, 1]
+
+
+@pytest.mark.parametrize("limit, sizes", [(70, [1, 1, 1]), (200, [2, 1])], ids=["bytes-70", "items-200"])
+def test_sfn_item_batcher_applies_the_lower_of_both_limits(sfn, limit, sizes):
+    """AWS probe both: with MaxItemsPerBatch and MaxInputBytesPerBatch, the lower limit ends the batch."""
+    assert _batch_sizes(sfn, {"MaxItemsPerBatch": 2}, _STR3, limit) == sizes
+
+
+@pytest.mark.parametrize("tolerance", [{"ToleratedFailureCount": 1}, {"ToleratedFailurePercentage": 35}],
+                         ids=["ToleratedFailureCount", "ToleratedFailurePercentage"])
+def test_sfn_item_batcher_failure_tolerance_counts_items(sfn, tolerance):
+    """AWS cases failure and percent: one failed batch of 2 is 2 of 5 failed items (40%), not 1 of 3 batches (33%)."""
+    processor = {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"}, "StartAt": "Decide",
+                 "States": {"Decide": {"Type": "Choice", "Default": "Echo", "Choices": [
+                                {"Variable": "$.Items[0].fail", "BooleanEquals": True, "Next": "Boom"}]},
+                            "Boom": {"Type": "Fail", "Error": "ProofItemFailed", "Cause": "fail=true"},
+                            "Echo": {"Type": "Pass", "End": True}}}
+    map_state = {"ItemsPath": "$.items", "ItemBatcher": {"MaxItemsPerBatch": 2}, **tolerance,
+                 "ItemProcessor": processor}
+    desc, map_run = _run_batched_map(sfn, map_state, _BATCHER_INPUT)
+    assert (desc["status"], desc["error"]) == ("FAILED", "States.ExceedToleratedFailureThreshold")
+    assert map_run["status"] == "FAILED"
+    counts = {k: (map_run[k]["total"], map_run[k]["succeeded"], map_run[k]["failed"])
+              for k in ("itemCounts", "executionCounts")}
+    assert counts == {"itemCounts": (5, 3, 2), "executionCounts": (3, 2, 1)}
+
+
+def test_sfn_jsonata_item_batcher_evaluates_its_fields(sfn):
+    """AWS case jsonata: JSONata MaxItemsPerBatch and BatchInput, and a batched child's context has no Map key."""
+    processor = {"ProcessorConfig": {"Mode": "DISTRIBUTED", "ExecutionType": "STANDARD"}, "StartAt": "Echo",
+                 "States": {"Echo": {"Type": "Pass", "End": True,
+                                     "Output": '{% {"input": $states.input, "context": $states.context} %}'}}}
+    map_state = {"Items": "{% $states.input.items %}", "ItemProcessor": processor,
+                 "ItemBatcher": {"MaxItemsPerBatch": "{% $states.input.batch_size %}",
+                                 "BatchInput": {"organization_id": "{% $states.input.org %}", "static": "fixed-value"}}}
+    desc, _ = _run_batched_map(sfn, map_state, _BATCHER_INPUT, query_language="JSONata")
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    results = json.loads(desc["output"])
+    batch_input = {"organization_id": "org-123", "static": "fixed-value"}
+    assert [r["input"] for r in results] == [{"BatchInput": batch_input, "Items": _BATCHER_ITEMS[0:2]},
+                                             {"BatchInput": batch_input, "Items": _BATCHER_ITEMS[2:4]},
+                                             {"BatchInput": batch_input, "Items": _BATCHER_ITEMS[4:]}]
+    assert not any("Map" in r["context"] for r in results)
+
+
+def test_sfn_item_batcher_measures_the_items_after_the_item_selector(sfn):
+    """AWS case selector-bytes: the selected items need 56 bytes, so all 5 fit. The original items need 5 batches."""
+    map_state = {"ItemsPath": "$.items", "ItemSelector": {"id.$": "$$.Map.Item.Value.id"},
+                 "ItemBatcher": {"MaxInputBytesPerBatch": 60}}
+    desc, _ = _run_batched_map(sfn, map_state, _BATCHER_INPUT)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert json.loads(desc["output"]) == [{"Items": [{"id": i} for i in range(1, 6)]}]
+
+
+def test_sfn_jsonata_item_batcher_evaluates_the_byte_limit(sfn):
+    """AWS case jsonata-bytes: a JSONata MaxInputBytesPerBatch of 120 gives the same batches as the value 120."""
+    map_state = {"Items": "{% $states.input.items %}",
+                 "ItemBatcher": {"MaxInputBytesPerBatch": "{% $states.input.batch_size * 60 %}"}}
+    desc, _ = _run_batched_map(sfn, map_state, _BATCHER_INPUT, query_language="JSONata")
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert [[item["id"] for item in batch["Items"]] for batch in json.loads(desc["output"])] == [[1, 2], [3], [4], [5]]
+
+
 def _history(sfn, definition):
     arn = sfn.create_state_machine(name=f"sfn-inner-events-{_uuid_mod.uuid4().hex[:8]}",
                                    definition=json.dumps(definition),
