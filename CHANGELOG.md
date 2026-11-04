@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **API Gateway — an imported OpenAPI document keeps its path parameters** — `ImportRestApi`, `PutRestApi` and an `AWS::ApiGateway::RestApi` `Body` ignored an operation's `parameters`, so the method had no `requestParameters`. Each path parameter now becomes `method.request.path.<name>`, as on AWS.
 - **Aurora DSQL — the backend Postgres is no longer published on every interface** — with `DSQL_STRICT=1` each cluster's backing Postgres container (trust auth, `postgres` superuser, no password) was published on `0.0.0.0` and `::`, so anyone on the same network could read and change the database directly, bypassing the proxy, even when MiniStack's own ports are bound to `127.0.0.1`. A containerised MiniStack reaches the backend over its Docker network, so the port is no longer published; a MiniStack running on the host publishes it on `127.0.0.1` only. Contributed by @toby6578.
 
 ## [1.5.37] — 2026-11-03
