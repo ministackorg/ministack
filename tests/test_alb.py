@@ -3406,10 +3406,10 @@ def test_elbv2_dataplane_reaches_load_balancer_in_any_tenant(account, region):
         teardown()
 
 
-def test_elbv2_dataplane_name_in_two_tenants_resolves_in_the_callers_tenant():
-    """A name used in the caller's tenant and in another account reaches the caller's own
-    load balancer by name; the other one stays reachable by its DNSName, and by name once
-    the caller's is gone (#2581)."""
+def test_elbv2_dataplane_name_in_two_tenants_resolves_in_the_default_tenant_first():
+    """An unsigned request runs as the default account and region. A name used there and in
+    another account reaches the default tenant's load balancer by name; the other stays
+    reachable by its DNSName, and by name once the default tenant's is gone (#2581)."""
     name = f"dpd-{_uuid_mod.uuid4().hex[:8]}"
     other_lb, other_teardown = _create_tenant_alb("111122223333", "us-east-1", name, "other")
     try:

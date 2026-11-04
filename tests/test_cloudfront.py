@@ -6386,6 +6386,28 @@ def test_registered_alb_origin_is_served_through_its_listener_rules(cloudfront, 
     assert (status, body) == (403, b"denied")
 
 
+def test_registered_alb_origin_in_another_region_is_served_through_its_listener(cloudfront):
+    """An origin naming a load balancer in another region than the distribution's reaches
+    that load balancer's listener (#2581)."""
+    import boto3
+
+    elbv2 = boto3.client("elbv2", endpoint_url=ENDPOINT, region_name="us-east-2",
+                         aws_access_key_id="test", aws_secret_access_key="test")
+    lb = elbv2.create_load_balancer(Name=f"cf-alb2-{_uuid_mod.uuid4().hex[:8]}")["LoadBalancers"][0]
+    try:
+        listener_arn = elbv2.create_listener(
+            LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+            DefaultActions=[_alb_fixed("200", "alb-in-us-east-2")],
+        )["Listeners"][0]["ListenerArn"]
+        try:
+            status, _headers, body = _get(_alb_origin_dist(cloudfront, lb["DNSName"], 80, []), "/anything")
+            assert (status, body) == (200, b"alb-in-us-east-2")
+        finally:
+            elbv2.delete_listener(ListenerArn=listener_arn)
+    finally:
+        elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+
+
 def test_registered_alb_origin_without_a_listener_on_the_origin_port_answers_502(cloudfront, alb_origin):
     dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 8080, [])
     status, headers, _body = _get(dist_host, "/anything")

@@ -1609,8 +1609,9 @@ async def handle_request(method, path, headers, body, query_params):
 def _lbs_in_every_tenant():
     """Every load balancer in every account and region, for the unsigned data plane.
 
-    The caller's own tenant comes first, so a name that exists in several tenants
-    resolves there; the rest follow in the order they were stored.
+    The request's own tenant comes first (for an unsigned request, the default account
+    and MINISTACK_REGION), so a name that exists in several tenants resolves there; the
+    rest follow in the order MiniStack stored them.
     """
     own = (get_account_id(), get_region())
     items = _lbs.all_items()
@@ -2514,12 +2515,22 @@ def _with_alb_server(response, listener_arn=None):
     return status, {**headers, "Server": "awselb/2.0"}, body
 
 
+def _lb_scope(lb):
+    """Pins the load balancer's own account and region. A data-plane request may have found it
+    in another tenant; its listeners, rules and target groups live in its own."""
+    owner = parse_arn(lb["LoadBalancerArn"])
+    return request_scope(owner.account_id, owner.region)
+
+
+def listeners_of(lb):
+    """The load balancer's listeners, read in its own account and region."""
+    with _lb_scope(lb):
+        return [l for l in _listeners.values() if l["LoadBalancerArn"] == lb["LoadBalancerArn"]]
+
+
 async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
                            raw_query_string=None, raw_path=None):
-    # The request may have found the load balancer in another tenant; its listeners,
-    # rules and target groups live in the load balancer's own account and region.
-    owner = parse_arn(lb["LoadBalancerArn"])
-    with request_scope(owner.account_id, owner.region):
+    with _lb_scope(lb):
         return await _dispatch_request(lb, method, path, headers, body, query_params, port, client_ip,
                                        raw_query_string, raw_path)
 
