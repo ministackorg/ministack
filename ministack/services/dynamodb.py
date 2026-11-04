@@ -3701,7 +3701,7 @@ def _partiql_update(table, parsed, data=None):
                 result = _pq_eval(value, work)
             if result is None:
                 return error_response_json("ValidationException", _PARTIQL_BAD_PATH, 400)
-            err_msg = _partiql_set_path(work, parts, result)
+            err_msg = _partiql_set_path(work, parts, _copy_attribute_value(result))
             if err_msg:
                 return error_response_json("ValidationException", err_msg, 400)
             applied_paths.append(parts)
@@ -7043,6 +7043,19 @@ def _apply_update_expression(item, expr, attr_values, attr_names, updated_attrs=
     return item, updated_attrs
 
 
+def _copy_attribute_value(value):
+    """A copy of an AttributeValue that shares nothing, with itself or the
+    original. A value SET at several paths (`SET a = :v, b = :v`,
+    `list_append(:l, :l)`) must be stored as independent values.
+    copy.deepcopy can't be used here: its memo turns one object used twice
+    into one copy used twice."""
+    if isinstance(value, dict):
+        return {k: _copy_attribute_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_copy_attribute_value(v) for v in value]
+    return value
+
+
 def _apply_set(item, tokens, attr_values, attr_names, updated_attrs):
     # AWS semantics: all RHS references resolve against the pre-update snapshot
     # of the item. Resolve every value first, then apply assignments — so
@@ -7070,7 +7083,7 @@ def _apply_set(item, tokens, attr_values, attr_names, updated_attrs):
             pending.append((path_parts, value))
             updated_attrs.add(tuple(path_parts))
     for path_parts, value in pending:
-        _set_at_path(item, path_parts, value)
+        _set_at_path(item, path_parts, _copy_attribute_value(value))
 
 
 def _eval_set_value(tokens, item, attr_values, attr_names):
