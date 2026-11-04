@@ -45,6 +45,7 @@ from ministack.core.responses import (
     get_region,
     get_request_client_ip,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("alb")
@@ -1605,9 +1606,21 @@ async def handle_request(method, path, headers, body, query_params):
 # Data-plane: host/name lookup
 # ---------------------------------------------------------------------------
 
+def _lbs_in_every_tenant():
+    """Every load balancer in every account and region, for the unsigned data plane.
+
+    The caller's own tenant comes first, so a name that exists in several tenants
+    resolves there; the rest follow in the order they were stored.
+    """
+    own = (get_account_id(), get_region())
+    items = _lbs.all_items()
+    return ([lb for (account, region, _), lb in items if (account, region) == own]
+            + [lb for (account, region, _), lb in items if (account, region) != own])
+
+
 def find_lb_for_host(host):
     hostname = host.split(":")[0].lower()
-    for lb in _lbs.values():
+    for lb in _lbs_in_every_tenant():
         if lb["DNSName"].lower() == hostname:
             return lb
         if hostname == f"{lb['LoadBalancerName'].lower()}.alb.localhost":
@@ -1652,7 +1665,7 @@ def _find_lb_for_alias_record(hostname):
 
 def _find_lb_by_name(name):
     name_lc = name.lower()
-    for lb in _lbs.values():
+    for lb in _lbs_in_every_tenant():
         if lb["LoadBalancerName"].lower() == name_lc:
             return lb
     return None
@@ -2503,6 +2516,16 @@ def _with_alb_server(response, listener_arn=None):
 
 async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
                            raw_query_string=None, raw_path=None):
+    # The request may have found the load balancer in another tenant; its listeners,
+    # rules and target groups live in the load balancer's own account and region.
+    owner = parse_arn(lb["LoadBalancerArn"])
+    with request_scope(owner.account_id, owner.region):
+        return await _dispatch_request(lb, method, path, headers, body, query_params, port, client_ip,
+                                       raw_query_string, raw_path)
+
+
+async def _dispatch_request(lb, method, path, headers, body, query_params, port, client_ip,
+                            raw_query_string, raw_path):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
