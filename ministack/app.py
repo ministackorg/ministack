@@ -1047,6 +1047,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, b"", query_params)
     if path == "/logout" and method == "GET":
         return _get_module("cognito").handle_logout(method, path, headers, query_params)
+    if path == "/forgotPassword" and method == "GET":
+        return _get_module("cognito").handle_forgot_password_page(method, path, headers, query_params)
     return None
 
 
