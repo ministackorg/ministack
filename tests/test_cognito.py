@@ -5465,6 +5465,144 @@ def test_oauth2_token_refresh_token():
     assert 'id_token' in resp2
 
 
+_RESOURCE = 'https://api.example.com/api/mcp/plugin'
+
+
+def _resource_code(client_id, resource):
+    """The authorization code a sign-in started with ?resource= gets, through the fields the sign-in page carries."""
+    _, _, page = _get(_authorize_url(client_id) + '&' + urllib.parse.urlencode({'resource': resource}))
+    carried = re.search(r'name="resource" value="([^"]*)"', page.decode('utf-8')).group(1)
+    return carried, _do_login_and_get_code(None, client_id, {'resource': html.unescape(carried)})
+
+
+def _resource_tokens(client_id, code, **extra):
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'authorization_code', 'code': code, 'client_id': client_id,
+        'redirect_uri': 'http://localhost:3000/callback', **extra})
+    return status, json.loads(body)
+
+
+def test_oauth2_resource_binds_the_access_token_audience_on_managed_login():
+    """Managed login (version 2) binds a registered RFC 8707 resource, sent to /authorize, to the access token's aud."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    client_id = client['ClientId']
+    try:
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=f'res-{pool_id[-8:].lower()}', ManagedLoginVersion=2)
+        cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier=_RESOURCE, Name='mcp')
+
+        carried, code = _resource_code(client_id, _RESOURCE)
+        assert carried == _RESOURCE
+        status, tokens = _resource_tokens(client_id, code, resource='https://other.example.com/')
+        assert status == 200
+        assert _decode_jwt_claims(tokens['access_token'])['aud'] == _RESOURCE
+        assert _decode_jwt_claims(tokens['id_token'])['aud'] == client_id
+
+        status, refreshed = _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'refresh_token', 'refresh_token': tokens['refresh_token'], 'client_id': client_id})[::2]
+        assert _decode_jwt_claims(json.loads(refreshed)['access_token'])['aud'] == _RESOURCE
+        api = cognito_idp.get_tokens_from_refresh_token(ClientId=client_id, RefreshToken=tokens['refresh_token'])
+        assert _decode_jwt_claims(api['AuthenticationResult']['AccessToken'])['aud'] == _RESOURCE
+
+        status, tokens = _resource_tokens(client_id, _do_login_and_get_code(None, client_id), resource=_RESOURCE)
+        assert 'aud' not in _decode_jwt_claims(tokens['access_token']), "a resource sent only to /oauth2/token is ignored"
+        status, refreshed = _post_form(f'{ENDPOINT}/oauth2/token', {
+            'grant_type': 'refresh_token', 'refresh_token': tokens['refresh_token'], 'client_id': client_id,
+            'resource': _RESOURCE})[::2]
+        assert 'aud' not in _decode_jwt_claims(json.loads(refreshed)['access_token'])
+
+        for unregistered in ('https://unregistered.example.com/x', _RESOURCE + '/'):
+            _, code = _resource_code(client_id, unregistered)
+            assert _resource_tokens(client_id, code) == (400, {'error': 'invalid_grant'})
+    finally:
+        cognito_idp.delete_user_pool_domain(UserPoolId=pool_id, Domain=f'res-{pool_id[-8:].lower()}')
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_oauth2_resource_follows_the_domain_the_request_names(cognito_idp):
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    client_id = client['ClientId']
+    prefix = f'dom-{pool_id[-8:].lower()}'
+    custom = f'{prefix}.example.com'
+    try:
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=prefix, ManagedLoginVersion=1)
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=custom, ManagedLoginVersion=2,
+                                            CustomDomainConfig={'CertificateArn': 'arn:aws:acm:us-east-1:000000000000:certificate/x'})
+        cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier=_RESOURCE, Name='mcp')
+        for host, bound in ((custom, True), (f'{prefix}.auth.us-east-1.amazoncognito.com', False)):
+            req = urllib.request.Request(
+                _authorize_url(client_id) + '&' + urllib.parse.urlencode({'resource': _RESOURCE}), headers={'Host': host})
+            page = urllib.request.urlopen(req).read().decode('utf-8')
+            carried = re.search(r'name="resource" value="([^"]*)"', page).group(1)
+            assert carried == (_RESOURCE if bound else ''), host
+    finally:
+        for domain in (prefix, custom):
+            cognito_idp.delete_user_pool_domain(UserPoolId=pool_id, Domain=domain)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_oauth2_resource_through_choice_based_sign_in(cognito_idp):
+    pool_id, client = _setup_pool_with_user(
+        cognito_idp, generate_secret=False, explicit_auth_flows=['ALLOW_USER_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'])
+    client_id = client['ClientId']
+    domain = f'cb-{pool_id[-8:].lower()}'
+    try:
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=domain, ManagedLoginVersion=2)
+        cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier=_RESOURCE, Name='mcp')
+        _, _, page = _get(_authorize_url(client_id) + '&' + urllib.parse.urlencode({'resource': _RESOURCE}))
+        fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', page.decode('utf-8')))
+        assert fields['resource'] == _RESOURCE
+        status, _, body = _post_form(f'{ENDPOINT}/login', {**{k: html.unescape(v) for k, v in fields.items()},
+                                                          'username': 'testuser'})
+        ua_token = _extract_ua_token(body.decode('utf-8'))
+        status, headers, _ = _post_form(f'{ENDPOINT}/login', {'ua_token': ua_token, 'challenge': 'PASSWORD',
+                                                              'password': 'TestPass1!'}, follow_redirects=False)
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(headers['location']).query)['code'][0]
+        assert _decode_jwt_claims(_resource_tokens(client_id, code)[1]['access_token'])['aud'] == _RESOURCE
+    finally:
+        cognito_idp.delete_user_pool_domain(UserPoolId=pool_id, Domain=domain)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_oauth2_resource_survives_the_hosted_totp_challenge(cognito_idp):
+    pool_id, client_id = _totp_pool(cognito_idp)
+    domain = f'mfa-{pool_id[-8:].lower()}'
+    try:
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=domain, ManagedLoginVersion=2)
+        cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier=_RESOURCE, Name='mcp')
+        secret = _enrol_totp_by_api(cognito_idp, client_id)
+        status, _, body = _post_form(f'{ENDPOINT}/login', {
+            **_hosted_oauth(client_id), 'resource': _RESOURCE, 'username': 'testuser', 'password': 'TestPass1!'},
+            follow_redirects=False)
+        mfa_token = _hidden(body.decode(), 'mfa_token')
+        status, headers, _ = _hosted_mfa(mfa_token, client_id, authentication_code=_totp_code(secret))
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(headers['location']).query)['code'][0]
+        assert _decode_jwt_claims(_resource_tokens(client_id, code)[1]['access_token'])['aud'] == _RESOURCE
+    finally:
+        cognito_idp.delete_user_pool_domain(UserPoolId=pool_id, Domain=domain)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_oauth2_resource_is_ignored_by_the_classic_hosted_ui():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    client_id = client['ClientId']
+    try:
+        cognito_idp.create_user_pool_domain(UserPoolId=pool_id, Domain=f'cls-{pool_id[-8:].lower()}', ManagedLoginVersion=1)
+        cognito_idp.create_resource_server(UserPoolId=pool_id, Identifier=_RESOURCE, Name='mcp')
+        for resource in (_RESOURCE, 'https://unregistered.example.com/x'):
+            carried, code = _resource_code(client_id, resource)
+            assert carried == ''
+            status, tokens = _resource_tokens(client_id, code)
+            assert status == 200
+            assert 'aud' not in _decode_jwt_claims(tokens['access_token'])
+            posted = _do_login_and_get_code(None, client_id, {'resource': resource})
+            assert 'aud' not in _decode_jwt_claims(_resource_tokens(client_id, posted)[1]['access_token'])
+    finally:
+        cognito_idp.delete_user_pool_domain(UserPoolId=pool_id, Domain=f'cls-{pool_id[-8:].lower()}')
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
 def _scoped_code_client(cognito_idp, scopes):
     """A pool with testuser and a code-flow client allowing *scopes* (resource servers api and zeta)."""
     pool_id, _ = _setup_pool_with_user(cognito_idp, generate_secret=False)
