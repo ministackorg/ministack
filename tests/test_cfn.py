@@ -8261,7 +8261,8 @@ def test_cfn_efs_create(cfn, efs):
         {"TransitionToIA": "AFTER_30_DAYS"}]
     assert efs.describe_backup_policy(FileSystemId=fs_id)["BackupPolicy"]["Status"] == "ENABLED"
     stored_policy = json.loads(efs.describe_file_system_policy(FileSystemId=fs_id)["Policy"])
-    assert stored_policy["Statement"][0]["Action"] == _EFS_POLICY["Statement"][0]["Action"]
+    # AWS stores a one-element Action list as the string (real AWS capture p1-put-unicode, #2578).
+    assert stored_policy["Statement"][0]["Action"] == "elasticfilesystem:ClientMount"
     assert stored_policy["Statement"][0]["Resource"] == out["FsArn"]
     assert fs["FileSystemProtection"]["ReplicationOverwriteProtection"] == "ENABLED"
 
