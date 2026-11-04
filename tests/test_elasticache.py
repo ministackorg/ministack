@@ -11,6 +11,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 from ministack.services import elasticache
 from ministack.services.elasticache import _engine_image_and_port
@@ -157,7 +158,7 @@ def test_elasticache_user_crud(ec):
 def test_elasticache_user_group_crud(ec):
     ec.create_user(
         UserId="ug-usr-1",
-        UserName="ug-usr-1",
+        UserName="default",
         Engine="redis",
         AccessString="on ~* +@all",
         NoPasswordRequired=True,
@@ -566,7 +567,7 @@ def test_elasticache_users_and_user_groups_are_region_scoped():
     for client in (east, west):
         client.create_user(
             UserId=user_id,
-            UserName=user_id,
+            UserName="default",
             Engine="redis",
             AccessString="on ~* +@all",
             NoPasswordRequired=True,
@@ -600,6 +601,509 @@ def test_elasticache_users_and_user_groups_are_region_scoped():
                 client.delete_user(UserId=user_id)
             except ClientError:
                 pass
+
+
+_DEFAULT_USER_REQUIRED = {
+    "Type": "Sender", "Code": "DefaultUserRequired",
+    "Message": "Redis user group needs to contain a user with the user name default.",
+}
+
+
+def _assert_default_user_required(exc):
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == _DEFAULT_USER_REQUIRED
+
+
+@pytest.fixture
+def ec_users(ec):
+    """Users like the capture rounds': Redis IAM (three, and one created with Engine `Redis`), Redis `default` (two),
+    Redis `Default` (two), Valkey IAM and Valkey `default`. Yields their ids by role and deletes them, with any user group they joined."""
+    s = _uid()
+    ids = {k: f"dug-{k}-{s}" for k in ("r-iam", "r-iam2", "r-iam3", "r-def", "r-def2", "r-case", "r-case2", "up-iam", "v-iam", "v-def")}
+    names = {"r-def": "default", "r-def2": "default", "r-case": "Default", "r-case2": "Default", "v-def": "default"}
+    groups, created = [], []
+    try:
+        for k, uid in ids.items():
+            auth = ({"Type": "password", "Passwords": ["msc-capture-default-password-1"]} if k in names
+                    else {"Type": "iam"})
+            engine = {"r": "redis", "u": "Redis", "v": "valkey"}[k[0]]
+            ec.create_user(UserId=uid, UserName=names.get(k, uid), Engine=engine,
+                           AccessString="on ~* +@all", AuthenticationMode=auth)
+            created.append(uid)
+        yield ids, groups, s
+    finally:
+        for g in groups:
+            try:
+                ec.delete_user_group(UserGroupId=g)
+            except ClientError:
+                pass
+        for uid in created:
+            try:
+                ec.delete_user(UserId=uid)
+            except ClientError:
+                pass
+
+
+@pytest.mark.parametrize("key,engine,members", [
+    ("cug-r-no-default", "redis", ["r-iam"]),
+    ("cug-r-no-users", "redis", None),
+    ("cug-r-empty-list", "redis", []),
+    ("cug-r-case-default", "redis", ["r-case", "r-iam"]),
+    ("cug-engine-Redis", "Redis", ["r-iam"]),
+    ("cug-engine-REDIS", "REDIS", ["r-iam"]),
+    ("cug-r-upper-engine-iam-no-default", "redis", ["up-iam"]),
+])
+def test_create_redis_user_group_requires_default_user(ec, ec_users, key, engine, members):
+    """A Redis OSS user group needs a user named exactly `default`, whatever the case of `Engine`, and the
+    refused id stays free (real AWS, us-east-2: cug-r-no-default, cug-r-no-users, cug-r-empty-list,
+    cug-r-case-default, cug-engine-Redis, cug-engine-REDIS; a user created with Engine `Redis` counts
+    as a Redis user, cug-r-upper-engine-iam-no-default; the id is reused in cug-r-retry1-no-users then
+    cug-r-retry1-ok, and cug-r-retry2-iam-only then cug-r-retry2-ok)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "Engine": engine}
+    if members is not None:
+        params["UserIds"] = [ids[m] for m in members]
+    raw = make_client("elasticache", {"parameter_validation": False})  # the capture's empty UserIds
+    with pytest.raises(ClientError) as exc:
+        raw.create_user_group(**params)
+    _assert_default_user_required(exc)
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+
+
+def test_create_user_group_already_exists_before_default_user(ec, ec_users):
+    """An existing group id is refused before the default-user check
+    (real AWS, us-east-2: cug-r-ok, cug-r-duplicate-no-default)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-r-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    with pytest.raises(ClientError) as exc:
+        ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-iam"]])
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == {
+        "Type": "Sender", "Code": "UserGroupAlreadyExists",
+        "Message": f"User group {group_id} already exists. Please retry with another name.",
+    }
+
+
+@pytest.mark.parametrize("key,members", [
+    ("cug-v-no-default", ["v-iam"]),
+    ("cug-v-no-users", None),
+    ("cug-v-redis-default", ["r-def", "v-iam"]),
+])
+def test_create_valkey_user_group_needs_no_default_user(ec, ec_users, key, members):
+    """Valkey user groups are created without a Valkey user named `default`
+    (real AWS, us-east-2: cug-v-no-default, cug-v-no-users, cug-v-redis-default)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    params = {"UserGroupId": group_id, "Engine": "valkey"}
+    if members is not None:
+        params["UserIds"] = [ids[m] for m in members]
+    resp = ec.create_user_group(**params)
+    groups.append(group_id)
+    assert resp["UserGroupId"] == group_id
+    assert resp["UserIds"] == params.get("UserIds", [])
+
+
+@pytest.mark.parametrize("key,members,remove,add", [
+    ("mug-r-remove-default", ["r-def", "r-iam"], ["r-def"], []),
+    ("mug-r-remove-default-add-case", ["r-def", "r-iam"], ["r-def"], ["r-case"]),
+    ("mug-r-remove-default-add-iam2", ["r-def", "r-iam"], ["r-def"], ["r-iam2"]),
+    ("mug-r-remove-only-default", ["r-def"], ["r-def"], []),
+    ("mug-r-remove-default-and-member", ["r-def", "r-iam", "r-iam2"], ["r-def", "r-iam"], []),
+    ("mug-r-remove-all", ["r-def", "r-iam", "r-iam2"], ["r-def", "r-iam", "r-iam2"], []),
+    ("mug-r-remove-default-add-two", ["r-def", "r-iam"], ["r-def"], ["r-iam2", "r-iam3"]),
+])
+def test_modify_redis_user_group_keeps_default_user(ec, ec_users, key, members, remove, add):
+    """Removing a Redis group's `default` user is refused, also when it is the only user or another user
+    is added, also with other users or all of them removed, and the group is left as it was (real AWS,
+    us-east-2: mug-r-remove-default, mug-r-remove-default-add-case, then describe-ug-r-1 after mug-r-remove-iam
+    took out only the IAM user; round 2's mug-r-remove-default-add-iam2, mug-r-remove-only-default and their
+    describe-ug-r-1, describe-ug-r-only-1; round 3's mug-r-remove-default-and-member, mug-r-remove-all,
+    describe-ug-r3; round 4's mug-r-remove-default-add-two, describe-ug-r4)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-r-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids[m] for m in members])
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "UserIdsToRemove": [ids[m] for m in remove]}
+    if add:
+        params["UserIdsToAdd"] = [ids[m] for m in add]
+    with pytest.raises(ClientError) as exc:
+        ec.modify_user_group(**params)
+    _assert_default_user_required(exc)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert group["UserIds"] == [ids[m] for m in members]
+
+
+def test_modify_redis_user_group_with_default_user_left(ec, ec_users):
+    """Removing another user, or swapping one `default` user for another, is accepted
+    (real AWS, us-east-2: mug-r-remove-iam, describe-ug-r-1, mug-r-swap-default, describe-ug-r-2)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-r-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-iam"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def"]]
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToAdd=[ids["r-def2"]], UserIdsToRemove=[ids["r-def"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def2"]]
+
+
+def test_modify_upper_case_engine_user_group_keeps_default_user(ec, ec_users):
+    """A group created with Engine `REDIS` is a Redis group for the rule too (real AWS, us-east-2:
+    cug-REDIS-ok, mug-REDIS-remove-default, describe-ug-REDIS-after)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-upper-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="REDIS", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    with pytest.raises(ClientError) as exc:
+        ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+    _assert_default_user_required(exc)
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def"], ids["r-iam"]]
+
+
+def test_modify_attached_user_group_keeps_default_user(ec, ec_users):
+    """A group attached to a replication group is refused the same way and stays attached and unchanged
+    (real AWS, us-east-2, round6-replication-group.py: mug-attached-remove-default,
+    describe-ug-attached-after)."""
+    ids, groups, s = ec_users
+    group_id, rg_id = f"dug-ug-rg-{s}", f"dug-rg-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ministack test",
+                                Engine="redis", CacheNodeType="cache.t4g.micro", NumCacheClusters=1,
+                                TransitEncryptionEnabled=True, UserGroupIds=[group_id])
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+        _assert_default_user_required(exc)
+        group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+        assert group["UserIds"] == [ids["r-def"], ids["r-iam"]]
+        assert group["ReplicationGroups"] == [rg_id]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+
+
+def test_modify_serverless_attached_user_group_keeps_default_user(ec, ec_users):
+    """A group attached to a serverless cache is refused the same way and stays unchanged (real AWS,
+    us-east-2, round12-attached-cfn.py: mug-sl-remove-default, describe-after-mug-sl-remove-default)."""
+    ids, groups, s = ec_users
+    group_id, name = f"dug-{_uid()}-{s}", f"dug-sl-{_uid()}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="redis", MajorEngineVersion="7", UserGroupId=group_id)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+        _assert_default_user_required(exc)
+        assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-def"], ids["r-iam"]]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_modify_valkey_user_group_removes_default_user(ec, ec_users):
+    """A Valkey group's `default` user can be removed (real AWS, us-east-2: cug-v-ok, mug-v-remove-default,
+    describe-ug-v)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-ug-v-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="valkey", UserIds=[ids["v-def"], ids["v-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["v-def"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["v-iam"]]
+
+
+@pytest.mark.parametrize("key,engine,members,modify,code", [
+    ("cug-r-missing-user", "redis", ["missing"], None, "UserNotFound"),
+    ("cug-r-missing-user-with-default", "redis", ["r-def", "missing"], None, "UserNotFound"),
+    ("cug-r-same-id-twice", "redis", ["r-iam", "r-iam"], None, "InvalidParameterValue"),
+    ("cug-r-two-defaults", "redis", ["r-def", "r-def2"], None, None),
+    ("cug-r-two-case-defaults", "redis", ["r-case", "r-case2"], None, None),
+    ("cug-r-valkey-default", "redis", ["v-def", "r-iam"], None, None),
+    ("cug-no-engine", None, ["r-iam"], None, None),
+    ("mug-r-remove-default-and-missing", "redis", ["r-def", "r-iam"], {"UserIdsToRemove": ["r-def", "missing"]},
+     "InvalidParameterValue"),
+    ("mug-r-remove-default-add-missing", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["missing"], "UserIdsToRemove": ["r-def"]}, "UserNotFound"),
+    ("mug-r-remove-default-add-member", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["r-iam"], "UserIdsToRemove": ["r-def"]}, "InvalidParameterCombination"),
+    ("mug-r-remove-member-twice", "redis", ["r-def", "r-iam"], {"UserIdsToRemove": ["r-iam", "r-iam"]},
+     "InvalidParameterValue"),
+    ("mug-r-remove-default-twice", "redis", ["r-def", "r-iam"], {"UserIdsToRemove": ["r-def", "r-def"]},
+     "InvalidParameterValue"),
+    ("mug-r-remove-default-add-twice", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["r-iam2", "r-iam2"], "UserIdsToRemove": ["r-def"]}, "InvalidParameterValue"),
+    ("mug-r-remove-default-and-existing-non-member", "redis", ["r-def", "r-iam"],
+     {"UserIdsToRemove": ["r-def", "r-iam2"]}, "InvalidParameterValue"),
+    ("mug-r-remove-default-add-valkey-default", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["v-def"], "UserIdsToRemove": ["r-def"]}, None),
+    ("mug-r-remove-default-add-two-case", "redis", ["r-def", "r-iam"],
+     {"UserIdsToAdd": ["r-case", "r-case2"], "UserIdsToRemove": ["r-def"]}, None),
+])
+def test_redis_user_group_earlier_errors_come_before_default_user(ec, ec_users, key, engine, members, modify, code):
+    """AWS refuses these with another error before the default-user check (real AWS, us-east-2: the key
+    named). Where MiniStack emulates that error the call gets its code; MiniStack contract: where it
+    doesn't yet (code None), the call keeps MiniStack's earlier answer, 200, rather than DefaultUserRequired."""
+    ids, groups, s = ec_users
+    ids = {**ids, "missing": f"dug-missing-{s}"}
+    raw = make_client("elasticache", {"parameter_validation": False})
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "UserIds": [ids[m] for m in members]}
+    if engine:
+        params["Engine"] = engine
+    call, kwargs = raw.create_user_group, params
+    if modify:
+        ec.create_user_group(**params)
+        call, kwargs = raw.modify_user_group, {"UserGroupId": group_id,
+                                               **{k: [ids[m] for m in v] for k, v in modify.items()}}
+    if code is None:
+        assert call(**kwargs)["ResponseMetadata"]["HTTPStatusCode"] == 200
+    else:
+        with pytest.raises(ClientError) as exc:
+            call(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+
+
+@pytest.mark.parametrize("key,group_engine,engine", [
+    ("mug-engine-redis-remove-default", "redis", "redis"),
+    ("mug-engine-Redis-remove-default", "redis", "Redis"),
+    ("mug-engine-memcached-remove-default", "redis", "memcached"),
+    ("mug-r-engine-junk-remove-default", "redis", "not-an-engine"),
+    ("mug-v-engine-redis-remove-default", "valkey", "redis"),
+    ("mug-v-engine-memcached-remove-default", "valkey", "memcached"),
+    ("mug-v-engine-junk-remove-default", "valkey", "not-an-engine"),
+])
+def test_modify_user_group_engine_redis_keeps_default_user(ec, ec_users, key, group_engine, engine):
+    """Sending any Engine but `valkey` with the change keeps the rule, also on a Valkey group of Redis users,
+    and the group is left as it was, engine included (real AWS, us-east-2, rounds 7, 9, 10 and 11: the key
+    named and describe-after-<key>)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine=group_engine, UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    raw = make_client("elasticache", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw.modify_user_group(UserGroupId=group_id, Engine=engine, UserIdsToRemove=[ids["r-def"]])
+    _assert_default_user_required(exc)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == (group_engine, [ids["r-def"], ids["r-iam"]])
+
+
+@pytest.mark.parametrize("key,group_engine,engine,add,remove,after", [
+    ("mug-r-engine-valkey-add-user", "redis", "valkey", ["r-iam2"], [], ["r-def", "r-iam", "r-iam2"]),
+    ("mug-r-engine-valkey-remove-iam", "redis", "valkey", [], ["r-iam"], ["r-def"]),
+    ("mug-v-engine-redis-add-user", "valkey", "redis", ["r-iam2"], [], ["r-def", "r-iam", "r-iam2"]),
+    ("mug-v-engine-redis-remove-iam", "valkey", "redis", [], ["r-iam"], ["r-def"]),
+    ("mug-r-engine-valkey-add-Default", "redis", "valkey", ["r-case"], [], ["r-def", "r-iam", "r-case"]),
+    ("mug-r-engine-valkey-remove-all", "redis", "valkey", [], ["r-def", "r-iam"], []),
+])
+def test_modify_user_group_engine_change_with_other_users(ec, ec_users, key, group_engine, engine, add, remove,
+                                                          after):
+    """An engine change made together with adding or removing other users is applied with them, `Default`
+    beside `default` included (real AWS, us-east-2, round10-last.py and round12-attached-cfn.py: the key named
+    and describe-after-<key>; round13-tags-engine.py for removing every user)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine=group_engine, UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "Engine": engine}
+    if add:
+        params["UserIdsToAdd"] = [ids[m] for m in add]
+    if remove:
+        params["UserIdsToRemove"] = [ids[m] for m in remove]
+    ec.modify_user_group(**params)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == (engine, [ids[m] for m in after])
+
+
+@pytest.mark.parametrize("engine", ["valkey", "Valkey", "VALKEY"])
+def test_modify_user_group_engine_valkey_removes_default_user(ec, ec_users, engine):
+    """Changing the group to Valkey (any case) in the same call lets its `default` user go, and the group is
+    Valkey afterwards (real AWS, us-east-2: round 7's mug-engine-valkey-remove-default, round 9's
+    mug-engine-Valkey-remove-default, mug-engine-VALKEY-remove-default, and their describe-after-<key>)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-engine-valkey-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, Engine=engine, UserIdsToRemove=[ids["r-def"]])
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("valkey", [ids["r-iam"]])
+
+
+def test_modify_valkey_user_group_engine_redis(ec, ec_users):
+    """A Valkey group of Redis users with a `default` one changed to Redis on its own becomes Redis (real AWS,
+    us-east-2, round9-remaining.py: mug-v-engine-redis-only, describe-after-mug-v-engine-redis-only)."""
+    ids, groups, s = ec_users
+    changed = f"dug-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=changed, Engine="valkey", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(changed)
+    ec.modify_user_group(UserGroupId=changed, Engine="redis")
+    group = ec.describe_user_groups(UserGroupId=changed)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("redis", [ids["r-def"], ids["r-iam"]])
+
+
+def test_modify_valkey_user_group_engine_redis_adding_default_user(ec, ec_users):
+    """A Valkey group can be made Redis in the call that adds its `default` user (real AWS, us-east-2,
+    round13-tags-engine.py: mug-v-engine-redis-add-default, describe-after-mug-v-engine-redis-add-default)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    ec.create_user_group(UserGroupId=group_id, Engine="valkey", UserIds=[ids["r-iam"]])
+    ec.modify_user_group(UserGroupId=group_id, Engine="redis", UserIdsToAdd=[ids["r-def"]])
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("redis", [ids["r-iam"], ids["r-def"]])
+
+
+@pytest.mark.parametrize("key,members", [
+    ("mug-v-no-default-engine-redis", ["r-iam"]),
+    ("mug-v-empty-engine-redis", []),
+])
+def test_modify_valkey_user_group_engine_redis_requires_default_user(ec, ec_users, key, members):
+    """Making a Valkey group without a `default` user Redis is refused, and it stays Valkey (real AWS,
+    us-east-2, round13-tags-engine.py: the key named and describe-after-<key>)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    raw = make_client("elasticache", {"parameter_validation": False})  # the capture's empty UserIds
+    raw.create_user_group(UserGroupId=group_id, Engine="valkey", UserIds=[ids[m] for m in members])
+    with pytest.raises(ClientError) as exc:
+        ec.modify_user_group(UserGroupId=group_id, Engine="redis")
+    _assert_default_user_required(exc)
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("valkey", [ids[m] for m in members])
+
+
+@pytest.mark.parametrize("case", ["valkey-user", "duplicate-name", "attached", "serverless-attached"])
+def test_modify_user_group_uncaptured_engine_changes_are_ignored(ec, ec_users, case):
+    """MiniStack contract: Engine `valkey` leaves the engine as it was, as before this change, with a second
+    `default` user added (AWS refuses two users with one name: DuplicateUserName, cug-r-two-defaults,
+    mug-r-remove-default-add-two-case), or on a group attached to a replication group or a serverless
+    cache (AWS: InvalidParameterValue, mug-rg-engine-valkey-only, mug-sl-engine-valkey-only), errors
+    MiniStack doesn't emulate; and, not captured, with a Valkey user added."""
+    ids, groups, s = ec_users
+    group_id, rg_id = f"dug-{_uid()}-{s}", f"dug-rg-{_uid()}-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    params = {"UserGroupId": group_id, "Engine": "valkey"}
+    if case == "valkey-user":
+        params["UserIdsToAdd"] = [ids["v-iam"]]
+    elif case == "duplicate-name":
+        params["UserIdsToAdd"] = [ids["r-def2"]]
+    elif case == "serverless-attached":
+        ec.create_serverless_cache(ServerlessCacheName=rg_id, Engine="redis", MajorEngineVersion="7",
+                                   UserGroupId=group_id)
+    else:
+        ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ministack test",
+                                    Engine="redis", CacheNodeType="cache.t4g.micro", NumCacheClusters=1,
+                                    TransitEncryptionEnabled=True, UserGroupIds=[group_id])
+    try:
+        ec.modify_user_group(**params)
+        assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["Engine"] == "redis"
+        if case in ("attached", "valkey-user"):  # and the rest of the call goes through, as before
+            ec.modify_user_group(UserGroupId=group_id, Engine="valkey", UserIdsToRemove=[ids["r-def"]])
+            assert ids["r-def"] not in ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"]
+    finally:
+        if case == "attached":
+            ec.delete_replication_group(ReplicationGroupId=rg_id)
+        elif case == "serverless-attached":
+            ec.delete_serverless_cache(ServerlessCacheName=rg_id)
+
+
+@pytest.mark.parametrize("key,template,length", [
+    ("cug-upper-id-no-default", "dug-UPPER-{s}", None),
+    ("cug-id-39-no-default", "dug-{s}-" + "a" * 26, 39),
+    ("cug-id-40-no-default", "dug-{s}-" + "a" * 27, 40),
+    ("cug-id-trailing-hyphen-no-default", "dug-trail-{s}-", None),
+    ("cug-id-1-char-no-default", "{c}", 1),
+])
+def test_create_user_group_accepted_ids_require_default_user(ec, ec_users, key, template, length):
+    """Ids with upper-case letters, of 1, 39 or 40 characters, or ending with a hyphen pass AWS's id check and
+    get the rule (real AWS, us-east-2, round9-remaining.py, round10-last.py and round14-dup-tags.py: the key
+    named)."""
+    ids, groups, s = ec_users
+    group_id = template.format(s=s, c="abcdefghijklmnop"[int(s[0], 16)])  # a 1-character id still varies
+    groups.append(group_id)
+    assert length is None or len(group_id) == length
+    with pytest.raises(ClientError) as exc:
+        ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-iam"]])
+    _assert_default_user_required(exc)
+
+
+@pytest.mark.parametrize("key,tags", [
+    ("cug-tags-valid-no-default", [{"Key": "k", "Value": "v"}]),
+    ("cug-tags-key-128-no-default", [{"Key": "k" * 128, "Value": "v"}]),
+    ("cug-tags-no-value-no-default", [{"Key": "k"}]),
+    ("cug-tags-51-tags-no-default", [{"Key": f"k{i}", "Value": "v"} for i in range(51)]),
+    ("cug-tags-duplicate-keys-no-default", [{"Key": "k", "Value": "a"}, {"Key": "k", "Value": "b"}]),
+    ("cug-tags-multibyte-128-no-default", [{"Key": "é" * 128, "Value": "v"}]),
+])
+def test_create_user_group_accepted_tags_require_default_user(ec, ec_users, key, tags):
+    """Tags with keys up to 128 characters (multibyte ones too), without a value, with a key repeated, or
+    more than 50 of them pass AWS's checks and the group gets the rule (real AWS, us-east-2,
+    round13-tags-engine.py and round14-dup-tags.py: the key named)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-{_uid()}-{s}"
+    groups.append(group_id)
+    raw = make_client("elasticache", {"parameter_validation": False})
+    with pytest.raises(ClientError) as exc:
+        raw.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-iam"]], Tags=tags)
+    _assert_default_user_required(exc)
+
+
+@pytest.mark.parametrize("key,group_id,tags", [
+    ("cug-bad-chars-no-default", "dug-Bad_ID!!-{s}", None),
+    ("cug-long-id-no-default", "dug-{s}-" + "x" * 300, None),
+    ("cug-id-41-no-default", "dug-{s}-" + "a" * 28, None),
+    ("cug-id-leading-digit-no-default", "9dug-digit-{s}", None),
+    ("cug-id-double-hyphen-no-default", "dug--double-{s}", None),
+    ("cug-empty-tag-key-no-default", "dug-tagkey-{s}", [{"Key": "", "Value": "v"}]),
+    ("cug-tags-key-129-no-default", "dug-tags-{s}", [{"Key": "k" * 129, "Value": "v"}]),
+    ("cug-tags-aws-prefix-no-default", "dug-tags-{s}", [{"Key": "aws:x", "Value": "v"}]),
+    ("cug-tags-value-257-no-default", "dug-tags-{s}", [{"Key": "k", "Value": "v" * 257}]),
+    ("cug-tags-odd-chars-no-default", "dug-tags-{s}", [{"Key": "a#b*{}", "Value": "v"}]),
+])
+def test_create_user_group_input_errors_are_not_default_user_required(ec, ec_users, key, group_id, tags):
+    """MiniStack contract: AWS refuses these with InvalidParameterValue before the default-user check (real
+    AWS, us-east-2, round9-remaining.py, round10-last.py, round11-id-length.py, round13-tags-engine.py and
+    round14-dup-tags.py: the key named), which
+    MiniStack doesn't emulate yet. Until it does, they keep MiniStack's earlier answer, 200, rather than
+    DefaultUserRequired."""
+    ids, groups, s = ec_users
+    group_id = group_id.format(s=s)
+    raw = make_client("elasticache", {"parameter_validation": False})
+    params = {"UserGroupId": group_id, "Engine": "redis", "UserIds": [ids["r-iam"]]}
+    if tags:
+        params["Tags"] = tags
+    resp = raw.create_user_group(**params)
+    groups.append(group_id)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
+def test_modify_user_group_engine_valkey_then_removes_default_user(ec, ec_users):
+    """A group changed to Valkey on its own is a Valkey group, whose `default` user can then be removed
+    (real AWS, us-east-2, round8-engine-sequence.py: mug-seq-engine-valkey, describe-seq-after-engine,
+    mug-seq-remove-default, describe-seq-after-remove)."""
+    ids, groups, s = ec_users
+    group_id = f"dug-engine-valkey-only-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["r-def"], ids["r-iam"]])
+    groups.append(group_id)
+    ec.modify_user_group(UserGroupId=group_id, Engine="valkey")
+    group = ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]
+    assert (group["Engine"], group["UserIds"]) == ("valkey", [ids["r-def"], ids["r-iam"]])
+    ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["r-def"]])
+    assert ec.describe_user_groups(UserGroupId=group_id)["UserGroups"][0]["UserIds"] == [ids["r-iam"]]
+
+
+def test_redis_user_group_valkey_default_user_removal_is_not_default_user_required(ec, ec_users):
+    """MiniStack contract, not captured: removing a Valkey `default` user from a Redis group (a group AWS
+    refuses to create, cug-r-valkey-default) keeps MiniStack's earlier answer, 200."""
+    ids, groups, s = ec_users
+    group_id = f"dug-vdef-in-redis-{s}"
+    ec.create_user_group(UserGroupId=group_id, Engine="redis", UserIds=[ids["v-def"], ids["r-iam"]])
+    groups.append(group_id)
+    resp = ec.modify_user_group(UserGroupId=group_id, UserIdsToRemove=[ids["v-def"]])
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
 
 
 def test_elasticache_subnet_and_param_groups_are_region_scoped():

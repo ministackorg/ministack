@@ -3717,12 +3717,60 @@ def _modify_user(p):
                 f"<ModifyUserResult>{_user_xml({**user, 'Status': 'modifying'})}</ModifyUserResult>")
 
 
+def _redis_user(user):
+    return bool(user) and (user.get("Engine") or "").lower() == "redis"
+
+
+def _user_group_needs_default_user(user_ids):
+    """True when AWS refuses these users of a Redis OSS user group with DefaultUserRequired: none of them is
+    named exactly `default` (real AWS, us-east-2). False when AWS refuses them first for a reason MiniStack
+    doesn't check (a user that isn't a Redis user, two users with one name) or for a member MiniStack
+    no longer has, so those calls keep their old answer."""
+    users = [_users.get(uid) for uid in user_ids]
+    if not all(_redis_user(u) for u in users):
+        return False
+    names = [u.get("UserName") for u in users]
+    return len(set(names)) == len(names) and "default" not in names
+
+
+def _user_group_input_checked(group_id, p):
+    """Whether a CreateUserGroup request passes the input checks AWS makes before DefaultUserRequired
+    (real AWS, us-east-2): an id of at most 40 characters (AWS's message says less than 40, but 40
+    passes) that begins with a letter and holds only ASCII letters, digits and single hyphens (it may
+    end with one); tag keys of 1 to 128 characters that AWS's message limits to letters, digits,
+    whitespace and `_ . : / = + \\\\ - @` (two backslashes in the message), not starting with `aws:`; tag values of at most 256. MiniStack
+    doesn't make them, so a request failing one keeps its old answer. Of the whitespace and symbols only
+    a space and `_ . : / = + - @` count as passing here; that errs only toward the old answer."""
+    if len(group_id) > 40 or not re.fullmatch(r"[A-Za-z](?:-?[A-Za-z0-9])*-?", group_id):
+        return False
+    for key in p:
+        tag = re.fullmatch(r"(Tags\.(?:member|Tag)\.\d+\.)(Key|Value)", key)
+        if not tag:
+            continue
+        tag_key, value = _p(p, tag.group(1) + "Key"), _p(p, tag.group(1) + "Value")
+        allowed = all(c.isalpha() or c.isdecimal() or c in " _.:/=+-@" for c in tag_key)
+        if (not 1 <= len(tag_key) <= 128 or not allowed or tag_key.lower().startswith("aws:")
+                or len(value) > 256):
+            return False
+    return True
+
+
+def _user_group_attached(group_id):
+    group = _user_groups.get(group_id) or {}
+    return bool(group.get("ReplicationGroups")) or any(
+        c.get("UserGroupId") == group_id for c in _serverless_caches.values())
+
+
+def _default_user_required():
+    return _error("DefaultUserRequired", "Redis user group needs to contain a user with the user name default.", 400)
+
+
 def _create_user_group(p):
     group_id = _p(p, "UserGroupId")
     if not group_id:
         return _error("InvalidParameterValue", "UserGroupId is required", 400)
     if group_id in _user_groups:
-        return _error("UserGroupAlreadyExists", f"User group {group_id} already exists", 400)
+        return _error("UserGroupAlreadyExists", f"User group {group_id} already exists. Please retry with another name.", 400)
 
     arn = _arn_user_group(group_id)
     user_ids = []
@@ -3735,6 +3783,9 @@ def _create_user_group(p):
     for uid in user_ids:
         if uid not in _users:
             return _error("UserNotFound", f"User {uid} not found.", 404)
+    if (_p(p, "Engine").lower() == "redis" and _user_group_input_checked(group_id, p)
+            and _user_group_needs_default_user(user_ids)):
+        return _default_user_required()
 
     group = {
         "UserGroupId": group_id,
@@ -3828,6 +3879,27 @@ def _modify_user_group(p):
     if len(set(to_remove)) != len(to_remove):
         return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
 
+    # The default-user rule and an Engine change (real AWS, us-east-2). An Engine change ignored below (an
+    # attached group, AWS: InvalidParameterValue; a Valkey user added) leaves the rest of the call as before.
+    members = group["UserIds"]
+    after = [u for u in members if u not in to_remove] + to_add
+    current = group.get("Engine", "").lower()
+    sent = _p(p, "Engine").lower()
+    # Any Engine but `valkey` keeps the rule, even on a Valkey group; with none, the group's engine decides.
+    redis_rule_applies = sent != "valkey" if sent else current == "redis"
+    has_default = any(_redis_user(_users.get(u)) and _users[u].get("UserName") == "default" for u in members)
+    to_redis = current == "valkey" and _p(p, "Engine") == "redis"  # only lower case was captured
+    if redis_rule_applies and (has_default or to_redis) and _user_group_needs_default_user(after):
+        return _default_user_required()
+    # Stored only in the captured shape: an unattached group of Redis users with distinct names after the
+    # call, with a `default` one for a change to Redis.
+    engine = "valkey" if sent == "valkey" else "redis" if _p(p, "Engine") == "redis" else current
+    after_users = [_users.get(u) for u in after]
+    names = [u.get("UserName") for u in after_users if u]
+    change_engine = (engine != current and not _user_group_attached(group_id)
+                     and all(_redis_user(u) for u in after_users) and len(set(names)) == len(names)
+                     and (engine == "valkey" or "default" in names))
+
     before = list(group["UserIds"])
     for uid in to_add:
         group["UserIds"].append(uid)
@@ -3841,6 +3913,8 @@ def _modify_user_group(p):
             if group_id in gids:
                 gids.remove(group_id)
 
+    if change_engine:
+        group["Engine"] = engine
     _apply_user_groups_of([group_id])
     # AWS answers with the group still modifying and the change pending (real AWS, us-west-2);
     # MiniStack settles at once.
