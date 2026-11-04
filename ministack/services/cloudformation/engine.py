@@ -1503,7 +1503,7 @@ def _fetch_include_snippet(location) -> dict:
     if not bucket or not key:
         raise _IncludeError(_INCLUDE_ERROR + "The location parameter is not a valid S3 uri.")
     from ministack.services import s3 as _s3
-    data = _s3._get_object_data(bucket, key)
+    data = _s3._get_object_data_for_caller(bucket, key)
     if data is None:
         raise _IncludeError(_INCLUDE_ERROR + f"The S3 object {location} does not exist.")
     snippet = _parse_snippet(data.decode("utf-8"))

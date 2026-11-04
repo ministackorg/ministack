@@ -3269,9 +3269,7 @@ _ACL_PATTERN_AFTER_STAR = ("Adding a pattern '{}' after the * pattern (or the '{
                            "have any effect. Try '{}' to start with an empty list of {}")
 
 
-# What real AWS answered for each rule on its own (us-east-2, issue #2551, rounds 13-15): the engine
-# version MinimumEngineVersion reports for it (rules not listed need no more than the engine's floor);
-# a user without channel rules gets `&*` written for a 6.2 rule and `resetchannels` from 7.0.
+# The engine version MinimumEngineVersion reports for each rule (real AWS, us-east-2).
 _ACL_RULE_VERSIONS = {
     **dict.fromkeys((
         "@json blmove copy failover geosearch geosearchstore getdel getex hrandfield json.arrappend "
@@ -3319,8 +3317,7 @@ _ACL_SUBCOMMAND_VERSIONS = {
     **dict.fromkeys("commandlog|get commandlog|help commandlog|len commandlog|reset".split(), "8.1"),
     **dict.fromkeys("cluster|flushslot".split(), "9.0"),
 }
-# The commands each category holds as AWS counts them for subcommand rules (us-east-2, issue #2551):
-# +command|sub is refused after +@category, and -command|sub accepted.
+# Each category's commands as AWS counts them for subcommand rules (real AWS, us-east-2).
 _ACL_CATEGORY_COMMANDS = {
     "admin": frozenset((
         "acl bgrewriteaof bgsave client cluster commandlog config debug failover json.debug lastsave "
@@ -3444,8 +3441,7 @@ _ACL_CATEGORY_COMMANDS = {
         "zpopmin zrangestore zrem zremrangebylex zremrangebyrank zremrangebyscore zunionstore"
     ).split()),
 }
-# +command|arg needs a later engine when it follows +@category for these pairs, unless a later rule took the
-# command away again (us-east-2, issue #2551).
+# +command|arg pairs needing a later engine after +@category (real AWS, us-east-2).
 _ACL_CATEGORY_ARG_VERSIONS = {
     **dict.fromkeys((("read", c) for c in "echo lastsave role time".split()), "6.2"),
     **dict.fromkeys((("keyspace", c) for c in "asking readonly readwrite select wait".split()), "7.0"),
@@ -3497,8 +3493,7 @@ def _acl_refusal(rule, keywords):
     """The message refusing one rule on its own, before any rule is applied."""
     message = _acl_aws_refusal(rule, keywords)
     if message is None and any(c < " " or c in "\ufffe\uffff" or "\ud800" <= c <= "\udfff" for c in rule):
-        # MiniStack-only: XML can't carry these. AWS stores `~a\x1cb`, then fails every DescribeUsers in the
-        # region with InternalFailure until the user is deleted (us-east-2, round 23), which isn't emulated.
+        # MiniStack-only: XML can't carry these characters.
         return "The access-string is invalid."
     return message
 
@@ -3562,8 +3557,7 @@ def _acl_apply(scope, rule):
         sign, name = low[0], low[1:]
         family = name.split("|")[0]
         if "|" in name:
-            # +command|sub is refused once the command is fully added, and -command|sub until something
-            # granted it; a -@category takes the first away but not the second.
+            # +command|sub is refused once the command is granted, -command|sub until something granted it.
             full = granted = scope["base"] == "+"
             version = None
             for command in scope["commands"]:
@@ -3584,8 +3578,7 @@ def _acl_apply(scope, rule):
                         "Add the command to start. Example: +DEBUG -DEBUG|DIGEST")
             if sign == "+" and version:
                 scope["versions"].append(version)
-        # A rule replaces its earlier one (a whole command also its subcommands'), and is dropped
-        # when it repeats the +@all/-@all base without touching a remaining rule.
+        # A rule replaces its earlier one; one repeating the base without touching a remaining rule is dropped.
         scope["commands"] = [c for c in scope["commands"]
                              if c[1:] != name and ("|" in name or not c[1:].startswith(f"{name}|"))]
         if sign != scope["base"] or any(name[0] == "@" or c[1] == "@" or c[1:].split("|")[0] == family
@@ -3663,8 +3656,7 @@ def _append_access_string(access, append):
     message = next(filter(None, map(_acl_refused, rules)), None)
     if message:
         return None, None, message
-    # MiniStack-only: a stored rule AWS would have refused (CreateUser here doesn't check them all)
-    # is skipped rather than failing every later append.
+    # MiniStack-only: a stored rule AWS would have refused is skipped.
     stored = _acl_rules(access)
     stored = [rule for rule in (_acl_split(access) if stored is None else stored) if not _acl_refused(rule)]
     root = _acl_scope(flag="off")
@@ -3674,8 +3666,7 @@ def _append_access_string(access, append):
         message = _acl_apply_rule(root, rule)
         if message:
             return None, None, message
-    # Every rule present counts, even one a later rule replaced or dropped (rounds 5, 9 and 16), and so do
-    # the category pairs the rules met on the way (rounds 19 and 20).
+    # Every rule present counts, even one a later rule dropped (real AWS, us-east-2).
     version = max(filter(None, [*map(_acl_version, [*stored, *rules]), *root["versions"]]),
                   key=_acl_version_key, default=None)
     default = None if not version else "&*" if version == "6.2" else "resetchannels"
@@ -3722,10 +3713,7 @@ def _redis_user(user):
 
 
 def _user_group_needs_default_user(user_ids):
-    """True when AWS refuses these users of a Redis OSS user group with DefaultUserRequired: none of them is
-    named exactly `default` (real AWS, us-east-2). False when AWS refuses them first for a reason MiniStack
-    doesn't check (a user that isn't a Redis user, two users with one name) or for a member MiniStack
-    no longer has, so those calls keep their old answer."""
+    """Whether these Redis users have none named exactly `default`; False when AWS would refuse them first."""
     users = [_users.get(uid) for uid in user_ids]
     if not all(_redis_user(u) for u in users):
         return False
@@ -3734,13 +3722,7 @@ def _user_group_needs_default_user(user_ids):
 
 
 def _user_group_input_checked(group_id, p):
-    """Whether a CreateUserGroup request passes the input checks AWS makes before DefaultUserRequired
-    (real AWS, us-east-2): an id of at most 40 characters (AWS's message says less than 40, but 40
-    passes) that begins with a letter and holds only ASCII letters, digits and single hyphens (it may
-    end with one); tag keys of 1 to 128 characters that AWS's message limits to letters, digits,
-    whitespace and `_ . : / = + \\\\ - @` (two backslashes in the message), not starting with `aws:`; tag values of at most 256. MiniStack
-    doesn't make them, so a request failing one keeps its old answer. Of the whitespace and symbols only
-    a space and `_ . : / = + - @` count as passing here; that errs only toward the old answer."""
+    """Whether CreateUserGroup passes the id and tag checks AWS makes before DefaultUserRequired (real AWS)."""
     if len(group_id) > 40 or not re.fullmatch(r"[A-Za-z](?:-?[A-Za-z0-9])*-?", group_id):
         return False
     for key in p:
@@ -3879,8 +3861,7 @@ def _modify_user_group(p):
     if len(set(to_remove)) != len(to_remove):
         return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
 
-    # The default-user rule and an Engine change (real AWS, us-east-2). An Engine change ignored below (an
-    # attached group, AWS: InvalidParameterValue; a Valkey user added) leaves the rest of the call as before.
+    # The default-user rule and an Engine change (real AWS, us-east-2).
     members = group["UserIds"]
     after = [u for u in members if u not in to_remove] + to_add
     current = group.get("Engine", "").lower()
@@ -3891,8 +3872,7 @@ def _modify_user_group(p):
     to_redis = current == "valkey" and _p(p, "Engine") == "redis"  # only lower case was captured
     if redis_rule_applies and (has_default or to_redis) and _user_group_needs_default_user(after):
         return _default_user_required()
-    # Stored only in the captured shape: an unattached group of Redis users with distinct names after the
-    # call, with a `default` one for a change to Redis.
+    # An Engine change is stored only in the captured shape.
     engine = "valkey" if sent == "valkey" else "redis" if _p(p, "Engine") == "redis" else current
     after_users = [_users.get(u) for u in after]
     names = [u.get("UserName") for u in after_users if u]

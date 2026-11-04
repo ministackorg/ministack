@@ -13756,9 +13756,7 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
         _ec_user_group_create, _ec_user_group_delete)
     if replaced:
         return replaced
-    # A change to the set of users or to Engine leaves the group with the template's users, diffed against the live
-    # group; an update that changes only tags or the order of the users keeps changes made outside the stack (real
-    # AWS, us-east-1).
+    # Only a change to the set of users or to Engine resets the group to the template's users (real AWS, us-east-1).
     live_users = list((_ec._user_groups.get(physical_id) or {}).get("UserIds") or [])
     new_users = list(new_props.get("UserIds") or [])
     params = {}

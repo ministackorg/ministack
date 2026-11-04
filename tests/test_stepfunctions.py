@@ -10616,6 +10616,14 @@ def _run_batched_map(sfn, map_state, payload, query_language=None):
     return desc, sfn.describe_map_run(mapRunArn=map_run["mapRunArn"])
 
 
+def test_sfn_item_batcher_caps_a_batch_at_256_kib_by_default():
+    """Without MaxInputBytesPerBatch a batch stops at 256 KiB (AWS ItemBatcher doc)."""
+    from ministack.services import stepfunctions as sfn_mod
+    items = ["x" * (100 * 1024)] * 5
+    batches = sfn_mod._item_batches({"MaxItemsPerBatch": 10}, None, items, {}, {}, {}, False)
+    assert [n for _input, n in batches] == [2, 2, 1]
+
+
 def _batch_sizes(sfn, batcher, items, limit):
     """The number of items in each batch, with MaxInputBytesPerBatchPath as in the AWS byte probes."""
     map_state = {"ItemsPath": "$.items", "ItemBatcher": {**batcher, "MaxInputBytesPerBatchPath": "$.limit"}}

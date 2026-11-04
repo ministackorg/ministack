@@ -1612,7 +1612,42 @@ def find_lb_for_host(host):
             return lb
         if hostname == f"{lb['LoadBalancerName'].lower()}.alb.localhost":
             return lb
-    return None
+    return _find_lb_for_alias_record(hostname)
+
+
+def _alias_target_for_host(hostname):
+    """The AliasTarget DNSName a public Route 53 record answers for ``hostname`` (Route 53 DomainNameFormat)."""
+    from ministack.services import route53
+
+    fqdn, best, best_rank = f"{hostname}.", [], -1
+    with route53._lock:
+        for zone_id, records in route53._records.items():
+            if (route53._zones.get(zone_id) or {}).get("private"):
+                continue
+            for rs in records:
+                name = rs.get("Name", "").lower().replace("\\052", "*")
+                if name == fqdn:
+                    rank = len(name) + 1  # an exact name beats any wildcard
+                elif name.startswith("*.") and fqdn.endswith(name[1:]):
+                    rank = len(name)
+                else:
+                    continue
+                if rank > best_rank:
+                    best, best_rank = [], rank
+                if rank == best_rank:
+                    best.append(rs)
+    # The most specific name answers, whatever its type; only its A/AAAA alias reaches a load balancer.
+    return next((rs["AliasTarget"].get("DNSName") for rs in best
+                 if rs.get("Type") in ("A", "AAAA") and (rs.get("AliasTarget") or {}).get("DNSName")), None)
+
+
+def _find_lb_for_alias_record(hostname):
+    target = _alias_target_for_host(hostname)
+    if not target:
+        return None
+    target = target.lower().rstrip(".")
+    target = target[len("dualstack."):] if target.startswith("dualstack.") else target
+    return next((lb for lb in _lbs.values() if lb["DNSName"].lower() == target), None)
 
 
 def _find_lb_by_name(name):

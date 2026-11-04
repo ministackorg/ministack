@@ -16986,6 +16986,16 @@ def test_rds_every_global_member_certificate_lists_the_global_name(monkeypatch):
     assert [_GLOBAL_ALIAS_NAME in tls for tls in names.values()] == [False]
 
 
+def test_rds_global_name_left_out_of_the_certificate_when_not_ascii(monkeypatch):
+    """A non-ASCII global identifier, which AWS refuses, must not stop the member's certificate being signed."""
+    m, gc, clusters, *_ = _global_alias_world(monkeypatch)
+    cluster = next(iter(clusters.values()))
+    assert m._global_member_certificate_names(cluster) == [_GLOBAL_ALIAS_NAME]
+    gc["GlobalClusterIdentifier"] = "gdbé"
+    assert m._global_member_certificate_names(cluster) == []
+    m._pg_server_material([cluster["Endpoint"], *m._global_member_certificate_names(cluster)], ["127.0.0.1"])
+
+
 def test_rds_pg_reader_certificate_lists_the_global_name(monkeypatch):
     """A hot-standby reader owns its container, and on AWS an instance's
     certificate lists the global name whatever its role."""

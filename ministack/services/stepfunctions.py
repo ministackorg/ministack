@@ -2936,7 +2936,8 @@ def _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_j
     selected = [_select_map_item(item_selector, i, item, raw_input, effective, ctx, is_jsonata)[0]
                 for i, item in enumerate(items)]
     max_items = _item_batcher_limit(batcher, "MaxItemsPerBatch", raw_input, effective, ctx, is_jsonata)
-    max_bytes = _item_batcher_limit(batcher, "MaxInputBytesPerBatch", raw_input, effective, ctx, is_jsonata)
+    # Without a byte limit a batch still stops at 256 KiB (AWS ItemBatcher doc).
+    max_bytes = _item_batcher_limit(batcher, "MaxInputBytesPerBatch", raw_input, effective, ctx, is_jsonata) or 262144
     envelope = {}
     if "BatchInput" in batcher:
         envelope["BatchInput"] = (_apply_jsonata_template(batcher["BatchInput"], raw_input, ctx) if is_jsonata

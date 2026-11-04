@@ -7044,11 +7044,7 @@ def _apply_update_expression(item, expr, attr_values, attr_names, updated_attrs=
 
 
 def _copy_attribute_value(value):
-    """A copy of an AttributeValue that shares nothing, with itself or the
-    original. A value SET at several paths (`SET a = :v, b = :v`,
-    `list_append(:l, :l)`) must be stored as independent values.
-    copy.deepcopy can't be used here: its memo turns one object used twice
-    into one copy used twice."""
+    """A copy sharing nothing, not even with itself (copy.deepcopy's memo would keep `[x, x]` shared)."""
     if isinstance(value, dict):
         return {k: _copy_attribute_value(v) for k, v in value.items()}
     if isinstance(value, list):
