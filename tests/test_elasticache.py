@@ -1619,6 +1619,15 @@ def test_user_acl_channels_default_to_all():
         assert elasticache._acl_setuser(user(access)) == ["ACL", "SETUSER", "u", *prefix, *access.split(), "nopass"]
 
 
+def test_user_acl_keeps_unicode_space_inside_a_pattern():
+    """AWS stores `~a\\xa0b` appended to `on ~x +@all` as one key pattern (us-east-2, issue #2551,
+    round23 modify-a-key-nbsp). MiniStack sends the engine the rules as stored; no capture reads a
+    real cache's ACL for it."""
+    user = {"UserId": "u", "UserName": "u", "AccessString": "on ~x ~a\xa0b +@all", "Authentication": {"Type": "iam"}}
+    assert elasticache._acl_setuser(user) == ["ACL", "SETUSER", "u", "reset", "&*", "on", "~x", "~a\xa0b", "+@all",
+                                              "nopass"]
+
+
 @pytest.mark.skipif(not _docker_reachable(), reason="needs Docker for the serverless cache container")
 @pytest.mark.parametrize("engine,major", [("valkey", "7"), ("valkey", "8"), ("valkey", "9"), ("redis", "7")])
 def test_serverless_cache_user_pubsub_channels(ec, tmp_path, engine, major):
@@ -2800,6 +2809,124 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         modified = ec.modify_user(UserId=uid, AuthenticationMode={"Type": "iam"})
         assert (modified["Status"], modified["Authentication"]) == ("modifying", {"Type": "iam"})
         assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+# Real AWS (us-east-2, issue #2551): each captured user's CreateUser, ModifyUser and DescribeUsers calls in
+# order, with AWS's answers. Built from the raw captures; a user's calls stop before one MiniStack doesn't model.
+def _append_captures():
+    """Expand the compact fixture: a step is ["c", create], [append, expect], ["m", params, expect] or
+    ["d", expect], and an integer expect is an index into "errors"."""
+    with open(os.path.join(os.path.dirname(__file__), "fixtures", "elasticache", "append_access_string.json")) as f:
+        data = json.load(f)
+    def step(row):
+        if row[0] == "c":
+            return "c", data["creates"][row[1]], None
+        op, params, expect = (("d", None, row[1]) if row[0] == "d" else ("m", row[1], row[2]) if row[0] == "m"
+                              else ("m", {"AppendAccessString": row[0]}, row[1]))
+        return op, params, data["errors"][expect] if isinstance(expect, int) else expect
+    return [{"id": case_id, "steps": [step(row) for row in rows]} for case_id, rows in data["cases"]]
+
+
+_APPEND_CAPTURES = _append_captures()
+
+
+@pytest.mark.parametrize("case", _APPEND_CAPTURES, ids=[c["id"] for c in _APPEND_CAPTURES])
+def test_elasticache_modify_user_append_replays_aws(ec, case):
+    """Each step is sent as captured and answered as AWS answered: the error's status, code and message, or
+    the user's Status, AccessString, MinimumEngineVersion and Authentication."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:8]}"
+    calls = {"c": ec.create_user, "m": ec.modify_user, "d": ec.describe_users}
+    created = False
+    try:
+        for op, params, expect in case["steps"]:
+            kwargs = {"UserId": uid, **({"UserName": uid} if op == "c" else {}), **(params or {})}
+            if expect and isinstance(expect[0], int):
+                with pytest.raises(ClientError) as exc:
+                    calls[op](**kwargs)
+                response = exc.value.response
+                assert [response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"],
+                        response["Error"]["Message"]] == expect
+                continue
+            answer = calls[op](**kwargs)
+            created = created or op == "c"
+            if op == "c":
+                continue
+            user = answer["Users"][0] if op == "d" else answer
+            want = {"Status": "modifying" if op == "m" else "active", "AccessString": expect[0],
+                    "MinimumEngineVersion": expect[1], "Authentication": expect[2] if len(expect) > 2 else {"Type": "iam"}}
+            if want["Authentication"] is None:  # no-password: AWS omits PasswordCount, MiniStack writes 0
+                del want["Authentication"]
+                assert user["Authentication"]["Type"] == "no-password"
+            assert {k: user.get(k) for k in want} == want
+    finally:
+        if created:
+            ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_append_skips_stored_rules_aws_refuses(ec):
+    """MiniStack contract, not AWS behavior: a stored AccessString can hold rules AWS would have refused
+    (`reset` here), since CreateUser doesn't check them all. An append skips them instead of failing."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="reset on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        assert ec.modify_user(UserId=uid, AppendAccessString="-flushall")["AccessString"] == "on ~* +@all -flushall"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_no_password_redis_user_reports_engine_floor(ec):
+    """AWS reports 6.0 for a no-password Redis user (us-east-2, issue #2551, round22 create-nopass-get)."""
+    uid = f"nopass-{_uuid_mod.uuid4().hex[:8]}"
+    user = ec.create_user(UserId=uid, UserName=uid, Engine="redis", AccessString="on ~* -@all",
+                          AuthenticationMode={"Type": "no-password-required"})
+    try:
+        assert user["MinimumEngineVersion"] == "6.0"
+        assert user["Authentication"]["Type"] == "no-password"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_append_refuses_control_characters(ec):
+    """MiniStack contract: XML can't carry a control character, so an append holding one is refused and
+    the user keeps its access string. (AWS stores `~a\\x1cb` and then answers InternalFailure, round 23.)"""
+    uid = f"ctrl-{_uuid_mod.uuid4().hex[:8]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~x +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        for append in ("~a\x1cb", "&a\x01b", "(+get|\x01)", "~a\ufffeb"):
+            with pytest.raises(ClientError) as exc:
+                ec.modify_user(UserId=uid, AppendAccessString=append)
+            assert exc.value.response["Error"]["Message"] == "The access-string is invalid."
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~x +@all"
+    finally:
+        ec.delete_user(UserId=uid)
+
+
+def test_elasticache_modify_user_access_string_and_append_together(ec):
+    """AccessString with AppendAccessString is refused and the user keeps its rules
+    (AWS captures round1 modify-both, describe-both); an unknown user is reported first
+    (round2 modify-both-missing)."""
+    uid = f"app-{_uuid_mod.uuid4().hex[:6]}"
+    ec.create_user(UserId=uid, UserName=uid, Engine="valkey", AccessString="on ~* +@all",
+                   AuthenticationMode={"Type": "iam"})
+    try:
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=uid, AccessString="on ~* +get", AppendAccessString="-get")
+        err = exc.value.response["Error"]
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]) == (
+            400, "InvalidParameterCombination",
+            "Both AccessString and AppendAccessString provided together. Pass either one of them.")
+        assert ec.describe_users(UserId=uid)["Users"][0]["AccessString"] == "on ~* +@all"
+        with pytest.raises(ClientError) as exc:  # round8 modify-both-spaces: an append of only spaces counts
+            ec.modify_user(UserId=uid, AccessString="on ~* +get", AppendAccessString="   ")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_user(UserId=f"{uid}-nosuch", AccessString="on ~* +get", AppendAccessString="-get")
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"],
+                exc.value.response["Error"]["Code"]) == (404, "UserNotFound")
     finally:
         ec.delete_user(UserId=uid)
 
