@@ -3312,3 +3312,116 @@ def test_alb_host_resolves_through_route53_alias_records(elbv2, r53):
             r53.delete_hosted_zone(Id=zone_id)
         for lb in lbs.values():
             elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+
+
+# ---------------------------------------------------------------------------
+# Data plane across accounts and regions (#2581)
+# ---------------------------------------------------------------------------
+
+def _tenant_client(service, account, region):
+    import boto3
+
+    return boto3.client(service, endpoint_url=_endpoint, region_name=region,
+                        aws_access_key_id=account, aws_secret_access_key="test")
+
+
+def _dataplane_get(path, host=None):
+    req = _req.Request(f"{_endpoint}{path}", method="GET")
+    if host:
+        req.add_header("Host", host)
+    try:
+        resp = _req.urlopen(req)
+    except HTTPError as e:
+        return e.code, e.read()
+    return resp.status, resp.read()
+
+
+def _create_tenant_alb(account, region, name, body):
+    """A load balancer whose listener answers ``body``, a rule to an empty target group
+    and a rule to a Lambda target, all in ``account``/``region``. Returns a teardown."""
+    elbv2 = _tenant_client("elbv2", account, region)
+    lam = _tenant_client("lambda", account, region)
+    created = []
+    try:
+        lb = elbv2.create_load_balancer(Name=name, Type="application")["LoadBalancers"][0]
+        created.append(lambda: elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"]))
+        empty_tg = elbv2.create_target_group(Name=f"{name}-e", TargetType="lambda")["TargetGroups"][0]
+        created.append(lambda: elbv2.delete_target_group(TargetGroupArn=empty_tg["TargetGroupArn"]))
+        lam.create_function(
+            FunctionName=f"{name}-fn", Runtime="python3.12", Handler="index.handler",
+            Role=f"arn:aws:iam::{account}:role/test-role",
+            Code={"ZipFile": _alb_zip(
+                "def handler(event, context):\n"
+                f"    return {{'statusCode': 200, 'body': 'lambda-{body}'}}\n")},
+        )
+        created.append(lambda: lam.delete_function(FunctionName=f"{name}-fn"))
+        fn_arn = lam.get_function(FunctionName=f"{name}-fn")["Configuration"]["FunctionArn"]
+        fn_tg = elbv2.create_target_group(Name=f"{name}-f", TargetType="lambda")["TargetGroups"][0]
+        created.append(lambda: elbv2.delete_target_group(TargetGroupArn=fn_tg["TargetGroupArn"]))
+        elbv2.register_targets(TargetGroupArn=fn_tg["TargetGroupArn"], Targets=[{"Id": fn_arn}])
+        listener = elbv2.create_listener(
+            LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+            DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+                "StatusCode": "200", "ContentType": "text/plain", "MessageBody": body}}],
+        )["Listeners"][0]
+        created.append(lambda: elbv2.delete_listener(ListenerArn=listener["ListenerArn"]))
+        for priority, pattern, tg in ((10, "/tg/*", empty_tg), (20, "/fn/*", fn_tg)):
+            elbv2.create_rule(
+                ListenerArn=listener["ListenerArn"], Priority=priority,
+                Conditions=[{"Field": "path-pattern", "PathPatternConfig": {"Values": [pattern]}}],
+                Actions=[{"Type": "forward", "TargetGroupArn": tg["TargetGroupArn"]}],
+            )
+    except Exception:
+        _run_teardown(created)
+        raise
+    return lb, lambda: _run_teardown(created)
+
+
+def _run_teardown(created):
+    for undo in reversed(created):
+        try:
+            undo()
+        except Exception:
+            pass
+
+
+@pytest.mark.parametrize("account,region", [
+    ("111122223333", "us-east-1"),
+    ("000000000000", "us-east-2"),
+    ("000000000000", "us-east-1"),
+], ids=["other-account", "other-region", "default-tenant"])
+def test_elbv2_dataplane_reaches_load_balancer_in_any_tenant(account, region):
+    """An unsigned request reaches a load balancer in any account and region by DNSName,
+    {name}.alb.localhost or /_alb/{name}/, and its listener, rules, target groups and
+    Lambda targets resolve in the load balancer's own tenant (#2581)."""
+    name = f"dpt-{_uuid_mod.uuid4().hex[:8]}"
+    lb, teardown = _create_tenant_alb(account, region, name, f"hello-{name}")
+    try:
+        assert f".{region}.elb.amazonaws.com" in lb["DNSName"]
+        for prefix, host in (("", lb["DNSName"]), ("", f"{name}.alb.localhost"), (f"/_alb/{name}", None)):
+            assert _dataplane_get(f"{prefix}/x", host) == (200, f"hello-{name}".encode())
+            assert _dataplane_get(f"{prefix}/tg/x", host)[0] == 503
+            assert _dataplane_get(f"{prefix}/fn/x", host) == (200, f"lambda-hello-{name}".encode())
+    finally:
+        teardown()
+
+
+def test_elbv2_dataplane_name_in_two_tenants_resolves_in_the_default_tenant_first():
+    """An unsigned request runs as the default account and region. A name used there and in
+    another account reaches the default tenant's load balancer by name; the other stays
+    reachable by its DNSName, and by name once the default tenant's is gone (#2581)."""
+    name = f"dpd-{_uuid_mod.uuid4().hex[:8]}"
+    other_lb, other_teardown = _create_tenant_alb("111122223333", "us-east-1", name, "other")
+    try:
+        own_lb, own_teardown = _create_tenant_alb("000000000000", "us-east-1", name, "own")
+        try:
+            assert _dataplane_get("/x", f"{name}.alb.localhost") == (200, b"own")
+            assert _dataplane_get(f"/_alb/{name}/x") == (200, b"own")
+            assert _dataplane_get("/x", own_lb["DNSName"]) == (200, b"own")
+            assert _dataplane_get("/x", other_lb["DNSName"]) == (200, b"other")
+            assert _dataplane_get("/fn/x", other_lb["DNSName"]) == (200, b"lambda-other")
+        finally:
+            own_teardown()
+        assert _dataplane_get(f"/_alb/{name}/x") == (200, b"other")
+    finally:
+        other_teardown()
