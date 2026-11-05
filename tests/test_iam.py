@@ -1830,3 +1830,19 @@ def test_iam_server_certificate_unknown(iam):
     with pytest.raises(ClientError) as exc:
         iam.get_server_certificate(ServerCertificateName="ghost-cert-xyz")
     assert exc.value.response["Error"]["Code"] == "NoSuchEntity"
+
+
+def test_iam_attach_missing_customer_policy_is_no_such_entity(iam):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    missing = f"arn:aws:iam::000000000000:policy/missing-{suffix}"
+    role = iam.create_role(RoleName=f"r-{suffix}", AssumeRolePolicyDocument="{}")["Role"]["RoleName"]
+    user = iam.create_user(UserName=f"u-{suffix}")["User"]["UserName"]
+    group = iam.create_group(GroupName=f"g-{suffix}")["Group"]["GroupName"]
+    for call, kw in ((iam.attach_role_policy, {"RoleName": role}), (iam.attach_user_policy, {"UserName": user}),
+                     (iam.attach_group_policy, {"GroupName": group})):
+        with pytest.raises(ClientError) as exc:
+            call(PolicyArn=missing, **kw)
+        err = exc.value.response
+        assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("NoSuchEntity", 404)
+        assert err["Error"]["Message"] == f"Policy {missing} does not exist or is not attachable."
+    assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []

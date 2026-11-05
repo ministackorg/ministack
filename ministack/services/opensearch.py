@@ -300,7 +300,7 @@ def _resolve_taggable_opensearch_arn(arn):
     name = spec.resource[len(prefix):]
     rec = _domains.get(name)
     if not rec or rec.get("ARN") != arn:
-        return None, _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return None, _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     return arn, None
 
 
@@ -948,7 +948,7 @@ def update_domain_from_cloudformation(name, payload, compatibility_properties):
     rec = _domains.get(name)
     if not rec:
         raise OpenSearchServiceError(
-            404, "ResourceNotFoundException", f"Domain not found: {name}"
+            409, "ResourceNotFoundException", f"Domain not found: {name}"
         )
 
     detached_payload = copy.deepcopy(payload or {})
@@ -1008,7 +1008,7 @@ def delete_domain_record(name, missing_ok=False):
             rec["_deleting"] = True
     if not rec and not missing_ok:
         raise OpenSearchServiceError(
-            404, "ResourceNotFoundException", f"Domain not found: {name}"
+            409, "ResourceNotFoundException", f"Domain not found: {name}"
         )
     if rec:
         _teardown_dataplane(rec)
@@ -1072,7 +1072,7 @@ def _create_domain(payload):
 def _describe_domain(name):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     return _json(200, {"DomainStatus": _public(rec)})
 
 
@@ -1110,7 +1110,7 @@ def _describe_domains(payload):
 def _update_domain_config(name, payload):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     updatable = {
         "ClusterConfig", "EBSOptions", "AccessPolicies", "SnapshotOptions",
         "VPCOptions", "CognitoOptions", "AdvancedOptions",
@@ -1147,14 +1147,14 @@ def _update_domain_config(name, payload):
 def _describe_domain_config(name):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     return _json(200, {"DomainConfig": _domain_config(rec)})
 
 
 def _describe_domain_change_progress(name, query_params):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     progress = _change_progress.get(name) or {
         "ChangeId": "",
         "StartTime": rec.get("_CreatedTime", _now()),
@@ -1193,7 +1193,7 @@ def _get_compatible_versions(query_params):
     if domain:
         rec = _domains.get(domain)
         if not rec:
-            return _error(404, "ResourceNotFoundException", f"Domain not found: {domain}")
+            return _error(409, "ResourceNotFoundException", f"Domain not found: {domain}")
         source = rec["EngineVersion"]
         targets = [v for v in _SUPPORTED_VERSIONS
                    if _engine_type(v) == _engine_type(source) and v != source]
@@ -1296,7 +1296,7 @@ def _update_package(payload):
     pid = payload.get("PackageID")
     rec = _packages.get(pid)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+        return _error(409, "ResourceNotFoundException", f"Package not found: {pid}")
     if "PackageSource" in payload:
         rec["_PackageSource"] = payload["PackageSource"]
     if "PackageDescription" in payload:
@@ -1335,7 +1335,7 @@ def _describe_packages(payload):
 def _delete_package(pid):
     rec = _packages.pop(pid, None)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+        return _error(409, "ResourceNotFoundException", f"Package not found: {pid}")
     # Cascade: drop any domain associations this package still had.
     for key in [k for k in _domain_packages.keys() if k.split(":", 1)[0] == pid]:
         _domain_packages.pop(key, None)
@@ -1347,9 +1347,9 @@ def _delete_package(pid):
 def _associate_package(pid, domain_name):
     rec = _packages.get(pid)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Package not found: {pid}")
+        return _error(409, "ResourceNotFoundException", f"Package not found: {pid}")
     if domain_name not in _domains:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {domain_name}")
     detail = {
         "PackageID": pid,
         "PackageName": rec["PackageName"],
@@ -1367,7 +1367,7 @@ def _associate_package(pid, domain_name):
 def _dissociate_package(pid, domain_name):
     detail = _domain_packages.pop(f"{pid}:{domain_name}", None)
     if not detail:
-        return _error(404, "ResourceNotFoundException",
+        return _error(409, "ResourceNotFoundException",
                       f"Package {pid} is not associated with domain {domain_name}")
     out = dict(detail)
     out["DomainPackageStatus"] = "DISSOCIATING"
@@ -1376,7 +1376,7 @@ def _dissociate_package(pid, domain_name):
 
 def _list_packages_for_domain(domain_name, query_params):
     if domain_name not in _domains:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {domain_name}")
     details = sorted(
         (v for k, v in _domain_packages.items() if k.split(":", 1)[-1] == domain_name),
         key=lambda d: d["PackageID"],

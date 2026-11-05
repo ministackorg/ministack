@@ -89,10 +89,14 @@ def _create_file_system(body):
     provisioned_throughput = body.get("ProvisionedThroughputInMibps")
     creation_token = body.get("CreationToken", _fs_id())
 
-    # Idempotency — same CreationToken returns existing FS
     for fs in _file_systems.values():
         if fs.get("CreationToken") == creation_token:
-            return _json(200, _fs_response(fs))
+            payload = json.dumps({
+                "ErrorCode": "FileSystemAlreadyExists",
+                "Message": f"File system '{fs['FileSystemId']}' already exists with creation token '{creation_token}'",
+                "FileSystemId": fs["FileSystemId"],
+            }).encode("utf-8")
+            return 409, {"Content-Type": "application/json", "x-amzn-errortype": "FileSystemAlreadyExists"}, payload
 
     fs_id = _fs_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:file-system/{fs_id}"
@@ -109,12 +113,16 @@ def _create_file_system(body):
         "PerformanceMode": perf_mode,
         "ThroughputMode": throughput_mode,
         "Encrypted": encrypted,
-        "KmsKeyId": kms_key_id,
         "Tags": tags,
         "OwnerId": get_account_id(),
-        "Name": next((t["Value"] for t in tags if t["Key"] == "Name"), ""),
         "FileSystemProtection": {"ReplicationOverwriteProtection": _PROTECTION_DEFAULT},
     }
+    # KmsKeyId and Name are optional in FileSystemDescription: omitted when unset.
+    if kms_key_id:
+        record["KmsKeyId"] = kms_key_id
+    name = next((t["Value"] for t in tags if t["Key"] == "Name"), "")
+    if name:
+        record["Name"] = name
     if provisioned_throughput:
         record["ProvisionedThroughputInMibps"] = provisioned_throughput
     if body.get("AvailabilityZoneName"):

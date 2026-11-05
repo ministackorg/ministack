@@ -183,7 +183,7 @@ def _paginate(items, query, key):
 
 def _create_vault(name, body):
     if name in _vaults:
-        return _err("AlreadyExistsException", f"Vault '{name}' already exists.", 409)
+        return _err("AlreadyExistsException", f"Vault '{name}' already exists.", 400)
     vault = {
         "BackupVaultName": name,
         "BackupVaultArn": _vault_arn(name),
@@ -206,20 +206,23 @@ def _create_vault(name, body):
 def _describe_vault(name):
     v = _vaults.get(name)
     if v is None:
-        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 400)
     return _ok(to_output_shape("backup", "DescribeBackupVaultOutput", v))
 
 
 def _delete_vault(name):
     if name not in _vaults:
-        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 400)
     del _vaults[name]
     logger.info("DeleteBackupVault: %s", name)
     return _no_content()
 
 
 def _list_vaults(query):
-    items = list(_vaults.values())
+    items = [
+        {k: v for k, v in to_output_shape("backup", "BackupVaultListMember", vault).items() if v not in ("", None)}
+        for vault in _vaults.values()
+    ]
     return _paginate(items, query, "BackupVaultList")
 
 
@@ -266,7 +269,7 @@ def _create_plan(body):
 def _get_plan(plan_id):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     return _ok({
         "BackupPlanId": p["BackupPlanId"],
         "BackupPlanArn": p["BackupPlanArn"],
@@ -281,7 +284,7 @@ def _get_plan(plan_id):
 def _update_plan(plan_id, body):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     plan_data = body.get("BackupPlan", {})
     if not plan_data:
         return _err("InvalidParameterValueException", "BackupPlan is required.", 400)
@@ -312,7 +315,7 @@ def _update_plan(plan_id, body):
 def _delete_plan(plan_id):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     del _plans[plan_id]
     logger.info("DeleteBackupPlan: %s", plan_id)
     return _ok({
@@ -341,7 +344,7 @@ def _list_plans(query):
 def _list_plan_versions(plan_id):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     return _ok({"BackupPlanVersionsList": [to_output_shape("backup", "BackupPlansListMember", v) for v in p["Versions"]]})
 
 
@@ -351,7 +354,7 @@ def _list_plan_versions(plan_id):
 
 def _create_selection(plan_id, body):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     sel = body.get("BackupSelection", {})
     if not sel:
         return _err("InvalidParameterValueException", "BackupSelection is required.", 400)
@@ -379,10 +382,10 @@ def _create_selection(plan_id, body):
 
 def _get_selection(plan_id, selection_id):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     s = _selections.get(selection_id)
     if s is None or s["BackupPlanId"] != plan_id:
-        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 400)
     return _ok({
         "SelectionId": s["SelectionId"],
         "BackupPlanId": s["BackupPlanId"],
@@ -401,10 +404,10 @@ def _get_selection(plan_id, selection_id):
 
 def _delete_selection(plan_id, selection_id):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     s = _selections.get(selection_id)
     if s is None or s["BackupPlanId"] != plan_id:
-        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 400)
     del _selections[selection_id]
     logger.info("DeleteBackupSelection: %s", selection_id)
     return _no_content()
@@ -412,7 +415,7 @@ def _delete_selection(plan_id, selection_id):
 
 def _list_selections(plan_id):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     items = [
         {
             "SelectionId": s["SelectionId"],
@@ -434,7 +437,7 @@ def _list_selections(plan_id):
 def _start_job(body):
     vault_name = body.get("BackupVaultName", "")
     if vault_name and vault_name not in _vaults:
-        return _err("ResourceNotFoundException", f"Vault '{vault_name}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Vault '{vault_name}' not found.", 400)
     job_id = new_uuid()
     now = _epoch()
     record = {
@@ -477,7 +480,7 @@ def _start_job(body):
 def _stop_job(job_id):
     j = _jobs.get(job_id)
     if j is None:
-        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 400)
     if j["State"] in ("COMPLETED", "FAILED", "ABORTED"):
         return _err(
             "InvalidRequestException",
@@ -504,7 +507,7 @@ def _shape_view(record, shape):
 def _describe_job(job_id):
     j = _jobs.get(job_id)
     if j is None:
-        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 400)
     return _ok(_shape_view(j, "DescribeBackupJobOutput"))
 
 
@@ -556,7 +559,7 @@ def _tag_resource(arn, body):
     except ValueError as exc:
         return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
-        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 400)
     tag_dict.update(tags)
     return _no_content()
 
@@ -568,7 +571,7 @@ def _untag_resource(arn, body):
     except ValueError as exc:
         return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
-        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 400)
     for k in keys:
         tag_dict.pop(k, None)
     return _no_content()
@@ -580,7 +583,7 @@ def _list_tags(arn, query=None):
     except ValueError as exc:
         return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
-        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 400)
     query = query or {}
     items = list(tag_dict.items())
     try:

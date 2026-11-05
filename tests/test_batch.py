@@ -489,3 +489,44 @@ def test_batch_restore_current_state_preserves_non_boot_regions():
             ) == value
     finally:
         service.reset()
+
+
+def test_batch_describe_filters_and_submit_validation(batch):
+    import uuid
+    suffix = uuid.uuid4().hex[:8]
+    ce = batch.create_compute_environment(computeEnvironmentName=f"ce-f-{suffix}", type="UNMANAGED")
+    assert [c["computeEnvironmentName"] for c in batch.describe_compute_environments(
+        computeEnvironments=[ce["computeEnvironmentArn"]])["computeEnvironments"]] == [f"ce-f-{suffix}"]
+    jq = batch.create_job_queue(
+        jobQueueName=f"jq-f-{suffix}", priority=1,
+        computeEnvironmentOrder=[{"order": 1, "computeEnvironment": ce["computeEnvironmentArn"]}],
+        schedulingPolicyArn=f"arn:aws:batch:us-east-1:000000000000:scheduling-policy/sp-{suffix}",
+        jobStateTimeLimitActions=[{"reason": "r", "state": "RUNNABLE", "maxTimeSeconds": 600, "action": "CANCEL"}])
+    queue = batch.describe_job_queues(jobQueues=[jq["jobQueueArn"]])["jobQueues"][0]
+    assert queue["schedulingPolicyArn"].endswith(f"sp-{suffix}")
+    assert queue["jobStateTimeLimitActions"][0]["maxTimeSeconds"] == 600
+
+    name = f"jd-f-{suffix}"
+    batch.register_job_definition(jobDefinitionName=name, type="container",
+                                  containerProperties={"image": "busybox", "vcpus": 1, "memory": 128})
+    jd2 = batch.register_job_definition(
+        jobDefinitionName=name, type="container", parameters={"k": "v"}, retryStrategy={"attempts": 2},
+        timeout={"attemptDurationSeconds": 60}, propagateTags=True, platformCapabilities=["EC2"],
+        schedulingPriority=5, containerProperties={"image": "busybox", "vcpus": 1, "memory": 128})
+    for ref in (f"{name}:2", jd2["jobDefinitionArn"]):
+        defs = batch.describe_job_definitions(jobDefinitions=[ref])["jobDefinitions"]
+        assert [d["revision"] for d in defs] == [2]
+        d = defs[0]
+        assert (d["parameters"], d["retryStrategy"]["attempts"], d["timeout"]["attemptDurationSeconds"],
+                d["propagateTags"], d["platformCapabilities"], d["schedulingPriority"]) == (
+            {"k": "v"}, 2, 60, True, ["EC2"], 5)
+    assert batch.describe_job_definitions(jobDefinitionName=name, status="INACTIVE")["jobDefinitions"] == []
+
+    for kwargs in ({"jobQueue": f"nope-{suffix}", "jobDefinition": name},
+                   {"jobQueue": jq["jobQueueArn"], "jobDefinition": f"nope-{suffix}"},
+                   {"jobQueue": jq["jobQueueArn"], "jobDefinition": f"{name}:9"}):
+        with pytest.raises(ClientError) as exc:
+            batch.submit_job(jobName="j", **kwargs)
+        assert exc.value.response["Error"]["Code"] == "ClientException"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert batch.submit_job(jobName="j", jobQueue=f"jq-f-{suffix}", jobDefinition=name)["jobId"]

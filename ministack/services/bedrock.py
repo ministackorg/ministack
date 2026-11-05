@@ -163,7 +163,7 @@ def _not_found(message: str) -> tuple:
 
 
 def _conflict(message: str) -> tuple:
-    return _error("ConflictException", message, 409)
+    return _error("ConflictException", message, 400)
 
 
 def _validation(message: str) -> tuple:
@@ -675,7 +675,23 @@ def _get_guardrail(identifier: str, query_params) -> tuple:
         rec = ver_rec
     payload = dict(rec)
     payload["Version"] = version
+    for field in ("TopicPolicy", "ContentPolicy", "WordPolicy", "SensitiveInformationPolicy",
+                  "ContextualGroundingPolicy"):
+        if isinstance(payload.get(field), dict):
+            payload[field] = {_GUARDRAIL_POLICY_OUTPUT_KEYS.get(k, k): v for k, v in payload[field].items()}
     return _json(payload)
+
+
+# Guardrail*PolicyConfig request members -> Guardrail*Policy output members (botocore bedrock).
+_GUARDRAIL_POLICY_OUTPUT_KEYS = {
+    "topicsConfig": "topics",
+    "filtersConfig": "filters",
+    "wordsConfig": "words",
+    "managedWordListsConfig": "managedWordLists",
+    "piiEntitiesConfig": "piiEntities",
+    "regexesConfig": "regexes",
+    "tierConfig": "tier",
+}
 
 
 def _list_guardrails(query_params) -> tuple:

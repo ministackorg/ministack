@@ -3804,9 +3804,10 @@ def _stop_docker_containers(include_unlabelled: bool = False):
     if client is None:
         return
     container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
-    # RDS_PERSIST=0 keeps no database data across a restart, Aurora cluster volumes included.
-    if os.environ.get("RDS_PERSIST", "0").lower() not in ("1", "true", "yes"):
-        container_reaper.reap_volumes(client, "rds")
+    # *_PERSIST=0 keeps no data across a restart, so that service's named volumes go too.
+    for service, flag in (("rds", "RDS_PERSIST"), ("mwaa", "MWAA_PERSIST"), ("dsql", "DSQL_PERSIST")):
+        if os.environ.get(flag, "0").lower() not in ("1", "true", "yes"):
+            container_reaper.reap_volumes(client, service)
 
 
 def _build_persistence_save_dict():

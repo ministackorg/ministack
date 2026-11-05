@@ -286,6 +286,28 @@ def _sync_dags_from_s3(env, docker_client, container):
         logger.exception("MWAA: failed to sync DAGs from S3")
 
 
+def _ensure_volume(docker_client, volume_name, labels):
+    """Create a labelled named volume so the shutdown sweep can find it; an existing one keeps its data."""
+    try:
+        docker_client.volumes.get(volume_name)
+    except Exception:
+        try:
+            docker_client.volumes.create(name=volume_name, labels=labels)
+        except Exception as e:
+            logger.warning("MWAA: could not create volume %s: %s", volume_name, e)
+
+
+def _remove_volumes(docker_client, env):
+    for field in ("_docker_dags_volume_name", "_docker_db_volume_name"):
+        volume_name = env.get(field)
+        if not volume_name:
+            continue
+        try:
+            docker_client.volumes.get(volume_name).remove()
+        except Exception as e:
+            logger.debug("MWAA: volume removal for %s: %s", volume_name, e)
+
+
 def _start_airflow_container(account_id, region, env_name, env):
     previous_account = get_account_id()
     previous_region = get_region()
@@ -382,6 +404,9 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
                 "_docker_db_volume_name",
                 f"{container_name}-db",
             )
+            for volume_name in (dags_volume_name, db_volume_name):
+                _ensure_volume(docker_client, volume_name, container_reaper.own_labels(
+                    "mwaa", region=region, env_name=env_name, account_id=account_id))
             container_kwargs["volumes"] = {
                 dags_volume_name: {"bind": "/opt/airflow/dags", "mode": "rw"},
                 db_volume_name: {"bind": "/opt/airflow", "mode": "rw"},
@@ -549,6 +574,9 @@ def _delete_environment(method, path, headers, body, query_params):
                 container.remove(force=True, v=True)
             except Exception:
                 logger.debug("MWAA: container cleanup for %s failed (may be already gone)", name)
+    if env.get("_docker_dags_volume_name") or env.get("_docker_db_volume_name"):
+        if docker_client := _get_docker():
+            _remove_volumes(docker_client, env)
 
     _release_port(env.get("_host_port"))
     del _environments[name]
@@ -783,6 +811,8 @@ def reset():
                 container.remove(force=True, v=True)
             except Exception:
                 pass
+        if docker_client:
+            _remove_volumes(docker_client, env)
         _release_port(env.get("_host_port"))
     _environments.clear()
 

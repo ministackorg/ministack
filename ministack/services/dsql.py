@@ -28,7 +28,7 @@ import time
 from ministack.core import container_reaper, pgproxy
 from ministack.core.concurrency import run_offloop
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     get_account_id,
     get_region,
     json_response,
@@ -54,11 +54,11 @@ DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes
 # Backend containers are opt-in: default is control-plane-only (metadata stubs).
 DSQL_STRICT = os.environ.get("DSQL_STRICT", "0").lower() in ("1", "true", "yes")
 
-_clusters = AccountScopedDict()  # identifier -> cluster dict
-_client_tokens = AccountScopedDict()  # clientToken -> identifier (create idempotency)
-_tags = AccountScopedDict()  # cluster/stream arn -> {key: value}
-_streams = AccountScopedDict()  # "{clusterId}/{streamId}" -> stream dict
-_stream_tokens = AccountScopedDict()  # clientToken -> stream key (create idempotency)
+_clusters = AccountRegionScopedDict()  # identifier -> cluster dict
+_client_tokens = AccountRegionScopedDict()  # clientToken -> identifier (create idempotency)
+_tags = AccountRegionScopedDict()  # cluster/stream arn -> {key: value}
+_streams = AccountRegionScopedDict()  # "{clusterId}/{streamId}" -> stream dict
+_stream_tokens = AccountRegionScopedDict()  # clientToken -> stream key (create idempotency)
 
 _port_counter = [BASE_PORT]
 _port_lock = threading.Lock()
@@ -214,6 +214,10 @@ def _container_name(identifier):
     return f"ministack-dsql-{identifier}"
 
 
+def _volume_name(identifier):
+    return f"ministack-dsql-{identifier}-data"
+
+
 def _published_port(container):
     ports = container.attrs.get("NetworkSettings", {}).get("Ports", {})
     return int(ports["5432/tcp"][0]["HostPort"])
@@ -265,8 +269,18 @@ def _run_backend_container(identifier):
         # A passwordless superuser: published on loopback only, for a host-run MiniStack.
         container_kwargs["ports"] = {"5432/tcp": ("127.0.0.1", None)}
     if DSQL_PERSIST:
+        volume_name = _volume_name(identifier)
+        # Labelled so the shutdown sweep can find it; an existing volume keeps its data.
+        try:
+            docker_client.volumes.get(volume_name)
+        except Exception:
+            try:
+                docker_client.volumes.create(
+                    name=volume_name, labels=container_reaper.own_labels("dsql", cluster_id=identifier))
+            except Exception as e:
+                logger.warning("DSQL: could not create volume %s: %s", volume_name, e)
         container_kwargs["volumes"] = {
-            f"ministack-dsql-{identifier}-data": {
+            volume_name: {
                 "bind": "/var/lib/postgresql/data",
                 "mode": "rw",
             },
@@ -324,10 +338,20 @@ def _remove_container(identifier):
         docker_client = rds._get_docker()
         if not docker_client:
             return
-        container = docker_client.containers.get(_container_name(identifier))
-        container.remove(v=True, force=True)
+        try:
+            docker_client.containers.get(_container_name(identifier)).remove(v=True, force=True)
+        except Exception as e:
+            logger.debug("DSQL: container removal for %s: %s", identifier, e)
+        _remove_volume(docker_client, identifier)
     except Exception as e:
-        logger.debug("DSQL: container removal for %s: %s", identifier, e)
+        logger.debug("DSQL: backend removal for %s: %s", identifier, e)
+
+
+def _remove_volume(docker_client, identifier):
+    try:
+        docker_client.volumes.get(_volume_name(identifier)).remove()
+    except Exception as e:
+        logger.debug("DSQL: volume removal for %s: %s", identifier, e)
 
 
 def _serving_loop():
@@ -1127,18 +1151,18 @@ def _handle_request_sync(method, path, headers, body, query_params):
 
 
 def get_state():
-    clusters = copy.deepcopy(dict(_clusters._data))
+    clusters = copy.deepcopy(_clusters)
     # Backend addresses are runtime-only (recomputed on restore).
-    for cluster in clusters.values():
+    for cluster in clusters.all_values():
         if isinstance(cluster, dict):
             cluster.pop("_backend_host", None)
             cluster.pop("_backend_port", None)
     return {
         "clusters": clusters,
-        "client_tokens": copy.deepcopy(dict(_client_tokens._data)),
-        "tags": copy.deepcopy(dict(_tags._data)),
-        "streams": copy.deepcopy(dict(_streams._data)),
-        "stream_tokens": copy.deepcopy(dict(_stream_tokens._data)),
+        "client_tokens": copy.deepcopy(_client_tokens),
+        "tags": copy.deepcopy(_tags),
+        "streams": copy.deepcopy(_streams),
+        "stream_tokens": copy.deepcopy(_stream_tokens),
         "port_counter": _port_counter[0],
     }
 
@@ -1150,21 +1174,12 @@ def load_persisted_state(data):
 def _restore_state(data):
     if not data:
         return
-    clusters = data.get("clusters", {})
-    if clusters:
-        _clusters._data.update(clusters)
-    tokens = data.get("client_tokens", {})
-    if tokens:
-        _client_tokens._data.update(tokens)
-    tags = data.get("tags", {})
-    if tags:
-        _tags._data.update(tags)
-    streams = data.get("streams", {})
-    if streams:
-        _streams._data.update(streams)
-    stream_tokens = data.get("stream_tokens", {})
-    if stream_tokens:
-        _stream_tokens._data.update(stream_tokens)
+    # update() re-homes legacy account-scoped records into their ARN's region.
+    _clusters.update(data.get("clusters", {}))
+    _client_tokens.update(data.get("client_tokens", {}))
+    _tags.update(data.get("tags", {}))
+    _streams.update(data.get("streams", {}))
+    _stream_tokens.update(data.get("stream_tokens", {}))
     saved_counter = data.get("port_counter")
     if isinstance(saved_counter, int) and saved_counter > _port_counter[0]:
         _port_counter[0] = saved_counter
@@ -1226,6 +1241,9 @@ def reset():
                         c.remove(v=True)
                     except Exception as e:
                         logger.warning("reset: failed to remove container %s: %s", c.name, e)
+                for cluster in _clusters.all_values():
+                    if isinstance(cluster, dict) and cluster.get("identifier"):
+                        _remove_volume(docker_client, cluster["identifier"])
         except Exception as e:
             logger.warning("reset: DSQL container sweep failed: %s", e)
     _backend_containers.clear()

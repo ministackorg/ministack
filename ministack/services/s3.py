@@ -7423,6 +7423,7 @@ def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict
         "Mode": mode_el.text,
         "RetainUntilDate": retain_until,
     }
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {"Content-Type": "application/xml"}, b""
 
 
@@ -7473,6 +7474,7 @@ def _put_object_legal_hold(bucket_name: str, key: str, body: bytes, query_params
         return _error("MalformedXML", _MALFORMED_XML, 400)
 
     _object_legal_hold[lock_key] = status_el.text
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {"Content-Type": "application/xml"}, b""
 
 
@@ -8852,7 +8854,14 @@ def _complete_multipart_upload(
             if pn_text is not None:
                 ordered_parts.append((int(pn_text), etag_text, part_checksums))
 
-    ordered_parts.sort(key=lambda x: x[0])
+    if not ordered_parts:
+        return _error("MalformedXML", _MALFORMED_XML, 400, f"/{bucket_name}/{key}")
+    if any(b[0] <= a[0] for a, b in zip(ordered_parts, ordered_parts[1:])):
+        return _error(
+            "InvalidPartOrder",
+            "The list of parts was not in ascending order. The parts list must be specified in order by part number.",
+            400,
+        )
 
     md5_digests = b""
     # Part bodies are joined once at the end: appending each 5 MB+ part to a
@@ -8870,7 +8879,7 @@ def _complete_multipart_upload(
                 400,
             )
         stored = upload["parts"][pn]
-        if req_etag and req_etag.strip('"') != stored["etag"].strip('"'):
+        if not req_etag or req_etag.strip('"') != stored["etag"].strip('"'):
             return _error(
                 "InvalidPart",
                 "One or more of the specified parts could not be found. "
@@ -9335,13 +9344,18 @@ def _persist_version_state(bucket_name: str, key: str, bucket: dict):
         _delete_persisted_object(bucket_name, key)
 
 
+def _key_sidecar_stores():
+    return (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations),
+            ("retention", _object_retention), ("legal_hold", _object_legal_hold))
+
+
 def _key_history_meta(bucket_name: str, key: str) -> dict:
     versions = _object_versions.get((bucket_name, key)) or []
     extra = {}
     if versions:
         extra["versions"] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
     vids = [None] + [v["version_id"] for v in versions if v["version_id"] != "null" and not v.get("is_delete_marker")]
-    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
+    for field, store in _key_sidecar_stores():
         found = {vid or "null": store.get((bucket_name, key, vid)) for vid in vids}
         found = {vid: value for vid, value in found.items() if value is not None}
         if found:
@@ -9563,7 +9577,7 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
         }
         if meta.get("version_id"):
             bucket["objects"][key]["version_id"] = meta["version_id"]
-        if "versions" in meta or "tags" in meta or "acl" in meta:
+        if "versions" in meta or any(field in meta for field, _ in _key_sidecar_stores()):
             _load_persisted_history(account_id, bucket, bucket_name, key, meta)
         elif meta.get("version_id"):
             vkey = (bucket_name, key)
@@ -9666,7 +9680,7 @@ def _load_persisted_history(account_id, bucket, bucket_name, key, meta):
     live = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
     if current is not None and not current.get("version_id"):
         live.add("null")
-    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
+    for field, store in _key_sidecar_stores():
         for vid, value in (meta.get(field) or {}).items():
             if vid in live:
                 store._data[(account_id, (bucket_name, key, None if vid == "null" else vid))] = value

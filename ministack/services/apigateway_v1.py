@@ -3041,7 +3041,7 @@ async def _invoke_lambda_custom_v1(
     # integration failure — API Gateway answers 504 (INTEGRATION_FAILURE). Never
     # 429: THROTTLED/429 is API Gateway's own usage-plan/stage/account throttling,
     # not the function's.
-    if err or result.get("throttle"):
+    if err or result.get("throttle") or result.get("service_error"):
         return 504, resp_headers, json.dumps({"message": "Internal server error"}).encode()
 
     # A standard Lambda error (the function ran and threw) is NOT mapped to a 5xx

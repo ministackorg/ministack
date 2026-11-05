@@ -246,7 +246,7 @@ def _describe_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     server = _servers[sid]
     described = {
@@ -273,7 +273,7 @@ def _describe_server(data):
 def _start_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
-        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 404)
+        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 400)
     _servers[sid]["State"] = "ONLINE"
     return json_response({})
 
@@ -281,7 +281,7 @@ def _start_server(data):
 def _stop_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
-        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 404)
+        return _error("ResourceNotFoundException", f"Unknown server: {sid}", 400)
     _servers[sid]["State"] = "OFFLINE"
     return json_response({})
 
@@ -290,7 +290,7 @@ async def _delete_server(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     # Cascade-delete all users on this server
     to_delete = [k for k in _users if k.startswith(sid + "/")]
@@ -329,7 +329,6 @@ def _list_servers(data):
             "Domain": s.get("Domain", "S3"),
             "EndpointType": s["EndpointType"],
             "IdentityProviderType": s["IdentityProviderType"],
-            "Protocols": s["Protocols"],
             "ServerId": s["ServerId"],
             "State": s["State"],
             "UserCount": s.get("UserCount", 0),
@@ -352,12 +351,12 @@ def _create_user(data):
 
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     uk = _user_key(sid, user_name)
     if uk in _users:
         return _error("ResourceExistsException",
-                       f"User already exists: {user_name}", 409)
+                       f"User already exists: {user_name}", 400)
 
     ssh_keys = []
     ssh_body = data.get("SshPublicKeyBody")
@@ -400,7 +399,7 @@ def _describe_user(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     user = _users[uk]
     described = {
@@ -428,7 +427,7 @@ def _delete_user(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     del _users[uk]
     if sid in _servers:
@@ -441,7 +440,7 @@ def _list_users(data):
     sid = data.get("ServerId", "")
     if sid not in _servers:
         return _error("ResourceNotFoundException",
-                       f"Unknown server: {sid}", 404)
+                       f"Unknown server: {sid}", 400)
 
     max_results = data.get("MaxResults", 1000)
     next_token = data.get("NextToken")
@@ -489,7 +488,7 @@ def _import_ssh_public_key(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     if not _validate_ssh_key(ssh_body):
         return _error("InvalidRequestException",
@@ -518,7 +517,7 @@ def _delete_ssh_public_key(data):
     uk = _user_key(sid, user_name)
     if uk not in _users:
         return _error("ResourceNotFoundException",
-                       f"Unknown user: {user_name}", 404)
+                       f"Unknown user: {user_name}", 400)
 
     keys = _users[uk]["SshPublicKeys"]
     _users[uk]["SshPublicKeys"] = [k for k in keys if k["SshPublicKeyId"] != key_id]

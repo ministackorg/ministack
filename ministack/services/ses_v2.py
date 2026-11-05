@@ -27,9 +27,16 @@ import base64
 import copy
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
+from datetime import datetime
+from email import encoders, message_from_bytes
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import getaddresses
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -51,6 +58,7 @@ from ministack.services.ses import (
     _restore_regional_store,
     _sent_emails_list,
     _smtp_relay,
+    _strip_message_id_header,
     _templates,
 )
 from ministack.services.ses import (
@@ -297,6 +305,107 @@ def _resolve_send_template(tpl):
         "BadRequestException",
         "Content.Template requires one of TemplateName, TemplateArn, or TemplateContent",
     )
+
+
+def _epoch_seconds(value):
+    """Stored template timestamps are ISO strings (shared with v1); restJson1 wants epoch seconds."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return int(time.time())
+
+
+def _email_identity_view(identity, rec):
+    """GetEmailIdentityResponse members MiniStack can fill."""
+    out = {
+        "IdentityType": rec["IdentityType"],
+        "FeedbackForwardingStatus": rec.get("FeedbackForwardingStatus", True),
+        "VerifiedForSendingStatus": rec.get("VerifiedForSendingStatus", True),
+        "DkimAttributes": rec.get("DkimAttributes") or {},
+    }
+    mail_from = rec.get("MailFromAttributes") or {}
+    if mail_from.get("MailFromDomain"):
+        out["MailFromAttributes"] = {
+            "MailFromDomain": mail_from["MailFromDomain"],
+            "MailFromDomainStatus": mail_from.get("MailFromDomainStatus", "SUCCESS"),
+            "BehaviorOnMxFailure": mail_from.get("BehaviorOnMxFailure", "USE_DEFAULT_VALUE"),
+        }
+    tags = _ses_tags.get(_resource_arn("identity", identity))
+    out["Tags"] = list(rec.get("Tags", []) if tags is None else tags)
+    if rec.get("ConfigurationSetName"):
+        out["ConfigurationSetName"] = rec["ConfigurationSetName"]
+    out["VerificationStatus"] = "SUCCESS"
+    return out
+
+
+_TRANSFER_ENCODERS = {
+    "BASE64": encoders.encode_base64,
+    "QUOTED_PRINTABLE": encoders.encode_quopri,
+    "SEVEN_BIT": encoders.encode_7or8bit,
+}
+
+
+def _attachment_part(att):
+    payload = _decode_raw(att.get("RawContent") or "")
+    filename = att.get("FileName", "")
+    ctype = att.get("ContentType") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    maintype, _, subtype = ctype.partition("/")
+    part = MIMEBase(maintype, subtype or "octet-stream")
+    part.set_payload(payload)
+    _TRANSFER_ENCODERS.get(att.get("ContentTransferEncoding") or "BASE64", encoders.encode_base64)(part)
+    disposition = "inline" if att.get("ContentDisposition") == "INLINE" else "attachment"
+    part.add_header("Content-Disposition", disposition, filename=filename)
+    if att.get("ContentId"):
+        part["Content-ID"] = f"<{att['ContentId'].strip('<>')}>"
+    if att.get("ContentDescription"):
+        part["Content-Description"] = att["ContentDescription"]
+    return part
+
+
+def _build_v2_mime(source, to_addrs, cc_addrs, reply_to, subject, body_text, body_html,
+                   message_id, headers, attachments):
+    """Simple/Template content as MIME, with Reply-To, custom Headers and Attachments."""
+    if body_text and body_html:
+        body = MIMEMultipart("alternative")
+        body.attach(MIMEText(body_text, "plain", "utf-8"))
+        body.attach(MIMEText(body_html, "html", "utf-8"))
+    elif body_html:
+        body = MIMEText(body_html, "html", "utf-8")
+    else:
+        body = MIMEText(body_text or "", "plain", "utf-8")
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(body)
+        for att in attachments:
+            msg.attach(_attachment_part(att))
+    else:
+        msg = body
+    msg["Message-ID"] = f"<{message_id}>"
+    msg["Subject"] = subject or ""
+    msg["From"] = source
+    if to_addrs:
+        msg["To"] = ", ".join(to_addrs)
+    if cc_addrs:
+        msg["Cc"] = ", ".join(cc_addrs)
+    if reply_to:
+        msg["Reply-To"] = ", ".join(reply_to)
+    for header in headers:
+        msg[header.get("Name", "")] = header.get("Value", "")
+    return msg.as_string()
+
+
+def _decode_raw(raw_data):
+    raw_bytes = raw_data.encode("utf-8") if isinstance(raw_data, str) else raw_data
+    try:
+        return base64.b64decode(raw_bytes)
+    except ValueError:
+        return raw_bytes
+
+
+def _addresses(value):
+    return [addr for _, addr in getaddresses([value]) if addr] if value else []
 
 
 def _local_ses_v2_resource_arn(arn):
@@ -853,7 +962,8 @@ async def handle_request(method, path, headers, body, query_params):
     if sub == "/outbound-emails" and method == "POST":
         msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
-        dest = data.get("Destination", {})
+        reply_to = list(data.get("ReplyToAddresses") or [])
+        dest = data.get("Destination") or {}
         to_addrs = dest.get("ToAddresses", [])
         cc_addrs = dest.get("CcAddresses", [])
         bcc_addrs = dest.get("BccAddresses", [])
@@ -865,27 +975,35 @@ async def handle_request(method, path, headers, body, query_params):
         body_text = ""
         body_html = None
         template_name = ""
+        raw_bytes = None
+        raw_from = ""
+        extras = simple or tpl
+        headers = list(extras.get("Headers") or [])
+        attachments = list(extras.get("Attachments") or [])
         if simple:
             subj = simple.get("Subject", {}).get("Data", "")
             body_text = simple.get("Body", {}).get("Text", {}).get("Data", "")
             body_html = simple.get("Body", {}).get("Html", {}).get("Data", "")
         elif raw:
-            raw_data = raw.get("Data", "")
-            parsed = _parse_raw_mime(raw_data)
+            raw_bytes = _decode_raw(raw.get("Data", ""))
+            parsed = _parse_raw_mime(raw.get("Data", ""))
+            raw_headers = message_from_bytes(raw_bytes)
+            raw_from = raw_headers.get("From", "") or ""
             subj = parsed.get("Subject", "") or ""
             for part_info in parsed.get("BodyParts", []):
                 if isinstance(part_info, dict):
                     ct = part_info.get("ContentType", "")
-                    data = part_info.get("Data", "")
+                    part_data = part_info.get("Data", "")
                     if "text/plain" in ct:
-                        body_text = data
+                        body_text = part_data
                     elif "text/html" in ct:
-                        body_html = data
-            # Extract Cc/Bcc from raw MIME headers when not provided via Destination
+                        body_html = part_data
+            if not dest:
+                to_addrs = _addresses(raw_headers.get("To", ""))
             if not cc_addrs:
-                cc_addrs = [e.strip() for e in parsed.get("Cc", "").split(",") if e.strip()]
+                cc_addrs = _addresses(raw_headers.get("Cc", ""))
             if not bcc_addrs:
-                bcc_addrs = [e.strip() for e in parsed.get("Bcc", "").split(",") if e.strip()]
+                bcc_addrs = _addresses(raw_headers.get("Bcc", ""))
         elif tpl:
             stored, template_name, err = _resolve_send_template(tpl)
             if err:
@@ -896,13 +1014,18 @@ async def handle_request(method, path, headers, body, query_params):
             body_html = rendered.get("Html", "")
 
         all_addrs = to_addrs + cc_addrs + bcc_addrs
-        rejected = _message_rejection(source or (parsed.get("From", "") if raw else ""), all_addrs)
+        sender = source or raw_from
+        rejected = _message_rejection(sender, all_addrs)
         if rejected:
             return _json_err("MessageRejected", rejected)
-        if source and all_addrs:
-            mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
-                                           subj, body_text, body_html, msg_id)
-            _smtp_relay(source, all_addrs, mime_str)
+        if sender and all_addrs:
+            if raw_bytes is not None:
+                mime_str = f"Message-ID: <{msg_id}>\r\n" + _strip_message_id_header(
+                    raw_bytes.decode("utf-8", errors="replace"))
+            else:
+                mime_str = _build_v2_mime(source, to_addrs, cc_addrs, reply_to, subj, body_text,
+                                          body_html, msg_id, headers, attachments)
+            _smtp_relay(sender, all_addrs, mime_str)
 
         # Append to shared sent_emails list for inspection endpoint visibility
         record = {
@@ -917,6 +1040,16 @@ async def handle_request(method, path, headers, body, query_params):
             "Timestamp": time.time(),
             "Type": "v2.SendEmail",
         }
+        if reply_to:
+            record["ReplyToAddresses"] = reply_to
+        if headers:
+            record["Headers"] = headers
+        if attachments:
+            record["Attachments"] = [
+                {k: att[k] for k in ("FileName", "ContentType", "ContentDisposition", "ContentId")
+                 if att.get(k)}
+                for att in attachments
+            ]
         if tpl:
             record["TemplateData"] = tpl.get("TemplateData", "")
             if template_name:
@@ -1052,7 +1185,7 @@ async def handle_request(method, path, headers, body, query_params):
             rec = _identities.get(identity)
             if not rec:
                 return _json_err("NotFoundException", f"Identity {identity} not found", 404)
-            return json_response(rec)
+            return json_response(_email_identity_view(identity, rec))
         if method == "DELETE":
             blocked = _tenant_delete_block(_resource_arn("identity", identity))
             if blocked:
@@ -1186,7 +1319,7 @@ async def handle_request(method, path, headers, body, query_params):
             "TemplatesMetadata": [
                 {
                     "TemplateName": t["TemplateName"],
-                    "CreatedTimestamp": t.get("CreatedTimestamp", ""),
+                    "CreatedTimestamp": _epoch_seconds(t.get("CreatedTimestamp")),
                 }
                 for t in page
             ],
