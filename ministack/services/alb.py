@@ -2115,6 +2115,44 @@ def _oidc_claims(id_token):
         return {}
 
 
+# The session cookie lives 7 days whatever the session timeout, which the session itself carries (AWS docs).
+OIDC_COOKIE_MAX_AGE = 604800
+# Internal key: cookies a refreshed session needs, added to the response by _execute_actions.
+_OIDC_REFRESHED_COOKIES = "__ministack_oidc_cookies"
+
+
+def _oidc_access_exp(tokens):
+    """When the access token expires (epoch seconds): ``expires_in``, else a JWT access token's ``exp``; 0 if unknown."""
+    try:
+        return int(time.time()) + int(tokens["expires_in"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        return int(_oidc_claims(tokens.get("access_token", "")).get("exp", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _oidc_session_from_tokens(cfg, tokens, session_exp, refresh_token=""):
+    """The session for a token response: claims from the user info endpoint, the refresh token AWS keeps."""
+    userinfo = cfg.get("UserInfoEndpoint", "")
+    claims = None
+    if userinfo:
+        claims = await run_reentrant(
+            lambda: _oidc_get_userinfo(userinfo, tokens.get("access_token", "")),
+            thread_name="ministack-alb-oidc-userinfo",
+        )
+    if not claims:
+        claims = _oidc_claims(tokens.get("id_token", ""))
+    return {
+        "claims": claims,
+        "access_token": tokens.get("access_token", ""),
+        "refresh_token": tokens.get("refresh_token") or refresh_token,
+        "access_exp": _oidc_access_exp(tokens),
+        "exp": session_exp,
+    }
+
+
 async def _authenticate_oidc(action, method, path, headers, body, query_params, listener_port,
                              lb_arn=""):
     """Run one authenticate-oidc action.
@@ -2169,29 +2207,37 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         # AWS; the ID token only serves as a fallback when the IdP has no
         # usable user info response. AWS never passes the ID token itself to
         # the backend, and neither does this.
-        userinfo = cfg.get("UserInfoEndpoint", "")
-        claims = None
-        if userinfo:
-            claims = await run_reentrant(
-                lambda: _oidc_get_userinfo(userinfo, tokens.get("access_token", "")),
-                thread_name="ministack-alb-oidc-userinfo",
-            )
-        if not claims:
-            claims = _oidc_claims(tokens.get("id_token", ""))
-        session = {
-            "claims": claims,
-            "access_token": tokens.get("access_token", ""),
-            "exp": int(time.time()) + session_timeout,
-        }
+        session = await _oidc_session_from_tokens(cfg, tokens, int(time.time()) + session_timeout)
         return (302, {
             "Location": pending["url"],
-            "Set-Cookie": _oidc_session_cookies(cookie_name, session, session_timeout, secure),
+            "Set-Cookie": _oidc_session_cookies(cookie_name, session, OIDC_COOKIE_MAX_AGE, secure),
             "Content-Type": "text/plain",
         }, b"")
 
     # --- an established session -------------------------------------------
     session = _oidc_read_session(jar, cookie_name)
-    if session and int(session.get("exp", 0)) > time.time():
+    live = bool(session) and int(session.get("exp", 0)) > time.time()
+    if live and session.get("access_exp") and int(session["access_exp"]) <= time.time():
+        # AWS refreshes the claims with the IdP's refresh token each time the access token expires, until the
+        # session times out or the refresh fails; without one, or on failure, the user signs in again.
+        live = False
+        if session.get("refresh_token"):
+            status, tokens = await run_reentrant(
+                lambda: _oidc_post_form(cfg.get("TokenEndpoint", ""), {
+                    "grant_type": "refresh_token",
+                    "refresh_token": session["refresh_token"],
+                    "client_id": cfg.get("ClientId", ""),
+                    "client_secret": cfg.get("ClientSecret", ""),
+                }),
+                thread_name="ministack-alb-oidc-refresh",
+            )
+            if status < 400 and "access_token" in tokens:
+                session = await _oidc_session_from_tokens(cfg, tokens, int(session["exp"]), session["refresh_token"])
+                headers[_OIDC_REFRESHED_COOKIES] = (
+                    _oidc_expiry_cookies(cookie_name, len(jar))
+                    + _oidc_session_cookies(cookie_name, session, OIDC_COOKIE_MAX_AGE, secure))
+                live = True
+    if live:
         claims = session.get("claims") or {}
         headers["x-amzn-oidc-identity"] = str(claims.get("sub", ""))
         headers["x-amzn-oidc-accesstoken"] = session.get("access_token", "")
@@ -2203,7 +2249,8 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
     on_unauth = (cfg.get("OnUnauthenticatedRequest") or "authenticate").lower()
     if on_unauth == "allow":
         return None
-    if on_unauth == "deny":
+    if on_unauth == "deny" and not session:
+        # deny answers 401 to a request with no authentication information; expired information is sent to the IdP.
         return (401, {"Content-Type": "text/plain"}, b"Unauthorized")
 
     host = headers.get("host") or f"localhost:{listener_port}"
@@ -2224,6 +2271,7 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         "created": time.time(),
     }
     location = cfg.get("AuthorizationEndpoint", "") + "?" + urlencode({
+        **(cfg.get("AuthenticationRequestExtraParams") or {}),
         "client_id": cfg.get("ClientId", ""),
         "response_type": "code",
         "scope": cfg.get("Scope") or "openid",
@@ -2268,6 +2316,16 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
                                                 lb_arn=lb_arn)
             if response is not None:
                 return response
+            refreshed = forwarded.pop(_OIDC_REFRESHED_COOKIES, None)
+            if refreshed:
+                status, out_headers, out_body = await _execute_actions(
+                    [a for a in ordered if int(a.get("Order", 1) or 1) > int(action.get("Order", 1) or 1)],
+                    method, path, forwarded, body, query_params, listener_port, lb_arn=lb_arn,
+                    target_host=target_host, raw_query_string=raw_query_string, raw_path=raw_path)
+                out_headers = dict(out_headers or {})
+                existing = out_headers.get("Set-Cookie")
+                out_headers["Set-Cookie"] = ([existing] if isinstance(existing, str) else list(existing or [])) + refreshed
+                return status, out_headers, out_body
             continue
         if atype == "authenticate-cognito":
             # Cognito authentication is the same protocol with the endpoints

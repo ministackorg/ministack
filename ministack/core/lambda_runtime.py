@@ -1285,7 +1285,7 @@ class Worker:
         runtime = self.config.get("Runtime", "python3.12")
         binary, worker_script = _detect_runtime_binary(runtime)
         if not binary:
-            raise RuntimeError(f"Unsupported runtime: {runtime}")
+            raise LambdaServiceError(f"no local runtime binary for {runtime}")
 
         ext = _worker_script_extension(runtime)
         worker_path = os.path.join(self._tmpdir, f"_worker{ext}")
@@ -1495,11 +1495,11 @@ class Worker:
             except json.JSONDecodeError:
                 continue
         if response is None:
-            raise RuntimeError("No JSON init response from worker")
+            raise LambdaServiceError("No JSON init response from worker")
         if response.get("status") != "ready":
             if response.get("errorType"):
                 raise ProvidedRuntimeError(response.get("error", ""), response["errorType"], response.get("payload"))
-            raise RuntimeError(f"Worker init failed: {response.get('error')}")
+            raise LambdaServiceError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
@@ -1616,9 +1616,10 @@ class Worker:
                                     return
                             except json.JSONDecodeError:
                                 continue
-                    result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
+                    result_box.append({"status": "error", "service_error": True,
+                                       "error": "No JSON response from worker after 200 lines"})
                 except Exception as e:
-                    result_box.append({"status": "error", "error": str(e)})
+                    result_box.append({"status": "error", "service_error": True, "error": str(e)})
 
             reader = threading.Thread(target=_read_response, daemon=True)
             reader.start()
@@ -1639,7 +1640,8 @@ class Worker:
 
             if not result_box:
                 self._proc = None
-                return {"status": "error", "error": "Worker returned no response", "cold_start": cold}
+                return {"status": "error", "service_error": True, "error": "Worker returned no response",
+                        "cold_start": cold}
 
             response = result_box[0]
             if response.get("status") == "error":
@@ -1960,6 +1962,10 @@ def runtime_exit_reason(returncode: int) -> str:
     return f"Runtime exited with error: exit status {returncode}"
 
 
+# AWS's errorMessage for a provided.* function with no bootstrap (Runtime.InvalidEntrypoint).
+MISSING_BOOTSTRAP_MESSAGE = "Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]"
+
+
 def runtime_exit_message(request_id: str, reason: str) -> str:
     return f"RequestId: {request_id} Error: {reason}" if request_id else f"Error: {reason}"
 
@@ -1975,8 +1981,14 @@ class RuntimeExitError(RuntimeError):
         super().__init__(self.reason)
 
 
+class LambdaServiceError(RuntimeError):
+    """MiniStack's own execution machinery failed, not the function: Invoke answers ServiceException."""
+
+
 class ProvidedInitTimeout(RuntimeError):
     """The bootstrap started but did not reach the Runtime API in time."""
+
+    error_type = "Runtime.Unknown"
 
 
 class ProvidedRuntimeError(RuntimeError):
@@ -2246,7 +2258,8 @@ class ProvidedWorker(Worker):
             # function returns a Runtime.InvalidEntrypoint error upon
             # invocation" (runtimes-custom.html).
             raise ProvidedRuntimeError(
-                "No bootstrap binary found in the deployment package.",
+                MISSING_BOOTSTRAP_MESSAGE if not os.path.exists(bootstrap_path)
+                else "Couldn't execute the bootstrap binary: permission denied",
                 "Runtime.InvalidEntrypoint",
             )
 
@@ -2345,7 +2358,7 @@ class ProvidedWorker(Worker):
                     f"bootstrap did not reach the Runtime API within "
                     f"{budget:g}s{self._init_log_suffix()}")
         if self._init_error is not None:
-            raise RuntimeError(f"init error: {self._init_error}")
+            raise ProvidedRuntimeError(f"init error: {self._init_error}", "Runtime.Unknown")
 
     def _init_log_suffix(self) -> str:
         log = self._drain_stderr_bounded(first_line_wait=0.1)
