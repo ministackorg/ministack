@@ -3418,7 +3418,7 @@ def _create_user_pool_client(data):
         "EnableTokenRevocation": data.get("EnableTokenRevocation", True),
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),
-        "RefreshTokenRotation": data.get("RefreshTokenRotation"),
+        "RefreshTokenRotation": rotation,
     }
     pool["_clients"][cid] = client
     out = {k: v for k, v in client.items() if v is not None}
@@ -3485,7 +3485,7 @@ def _update_user_pool_client(data):
         "SupportedIdentityProviders", "CallbackURLs", "LogoutURLs", "DefaultRedirectURI",
         "AllowedOAuthFlows", "AllowedOAuthScopes", "AllowedOAuthFlowsUserPoolClient",
         "AnalyticsConfiguration", "PreventUserExistenceErrors", "EnableTokenRevocation",
-        "EnablePropagateAdditionalUserContextData", "AuthSessionValidity", "RefreshTokenRotation",
+        "EnablePropagateAdditionalUserContextData", "AuthSessionValidity",
     }
     # Left out of an update, rotation stays as it was, as on AWS.
     rotation = data["RefreshTokenRotation"] if data.get("RefreshTokenRotation") is not None else client.get("RefreshTokenRotation")
@@ -4604,11 +4604,11 @@ def _esdk_encrypt(plaintext: bytes, data_key: bytes, encrypted_data_key: bytes, 
             + struct.pack(">I", len(content)) + content + tag)
 
     signed = header + header_auth + body
-    while True:
+    for _ in range(64):
         signature = private_key.sign(signed, ec.ECDSA(hashes.SHA384()))
         if len(signature) == _ESDK_SIGNATURE_LENGTH:
-            break
-    return signed + _esdk_field(signature)
+            return signed + _esdk_field(signature)
+    raise RuntimeError("could not produce a fixed-length ECDSA signature")
 
 
 def _send_to_custom_email_sender(pool, attr_dict, trigger, user_name, user_status, code,
