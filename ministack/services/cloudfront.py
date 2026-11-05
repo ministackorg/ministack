@@ -6104,8 +6104,7 @@ async def _fetch_from_alb_origin(lb: dict, origin: dict, method: str, uri: str, 
     _host, port, use_https = _origin_connect_target(origin, viewer_is_https)
     # Without a TLS handshake there is no certificate for CloudFront to check, so only HTTP is served.
     if use_https or not any(
-        listener["LoadBalancerArn"] == lb["LoadBalancerArn"] and listener.get("Port") == port
-        and listener.get("Protocol") == "HTTP" for listener in alb._listeners.values()
+        listener.get("Port") == port and listener.get("Protocol") == "HTTP" for listener in alb.listeners_of(lb)
     ):
         raise OriginUnreachable(f"no HTTP listener on port {port} of {lb['DNSName']}")
 

@@ -12,6 +12,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -7831,6 +7832,64 @@ def _cognito_user_pool_domain_delete(physical_id, props):
         _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
+def _cognito_branding_numbers(settings, defaults):
+    """A template's Settings with each string a number or boolean where Cognito's own setting is one,
+    as CloudFormation passes a String parameter's "8.0" on as 8.0 and "true" as true."""
+    if isinstance(settings, dict) and isinstance(defaults, dict):
+        return {k: _cognito_branding_numbers(v, defaults.get(k)) for k, v in settings.items()}
+    if not isinstance(settings, str):
+        return settings
+    if isinstance(defaults, bool):
+        return {"true": True, "false": False}.get(settings.lower(), settings)
+    if isinstance(defaults, (int, float)):
+        try:
+            number = float(settings)
+        except ValueError:
+            return settings
+        return number if math.isfinite(number) else settings
+    return settings
+
+
+def _cognito_managed_login_branding_values(props):
+    values = {k: props[k] for k in ("Settings", "Assets") if k in props}
+    if "Settings" in values:
+        values["Settings"] = _cognito_branding_numbers(values["Settings"], _cognito.DEFAULT_SETTINGS)
+    if "UseCognitoProvidedValues" in props:
+        values["UseCognitoProvidedValues"] = _cfn_bool(props["UseCognitoProvidedValues"])
+    return values
+
+
+def _cognito_managed_login_branding_create(logical_id, props, stack_name):
+    """Ref is "{UserPoolId}|{ManagedLoginBrandingId}" and GetAtt
+    ManagedLoginBrandingId the id alone, as on AWS."""
+    pid = props.get("UserPoolId", "")
+    status, _, body = _cognito._create_managed_login_branding({
+        "UserPoolId": pid, "ClientId": props.get("ClientId", ""),
+        **_cognito_managed_login_branding_values(props),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::ManagedLoginBranding create failed: {body!r}")
+    bid = json.loads(body)["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+    return f"{pid}|{bid}", {"ManagedLoginBrandingId": bid}
+
+
+def _cognito_managed_login_branding_update(physical_id, old_props, new_props, stack_name):
+    """Update in place; the engine replaces the branding for a new ClientId or UserPoolId."""
+    pid, _, bid = physical_id.partition("|")
+    status, _, body = _cognito._update_managed_login_branding({
+        "UserPoolId": pid, "ManagedLoginBrandingId": bid,
+        **_cognito_managed_login_branding_values(new_props),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::ManagedLoginBranding update failed: {body!r}")
+    return physical_id, {"ManagedLoginBrandingId": bid}
+
+
+def _cognito_managed_login_branding_delete(physical_id, props):
+    pid, _, bid = physical_id.partition("|")
+    _cognito._delete_managed_login_branding({"UserPoolId": pid, "ManagedLoginBrandingId": bid})
+
+
 # ===========================================================================
 # --- ECR resource provisioners ---
 
@@ -12789,7 +12848,7 @@ def _asg_create(logical_id, props, stack_name):
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
-def _asg_mixed_instances_policy(policy):
+def _asg_mixed_instances_policy(policy, stored=None):
     from ministack.services.autoscaling import resolve_mixed_instances_policy
 
     if not policy:
@@ -12798,14 +12857,15 @@ def _asg_mixed_instances_policy(policy):
     for key in ("OnDemandBaseCapacity", "OnDemandPercentageAboveBaseCapacity", "SpotInstancePools"):
         if key in distribution:
             distribution[key] = int(distribution[key])
-    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution})
+    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution}, stored)
     if error:
         raise ValueError(error)
     return resolved
 
 
-def _asg_fields(props):
-    """The group members a template sets, for create and update alike."""
+def _asg_fields(props, stored_policy=None):
+    """The group members a template sets, for create and update alike; an update passes the group's
+    MixedInstancesPolicy, which keeps the members the template no longer sets."""
     from ministack.services.autoscaling import _SOURCE_ERROR
 
     has_lt, has_mixed = bool(props.get("LaunchTemplate")), bool(props.get("MixedInstancesPolicy"))
@@ -12816,7 +12876,7 @@ def _asg_fields(props):
     return {
         "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
         "LaunchTemplate": _asg_launch_template(props.get("LaunchTemplate")),
-        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy")),
+        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy"), stored_policy),
         "MinSize": int(props.get("MinSize", 0)),
         "MaxSize": int(props.get("MaxSize", 0)),
         "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
@@ -12855,7 +12915,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     )
     if replaced is not None:
         return replaced
-    asg.update(_asg_fields(new_props))
+    asg.update(_asg_fields(new_props, asg.get("MixedInstancesPolicy")))
     # Tags from CreateOrUpdateTags stay.
     tags = _asg._tags.get(physical_id)
     if tags is None:
@@ -15318,6 +15378,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
+    "AWS::Cognito::ManagedLoginBranding": ("ClientId", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -15951,6 +16012,11 @@ _RESOURCE_HANDLERS = {
         "create": _cognito_user_pool_domain_create,
         "update": _cognito_user_pool_domain_update,
         "delete": _cognito_user_pool_domain_delete,
+    },
+    "AWS::Cognito::ManagedLoginBranding": {
+        "create": _cognito_managed_login_branding_create,
+        "update": _cognito_managed_login_branding_update,
+        "delete": _cognito_managed_login_branding_delete,
     },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,
