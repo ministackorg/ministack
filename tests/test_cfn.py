@@ -39156,6 +39156,169 @@ def test_cfn_asg_mixed_instances_policy_and_launch_source(cfn, autoscaling, ec2)
         ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
 
 
+def test_cfn_asg_spot_instance_pools_follow_allocation_strategy(cfn, autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04): a price-capacity-optimized group has no SpotInstancePools
+    (m3-describe-cfn-pco), and sending SpotInstancePools with it fails the resource (m3-cfn-events-pco-pools)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(LaunchTemplateName=f"cfn-pools-{suffix}", LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+
+    def template(group, **extra):
+        return json.dumps({"Resources": {"ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+            "AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "0", "DesiredCapacity": "0",
+            "AvailabilityZones": ["us-east-1a"], "MixedInstancesPolicy": {
+                "LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt["LaunchTemplateId"],
+                                                                   "Version": "1"},
+                                   "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]},
+                "InstancesDistribution": {"OnDemandBaseCapacity": "0", "OnDemandPercentageAboveBaseCapacity": "0",
+                                          "SpotAllocationStrategy": "price-capacity-optimized", **extra}}}}}})
+
+    ok, bad = f"cfn-pools-{suffix}", f"cfn-pools-bad-{suffix}"
+    try:
+        cfn.create_stack(StackName=ok, TemplateBody=template(ok))
+        assert _wait_stack(cfn, ok)["StackStatus"] == "CREATE_COMPLETE"
+        assert autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ok])["AutoScalingGroups"][0][
+            "MixedInstancesPolicy"]["InstancesDistribution"] == {
+            "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+            "OnDemandPercentageAboveBaseCapacity": 0, "SpotAllocationStrategy": "price-capacity-optimized"}
+        cfn.create_stack(StackName=bad, TemplateBody=template(bad, SpotInstancePools="2"))
+        assert _wait_stack(cfn, bad)["StackStatus"] == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=bad)["StackEvents"]
+                   if e["LogicalResourceId"] == "ASG" and e["ResourceStatus"] == "CREATE_FAILED"]
+        assert any("SpotInstancePools option is only available with the lowest-price allocation strategy." in r
+                   for r in reasons), reasons
+        assert not autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[bad])["AutoScalingGroups"]
+    finally:
+        for name in (ok, bad):
+            _delete_cfn_test_stack(cfn, name)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_cfn_asg_update_spot_instance_pools_follow_allocation_strategy(cfn, autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04): a stack update from lowest-price with 3 pools to
+    price-capacity-optimized leaves no SpotInstancePools (m5-describe-cfn-upd-created,
+    m5-describe-cfn-upd-after-to-pco), and one adding SpotInstancePools fails the resource and rolls back, leaving
+    the group unchanged (m5-cfn-events-update-pco-pools, m5-cfn-stack-update-pco-pools,
+    m5-describe-cfn-upd-after-pco-pools). A later update whose template drops SpotInstancePools, SpotMaxPrice and
+    OnDemandAllocationStrategy keeps their stored values (m8-describe-cfn-drop-after-update). m8 captured that from a
+    fresh stack; here it follows the rolled-back update, which leaves the group as m5 shows. SpotMaxPrice "" then
+    removes the price (m11-describe-cfn-max-after-empty). Templates that drop Overrides, or InstancesDistribution,
+    keep the stored ones (m12-describe-cfn-part-after-drop-overrides, m12-describe-cfn-part-after-drop-dist)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(LaunchTemplateName=f"cfn-upd-pools-{suffix}", LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    stack, group = f"cfn-upd-pools-{suffix}", f"cfn-upd-pools-{suffix}"
+
+    def template(**dist):
+        return json.dumps({"Resources": {"ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+            "AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "0", "DesiredCapacity": "0",
+            "AvailabilityZones": ["us-east-1a"], "MixedInstancesPolicy": {
+                "LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt["LaunchTemplateId"],
+                                                                   "Version": "1"},
+                                   "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]},
+                "InstancesDistribution": {"OnDemandBaseCapacity": "0", "OnDemandPercentageAboveBaseCapacity": "0",
+                                          **dist}}}}}})
+
+    def distribution():
+        return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])["AutoScalingGroups"][0][
+            "MixedInstancesPolicy"]["InstancesDistribution"]
+
+    common = {"OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+              "OnDemandPercentageAboveBaseCapacity": 0}
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=template(SpotAllocationStrategy="lowest-price",
+                                                                SpotInstancePools="3"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        assert distribution() == {**common, "SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 3}
+        cfn.update_stack(StackName=stack, TemplateBody=template(SpotAllocationStrategy="price-capacity-optimized"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        pco = {**common, "SpotAllocationStrategy": "price-capacity-optimized"}
+        assert distribution() == pco
+        cfn.update_stack(StackName=stack, TemplateBody=template(SpotAllocationStrategy="price-capacity-optimized",
+                                                                SpotInstancePools="2"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "ASG" and e["ResourceStatus"] == "UPDATE_FAILED"]
+        assert any("SpotInstancePools option is only available with the lowest-price allocation strategy." in r
+                   for r in reasons), reasons
+        assert distribution() == pco
+        cfn.update_stack(StackName=stack, TemplateBody=template(
+            SpotAllocationStrategy="lowest-price", SpotInstancePools="3", SpotMaxPrice="0.05",
+            OnDemandAllocationStrategy="lowest-price"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        kept = {**common, "OnDemandAllocationStrategy": "lowest-price", "SpotAllocationStrategy": "lowest-price",
+                "SpotInstancePools": 3, "SpotMaxPrice": "0.05"}
+        assert distribution() == kept
+        cfn.update_stack(StackName=stack, TemplateBody=template(SpotAllocationStrategy="lowest-price"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        assert distribution() == kept
+        cfn.update_stack(StackName=stack, TemplateBody=template(SpotAllocationStrategy="lowest-price", SpotMaxPrice=""))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+        del kept["SpotMaxPrice"]
+        assert distribution() == kept
+        before = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])["AutoScalingGroups"][0][
+            "MixedInstancesPolicy"]
+        for policy in ({"LaunchTemplate": {"LaunchTemplateSpecification": {
+                            "LaunchTemplateId": lt["LaunchTemplateId"], "Version": "1"}},
+                        "InstancesDistribution": {"OnDemandBaseCapacity": "0", "OnDemandPercentageAboveBaseCapacity": "0",
+                                                  "SpotAllocationStrategy": "lowest-price"}},
+                       {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                           "LaunchTemplateId": lt["LaunchTemplateId"], "Version": "1"},
+                           "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]}}):
+            body = json.loads(template())
+            body["Resources"]["ASG"]["Properties"]["MixedInstancesPolicy"] = policy
+            cfn.update_stack(StackName=stack, TemplateBody=json.dumps(body))
+            assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_COMPLETE"
+            assert autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])["AutoScalingGroups"][0][
+                "MixedInstancesPolicy"] == before
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_cfn_asg_rollback_keeps_the_mixed_instances_policy_update(cfn, autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04): when a stack update sets SpotInstancePools and SpotMaxPrice on
+    a group and a later resource fails, the rollback leaves both on the group (m9-cfn-stack-update-rb,
+    m9-describe-cfn-rb-created, m9-describe-cfn-rb-after-rollback). The capture failed a security group in a missing
+    VPC; here a second group with no launch source fails, which MiniStack refuses as AWS does (#2452)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(LaunchTemplateName=f"cfn-rb-{suffix}", LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    stack, group = f"cfn-rb-{suffix}", f"cfn-rb-{suffix}"
+
+    def template(failing=False, **dist):
+        resources = {"ASG": {"Type": "AWS::AutoScaling::AutoScalingGroup", "Properties": {
+            "AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "0", "DesiredCapacity": "0",
+            "AvailabilityZones": ["us-east-1a"], "MixedInstancesPolicy": {
+                "LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt["LaunchTemplateId"],
+                                                                   "Version": "1"},
+                                   "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]},
+                "InstancesDistribution": {"OnDemandBaseCapacity": "0", "OnDemandPercentageAboveBaseCapacity": "0",
+                                          "SpotAllocationStrategy": "lowest-price", **dist}}}}}
+        if failing:
+            resources["Fail"] = {"Type": "AWS::AutoScaling::AutoScalingGroup", "DependsOn": "ASG", "Properties": {
+                "MinSize": "0", "MaxSize": "0", "AvailabilityZones": ["us-east-1a"]}}
+        return json.dumps({"Resources": resources})
+
+    def distribution():
+        return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[group])["AutoScalingGroups"][0][
+            "MixedInstancesPolicy"]["InstancesDistribution"]
+
+    common = {"OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+              "OnDemandPercentageAboveBaseCapacity": 0, "SpotAllocationStrategy": "lowest-price"}
+    try:
+        cfn.create_stack(StackName=stack, TemplateBody=template())
+        assert _wait_stack(cfn, stack)["StackStatus"] == "CREATE_COMPLETE"
+        assert distribution() == {**common, "SpotInstancePools": 2}
+        cfn.update_stack(StackName=stack, TemplateBody=template(failing=True, SpotInstancePools="4",
+                                                                SpotMaxPrice="0.07"))
+        assert _wait_stack(cfn, stack)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert distribution() == {**common, "SpotInstancePools": 4, "SpotMaxPrice": "0.07"}
+    finally:
+        _delete_cfn_test_stack(cfn, stack)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
 def _stack_set_template(set_name, queue_name, **overrides):
     """A parent stack with one SELF_MANAGED StackSet deploying an SQS queue to its own account and Region
     (the template of the real-AWS capture, with the retention passed through the parent)."""

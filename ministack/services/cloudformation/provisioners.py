@@ -12789,7 +12789,7 @@ def _asg_create(logical_id, props, stack_name):
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
-def _asg_mixed_instances_policy(policy):
+def _asg_mixed_instances_policy(policy, stored=None):
     from ministack.services.autoscaling import resolve_mixed_instances_policy
 
     if not policy:
@@ -12798,14 +12798,15 @@ def _asg_mixed_instances_policy(policy):
     for key in ("OnDemandBaseCapacity", "OnDemandPercentageAboveBaseCapacity", "SpotInstancePools"):
         if key in distribution:
             distribution[key] = int(distribution[key])
-    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution})
+    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution}, stored)
     if error:
         raise ValueError(error)
     return resolved
 
 
-def _asg_fields(props):
-    """The group members a template sets, for create and update alike."""
+def _asg_fields(props, stored_policy=None):
+    """The group members a template sets, for create and update alike; an update passes the group's
+    MixedInstancesPolicy, which keeps the members the template no longer sets."""
     from ministack.services.autoscaling import _SOURCE_ERROR
 
     has_lt, has_mixed = bool(props.get("LaunchTemplate")), bool(props.get("MixedInstancesPolicy"))
@@ -12816,7 +12817,7 @@ def _asg_fields(props):
     return {
         "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
         "LaunchTemplate": _asg_launch_template(props.get("LaunchTemplate")),
-        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy")),
+        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy"), stored_policy),
         "MinSize": int(props.get("MinSize", 0)),
         "MaxSize": int(props.get("MaxSize", 0)),
         "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
@@ -12855,7 +12856,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     )
     if replaced is not None:
         return replaced
-    asg.update(_asg_fields(new_props))
+    asg.update(_asg_fields(new_props, asg.get("MixedInstancesPolicy")))
     # Tags from CreateOrUpdateTags stay.
     tags = _asg._tags.get(physical_id)
     if tags is None:
