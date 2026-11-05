@@ -185,3 +185,16 @@ def test_create_duplicate_conflicts():
     status, _, body = _call("CreateResource", payload)
     assert status == 400
     assert body["__type"] == "AlreadyExistsException"
+
+
+def test_identifier_is_the_schema_primary_identifier():
+    desired = {"LogGroupName": "/cc/app", "RetentionInDays": 7}
+    status, _, body = _call("CreateResource", {"TypeName": "AWS::Logs::LogGroup", "DesiredState": json.dumps(desired)})
+    assert status == 200 and body["ProgressEvent"]["Identifier"] == "/cc/app"
+    status, _, body = _call("GetResource", {"TypeName": "AWS::Logs::LogGroup", "Identifier": "/cc/app"})
+    assert status == 200 and json.loads(body["ResourceDescription"]["Properties"]) == desired
+    status, _, body = _call("CreateResource", {
+        "TypeName": "AWS::Cognito::UserPoolGroup",
+        "DesiredState": json.dumps({"UserPoolId": "us-east-1_abc", "GroupName": "admins"}),
+    })
+    assert status == 200 and body["ProgressEvent"]["Identifier"] == "us-east-1_abc|admins"

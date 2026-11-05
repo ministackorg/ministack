@@ -206,7 +206,7 @@ def _lambda_failure(result: dict) -> tuple | None:
     message = body.get("errorMessage", "") if isinstance(body, dict) else str(body or "")
     if error_type == "Sandbox.Timedout" or message.startswith("Task timed out"):
         return _error("LambdaTimeout", "The Lambda function timed out.", 500)
-    if result.get("throttle") or error_type == "TooManyRequestsException":
+    if result.get("throttle") or result.get("service_error") or error_type == "TooManyRequestsException":
         return _error("LambdaInvocationFailed", "The Lambda function could not be invoked.", 400)
     return _error("LambdaRuntimeError", message or "The Lambda function failed.", 500)
 

@@ -544,7 +544,7 @@ def _error(code, message, status=400):
 
 def _attrs_xml(attrs):
     return "".join(
-        f"<member><Key>{a['Key']}</Key><Value>{a['Value']}</Value></member>"
+        f"<member><Key>{_esc(str(a['Key']))}</Key><Value>{_esc(str(a['Value']))}</Value></member>"
         for a in attrs
     )
 
@@ -554,61 +554,61 @@ def _attrs_xml(attrs):
 
 def _lb_xml(lb):
     azs = "".join(
-        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{s}</SubnetId>"
+        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{_esc(str(s))}</SubnetId>"
         f"<LoadBalancerAddresses/></member>"
         for s in lb.get("Subnets", [])
     )
-    sgs = "".join(f"<member>{sg}</member>" for sg in lb.get("SecurityGroups", []))
+    sgs = "".join(f"<member>{_esc(str(sg))}</member>" for sg in lb.get("SecurityGroups", []))
     return (
         f"<member>"
-        f"<LoadBalancerArn>{lb['LoadBalancerArn']}</LoadBalancerArn>"
-        f"<LoadBalancerName>{lb['LoadBalancerName']}</LoadBalancerName>"
-        f"<DNSName>{lb['DNSName']}</DNSName>"
+        f"<LoadBalancerArn>{_esc(str(lb['LoadBalancerArn']))}</LoadBalancerArn>"
+        f"<LoadBalancerName>{_esc(str(lb['LoadBalancerName']))}</LoadBalancerName>"
+        f"<DNSName>{_esc(str(lb['DNSName']))}</DNSName>"
         f"<CanonicalHostedZoneId>Z35SXDOTRQ7X7K</CanonicalHostedZoneId>"
-        f"<CreatedTime>{lb['CreatedTime']}</CreatedTime>"
-        f"<Scheme>{lb['Scheme']}</Scheme>"
-        f"<VpcId>{lb.get('VpcId','')}</VpcId>"
-        f"<State><Code>{lb['State']}</Code></State>"
-        f"<Type>{lb['Type']}</Type>"
+        f"<CreatedTime>{_esc(str(lb['CreatedTime']))}</CreatedTime>"
+        f"<Scheme>{_esc(str(lb['Scheme']))}</Scheme>"
+        f"<VpcId>{_esc(str(lb.get('VpcId','')))}</VpcId>"
+        f"<State><Code>{_esc(str(lb['State']))}</Code></State>"
+        f"<Type>{_esc(str(lb['Type']))}</Type>"
         f"<AvailabilityZones>{azs}</AvailabilityZones>"
         f"<SecurityGroups>{sgs}</SecurityGroups>"
-        f"<IpAddressType>{lb.get('IpAddressType','ipv4')}</IpAddressType>"
+        f"<IpAddressType>{_esc(str(lb.get('IpAddressType','ipv4')))}</IpAddressType>"
         f"{_members_xml(lb, 'LoadBalancer', ('EnablePrefixForIpv6SourceNat', 'IpamPools'))}"
         f"</member>"
     )
 
 
 def _tg_xml(tg):
-    lb_arns = "".join(f"<member>{a}</member>" for a in tg.get("LoadBalancerArns", []))
+    lb_arns = "".join(f"<member>{_esc(str(a))}</member>" for a in tg.get("LoadBalancerArns", []))
     return (
         f"<member>"
-        f"<TargetGroupArn>{tg['TargetGroupArn']}</TargetGroupArn>"
-        f"<TargetGroupName>{tg['TargetGroupName']}</TargetGroupName>"
-        f"<Protocol>{tg.get('Protocol','HTTP')}</Protocol>"
-        f"<Port>{tg.get('Port',80)}</Port>"
-        f"<VpcId>{tg.get('VpcId','')}</VpcId>"
+        f"<TargetGroupArn>{_esc(str(tg['TargetGroupArn']))}</TargetGroupArn>"
+        f"<TargetGroupName>{_esc(str(tg['TargetGroupName']))}</TargetGroupName>"
+        f"<Protocol>{_esc(str(tg.get('Protocol','HTTP')))}</Protocol>"
+        f"<Port>{_esc(str(tg.get('Port',80)))}</Port>"
+        f"<VpcId>{_esc(str(tg.get('VpcId','')))}</VpcId>"
         f"{_members_xml(tg, 'TargetGroup', ('HealthCheckProtocol', 'HealthCheckPort', 'HealthCheckEnabled', 'HealthCheckIntervalSeconds', 'HealthCheckTimeoutSeconds', 'HealthyThresholdCount', 'UnhealthyThresholdCount', 'HealthCheckPath', 'Matcher'))}"
         f"<LoadBalancerArns>{lb_arns}</LoadBalancerArns>"
-        f"<TargetType>{tg.get('TargetType','instance')}</TargetType>"
+        f"<TargetType>{_esc(str(tg.get('TargetType','instance')))}</TargetType>"
         f"{_members_xml(tg, 'TargetGroup', ('ProtocolVersion', 'IpAddressType', 'TargetControlPort'))}"
         f"</member>"
     )
 
 
 def _action_xml(a):
-    inner = f"<Type>{a['Type']}</Type><Order>{a.get('Order',1)}</Order>"
+    inner = f"<Type>{_esc(str(a['Type']))}</Type><Order>{_esc(str(a.get('Order',1)))}</Order>"
     if "TargetGroupArn" in a:
-        inner += f"<TargetGroupArn>{a['TargetGroupArn']}</TargetGroupArn>"
+        inner += f"<TargetGroupArn>{_esc(str(a['TargetGroupArn']))}</TargetGroupArn>"
     if "RedirectConfig" in a:
         rc = a["RedirectConfig"]
         inner += (
             f"<RedirectConfig>"
-            f"<Protocol>{rc.get('Protocol','#{protocol}')}</Protocol>"
-            f"<Port>{rc.get('Port','#{port}')}</Port>"
-            f"<Host>{rc.get('Host','#{host}')}</Host>"
-            f"<Path>{rc.get('Path','/#{path}')}</Path>"
+            f"<Protocol>{_esc(str(rc.get('Protocol','#{protocol}')))}</Protocol>"
+            f"<Port>{_esc(str(rc.get('Port','#{port}')))}</Port>"
+            f"<Host>{_esc(str(rc.get('Host','#{host}')))}</Host>"
+            f"<Path>{_esc(str(rc.get('Path','/#{path}')))}</Path>"
             f"<Query>{_esc(rc.get('Query', '#{query}'))}</Query>"
-            f"<StatusCode>{rc.get('StatusCode','HTTP_301')}</StatusCode>"
+            f"<StatusCode>{_esc(str(rc.get('StatusCode','HTTP_301')))}</StatusCode>"
             f"</RedirectConfig>"
         )
     if "AuthenticateOidcConfig" in a:
@@ -616,24 +616,24 @@ def _action_xml(a):
         # ClientSecret is deliberately absent: AWS never echoes it back.
         inner += (
             f"<AuthenticateOidcConfig>"
-            f"<Issuer>{oc.get('Issuer','')}</Issuer>"
-            f"<AuthorizationEndpoint>{oc.get('AuthorizationEndpoint','')}</AuthorizationEndpoint>"
-            f"<TokenEndpoint>{oc.get('TokenEndpoint','')}</TokenEndpoint>"
-            f"<UserInfoEndpoint>{oc.get('UserInfoEndpoint','')}</UserInfoEndpoint>"
-            f"<ClientId>{oc.get('ClientId','')}</ClientId>"
-            f"<Scope>{oc.get('Scope','openid')}</Scope>"
-            f"<SessionCookieName>{oc.get('SessionCookieName', OIDC_DEFAULT_COOKIE_NAME)}</SessionCookieName>"
-            f"<SessionTimeout>{oc.get('SessionTimeout', OIDC_DEFAULT_SESSION_TIMEOUT)}</SessionTimeout>"
-            f"<OnUnauthenticatedRequest>{oc.get('OnUnauthenticatedRequest','authenticate')}</OnUnauthenticatedRequest>"
+            f"<Issuer>{_esc(str(oc.get('Issuer','')))}</Issuer>"
+            f"<AuthorizationEndpoint>{_esc(str(oc.get('AuthorizationEndpoint','')))}</AuthorizationEndpoint>"
+            f"<TokenEndpoint>{_esc(str(oc.get('TokenEndpoint','')))}</TokenEndpoint>"
+            f"<UserInfoEndpoint>{_esc(str(oc.get('UserInfoEndpoint','')))}</UserInfoEndpoint>"
+            f"<ClientId>{_esc(str(oc.get('ClientId','')))}</ClientId>"
+            f"<Scope>{_esc(str(oc.get('Scope','openid')))}</Scope>"
+            f"<SessionCookieName>{_esc(str(oc.get('SessionCookieName', OIDC_DEFAULT_COOKIE_NAME)))}</SessionCookieName>"
+            f"<SessionTimeout>{_esc(str(oc.get('SessionTimeout', OIDC_DEFAULT_SESSION_TIMEOUT)))}</SessionTimeout>"
+            f"<OnUnauthenticatedRequest>{_esc(str(oc.get('OnUnauthenticatedRequest','authenticate')))}</OnUnauthenticatedRequest>"
             f"</AuthenticateOidcConfig>"
         )
     if "FixedResponseConfig" in a:
         frc = a["FixedResponseConfig"]
         inner += (
             f"<FixedResponseConfig>"
-            f"<StatusCode>{frc.get('StatusCode','200')}</StatusCode>"
-            f"<ContentType>{frc.get('ContentType','text/plain')}</ContentType>"
-            f"<MessageBody>{frc.get('MessageBody','')}</MessageBody>"
+            f"<StatusCode>{_esc(str(frc.get('StatusCode','200')))}</StatusCode>"
+            f"<ContentType>{_esc(str(frc.get('ContentType','text/plain')))}</ContentType>"
+            f"<MessageBody>{_esc(str(frc.get('MessageBody','')))}</MessageBody>"
             f"</FixedResponseConfig>"
         )
     inner += _members_xml(a, "Action", ("ForwardConfig", "AuthenticateCognitoConfig"))
@@ -658,10 +658,10 @@ def _listener_xml(l):
     # Member order follows the botocore Listener shape.
     return (
         f"<member>"
-        f"<ListenerArn>{l['ListenerArn']}</ListenerArn>"
-        f"<LoadBalancerArn>{l['LoadBalancerArn']}</LoadBalancerArn>"
-        f"<Port>{l.get('Port',80)}</Port>"
-        f"<Protocol>{l.get('Protocol','HTTP')}</Protocol>"
+        f"<ListenerArn>{_esc(str(l['ListenerArn']))}</ListenerArn>"
+        f"<LoadBalancerArn>{_esc(str(l['LoadBalancerArn']))}</LoadBalancerArn>"
+        f"<Port>{_esc(str(l.get('Port',80)))}</Port>"
+        f"<Protocol>{_esc(str(l.get('Protocol','HTTP')))}</Protocol>"
         f"{certs_xml}{policy_xml}"
         f"<DefaultActions>{acts}</DefaultActions>"
         f"{_members_xml(l, 'Listener', ('AlpnPolicy', 'MutualAuthentication'))}"
@@ -712,8 +712,8 @@ def _condition_xml(c):
     change on every run to put the values back.
     """
     values = c.get("Values", [])
-    members = "".join(f"<member>{v}</member>" for v in values)
-    xml = f"<member><Field>{c['Field']}</Field><Values>{members}</Values>"
+    members = "".join(f"<member>{_esc(str(v))}</member>" for v in values)
+    xml = f"<member><Field>{_esc(str(c['Field']))}</Field><Values>{members}</Values>"
     config_key = _CONDITION_VALUE_KEYS.get(c.get("Field"))
     if config_key:
         xml += f"<{config_key}><Values>{members}</Values></{config_key}>"
@@ -932,8 +932,8 @@ def _rule_xml(r, with_transforms=True):
                   + "</Transforms>") if with_transforms else ""
     return (
         f"<member>"
-        f"<RuleArn>{r['RuleArn']}</RuleArn>"
-        f"<Priority>{r['Priority']}</Priority>"
+        f"<RuleArn>{_esc(str(r['RuleArn']))}</RuleArn>"
+        f"<Priority>{_esc(str(r['Priority']))}</Priority>"
         f"<Conditions>{conds}</Conditions>"
         f"<Actions>{acts}</Actions>"
         f"<IsDefault>{str(r.get('IsDefault',False)).lower()}</IsDefault>"
@@ -1584,7 +1584,7 @@ def _describe_target_health(params):
     default_port = _tgs[tg_arn].get("Port", 80)
     descs = "".join(
         f"<member>"
-        f"<Target><Id>{t['Id']}</Id><Port>{t.get('Port', default_port)}</Port></Target>"
+        f"<Target><Id>{_esc(str(t['Id']))}</Id><Port>{_esc(str(t.get('Port', default_port)))}</Port></Target>"
         f"<TargetHealth><State>healthy</State></TargetHealth>"
         f"</member>"
         for t in registered
@@ -1633,10 +1633,10 @@ def _describe_tags(params):
         if err:
             return err
         tags_xml = "".join(
-            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+            f"<member><Key>{_esc(str(t['Key']))}</Key><Value>{_esc(str(t['Value']))}</Value></member>"
             for t in _tags.get(arn, [])
         )
-        descs += f"<member><ResourceArn>{arn}</ResourceArn><Tags>{tags_xml}</Tags></member>"
+        descs += f"<member><ResourceArn>{_esc(str(arn))}</ResourceArn><Tags>{tags_xml}</Tags></member>"
     return _xml(200, "DescribeTags", f"<TagDescriptions>{descs}</TagDescriptions>")
 
 
@@ -1656,13 +1656,13 @@ def _set_subnets(params):
     if ip_type:
         lb["IpAddressType"] = ip_type
     azs = "".join(
-        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{s}</SubnetId>"
+        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{_esc(str(s))}</SubnetId>"
         f"<LoadBalancerAddresses/></member>"
         for s in lb.get("Subnets", [])
     )
     return _xml(200, "SetSubnets",
                 f"<AvailabilityZones>{azs}</AvailabilityZones>"
-                f"<IpAddressType>{lb.get('IpAddressType','ipv4')}</IpAddressType>")
+                f"<IpAddressType>{_esc(str(lb.get('IpAddressType','ipv4')))}</IpAddressType>")
 
 
 def _set_ip_address_type(params):
@@ -1676,7 +1676,7 @@ def _set_ip_address_type(params):
                       f"Invalid IpAddressType: {ip_type}", 400)
     lb["IpAddressType"] = ip_type
     return _xml(200, "SetIpAddressType",
-                f"<IpAddressType>{ip_type}</IpAddressType>")
+                f"<IpAddressType>{_esc(str(ip_type))}</IpAddressType>")
 
 
 def _set_security_groups(params):
@@ -1686,7 +1686,7 @@ def _set_security_groups(params):
         return _error("LoadBalancerNotFound", "Load balancer not found", 400)
     sgs = _parse_member_list(params, "SecurityGroups")
     lb["SecurityGroups"] = sgs
-    members = "".join(f"<member>{s}</member>" for s in sgs)
+    members = "".join(f"<member>{_esc(str(s))}</member>" for s in sgs)
     return _xml(200, "SetSecurityGroups",
                 f"<SecurityGroupIds>{members}</SecurityGroupIds>")
 

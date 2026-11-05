@@ -25,12 +25,24 @@ def test_transfer_describe_server_not_found(transfer):
     with pytest.raises(ClientError) as exc:
         transfer.describe_server(ServerId="s-doesnotexist00000")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_transfer_list_servers(transfer):
     resp = transfer.list_servers()
     assert "Servers" in resp
     assert len(resp["Servers"]) >= 1
+    raw = {}
+
+    def grab(http_response, **_):
+        raw["body"] = http_response.content
+
+    transfer.meta.events.register("after-call.transfer.ListServers", grab)
+    try:
+        transfer.list_servers()
+    finally:
+        transfer.meta.events.unregister("after-call.transfer.ListServers", grab)
+    assert b'"Protocols"' not in raw["body"]
 
 
 def test_transfer_create_server_with_options(transfer):

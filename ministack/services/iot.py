@@ -2416,7 +2416,7 @@ def _create_provisioning_claim(name: str) -> tuple:
             days_valid=_PROVISIONING_CLAIM_SECONDS / 86400,
         )
     except RuntimeError as e:
-        return error_response_json("InternalFailureException", str(e), 503)
+        return error_response_json("InternalFailureException", str(e), 500)
     from cryptography import x509
 
     leaf = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
@@ -2599,7 +2599,7 @@ async def _run_provisioning_hook(template: dict, event: dict) -> dict:
         result = await asyncio.wait_for(asyncio.shield(invocation), _PROVISIONING_HOOK_SECONDS)
     except Exception:
         result = None
-    if not isinstance(result, dict) or result.get("throttle"):
+    if not isinstance(result, dict) or result.get("throttle") or result.get("service_error"):
         raise _ProvisioningRejected(
             "InvocationError", "A failure occurred while invoking the provisioning hook."
         )
@@ -2978,7 +2978,7 @@ def _create_keys_and_certificate(qp: dict) -> tuple:
             common_name="AWS IoT Certificate",
         )
     except RuntimeError as e:
-        return error_response_json("InternalFailureException", str(e), 503)
+        return error_response_json("InternalFailureException", str(e), 500)
     cert_id = get_certificate_id(cert_pem)
     record = _certificate_record(cert_id, cert_pem, "ACTIVE" if set_active else "INACTIVE")
     _certificates[cert_id] = record
@@ -3007,7 +3007,7 @@ def _create_certificate_from_csr(payload: dict, qp: dict) -> tuple:
     except ValueError:
         return error_response_json("InvalidRequestException", "CSR violates constraints", 400)
     except RuntimeError as e:
-        return error_response_json("InternalFailureException", str(e), 503)
+        return error_response_json("InternalFailureException", str(e), 500)
     cert_id = get_certificate_id(cert_pem)
     record = _certificate_record(
         cert_id, cert_pem, "ACTIVE" if _qp_bool(qp, "setAsActive") else "INACTIVE")

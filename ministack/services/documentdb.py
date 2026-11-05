@@ -92,7 +92,7 @@ def load_persisted_state(data):
         cluster["_shared_container_id"] = None
         cluster["_shared_container_ready"] = False
         if DOCDB_PERSIST:
-            cluster.setdefault("_shared_volume_name", _cluster_volume_name(cluster_id))
+            cluster.setdefault("_shared_volume_name", _cluster_volume_name(cluster_id, account_id, region))
         _clusters._data[key] = cluster
 
     _tags.update(data.get("tags", {}))
@@ -108,7 +108,7 @@ def load_persisted_state(data):
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
             if DOCDB_PERSIST:
-                inst.setdefault("_docker_volume_name", _instance_volume_name(db_id))
+                inst.setdefault("_docker_volume_name", _legacy_instance_volume_name(db_id))
             _instances._data[(account_id, region, db_id)] = inst
             to_respawn.append((account_id, region, db_id, inst))
     elif hasattr(instances_data, "_data"):
@@ -258,7 +258,7 @@ def _respawn_standalone_instance(account_id, region, db_id, instance):
         host_port = _next_port()
     volume_name = instance.get("_docker_volume_name") if DOCDB_PERSIST else None
     started = _launch_documentdb_container(
-        f"ministack-docdb-{db_id}",
+        _instance_docker_name(db_id, account_id, region),
         image, env, host_port, container_port, data_path,
         labels={
             **container_reaper.own_labels("documentdb"),
@@ -353,18 +353,28 @@ def _next_port():
         return port
 
 
-def _cluster_docker_name(cluster_id):
-    """Get s the Docker container name for a cluster's shared DocumentDB contain er."""
-    return f"ministack-docdb-cluster-{cluster_id}"
+def _cluster_docker_name(cluster_id, account_id=None, region=None):
+    """Docker container name for a cluster's shared container, scoped per account/region."""
+    return f"ministack-docdb-cluster-{_rds._rds_docker_scope(account_id, region)}-{cluster_id}"
 
 
-def _cluster_volume_name(cluster_id):
-    """Gets the Docker volume name for a cluster's persistent storage."""
-    return f"ministack-docdb-cluster-{cluster_id}-data"
+def _cluster_volume_name(cluster_id, account_id=None, region=None):
+    """Docker volume name for a cluster's persistent storage."""
+    return f"{_cluster_docker_name(cluster_id, account_id, region)}-data"
 
 
-def _instance_volume_name(db_id):
-    """Gets the Docker volume name for a standalone instance's storage."""
+def _instance_docker_name(db_id, account_id=None, region=None):
+    """Docker container name for a standalone instance, scoped per account/region."""
+    return f"ministack-docdb-instance-{_rds._rds_docker_scope(account_id, region)}-{db_id}"
+
+
+def _instance_volume_name(db_id, account_id=None, region=None):
+    """Docker volume name for a standalone instance's storage."""
+    return f"{_instance_docker_name(db_id, account_id, region)}-data"
+
+
+def _legacy_instance_volume_name(db_id):
+    """Pre-scoping volume name, kept so restored legacy records find their data."""
     return f"ministack-docdb-{db_id}-data"
 
 
@@ -416,14 +426,17 @@ def _launch_documentdb_container(name,
     return container.id, internal_addr, internal_port, endpoint_addr, endpoint_port, host_port
 
 
-def _remove_stale_owned_container(docker_client, name):
-    """Remove a leftover same-name container only when our labels prove ownership."""
+def _remove_stale_owned_container(docker_client, name, account_id=None, region=None):
+    """Remove a leftover same-name container only when its labels prove it is this tenant's."""
     try:
         stale = docker_client.containers.get(name)
     except Exception:
         return
     labels = getattr(stale, "labels", None) or {}
-    if labels.get("ministack") == "documentdb":
+    if (labels.get("ministack") == "documentdb"
+            and labels.get(container_reaper.INSTANCE_LABEL) == container_reaper.instance_id()
+            and labels.get("account_id") == (account_id or get_account_id())
+            and labels.get("region") == (region or get_region())):
         try:
             stale.remove(force=True)
         except Exception as e:
@@ -596,12 +609,13 @@ def _stop_cluster_shared_container(cluster_id, cluster):
         return False
 
 
-def _remove_cluster_shared_resources(cluster_id, cluster, timeout=5):
+def _remove_cluster_shared_resources(cluster_id, cluster, timeout=5, account_id=None, region=None):
     """Stop and remove a cluster's shared container and its named volume."""
     docker_client = _get_docker()
     if not docker_client:
         return
-    for identifier in [cluster.get("_shared_container_id"), _cluster_docker_name(cluster_id)]:
+    for identifier in [cluster.get("_shared_container_id"),
+                       _cluster_docker_name(cluster_id, account_id, region)]:
         if not identifier:
             continue
         try:
@@ -612,7 +626,7 @@ def _remove_cluster_shared_resources(cluster_id, cluster, timeout=5):
             break
         except Exception:
             continue
-    volume_name = cluster.get("_shared_volume_name") or _cluster_volume_name(cluster_id)
+    volume_name = cluster.get("_shared_volume_name") or _cluster_volume_name(cluster_id, account_id, region)
     try:
         docker_client.volumes.get(volume_name).remove()
     except Exception as e:
@@ -1067,8 +1081,10 @@ def _start_instance_container(db_id, instance):
     )
     host_port = _next_port()
     volume_name = _instance_volume_name(db_id) if DOCDB_PERSIST else None
+    if volume_name:
+        instance["_docker_volume_name"] = volume_name
     started = _launch_documentdb_container(
-        f"ministack-docdb-{db_id}",
+        _instance_docker_name(db_id),
         image, env, host_port, container_port, data_path,
         labels={
             **container_reaper.own_labels("documentdb"),
@@ -2217,13 +2233,14 @@ def reset():
         docker_client = _get_docker()
         shared_container_ids = set()
         if docker_client:
-            for (_acct, _reg, cluster_id), cluster in list(_clusters.all_items()):
+            for (acct, reg, cluster_id), cluster in list(_clusters.all_items()):
                 if any(cluster.get(f) for f in (
                         "_shared_container_id", "_shared_endpoint", "_shared_volume_name",
                 )):
                     if cluster.get("_shared_container_id"):
                         shared_container_ids.add(cluster["_shared_container_id"])
-                    _remove_cluster_shared_resources(cluster_id, cluster, timeout=2)
+                    _remove_cluster_shared_resources(
+                        cluster_id, cluster, timeout=2, account_id=acct, region=reg)
             for instance in _instances.all_values():
                 cid = instance.get("_docker_container_id")
                 if cid and cid not in shared_container_ids:

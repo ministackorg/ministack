@@ -280,10 +280,24 @@ def test_s3tables_get_update_table_metadata_location(s3tables):
             versionToken=token, metadataLocation=new_loc,
         )
         assert updated.get("metadataLocation") == new_loc
+        assert got["warehouseLocation"]
+        assert updated["tableARN"].startswith("arn:aws:s3tables:")
+        assert updated["namespace"] == [ns] and updated["name"] == table
+        assert updated["versionToken"] != token
 
         got2 = s3tables.get_table_metadata_location(
             tableBucketARN=arn, namespace=ns, name=table)
         assert got2.get("metadataLocation") == new_loc
+        assert got2["versionToken"] == updated["versionToken"]
+        assert got2["warehouseLocation"] == got["warehouseLocation"]
+
+        with pytest.raises(ClientError) as stale:
+            s3tables.update_table_metadata_location(
+                tableBucketARN=arn, namespace=ns, name=table,
+                versionToken=token, metadataLocation=new_loc,
+            )
+        assert stale.value.response["Error"]["Code"] == "ConflictException"
+        assert stale.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
     finally:
         try:
             s3tables.delete_table(tableBucketARN=arn, namespace=ns, name=table)

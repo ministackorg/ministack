@@ -712,3 +712,39 @@ def test_servicediscovery_reset_clears_all_regions():
 
     assert all(not store.has_any() for store in regional_stores)
     assert sd_svc._resource_tags._data == {}
+
+
+def test_servicediscovery_discover_instances_filters(sd):
+    import uuid
+    ns_name = f"disc-{uuid.uuid4().hex[:8]}"
+    op = sd.create_http_namespace(Name=ns_name)
+    ns_id = sd.get_operation(OperationId=op["OperationId"])["Operation"]["Targets"]["NAMESPACE"]
+    checked = sd.create_service(Name="checked", NamespaceId=ns_id,
+                                HealthCheckCustomConfig={"FailureThreshold": 1})["Service"]["Id"]
+    plain = sd.create_service(Name="plain", NamespaceId=ns_id)["Service"]["Id"]
+    for svc in (checked, plain):
+        sd.register_instance(ServiceId=svc, InstanceId="a", Attributes={"version": "v1", "az": "1a"})
+        sd.register_instance(ServiceId=svc, InstanceId="b", Attributes={"version": "v2", "az": "1a"})
+        sd.update_instance_custom_health_status(ServiceId=svc, InstanceId="b", Status="UNHEALTHY")
+    try:
+        def ids(service, **kw):
+            resp = sd.discover_instances(NamespaceName=ns_name, ServiceName=service, **kw)
+            assert isinstance(resp["InstancesRevision"], int)
+            return sorted(i["InstanceId"] for i in resp["Instances"])
+
+        assert ids("checked", HealthStatus="HEALTHY") == ["a"]
+        assert ids("checked", HealthStatus="UNHEALTHY") == ["b"]
+        # No health check: HealthStatus is ignored and all instances return.
+        assert ids("plain", HealthStatus="HEALTHY") == ["a", "b"]
+        sd.update_instance_custom_health_status(ServiceId=checked, InstanceId="a", Status="UNHEALTHY")
+        assert ids("checked", HealthStatus="HEALTHY_OR_ELSE_ALL") == ["a", "b"]
+        assert ids("plain", QueryParameters={"version": "v2", "az": "1a"}) == ["b"]
+        assert ids("plain", QueryParameters={"az": "1a"}, OptionalParameters={"version": "v1"}) == ["a"]
+        assert ids("plain", QueryParameters={"az": "1a"}, OptionalParameters={"version": "v9"}) == ["a", "b"]
+        assert len(ids("plain", MaxResults=1)) == 1
+    finally:
+        for svc in (checked, plain):
+            for inst in ("a", "b"):
+                sd.deregister_instance(ServiceId=svc, InstanceId=inst)
+            sd.delete_service(Id=svc)
+        sd.delete_namespace(Id=ns_id)

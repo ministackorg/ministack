@@ -12843,3 +12843,49 @@ def test_s3_persisted_keys_a_path_cannot_hold_survive_a_restart(tmp_path, monkey
                                                  "last_modified": s3mod.now_iso()})
     assert open(tmp_path / "000000000000" / "keys-bucket" / "a" / "b", "rb").read() == b"moved"
     s3mod._buckets._data.pop(("000000000000", "keys-bucket"), None)
+
+
+def test_object_lock_retention_and_legal_hold_survive_a_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(_s3_mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(_s3_mod, "S3_PERSIST", True)
+    bucket = _locked_in_process(**{"x-amz-object-lock-mode": "COMPLIANCE",
+                                   "x-amz-object-lock-retain-until-date": _until()})
+    vid = _s3_mod._buckets[bucket]["objects"]["k"]["version_id"]
+    hold = b'<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>ON</Status></LegalHold>'
+    assert _lock_call("PUT", f"/{bucket}/k", {}, hold, {"legal-hold": [""], "versionId": [vid]})[0] == 200
+    with request_scope("000000000000", "us-east-1"):
+        state = _s3_mod.get_state()
+    for store in (_s3_mod._buckets, _s3_mod._object_versions, _s3_mod._object_retention, _s3_mod._object_legal_hold):
+        for k in [k for k in store._data if k[1] == bucket or (isinstance(k[1], tuple) and k[1][0] == bucket)]:
+            del store._data[k]
+    _s3_mod._load_persisted_data()
+    _s3_mod._restore_state(state)
+    query = {"versionId": [vid]}
+    status, _, body = _lock_call("GET", f"/{bucket}/k", {}, b"", {"retention": [""], **query})
+    assert status == 200 and b"<Mode>COMPLIANCE</Mode>" in body
+    status, _, body = _lock_call("GET", f"/{bucket}/k", {}, b"", {"legal-hold": [""], **query})
+    assert status == 200 and b"<Status>ON</Status>" in body
+    status, _, body = _lock_call("DELETE", f"/{bucket}/k", {}, b"", query)
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+
+
+def test_complete_multipart_upload_validates_the_parts_list(s3):
+    bkt = f"mpu-parts-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    upload_id = s3.create_multipart_upload(Bucket=bkt, Key="k")["UploadId"]
+    etags = [s3.upload_part(Bucket=bkt, Key="k", UploadId=upload_id, PartNumber=n,
+                            Body=b"x" * (5 * 1024 * 1024 if n == 1 else 10))["ETag"] for n in (1, 2)]
+
+    def complete(parts):
+        with pytest.raises(ClientError) as exc:
+            s3.complete_multipart_upload(Bucket=bkt, Key="k", UploadId=upload_id,
+                                         MultipartUpload={"Parts": parts})
+        return exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+
+    assert complete([{"PartNumber": 2, "ETag": etags[1]}, {"PartNumber": 1, "ETag": etags[0]}]) == (
+        "InvalidPartOrder", 400)
+    assert complete([]) == ("MalformedXML", 400)
+    assert complete([{"PartNumber": 1}, {"PartNumber": 2, "ETag": etags[1]}]) == ("InvalidPart", 400)
+    s3.complete_multipart_upload(Bucket=bkt, Key="k", UploadId=upload_id, MultipartUpload={
+        "Parts": [{"PartNumber": 1, "ETag": etags[0]}, {"PartNumber": 2, "ETag": etags[1]}]})
+    assert s3.head_object(Bucket=bkt, Key="k")["ContentLength"] == 5 * 1024 * 1024 + 10

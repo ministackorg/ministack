@@ -4994,3 +4994,41 @@ def test_ec2_launch_template_keeps_instance_requirements(ec2):
                 "Either the instance type or the instance requirements can be specified in the request, but not both.")
     finally:
         ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_ec2_xml_special_characters_are_escaped(ec2):
+    suffix = _uuid_mod.uuid4().hex[:8]
+    key_name = f"R&D-key-{suffix}"
+    ec2.create_key_pair(KeyName=key_name)
+    vpc_id = ec2.create_vpc(CidrBlock="10.77.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.77.1.0/24")["Subnet"]["SubnetId"]
+    sg_id = ec2.create_security_group(GroupName=f"R&D sg {suffix}", Description="R&D group",
+                                      VpcId=vpc_id)["GroupId"]
+    eni_id = ec2.create_network_interface(SubnetId=subnet_id, Description="R&D eni")[
+        "NetworkInterface"]["NetworkInterfaceId"]
+    pl_id = ec2.create_managed_prefix_list(PrefixListName=f"R&D-pl-{suffix}", AddressFamily="IPv4", MaxEntries=2,
+                                           Entries=[{"Cidr": "10.0.0.0/24", "Description": "R&D entry"}])[
+        "PrefixList"]["PrefixListId"]
+    try:
+        assert ec2.describe_key_pairs(KeyNames=[key_name])["KeyPairs"][0]["KeyName"] == key_name
+        sg = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+        assert (sg["GroupName"], sg["Description"]) == (f"R&D sg {suffix}", "R&D group")
+        ec2.create_tags(Resources=[sg_id], Tags=[{"Key": "team", "Value": "R&D <ops>"}])
+        sg = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+        assert {"Key": "team", "Value": "R&D <ops>"} in sg["Tags"]
+        eni = ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])["NetworkInterfaces"][0]
+        assert eni["Description"] == "R&D eni"
+        pl = ec2.describe_managed_prefix_lists(PrefixListIds=[pl_id])["PrefixLists"][0]
+        assert pl["PrefixListName"] == f"R&D-pl-{suffix}"
+        entries = ec2.get_managed_prefix_list_entries(PrefixListId=pl_id)["Entries"]
+        assert entries[0]["Description"] == "R&D entry"
+        with pytest.raises(ClientError) as exc:
+            ec2.describe_key_pairs(KeyNames=["no&such<key>"])
+        assert "no&such<key>" in exc.value.response["Error"]["Message"]
+    finally:
+        ec2.delete_managed_prefix_list(PrefixListId=pl_id)
+        ec2.delete_network_interface(NetworkInterfaceId=eni_id)
+        ec2.delete_security_group(GroupId=sg_id)
+        ec2.delete_subnet(SubnetId=subnet_id)
+        ec2.delete_vpc(VpcId=vpc_id)
+        ec2.delete_key_pair(KeyName=key_name)

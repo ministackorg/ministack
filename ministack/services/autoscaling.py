@@ -136,6 +136,51 @@ def _parse_member_list(params, prefix):
     return items
 
 
+def _parse_filters(params):
+    """Filters.member.N.Name / .Values.member.M as [(name, [values])]."""
+    filters = []
+    i = 1
+    while _p(params, f"Filters.member.{i}.Name"):
+        filters.append((_p(params, f"Filters.member.{i}.Name"),
+                        _parse_member_list(params, f"Filters.member.{i}.Values")))
+        i += 1
+    return filters
+
+
+def _group_matches_filters(asg, filters):
+    """DescribeAutoScalingGroups tag filters: tag-key, tag-value, tag:<key>; values OR'd, filters AND'd."""
+    tags = asg.get("Tags", [])
+    for name, values in filters:
+        if name == "tag-key":
+            ok = any(t["Key"] in values for t in tags)
+        elif name == "tag-value":
+            ok = any(t["Value"] in values for t in tags)
+        elif name.startswith("tag:"):
+            ok = any(t["Key"] == name[4:] and t["Value"] in values for t in tags)
+        else:
+            ok = True
+        if not ok:
+            return False
+    return True
+
+
+_TAG_FILTER_FIELDS = {"auto-scaling-group": "ResourceId", "key": "Key", "value": "Value"}
+
+
+def _tag_matches_filters(tag, filters):
+    """DescribeTags filters: auto-scaling-group, key, value, propagate-at-launch."""
+    for name, values in filters:
+        if name in _TAG_FILTER_FIELDS:
+            ok = tag[_TAG_FILTER_FIELDS[name]] in values
+        elif name == "propagate-at-launch":
+            ok = ("true" if tag.get("PropagateAtLaunch") else "false") in [v.lower() for v in values]
+        else:
+            ok = True
+        if not ok:
+            return False
+    return True
+
+
 def _page(p, items, default=50, high=100):
     """MaxRecords/NextToken offset paging; returns (page, NextToken XML or "")."""
     raw = _p(p, "MaxRecords")
@@ -159,7 +204,7 @@ def _error(code, message, status=400):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if status < 500 else "Receiver"
     body = (f'<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">'
-            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>'
+            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{escape(message)}</Message></Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
@@ -418,7 +463,7 @@ def _group_members_xml(asg):
 
 
 def _launch_template_xml(lt):
-    fields = "".join(f"<{k}>{lt[k]}</{k}>" for k in ("LaunchTemplateId", "LaunchTemplateName", "Version") if lt.get(k))
+    fields = "".join(f"<{k}>{escape(str(lt[k]))}</{k}>" for k in ("LaunchTemplateId", "LaunchTemplateName", "Version") if lt.get(k))
     return f"<LaunchTemplate>{fields}</LaunchTemplate>"
 
 
@@ -430,12 +475,12 @@ def _instance_member_xml(inst, include_group_name=""):
     if launch_template:
         lt_xml = _launch_template_xml(launch_template)
     launch_config = inst.get("LaunchConfigurationName", "")
-    lc_xml = f"<LaunchConfigurationName>{launch_config}</LaunchConfigurationName>" if launch_config else ""
-    group_xml = f"<AutoScalingGroupName>{include_group_name}</AutoScalingGroupName>" if include_group_name else ""
+    lc_xml = f"<LaunchConfigurationName>{escape(launch_config)}</LaunchConfigurationName>" if launch_config else ""
+    group_xml = f"<AutoScalingGroupName>{escape(include_group_name)}</AutoScalingGroupName>" if include_group_name else ""
     return (f"<member>"
             f"<InstanceId>{inst['InstanceId']}</InstanceId>"
             f"{group_xml}"
-            f"<AvailabilityZone>{inst['AvailabilityZone']}</AvailabilityZone>"
+            f"<AvailabilityZone>{escape(inst['AvailabilityZone'])}</AvailabilityZone>"
             f"<LifecycleState>{inst['LifecycleState']}</LifecycleState>"
             f"<HealthStatus>{inst['HealthStatus']}</HealthStatus>"
             f"<ProtectedFromScaleIn>{'true' if inst['ProtectedFromScaleIn'] else 'false'}</ProtectedFromScaleIn>"
@@ -520,14 +565,16 @@ def _create_asg(p):
 
 def _describe_asgs(p):
     names = _parse_member_list(p, "AutoScalingGroupNames")
+    filters = _parse_filters(p)
     members = ""
-    groups, next_xml = _page(p, [(n, a) for n, a in _asgs.items() if not names or n in names])
+    groups, next_xml = _page(p, [(n, a) for n, a in _asgs.items()
+                                 if (not names or n in names) and _group_matches_filters(a, filters)])
     for name, asg in groups:
-        azs = "".join(f"<member>{az}</member>" for az in asg["AvailabilityZones"])
-        tp = "".join(f"<member>{t}</member>" for t in asg["TerminationPolicies"])
+        azs = "".join(f"<member>{escape(az)}</member>" for az in asg["AvailabilityZones"])
+        tp = "".join(f"<member>{escape(t)}</member>" for t in asg["TerminationPolicies"])
         tags_xml = "".join(
-            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value>"
-            f"<ResourceId>{t['ResourceId']}</ResourceId><ResourceType>{t['ResourceType']}</ResourceType>"
+            f"<member><Key>{escape(t['Key'])}</Key><Value>{escape(t['Value'])}</Value>"
+            f"<ResourceId>{escape(t['ResourceId'])}</ResourceId><ResourceType>{t['ResourceType']}</ResourceType>"
             f"<PropagateAtLaunch>{'true' if t.get('PropagateAtLaunch') else 'false'}</PropagateAtLaunch></member>"
             for t in asg.get("Tags", [])
         )
@@ -539,24 +586,24 @@ def _describe_asgs(p):
         elif lt:
             lt_xml = _launch_template_xml(lt)
         members += (f"<member>"
-                    f"<AutoScalingGroupName>{name}</AutoScalingGroupName>"
-                    f"<AutoScalingGroupARN>{asg['AutoScalingGroupARN']}</AutoScalingGroupARN>"
+                    f"<AutoScalingGroupName>{escape(name)}</AutoScalingGroupName>"
+                    f"<AutoScalingGroupARN>{escape(asg['AutoScalingGroupARN'])}</AutoScalingGroupARN>"
                     f"<MinSize>{asg['MinSize']}</MinSize>"
                     f"<MaxSize>{asg['MaxSize']}</MaxSize>"
                     f"<DesiredCapacity>{asg['DesiredCapacity']}</DesiredCapacity>"
                     f"<DefaultCooldown>{asg['DefaultCooldown']}</DefaultCooldown>"
                     f"<AvailabilityZones>{azs}</AvailabilityZones>"
-                    f"<HealthCheckType>{asg['HealthCheckType']}</HealthCheckType>"
+                    f"<HealthCheckType>{escape(asg['HealthCheckType'])}</HealthCheckType>"
                     f"<HealthCheckGracePeriod>{asg['HealthCheckGracePeriod']}</HealthCheckGracePeriod>"
                     f"<CreatedTime>{asg['CreatedTime']}</CreatedTime>"
-                    f"<VPCZoneIdentifier>{asg['VPCZoneIdentifier']}</VPCZoneIdentifier>"
+                    f"<VPCZoneIdentifier>{escape(asg['VPCZoneIdentifier'])}</VPCZoneIdentifier>"
                     f"<TerminationPolicies>{tp}</TerminationPolicies>"
                     f"<NewInstancesProtectedFromScaleIn>{'true' if asg['NewInstancesProtectedFromScaleIn'] else 'false'}</NewInstancesProtectedFromScaleIn>"
                     f"{_group_members_xml(asg)}"
                     f"<Tags>{tags_xml}</Tags>"
                     f"{_instances_xml(asg)}"
                     f"{lt_xml}"
-                    f"<LaunchConfigurationName>{asg.get('LaunchConfigurationName', '')}</LaunchConfigurationName>"
+                    f"<LaunchConfigurationName>{escape(asg.get('LaunchConfigurationName', ''))}</LaunchConfigurationName>"
                     f"</member>")
     return _xml(200, "DescribeAutoScalingGroupsResponse",
                 f"<DescribeAutoScalingGroupsResult><AutoScalingGroups>{members}</AutoScalingGroups>{next_xml}</DescribeAutoScalingGroupsResult>")
@@ -623,6 +670,10 @@ def _set_desired_capacity(p):
 
 def _delete_asg(p):
     name = _p(p, "AutoScalingGroupName")
+    asg = _asgs.get(name)
+    if asg and asg["Instances"] and _p(p, "ForceDelete") != "true":
+        return _error("ResourceInUse", "You cannot delete an AutoScalingGroup while there are instances "
+                                       "or pending Spot instance request(s) still in the group.")
     _asgs.pop(name, None)
     _tags.pop(name, None)
     _delete_group_hooks(name)
@@ -705,7 +756,7 @@ def _describe_instance_refreshes(p):
     for r in refreshes:
         members += (f"<member>"
                     f"<InstanceRefreshId>{r['InstanceRefreshId']}</InstanceRefreshId>"
-                    f"<AutoScalingGroupName>{r['AutoScalingGroupName']}</AutoScalingGroupName>"
+                    f"<AutoScalingGroupName>{escape(r['AutoScalingGroupName'])}</AutoScalingGroupName>"
                     f"<Status>{r['Status']}</Status>"
                     f"<StatusReason>{r['StatusReason']}</StatusReason>"
                     f"<StartTime>{r['StartTime']}</StartTime>"
@@ -774,12 +825,12 @@ def _describe_lcs(p):
     members = ""
     configs, next_xml = _page(p, [(n, lc) for n, lc in _launch_configs.items() if not names or n in names])
     for name, lc in configs:
-        sgs = "".join(f"<member>{sg}</member>" for sg in lc.get("SecurityGroups", []))
+        sgs = "".join(f"<member>{escape(sg)}</member>" for sg in lc.get("SecurityGroups", []))
         members += (f"<member>"
-                    f"<LaunchConfigurationName>{name}</LaunchConfigurationName>"
-                    f"<LaunchConfigurationARN>{lc['LaunchConfigurationARN']}</LaunchConfigurationARN>"
-                    f"<ImageId>{lc['ImageId']}</ImageId>"
-                    f"<InstanceType>{lc['InstanceType']}</InstanceType>"
+                    f"<LaunchConfigurationName>{escape(name)}</LaunchConfigurationName>"
+                    f"<LaunchConfigurationARN>{escape(lc['LaunchConfigurationARN'])}</LaunchConfigurationARN>"
+                    f"<ImageId>{escape(lc['ImageId'])}</ImageId>"
+                    f"<InstanceType>{escape(lc['InstanceType'])}</InstanceType>"
                     f"<CreatedTime>{lc['CreatedTime']}</CreatedTime>"
                     f"<SecurityGroups>{sgs}</SecurityGroups>"
                     f"{''.join(f'<{m}>{_shape_xml(lc[m], shape.members[m])}</{m}>' for m in _LC_MEMBERS if lc.get(m) not in (None, ''))}"
@@ -900,12 +951,12 @@ def _put_scaling_policy(p):
     try:
         record = _policy_record(asg_name, policy_name, arn, fields)
     except ValueError as exc:
-        return _error("ValidationError", f"Invalid numeric value in the scaling policy: {escape(str(exc))}")
+        return _error("ValidationError", f"Invalid numeric value in the scaling policy: {exc}")
     _delete_policy_alarms(_policies.get(key))
     _put_tracking_alarms(record)
     _policies[key] = record
     return _xml(200, "PutScalingPolicyResponse",
-                f"<PutScalingPolicyResult><PolicyARN>{arn}</PolicyARN>"
+                f"<PutScalingPolicyResult><PolicyARN>{escape(arn)}</PolicyARN>"
                 f"<Alarms>{_member_xml(record.get('Alarms', []))}</Alarms></PutScalingPolicyResult>")
 
 
@@ -1002,9 +1053,13 @@ def _member_xml(value):
 
 def _describe_policies(p):
     asg_name = _p(p, "AutoScalingGroupName")
+    names = _parse_member_list(p, "PolicyNames")
+    types = _parse_member_list(p, "PolicyTypes")
     members = ""
     policies, next_xml = _page(p, [pol for pol in _policies.values()
-                                   if not asg_name or pol["AutoScalingGroupName"] == asg_name])
+                                   if (not asg_name or pol["AutoScalingGroupName"] == asg_name)
+                                   and (not names or pol["PolicyName"] in names)
+                                   and (not types or pol["PolicyType"] in types)])
     for pol in policies:
         body = dict(pol)
         body.setdefault("Enabled", True)
@@ -1056,20 +1111,21 @@ def _put_lifecycle_hook(p):
 
 def _describe_lifecycle_hooks(p):
     asg_name = _p(p, "AutoScalingGroupName")
+    names = _parse_member_list(p, "LifecycleHookNames")
     members = ""
     for key, hook in _hooks.items():
-        if hook["AutoScalingGroupName"] != asg_name:
+        if hook["AutoScalingGroupName"] != asg_name or (names and hook["LifecycleHookName"] not in names):
             continue
         metadata = hook.get("NotificationMetadata")
         metadata_xml = f"<NotificationMetadata>{escape(metadata)}</NotificationMetadata>" if metadata else ""
         members += (f"<member>"
-                    f"<LifecycleHookName>{hook['LifecycleHookName']}</LifecycleHookName>"
-                    f"<AutoScalingGroupName>{hook['AutoScalingGroupName']}</AutoScalingGroupName>"
-                    f"<LifecycleTransition>{hook['LifecycleTransition']}</LifecycleTransition>"
+                    f"<LifecycleHookName>{escape(hook['LifecycleHookName'])}</LifecycleHookName>"
+                    f"<AutoScalingGroupName>{escape(hook['AutoScalingGroupName'])}</AutoScalingGroupName>"
+                    f"<LifecycleTransition>{escape(hook['LifecycleTransition'])}</LifecycleTransition>"
                     f"{''.join(f'<{m}>{escape(hook[m])}</{m}>' for m in ('NotificationTargetARN', 'RoleARN') if hook.get(m))}"
                     f"{metadata_xml}"
                     f"<HeartbeatTimeout>{hook['HeartbeatTimeout']}</HeartbeatTimeout>"
-                    f"<DefaultResult>{hook['DefaultResult']}</DefaultResult>"
+                    f"<DefaultResult>{escape(hook['DefaultResult'])}</DefaultResult>"
                     f"</member>")
     return _xml(200, "DescribeLifecycleHooksResponse",
                 f"<DescribeLifecycleHooksResult><LifecycleHooks>{members}</LifecycleHooks></DescribeLifecycleHooksResult>")
@@ -1129,14 +1185,16 @@ def _put_scheduled_action(p):
 
 def _describe_scheduled_actions(p):
     asg_name = _p(p, "AutoScalingGroupName")
+    names = _parse_member_list(p, "ScheduledActionNames")
     members = ""
     actions, next_xml = _page(p, [sa for sa in _scheduled_actions.values()
-                                  if not asg_name or sa["AutoScalingGroupName"] == asg_name])
+                                  if (not asg_name or sa["AutoScalingGroupName"] == asg_name)
+                                  and (not names or sa["ScheduledActionName"] in names)])
     for sa in actions:
         members += (f"<member>"
-                    f"<ScheduledActionARN>{sa['ScheduledActionARN']}</ScheduledActionARN>"
-                    f"<ScheduledActionName>{sa['ScheduledActionName']}</ScheduledActionName>"
-                    f"<AutoScalingGroupName>{sa['AutoScalingGroupName']}</AutoScalingGroupName>"
+                    f"<ScheduledActionARN>{escape(sa['ScheduledActionARN'])}</ScheduledActionARN>"
+                    f"<ScheduledActionName>{escape(sa['ScheduledActionName'])}</ScheduledActionName>"
+                    f"<AutoScalingGroupName>{escape(sa['AutoScalingGroupName'])}</AutoScalingGroupName>"
                     f"<Recurrence>{escape(sa.get('Recurrence', ''))}</Recurrence>")
         for member in ("MinSize", "MaxSize", "DesiredCapacity"):
             value = sa.get(member, -1)
@@ -1187,12 +1245,14 @@ def _create_or_update_tags(p):
 
 
 def _describe_tags(p):
+    filters = _parse_filters(p)
     members = ""
-    tags, next_xml = _page(p, [t for tag_list in _tags.values() for t in tag_list])
+    tags, next_xml = _page(p, [t for tag_list in _tags.values() for t in tag_list
+                               if _tag_matches_filters(t, filters)])
     for t in tags:
         members += (f"<member>"
-                    f"<Key>{t['Key']}</Key><Value>{t['Value']}</Value>"
-                    f"<ResourceId>{t['ResourceId']}</ResourceId>"
+                    f"<Key>{escape(t['Key'])}</Key><Value>{escape(t['Value'])}</Value>"
+                    f"<ResourceId>{escape(t['ResourceId'])}</ResourceId>"
                     f"<ResourceType>{t['ResourceType']}</ResourceType>"
                     f"<PropagateAtLaunch>{'true' if t.get('PropagateAtLaunch') else 'false'}</PropagateAtLaunch>"
                     f"</member>")

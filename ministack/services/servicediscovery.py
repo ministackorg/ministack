@@ -564,22 +564,35 @@ def _discover_instances(data):
     if not service:
         return error_response_json("ServiceNotFound", "Service not found", 404)
 
-    out = []
-    requested_health_status = data.get("HealthStatus", "")
-    for inst in _instances.get(service["Id"], {}).values():
-        health = _instance_health_status.get(service["Id"], {}).get(inst["Id"], "HEALTHY")
-        if requested_health_status and requested_health_status != "ALL" and health != requested_health_status:
-            continue
-        out.append(
-            {
-                "InstanceId": inst["Id"],
-                "NamespaceName": ns_name,
-                "ServiceName": svc_name,
-                "Attributes": inst.get("Attributes", {}),
-                "HealthStatus": health,
-            }
-        )
-    return json_response({"Instances": out})
+    out = [
+        {
+            "InstanceId": inst["Id"],
+            "NamespaceName": ns_name,
+            "ServiceName": svc_name,
+            "Attributes": inst.get("Attributes", {}),
+            "HealthStatus": _instance_health_status.get(service["Id"], {}).get(inst["Id"], "HEALTHY"),
+        }
+        for inst in _instances.get(service["Id"], {}).values()
+    ]
+    # HealthStatus is ignored for services without a health check (service-2.json).
+    requested = data.get("HealthStatus") or "ALL"
+    if service.get("HealthCheckConfig") or service.get("HealthCheckCustomConfig"):
+        if requested in ("HEALTHY", "UNHEALTHY"):
+            out = [i for i in out if i["HealthStatus"] == requested]
+        elif requested == "HEALTHY_OR_ELSE_ALL":
+            out = [i for i in out if i["HealthStatus"] == "HEALTHY"] or out
+
+    def matches(inst, params):
+        return all(inst["Attributes"].get(k) == v for k, v in params.items())
+
+    query = data.get("QueryParameters") or {}
+    out = [i for i in out if matches(i, query)]
+    optional = data.get("OptionalParameters") or {}
+    if optional:
+        out = [i for i in out if matches(i, optional)] or out
+    max_results = int(data.get("MaxResults") or 100)
+    return json_response({"Instances": out[:max_results],
+                          "InstancesRevision": int(_instances_revision.get(service["Id"], 1))})
 
 
 def _discover_instances_revision(data):
