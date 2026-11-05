@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Aurora DSQL — the backend Postgres is no longer published on every interface** — with `DSQL_STRICT=1` each cluster's backing Postgres container (trust auth, `postgres` superuser, no password) was published on `0.0.0.0` and `::`, so anyone on the same network could read and change the database directly, bypassing the proxy, even when MiniStack's own ports are bound to `127.0.0.1`. A containerised MiniStack reaches the backend over its Docker network, so the port is no longer published; a MiniStack running on the host publishes it on `127.0.0.1` only. Contributed by @toby6578.
+- **Lambda — `LAMBDA_EXECUTOR=local` had no `ListTagsCommand`, and `Lambda` had no `.send()`** — real AWS Lambda ships `@aws-sdk/client-lambda` built into the Node 18+ runtime, so code that calls it never bundles it. The local executor's shim covered `invoke` on both `Lambda` and `LambdaClient`, but never exported `ListTagsCommand`, and `Lambda` itself had no `.send()`. Amplify's `AmplifyTableManager` custom resource does `new client_lambda_1.Lambda().send(new client_lambda_1.ListTagsCommand({ Resource: arn }))`, so every DynamoDB-backed Amplify Gen 2 app failed its sandbox deploy at that step with `ListTagsCommand is not a constructor`. `ListTagsCommand` now calls the GET `/2017-03-31/tags/{Resource}` route already served by the Lambda service, and `Lambda` gets `.send()`, matching the real `Lambda` class extending `LambdaClient`.
 
 ## [1.5.37] — 2026-11-03
 
