@@ -637,3 +637,13 @@ def test_extract_region_never_returns_the_service_for_sigv4a(monkeypatch):
     monkeypatch.setenv("MINISTACK_REGION", "eu-central-1")
     assert extract_region({}, query) == "eu-central-1"
     assert extract_region({"authorization": _SIGV4_AUTH.format(region="sa-east-1")}) == "sa-east-1"
+
+
+def test_extract_access_key_id_reads_sigv4a_credentials():
+    """A SigV4a header or presigned URL names its key, as SigV4 does; the server sets the account from it with AUTH unset too."""
+    from ministack.core.router import extract_access_key_id
+
+    assert extract_access_key_id({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}) == "AKID"
+    query = {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+             "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}
+    assert extract_access_key_id({}, query) == "AKID"
