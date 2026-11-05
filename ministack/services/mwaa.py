@@ -387,7 +387,9 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
                 db_volume_name: {"bind": "/opt/airflow", "mode": "rw"},
             }
 
-        container = docker_client.containers.run(**container_kwargs)
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: docker_client.containers.run(**kwargs), container_kwargs, _next_port)
+        env["_host_port"] = host_port
         env["_docker_container_id"] = container.id
 
         internal_host = "localhost"

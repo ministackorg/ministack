@@ -405,6 +405,16 @@ def _remove_container_by_id(cid: str) -> None:
         pass
 
 
+def _next_free_port(counter):
+    from ministack.services.rds import _is_host_port_free
+    with _state_lock:
+        port = counter[0]
+        while not _is_host_port_free(port):  # another container may already publish it
+            port += 1
+        counter[0] = port + 1
+        return port
+
+
 def start_engine_container(docker, name: str, labels: dict, host_port=None, volumes=None):
     """Run one single-node OpenSearch engine container.
 
@@ -435,7 +445,8 @@ def start_engine_container(docker, name: str, labels: dict, host_port=None, volu
         run_kwargs["volumes"] = volumes
     if DOCKER_NETWORK:
         run_kwargs["network"] = DOCKER_NETWORK
-    container = docker.containers.run(**run_kwargs)
+    container, host_port = container_reaper.run_on_free_port(
+        docker, lambda kwargs: docker.containers.run(**kwargs), run_kwargs, lambda: _next_free_port(_port_counter))
     try:
         host, port = _MINISTACK_HOST, host_port
         if DOCKER_NETWORK or host_port is None:
@@ -478,16 +489,8 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         )
         return stub_host, stub_port, None, None, None
 
-    from ministack.services.rds import _is_host_port_free
-    with _state_lock:
-        host_port = _port_counter[0]
-        while not _is_host_port_free(host_port):  # another container may already publish it
-            host_port += 1
-        _port_counter[0] = host_port + 1
-        dash_host_port = _dashboards_port_counter[0]
-        while not _is_host_port_free(dash_host_port):
-            dash_host_port += 1
-        _dashboards_port_counter[0] = dash_host_port + 1
+    host_port = _next_free_port(_port_counter)
+    dash_host_port = _next_free_port(_dashboards_port_counter)
 
     labels = {
         # Standard label so the boot/shutdown orphan reap finds these; the
@@ -526,7 +529,9 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
             )
             if DOCKER_NETWORK:
                 dash_kwargs["network"] = DOCKER_NETWORK
-            dash_container = docker.containers.run(**dash_kwargs)
+            dash_container, dash_host_port = container_reaper.run_on_free_port(
+                docker, lambda kwargs: docker.containers.run(**kwargs), dash_kwargs,
+                lambda: _next_free_port(_dashboards_port_counter))
             dash_cid = dash_container.id
             dash_endpoint = f"{_MINISTACK_HOST}:{dash_host_port}"
             logger.info(

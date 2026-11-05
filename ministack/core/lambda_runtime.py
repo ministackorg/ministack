@@ -243,9 +243,26 @@ def run():
     # After sys.path is complete (so a function that bundles its own botocore
     # gets that one) and before the handler module builds any client.
     _ms_install_invoke_depth()
+    # The handler's module as the function names it, for the messages awslambdaric words with it.
+    _ms_modname = init.get("handler_module") or module_name
+
+    class _MsFault(Exception):
+        def __init__(self, etype, msg, trace=None):
+            super().__init__(msg)
+            self.etype, self.msg, self.trace = etype, msg, trace or []
+
     try:
-        mod = importlib.import_module(module_name)
-        handler_fn = getattr(mod, handler_name)
+        try:
+            mod = importlib.import_module(module_name)
+        except ImportError as e:
+            raise _MsFault("Runtime.ImportModuleError", "Unable to import module '%s': %s" % (_ms_modname, e))
+        except SyntaxError as e:
+            raise _MsFault("Runtime.UserCodeSyntaxError", "Syntax error in module '%s': %s" % (_ms_modname, e),
+                           ['  File "%s" Line %s\\n    %s' % (e.filename, e.lineno, e.text)])
+        try:
+            handler_fn = getattr(mod, handler_name)
+        except AttributeError:
+            raise _MsFault("Runtime.HandlerNotFound", "Handler '%s' missing on module '%s'" % (handler_name, _ms_modname))
         if init.get("snapstart"):
             # SnapStart runtime hooks (snapshot-restore-py, bundled in AWS's
             # python3.12+ runtimes). Each environment of a published SnapStart
@@ -268,7 +285,13 @@ def run():
         _real_stdout.write(json.dumps({"status": "ready", "cold": True}) + "\\n")
         _real_stdout.flush()
     except Exception as e:
-        _real_stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\\n")
+        if isinstance(e, _MsFault):
+            _ms_payload = {"errorMessage": e.msg, "errorType": e.etype, "requestId": "", "stackTrace": e.trace}
+        else:
+            _ms_payload = {"errorMessage": str(e), "errorType": type(e).__name__, "requestId": "",
+                           "stackTrace": traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])}
+        _real_stdout.write(json.dumps({"status": "error", "error": _ms_payload["errorMessage"],
+                                       "errorType": _ms_payload["errorType"], "payload": _ms_payload}) + "\\n")
         _real_stdout.flush()
         return
 
@@ -322,11 +345,23 @@ def run():
             "client_context": None,
             "get_remaining_time_in_millis": lambda self: max(0, int((_deadline - time.time()) * 1000)),
         })()
+        _ms_rid = _ms_ctx.get("request_id", "")
         try:
             result = handler_fn(event, context)
-            _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
         except Exception as e:
-            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()}) + "\\n")
+            # As awslambdaric reports it: the exception's own type, and the frames below the runtime's.
+            _ms_payload = {"errorMessage": str(e), "errorType": type(e).__name__, "requestId": _ms_rid,
+                           "stackTrace": traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])}
+            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc(),
+                                           "payload": _ms_payload}) + "\\n")
+        else:
+            try:
+                _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
+            except Exception as e:
+                _ms_payload = {"errorMessage": "Unable to marshal response: %s" % e, "errorType": "Runtime.MarshalError",
+                               "requestId": _ms_rid, "stackTrace": []}
+                _real_stdout.write(json.dumps({"status": "error", "error": _ms_payload["errorMessage"],
+                                               "payload": _ms_payload}) + "\\n")
         _real_stdout.flush()
 
 run()
@@ -989,6 +1024,39 @@ function patchAwsSdk() {
 
 let handlerFn = null;
 
+// The error document AWS's Node.js runtime client posts (formatError in src/utils/error.ts).
+function _msFormatError(error) {
+  try {
+    if (error instanceof Error) {
+      return {
+        errorType: error.name?.replaceAll("\x7F", "%7F"),
+        errorMessage: error.message?.replaceAll("\x7F", "%7F"),
+        trace: error.stack?.replaceAll("\x7F", "%7F").split("\n") || [],
+      };
+    }
+    return { errorType: typeof error, errorMessage: String(error), trace: [] };
+  } catch {
+    return {
+      errorType: "handled",
+      errorMessage: "callback called with Error argument, but there was a problem while retrieving one or more of its message, name, and stack",
+      trace: [],
+    };
+  }
+}
+
+function _msRuntimeError(name, message, stack) {
+  const e = new Error(message);
+  e.name = name;
+  e.stack = stack || String(e.stack).replace(/^Error/, name);
+  return e;
+}
+
+function _msFail(error, extra) {
+  const payload = _msFormatError(error);
+  _realStdoutWrite(JSON.stringify(Object.assign(
+    { status: "error", error: payload.errorMessage, payload }, extra || {})) + "\n");
+}
+
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 let lineNum = 0;
 
@@ -1037,29 +1105,35 @@ rl.on("line", async (line) => {
         }
         handlerFn = mod[handlerName] || (mod.default && mod.default[handlerName]) || mod.default;
         if (typeof handlerFn !== "function") {
-          _realStdoutWrite(JSON.stringify({
-            status: "error",
-            error: `Handler ${handlerName} is not a function in ${modPath}`
-          }) + "\n");
+          const full = modPath + "." + handlerName;
+          const err = _msRuntimeError("Runtime.HandlerNotFound", handlerFn === undefined
+            ? `${full} is undefined or not exported` : `${full} is not a function`);
+          _msFail(err, { errorType: err.name });
           return;
         }
         // AWS's Node.js 24+ runtime refuses a callback-based handler at init.
         const major = /^AWS_Lambda_nodejs(\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
         if (major && Number(major[1]) >= 24 && handlerFn.length >= 3
             && !handlerFn[Symbol.for("aws.lambda.runtime.handler.streaming")]) {
-          _realStdoutWrite(JSON.stringify({
-            status: "error", errorType: "Runtime.CallbackHandlerDeprecated",
-            error: "ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
+          const err = _msRuntimeError("Runtime.CallbackHandlerDeprecated",
+            "ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
               + "Node.js 24. You need to modify this function to use a supported handler signature to use Node.js 24 or "
-              + "later. For more information see https://docs.aws.amazon.com/lambda/latest/dg/nodejs-handler.html."
-          }) + "\n");
+              + "later. For more information see https://docs.aws.amazon.com/lambda/latest/dg/nodejs-handler.html.");
+          _msFail(err, { errorType: err.name });
           return;
         }
         _realStdoutWrite(JSON.stringify({ status: "ready", cold: true }) + "\n");
       } catch (e) {
-        _realStdoutWrite(JSON.stringify({
-          status: "error", error: e.message
-        }) + "\n");
+        // As the runtime client loads the module: a syntax error or a missing CommonJS module is
+        // reported under its Runtime.* name with String(err) as the message; anything else as itself.
+        let err = e;
+        if (e instanceof SyntaxError) {
+          err = _msRuntimeError("Runtime.UserCodeSyntaxError", String(e), e.stack);
+        } else if (e instanceof Error && e.code === "MODULE_NOT_FOUND") {
+          err = _msRuntimeError("Runtime.ImportModuleError", String(e));
+        }
+        const payload = _msFormatError(err);
+        _msFail(err, { errorType: payload.errorType });
       }
       return;
     }
@@ -1121,12 +1195,17 @@ rl.on("line", async (line) => {
         if (settled) return;
         settled = true;
         if (err) {
-          _realStdoutWrite(JSON.stringify({
-            status: "error", error: String(err.message || err), trace: err.stack || ""
-          }) + "\n");
-        } else {
-          _realStdoutWrite(JSON.stringify({ status: "ok", result: res }) + "\n");
+          _msFail(err, { trace: (err && err.stack) || "" });
+          return;
         }
+        let out;
+        try {
+          out = JSON.stringify({ status: "ok", result: res === undefined ? null : res });
+        } catch (_e) {
+          _msFail(_msRuntimeError("Runtime.JSONStringifyError", "Unable to stringify response body"));
+          return;
+        }
+        _realStdoutWrite(out + "\n");
       };
       const callback = (err, res) => settle(err, res);
       context.done = (err, res) => settle(err, res);
@@ -1144,9 +1223,7 @@ rl.on("line", async (line) => {
       // If handler accepts callback (arity >= 3) or returned undefined,
       // we wait for callback/context.done/context.succeed/context.fail
     } catch (e) {
-      _realStdoutWrite(JSON.stringify({
-        status: "error", error: e.message, trace: e.stack
-      }) + "\n");
+      _msFail(e, { trace: (e && e.stack) || "" });
     }
   } catch (e) {
     _realStdoutWrite(JSON.stringify({
@@ -1275,6 +1352,16 @@ class Worker:
                             os.symlink(src, dst)
 
         handler = self.config.get("Handler", "index.handler")
+        if "." not in handler:
+            # The runtime client refuses it at init: awslambdaric words the unpack error, the Node.js client says "Bad handler".
+            if runtime.startswith("python"):
+                message = f"Bad handler '{handler}': not enough values to unpack (expected 2, got 1)"
+                payload = {"errorMessage": message, "errorType": "Runtime.MalformedHandlerName",
+                           "requestId": "", "stackTrace": []}
+            else:
+                message = "Bad handler"
+                payload = {"errorType": "Runtime.MalformedHandlerName", "errorMessage": message, "trace": []}
+            raise ProvidedRuntimeError(message, "Runtime.MalformedHandlerName", payload)
         module_name, handler_name = handler.rsplit(".", 1)
         # AWS Python Lambda accepts both dot (``pkg.mod.fn``) and slash
         # (``pkg/mod.fn``) in nested handler paths; ``__import__`` only
@@ -1369,6 +1456,7 @@ class Worker:
         init = {
             "code_dir": code_dir,
             "module": module_name,
+            "handler_module": handler.rsplit(".", 1)[0],
             "handler": handler_name,
             "env": env_vars,
             "function_name": self.config.get("FunctionName", ""),
@@ -1410,7 +1498,7 @@ class Worker:
             raise RuntimeError("No JSON init response from worker")
         if response.get("status") != "ready":
             if response.get("errorType"):
-                raise ProvidedRuntimeError(response.get("error", ""), response["errorType"])
+                raise ProvidedRuntimeError(response.get("error", ""), response["errorType"], response.get("payload"))
             raise RuntimeError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
@@ -1894,9 +1982,11 @@ class ProvidedInitTimeout(RuntimeError):
 class ProvidedRuntimeError(RuntimeError):
     """A runtime failure that carries the error type AWS reports."""
 
-    def __init__(self, message: str, error_type: str):
+    def __init__(self, message: str, error_type: str, payload: dict | None = None):
         super().__init__(message)
         self.error_type = error_type
+        # The runtime's own error document, when it reported one, returned to Invoke as is.
+        self.payload = payload
 
 
 class ProvidedWorker(Worker):

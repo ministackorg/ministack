@@ -678,7 +678,9 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
-        container = _run_with_acl(docker_client, run_kwargs, acl)
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_with_acl(docker_client, kwargs, acl), run_kwargs, _next_host_port)
+        endpoint_port = host_port
         container_ip = ""
         if DOCKER_NETWORK:
             container.reload()
@@ -2614,7 +2616,8 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
     )
     if DOCKER_NETWORK:
         run_kwargs["network"] = DOCKER_NETWORK
-    container = docker_client.containers.run(**run_kwargs)
+    container, host_port = container_reaper.run_on_free_port(
+        docker_client, lambda kwargs: docker_client.containers.run(**kwargs), run_kwargs, _next_host_port)
     try:
         address, port, container_ip = _MINISTACK_HOST, host_port, ""
         if DOCKER_NETWORK:

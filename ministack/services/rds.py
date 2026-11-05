@@ -1339,6 +1339,17 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         or _rds_cluster_docker_volume_name(cluster_id)
     )
     cluster["_shared_volume_name"] = volume_name
+    # Created with MiniStack's labels so the boot and shutdown sweeps can find it (it outlives the
+    # container); a volume that already exists keeps its data.
+    try:
+        docker_client.volumes.get(volume_name)
+    except Exception:
+        try:
+            docker_client.volumes.create(name=volume_name, labels={
+                **container_reaper.own_labels("rds"), "cluster_id": cluster_id,
+                "account_id": get_account_id(), "region": get_region()})
+        except Exception as e:
+            logger.warning("RDS: could not create volume %s: %s", volume_name, e)
     container_kwargs["volumes"] = {
         volume_name: {"bind": data_path, "mode": "rw"},
     }
@@ -1366,13 +1377,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             container_kwargs["network"]: {"Aliases": network_aliases},
         }
     try:
-        container = _run_rds_container(
-            docker_client, engine, container_kwargs,
-            # The first name becomes the CN, so the global name goes last.
-            tls_names=list(endpoint_aliases)
-            + [container_kwargs.get("name") or ""]
-            + (_global_member_certificate_names(cluster) if aliasable else []),
-        )
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_rds_container(
+                docker_client, engine, kwargs,
+                # The first name becomes the CN, so the global name goes last.
+                tls_names=list(endpoint_aliases)
+                + [kwargs.get("name") or ""]
+                + (_global_member_certificate_names(cluster) if aliasable else []),
+            ), container_kwargs, _next_port)
     except Exception as e:
         cluster["_shared_container_ready"] = False
         logger.warning("RDS: failed to start shared container for cluster %s: %s", cluster_id, e)
@@ -1601,12 +1613,13 @@ def _start_pg_reader_container(db_id, cluster):
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
     try:
-        container = _run_rds_container(
-            docker_client, engine, container_kwargs,
-            tls_names=_cluster_endpoint_aliases(cluster)
-            + [container_kwargs.get("name") or ""]
-            + _global_member_certificate_names(cluster),
-        )
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_rds_container(
+                docker_client, engine, kwargs,
+                tls_names=_cluster_endpoint_aliases(cluster)
+                + [kwargs.get("name") or ""]
+                + _global_member_certificate_names(cluster),
+            ), container_kwargs, _next_port)
     except Exception as e:
         logger.warning(
             "RDS: failed to start reader container for %s: %s", db_id, e,
@@ -2480,15 +2493,21 @@ def _start_rds_container_for_instance(db_id, instance):
         groups[0]["ParameterApplyStatus"] = "in-sync"
 
     try:
-        container = _run_rds_container(
-            docker_client, engine, container_kwargs,
-            tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
-                       container_kwargs.get("name") or ""],
-        )
+        moved_from = host_port
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_rds_container(
+                docker_client, engine, kwargs,
+                tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
+                           kwargs.get("name") or ""],
+            ), container_kwargs, _next_port)
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
         return
+    if host_port != moved_from:
+        if endpoint.get("Port") == moved_from:
+            endpoint["Port"] = host_port
+        instance["_HostPort"] = host_port
 
     # Check-and-publish under the lock, so a DeleteDBInstance cannot land in the
     # gap between them and leave this container referenced by nothing. The check
@@ -5228,11 +5247,13 @@ def _create_db_instance_impl(p):
                     _p(p, "BackupRetentionPeriod") or "1", param_group_name,
                 )):
                     container_kwargs["command"] = options
-                container = _run_rds_container(
-                    docker_client, engine, container_kwargs,
-                    tls_names=[endpoint_host or "",
-                               container_kwargs.get("name") or ""],
-                )
+                container, host_port = container_reaper.run_on_free_port(
+                    docker_client, lambda kwargs: _run_rds_container(
+                        docker_client, engine, kwargs,
+                        tls_names=[endpoint_host or "",
+                                   kwargs.get("name") or ""],
+                    ), container_kwargs, _next_port)
+                endpoint_port = host_port
                 docker_container_id = container.id
                 real_container_started = True
                 if ms_network:

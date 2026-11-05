@@ -3,4 +3,4 @@ docker>=7.0.0
 cbor2>=5.4.0
 # Pinned to the version the images carry, so a pip install and a Docker run
 # classify requests against identical service models.
-botocore==1.43.106
+botocore==1.43.124

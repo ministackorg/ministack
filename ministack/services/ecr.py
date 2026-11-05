@@ -1286,6 +1286,27 @@ def held_image_archive(image, architecture):
     return out.getvalue(), config_digest
 
 
+_DOCKER_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
+
+
+def load_held_image(docker_client, image, architecture=None):
+    """Load an image this MiniStack holds into ``docker_client`` for ``architecture`` (the daemon's when None).
+
+    Returns the reference to run it by, or None when it is not held here or has no image for that platform."""
+    if not architecture:
+        reported = (docker_client.info() or {}).get("Architecture", "")
+        architecture = _DOCKER_ARCHITECTURES.get(reported, reported)
+    built = held_image_archive(image, architecture)
+    if built is None:
+        return None
+    archive, config_digest = built
+    loaded = docker_client.images.load(archive)
+    if "@" not in image.rsplit("/", 1)[-1]:
+        return image
+    # An untagged load is named by its ID: the config digest on the classic store, the manifest digest on containerd's.
+    return loaded[0].id if loaded else config_digest
+
+
 def _v2_put_manifest(name, ref, headers, body):
     err = _ensure_repo_exists(name)
     if err is not None:

@@ -4542,6 +4542,14 @@ def test_ecs_runs_a_held_ecr_image_without_pulling(monkeypatch):
     client.images.pull.assert_not_called()
     client.containers.run.assert_called_once_with(uri)
 
+    # By digest it runs by the loaded image's ID (the manifest digest on containerd's image store).
+    pinned = "111122223333.dkr.ecr.us-east-2.amazonaws.com/held@sha256:" + "a" * 64
+    monkeypatch.setattr(ecr, "_held_image", lambda image: ("111122223333", "us-east-2", "held", "v1"))
+    by_digest = MagicMock(info=MagicMock(return_value={"Architecture": "aarch64"}))
+    by_digest.images.load.return_value = [MagicMock(id="sha256:manifest")]
+    ecs._run_docker_container(by_digest, {"image": pinned}, {}, refresh_image=True)
+    by_digest.containers.run.assert_called_once_with("sha256:manifest")
+
     other = MagicMock(info=MagicMock(return_value={"Architecture": "x86_64"}))
     with pytest.raises(ecs._ImagePullError):  # no image for this platform
         ecs._run_docker_container(other, {"image": uri}, {}, refresh_image=True)

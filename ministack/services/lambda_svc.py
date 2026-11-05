@@ -378,6 +378,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "_HANDLER",
     "_LAMBDA_CODE_DIR",
     "_LAMBDA_HANDLER_MODULE",
+    "_LAMBDA_HANDLER_MODNAME",
     "_LAMBDA_HANDLER_FUNC",
     "_LAMBDA_FUNCTION_ARN",
     "_LAMBDA_LAYERS_DIRS",
@@ -857,12 +858,45 @@ class LambdaContext:
 # that one) and before the handler module builds any client.
 _ms_install_invoke_depth()
 
-_mod = __import__(_mod_path)
-for _part in _mod_path.split(".")[1:]:
-    _mod = getattr(_mod, _part)
-_result = getattr(_mod, _fn_name)(event, LambdaContext())
+import traceback
+_rid = os.environ["_LAMBDA_REQUEST_ID"]
+_modname = os.environ.get("_LAMBDA_HANDLER_MODNAME") or _mod_path
+
+def _fail(doc):
+    # A handler or init error is the runtime's error document, marked so a process exit stays distinct.
+    _REAL_STDOUT.write("\\x1eMINISTACK-ERROR\\x1e" + json.dumps(doc))
+    _REAL_STDOUT.flush()
+    sys.exit(0)
+
+def _doc(msg, etype, trace, rid=_rid):
+    return {"errorMessage": msg, "errorType": etype, "requestId": rid, "stackTrace": trace}
+
+try:
+    _mod = __import__(_mod_path)
+    for _part in _mod_path.split(".")[1:]:
+        _mod = getattr(_mod, _part)
+except ImportError as e:
+    _fail(_doc("Unable to import module '%s': %s" % (_modname, e), "Runtime.ImportModuleError", [], ""))
+except SyntaxError as e:
+    _fail(_doc("Syntax error in module '%s': %s" % (_modname, e), "Runtime.UserCodeSyntaxError",
+               ['  File "%s" Line %s\\n    %s' % (e.filename, e.lineno, e.text)], ""))
+except Exception as e:
+    _fail(_doc(str(e), type(e).__name__, traceback.format_list(traceback.extract_tb(e.__traceback__)[1:]), ""))
+try:
+    _fn = getattr(_mod, _fn_name)
+except AttributeError:
+    _fail(_doc("Handler '%s' missing on module '%s'" % (_fn_name, _modname), "Runtime.HandlerNotFound", [], ""))
+try:
+    _result = _fn(event, LambdaContext())
+except Exception as e:
+    traceback.print_exc()
+    _fail(_doc(str(e), type(e).__name__, traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])))
 if _result is not None:
-    _REAL_STDOUT.write(json.dumps(_result))
+    try:
+        _out = json.dumps(_result)
+    except Exception as e:
+        _fail(_doc("Unable to marshal response: %s" % e, "Runtime.MarshalError", []))
+    _REAL_STDOUT.write(_out)
     _REAL_STDOUT.flush()
 """
 
@@ -958,6 +992,32 @@ const context = {
   getRemainingTimeInMillis: () => parseFloat(process.env._LAMBDA_TIMEOUT || '3') * 1000,
 };
 
+function formatError(error) {
+  try {
+    if (error instanceof Error) {
+      return {
+        errorType: error.name?.replaceAll('\\x7F', '%7F'),
+        errorMessage: error.message?.replaceAll('\\x7F', '%7F'),
+        trace: error.stack?.replaceAll('\\x7F', '%7F').split('\\n') || [],
+      };
+    }
+    return { errorType: typeof error, errorMessage: String(error), trace: [] };
+  } catch {
+    return { errorType: 'handled', errorMessage: 'callback called with Error argument, but there was a problem while retrieving one or more of its message, name, and stack', trace: [] };
+  }
+}
+function runtimeError(name, message, stack) {
+  const e = new Error(message);
+  e.name = name;
+  e.stack = stack || String(e.stack).replace(/^Error/, name);
+  return e;
+}
+function fail(error) {
+  // A handler or init error is the runtime's error document, marked so a process exit stays distinct.
+  realStdoutWrite('\\x1eMINISTACK-ERROR\\x1e' + JSON.stringify(formatError(error)));
+  process.exit(0);
+}
+
 let input = '';
 process.stdin.on('data', d => input += d);
 process.stdin.on('end', async () => {
@@ -965,6 +1025,7 @@ process.stdin.on('end', async () => {
   const fullPath = path.resolve(codeDir, modPath);
   let mod;
   let resolvedPath;
+  try {
   try {
     resolvedPath = require.resolve(fullPath);
     mod = require(resolvedPath);
@@ -985,18 +1046,35 @@ process.stdin.on('end', async () => {
       throw reqErr;
     }
   }
+  } catch (e) {
+    if (e instanceof SyntaxError) fail(runtimeError('Runtime.UserCodeSyntaxError', String(e), e.stack));
+    if (e instanceof Error && e.code === 'MODULE_NOT_FOUND') fail(runtimeError('Runtime.ImportModuleError', String(e)));
+    fail(e);
+  }
   const handler = mod[fnName] || (mod.default && mod.default[fnName]) || mod.default;
   if (typeof handler !== 'function') {
-    process.stderr.write(
-      "Handler '" + fnName + "' in module '" + modPath + "' is undefined or not a function"
-    );
-    process.exit(1);
+    const full = modPath + '.' + fnName;
+    fail(runtimeError('Runtime.HandlerNotFound',
+      handler === undefined ? full + ' is undefined or not exported' : full + ' is not a function'));
   }
-  Promise.resolve(handler(event, context)).then(result => {
-    if (result !== undefined) realStdoutWrite(JSON.stringify(result));
+  let pending;
+  try {
+    pending = Promise.resolve(handler(event, context));
+  } catch (err) {
+    process.stderr.write(String((err && err.stack) || err));
+    fail(err);
+  }
+  pending.then(result => {
+    let out;
+    try {
+      out = JSON.stringify(result === undefined ? null : result);
+    } catch (_e) {
+      fail(runtimeError('Runtime.JSONStringifyError', 'Unable to stringify response body'));
+    }
+    if (result !== undefined) realStdoutWrite(out);
   }).catch(err => {
-    process.stderr.write(String(err.stack || err));
-    process.exit(1);
+    process.stderr.write(String((err && err.stack) || err));
+    fail(err);
   });
 });
 """
@@ -4090,9 +4168,10 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
 # by urlopen(timeout=timeout).
 _RIE_CONNECT_RETRY_SECONDS = 30.0
 
-_RIE_RUNTIME_EXIT_RE = re.compile(
-    r"Runtime exited (?:with error: (?:exit status \d+|signal: [^\"\n]+?)|without providing a reason)(?= InvokeID=|[\"\n]|$)",
-    re.M)
+# RIE logs the error it answers a failed invoke with ("Invoke failed error=<err> InvokeID=<id>", or
+# "Init failed ... error=<err>") and its type ("First fatal error stored in appctx: <type>").
+_RIE_FAILED_RE = re.compile(r"\b(Invoke|Init) failed\b.*?\berror=(.+?)(?= InvokeID=|[\"\n]|$)", re.M)
+_RIE_FATAL_TYPE_RE = re.compile(r"First fatal error stored in appctx: ([\w.]+)")
 
 
 def _rie_failure_is_retryable(exc: BaseException) -> bool:
@@ -4136,13 +4215,15 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str, request_id
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             parsed = None
-        exited = _RIE_RUNTIME_EXIT_RE.search(logs or "")
+        failures = {m.group(1): m.group(2) for m in _RIE_FAILED_RE.finditer(logs or "")}
+        failed = failures.get("Invoke") or failures.get("Init")
+        fatal = _RIE_FATAL_TYPE_RE.search(logs or "")
         if isinstance(parsed, dict) and parsed.get("errorMessage"):
             body = parsed
-        elif exited:
-            # The runtime died (RIE answers 502, empty): AWS reports the reason the RIE logged.
-            body = {"errorMessage": runtime_exit_message(request_id, exited.group(0)),
-                    "errorType": "Runtime.ExitError"}
+        elif failed:
+            # RIE answers a failed init or invoke with 502 and no body: AWS reports the error RIE logged.
+            body = {"errorMessage": runtime_exit_message(request_id, failed),
+                    "errorType": fatal.group(1) if fatal else "Runtime.Unknown"}
         else:
             err_type = exc.headers.get("Lambda-Runtime-Function-Error-Type") if exc.headers else None
             body = {
@@ -4879,6 +4960,18 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             "host.docker.internal", "host-gateway"
         )
 
+    from ministack.services import ecr
+    if package_type == "Image" and ecr._held_image(image) is not None:
+        # An image in this MiniStack's ECR is loaded from it, never pulled from the real registry.
+        architecture = docker_arch or _host_docker_arch(client)
+        held = ecr.load_held_image(client, image, architecture)
+        if held is None:
+            reason = f"{image}: not found in this MiniStack's ECR for linux/{architecture}"
+            if docker_platform:
+                return _platform_fallback(reason)
+            raise RuntimeError(f"Failed to pull image {reason}")
+        image = run_kwargs["image"] = held
+
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
         local_image = client.images.get(image)
@@ -5573,6 +5666,10 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
+        if isinstance(result.get("payload"), dict):
+            # The runtime's own error document, as AWS's runtime client posts it.
+            return {"body": result["payload"], "error": True,
+                    "log": "\n".join(filter(None, [result.get("log", ""), result.get("trace", "")]))}
         else:
             error_msg = result.get("error", "Unknown error")
             error_type = result.get("error_type") or "Runtime.HandlerError"
@@ -5593,6 +5690,8 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         if isinstance(e, RuntimeExitError):
             return {"body": {"errorMessage": runtime_exit_message(request_id, e.reason), "errorType": e.error_type},
                     "error": True, "log": e.log}
+        if isinstance(getattr(e, "payload", None), dict):
+            return {"body": e.payload, "error": True, "log": ""}
         return {
             "body": {"errorMessage": str(e), "errorType": getattr(e, "error_type", "") or type(e).__name__},
             "error": True,
@@ -5962,6 +6061,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
                     "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
                     "_LAMBDA_CODE_DIR": code_dir,
                     "_LAMBDA_HANDLER_MODULE": module_name,
+                    "_LAMBDA_HANDLER_MODNAME": handler.rsplit(".", 1)[0],
                     "_LAMBDA_HANDLER_FUNC": func_name,
                     "_LAMBDA_FUNCTION_ARN": config["FunctionArn"],
                     "_LAMBDA_TIMEOUT": str(timeout),
@@ -6010,31 +6110,24 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
 
             log_tail = proc.stderr.strip()
 
-            if proc.returncode < 0:
-                # Killed by a signal: the runtime died, which AWS reports as Runtime.ExitError.
+            marker = "\x1eMINISTACK-ERROR\x1e"
+            if proc.returncode == 0 and proc.stdout.startswith(marker):
+                return {"body": json.loads(proc.stdout[len(marker):]), "error": True, "log": log_tail}
+            if proc.returncode != 0:
+                # The wrapper reports handler errors itself, so any other exit is the runtime dying.
                 return {
                     "body": {"errorMessage": runtime_exit_message(request_id, runtime_exit_reason(proc.returncode)),
                              "errorType": "Runtime.ExitError"},
                     "error": True,
                     "log": log_tail,
                 }
-            if proc.returncode == 0:
-                stdout = proc.stdout.strip()
-                if not stdout:
-                    return {"body": None, "log": log_tail}
-                try:
-                    return {"body": json.loads(stdout), "log": log_tail}
-                except json.JSONDecodeError:
-                    return {"body": stdout, "log": log_tail, "raw_payload": True}
-            else:
-                return {
-                    "body": {
-                        "errorMessage": log_tail or "Unknown error",
-                        "errorType": "Runtime.HandlerError",
-                    },
-                    "error": True,
-                    "log": log_tail,
-                }
+            stdout = proc.stdout.strip()
+            if not stdout:
+                return {"body": None, "log": log_tail}
+            try:
+                return {"body": json.loads(stdout), "log": log_tail}
+            except json.JSONDecodeError:
+                return {"body": stdout, "log": log_tail, "raw_payload": True}
 
     except subprocess.TimeoutExpired as exc:
         try:

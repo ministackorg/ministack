@@ -800,12 +800,12 @@ def _create_cluster(body, creator_arn=None):
                 client, ms_network, name, account_id, region,
                 cluster.get("_auth_token", ""),
             )
-            container = _start_k3s_container(
-                client, run_kwargs, registries_yaml, auth_webhook_config
-            )
+            container, cluster["_port"] = container_reaper.run_on_free_port(
+                client, lambda kwargs: _start_k3s_container(client, kwargs, registries_yaml, auth_webhook_config),
+                run_kwargs, _next_port)
             cluster["_docker_id"] = container.id
 
-            cluster["endpoint"] = _cluster_endpoint(port)
+            cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
             _schedule_access_policy_reconcile(name, account_id, region)
@@ -1882,9 +1882,9 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 client, ms_network, cluster_name, cluster_spec.account_id,
                 cluster_spec.region, cluster["_auth_token"],
             )
-            container = _start_k3s_container(
-                client, run_kwargs, registries_yaml, auth_webhook_config
-            )
+            container, cluster["_port"] = container_reaper.run_on_free_port(
+                client, lambda kwargs: _start_k3s_container(client, kwargs, registries_yaml, auth_webhook_config),
+                run_kwargs, _next_port)
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(cluster["_port"])

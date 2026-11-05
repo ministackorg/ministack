@@ -1931,11 +1931,18 @@ def _container_invocations_url(runtime):
                     run_kwargs["network"] = network
                 else:
                     run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
+                from ministack.services import ecr
+                run_image = image
+                if ecr._held_image(image) is not None:
+                    # An image in this MiniStack's ECR is loaded from it, never pulled from the real registry.
+                    run_image = ecr.load_held_image(client, image)
+                    if run_image is None:
+                        raise RuntimeError("not found in this MiniStack's ECR for the host platform")
                 try:
-                    container = client.containers.create(image, **run_kwargs)
+                    container = client.containers.create(run_image, **run_kwargs)
                 except docker.errors.ImageNotFound:
-                    client.images.pull(image)
-                    container = client.containers.create(image, **run_kwargs)
+                    client.images.pull(run_image)
+                    container = client.containers.create(run_image, **run_kwargs)
                 container.start()
                 container.reload()
                 if network:

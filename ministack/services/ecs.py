@@ -2374,28 +2374,18 @@ class _ImagePullError(Exception):
     """An image pull failed and the launch type has no usable cache."""
 
 
-_DOCKER_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
-
-
 def _load_held_image(docker_client, image, platform, principal_arn=None):
     """Load an image held in this MiniStack's ECR into the daemon; return the reference to run, or None when
     the image belongs to another registry. Raises _ImagePullError when the repository has no such image."""
-    from ministack.services import ecr
     if ecr._held_image(image) is None:
         return None
     if not ecr.held_image_readable(image, principal_arn or f"arn:aws:iam::{get_account_id()}:root"):
         raise _ImagePullError(f"{image}: the repository policy does not allow this account to pull it")
-    if platform:
-        architecture = platform.rsplit("/", 1)[-1]
-    else:
-        reported = (docker_client.info() or {}).get("Architecture", "")
-        architecture = _DOCKER_ARCHITECTURES.get(reported, reported)
-    built = ecr.held_image_archive(image, architecture)
-    if built is None:
-        raise _ImagePullError(f"{image}: not found in this MiniStack's ECR for linux/{architecture}")
-    archive, config_digest = built
-    docker_client.images.load(archive)
-    return config_digest if "@" in image.rsplit("/", 1)[-1] else image
+    architecture = platform.rsplit("/", 1)[-1] if platform else None
+    loaded = ecr.load_held_image(docker_client, image, architecture)
+    if loaded is None:
+        raise _ImagePullError(f"{image}: not found in this MiniStack's ECR for {platform or 'the host platform'}")
+    return loaded
 
 
 def _run_docker_container(

@@ -446,11 +446,19 @@ def _execute_build(build_id, project):
         _record_phase(build, "QUEUED", "SUCCEEDED")
         build["buildStatus"] = "IN_PROGRESS"
 
+        image_name = env.get("image", "aws/codebuild/standard:7.0")
+        from ministack.services import ecr
+        if ecr._held_image(image_name) is not None:
+            # An image in this MiniStack's ECR is loaded for the agent, never pulled from the real registry.
+            image_name = ecr.load_held_image(client, image_name)
+            if image_name is None:
+                raise RuntimeError(f"{env['image']}: not found in this MiniStack's ECR for the host platform")
+
         run_kwargs = dict(
             detach=True,
             environment={
                 "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
-                "IMAGE_NAME": env.get("image", "aws/codebuild/standard:7.0"),
+                "IMAGE_NAME": image_name,
                 "SOURCE": source_dir,
                 "MOUNT_SOURCE_DIRECTORY": "TRUE",
                 "ARTIFACTS": artifacts_dir,

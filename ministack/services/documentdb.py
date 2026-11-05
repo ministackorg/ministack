@@ -254,7 +254,7 @@ def _respawn_standalone_instance(account_id, region, db_id, instance):
         engine_version, master_user, master_pass, instance.get("DBName") or "admin",
     )
     host_port = instance.get("_host_port") or _next_port()
-    if not _is_host_port_free(host_port):
+    if not _rds._is_host_port_free(host_port):
         host_port = _next_port()
     volume_name = instance.get("_docker_volume_name") if DOCDB_PERSIST else None
     started = _launch_documentdb_container(
@@ -271,7 +271,7 @@ def _respawn_standalone_instance(account_id, region, db_id, instance):
     if not started:
         instance["DBInstanceStatus"] = "failed"
         return
-    container_id, internal_addr, internal_port, ep_addr, ep_port = started
+    container_id, internal_addr, internal_port, ep_addr, ep_port, host_port = started
     instance.update({
         "_docker_container_id": container_id,
         "_internal_address": internal_addr,
@@ -343,15 +343,6 @@ def _wait_for_port(host, port, timeout=300):
     return False
 
 
-def _is_host_port_free(port):
-    """True when no listener currently holds the given localhost port."""
-    try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
-            return False
-    except OSError:
-        return True
-
-
 def _next_port():
     """Allocate the next host port for published containers."""
     with _port_lock:
@@ -405,7 +396,8 @@ def _launch_documentdb_container(name,
     else:
         kwargs["tmpfs"] = {data_path: f"rw,noexec,nosuid,size={DOCDB_TMPFS_SIZE}"}
     try:
-        container = docker_client.containers.run(**kwargs)
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda run_kwargs: docker_client.containers.run(**run_kwargs), kwargs, _next_port)
     except Exception as e:
         logger.warning("docdb: failed to start container %s: %s", name, e)
         return None
@@ -421,7 +413,7 @@ def _launch_documentdb_container(name,
                 internal_addr, internal_port = ip, container_port
         except Exception:
             pass
-    return container.id, internal_addr, internal_port, endpoint_addr, endpoint_port
+    return container.id, internal_addr, internal_port, endpoint_addr, endpoint_port, host_port
 
 
 def _remove_stale_owned_container(docker_client, name):
@@ -477,7 +469,7 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         _remove_stale_owned_container(docker_client, container_name)
 
     host_port = cluster.get("_shared_host_port") or _next_port()
-    if not _is_host_port_free(host_port):
+    if not _rds._is_host_port_free(host_port):
         logger.info(
             "docdb: persisted shared host port %d for cluster %s is in use; "
             "allocating a fresh port",
@@ -507,7 +499,7 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         logger.warning("docdb: failed to start shared container for cluster %s", cluster_id)
         return {"started": False, "failed": True, "readiness_host": None, "readiness_port": None}
 
-    container_id, internal_addr, internal_port, ep_addr, ep_port = started
+    container_id, internal_addr, internal_port, ep_addr, ep_port, host_port = started
     epoch = int(cluster.get("_shared_container_epoch", 0)) + 1
     cluster.update({
         "_shared_container_id": container_id,
@@ -1089,7 +1081,7 @@ def _start_instance_container(db_id, instance):
     if not started:
         logger.warning("docdb: no container for instance %s; endpoint is a placeholder", db_id)
         return
-    container_id, internal_addr, internal_port, ep_addr, ep_port = started
+    container_id, internal_addr, internal_port, ep_addr, ep_port, host_port = started
     instance.update({
         "_docker_container_id": container_id,
         "_internal_address": internal_addr,
