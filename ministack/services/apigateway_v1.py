@@ -3968,9 +3968,14 @@ def _import_path_item(api_id, path, path_item, scheme_map=None, default_security
             resource_id = child
 
     for method, operation in path_item.items():
-        if method.lower() in _OPENAPI_HTTP_METHODS:
-            _import_operation(api_id, resource_id, method.upper(), operation,
-                              scheme_map, default_security)
+        if method == "x-amazon-apigateway-any-method":
+            http_method = "ANY"
+        elif method.lower() in _OPENAPI_HTTP_METHODS:
+            http_method = method.upper()
+        else:
+            continue
+        _import_operation(api_id, resource_id, http_method, operation,
+                          scheme_map, default_security)
 
 
 def _import_operation(api_id, resource_id, http_method, operation,

@@ -6569,6 +6569,74 @@ def _sigv4a_request(credentials, method, url, service, region_set, *, host=None,
     return response.status_code, code.group(1) if code else ""
 
 
+def test_sigv4a_put_events_runs_as_the_signing_account():
+    """A SigV4a PutEvents (as botocore sends one with EndpointId) is delivered in the signing account.
+
+    Region set ``*`` runs in MINISTACK_REGION, so the bus and queue are made there."""
+    import os
+    import uuid
+
+    import boto3
+    from conftest import ENDPOINT
+
+    account = "111122223333"
+
+    def client(service):
+        return boto3.client(service, endpoint_url=ENDPOINT, region_name=os.environ.get("MINISTACK_REGION", "us-east-1"),
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    events, sqs = client("events"), client("sqs")
+    bus, source = f"sigv4a-{uuid.uuid4().hex[:8]}", "ministack.sigv4a"
+    with contextlib.ExitStack() as cleanup:
+        events.create_event_bus(Name=bus)
+        cleanup.callback(events.delete_event_bus, Name=bus)
+        queue = sqs.create_queue(QueueName=bus)["QueueUrl"]
+        cleanup.callback(sqs.delete_queue, QueueUrl=queue)
+        queue_arn = sqs.get_queue_attributes(QueueUrl=queue, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        events.put_rule(Name=bus, EventBusName=bus, EventPattern=json.dumps({"source": [source]}))
+        cleanup.callback(events.delete_rule, Name=bus, EventBusName=bus)
+        events.put_targets(Rule=bus, EventBusName=bus, Targets=[{"Id": "q", "Arn": queue_arn}])
+        cleanup.callback(events.remove_targets, Rule=bus, EventBusName=bus, Ids=["q"])
+        body = json.dumps({"Entries": [{"EventBusName": bus, "Source": source, "DetailType": "sigv4a",
+                                        "Detail": "{}"}]}).encode()
+        headers = {"Content-Type": "application/x-amz-json-1.1", "X-Amz-Target": "AWSEvents.PutEvents"}
+        status, _ = _sigv4a_request((account, "test"), "POST", f"{ENDPOINT.rstrip('/')}/", "events", "*",
+                                    body=body, headers=headers)
+        assert status == 200
+        messages = sqs.receive_message(QueueUrl=queue, MaxNumberOfMessages=10, WaitTimeSeconds=5).get("Messages", [])
+        assert [json.loads(m["Body"])["account"] for m in messages] == [account]
+
+
+def test_sigv4a_mrap_get_runs_as_the_signing_account():
+    """The owner's SigV4a GetObject through its Multi-Region Access Point, header-signed and presigned, returns the object."""
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT
+
+    account, endpoint = "111122223333", ENDPOINT.rstrip("/")
+    s3 = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id=account,
+                      aws_secret_access_key="test")
+    control = boto3.client("s3control", endpoint_url=ENDPOINT, region_name="us-west-2", aws_access_key_id=account,
+                           aws_secret_access_key="test", config=Config(inject_host_prefix=False))
+    bucket, name = f"sigv4a-{uuid.uuid4().hex[:8]}", f"sigv4a-{uuid.uuid4().hex[:8]}"
+    with contextlib.ExitStack() as cleanup:
+        s3.create_bucket(Bucket=bucket)
+        cleanup.callback(s3.delete_bucket, Bucket=bucket)
+        s3.put_object(Bucket=bucket, Key="k", Body=b"v")
+        cleanup.callback(s3.delete_object, Bucket=bucket, Key="k")
+        control.create_multi_region_access_point(AccountId=account, ClientToken=uuid.uuid4().hex,
+                                                 Details={"Name": name, "Regions": [{"Bucket": bucket}]})
+        cleanup.callback(control.delete_multi_region_access_point, AccountId=account, ClientToken=uuid.uuid4().hex,
+                         Details={"Name": name})
+        alias = control.get_multi_region_access_point(AccountId=account, Name=name)["AccessPoint"]["Alias"]
+        mrap = f"{alias}.accesspoint.s3-global.amazonaws.com"
+        results = [_sigv4a_request((account, "test"), "GET", f"{endpoint}/k", "s3", "*", host=mrap, presign=presign)
+                   for presign in (False, True)]
+        assert results == [(200, ""), (200, "")]
+
+
 @pytest.mark.auth_contract
 def test_sigv4a_signatures_are_verified_contract(auth_enabled, iam_user):
     """SigV4a header and presigned signatures are checked for an IAM user, with their date and region set."""
