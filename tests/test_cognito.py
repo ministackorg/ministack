@@ -7130,6 +7130,245 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     assert _decode_jwt_claims(m2m_token)["seen_org_id"] == "org-m2m"
 
 
+# The response of a PostAuthentication Lambda changes nothing, so these tests
+# read what it received from the error it raises.
+_POSTAUTH_ECHO = (
+    "import json\n"
+    "def handler(event, ctx):\n"
+    "    raise Exception(json.dumps(event, sort_keys=True))\n"
+)
+_POSTAUTH_PASS = "def handler(event, ctx):\n    return event\n"
+
+
+def _postauth_event(exc) -> dict:
+    message = exc.value.response["Error"]["Message"]
+    prefix, suffix = "PostAuthentication failed with error ", "."
+    assert message.startswith(prefix) and message.endswith(suffix), message
+    return json.loads(message[len(prefix):-len(suffix)])
+
+
+def _postauth_password_pool(cognito_idp, pool_name: str, lambda_config: dict):
+    pid = cognito_idp.create_user_pool(
+        PoolName=pool_name, LambdaConfig=lambda_config,
+        Schema=[{"Name": "guid", "AttributeDataType": "String", "Mutable": True}],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="u", TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "u@example.com"}, {"Name": "custom:guid", "Value": "g-1"}],
+    )
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="u", Password="Pwd1234!", Permanent=True)
+    return pid, cid
+
+
+def test_cognito_postauth_runs_on_sign_in(cognito_idp, lam):
+    """A PostAuthentication Lambda runs when a sign-in completes, with AWS's event; tokens follow when it returns."""
+    echo_arn = _create_lambda(lam, "ministack-postauth-echo", _POSTAUTH_ECHO)
+    pid, cid = _postauth_password_pool(cognito_idp, "postauth-event", {"PostAuthentication": echo_arn})
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+            ClientMetadata={"ignored": "by InitiateAuth"},
+        )
+    event = _postauth_event(exc)
+    assert event["version"] == "1"
+    assert event["triggerSource"] == "PostAuthentication_Authentication"
+    assert event["userPoolId"] == pid
+    assert event["userName"] == "u"
+    assert event["callerContext"]["clientId"] == cid
+    assert event["response"] == {}
+    # InitiateAuth does not pass its ClientMetadata on, as on AWS
+    assert set(event["request"]) == {"userAttributes", "newDeviceUsed"}
+    assert event["request"]["newDeviceUsed"] is False
+    attrs = event["request"]["userAttributes"]
+    assert attrs["email"] == "u@example.com"
+    assert attrs["custom:guid"] == "g-1"
+    assert attrs["cognito:user_status"] == "CONFIRMED"
+    assert "sub" in attrs
+
+    pass_arn = _create_lambda(lam, "ministack-postauth-pass", _POSTAUTH_PASS)
+    cognito_idp.update_user_pool(UserPoolId=pid, LambdaConfig={"PostAuthentication": pass_arn})
+    tokens = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+    )["AuthenticationResult"]
+    assert tokens["AccessToken"]
+
+
+def test_cognito_postauth_lambda_error_fails_sign_in(cognito_idp, lam):
+    """A PostAuthentication Lambda that throws fails the sign-in with UserLambdaValidationException, as on AWS."""
+    fn_arn = _create_lambda(lam, "ministack-postauth-broken", "def handler(event, ctx):\n    raise RuntimeError('boom')\n")
+    _, cid = _postauth_password_pool(cognito_idp, "postauth-broken", {"PostAuthentication": fn_arn})
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    assert exc.value.response["Error"]["Message"] == "PostAuthentication failed with error boom."
+
+
+def test_cognito_postauth_missing_lambda_fails_sign_in(cognito_idp):
+    """A PostAuthentication Lambda that does not exist fails the sign-in with UnexpectedLambdaException."""
+    missing = "arn:aws:lambda:us-east-1:000000000000:function:ministack-postauth-missing"
+    _, cid = _postauth_password_pool(cognito_idp, "postauth-missing", {"PostAuthentication": missing})
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "UnexpectedLambdaException"
+    assert exc.value.response["Error"]["Message"] == (
+        "PostAuthentication invocation failed due to error AccessDeniedException.")
+
+
+def test_cognito_postauth_runs_before_the_new_password_challenge(cognito_idp, lam):
+    """AWS invokes PostAuthentication once a temporary password is verified, before NEW_PASSWORD_REQUIRED is returned."""
+    echo_arn = _create_lambda(lam, "ministack-postauth-temporary", _POSTAUTH_ECHO)
+    pid, cid = _postauth_password_pool(cognito_idp, "postauth-temporary", {"PostAuthentication": echo_arn})
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="new", TemporaryPassword="Temp1234!", MessageAction="SUPPRESS")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "new", "PASSWORD": "Temp1234!"},
+        )
+    event = _postauth_event(exc)
+    assert event["userName"] == "new"
+    assert event["request"]["userAttributes"]["cognito:user_status"] == "FORCE_CHANGE_PASSWORD"
+    assert event["request"]["newDeviceUsed"] is False
+
+
+def test_cognito_postauth_runs_again_when_the_new_password_is_set(cognito_idp, lam):
+    """Setting the new password invokes it again, with newDeviceUsed true and ClientMetadata, as on AWS."""
+    # Lets the temporary-password step pass so the sign-in reaches the new-password step
+    fn_arn = _create_lambda(lam, "ministack-postauth-new-password", (
+        "import json\n"
+        "def handler(event, ctx):\n"
+        "    if event['request']['userAttributes']['cognito:user_status'] == 'CONFIRMED':\n"
+        "        raise Exception(json.dumps(event, sort_keys=True))\n"
+        "    return event\n"
+    ))
+    pid, cid = _postauth_password_pool(cognito_idp, "postauth-new-password", {"PostAuthentication": fn_arn})
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="new", TemporaryPassword="Temp1234!", MessageAction="SUPPRESS")
+
+    challenge = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "new", "PASSWORD": "Temp1234!"},
+    )
+    assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="NEW_PASSWORD_REQUIRED", Session=challenge["Session"],
+            ChallengeResponses={"USERNAME": "new", "NEW_PASSWORD": "Final1234!"},
+            ClientMetadata={"orgId": "org-1"},
+        )
+    event = _postauth_event(exc)
+    assert event["userName"] == "new"
+    assert event["request"]["newDeviceUsed"] is True
+    assert event["request"]["clientMetadata"] == {"orgId": "org-1"}
+    # The new password stays set although the sign-in failed, as on AWS
+    assert cognito_idp.admin_get_user(UserPoolId=pid, Username="new")["UserStatus"] == "CONFIRMED"
+
+
+def test_cognito_postauth_runs_when_the_mfa_code_is_answered(cognito_idp, lam):
+    """With MFA, AWS invokes it when the code is answered, not when the challenge is returned."""
+    pid, cid = _postauth_password_pool(cognito_idp, "postauth-mfa", {})
+    access = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+    )["AuthenticationResult"]["AccessToken"]
+    secret = cognito_idp.associate_software_token(AccessToken=access)["SecretCode"]
+    cognito_idp.verify_software_token(AccessToken=access, UserCode=_totp_code(secret))
+    echo_arn = _create_lambda(lam, "ministack-postauth-mfa", _POSTAUTH_ECHO)
+    cognito_idp.update_user_pool(UserPoolId=pid, LambdaConfig={"PostAuthentication": echo_arn})
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid, SoftwareTokenMfaConfiguration={"Enabled": True}, MfaConfiguration="ON")
+
+    challenge = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+    )
+    assert challenge["ChallengeName"] == "SOFTWARE_TOKEN_MFA"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", Session=challenge["Session"],
+            ChallengeResponses={"USERNAME": "u", "SOFTWARE_TOKEN_MFA_CODE": _totp_code(secret)},
+            ClientMetadata={"orgId": "org-1"},
+        )
+    event = _postauth_event(exc)
+    assert event["request"]["newDeviceUsed"] is False
+    assert event["request"]["clientMetadata"] == {"orgId": "org-1"}
+
+
+@pytest.mark.parametrize("kind,returned,message", [
+    ("null", "None", "Invalid lambda function output : Invalid JSON"),
+    ("string", "'not-an-event'", "Unrecognizable lambda output"),
+])
+def test_cognito_postauth_invalid_response_fails_sign_in(cognito_idp, lam, kind, returned, message):
+    """A PostAuthentication Lambda must return the event; AWS fails the sign-in on anything else."""
+    fn_arn = _create_lambda(lam, f"ministack-postauth-invalid-{kind}",
+                            f"def handler(event, ctx):\n    return {returned}\n")
+    _, cid = _postauth_password_pool(cognito_idp, f"postauth-invalid-{kind}", {"PostAuthentication": fn_arn})
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "InvalidLambdaResponseException"
+    assert exc.value.response["Error"]["Message"] == message
+
+
+def test_cognito_postauth_does_not_run_on_refresh(cognito_idp, lam):
+    """Refreshing tokens is not a sign-in, so a PostAuthentication Lambda that would fail it is not invoked."""
+    pid, cid = _postauth_password_pool(cognito_idp, "postauth-refresh", {})
+    tokens = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+    )["AuthenticationResult"]
+    fn_arn = _create_lambda(lam, "ministack-postauth-refresh", "def handler(event, ctx):\n    raise RuntimeError('boom')\n")
+    cognito_idp.update_user_pool(UserPoolId=pid, LambdaConfig={"PostAuthentication": fn_arn})
+
+    refreshed = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={"REFRESH_TOKEN": tokens["RefreshToken"]},
+    )["AuthenticationResult"]
+    assert refreshed["AccessToken"]
+    assert cognito_idp.get_tokens_from_refresh_token(
+        ClientId=cid, RefreshToken=tokens["RefreshToken"])["AuthenticationResult"]["AccessToken"]
+
+
+def test_cognito_postauth_runs_before_pretoken(cognito_idp, lam):
+    """AWS runs PostAuthentication before PreTokenGeneration, so a failing PostAuthentication is the error a sign-in gets."""
+    postauth_arn = _create_lambda(lam, "ministack-postauth-order", "def handler(event, ctx):\n    raise RuntimeError('post')\n")
+    pretoken_arn = _create_lambda(lam, "ministack-postauth-order-pretoken", "def handler(event, ctx):\n    raise RuntimeError('pre')\n")
+    _, cid = _postauth_password_pool(cognito_idp, "postauth-order", {
+        "PostAuthentication": postauth_arn,
+        "PreTokenGenerationConfig": {"LambdaArn": pretoken_arn, "LambdaVersion": "V2_0"},
+    })
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"},
+        )
+    assert exc.value.response["Error"]["Message"] == "PostAuthentication failed with error post."
+
+
 @pytest.fixture
 def _enable_persistence(monkeypatch, tmp_path):
     """Force PERSIST_STATE on and point STATE_DIR at a tmp dir so

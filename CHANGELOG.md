@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Cognito — the `PostAuthentication` trigger** — `LambdaConfig.PostAuthentication` was stored and never invoked. It now runs with AWS's event where AWS runs it: when a sign-in completes, and when a temporary password is verified before `NEW_PASSWORD_REQUIRED`, but not for an MFA challenge or a refresh. A Lambda that throws, returns something other than the event, or cannot be invoked fails the sign-in with `UserLambdaValidationException`, `InvalidLambdaResponseException` or `UnexpectedLambdaException`. Federated and managed login sign-ins do not invoke it yet. Contributed by @ryuzo-hayashi.
+
 ## [1.5.38] — 2026-11-05
 
 ### Added
