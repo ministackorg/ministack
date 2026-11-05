@@ -520,6 +520,10 @@ _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 _authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
 _revoked_tokens: set = set()                 # refresh tokens and origin_jti values revoked
+_signed_out_tokens: set = set()              # the origin_jti values of those a global sign-out ended
+# origin_jti -> {latest, rotated, rotated_at}: a rotating client's refresh-token family
+_refresh_token_families: dict[str, dict] = {}
+_refresh_token_families_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # In-memory state — Identity Pools (cognito-identity)
@@ -636,6 +640,8 @@ def get_state():
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
         "revoked_tokens": list(_revoked_tokens),
+        "signed_out_tokens": list(_signed_out_tokens),
+        "refresh_token_families": copy.deepcopy(_refresh_token_families),
         "auth_codes": copy.deepcopy(_auth_codes),
         "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
@@ -678,6 +684,8 @@ def _restore_state(data):
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
         _revoked_tokens.update(data.get("revoked_tokens", []))
+        _signed_out_tokens.update(data.get("signed_out_tokens", []))
+        _refresh_token_families.update(data.get("refresh_token_families", {}))
         _auth_codes.update(data.get("auth_codes", {}))
         _challenge_sessions.update(data.get("challenge_sessions", {}))
 
@@ -892,7 +900,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                  nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication",
                  client_metadata: dict | None = None, origin_jti: str = "",
-                 scope: str | None = None) -> str:
+                 scope: str | None = None, expires_at: int | None = None) -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
@@ -908,7 +916,7 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
         "token_use": token_type,
         "iat": now,
-        "exp": now + _token_validity(pool_id, client_id, token_type),
+        "exp": expires_at or now + _token_validity(pool_id, client_id, token_type),
         "jti": new_uuid(),
     }
     if token_type == "id":
@@ -2752,6 +2760,9 @@ def _validate_client_secret_hash(action: str, data: dict):
 
     username = params.get("USERNAME" if parameter else "Username")
     refreshing = parameter == "AuthParameters" and data.get("AuthFlow") in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN")
+    if refreshing and not client.get("ClientSecret") and _rotation_grace(pool, cid) is not None:
+        # A public client that rotates refresh tokens is refused the flow ahead of its token.
+        return None
     if refreshing:
         # AWS rejects invalid refresh tokens before examining their secret hash.
         user, error = _refresh_auth_user(pool, pool["Id"], cid, params.get("REFRESH_TOKEN", ""))
@@ -3314,11 +3325,49 @@ def _pool_out(pool: dict) -> dict:
 # USER POOL CLIENT CRUD
 # ===========================================================================
 
+def _refresh_token_rotation(rotation, explicit_auth_flows):
+    """The client's stored RefreshTokenRotation and the error AWS answers for it, one of them None."""
+    grace = rotation.get("RetryGracePeriodSeconds", 0)
+    if isinstance(grace, bool):
+        return None, error_response_json(
+            "SerializationException", f"{str(grace).upper()}_VALUE can not be converted to an Integer", 400)
+    if isinstance(grace, str):
+        return None, error_response_json("SerializationException", "STRING_VALUE can not be converted to an Integer", 400)
+    if isinstance(grace, float):
+        grace = int(grace)
+    feature = rotation.get("Feature")
+    errors = []
+    if feature is None:
+        errors.append("Value null at 'refreshTokenRotation.feature' failed to satisfy constraint: Member must not be null")
+    elif feature not in ("ENABLED", "DISABLED"):
+        errors.append(f"Value '{feature}' at 'refreshTokenRotation.feature' failed to satisfy constraint: "
+                      "Member must satisfy enum value set: [ENABLED, DISABLED]")
+    if isinstance(grace, int) and grace > 60:
+        errors.append(f"Value '{grace}' at 'refreshTokenRotation.retryGracePeriodSeconds' "
+                      "failed to satisfy constraint: Member must have value less than or equal to 60")
+    elif isinstance(grace, int) and grace < 0:
+        errors.append(f"Value '{grace}' at 'refreshTokenRotation.retryGracePeriodSeconds' "
+                      "failed to satisfy constraint: Member must have value greater than or equal to 0")
+    if errors:
+        count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+        return None, error_response_json("InvalidParameterException", count + "; ".join(errors), 400)
+    if feature == "ENABLED" and "ALLOW_REFRESH_TOKEN_AUTH" in (explicit_auth_flows or []):
+        return None, error_response_json("InvalidParameterException", (
+            "ALLOW_REFRESH_TOKEN_AUTH is not a permitted ExplicitAuthFlow when refresh token rotation is enabled."), 400)
+    # A disabled rotation keeps no grace period.
+    return {"Feature": feature, "RetryGracePeriodSeconds": int(grace or 0) if feature == "ENABLED" else 0}, None
+
+
 def _create_user_pool_client(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    rotation = None
+    if data.get("RefreshTokenRotation") is not None:
+        rotation, err = _refresh_token_rotation(data["RefreshTokenRotation"], data.get("ExplicitAuthFlows"))
+        if err:
+            return err
 
     cid = _client_id()
     now = _now_epoch()
@@ -3349,6 +3398,7 @@ def _create_user_pool_client(data):
         "EnableTokenRevocation": data.get("EnableTokenRevocation", True),
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),
+        "RefreshTokenRotation": rotation,
     }
     pool["_clients"][cid] = client
     out = {k: v for k, v in client.items() if v is not None}
@@ -3417,6 +3467,13 @@ def _update_user_pool_client(data):
         "AnalyticsConfiguration", "PreventUserExistenceErrors", "EnableTokenRevocation",
         "EnablePropagateAdditionalUserContextData", "AuthSessionValidity",
     }
+    # Left out of an update, rotation stays as it was, as on AWS.
+    rotation = data["RefreshTokenRotation"] if data.get("RefreshTokenRotation") is not None else client.get("RefreshTokenRotation")
+    if rotation is not None:
+        rotation, err = _refresh_token_rotation(rotation, data.get("ExplicitAuthFlows", client.get("ExplicitAuthFlows")))
+        if err:
+            return err
+        client["RefreshTokenRotation"] = rotation
     for k in updatable:
         if k in data:
             client[k] = data[k]
@@ -4835,7 +4892,7 @@ def _admin_disable_user(data):
     from ministack.app import AUTH
     if AUTH:
         # Every session ends: its tokens stay revoked after AdminEnableUser.
-        _revoked_tokens.update(user.pop("_origin_jtis", []))
+        _sign_out_sessions(user)
         for tok in [t for t, e in _refresh_tokens.items()
                     if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
             del _refresh_tokens[tok]
@@ -4942,7 +4999,7 @@ def _admin_user_global_sign_out(data):
     # Invalidate every token issued before now (checked by REFRESH_TOKEN_AUTH)
     # and drop the user's OAuth-flow refresh tokens.
     user["_signout_at"] = _now_epoch()
-    _revoked_tokens.update(user.pop("_origin_jtis", []))
+    _sign_out_sessions(user)
     uname = user.get("Username", username)
     for tok in [t for t, e in _refresh_tokens.items()
                 if e.get("username") == uname and e.get("pool_id") == pid]:
@@ -5385,6 +5442,8 @@ def _admin_initiate_auth(data):
         return _initiate_user_srp_auth(pool, pid, cid, auth_params)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
+        if _rotation_grace(pool, cid) is not None:
+            return _rotation_unsupported()
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
         result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
         if err:
@@ -5592,6 +5651,51 @@ def _pool_for_client(cid):
     return None, None
 
 
+def _rotation_grace(pool, cid):
+    """The retry grace period of a client that rotates refresh tokens, else None."""
+    rotation = ((pool or {}).get("_clients", {}).get(cid) or {}).get("RefreshTokenRotation") or {}
+    return int(rotation.get("RetryGracePeriodSeconds", 0)) if rotation.get("Feature") == "ENABLED" else None
+
+
+def _next_refresh_token(pid, cid, grace, refresh_token, claims):
+    """A rotating client's next refresh token, or None for a reused one.
+
+    Only the newest token of a sign-in's family refreshes. The token it
+    replaced may be retried for ``grace`` seconds after it was first used,
+    each retry minting a newer token in turn; any other reuse is refused
+    without revoking the family. A new token keeps the family's original
+    expiry: rotation never extends a session, as on AWS.
+    """
+    origin = claims.get("origin_jti") or refresh_token
+    minted = _fake_token(claims.get("sub", ""), pid, cid, "refresh",
+                         origin_jti=claims.get("origin_jti", ""), scope=claims.get("scope"),
+                         expires_at=claims.get("exp"))
+    with _refresh_token_families_lock:
+        family = _refresh_token_families.setdefault(
+            origin, {"latest": refresh_token, "rotated": None, "rotated_at": 0})
+        now = _now_epoch()
+        if refresh_token == family["latest"]:
+            family["rotated"], family["rotated_at"] = refresh_token, now
+        elif refresh_token != family["rotated"] or now - family["rotated_at"] >= grace:
+            return None
+        family["latest"] = minted
+    return minted
+
+
+def _rotated_out(refresh_token, origin):
+    """A token a newer one replaced while its client rotated, which stays refused once rotation is off."""
+    family = _refresh_token_families.get(origin or refresh_token)
+    return bool(family) and refresh_token != family["latest"]
+
+
+def _rotation_unsupported():
+    return error_response_json("UnsupportedOperationException", "This API does not support refresh token rotation", 400)
+
+
+def _refresh_token_reused():
+    return error_response_json("RefreshTokenReuseException", "Refresh token reuse detected", 400)
+
+
 def _refresh_auth_user(pool, pid, cid, refresh_token):
     """Resolve a refresh-token owner without issuing tokens or invoking triggers."""
     if not refresh_token:
@@ -5609,6 +5713,9 @@ def _refresh_auth_user(pool, pid, cid, refresh_token):
     if claims.get("client_id") != cid:
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has different Client", 400)
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and time.time() >= exp:
+        return None, error_response_json("NotAuthorizedException", "Refresh Token has expired", 400)
     user = _user_from_token(refresh_token, pool)
     if not user:
         return None, error_response_json("NotAuthorizedException",
@@ -5616,16 +5723,25 @@ def _refresh_auth_user(pool, pid, cid, refresh_token):
     if AUTH and not user.get("Enabled", True):
         return None, error_response_json("NotAuthorizedException", "User is disabled.", 400)
     origin = claims.get("origin_jti")
-    if _refresh_token_revoked(refresh_token, user) or (AUTH and isinstance(origin, str) and origin in _revoked_tokens):
+    if _rotation_grace(pool, cid) is not None:
+        # Revoking any token of a rotating family revokes it all, and AWS names no reason;
+        # a global sign-out still answers "has been revoked".
+        if refresh_token in _revoked_tokens or (origin in _revoked_tokens and origin not in _signed_out_tokens):
+            return None, error_response_json("NotAuthorizedException", "", 400)
+        if origin in _signed_out_tokens or _refresh_token_revoked(refresh_token, user):
+            return None, error_response_json("NotAuthorizedException", "Refresh Token has been revoked", 400)
+    elif (_refresh_token_revoked(refresh_token, user) or (AUTH and isinstance(origin, str) and origin in _revoked_tokens)
+          or _rotated_out(refresh_token, origin)):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
     return user, None
 
 
-def _refresh_auth_result(pool, pid, cid, refresh_token):
+def _refresh_auth_result(pool, pid, cid, refresh_token, reused=_refresh_token_reused):
     """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
     exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
-    by GetTokensFromRefreshToken so both mint tokens identically."""
+    by GetTokensFromRefreshToken so both mint tokens identically. A rotating
+    client gets a new refresh token too, and ``reused()`` for a reused one."""
     user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
     if err:
         return None, err
@@ -5633,7 +5749,17 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
                                 origin_jti=claims.get("origin_jti", ""),
                                 scope=claims.get("scope"))
-    result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+    grace = _rotation_grace(pool, cid)
+    rotated = None
+    if grace is not None:
+        # Rotated only once the tokens exist, so a failing PreTokenGeneration trigger leaves the family as it was.
+        rotated = _next_refresh_token(pid, cid, grace, refresh_token, claims)
+        if rotated is None:
+            return None, reused()
+    if rotated:
+        result["RefreshToken"] = rotated
+    else:
+        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
     return result, None
 
 
@@ -5641,12 +5767,8 @@ def _get_tokens_from_refresh_token(data):
     """GetTokensFromRefreshToken — the only session-refresh path aws-amplify
     v6.15+ uses (added by AWS in 2025 alongside refresh token rotation). Accepts
     a top-level ``RefreshToken``/``ClientId`` and reuses the REFRESH_TOKEN_AUTH
-    core, returning the same ``AuthenticationResult`` shape.
-
-    Refresh token rotation (reissuing the RefreshToken and the
-    ``RefreshTokenReuseException`` grace period) is not modeled; with rotation
-    disabled — the pool default — AWS returns no new refresh token here, so the
-    result carries AccessToken/IdToken/ExpiresIn/TokenType only."""
+    core, returning the same ``AuthenticationResult`` shape: with a new
+    RefreshToken for a client that rotates them, and without one otherwise."""
     cid = data.get("ClientId")
     refresh_token = data.get("RefreshToken")
     if not cid:
@@ -5658,6 +5780,18 @@ def _get_tokens_from_refresh_token(data):
     pool, pid = _pool_for_client(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    from ministack.app import AUTH
+    secret = pool["_clients"][cid].get("ClientSecret")
+    if AUTH and secret:
+        # The token is checked before the secret.
+        _user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
+        if err:
+            return err
+    if AUTH and secret and not data.get("ClientSecret"):
+        return error_response_json("NotAuthorizedException",
+                                   f"Client {cid} is configured for secret but secret was not received", 400)
+    if AUTH and secret and data.get("ClientSecret") != secret:
+        return error_response_json("NotAuthorizedException", f"Unable to verify secret hash for client {cid}", 400)
     result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
     if err:
         return err
@@ -5705,6 +5839,8 @@ def _initiate_auth(data):
         return _password_auth_result(pool, pid, cid, user, username, data=data)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
+        if _rotation_grace(pool, cid) is not None:
+            return _rotation_unsupported()
         result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
         if err:
             return err
@@ -5890,6 +6026,12 @@ def _respond_to_auth_challenge(data):
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
 
+def _sign_out_sessions(user: dict) -> None:
+    ended = user.pop("_origin_jtis", [])
+    _revoked_tokens.update(ended)
+    _signed_out_tokens.update(ended)
+
+
 def _refresh_token_revoked(refresh_token: str, user: dict | None) -> bool:
     """True if a refresh token has been revoked (RevokeToken) or invalidated by a
     GlobalSignOut that happened after the token was issued."""
@@ -5925,7 +6067,7 @@ def _global_sign_out(data):
         user = pool["_users"].get(username)
         if user:
             user["_signout_at"] = _now_epoch()
-            _revoked_tokens.update(user.pop("_origin_jtis", []))
+            _sign_out_sessions(user)
     if username and pool_id:
         for tok in [t for t, e in _refresh_tokens.items()
                     if e.get("username") == username and e.get("pool_id") == pool_id]:
@@ -8304,6 +8446,11 @@ def _handle_new_password_submit(np_token, form):
 
 # -- /oauth2/token (POST) ---------------------------------------------------
 
+def _oauth2_refresh_token_reused():
+    """/oauth2/token's answer to a refresh token a rotating client refuses, or one rotation replaced: the bare error."""
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": "invalid_grant"}).encode()
+
+
 def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
     """Refresh tokens minted by InitiateAuth / RespondToAuthChallenge never enter
     ``_refresh_tokens`` (that registry only holds Hosted UI grants), yet AWS accepts
@@ -8323,8 +8470,12 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
     _, _, client = _find_pool_by_client_id(client_id)
     if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
         return _oauth2_error("invalid_client", "Invalid client credentials.")
-    result, err = _refresh_auth_result(pool, pid, client_id, refresh_val)
+    result, err = _refresh_auth_result(pool, pid, client_id, refresh_val, reused=_oauth2_refresh_token_reused)
     if err:
+        if err[2] == _oauth2_refresh_token_reused()[2]:
+            return err
+        if _rotation_grace(pool, client_id) is not None or _rotated_out(refresh_val, _token_claims(refresh_val).get("origin_jti")):
+            return _oauth2_refresh_token_reused()
         return _oauth2_error("invalid_grant", "Invalid refresh token.")
     resp = {
         "access_token": result["AccessToken"],
@@ -8332,6 +8483,8 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         "token_type": "Bearer",
         "expires_in": 3600,
     }
+    if result.get("RefreshToken"):
+        resp["refresh_token"] = result["RefreshToken"]
     if not _id_token_granted(claims.get("scope")):
         del resp["id_token"]
     return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
@@ -8496,9 +8649,13 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             return _oauth2_error("server_error", "User not found.")
         from ministack.app import AUTH
         registry_origin = _token_claims(refresh_val).get("origin_jti")
-        if AUTH and (not user.get("Enabled", True) or _refresh_token_revoked(refresh_val, user) or (
-                isinstance(registry_origin, str) and registry_origin in _revoked_tokens)):
-            return _oauth2_error("invalid_grant", "Invalid refresh token.")
+        revoked = _refresh_token_revoked(refresh_val, user) or (
+            isinstance(registry_origin, str) and registry_origin in _revoked_tokens)
+        rotating = _rotation_grace(pool, cid or entry["client_id"]) is not None
+        if (revoked and rotating) or _rotated_out(refresh_val, registry_origin):
+            return _oauth2_refresh_token_reused()
+        if AUTH and (not user.get("Enabled", True) or revoked):
+            return _oauth2_refresh_token_reused() if rotating else _oauth2_error("invalid_grant", "Invalid refresh token.")
 
         # Validate client secret if client has one
         _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
@@ -8512,6 +8669,11 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         refresh_claims = _token_claims(refresh_val)
         origin_jti = refresh_claims.get("origin_jti", "")
         scope = refresh_claims.get("scope")
+        exp = refresh_claims.get("exp")
+        if isinstance(exp, (int, float)) and time.time() >= exp:
+            if _rotation_grace(pool, client_id) is not None:
+                return _oauth2_refresh_token_reused()
+            return _oauth2_error("invalid_grant", "Invalid refresh token.")
         resp = {
             "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
                                          trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
@@ -8522,6 +8684,13 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             "token_type": "Bearer",
             "expires_in": _token_validity(pool_id, client_id, "access"),
         }
+        grace = _rotation_grace(pool, client_id)
+        if grace is not None:
+            rotated = _next_refresh_token(pool_id, client_id, grace, refresh_val, refresh_claims)
+            if rotated is None:
+                return _oauth2_refresh_token_reused()
+            _refresh_tokens[rotated] = dict(entry)
+            resp["refresh_token"] = rotated
         if not _id_token_granted(scope):
             del resp["id_token"]
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
@@ -9325,6 +9494,8 @@ def reset():
     _authorization_codes.clear()
     _refresh_tokens.clear()
     _revoked_tokens.clear()
+    _signed_out_tokens.clear()
+    _refresh_token_families.clear()
     _challenge_sessions.clear()
     _pending_new_password.clear()
     _pending_user_auth.clear()

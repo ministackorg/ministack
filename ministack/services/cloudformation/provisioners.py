@@ -7451,7 +7451,7 @@ def _cognito_user_pool_delete(physical_id, props):
 # request omits it, since the resource reference says a parameter without a
 # value is set to its default. None clears AnalyticsConfiguration and the
 # access and ID token validities, which the client record omits on read.
-# RefreshTokenRotation has no field on the record and is not modelled.
+# RefreshTokenRotation is kept when an update leaves it out, so it is not here.
 _COGNITO_USER_POOL_CLIENT_UPDATABLE = {
     "ClientName": "",
     "RefreshTokenValidity": 30,
@@ -7476,12 +7476,19 @@ _COGNITO_USER_POOL_CLIENT_UPDATABLE = {
 }
 
 
+def _cognito_refresh_token_rotation(rotation):
+    grace = rotation.get("RetryGracePeriodSeconds")
+    return {**rotation, **({"RetryGracePeriodSeconds": int(grace)} if grace is not None else {})}
+
+
 def _cognito_user_pool_client_create(logical_id, props, stack_name):
     """Create the app client through the service's CreateUserPoolClient so
     the record carries every property UpdateUserPoolClient can change
     later, and a replacement (UserPoolId or GenerateSecret changed) carries
     the whole template over."""
     payload = {key: props[key] for key in _COGNITO_USER_POOL_CLIENT_UPDATABLE if key in props}
+    if props.get("RefreshTokenRotation"):
+        payload["RefreshTokenRotation"] = _cognito_refresh_token_rotation(props["RefreshTokenRotation"])
     payload["UserPoolId"] = props.get("UserPoolId", "")
     payload["GenerateSecret"] = bool(props.get("GenerateSecret", False))
     status, _, body = _cognito._create_user_pool_client(payload)
@@ -7529,6 +7536,8 @@ def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_na
     payload = _declared_or_default(
         old_props, new_props, _COGNITO_USER_POOL_CLIENT_UPDATABLE
     )
+    if new_props.get("RefreshTokenRotation") and new_props["RefreshTokenRotation"] != old_props.get("RefreshTokenRotation"):
+        payload["RefreshTokenRotation"] = _cognito_refresh_token_rotation(new_props["RefreshTokenRotation"])
     if payload:
         payload["UserPoolId"] = new_props.get("UserPoolId", "")
         payload["ClientId"] = physical_id
