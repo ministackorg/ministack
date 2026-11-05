@@ -1173,28 +1173,38 @@ def test_eventbridge_create_archive_refusals(eb):
 
 
 def test_eventbridge_endpoints_and_partner_stubs(eb):
-    eb.create_endpoint(
+    from conftest import make_client
+
+    route53 = make_client("route53")
+    health_check = route53.create_health_check(
+        CallerReference=_uuid_mod.uuid4().hex,
+        HealthCheckConfig={"Type": "CALCULATED", "ChildHealthChecks": [], "HealthThreshold": 0},
+    )["HealthCheck"]["Id"]
+    created = eb.create_endpoint(
         Name="my-global-endpoint",
         Description="stub",
-        RoleArn="arn:aws:iam::000000000000:role/r",
         RoutingConfig={
             "FailoverConfig": {
-                "Primary": {"HealthCheck": "arn:aws:route53:::healthcheck/primary"},
-                "Secondary": {"Route": "secondary-route"},
+                "Primary": {"HealthCheck": f"arn:aws:route53:::healthcheck/{health_check}"},
+                "Secondary": {"Route": "us-west-2"},
             }
         },
+        ReplicationConfig={"State": "DISABLED"},
         EventBuses=[
             {"EventBusArn": "arn:aws:events:us-east-1:000000000000:event-bus/default"},
-            {"EventBusArn": "arn:aws:events:us-east-1:000000000000:event-bus/backup"},
+            {"EventBusArn": "arn:aws:events:us-west-2:000000000000:event-bus/default"},
         ],
     )
+    assert created["State"] == "CREATING" and "EndpointId" not in created
+    time.sleep(1.2)
     d = eb.describe_endpoint(Name="my-global-endpoint")
     assert d["State"] == "ACTIVE"
-    assert "Arn" in d
+    assert d["EndpointUrl"] == f"https://{d['EndpointId']}.endpoint.events.amazonaws.com"
     lst = eb.list_endpoints()
     assert any(e["Name"] == "my-global-endpoint" for e in lst["Endpoints"])
     eb.update_endpoint(Name="my-global-endpoint", Description="updated")
     eb.delete_endpoint(Name="my-global-endpoint")
+    route53.delete_health_check(HealthCheckId=health_check)
 
     eb.activate_event_source(Name="aws.partner/saas/foo")
     eb.deactivate_event_source(Name="aws.partner/saas/foo")
