@@ -1596,32 +1596,58 @@ def _client_user_not_found():
 
 def _masked_destination(address: str) -> str:
     """
-    Mask a delivery destination the way Cognito reports it: j****@e****.
+    Mask a delivery destination the way Cognito reports it: j***@e***.
 
     Applied to BOTH the real and the unknown-user path, which is what makes the
     two indistinguishable: returning the full address for a real user and a mask
     for an unknown one would just move the enumeration oracle into this field.
     AWS masks it in either case, and drops the domain suffix as well.
 
-    For a user who does not exist there is no stored address to mask, so the
-    requested username is masked instead — the same substitution AWS documents
-    for ForgotPassword, whose simulated destination is "determined by the input
-    username format".
+    For a user who does not exist there is no stored address, so an address-shaped
+    username is masked instead; AWS documents ForgotPassword's simulated destination
+    as "determined by the input username format" (_unknown_user_delivery).
     """
     if not address or "@" not in address:
         return "****"
     local, _, domain = address.partition("@")
-    return f"{local[:1]}****@{domain[:1]}****"
+    return f"{local[:1]}***@{domain[:1]}***"
 
 
-def _code_delivery_response(destination: str):
-    return json_response({
-        "CodeDeliveryDetails": {
-            "Destination": destination,
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-    })
+def _masked_phone(number: str) -> str:
+    """A phone number as Cognito's CodeDeliveryDetails shows it: +********0202."""
+    return "+" + "*" * max(0, len(number) - 5) + number[-4:]
+
+
+def _code_delivery(attribute: str, value: str) -> dict:
+    if attribute == "phone_number":
+        return {"Destination": _masked_phone(value), "DeliveryMedium": "SMS", "AttributeName": "phone_number"}
+    return {"Destination": _masked_destination(value), "DeliveryMedium": "EMAIL", "AttributeName": "email"}
+
+
+def _sign_up_code_attribute(pool, attrs):
+    """Where a sign-up's code goes: the phone number when the pool verifies it and the user has one, else the email."""
+    verified = pool.get("AutoVerifiedAttributes") or []
+    for attribute in ("phone_number", "email"):
+        if attribute in verified and attrs.get(attribute):
+            return attribute
+    return None
+
+
+def _unknown_user_delivery(username: str, attribute: str) -> dict:
+    """The made-up CodeDeliveryDetails a client that hides user existence answers for an unknown user.
+
+    The shape follows the username: an address is masked as itself. For any other username AWS
+    invents a destination, an SMS one for ForgotPassword and an email one for ResendConfirmationCode;
+    MiniStack derives it from the username so it is stable.
+    """
+    if "@" in (username or ""):
+        return _code_delivery("email", username)
+    digest = hashlib.sha256(username.encode()).hexdigest()
+    if attribute == "phone_number":
+        return {"Destination": "+*******" + str(int(digest[:8], 16))[-4:].zfill(4),
+                "DeliveryMedium": "SMS", "AttributeName": "phone_number"}
+    letter = "abcdefghijklmnopqrstuvwxyz"[int(digest[:2], 16) % 26]
+    return {"Destination": f"{(username or 'x')[:1].lower()}***@{letter}***", "DeliveryMedium": "EMAIL", "AttributeName": "email"}
 
 
 def _user_out(user: dict) -> dict:
@@ -2998,10 +3024,54 @@ def _user_pool_tier_error(tier, add_ons, policies, current=None):
         code, f"The following features need to be disabled for the {tier} pricing tier configured: {feature}", 400)
 
 
+def _custom_sender_key_error(lambda_config):
+    """The error AWS answers for a custom sender trigger without a usable KMSKeyID, or None."""
+    lambda_config = lambda_config or {}
+    if not (lambda_config.get("CustomEmailSender") or lambda_config.get("CustomSMSSender")):
+        return None
+    key_id = lambda_config.get("KMSKeyID")
+    if not key_id:
+        return error_response_json(
+            "InvalidParameterException", "KMSKeyId parameter is required when Custom SMS/Email Lambda trigger is used.", 400)
+    if not _KMS_KEY_ARN_RE.fullmatch(key_id):
+        return error_response_json("InvalidParameterException", (
+            f"1 validation error detected: Value '{key_id}' at 'lambdaConfig.kMSKeyID' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_KMS_KEY_ARN_RE.pattern}"), 400)
+    if ":alias/" in key_id:
+        return error_response_json("InvalidParameterException", (
+            "Encountered error when CreateGrant was attempted on the input KMS key - "
+            "Key Aliases are not supported for this operation."), 400)
+    from ministack.services import kms as kms_mod
+    key = kms_mod._resolve_key(key_id)
+    if not key:
+        return error_response_json("InvalidParameterException", (
+            f"Encountered error when CreateGrant was attempted on the input KMS key - Key '{key_id}' does not exist"), 400)
+    if key.get("KeyState") == "PendingDeletion":
+        return error_response_json("InvalidParameterException", (
+            f"Encountered error when CreateGrant was attempted on the input KMS key - {key_id} is pending deletion."), 400)
+    return None
+
+
+_KMS_KEY_ARN_RE = re.compile(
+    r"arn:[\w+=/,.@-]+:[\w+=/,.@-]+:([\w+=/,.@-]*)?:[0-9]+:[\w+=/,.@-]+(:[\w+=/,.@-]+)?(:[\w+=/,.@-]+)?")
+_TEMPORARY_PASSWORD_RE = re.compile(r"^[\S]+.*[\S]+$")
+
+
+def _sms_configuration_error(auto_verified, sms_configuration):
+    if "phone_number" in (auto_verified or []) and not sms_configuration:
+        return error_response_json(
+            "InvalidParameterException", "SMS configuration is required when phone_number is selected for auto verification", 400)
+    return None
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
+    err = _custom_sender_key_error(data.get("LambdaConfig")) or _sms_configuration_error(
+        data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+    if err:
+        return err
 
     # "You can't require that users provide a value for the attribute" — a
     # custom (or developer-only) schema entry with Required=true is a pool
@@ -3122,6 +3192,13 @@ def _list_user_pools(data):
 def _update_user_pool(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    if "LambdaConfig" in data:
+        err = _custom_sender_key_error(data["LambdaConfig"])
+        if err:
+            return err
+    err = _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
     if err:
         return err
     # An omitted tier keeps the pool's plan; omitted add-ons stay out of the check, AWS resets them.
@@ -3974,7 +4051,7 @@ def _password_policy_errors(pool, password):
     min_len = policy.get("MinimumLength", 8)
     errors = []
     if len(password) < min_len:
-        errors.append(f"Password must have length greater than or equal to {min_len}")
+        errors.append("Password not long enough")
     if policy.get("RequireUppercase", True) and not any(c.isupper() for c in password):
         errors.append("Password must have uppercase characters")
     if policy.get("RequireLowercase", True) and not any(c.islower() for c in password):
@@ -3986,15 +4063,12 @@ def _password_policy_errors(pool, password):
     return errors
 
 
-def _validate_password(pool, password):
-    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+def _validate_password(pool, password, prefix="Password did not conform with policy"):
+    """The pool's PasswordPolicy answer for a password, or None. AWS names only the first rule it breaks,
+    and words the prefix differently per operation."""
     errors = _password_policy_errors(pool, password)
     if errors:
-        return error_response_json(
-            "InvalidPasswordException",
-            "Password did not conform with policy: " + "; ".join(errors),
-            400,
-        )
+        return error_response_json("InvalidPasswordException", f"{prefix}: {errors[0]}", 400)
     return None
 
 
@@ -4237,9 +4311,11 @@ def _render_invitation_message(pool, username, temp_password, attr_dict,
             _expand_template(body_tpl, display, temp_password))
 
 
-def _deliver_invitation_email(pool, username, attr_dict, subject, body):
+def _deliver_invitation_email(pool, username, attr_dict, subject, body, sender=None):
     email = (attr_dict or {}).get("email")
     if not email:
+        return None
+    if sender and _send_to_custom_email_sender(pool, attr_dict, **sender):
         return None
     return _deliver_cognito_email(
         pool, email, subject, body,
@@ -4248,9 +4324,11 @@ def _deliver_invitation_email(pool, username, attr_dict, subject, body):
     )
 
 
-def _send_verification_email(pool, username, attr_dict, code, attribute_name="email"):
+def _send_verification_email(pool, username, attr_dict, code, attribute_name="email", sender=None):
     email = (attr_dict or {}).get("email")
     if not email:
+        return None
+    if sender and _send_to_custom_email_sender(pool, attr_dict, code=code, **sender):
         return None
     # CONFIRM_WITH_LINK means body uses {##...##} link placeholder; we still
     # interpolate {####} as the verification code for compatibility.
@@ -4268,9 +4346,11 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
     )
 
 
-def _send_email_otp(pool, username, attr_dict, code):
+def _send_email_otp(pool, username, attr_dict, code, sender=None):
     """Send the EMAIL_OTP first-factor sign-in code. AWS has no template
     configuration API for this message, so it always uses the built-in text."""
+    if sender and _send_to_custom_email_sender(pool, attr_dict, code=code, **sender):
+        return None
     return _deliver_cognito_email(
         pool, attr_dict["email"],
         _DEFAULT_EMAIL_OTP_SUBJECT,
@@ -4282,6 +4362,180 @@ def _send_email_otp(pool, username, attr_dict, code):
         type_name="CognitoEmailOtpMessage",
         extra={"Username": username},
     )
+
+
+_CLIENT_ID_NOT_APPLICABLE = "CLIENT_ID_NOT_APPLICABLE"
+
+
+def _html_encoded_code(code) -> str:
+    """The code as Cognito hands it to a custom sender: A&<>"'1a arrives as A&amp;&lt;&gt;&quot;&#39;1a."""
+    return html_mod.escape(str(code), quote=True).replace("&#x27;", "&#39;")
+
+
+class _CustomEmailSenderUnavailable(Exception):
+    """The pool's custom email sender can't be reached: its KMS key or its Lambda."""
+
+
+# ---------------------------------------------------------------------------
+# AWS Encryption SDK messages, as Cognito writes them for a custom sender trigger
+# ---------------------------------------------------------------------------
+# Cognito hands a custom email sender the code (or temporary password) as an
+# Encryption SDK ciphertext: a version 1 message with algorithm suite 0x0378
+# (AES-256-GCM, HKDF-SHA384, ECDSA P-384), one aws-kms encrypted data key for the
+# pool's KMSKeyID, an encryption context of userpool-id and the signing key's
+# aws-crypto-public-key, and the whole plaintext in one final frame of a 4096-byte
+# framed body. A sender decrypts it with any Encryption SDK and a KMS keyring for
+# that key, so the data key here comes from ministack's own KMS, whose Decrypt
+# then opens it.
+# Spec: https://github.com/awslabs/aws-encryption-sdk-specification
+
+_ESDK_SUITE_ID = 0x0378
+_ESDK_VERSION = 0x01
+_ESDK_TYPE_CUSTOMER_AED = 0x80
+_ESDK_CONTENT_FRAMED = 0x02
+_ESDK_IV_LENGTH = 12
+_ESDK_TAG_LENGTH = 16
+_ESDK_FRAME_LENGTH = 4096
+_ESDK_FINAL_FRAME = 0xFFFFFFFF
+_ESDK_FINAL_FRAME_AAD = b"AWSKMSEncryptionClient Final Frame"
+_ESDK_PUBLIC_KEY_CONTEXT_KEY = "aws-crypto-public-key"
+# The DER signature of a P-384 key varies in length. Cognito's are always 103 bytes,
+# so a signature is made again until one is.
+_ESDK_SIGNATURE_LENGTH = 103
+
+
+def _esdk_u16(value: int) -> bytes:
+    return struct.pack(">H", value)
+
+
+def _esdk_field(value: bytes) -> bytes:
+    return _esdk_u16(len(value)) + value
+
+
+def _esdk_serialize_context(context: dict) -> bytes:
+    if not context:
+        return b""
+    pairs = sorted((k.encode(), v.encode()) for k, v in context.items())
+    return _esdk_u16(len(pairs)) + b"".join(_esdk_field(k) + _esdk_field(v) for k, v in pairs)
+
+
+def _esdk_frame_iv(sequence: int) -> bytes:
+    return b"\x00" * (_ESDK_IV_LENGTH - 4) + struct.pack(">I", sequence)
+
+
+def _esdk_signing_key():
+    """A fresh P-384 key and its compressed public point, base64 encoded, for the encryption context."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key = ec.generate_private_key(ec.SECP384R1())
+    public = private_key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.CompressedPoint)
+    return private_key, base64.b64encode(public).decode()
+
+
+def _esdk_encrypt(plaintext: bytes, data_key: bytes, encrypted_data_key: bytes, key_arn: str,
+            context: dict, private_key) -> bytes:
+    """Build the message. ``context`` must already carry ``aws-crypto-public-key``
+    for ``private_key``, because KMS bound ``encrypted_data_key`` to the whole context."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if _ESDK_PUBLIC_KEY_CONTEXT_KEY not in context:
+        raise ValueError("the encryption context needs the signing key's public point")
+    if len(plaintext) > _ESDK_FRAME_LENGTH:
+        raise ValueError("a custom sender's code fits one frame")
+
+    message_id = os.urandom(16)
+    aad = _esdk_serialize_context(context)
+    header = (
+        bytes([_ESDK_VERSION, _ESDK_TYPE_CUSTOMER_AED]) + _esdk_u16(_ESDK_SUITE_ID) + message_id
+        + _esdk_field(aad)
+        + _esdk_u16(1) + _esdk_field(b"aws-kms") + _esdk_field(key_arn.encode()) + _esdk_field(encrypted_data_key)
+        + bytes([_ESDK_CONTENT_FRAMED]) + b"\x00\x00\x00\x00"
+        + bytes([_ESDK_IV_LENGTH]) + struct.pack(">I", _ESDK_FRAME_LENGTH)
+    )
+
+    key = HKDF(algorithm=hashes.SHA384(), length=32, salt=None,
+               info=_esdk_u16(_ESDK_SUITE_ID) + message_id).derive(data_key)
+    aes = AESGCM(key)
+    header_iv = b"\x00" * _ESDK_IV_LENGTH
+    header_auth = header_iv + aes.encrypt(header_iv, b"", header)
+
+    sequence = 1
+    frame_iv = _esdk_frame_iv(sequence)
+    frame_aad = message_id + _ESDK_FINAL_FRAME_AAD + struct.pack(">I", sequence) + struct.pack(">Q", len(plaintext))
+    sealed = aes.encrypt(frame_iv, plaintext, frame_aad)
+    content, tag = sealed[:-_ESDK_TAG_LENGTH], sealed[-_ESDK_TAG_LENGTH:]
+    body = (struct.pack(">I", _ESDK_FINAL_FRAME) + struct.pack(">I", sequence) + frame_iv
+            + struct.pack(">I", len(content)) + content + tag)
+
+    signed = header + header_auth + body
+    while True:
+        signature = private_key.sign(signed, ec.ECDSA(hashes.SHA384()))
+        if len(signature) == _ESDK_SIGNATURE_LENGTH:
+            break
+    return signed + _esdk_field(signature)
+
+
+def _send_to_custom_email_sender(pool, attr_dict, trigger, user_name, user_status, code,
+                                 client_id=None, client_metadata=None) -> bool:
+    """Hand the email to the pool's custom email sender, if it has one, in place of Cognito's own.
+
+    As on AWS the Lambda is invoked asynchronously, retried on failure, and
+    never fails the call that sent the email. ``code`` reaches it as an AWS
+    Encryption SDK message under the pool's ``KMSKeyID``, which the Lambda
+    decrypts through KMS. Returns False when the pool has no custom email
+    sender, so the caller sends the email itself.
+    """
+    lambda_config = pool.get("LambdaConfig") or {}
+    arn = (lambda_config.get("CustomEmailSender") or {}).get("LambdaArn")
+    if not arn:
+        return False
+    pool_id = pool.get("Id", "")
+    try:
+        from ministack.services import kms as kms_mod
+        from ministack.services import lambda_svc
+
+        private_key, public_key = _esdk_signing_key()
+        context = {"userpool-id": pool_id, "aws-crypto-public-key": public_key}
+        key, data_key, encrypted_data_key = kms_mod._generate_data_key_common(
+            {"KeyId": lambda_config.get("KMSKeyID", ""), "EncryptionContext": context})
+        if key is None:
+            raise _CustomEmailSenderUnavailable(
+                f"KMS key {lambda_config.get('KMSKeyID')!r} cannot encrypt the code: {encrypted_data_key[2]!r}")
+        message = _esdk_encrypt(_html_encoded_code(code).encode(), data_key,
+                                encrypted_data_key, key["Arn"], context, private_key)
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _CustomEmailSenderUnavailable(f"CustomEmailSender Lambda not found: {arn}")
+        attributes = {k: v for k, v in (attr_dict or {}).items() if isinstance(v, str)}
+        attributes["cognito:user_status"] = user_status
+        event = {
+            "version": "1",
+            "triggerSource": f"CustomEmailSender_{trigger}",
+            "region": _pool_region(pool_id),
+            "userPoolId": pool_id,
+            "userName": user_name,
+            "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id},
+            "request": {
+                "type": "customEmailSenderRequestV1",
+                "code": base64.b64encode(message).decode(),
+                "clientMetadata": dict(client_metadata) if client_metadata else None,
+                "userAttributes": attributes,
+            },
+        }
+        lambda_svc.invoke_async_with_retry(lambda_svc._execution_record_for_config(record, config), event)
+    except _CustomEmailSenderUnavailable as e:
+        logger.warning("Cognito: CustomEmailSender_%s for pool %s was not sent: %s", trigger, pool_id, e)
+    except ImportError:
+        logger.warning("Cognito: CustomEmailSender_%s for pool %s was not sent: encrypting its code needs the "
+                       "cryptography package (pip install ministack[full])", trigger, pool_id)
+    except Exception:
+        logger.exception("Cognito: CustomEmailSender_%s for pool %s was not sent", trigger, pool_id)
+    return True
 
 
 # ===========================================================================
@@ -4347,6 +4601,10 @@ def _admin_create_user(data):
     if username_err:
         return username_err
 
+    if "TemporaryPassword" in data and not _TEMPORARY_PASSWORD_RE.fullmatch(str(data["TemporaryPassword"])):
+        return error_response_json("InvalidParameterException", (
+            "1 validation error detected: Value at 'temporaryPassword' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_TEMPORARY_PASSWORD_RE.pattern}"), 400)
     alias_attr = _username_alias_attribute(pool, username)
     message_action = (data.get("MessageAction") or "").upper()
     if alias_attr:
@@ -4358,17 +4616,31 @@ def _admin_create_user(data):
             return error_response_json(
                 "UserNotFoundException", "User does not exist.", 400,
             )
+        if existing.get("UserStatus") != "FORCE_CHANGE_PASSWORD":
+            return error_response_json(
+                "UnsupportedUserStateException",
+                f"Resend not possible. {existing['Username']} status is not FORCE_CHANGE_PASSWORD", 400)
+        # A resent invitation carries a new temporary password, and the old one stops working.
+        temp_password = data.get("TemporaryPassword") or _generate_temp_password(pool)
+        pw_err = _validate_password(pool, temp_password, "Password does not conform to policy")
+        if pw_err:
+            return pw_err
         attr_dict = _attr_list_to_dict(existing.get("Attributes", []))
+        invitation = None
         if _wants_email_delivery(data) and attr_dict.get("email"):
             try:
-                subject, body = _render_invitation_message(
-                    pool, existing["Username"], existing.get("_password", ""),
-                    attr_dict, data.get("ClientMetadata"),
+                invitation = _render_invitation_message(
+                    pool, existing["Username"], temp_password, attr_dict, data.get("ClientMetadata"),
                 )
             except (_CustomMessageRejected, _CustomMessageInvalid) as e:
                 return _custom_message_error(e)
-            _deliver_invitation_email(pool, existing["Username"], attr_dict, subject, body)
+        existing["_password"] = temp_password
         existing["UserLastModifiedDate"] = _now_epoch()
+        if invitation:
+            _deliver_invitation_email(pool, existing["Username"], attr_dict, *invitation, sender={
+                "trigger": "AdminCreateUser", "user_name": username, "user_status": existing.get("UserStatus"),
+                "code": temp_password, "client_id": _CLIENT_ID_NOT_APPLICABLE,
+                "client_metadata": data.get("ClientMetadata")})
         return json_response({"User": _user_out(existing)})
 
     if existing:
@@ -4378,8 +4650,8 @@ def _admin_create_user(data):
         )
 
     now = _now_epoch()
-    temp_password = data.get("TemporaryPassword") or _generate_temp_password()
-    pw_err = _validate_password(pool, temp_password)
+    temp_password = data.get("TemporaryPassword") or _generate_temp_password(pool)
+    pw_err = _validate_password(pool, temp_password, "Password did not conform with password policy")
     if pw_err:
         return pw_err
     attrs = data.get("UserAttributes", [])
@@ -4422,7 +4694,10 @@ def _admin_create_user(data):
     logger.info("Cognito: AdminCreateUser %s in pool %s", real_username, pid)
 
     if invitation:
-        _deliver_invitation_email(pool, real_username, attr_dict, *invitation)
+        _deliver_invitation_email(pool, real_username, attr_dict, *invitation, sender={
+            "trigger": "AdminCreateUser", "user_name": username, "user_status": user["UserStatus"],
+            "code": temp_password, "client_id": _CLIENT_ID_NOT_APPLICABLE,
+            "client_metadata": data.get("ClientMetadata")})
 
     return json_response({"User": _user_out(user)})
 
@@ -4502,7 +4777,7 @@ def _admin_set_user_password(data):
     if err:
         return err
     new_pw = data.get("Password", "")
-    pw_err = _validate_password(pool, new_pw)
+    pw_err = _validate_password(pool, new_pw, "Password does not conform to policy")
     if pw_err:
         return pw_err
     user["_password"] = new_pw
@@ -4581,6 +4856,20 @@ def _admin_enable_user(data):
     return json_response({})
 
 
+def _reset_code_attribute(user):
+    """Where a password reset's code goes: the verified email, else the verified phone number."""
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    for attribute in ("email", "phone_number"):
+        if attrs.get(attribute) and str(attrs.get(f"{attribute}_verified", "")).lower() == "true":
+            return attribute, attrs[attribute]
+    return None, None
+
+
+def _cannot_reset_password():
+    return error_response_json("InvalidParameterException", (
+        "Cannot reset password for the user as there is no registered/verified email or phone_number"), 400)
+
+
 def _admin_reset_user_password(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -4590,12 +4879,19 @@ def _admin_reset_user_password(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
+    attribute, _destination = _reset_code_attribute(user)
+    if not attribute:
+        return _cannot_reset_password()
+    status_before_reset = user.get("UserStatus")
     user["UserStatus"] = "RESET_REQUIRED"
     user["UserLastModifiedDate"] = _now_epoch()
     code = "654321"
     user["_reset_code"] = code
-    attrs = _attr_list_to_dict(user.get("Attributes", []))
-    _send_verification_email(pool, username, attrs, code, attribute_name="password")
+    if attribute == "email":
+        attrs = _attr_list_to_dict(user.get("Attributes", []))
+        _send_verification_email(pool, username, attrs, code, attribute_name="password", sender={
+            "trigger": "ForgotPassword", "user_name": user["Username"], "user_status": status_before_reset,
+            "client_metadata": data.get("ClientMetadata")})
     return json_response({})
 
 
@@ -4611,17 +4907,27 @@ def _resend_confirmation_code(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    if not (pool.get("AutoVerifiedAttributes") or []):
+        return error_response_json("NotAuthorizedException", "Cannot resend codes. Auto verification not turned on.", 400)
     user, _err = _resolve_user(pool, username)
     if not user:
         if _hides_user_existence(pool, cid):
-            return _code_delivery_response(_masked_destination(username))
+            return json_response({"CodeDeliveryDetails": _unknown_user_delivery(username, "email")})
         return _client_user_not_found()
-
+    if user.get("UserStatus") == "CONFIRMED" and not _hides_user_existence(pool, cid):
+        return error_response_json("InvalidParameterException", "User is already confirmed.", 400)
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    attribute = _sign_up_code_attribute(pool, attrs)
+    if not attribute:
+        return error_response_json("InvalidParameterException", "Cannot send code to either phone_number or email", 400)
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
-    attrs = _attr_list_to_dict(user.get("Attributes", []))
-    _send_verification_email(pool, username, attrs, code)
-    return _code_delivery_response(_masked_destination(attrs.get("email") or username))
+    user["_confirmation_attribute"] = attribute
+    if attribute == "email":
+        _send_verification_email(pool, username, attrs, code, sender={
+            "trigger": "ResendCode", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": cid, "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attribute, attrs[attribute])})
 
 
 def _admin_user_global_sign_out(data):
@@ -5700,6 +6006,11 @@ def _sign_up(data):
         attr_dict["email_verified"] = "true"
     if presignup["autoVerifyPhone"] and "phone_number" in attr_dict:
         attr_dict["phone_number_verified"] = "true"
+    # Only a pool that verifies the address sends the sign-up a code; the email is unverified either way.
+    code_attribute = _sign_up_code_attribute(pool, attr_dict)
+    for verifiable in ("email", "phone_number"):
+        if verifiable in attr_dict:
+            attr_dict.setdefault(f"{verifiable}_verified", "false")
     attrs = _dict_to_attr_list(attr_dict)
 
     user = {
@@ -5713,7 +6024,6 @@ def _sign_up(data):
         "_password": password,
         "_groups": [],
         "_tokens": [],
-        "_confirmation_code": "123456",
     }
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
@@ -5722,14 +6032,15 @@ def _sign_up(data):
         "UserConfirmed": status == "CONFIRMED",
         "UserSub": attr_dict["sub"],
     }
-    if "email" in attr_dict and status != "CONFIRMED":
+    if code_attribute and status != "CONFIRMED":
         # An auto-confirmed user has nothing to verify — no code is delivered.
-        resp["CodeDeliveryDetails"] = {
-            "Destination": attr_dict["email"],
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-        _send_verification_email(pool, username, attr_dict, user["_confirmation_code"])
+        user["_confirmation_code"] = "123456"
+        user["_confirmation_attribute"] = code_attribute
+        resp["CodeDeliveryDetails"] = _code_delivery(code_attribute, attr_dict[code_attribute])
+        if code_attribute == "email":
+            _send_verification_email(pool, username, attr_dict, user["_confirmation_code"], sender={
+                "trigger": "SignUp", "user_name": username, "user_status": status,
+                "client_id": cid, "client_metadata": data.get("ClientMetadata")})
     return json_response(resp)
 
 
@@ -5783,6 +6094,10 @@ def _confirm_sign_up(data):
 
     # Codes are checked under AUTH=true (_confirmation_code_error).
     user.pop("_confirmation_code", None)
+    attribute = user.pop("_confirmation_attribute", None)
+    if attribute:
+        # Confirming with the code verifies the address it went to.
+        user["Attributes"] = _merge_attributes(user.get("Attributes", []), [{"Name": f"{attribute}_verified", "Value": "true"}])
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
@@ -5802,17 +6117,24 @@ def _forgot_password(data):
 
     user, _err = _resolve_user(pool, username)
     if _err:
+        if _hides_user_existence(pool, cid) and not (pool.get("AutoVerifiedAttributes") or []):
+            return _cannot_reset_password()
         if _hides_user_existence(pool, cid):
-            # Answer as though a code had been sent. Nothing is delivered and no
-            # state changes; only the response shape is preserved.
-            return _code_delivery_response(_masked_destination(username))
+            # Answer as though a code had been sent; nothing is delivered and no state changes.
+            return json_response({"CodeDeliveryDetails": _unknown_user_delivery(username, "phone_number")})
         return _client_user_not_found()
 
+    attribute, destination = _reset_code_attribute(user)
+    if not attribute:
+        return _cannot_reset_password()
     code = "654321"
     user["_reset_code"] = code
-    attrs = _attr_list_to_dict(user.get("Attributes", []))
-    _send_verification_email(pool, username, attrs, code, attribute_name="password")
-    return _code_delivery_response(_masked_destination(attrs.get("email") or username))
+    if attribute == "email":
+        attrs = _attr_list_to_dict(user.get("Attributes", []))
+        _send_verification_email(pool, username, attrs, code, attribute_name="password", sender={
+            "trigger": "ForgotPassword", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": cid, "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attribute, destination)})
 
 
 def _confirm_forgot_password(data):
@@ -7825,7 +8147,10 @@ def _begin_user_auth_challenge(pool, ua_token, session, challenge):
         attr_dict = _attr_list_to_dict(user.get("Attributes", [])) if user else {}
         if user and attr_dict.get("email"):
             session["otp_code"] = _EMAIL_OTP_CODE
-            _send_email_otp(pool, session["username"], attr_dict, _EMAIL_OTP_CODE)
+            # AWS leaves the sign-in's ClientMetadata out of this event.
+            _send_email_otp(pool, session["username"], attr_dict, _EMAIL_OTP_CODE, sender={
+                "trigger": "Authentication", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+                "client_id": session.get("client_id")})
         return _email_otp_page_html(ua_token)
     return _password_page_html(ua_token, session["username"])
 
@@ -8920,7 +9245,7 @@ def _identity_pool_out(pool: dict) -> dict:
 # MISC HELPERS
 # ===========================================================================
 
-def _generate_temp_password() -> str:
+def _generate_temp_password(pool) -> str:
     # Ensure at least one char from each required class to satisfy default policy
     required = [
         secrets.choice(string.ascii_uppercase),
@@ -8929,7 +9254,8 @@ def _generate_temp_password() -> str:
         secrets.choice("!@#$%^&*"),
     ]
     chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*"
-    remaining = [secrets.choice(chars) for _ in range(8)]
+    length = max(12, int(((pool.get("Policies") or {}).get("PasswordPolicy") or {}).get("MinimumLength") or 0))
+    remaining = [secrets.choice(chars) for _ in range(length - len(required))]
     password = required + remaining
     secrets.SystemRandom().shuffle(password)
     return "".join(password)
