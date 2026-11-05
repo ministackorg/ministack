@@ -5,7 +5,7 @@ import uuid
 import boto3
 import pytest
 from botocore.exceptions import ClientError
-from conftest import make_client
+from conftest import ENDPOINT, make_client
 
 
 def test_route53_create_and_get_hosted_zone(r53):
@@ -499,6 +499,312 @@ def test_route53_create_health_check(r53):
 
     get_resp = r53.get_health_check(HealthCheckId=hc_id)
     assert get_resp["HealthCheck"]["Id"] == hc_id
+
+def test_route53_health_check_interval_defaults_only_for_endpoint_checks(r53, cw):
+    # Endpoint checks get RequestInterval 30 / FailureThreshold 3 when omitted;
+    # CLOUDWATCH_METRIC and CALCULATED checks return neither field (Terraform
+    # would otherwise see request_interval drift and replace them).
+    cw.put_metric_alarm(
+        AlarmName="hc-default-alarm", MetricName="Invocations", Namespace="AWS/Lambda", Statistic="Sum",
+        Period=60, EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanThreshold",
+    )
+    configs = {
+        "HTTP": {"Type": "HTTP", "FullyQualifiedDomainName": "example.com", "Port": 80, "ResourcePath": "/"},
+        "HTTPS": {"Type": "HTTPS", "FullyQualifiedDomainName": "example.com", "Port": 443, "ResourcePath": "/"},
+        "HTTP_STR_MATCH": {
+            "Type": "HTTP_STR_MATCH", "FullyQualifiedDomainName": "example.com", "Port": 80,
+            "ResourcePath": "/", "SearchString": "ok",
+        },
+        "HTTPS_STR_MATCH": {
+            "Type": "HTTPS_STR_MATCH", "FullyQualifiedDomainName": "example.com", "Port": 443,
+            "ResourcePath": "/", "SearchString": "ok",
+        },
+        "TCP": {"Type": "TCP", "FullyQualifiedDomainName": "example.com", "Port": 443},
+        "CLOUDWATCH_METRIC": {
+            "Type": "CLOUDWATCH_METRIC",
+            "AlarmIdentifier": {"Region": "us-east-1", "Name": "hc-default-alarm"},
+            "InsufficientDataHealthStatus": "LastKnownStatus",
+        },
+        "CALCULATED": {"Type": "CALCULATED", "ChildHealthChecks": [], "HealthThreshold": 0},
+    }
+    ids = {}
+    for t, cfg in configs.items():
+        created = r53.create_health_check(CallerReference=str(uuid.uuid4()), HealthCheckConfig=cfg)
+        ids[t] = created["HealthCheck"]["Id"]
+        for got in (created["HealthCheck"], r53.get_health_check(HealthCheckId=ids[t])["HealthCheck"]):
+            c = got["HealthCheckConfig"]
+            if t not in ("CLOUDWATCH_METRIC", "CALCULATED"):
+                assert c["RequestInterval"] == 30
+                assert c["FailureThreshold"] == 3
+            else:
+                assert "RequestInterval" not in c
+                assert "FailureThreshold" not in c
+    listed = {
+        h["Id"]: h["HealthCheckConfig"]
+        for page in r53.get_paginator("list_health_checks").paginate()
+        for h in page["HealthChecks"]
+    }
+    assert "RequestInterval" not in listed[ids["CLOUDWATCH_METRIC"]]
+    assert "RequestInterval" not in listed[ids["CALCULATED"]]
+    updated = r53.update_health_check(HealthCheckId=ids["CLOUDWATCH_METRIC"], InsufficientDataHealthStatus="Unhealthy")
+    assert "RequestInterval" not in updated["HealthCheck"]["HealthCheckConfig"]
+    for hc_id in ids.values():
+        r53.delete_health_check(HealthCheckId=hc_id)
+    cw.delete_alarms(AlarmNames=["hc-default-alarm"])
+
+def test_route53_metric_and_calculated_health_check_validation(r53, cw):
+    cw.put_metric_alarm(
+        AlarmName="hc-validation-alarm", MetricName="Invocations", Namespace="AWS/Lambda", Statistic="Sum",
+        Period=60, EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanThreshold",
+    )
+    cw.put_composite_alarm(AlarmName="hc-validation-composite", AlarmRule='ALARM("hc-validation-alarm")')
+    alarm = {"Region": "us-east-1", "Name": "hc-validation-alarm"}
+    missing = {"Region": "us-east-1", "Name": "hc-validation-missing"}
+    cw_cfg = {"Type": "CLOUDWATCH_METRIC", "AlarmIdentifier": alarm, "InsufficientDataHealthStatus": "LastKnownStatus"}
+    calc_cfg = {"Type": "CALCULATED", "ChildHealthChecks": [], "HealthThreshold": 0}
+    period = "Invalid parameter : {} health checks must not have a period specified."
+    threshold = "Invalid parameter : {} health checks must not have a failure threshold specified."
+    not_found = "The specified CloudWatch alarm doesn't exist. Name: {}, region: {}"
+
+    def create_error(cfg):
+        with pytest.raises(ClientError) as exc:
+            r53.create_health_check(CallerReference=str(uuid.uuid4()), HealthCheckConfig=cfg)
+        err = exc.value.response
+        assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert err["Error"]["Code"] == "InvalidInput"
+        return err["Error"]["Message"]
+
+    # The alarm is checked first, then the period, then the failure threshold.
+    assert create_error({**cw_cfg, "AlarmIdentifier": missing, "RequestInterval": 30}) == not_found.format(
+        "hc-validation-missing", "us-east-1"
+    )
+    assert create_error({**cw_cfg, "AlarmIdentifier": {"Region": "us-west-2", "Name": "hc-validation-alarm"}}) == (
+        not_found.format("hc-validation-alarm", "us-west-2")
+    )
+    assert create_error({**cw_cfg, "AlarmIdentifier": {"Region": "us-east-1", "Name": "hc-validation-composite"}}) == (
+        not_found.format("hc-validation-composite", "us-east-1")
+    )
+    assert create_error({**cw_cfg, "RequestInterval": 10, "FailureThreshold": 3}) == period.format("Metric-based")
+    assert create_error({**cw_cfg, "FailureThreshold": 3}) == threshold.format("Metric-based")
+    assert create_error({**calc_cfg, "RequestInterval": 30, "FailureThreshold": 3}) == period.format("Calculated")
+    assert create_error({**calc_cfg, "FailureThreshold": 1}) == threshold.format("Calculated")
+    assert create_error({"Type": "CLOUDWATCH_METRIC", "RequestInterval": 30}) == "Alarm identifier must not be null."
+    rc_cfg = {
+        "Type": "RECOVERY_CONTROL",
+        "RoutingControlArn": "arn:aws:route53-recovery-control::000000000000:controlpanel/"
+        "c14b2e806664476aae6db2edd214cc6e/routingcontrol/a7011654a2034f07",
+    }
+    assert create_error({"Type": "RECOVERY_CONTROL", "RequestInterval": 30}) == "Routing control ARN must not be null"
+    assert create_error({"Type": "RECOVERY_CONTROL", "FailureThreshold": 3}) == "Routing control ARN must not be null"
+    # AWS words the recovery-control errors as calculated-check errors. AWS checks
+    # that the routing control exists before these; MiniStack has no Route 53 ARC
+    # service to check against, so any ARN passes here.
+    assert create_error({**rc_cfg, "RequestInterval": 10, "FailureThreshold": 1}) == period.format("Calculated")
+    assert create_error({**rc_cfg, "FailureThreshold": 3}) == threshold.format("Calculated")
+    rc = r53.create_health_check(CallerReference=str(uuid.uuid4()), HealthCheckConfig=rc_cfg)["HealthCheck"]
+    assert "RequestInterval" not in rc["HealthCheckConfig"]
+    assert "FailureThreshold" not in rc["HealthCheckConfig"]
+    for kwargs in ({}, {"FailureThreshold": 5}, {"Inverted": True}, {"Disabled": True}):
+        with pytest.raises(ClientError) as exc:
+            r53.update_health_check(HealthCheckId=rc["Id"], **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidInput"
+        assert exc.value.response["Error"]["Message"] == (
+            "Invalid parameter : Update is not supported for this health check type."
+        )
+    rc_after = r53.get_health_check(HealthCheckId=rc["Id"])["HealthCheck"]["HealthCheckConfig"]
+    assert "FailureThreshold" not in rc_after
+    assert not rc_after.get("Inverted")
+    r53.delete_health_check(HealthCheckId=rc["Id"])
+
+    cw_ref = str(uuid.uuid4())
+    cw_id = r53.create_health_check(CallerReference=cw_ref, HealthCheckConfig=cw_cfg)["HealthCheck"]["Id"]
+    with pytest.raises(ClientError) as exc:
+        r53.create_health_check(CallerReference=cw_ref, HealthCheckConfig={**cw_cfg, "RequestInterval": 30})
+    assert exc.value.response["Error"]["Message"] == period.format("Metric-based")
+    calc_id = r53.create_health_check(CallerReference=str(uuid.uuid4()), HealthCheckConfig=calc_cfg)["HealthCheck"]["Id"]
+    for hc_id, kwargs, message in (
+        (cw_id, {"AlarmIdentifier": missing, "FailureThreshold": 3}, not_found.format("hc-validation-missing", "us-east-1")),
+        (cw_id, {"FailureThreshold": 3}, threshold.format("Metric-based")),
+        (calc_id, {"FailureThreshold": 5}, threshold.format("Calculated")),
+    ):
+        with pytest.raises(ClientError) as exc:
+            r53.update_health_check(HealthCheckId=hc_id, **kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidInput"
+        assert exc.value.response["Error"]["Message"] == message
+    # An update with no members (empty body) succeeds and bumps the version.
+    assert r53.update_health_check(HealthCheckId=cw_id)["HealthCheck"]["HealthCheckVersion"] == 2
+    assert r53.update_health_check(HealthCheckId=calc_id)["HealthCheck"]["HealthCheckVersion"] == 2
+    cw.put_metric_alarm(
+        AlarmName="hc-validation-alarm-2", MetricName="Invocations", Namespace="AWS/Lambda", Statistic="Sum",
+        Period=60, EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanThreshold",
+    )
+    moved = r53.update_health_check(HealthCheckId=cw_id, AlarmIdentifier={"Region": "us-east-1", "Name": "hc-validation-alarm-2"})
+    assert moved["HealthCheck"]["HealthCheckConfig"]["AlarmIdentifier"]["Name"] == "hc-validation-alarm-2"
+    r53.update_health_check(HealthCheckId=cw_id, AlarmIdentifier=alarm)
+    cw.delete_alarms(AlarmNames=["hc-validation-alarm-2"])
+    cfg = r53.get_health_check(HealthCheckId=cw_id)["HealthCheck"]["HealthCheckConfig"]
+    assert cfg["AlarmIdentifier"]["Name"] == "hc-validation-alarm"
+    assert "FailureThreshold" not in cfg
+    assert "FailureThreshold" not in r53.get_health_check(HealthCheckId=calc_id)["HealthCheck"]["HealthCheckConfig"]
+    for hc_id in (cw_id, calc_id):
+        r53.delete_health_check(HealthCheckId=hc_id)
+    cw.delete_alarms(AlarmNames=["hc-validation-composite"])
+    cw.delete_alarms(AlarmNames=["hc-validation-alarm"])
+
+def test_route53_update_health_check_malformed_body(r53):
+    import urllib.error
+    import urllib.request
+
+    hc_id = r53.create_health_check(
+        CallerReference=str(uuid.uuid4()),
+        HealthCheckConfig={"Type": "HTTP", "FullyQualifiedDomainName": "example.com", "Port": 80, "ResourcePath": "/"},
+    )["HealthCheck"]["Id"]
+    for target in (hc_id, str(uuid.uuid4())):
+        for body in (b" ", b"abc"):
+            req = urllib.request.Request(f"{ENDPOINT}/2013-04-01/healthcheck/{target}", data=body, method="POST")
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(req)
+            assert exc.value.code == 400
+            text = exc.value.read().decode()
+            assert "<Code>MalformedInput</Code>" in text
+            assert "<Message>Could not parse XML</Message>" in text
+    r53.delete_health_check(HealthCheckId=hc_id)
+
+def _hc_error(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    err = exc.value.response
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err["Error"]["Code"] == "InvalidInput"
+    return err["Error"]["Message"]
+
+
+def _peel(call, fields, expected):
+    """Send all fields, then drop the one AWS reported, in AWS's reported order."""
+    fields = dict(fields)
+    for field, message in expected:
+        assert _hc_error(call, **fields) == message
+        del fields[field]
+    return call(**fields)
+
+
+def test_route53_health_check_field_rules(r53, cw):
+    for name, extra in (("hc-rules-std", {"Statistic": "Sum", "Period": 60}), ("hc-rules-std2", {"Statistic": "Sum", "Period": 120}),
+                        ("hc-rules-ext", {"ExtendedStatistic": "p90", "Period": 60}), ("hc-rules-p30", {"Statistic": "Sum", "Period": 30}),
+                        ("hc-rules-p10", {"Statistic": "Sum", "Period": 10})):
+        cw.put_metric_alarm(AlarmName=name, MetricName="Invocations", Namespace="AWS/Lambda", EvaluationPeriods=1,
+                            Threshold=1, ComparisonOperator="GreaterThanThreshold", **extra)
+    cw.put_metric_alarm(AlarmName="hc-rules-math", EvaluationPeriods=1, Threshold=1, ComparisonOperator="GreaterThanThreshold", Metrics=[
+        {"Id": "m1", "MetricStat": {"Metric": {"Namespace": "AWS/Lambda", "MetricName": "Invocations"}, "Period": 60, "Stat": "Sum"},
+         "ReturnData": False},
+        {"Id": "e1", "Expression": "m1 * 2", "Label": "double", "ReturnData": True}])
+    alarm = {"Region": "us-east-1", "Name": "hc-rules-std"}
+    ghosts = [str(uuid.uuid4()), str(uuid.uuid4())]
+    endpoint = {"IPAddress": "1.2.3.4", "Port": 80, "FullyQualifiedDomainName": "example.com", "ResourcePath": "/",
+                "SearchString": "ok", "Regions": ["us-east-1", "us-west-1", "eu-west-1"], "EnableSNI": True}
+    created = []
+
+    def create(**cfg):
+        hc_id = r53.create_health_check(CallerReference=str(uuid.uuid4()), HealthCheckConfig=cfg)["HealthCheck"]["Id"]
+        created.append(hc_id)
+        return hc_id
+
+    def create_error(**cfg):
+        return _hc_error(r53.create_health_check, CallerReference=str(uuid.uuid4()), HealthCheckConfig=cfg)
+
+    def peel_create(cfg, expected):
+        return _peel(lambda **c: created.append(
+            r53.create_health_check(CallerReference=str(uuid.uuid4()), HealthCheckConfig=c)["HealthCheck"]["Id"]
+        ), cfg, expected)
+
+    def msg(kind, label):
+        return f"Invalid parameter : {kind} health checks must not have {label} specified."
+
+    metric_order = [("IPAddress", "an IP address"), ("Port", "a port"), ("ResourcePath", "a resource path"),
+                    ("SearchString", "a search string"), ("RequestInterval", "a period"), ("FailureThreshold", "a failure threshold"),
+                    ("Regions", "regions"), ("MeasureLatency", "a latency measurement"), ("FullyQualifiedDomainName", "a FQDN"),
+                    ("HealthThreshold", "a health threshold"), ("ChildHealthChecks", "child health checks"), ("EnableSNI", "enable SNI")]
+    calc_order = [("IPAddress", "an IP address"), ("Port", "a port"), ("ResourcePath", "a resource path"),
+                  ("SearchString", "a search string"), ("RequestInterval", "a period"), ("FailureThreshold", "a failure threshold"),
+                  ("Regions", "regions"), ("MeasureLatency", "a latency measurement"), ("FullyQualifiedDomainName", "a FQDN"),
+                  ("EnableSNI", "enable SNI"), ("AlarmIdentifier", "an metric region"),
+                  ("InsufficientDataHealthStatus", "an insufficient data health status")]
+    everything = dict(endpoint, MeasureLatency=True, RequestInterval=30, FailureThreshold=3)
+
+    # Metric checks: the alarm comes before every field rule.
+    cw_cfg = {"Type": "CLOUDWATCH_METRIC", "AlarmIdentifier": alarm, "InsufficientDataHealthStatus": "LastKnownStatus"}
+    assert create_error(Type="CLOUDWATCH_METRIC", IPAddress="1.2.3.4") == "Alarm identifier must not be null."
+    assert create_error(**{**cw_cfg, "AlarmIdentifier": {"Region": "us-east-1", "Name": "hc-rules-missing"},
+                           "IPAddress": "1.2.3.4"}) == (
+        "The specified CloudWatch alarm doesn't exist. Name: hc-rules-missing, region: us-east-1")
+    extended = "Route 53 does not support extended CloudWatch metric statistics"
+    high_res = "Route 53 does not support high-resolution CloudWatch alarms"
+    for name, message in (("hc-rules-ext", extended), ("hc-rules-math", extended), ("hc-rules-p30", high_res), ("hc-rules-p10", high_res)):
+        assert create_error(**{**cw_cfg, "AlarmIdentifier": {"Region": "us-east-1", "Name": name}, "IPAddress": "1.2.3.4"}) == message
+    create(**{**cw_cfg, "AlarmIdentifier": {"Region": "us-east-1", "Name": "hc-rules-std2"}})
+    # A metric check without InsufficientDataHealthStatus gets LastKnownStatus.
+    no_status = create(Type="CLOUDWATCH_METRIC", AlarmIdentifier=alarm)
+    assert r53.get_health_check(HealthCheckId=no_status)["HealthCheck"]["HealthCheckConfig"][
+        "InsufficientDataHealthStatus"] == "LastKnownStatus"
+    # An empty child list is accepted on a metric check and not returned.
+    no_children = create(**cw_cfg, ChildHealthChecks=[])
+    assert "ChildHealthChecks" not in r53.get_health_check(HealthCheckId=no_children)["HealthCheck"]["HealthCheckConfig"]
+    for extra, label in (({"EnableSNI": False}, "enable SNI"), ({"MeasureLatency": False}, "a latency measurement"),
+                         ({"HealthThreshold": 0}, "a health threshold")):
+        assert create_error(**cw_cfg, **extra) == msg("Metric-based", label)
+    peel_create({**cw_cfg, **everything, "HealthThreshold": 1, "ChildHealthChecks": [ghosts[0]]},
+                [(f, msg("Metric-based", label)) for f, label in metric_order])
+
+    # Calculated checks: field rules, then a missing threshold, then unknown children.
+    calc_cfg = {"Type": "CALCULATED", "ChildHealthChecks": ghosts, "HealthThreshold": 1}
+    peel_create({**calc_cfg, **everything, "AlarmIdentifier": alarm, "InsufficientDataHealthStatus": "Healthy"},
+                [(f, msg("Calculated", label)) for f, label in calc_order]
+                + [("ChildHealthChecks", "Invalid parameter : Child health check IDs do not exist or are deleted: "
+                    + ", ".join(ghosts))])
+    assert create_error(Type="CALCULATED", ChildHealthChecks=[ghosts[0]]) == (
+        "Invalid parameter : Calculated health checks must have a health threshold specified.")
+    assert create_error(Type="CALCULATED", ChildHealthChecks=[], IPAddress="1.2.3.4") == msg("Calculated", "an IP address")
+    child = create(Type="HTTP", FullyQualifiedDomainName="example.com", Port=80, ResourcePath="/")
+    assert create_error(Type="CALCULATED", ChildHealthChecks=[child, ghosts[0]], HealthThreshold=1) == (
+        f"Invalid parameter : Child health check IDs do not exist or are deleted: {ghosts[0]}")
+    calc_id = create(Type="CALCULATED", ChildHealthChecks=[child], HealthThreshold=1)
+    assert r53.get_health_check(HealthCheckId=calc_id)["HealthCheck"]["HealthCheckConfig"]["ChildHealthChecks"] == [child]
+    # A calculated check always lists its children, even when none were sent.
+    bare_calc = create(Type="CALCULATED", HealthThreshold=0)
+    assert r53.get_health_check(HealthCheckId=bare_calc)["HealthCheck"]["HealthCheckConfig"]["ChildHealthChecks"] == []
+
+    # Recovery-control checks use the calculated rules but allow children and a threshold.
+    # (AWS also checks that the routing control exists; MiniStack has no ARC service.)
+    rc_cfg = {"Type": "RECOVERY_CONTROL", "RoutingControlArn": "arn:aws:route53-recovery-control::000000000000:controlpanel/"
+              "c14b2e806664476aae6db2edd214cc6e/routingcontrol/a7011654a2034f07"}
+    assert create_error(Type="RECOVERY_CONTROL", IPAddress="1.2.3.4") == "Routing control ARN must not be null"
+    peel_create({**rc_cfg, **everything, "AlarmIdentifier": alarm, "InsufficientDataHealthStatus": "Healthy",
+                 "HealthThreshold": 1, "ChildHealthChecks": [ghosts[0]]},
+                [(f, msg("Calculated", label)) for f, label in calc_order])
+    # ...and accepts children (even unknown ones) and a threshold without returning either.
+    rc_cfg_back = r53.get_health_check(HealthCheckId=created[-1])["HealthCheck"]["HealthCheckConfig"]
+    assert "ChildHealthChecks" not in rc_cfg_back
+    assert "HealthThreshold" not in rc_cfg_back
+
+    # Updates: the same rules without RequestInterval and MeasureLatency, which UpdateHealthCheck lacks.
+    update_fields = dict(endpoint, FailureThreshold=3, HealthThreshold=1, ChildHealthChecks=[ghosts[0]],
+                         AlarmIdentifier={"Region": "us-east-1", "Name": "hc-rules-std2"}, InsufficientDataHealthStatus="Unhealthy")
+    cw_id = create(**cw_cfg)
+    assert _hc_error(r53.update_health_check, HealthCheckId=cw_id, IPAddress="1.2.3.4",
+                     AlarmIdentifier={"Region": "us-east-1", "Name": "hc-rules-ext"}) == extended
+    _peel(lambda **f: r53.update_health_check(HealthCheckId=cw_id, **f), update_fields,
+          [(f, msg("Metric-based", label)) for f, label in metric_order if f not in ("RequestInterval", "MeasureLatency")])
+    emptied = r53.update_health_check(HealthCheckId=cw_id, ChildHealthChecks=[])["HealthCheck"]
+    assert emptied["HealthCheckVersion"] == 3
+    assert "ChildHealthChecks" not in emptied["HealthCheckConfig"]
+    calc_update_id = create(Type="CALCULATED", ChildHealthChecks=[], HealthThreshold=0)
+    _peel(lambda **f: r53.update_health_check(HealthCheckId=calc_update_id, **f), update_fields,
+          [(f, msg("Calculated", label)) for f, label in calc_order if f not in ("RequestInterval", "MeasureLatency")]
+          + [("ChildHealthChecks", f"Invalid parameter : Child health check IDs do not exist or are deleted: {ghosts[0]}")])
+
+    for hc_id in reversed(created):
+        r53.delete_health_check(HealthCheckId=hc_id)
+    cw.delete_alarms(AlarmNames=["hc-rules-std", "hc-rules-std2", "hc-rules-ext", "hc-rules-p30", "hc-rules-p10", "hc-rules-math"])
 
 def test_route53_list_health_checks(r53):
     r53.create_health_check(

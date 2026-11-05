@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Route 53 — metric and calculated health checks no longer get `RequestInterval` and `FailureThreshold`** — `CreateHealthCheck` added `RequestInterval` 30 and `FailureThreshold` 3 to `CLOUDWATCH_METRIC` and `CALCULATED` checks, so Terraform replaced them on every plan. Only endpoint checks get them now, as on AWS, and a metric check without `InsufficientDataHealthStatus` gets `LastKnownStatus`. `CreateHealthCheck` and `UpdateHealthCheck` also reject what AWS rejects for metric, calculated and recovery-control checks, with AWS's `InvalidInput` messages and order: a metric check now needs an existing metric alarm in its `AlarmIdentifier` region (not a percentile, metric-math or high-resolution alarm), fields the type cannot carry are refused, a calculated check needs a `HealthThreshold` and existing child checks, and a recovery-control check cannot be updated. An `UpdateHealthCheck` with no members succeeds, a body that is not XML answers `MalformedInput`, and child health check IDs are no longer stored empty. MiniStack does not check that a routing control exists. Fixes #2603. Contributed by @kharabasz.
+
 ## [1.5.38] — 2026-11-05
 
 ### Added
