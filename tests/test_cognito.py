@@ -19,7 +19,7 @@ import urllib.request
 import uuid as _uuid_mod
 import zipfile
 import zlib
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import urlencode as _urlencode
 from urllib.parse import urlparse
@@ -10922,6 +10922,8 @@ def test_cognito_user_pool_keeps_mfa_and_attribute_update_settings(cognito_idp):
     pool = cognito_idp.create_user_pool(
         PoolName="qa-pool-settings",
         MfaConfiguration="OPTIONAL",
+        AutoVerifiedAttributes=["email", "phone_number"],
+        SmsConfiguration={"SnsCallerArn": "arn:aws:iam::000000000000:role/qa-sms", "ExternalId": "qa"},
         UserAttributeUpdateSettings={
             "AttributesRequireVerificationBeforeUpdate": ["email", "phone_number"]
         },
@@ -10940,6 +10942,7 @@ def test_cognito_user_pool_keeps_mfa_and_attribute_update_settings(cognito_idp):
     cognito_idp.update_user_pool(
         UserPoolId=pid,
         MfaConfiguration="OPTIONAL",
+        AutoVerifiedAttributes=["email"],
         UserAttributeUpdateSettings={
             "AttributesRequireVerificationBeforeUpdate": ["email"]
         },
@@ -14087,5 +14090,494 @@ def test_refresh_token_rotation_concurrent_refreshes_rotate_once(cognito_idp):
 
         with ThreadPoolExecutor(8) as pool:
             assert sum(pool.map(attempt, range(8))) == 1
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+# ---------------------------------------------------------------------------
+# Attribute verification (answers measured on AWS in eu-west-2, 2026-11-04)
+# ---------------------------------------------------------------------------
+
+def _verifying_pool(cognito_idp, **pool_kwargs):
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"verify-{_uuid_mod.uuid4().hex[:8]}", UsernameAttributes=["email"], AutoVerifiedAttributes=["email"],
+        **pool_kwargs)["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    return pid, cid
+
+
+def _verifying_user(cognito_idp, pid, cid, email, verified="false"):
+    cognito_idp.admin_create_user(UserPoolId=pid, Username=email, MessageAction="SUPPRESS", UserAttributes=[
+        {"Name": "email", "Value": email}, {"Name": "email_verified", "Value": verified}])
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username=email, Password="Probe-Passw0rd!", Permanent=True)
+    return _sign_in_as(cognito_idp, cid, email)
+
+
+def _sign_in_as(cognito_idp, cid, email):
+    return cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={"USERNAME": email, "PASSWORD": "Probe-Passw0rd!"},
+    )["AuthenticationResult"]["AccessToken"]
+
+
+def _attrs_of(cognito_idp, token):
+    return {a["Name"]: a["Value"] for a in cognito_idp.get_user(AccessToken=token)["UserAttributes"]}
+
+
+@pytest.mark.auth_contract
+def test_get_user_attribute_verification_code_and_verify(cognito_idp, auth_enabled):
+    pid, cid = _verifying_pool(cognito_idp)
+    try:
+        email = f"verify-{_uuid_mod.uuid4().hex[:8]}@example.com"
+        token = _verifying_user(cognito_idp, pid, cid, email)
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+            assert exc.value.response["Error"]["Code"] == "ExpiredCodeException"
+        delivery = cognito_idp.get_user_attribute_verification_code(AccessToken=token, AttributeName="email")
+        assert delivery["CodeDeliveryDetails"]["DeliveryMedium"] == "EMAIL"
+        assert delivery["CodeDeliveryDetails"]["AttributeName"] == "email"
+        assert len(_messages_to(email, "CognitoVerificationMessage")) == 1
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="000000")
+            assert exc.value.response["Error"]["Message"] == "Invalid verification code provided, please try again."
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        assert _attrs_of(cognito_idp, token)["email_verified"] == "true"
+
+        for call, kwargs, message in (
+            (cognito_idp.get_user_attribute_verification_code, {"AttributeName": "phone_number"},
+             "User does not have a valid registered phone number"),
+            (cognito_idp.get_user_attribute_verification_code, {"AttributeName": "custom:nothing"},
+             "Invalid attribute name. Only phone_number and email can be verified."),
+            (cognito_idp.verify_user_attribute, {"AttributeName": "phone_number", "Code": "123456"},
+             "Unable to verify attribute: phone_number no value set to verify"),
+            (cognito_idp.verify_user_attribute, {"AttributeName": "sub", "Code": "123456"},
+             "Invalid attribute name. Only phone_number and email can be verified."),
+            (cognito_idp.update_user_attributes, {"UserAttributes": [{"Name": "email_verified", "Value": "true"}]},
+             "Cannot modify the non-mutable attribute email_verified"),
+            (cognito_idp.update_user_attributes, {"UserAttributes": [{"Name": "phone_number_verified", "Value": "true"}]},
+             "Cannot modify the non-mutable attribute phone_number_verified"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(AccessToken=token, **kwargs)
+            assert exc.value.response["Error"] == {"Code": "InvalidParameterException", "Message": message} | {
+                k: v for k, v in exc.value.response["Error"].items() if k not in ("Code", "Message")}
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_changing_email_sends_a_code_and_unverifies_the_new_address(cognito_idp):
+    pid, cid = _verifying_pool(cognito_idp)
+    try:
+        old, new = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("old", "new"))
+        token = _verifying_user(cognito_idp, pid, cid, old, verified="true")
+        sent = cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": new}])
+        assert [d["AttributeName"] for d in sent["CodeDeliveryDetailsList"]] == ["email"]
+        assert len(_messages_to(new, "CognitoVerificationMessage")) == 1
+        assert {k: v for k, v in _attrs_of(cognito_idp, token).items() if k.startswith("email")} == {
+            "email": new, "email_verified": "false"}
+        assert _sign_in_as(cognito_idp, cid, new)
+        with pytest.raises(ClientError):
+            _sign_in_as(cognito_idp, cid, old)
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        assert _attrs_of(cognito_idp, token)["email_verified"] == "true"
+
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username=new, UserAttributes=[{"Name": "email", "Value": old}])
+        assert len(_messages_to(old, "CognitoVerificationMessage")) == 1
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username=old, UserAttributes=[
+            {"Name": "email", "Value": new}, {"Name": "email_verified", "Value": "true"}])
+        assert len(_messages_to(new, "CognitoVerificationMessage")) == 1
+        got = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(UserPoolId=pid, Username=new)["UserAttributes"]}
+        assert (got["email"], got["email_verified"]) == (new, "true")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_email_change_kept_pending_until_verified(cognito_idp):
+    """With AttributesRequireVerificationBeforeUpdate, the old address stays, and signs in, until the new one is verified."""
+    pid, cid = _verifying_pool(
+        cognito_idp, UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": ["email"]})
+    try:
+        old, new = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("old", "new"))
+        token = _verifying_user(cognito_idp, pid, cid, old, verified="true")
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": new}])
+        assert len(_messages_to(new, "CognitoVerificationMessage")) == 1
+        assert {k: v for k, v in _attrs_of(cognito_idp, token).items() if k.startswith("email")} == {
+            "email": old, "email_verified": "true"}
+        assert _sign_in_as(cognito_idp, cid, old)
+        with pytest.raises(ClientError):
+            _sign_in_as(cognito_idp, cid, new)
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        assert _attrs_of(cognito_idp, token)["email"] == new
+        assert _sign_in_as(cognito_idp, cid, new)
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_custom_email_sender_gets_attribute_codes(cognito_idp, lam, sqs, kms_client):
+    name, queue_url, key_arn, config = _custom_email_sender(lam, sqs, kms_client)
+    pid, cid = _verifying_pool(cognito_idp, LambdaConfig=config)
+    try:
+        old, new = (f"{n}-{name}@example.com" for n in ("old", "new"))
+        token = _verifying_user(cognito_idp, pid, cid, old)
+        cognito_idp.get_user_attribute_verification_code(AccessToken=token, AttributeName="email", ClientMetadata={"why": "verify"})
+        (verify,) = _sender_events(sqs, queue_url)
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": new}],
+                                           ClientMetadata={"why": "update"})
+        (update,) = _sender_events(sqs, queue_url)
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username=new, UserAttributes=[{"Name": "email", "Value": old}])
+        (admin,) = _sender_events(sqs, queue_url)
+        assert [(e["triggerSource"], e["callerContext"]["clientId"], e["request"]["clientMetadata"],
+                 e["request"]["userAttributes"]["email"], e["request"]["userAttributes"].get("email_verified"))
+                for e in (verify, update, admin)] == [
+            ("CustomEmailSender_VerifyUserAttribute", cid, {"why": "verify"}, old, "false"),
+            ("CustomEmailSender_UpdateUserAttribute", cid, {"why": "update"}, new, "false"),
+            ("CustomEmailSender_UpdateUserAttribute", None, None, old, "false"),
+        ]
+        assert _decrypt_sender_code(kms_client, update["request"]["code"])[0] == "123456"
+    finally:
+        _drop_custom_email_sender(cognito_idp, lam, sqs, kms_client, pid, name, queue_url, key_arn)
+
+
+def test_attribute_verification_without_an_address(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName=f"noaddr-{_uuid_mod.uuid4().hex[:8]}", AutoVerifiedAttributes=["email"])["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    try:
+        cognito_idp.admin_create_user(UserPoolId=pid, Username="nomail", MessageAction="SUPPRESS",
+                                      UserAttributes=[{"Name": "phone_number", "Value": "+447700900001"}])
+        cognito_idp.admin_set_user_password(UserPoolId=pid, Username="nomail", Password="Probe-Passw0rd!", Permanent=True)
+        token = _sign_in_as(cognito_idp, cid, "nomail")
+        for call, kwargs, message in (
+            (cognito_idp.get_user_attribute_verification_code, {"AttributeName": "email"},
+             "User does not have a valid registered email"),
+            (cognito_idp.verify_user_attribute, {"AttributeName": "email", "Code": "123456"},
+             "Unable to verify attribute: email no value set to verify"),
+            (cognito_idp.get_user_attribute_verification_code, {"AttributeName": "phone_number"},
+             "Invalid phone number provided/Unable to send the message. User pool does not have SMS configuration "
+             "to send messages."),
+        ):
+            with pytest.raises(ClientError) as exc:
+                call(AccessToken=token, **kwargs)
+            assert exc.value.response["Error"]["Message"] == message
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "phone_number", "Value": "+447700900002"}])
+        assert _attrs_of(cognito_idp, token)["phone_number_verified"] == "false"
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username="nomail", UserAttributes=[
+            {"Name": "phone_number", "Value": "+447700900003"}, {"Name": "phone_number_verified", "Value": "true"}])
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username="nomail", UserAttributes=[
+            {"Name": "phone_number", "Value": "+447700900004"}])
+        assert _attrs_of(cognito_idp, token)["phone_number_verified"] == "false"
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_a_changed_email_is_unverified_in_any_pool_but_coded_only_where_verified(cognito_idp, auth_enabled):
+    pid = cognito_idp.create_user_pool(PoolName=f"noauto-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    try:
+        old, new = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("old", "new"))
+        cognito_idp.admin_create_user(UserPoolId=pid, Username="noauto", MessageAction="SUPPRESS", UserAttributes=[
+            {"Name": "email", "Value": old}, {"Name": "email_verified", "Value": "true"}])
+        cognito_idp.admin_set_user_password(UserPoolId=pid, Username="noauto", Password="Probe-Passw0rd!", Permanent=True)
+        token = _sign_in_as(cognito_idp, cid, "noauto")
+        sent = cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": new}])
+        assert "CodeDeliveryDetailsList" not in sent
+        assert _messages_to(new) == []
+        assert _attrs_of(cognito_idp, token)["email_verified"] == "false"
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": new}])
+        assert _messages_to(new) == []
+        cognito_idp.get_user_attribute_verification_code(AccessToken=token, AttributeName="email")
+        assert len(_messages_to(new, "CognitoVerificationMessage")) == 1
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": old}])
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+            assert exc.value.response["Error"]["Code"] == "ExpiredCodeException", "a change drops the code"
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_changing_to_another_users_email_is_refused(cognito_idp):
+    pid, cid = _verifying_pool(cognito_idp)
+    try:
+        taken, mine = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("taken", "mine"))
+        _verifying_user(cognito_idp, pid, cid, taken, verified="true")
+        token = _verifying_user(cognito_idp, pid, cid, mine, verified="true")
+        for call, kwargs in ((cognito_idp.update_user_attributes, {"AccessToken": token}),
+                             (cognito_idp.admin_update_user_attributes, {"UserPoolId": pid, "Username": mine})):
+            with pytest.raises(ClientError) as exc:
+                call(UserAttributes=[{"Name": "email", "Value": taken}], **kwargs)
+            assert exc.value.response["Error"] == {
+                **exc.value.response["Error"], "Code": "AliasExistsException",
+                "Message": "An account with the given email already exists."}
+        assert _attrs_of(cognito_idp, token)["email"] == mine
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_a_pending_email_change_outlives_a_change_back_and_an_admin_update(cognito_idp, auth_enabled):
+    pid, cid = _verifying_pool(
+        cognito_idp, UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": ["email"]})
+    try:
+        old, new, newer, admin = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("old", "new", "newer", "admin"))
+        token = _verifying_user(cognito_idp, pid, cid, old, verified="true")
+
+        def email():
+            got = _attrs_of(cognito_idp, token)
+            return got["email"], got.get("email_verified")
+
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[
+            {"Name": "email", "Value": new}, {"Name": "name", "Value": "Bee"}])
+        assert _attrs_of(cognito_idp, token)["name"] == "Bee"
+        assert cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": old}]) == {
+            "ResponseMetadata": ANY}
+        assert _messages_to(old) == []
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        assert email() == (new, "true"), "the change back left the change pending"
+
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": newer}])
+        cognito_idp.get_user_attribute_verification_code(AccessToken=token, AttributeName="email")
+        assert len(_messages_to(new, "CognitoVerificationMessage")) == 2
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        assert email() == (new, "true"), "a code for the current address verifies it"
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+            assert exc.value.response["Error"]["Code"] == "ExpiredCodeException", "it replaced the pending address's code"
+
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": newer}])
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username=new, UserAttributes=[
+            {"Name": "email", "Value": admin}, {"Name": "email_verified", "Value": "true"}])
+        assert email() == (admin, "true")
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        assert email() == (newer, "true"), "the admin's update left the change pending"
+
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username=newer, UserAttributes=[
+            {"Name": "email", "Value": admin}, {"Name": "email_verified", "Value": "false"}])
+        assert email() == (newer, "false")
+        assert len(_messages_to(admin, "CognitoVerificationMessage")) == 1
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_verifying_a_pending_address_another_user_took_is_refused_and_keeps_the_code(cognito_idp, auth_enabled):
+    pid, cid = _verifying_pool(
+        cognito_idp, UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": ["email"]})
+    try:
+        taken, mine = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("taken", "mine"))
+        _verifying_user(cognito_idp, pid, cid, taken, verified="true")
+        token = _verifying_user(cognito_idp, pid, cid, mine, verified="true")
+        sent = cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": taken}])
+        assert [d["AttributeName"] for d in sent["CodeDeliveryDetailsList"]] == ["email"]
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="000000")
+            assert exc.value.response["Error"]["Code"] == "CodeMismatchException", "the code is checked before the address"
+        for _ in range(2):
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "AliasExistsException", "An account with the given email already exists.")
+        assert _attrs_of(cognito_idp, token)["email"] == mine
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+_SMS = {"SnsCallerArn": "arn:aws:iam::000000000000:role/sms", "ExternalId": "sms"}
+
+
+def _plain_pool_user(cognito_idp, attrs, **pool_kwargs):
+    pid = cognito_idp.create_user_pool(PoolName=f"attr-{_uuid_mod.uuid4().hex[:8]}", **pool_kwargs)["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="someone", MessageAction="SUPPRESS",
+                                  UserAttributes=[{"Name": k, "Value": v} for k, v in attrs.items()])
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="someone", Password="Probe-Passw0rd!", Permanent=True)
+    return pid, _sign_in_as(cognito_idp, cid, "someone")
+
+
+@pytest.mark.auth_contract
+def test_a_first_email_in_a_keep_pool_waits_for_its_code_even_once_the_setting_goes(cognito_idp, auth_enabled):
+    pid, token = _plain_pool_user(cognito_idp, {}, AutoVerifiedAttributes=["email"],
+                                  UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": ["email"]})
+    try:
+        email = f"first-{_uuid_mod.uuid4().hex[:8]}@example.com"
+        sent = cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": email}])
+        assert sent["CodeDeliveryDetailsList"] == [{"Destination": "f***@e***", "DeliveryMedium": "EMAIL", "AttributeName": "email"}]
+        assert "email" not in _attrs_of(cognito_idp, token)
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.get_user_attribute_verification_code(AccessToken=token, AttributeName="email")
+        assert exc.value.response["Error"]["Message"] == "User does not have a valid registered email"
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="000000")
+            assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+        cognito_idp.update_user_pool(UserPoolId=pid, AutoVerifiedAttributes=["email"],
+                                     UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": []})
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="email", Code="123456")
+        got = _attrs_of(cognito_idp, token)
+        assert (got["email"], got["email_verified"]) == (email, "true")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+@pytest.mark.auth_contract
+def test_phone_numbers_get_codes_in_a_pool_with_sms(cognito_idp, auth_enabled):
+    pid, token = _plain_pool_user(cognito_idp, {"phone_number": "+447700900301"},
+                                  AutoVerifiedAttributes=["email"], SmsConfiguration=_SMS)
+    try:
+        assert cognito_idp.get_user_attribute_verification_code(AccessToken=token, AttributeName="phone_number")[
+            "CodeDeliveryDetails"] == {"Destination": "+********0301", "DeliveryMedium": "SMS", "AttributeName": "phone_number"}
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="phone_number", Code="123456")
+        assert _attrs_of(cognito_idp, token)["phone_number_verified"] == "true"
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="phone_number", Code="000000")
+            assert exc.value.response["Error"]["Code"] == "ExpiredCodeException"
+        assert cognito_idp.update_user_attributes(
+            AccessToken=token, UserAttributes=[{"Name": "phone_number", "Value": "+447700900302"}]) == {"ResponseMetadata": ANY}
+        assert _attrs_of(cognito_idp, token)["phone_number_verified"] == "false"
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_a_phone_number_change_kept_pending_until_verified(cognito_idp):
+    pid, token = _plain_pool_user(
+        cognito_idp, {"phone_number": "+447700900203", "phone_number_verified": "true"},
+        AutoVerifiedAttributes=["phone_number", "email"], SmsConfiguration=_SMS,
+        UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": ["phone_number"]})
+    try:
+        def phone():
+            got = _attrs_of(cognito_idp, token)
+            return got["phone_number"], got["phone_number_verified"]
+
+        sent = cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "phone_number", "Value": "+447700900204"}])
+        assert sent["CodeDeliveryDetailsList"] == [
+            {"Destination": "+********0204", "DeliveryMedium": "SMS", "AttributeName": "phone_number"}]
+        assert phone() == ("+447700900203", "true")
+        assert "CodeDeliveryDetailsList" not in cognito_idp.update_user_attributes(
+            AccessToken=token, UserAttributes=[{"Name": "phone_number", "Value": "+447700900203"}])
+        cognito_idp.verify_user_attribute(AccessToken=token, AttributeName="phone_number", Code="123456")
+        assert phone() == ("+447700900204", "true")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_a_phone_number_or_a_differently_cased_email_another_user_signs_in_with_is_refused(cognito_idp):
+    pids = []
+    try:
+        for kwargs, attribute, mine, theirs in (
+            ({"UsernameAttributes": ["phone_number"], "AutoVerifiedAttributes": ["phone_number"], "SmsConfiguration": _SMS},
+             "phone_number", "+447700900402", "+447700900401"),
+            ({"UsernameAttributes": ["email"], "UsernameConfiguration": {"CaseSensitive": False}, "AutoVerifiedAttributes": ["email"]},
+             "email", "mine@example.com", "THEIRS@example.com"),
+        ):
+            pid = cognito_idp.create_user_pool(PoolName=f"alias-{_uuid_mod.uuid4().hex[:8]}", **kwargs)["UserPool"]["Id"]
+            pids.append(pid)
+            cid = cognito_idp.create_user_pool_client(
+                UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+            for value in (theirs.lower(), mine):
+                cognito_idp.admin_create_user(UserPoolId=pid, Username=value, MessageAction="SUPPRESS", UserAttributes=[
+                    {"Name": attribute, "Value": value}, {"Name": f"{attribute}_verified", "Value": "true"}])
+                cognito_idp.admin_set_user_password(UserPoolId=pid, Username=value, Password="Probe-Passw0rd!", Permanent=True)
+            token = _sign_in_as(cognito_idp, cid, mine)
+            for call, kwargs_ in ((cognito_idp.update_user_attributes, {"AccessToken": token}),
+                                  (cognito_idp.admin_update_user_attributes, {"UserPoolId": pid, "Username": mine})):
+                with pytest.raises(ClientError) as exc:
+                    call(UserAttributes=[{"Name": attribute, "Value": theirs}], **kwargs_)
+                assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                    "AliasExistsException", f"An account with the given {attribute} already exists.")
+    finally:
+        for pid in pids:
+            cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_an_email_alias_moves_to_the_user_who_verifies_it(cognito_idp):
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"alias-{_uuid_mod.uuid4().hex[:8]}", AliasAttributes=["email"], AutoVerifiedAttributes=["email"])["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app", ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    try:
+        shared = f"shared-{_uuid_mod.uuid4().hex[:8]}@example.com"
+
+        def user(name, email, verified):
+            attrs = [{"Name": "email", "Value": email}] + ([{"Name": "email_verified", "Value": "true"}] if verified else [])
+            cognito_idp.admin_create_user(UserPoolId=pid, Username=name, MessageAction="SUPPRESS", UserAttributes=attrs)
+            cognito_idp.admin_set_user_password(UserPoolId=pid, Username=name, Password="Probe-Passw0rd!", Permanent=True)
+            return _sign_in_as(cognito_idp, cid, name)
+
+        def attrs(name):
+            got = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(UserPoolId=pid, Username=name)["UserAttributes"]}
+            return got["email"], got.get("email_verified")
+
+        user("first", shared, verified=False)
+        second = user("second", f"second-{shared}", verified=True)
+        cognito_idp.update_user_attributes(AccessToken=second, UserAttributes=[{"Name": "email", "Value": shared}])
+        assert attrs("second") == (shared, "false")
+        cognito_idp.verify_user_attribute(AccessToken=second, AttributeName="email", Code="123456")
+        assert (attrs("first"), attrs("second")) == ((shared, None), (shared, "true"))
+
+        third = user("third", f"third-{shared}", verified=True)
+        assert "CodeDeliveryDetailsList" in cognito_idp.update_user_attributes(
+            AccessToken=third, UserAttributes=[{"Name": "email", "Value": shared}])
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username="third", UserAttributes=[
+            {"Name": "email", "Value": shared}, {"Name": "email_verified", "Value": "true"}])
+        assert (attrs("second"), attrs("third")) == ((shared, "false"), (shared, "true"))
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_an_admin_may_mark_an_email_verified_in_any_case(cognito_idp):
+    pid, cid = _verifying_pool(cognito_idp)
+    try:
+        old, new = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("old", "new"))
+        token = _verifying_user(cognito_idp, pid, cid, old, verified="true")
+        cognito_idp.admin_update_user_attributes(UserPoolId=pid, Username=old, UserAttributes=[
+            {"Name": "email", "Value": new}, {"Name": "email_verified", "Value": "True"}])
+        assert _messages_to(new) == []
+        assert {k: v for k, v in _attrs_of(cognito_idp, token).items() if k.startswith("email")} == {
+            "email": new, "email_verified": "True"}
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_attributes_kept_until_verified_must_be_auto_verified(cognito_idp):
+    message = "All attributes in AttributesRequireVerificationBeforeUpdate must exist in AutoVerifiedAttributes"
+    for kwargs in ({}, {"AutoVerifiedAttributes": ["email"]}):
+        kept = ["email"] if not kwargs else ["phone_number"]
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.create_user_pool(PoolName=f"keep-{_uuid_mod.uuid4().hex[:8]}", **kwargs,
+                                         UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": kept})
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == ("InvalidParameterException", message)
+    plain = cognito_idp.create_user_pool(PoolName=f"keep-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    verifying = cognito_idp.create_user_pool(PoolName=f"keep-{_uuid_mod.uuid4().hex[:8]}", AutoVerifiedAttributes=["email"],
+                                             UserAttributeUpdateSettings={"AttributesRequireVerificationBeforeUpdate": ["email"]})["UserPool"]["Id"]
+    try:
+        for update in (
+            {"UserPoolId": plain, "UserAttributeUpdateSettings": {"AttributesRequireVerificationBeforeUpdate": ["email"]}},
+            {"UserPoolId": verifying, "UserAttributeUpdateSettings": {"AttributesRequireVerificationBeforeUpdate": ["email"]}},
+            {"UserPoolId": verifying, "AutoVerifiedAttributes": []},
+        ):
+            with pytest.raises(ClientError) as exc:
+                cognito_idp.update_user_pool(**update)
+            assert exc.value.response["Error"]["Message"] == message
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=plain)
+        cognito_idp.delete_user_pool(UserPoolId=verifying)
+
+
+def test_a_link_verification_pool_sends_a_code_for_a_changed_email(cognito_idp):
+    pid, cid = _verifying_pool(cognito_idp, VerificationMessageTemplate={"DefaultEmailOption": "CONFIRM_WITH_LINK"})
+    try:
+        old, new = (f"{n}-{_uuid_mod.uuid4().hex[:8]}@example.com" for n in ("old", "new"))
+        token = _verifying_user(cognito_idp, pid, cid, old, verified="true")
+        cognito_idp.update_user_attributes(AccessToken=token, UserAttributes=[{"Name": "email", "Value": new}])
+        (message,) = _messages_to(new, "CognitoVerificationMessage")
+        assert "123456" in (message["BodyText"] or message["BodyHtml"])
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
