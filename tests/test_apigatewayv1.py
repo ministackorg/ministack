@@ -6553,6 +6553,40 @@ def test_apigwv1_import_rest_api_loads_the_definition(apigw_v1):
         apigw_v1.delete_rest_api(restApiId=api["id"])
 
 
+_PATH_PARAMS_SPEC = {
+    "swagger": "2.0", "info": {"title": "path-params", "version": "1"},
+    "paths": {"/orgs/{orgId}/{proxy+}": {"options": {
+        "parameters": [
+            {"name": "orgId", "in": "path", "required": True, "type": "string"},
+            {"name": "proxy", "in": "path", "required": True, "type": "string"},
+        ],
+        "x-amazon-apigateway-integration": {"type": "mock"},
+    }}},
+}
+
+
+@pytest.mark.parametrize("mode", ["import", "put"])
+def test_apigwv1_import_keeps_the_path_parameters(apigw_v1, mode):
+    """Captured on AWS: ImportRestApi and PutRestApi turn an operation's path parameters into the method's
+    requestParameters."""
+    body = json.dumps(_PATH_PARAMS_SPEC)
+    if mode == "import":
+        api_id = apigw_v1.import_rest_api(body=body)["id"]
+    else:
+        api_id = apigw_v1.create_rest_api(name=f"params-{_uuid_mod.uuid4().hex[:8]}")["id"]
+        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=body)
+    try:
+        proxy_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+                        if r["path"] == "/orgs/{orgId}/{proxy+}")
+        method = apigw_v1.get_method(restApiId=api_id, resourceId=proxy_id, httpMethod="OPTIONS")
+        assert method["requestParameters"] == {
+            "method.request.path.orgId": True,
+            "method.request.path.proxy": True,
+        }
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 _MOCK_OPERATION = {"x-amazon-apigateway-integration": {
     "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
     "responses": {"default": {"statusCode": "200"}}}}
@@ -6596,40 +6630,6 @@ def test_apigwv1_import_creates_the_any_method(apigw_v1, mode):
         req = urllib.request.Request(url, data=b"{}", method="POST", headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             assert resp.status == 200
-    finally:
-        apigw_v1.delete_rest_api(restApiId=api_id)
-
-
-_PATH_PARAMS_SPEC = {
-    "swagger": "2.0", "info": {"title": "path-params", "version": "1"},
-    "paths": {"/orgs/{orgId}/{proxy+}": {"options": {
-        "parameters": [
-            {"name": "orgId", "in": "path", "required": True, "type": "string"},
-            {"name": "proxy", "in": "path", "required": True, "type": "string"},
-        ],
-        "x-amazon-apigateway-integration": {"type": "mock"},
-    }}},
-}
-
-
-@pytest.mark.parametrize("mode", ["import", "put"])
-def test_apigwv1_import_keeps_the_path_parameters(apigw_v1, mode):
-    """Captured on AWS: ImportRestApi and PutRestApi turn an operation's path parameters into the method's
-    requestParameters."""
-    body = json.dumps(_PATH_PARAMS_SPEC)
-    if mode == "import":
-        api_id = apigw_v1.import_rest_api(body=body)["id"]
-    else:
-        api_id = apigw_v1.create_rest_api(name=f"params-{_uuid_mod.uuid4().hex[:8]}")["id"]
-        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=body)
-    try:
-        proxy_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
-                        if r["path"] == "/orgs/{orgId}/{proxy+}")
-        method = apigw_v1.get_method(restApiId=api_id, resourceId=proxy_id, httpMethod="OPTIONS")
-        assert method["requestParameters"] == {
-            "method.request.path.orgId": True,
-            "method.request.path.proxy": True,
-        }
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
 

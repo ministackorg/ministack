@@ -3996,7 +3996,7 @@ def _import_operation(api_id, resource_id, http_method, operation,
     request_params = {
         f"method.request.{_OPENAPI_PARAM_SOURCES[param['in']]}.{param['name']}": bool(param.get("required"))
         for param in (operation or {}).get("parameters") or []
-        if param.get("in") in _OPENAPI_PARAM_SOURCES and param.get("name")
+        if isinstance(param, dict) and param.get("in") in _OPENAPI_PARAM_SOURCES and param.get("name")
     }
     if request_params:
         method_data["requestParameters"] = request_params

@@ -264,7 +264,7 @@ _SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfi
                  "MixedInstancesPolicy parameter.")
 _INSTANCES_DISTRIBUTION_DEFAULTS = {
     "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
-    "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 2,
+    "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price",
 }
 
 
@@ -317,66 +317,61 @@ def _shape_xml(value, shape):
     return escape(str(value))
 
 
-_SPOT_POOLS_ERROR = "SpotInstancePools option is only available with the lowest-price allocation strategy."
-
-
 _SPOT_STRATEGIES = ("lowest-price", "capacity-optimized", "capacity-optimized-prioritized", "price-capacity-optimized")
-_MIXED_NEEDS_LT_ERROR = ("A launch template is required when configuring an Auto Scaling group with a mixed instances "
-                         "policy. Add a launch template to the mixed instances policy and try again.")
 
 
-def _resolve_lt_spec(spec):
-    return resolve_launch_template(spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"), spec.get("Version"))
-
-
-def resolve_mixed_instances_policy(policy, previous=None):
+def resolve_mixed_instances_policy(policy, stored=None):
     """(policy, error message): the policy as AWS stores it, its launch templates resolved like a group's.
-    On update, *previous* is the stored policy: the spec, the Overrides and each distribution member not sent keep
-    their stored values."""
-    previous = previous or {}
-    sent = policy.get("InstancesDistribution") or {}
-    strategy = sent.get("SpotAllocationStrategy")
-    if strategy is not None and strategy not in _SPOT_STRATEGIES:
-        return None, f"SpotAllocationStrategy is not valid. Valid options are: [{', '.join(_SPOT_STRATEGIES)}]."
-    distribution = {**_INSTANCES_DISTRIBUTION_DEFAULTS, **(previous.get("InstancesDistribution") or {}), **sent}
-    if distribution.get("SpotMaxPrice") == "":
-        del distribution["SpotMaxPrice"]
-    if distribution["SpotAllocationStrategy"] != "lowest-price":
-        if "SpotInstancePools" in sent:
-            return None, _SPOT_POOLS_ERROR
-        distribution.pop("SpotInstancePools", None)
-    elif "SpotInstancePools" not in distribution:
-        distribution["SpotInstancePools"] = _INSTANCES_DISTRIBUTION_DEFAULTS["SpotInstancePools"]
+    On an update, *stored* is the group's policy and the members not sent are kept from it."""
+    stored = stored or {}
     sent_lt = policy.get("LaunchTemplate") or {}
-    lt = {**(previous.get("LaunchTemplate") or {}), **sent_lt}
-    if "LaunchTemplateSpecification" in sent_lt or not previous:
-        resolved, error = _resolve_lt_spec(sent_lt.get("LaunchTemplateSpecification") or {})
+    lt = {**(stored.get("LaunchTemplate") or {}), **sent_lt}
+    if "LaunchTemplateSpecification" in sent_lt or not stored:
+        spec = sent_lt.get("LaunchTemplateSpecification") or {}
+        resolved, error = resolve_launch_template(spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"),
+                                                  spec.get("Version"))
         if error:
             return None, error
         lt["LaunchTemplateSpecification"] = resolved
-    if "Overrides" in sent_lt or not previous:
+    if "Overrides" in sent_lt or not stored:
         overrides = []
         for override in sent_lt.get("Overrides") or []:
             override = dict(override)
             if override.get("LaunchTemplateSpecification"):
-                o_resolved, error = _resolve_lt_spec(override["LaunchTemplateSpecification"])
+                o_spec = override["LaunchTemplateSpecification"]
+                o_resolved, error = resolve_launch_template(o_spec.get("LaunchTemplateId"),
+                                                            o_spec.get("LaunchTemplateName"), o_spec.get("Version"))
                 if error:
                     return None, error
                 override["LaunchTemplateSpecification"] = o_resolved
             overrides.append(override)
         lt["Overrides"] = overrides
+    sent = policy.get("InstancesDistribution") or {}
+    strategy = sent.get("SpotAllocationStrategy")
+    if strategy is not None and strategy not in _SPOT_STRATEGIES:
+        return None, f"SpotAllocationStrategy is not valid. Valid options are: [{', '.join(_SPOT_STRATEGIES)}]."
+    distribution = {**_INSTANCES_DISTRIBUTION_DEFAULTS, **(stored.get("InstancesDistribution") or {}), **sent}
+    if distribution.get("SpotMaxPrice") == "":
+        del distribution["SpotMaxPrice"]
+    if distribution["SpotAllocationStrategy"] != "lowest-price":
+        if "SpotInstancePools" in sent:
+            return None, "SpotInstancePools option is only available with the lowest-price allocation strategy."
+        distribution.pop("SpotInstancePools", None)
+    else:
+        distribution.setdefault("SpotInstancePools", 2)
     return {"LaunchTemplate": lt, "InstancesDistribution": distribution}, None
 
 
-def _mixed_instances_policy(p, previous=None):
+def _mixed_instances_policy(p, stored=None):
     policy = _query_value(p, "MixedInstancesPolicy", _model_shape("MixedInstancesPolicy"))
     if not policy:
         return None, None
-    if not previous and not policy.get("LaunchTemplate"):
-        return None, _MIXED_NEEDS_LT_ERROR
-    if not previous and not policy["LaunchTemplate"].get("LaunchTemplateSpecification"):
+    if not stored and not policy.get("LaunchTemplate"):
+        return None, ("A launch template is required when configuring an Auto Scaling group with a mixed instances "
+                      "policy. Add a launch template to the mixed instances policy and try again.")
+    if not stored and not policy["LaunchTemplate"].get("LaunchTemplateSpecification"):
         return None, "Valid requests must contain either launchTemplateId or LaunchTemplateName"
-    return resolve_mixed_instances_policy(policy, previous)
+    return resolve_mixed_instances_policy(policy, stored)
 
 
 def _has_member(p, name):
