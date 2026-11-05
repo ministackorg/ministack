@@ -8656,7 +8656,7 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
             f"Worker init failed: {init_resp}; stderr: {proc.stderr.read(2048)}"
         )
 
-        event = json.dumps({**(event_payload or {}), "_request_id": "test-req-1"})
+        event = json.dumps({"event": event_payload or {}, "ctx": {"request_id": "test-req-1"}})
         proc.stdin.write(event + "\n")
         proc.stdin.flush()
 
@@ -8758,7 +8758,7 @@ def test_nodejs_worker_aws_sdk_v3_stub_resolves():
     stub backed by Ministack's own service implementations.
     """
     handler_js = """\
-const { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
+const { Lambda, LambdaClient, InvokeCommand, ListTagsCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
 const { OpenSearch, OpenSearchClient, UpdateDomainConfigCommand } = require("@aws-sdk/client-opensearch");
 const { SFN, SFNClient } = require("@aws-sdk/client-sfn");
 const { SSM, SSMClient, PutParameterCommand, GetParameterCommand } = require("@aws-sdk/client-ssm");
@@ -8766,6 +8766,8 @@ exports.handler = async (_event, _ctx) => ({
   hasLambda: typeof Lambda === "function",
   hasLambdaClient: typeof LambdaClient === "function",
   hasInvokeCommand: typeof InvokeCommand === "function",
+  hasListTagsCommand: typeof ListTagsCommand === "function",
+  hasLambdaSend: typeof new Lambda().send === "function",
   hasWaiter: typeof waitUntilFunctionActiveV2 === "function",
   hasOpenSearch: typeof OpenSearch === "function",
   hasOpenSearchClient: typeof OpenSearchClient === "function",
@@ -8784,6 +8786,8 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasLambda"] is True
     assert r["hasLambdaClient"] is True
     assert r["hasInvokeCommand"] is True
+    assert r["hasListTagsCommand"] is True
+    assert r["hasLambdaSend"] is True
     assert r["hasWaiter"] is True
     assert r["hasOpenSearch"] is True
     assert r["hasOpenSearchClient"] is True
@@ -8794,6 +8798,39 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasSSMClient"] is True
     assert r["hasPutParameterCommand"] is True
     assert r["hasGetParameterCommand"] is True
+
+
+def test_nodejs_worker_lambda_send_list_tags_command(lam):
+    """Lambda.send(new ListTagsCommand(...)) round-trips real tags.
+
+    This is the call shape Amplify's AmplifyTableManager custom resource uses
+    (new Lambda(), then .send(new ListTagsCommand({ Resource: arn }))), which
+    needs both the ListTagsCommand class and Lambda.send to exist.
+    """
+    name = f"lambda-list-tags-send-{_uuid_mod.uuid4().hex[:8]}"
+    created = lam.create_function(
+        FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _region_marker_code("one")},
+    )
+    arn = created["FunctionArn"]
+    try:
+        lam.tag_resource(Resource=arn, Tags={"env": "test", "team": "backend"})
+
+        handler_js = """\
+const { Lambda, ListTagsCommand } = require("@aws-sdk/client-lambda");
+exports.handler = async (event) => {
+  const client = new Lambda();
+  const command = new ListTagsCommand({ Resource: event.arn });
+  const resp = await client.send(command);
+  return { tags: resp.Tags };
+};
+"""
+        result = _run_nodejs_worker(handler_js, event_payload={"arn": arn})
+        assert result.get("status") == "ok", f"Invocation failed: {result}"
+        assert result["result"]["tags"]["env"] == "test"
+        assert result["result"]["tags"]["team"] == "backend"
+    finally:
+        lam.delete_function(FunctionName=name)
 
 
 def test_nodejs_worker_opensearch_sdk_v3_stub_uses_rest_json():
