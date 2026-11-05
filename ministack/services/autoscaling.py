@@ -254,7 +254,7 @@ _SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfi
                  "MixedInstancesPolicy parameter.")
 _INSTANCES_DISTRIBUTION_DEFAULTS = {
     "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
-    "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 2,
+    "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price",
 }
 
 
@@ -307,34 +307,55 @@ def _shape_xml(value, shape):
     return escape(str(value))
 
 
-def resolve_mixed_instances_policy(policy):
-    """(policy, error message): the policy as AWS stores it, its launch templates resolved like a group's."""
-    lt = dict(policy.get("LaunchTemplate") or {})
-    spec = lt.get("LaunchTemplateSpecification") or {}
-    resolved, error = resolve_launch_template(spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"),
-                                              spec.get("Version"))
-    if error:
-        return None, error
-    lt["LaunchTemplateSpecification"] = resolved
-    overrides = []
-    for override in lt.get("Overrides") or []:
-        override = dict(override)
-        if override.get("LaunchTemplateSpecification"):
-            o_spec = override["LaunchTemplateSpecification"]
-            o_resolved, error = resolve_launch_template(o_spec.get("LaunchTemplateId"), o_spec.get("LaunchTemplateName"),
-                                                        o_spec.get("Version"))
-            if error:
-                return None, error
-            override["LaunchTemplateSpecification"] = o_resolved
-        overrides.append(override)
-    lt["Overrides"] = overrides
-    distribution = {**_INSTANCES_DISTRIBUTION_DEFAULTS, **(policy.get("InstancesDistribution") or {})}
+def resolve_mixed_instances_policy(policy, stored=None):
+    """(policy, error message): the policy as AWS stores it, its launch templates resolved like a group's.
+    On an update, *stored* is the group's policy and the members not sent are kept from it."""
+    stored = stored or {}
+    sent_lt = policy.get("LaunchTemplate") or {}
+    lt = {**(stored.get("LaunchTemplate") or {}), **sent_lt}
+    if "LaunchTemplateSpecification" in sent_lt or not stored:
+        spec = sent_lt.get("LaunchTemplateSpecification") or {}
+        resolved, error = resolve_launch_template(spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"),
+                                                  spec.get("Version"))
+        if error:
+            return None, error
+        lt["LaunchTemplateSpecification"] = resolved
+    if "Overrides" in sent_lt or not stored:
+        overrides = []
+        for override in sent_lt.get("Overrides") or []:
+            override = dict(override)
+            if override.get("LaunchTemplateSpecification"):
+                o_spec = override["LaunchTemplateSpecification"]
+                o_resolved, error = resolve_launch_template(o_spec.get("LaunchTemplateId"),
+                                                            o_spec.get("LaunchTemplateName"), o_spec.get("Version"))
+                if error:
+                    return None, error
+                override["LaunchTemplateSpecification"] = o_resolved
+            overrides.append(override)
+        lt["Overrides"] = overrides
+    sent = policy.get("InstancesDistribution") or {}
+    distribution = {**_INSTANCES_DISTRIBUTION_DEFAULTS, **(stored.get("InstancesDistribution") or {}), **sent}
+    if distribution.get("SpotMaxPrice") == "":
+        del distribution["SpotMaxPrice"]
+    if distribution["SpotAllocationStrategy"] != "lowest-price":
+        if "SpotInstancePools" in sent:
+            return None, "SpotInstancePools option is only available with the lowest-price allocation strategy."
+        distribution.pop("SpotInstancePools", None)
+    else:
+        distribution.setdefault("SpotInstancePools", 2)
     return {"LaunchTemplate": lt, "InstancesDistribution": distribution}, None
 
 
-def _mixed_instances_policy(p):
+def _mixed_instances_policy(p, stored=None):
     policy = _query_value(p, "MixedInstancesPolicy", _model_shape("MixedInstancesPolicy"))
-    return resolve_mixed_instances_policy(policy) if policy else (None, None)
+    if not policy:
+        return None, None
+    if not stored and not policy.get("LaunchTemplate"):
+        return None, ("A launch template is required when configuring an Auto Scaling group with a mixed instances "
+                      "policy. Add a launch template to the mixed instances policy and try again.")
+    if not stored and not policy["LaunchTemplate"].get("LaunchTemplateSpecification"):
+        return None, "Valid requests must contain either launchTemplateId or LaunchTemplateName"
+    return resolve_mixed_instances_policy(policy, stored)
 
 
 def _has_member(p, name):
@@ -492,7 +513,7 @@ def _update_asg(p):
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
-    mixed, mixed_error = _mixed_instances_policy(p)
+    mixed, mixed_error = _mixed_instances_policy(p, asg.get("MixedInstancesPolicy"))
     if mixed_error:
         return _error("ValidationError", mixed_error)
     if mixed:

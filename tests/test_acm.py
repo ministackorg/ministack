@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 
@@ -152,6 +153,174 @@ def test_acm_update_certificate_options(acm_client):
     pref2 = desc2["Certificate"]["Options"]["CertificateTransparencyLoggingPreference"]
     assert pref2 == "ENABLED"
     acm_client.delete_certificate(CertificateArn=arn)
+
+
+_ENUM_ERROR = ("Value of the input at 'options.{}' failed to satisfy constraint: "
+               "Member must satisfy enum value set: [ENABLED, DISABLED]")
+
+
+def test_acm_request_certificate_stores_options_with_defaults(acm_client):
+    for sent, expected in (
+        ({"CertificateTransparencyLoggingPreference": "ENABLED"}, ("ENABLED", "DISABLED")),
+        ({"CertificateTransparencyLoggingPreference": "DISABLED"}, ("DISABLED", "DISABLED")),
+        ({"Export": "DISABLED"}, ("ENABLED", "DISABLED")),
+        ({}, ("ENABLED", "DISABLED")),
+        (None, ("ENABLED", "DISABLED")),
+    ):
+        kwargs = {} if sent is None else {"Options": sent}
+        arn = acm_client.request_certificate(DomainName="opts.example.com", ValidationMethod="DNS",
+                                             **kwargs)["CertificateArn"]
+        options = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"]
+        assert options == {"CertificateTransparencyLoggingPreference": expected[0], "Export": expected[1]}
+        acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_acm_certificate_options_reject_values_outside_the_enum(acm_client):
+    raw = make_client("acm", {"parameter_validation": False})
+    arn = acm_client.request_certificate(ValidationMethod="DNS", DomainName="opts-enum.example.com")["CertificateArn"]
+    ct, export = _ENUM_ERROR.format("certificateTransparencyLoggingPreference"), _ENUM_ERROR.format("export")
+    for options, message in (
+        ({"CertificateTransparencyLoggingPreference": "BOGUS"}, f"1 validation error detected: {ct}"),
+        ({"CertificateTransparencyLoggingPreference": "disabled"}, f"1 validation error detected: {ct}"),
+        ({"CertificateTransparencyLoggingPreference": ""}, f"1 validation error detected: {ct}"),
+        ({"Export": "disabled"}, f"1 validation error detected: {export}"),
+        ({"Export": "BOGUS"}, f"1 validation error detected: {export}"),
+        ({"Export": ""}, f"1 validation error detected: {export}"),
+        ({"CertificateTransparencyLoggingPreference": "BOGUS", "Export": "BOGUS"},
+         f"2 validation errors detected: {ct}; {export}"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            raw.request_certificate(ValidationMethod="DNS", DomainName="opts-enum.example.com", Options=options)
+        assert exc.value.response["Error"] == {"Code": "ValidationException", "Message": message}
+        # Checked before the certificate lookup: an unknown ARN gets the same error.
+        unknown = (arn.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000",) if options == {"CertificateTransparencyLoggingPreference": "BOGUS"} else ()
+        for target in (arn, *unknown):
+            with pytest.raises(ClientError) as exc:
+                raw.update_certificate_options(CertificateArn=target, Options=options)
+            assert exc.value.response["Error"] == {"Code": "ValidationException", "Message": message}
+    with pytest.raises(ClientError) as exc:
+        raw.update_certificate_options(CertificateArn=arn)
+    assert exc.value.response["Error"] == {
+        "Code": "ValidationException",
+        "Message": "1 validation error detected: Value null at 'options' failed to satisfy constraint: "
+                   "Member must not be null",
+    }
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == {
+        "CertificateTransparencyLoggingPreference": "ENABLED", "Export": "DISABLED"}
+    acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_acm_update_certificate_options_keeps_omitted_options_and_export(acm_client):
+    arn = acm_client.request_certificate(
+        ValidationMethod="DNS",
+        DomainName="opts-merge.example.com",
+        Options={"CertificateTransparencyLoggingPreference": "DISABLED"},
+    )["CertificateArn"]
+    expected = {"CertificateTransparencyLoggingPreference": "DISABLED", "Export": "DISABLED"}
+    for options in ({"Export": "DISABLED"}, {}):
+        acm_client.update_certificate_options(CertificateArn=arn, Options=options)
+        assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == expected
+    for options in ({"Export": "ENABLED"},
+                    {"CertificateTransparencyLoggingPreference": "ENABLED", "Export": "ENABLED"}):
+        with pytest.raises(ClientError) as exc:
+            acm_client.update_certificate_options(CertificateArn=arn, Options=options)
+        assert exc.value.response["Error"] == {
+            "Code": "ValidationException", "Message": "Export option for certificates cannot be updated"}
+        assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == expected
+    acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_acm_imported_certificate_options(acm_client):
+    fake_cert = b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"
+    fake_key = b"-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----"
+    arn = acm_client.import_certificate(Certificate=fake_cert, PrivateKey=fake_key)["CertificateArn"]
+    expected = {"CertificateTransparencyLoggingPreference": "DISABLED", "Export": "DISABLED"}
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == expected
+    for options in ({"CertificateTransparencyLoggingPreference": "DISABLED"},
+                    {"Export": "ENABLED"}, {"Export": "DISABLED"}):
+        with pytest.raises(ClientError) as exc:
+            acm_client.update_certificate_options(CertificateArn=arn, Options=options)
+        assert exc.value.response["Error"] == {
+            "Code": "InvalidStateException",
+            "Message": "The UpdateCertificateOptions command is not permitted for imported certificates.",
+        }
+    raw = make_client("acm", {"parameter_validation": False})
+    for options in ({}, {"CertificateTransparencyLoggingPreference": None},
+                    {"CertificateTransparencyLoggingPreference": None, "Export": None}):
+        raw.update_certificate_options(CertificateArn=arn, Options=options)
+    acm_client.import_certificate(CertificateArn=arn, Certificate=fake_cert, PrivateKey=fake_key)
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == expected
+    acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_acm_certificate_options_null_members_count_as_not_sent(acm_client):
+    raw = make_client("acm", {"parameter_validation": False})
+    for sent, expected in (
+        ({"CertificateTransparencyLoggingPreference": None}, ("ENABLED", "DISABLED")),
+        ({"Export": None}, ("ENABLED", "DISABLED")),
+        ({"CertificateTransparencyLoggingPreference": "DISABLED", "Export": None}, ("DISABLED", "DISABLED")),
+    ):
+        arn = raw.request_certificate(ValidationMethod="DNS", DomainName="opts-null.example.com", Options=sent)["CertificateArn"]
+        options = acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"]
+        assert options == {"CertificateTransparencyLoggingPreference": expected[0], "Export": expected[1]}
+        acm_client.delete_certificate(CertificateArn=arn)
+    arn = acm_client.request_certificate(
+        ValidationMethod="DNS",
+        DomainName="opts-null.example.com", Options={"CertificateTransparencyLoggingPreference": "DISABLED"},
+    )["CertificateArn"]
+    for options in ({"CertificateTransparencyLoggingPreference": None},
+                    {"Export": None},
+                    {"CertificateTransparencyLoggingPreference": None, "Export": "DISABLED"}):
+        raw.update_certificate_options(CertificateArn=arn, Options=options)
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == {
+        "CertificateTransparencyLoggingPreference": "DISABLED", "Export": "DISABLED"}
+    acm_client.delete_certificate(CertificateArn=arn)
+
+
+def test_acm_request_certificate_domain_name_errors_combine_with_options_errors(acm_client):
+    raw = make_client("acm", {"parameter_validation": False})
+    null = "Value null at 'domainName' failed to satisfy constraint: Member must not be null"
+    empty = ("Value of the input at 'domainName' failed to satisfy constraint: Member must satisfy regular "
+             "expression pattern: (\\*\\.)?(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}"
+             "[A-Za-z0-9]); Value of the input at 'domainName' failed to satisfy constraint: Member must have "
+             "length greater than or equal to 1")
+    ct, export = _ENUM_ERROR.format("certificateTransparencyLoggingPreference"), _ENUM_ERROR.format("export")
+    bogus = {"CertificateTransparencyLoggingPreference": "BOGUS"}
+    for kwargs, message in (
+        ({}, f"1 validation error detected: {null}"),
+        ({"DomainName": None}, f"1 validation error detected: {null}"),
+        ({"Options": bogus}, f"2 validation errors detected: {null}; {ct}"),
+        ({"Options": {**bogus, "Export": "BOGUS"}}, f"3 validation errors detected: {null}; {ct}; {export}"),
+        ({"DomainName": ""}, f"2 validation errors detected: {empty}"),
+        ({"DomainName": "", "Options": bogus}, f"3 validation errors detected: {empty}; {ct}"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            raw.request_certificate(ValidationMethod="DNS", **kwargs)
+        assert exc.value.response["Error"] == {"Code": "ValidationException", "Message": message}
+
+
+def test_acm_exportable_certificate_options(acm_client):
+    both = acm_client.request_certificate(
+        ValidationMethod="DNS",
+        DomainName="opts-export.example.com",
+        Options={"CertificateTransparencyLoggingPreference": "DISABLED", "Export": "ENABLED"},
+    )["CertificateArn"]
+    assert acm_client.describe_certificate(CertificateArn=both)["Certificate"]["Options"] == {
+        "CertificateTransparencyLoggingPreference": "DISABLED", "Export": "ENABLED"}
+    acm_client.delete_certificate(CertificateArn=both)
+    arn = acm_client.request_certificate(ValidationMethod="DNS", DomainName="opts-export.example.com",
+                                         Options={"Export": "ENABLED"})["CertificateArn"]
+    expected = {"CertificateTransparencyLoggingPreference": "ENABLED", "Export": "ENABLED"}
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == expected
+    with pytest.raises(ClientError) as exc:
+        acm_client.update_certificate_options(CertificateArn=arn, Options={"Export": "DISABLED"})
+    assert exc.value.response["Error"] == {
+        "Code": "ValidationException", "Message": "Export option for certificates cannot be updated"}
+    for options in ({"Export": "ENABLED"}, {}):
+        acm_client.update_certificate_options(CertificateArn=arn, Options=options)
+    assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == expected
+    acm_client.delete_certificate(CertificateArn=arn)
+
 
 def test_acm_renew_certificate(acm_client):
     arn = acm_client.request_certificate(DomainName="renew.example.com")["CertificateArn"]
@@ -390,7 +559,7 @@ def test_acm_certificate_arn_operations_reject_out_of_scope_arns(acm_service_mod
 
     cert = _json_body(mod._describe_certificate({"CertificateArn": good_arn}))["Certificate"]
     assert cert["CertificateArn"] == good_arn
-    assert cert["Options"] == {}
+    assert cert["Options"] == {"CertificateTransparencyLoggingPreference": "ENABLED", "Export": "DISABLED"}
     assert cert["Tags"] == []
 
 
@@ -701,3 +870,197 @@ def test_acm_certificates_are_region_isolated(acm_client):
         assert arn not in west
     finally:
         acm_client.delete_certificate(CertificateArn=arn)
+
+
+_CT, _EX, _VM = "CertificateTransparencyLoggingPreference", "Export", "ValidationMethod"
+_LIST = "Start of list found where not expected"
+_MAP = "Start of structure or map found where not expected."
+_NUMBER = "NUMBER_VALUE can not be converted to a String"
+_TRUE = "TRUE_VALUE can not be converted to a String"
+_FALSE = "FALSE_VALUE can not be converted to a String"
+def _same(value, *candidates):
+    # Compare as JSON, so True and 1 differ.
+    return any(json.dumps(value) == json.dumps(c) for c in candidates)
+
+
+_MEMBER_TYPES = ((False, _FALSE), (True, _TRUE), (1, _NUMBER), (1.5, _NUMBER), ([], _LIST), (["ENABLED"], _LIST),
+                 ({}, _MAP))
+
+
+@pytest.mark.parametrize("options, message, on_update", [
+    ("ENABLED", "Expected null", True),
+    (1, "Expected null", True),
+    (1.5, "Expected null", True),
+    (True, "Expected null", True),
+    (False, "Expected null", True),
+    ([], _LIST, True),
+    *[({_CT: v}, m, True) for v, m in _MEMBER_TYPES],
+    *[({_EX: v}, m, True) for v, m in _MEMBER_TYPES],
+    *[({_VM: v}, m, False) for v, m in _MEMBER_TYPES if v != ["ENABLED"]],
+    # Members are checked in model order, and before enum values.
+    ({_EX: True, _CT: 1}, _NUMBER, True),
+    ({_CT: 1, _EX: "BOGUS"}, _NUMBER, True),
+    ({_CT: "BOGUS", _EX: 1}, _NUMBER, False),
+    ({_VM: 1, _CT: True}, _TRUE, False),
+    ({_EX: True, _VM: 1}, _TRUE, False),
+    ({_VM: [], _EX: True}, _TRUE, False),
+    *[(dict(order), _NUMBER, False) for order in itertools.permutations(((_CT, 1), (_EX, True), (_VM, [])))],
+])
+def test_acm_certificate_options_that_are_not_an_object_fail_to_deserialize(acm_service_module, options, message,
+                                                                             on_update):
+    mod = acm_service_module
+    arn = _json_body(mod._request_certificate({"ValidationMethod": "DNS", "DomainName": "opts-type.example.com"}))["CertificateArn"]
+    responses = [mod._request_certificate({"ValidationMethod": "DNS", "DomainName": "opts-type.example.com", "Options": options})]
+    if on_update:
+        responses.append(mod._update_options({"CertificateArn": arn, "Options": options}))
+    unknown = arn.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000"
+    # Checked before DomainName and before the certificate lookup.
+    if _same(options, "ENABLED", {_CT: 1}):
+        responses.append(mod._request_certificate({"ValidationMethod": "DNS", "Options": options}))
+    if _same(options, []):
+        responses.append(mod._request_certificate({"ValidationMethod": "DNS", "DomainName": "", "Options": options}))
+    if _same(options, "ENABLED", [], {_CT: 1}, {_VM: 1}):
+        responses.append(mod._update_options({"CertificateArn": unknown, "Options": options}))
+    if _same(options, "ENABLED"):
+        responses.append(mod._update_options({"Options": "x"}))
+        responses.append(mod._update_options({"CertificateArn": None, "Options": options}))
+    for resp in responses:
+        assert resp[0] == 400
+        assert _json_body(resp) == {"__type": "SerializationException", "Message": message}
+    assert list(mod._certificates.keys()) == [arn]
+
+
+# The Options each DomainName type was sent with: a string Options and a mistyped logging preference.
+@pytest.mark.parametrize("domain, message, with_options", [
+    (1, _NUMBER, ("ENABLED", {_CT: True})), (1.5, _NUMBER, ("ENABLED", {_CT: 1})), (True, _TRUE, ("ENABLED", {_CT: 1})),
+    (False, _FALSE, ("ENABLED", {_CT: 1})), ([], _LIST, ("ENABLED", {_CT: 1})), (["a.example.com"], _LIST, ()),
+    ({}, _MAP, ("ENABLED", {_CT: 1})),
+])
+def test_acm_request_certificate_domain_name_of_another_type_fails_to_deserialize(acm_service_module, domain,
+                                                                                    message, with_options):
+    mod = acm_service_module
+    for data in ({"DomainName": domain}, *({"DomainName": domain, "Options": o} for o in with_options)):
+        resp = mod._request_certificate({"ValidationMethod": "DNS", **data})
+        assert resp[0] == 400
+        assert _json_body(resp) == {"__type": "SerializationException", "Message": message}
+    assert not mod._certificates
+
+
+def test_acm_update_certificate_options_needs_a_certificate_arn(acm_service_module):
+    mod = acm_service_module
+    null_arn = "Value null at 'certificateArn' failed to satisfy constraint: Member must not be null"
+    null_options = "Value null at 'options' failed to satisfy constraint: Member must not be null"
+    ct = _ENUM_ERROR.format("certificateTransparencyLoggingPreference")
+    for data, message in (
+        ({"Options": {_CT: "BOGUS"}}, f"2 validation errors detected: {null_arn}; {ct}"),
+        ({}, f"2 validation errors detected: {null_arn}; {null_options}"),
+        ({"Options": {_CT: None}}, f"1 validation error detected: {null_arn}"),
+    ):
+        resp = mod._update_options(data)
+        assert resp[0] == 400
+        assert _json_body(resp) == {"__type": "ValidationException", "message": message}
+
+
+def test_acm_update_certificate_options_with_nothing_to_change_skips_the_lookup(acm_service_module):
+    mod = acm_service_module
+    arn = _json_body(mod._request_certificate({"ValidationMethod": "DNS", "DomainName": "noop.example.com"}))["CertificateArn"]
+    zero = "00000000-0000-0000-0000-000000000000"
+    for target in (arn.rsplit("/", 1)[0] + "/" + zero,
+                   f"arn:aws:acm:us-east-1:123456789012:certificate/{zero}",
+                   f"arn:aws:acm:eu-west-1:000000000000:certificate/{zero}",
+                   f"arn:aws-cn:acm:cn-north-1:000000000000:certificate/{zero}",
+                   f"arn:aws:acm:us-east-1:000000000000:foo/{zero}"):
+        resp = mod._update_options({"CertificateArn": target, "Options": {}})
+        assert resp[0] == 200, target
+    unknown = arn.rsplit("/", 1)[0] + "/" + zero
+    for options in ({_CT: None}, {_CT: None, _EX: None}, {_VM: None}, {"Foo": "x"}, {_CT: None, "Foo": "x"}):
+        resp = mod._update_options({"CertificateArn": unknown, "Options": options})
+        assert resp[0] == 200, options
+    for options in ({_VM: "DNS"}, {_EX: "DISABLED"}, {_CT: "ENABLED"}):
+        resp = mod._update_options({"CertificateArn": unknown, "Options": options})
+        assert resp[0] == 400
+        assert _error_code(resp) == "ResourceNotFoundException"
+    disabled = _json_body(mod._request_certificate({"ValidationMethod": "DNS", "DomainName": "noop.example.com",
+                                                    "Options": {_CT: "DISABLED"}}))["CertificateArn"]
+    resp = mod._update_options({"CertificateArn": disabled, "Options": {"Foo": "x", _EX: "DISABLED"}})
+    assert resp[0] == 200
+    assert _json_body(mod._describe_certificate({"CertificateArn": disabled}))["Certificate"]["Options"] == {
+        _CT: "DISABLED", _EX: "DISABLED"}
+
+
+def test_acm_certificate_options_validation_method(acm_client, acm_service_module):
+    raw = make_client("acm", {"parameter_validation": False})
+    vm = ("Value of the input at 'options.validationMethod' failed to satisfy constraint: "
+          "Member must satisfy enum value set: [HTTP, DNS, EMAIL]")
+    ct, export = _ENUM_ERROR.format("certificateTransparencyLoggingPreference"), _ENUM_ERROR.format("export")
+    null = "Value null at 'domainName' failed to satisfy constraint: Member must not be null"
+    for kwargs, message in (
+        ({"Options": {_VM: "BOGUS"}}, f"1 validation error detected: {vm}"),
+        ({"Options": {_VM: "dns"}}, f"1 validation error detected: {vm}"),
+        ({"Options": {_VM: ""}}, f"1 validation error detected: {vm}"),
+        ({"Options": {_CT: "BOGUS", _VM: "BOGUS"}}, f"2 validation errors detected: {vm}; {ct}"),
+        ({"Options": {_VM: "BOGUS", _EX: "BOGUS"}}, f"2 validation errors detected: {vm}; {export}"),
+        ({"Options": {_CT: "BOGUS", _EX: "BOGUS", _VM: "BOGUS"}}, f"3 validation errors detected: {vm}; {ct}; {export}"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            raw.request_certificate(DomainName="opts-vm.example.com", ValidationMethod="DNS", **kwargs)
+        assert exc.value.response["Error"] == {"Code": "ValidationException", "Message": message}
+    with pytest.raises(ClientError) as exc:
+        raw.request_certificate(ValidationMethod="DNS", Options={_VM: "BOGUS"})
+    assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                           "Message": f"2 validation errors detected: {null}; {vm}"}
+    # Accepted, and not shown by DescribeCertificate.
+    for options in ({_VM: "DNS"}, {_VM: None}, {_VM: "EMAIL"}, {_VM: "HTTP"}):
+        arn = raw.request_certificate(DomainName="opts-vm.example.com", ValidationMethod="DNS",
+                                      Options=options)["CertificateArn"]
+        assert acm_client.describe_certificate(CertificateArn=arn)["Certificate"]["Options"] == {
+            _CT: "ENABLED", _EX: "DISABLED"}
+        acm_client.delete_certificate(CertificateArn=arn)
+    # Unknown members are ignored (in-process: boto3 drops members the model doesn't have).
+    mod = acm_service_module
+    for options, expected in (({"Foo": "x"}, "ENABLED"), ({_CT: "DISABLED", "Foo": 1}, "DISABLED")):
+        arn = _json_body(mod._request_certificate({"ValidationMethod": "DNS", "DomainName": "opts-vm.example.com", "Options": options}))[
+            "CertificateArn"]
+        assert _json_body(mod._describe_certificate({"CertificateArn": arn}))["Certificate"]["Options"] == {
+            _CT: expected, _EX: "DISABLED"}
+
+    arn = acm_client.request_certificate(ValidationMethod="DNS", DomainName="opts-vm.example.com")["CertificateArn"]
+    for target in (arn, arn.rsplit("/", 1)[0] + "/00000000-0000-0000-0000-000000000000"):
+        with pytest.raises(ClientError) as exc:
+            raw.update_certificate_options(CertificateArn=target, Options={_VM: "BOGUS"})
+        assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                               "Message": f"1 validation error detected: {vm}"}
+    with pytest.raises(ClientError) as exc:
+        raw.update_certificate_options(CertificateArn=arn, Options={_CT: "BOGUS", _VM: "BOGUS"})
+    assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                           "Message": f"2 validation errors detected: {vm}; {ct}"}
+    # On a requested certificate, the Export check comes before anything ValidationMethod does.
+    with pytest.raises(ClientError) as exc:
+        raw.update_certificate_options(CertificateArn=arn, Options={_VM: "DNS", _EX: "ENABLED"})
+    assert exc.value.response["Error"] == {
+        "Code": "ValidationException", "Message": "Export option for certificates cannot be updated"}
+    acm_client.delete_certificate(CertificateArn=arn)
+
+    fake_cert = b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"
+    fake_key = b"-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----"
+    iarn = acm_client.import_certificate(Certificate=fake_cert, PrivateKey=fake_key)["CertificateArn"]
+    with pytest.raises(ClientError) as exc:
+        raw.update_certificate_options(CertificateArn=iarn, Options={_VM: "BOGUS"})
+    assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                           "Message": f"1 validation error detected: {vm}"}
+    for options in ({_VM: "DNS"}, {_VM: "EMAIL"}, {_VM: "HTTP"}, {_VM: "DNS", _CT: None}):
+        with pytest.raises(ClientError) as exc:
+            raw.update_certificate_options(CertificateArn=iarn, Options=options)
+        assert exc.value.response["Error"] == {
+            "Code": "ValidationException", "Message": "UpdateCertificate can only be used for public certificates."}
+    for options in ({_CT: "ENABLED", _VM: "DNS"}, {_EX: "DISABLED", _VM: "DNS"}, {_EX: "ENABLED", _VM: "DNS"},
+                    {_VM: None, _CT: "ENABLED"}):
+        with pytest.raises(ClientError) as exc:
+            raw.update_certificate_options(CertificateArn=iarn, Options=options)
+        assert exc.value.response["Error"] == {
+            "Code": "InvalidStateException",
+            "Message": "The UpdateCertificateOptions command is not permitted for imported certificates.",
+        }
+    assert acm_client.describe_certificate(CertificateArn=iarn)["Certificate"]["Options"] == {
+        _CT: "DISABLED", _EX: "DISABLED"}
+    acm_client.delete_certificate(CertificateArn=iarn)
