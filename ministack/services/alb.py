@@ -45,6 +45,7 @@ from ministack.core.responses import (
     get_region,
     get_request_client_ip,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("alb")
@@ -1605,9 +1606,22 @@ async def handle_request(method, path, headers, body, query_params):
 # Data-plane: host/name lookup
 # ---------------------------------------------------------------------------
 
+def _lbs_in_every_tenant():
+    """Every load balancer in every account and region, for the unsigned data plane.
+
+    The request's own tenant comes first (for an unsigned request, the default account
+    and MINISTACK_REGION), so a name that exists in several tenants resolves there; the
+    rest follow in the order MiniStack stored them.
+    """
+    own = (get_account_id(), get_region())
+    items = _lbs.all_items()
+    return ([lb for (account, region, _), lb in items if (account, region) == own]
+            + [lb for (account, region, _), lb in items if (account, region) != own])
+
+
 def find_lb_for_host(host):
     hostname = host.split(":")[0].lower()
-    for lb in _lbs.values():
+    for lb in _lbs_in_every_tenant():
         if lb["DNSName"].lower() == hostname:
             return lb
         if hostname == f"{lb['LoadBalancerName'].lower()}.alb.localhost":
@@ -1652,7 +1666,7 @@ def _find_lb_for_alias_record(hostname):
 
 def _find_lb_by_name(name):
     name_lc = name.lower()
-    for lb in _lbs.values():
+    for lb in _lbs_in_every_tenant():
         if lb["LoadBalancerName"].lower() == name_lc:
             return lb
     return None
@@ -2501,8 +2515,28 @@ def _with_alb_server(response, listener_arn=None):
     return status, {**headers, "Server": "awselb/2.0"}, body
 
 
+def _lb_scope(lb):
+    """Pins the load balancer's own account and region. A data-plane request may have found it
+    in another tenant; its listeners, rules and target groups live in its own."""
+    owner = parse_arn(lb["LoadBalancerArn"])
+    return request_scope(owner.account_id, owner.region)
+
+
+def listeners_of(lb):
+    """The load balancer's listeners, read in its own account and region."""
+    with _lb_scope(lb):
+        return [l for l in _listeners.values() if l["LoadBalancerArn"] == lb["LoadBalancerArn"]]
+
+
 async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None,
                            raw_query_string=None, raw_path=None):
+    with _lb_scope(lb):
+        return await _dispatch_request(lb, method, path, headers, body, query_params, port, client_ip,
+                                       raw_query_string, raw_path)
+
+
+async def _dispatch_request(lb, method, path, headers, body, query_params, port, client_ip,
+                            raw_query_string, raw_path):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]

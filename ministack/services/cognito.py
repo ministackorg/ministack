@@ -508,6 +508,7 @@ _user_pools = AccountRegionScopedDict()
 #   _identity_providers: {provider_name -> provider_dict},
 #   _resource_servers: {identifier -> resource_server_dict},
 #   _ui_customizations: {client_id or ALL -> UICustomizationType},
+#   _managed_login_brandings: {branding_id -> branding_dict},
 # }
 
 _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
@@ -2860,6 +2861,12 @@ async def _dispatch_idp(action: str, data: dict):
         "UpdateUserPoolClient": _update_user_pool_client,
         "GetUICustomization": _get_ui_customization,
         "SetUICustomization": _set_ui_customization,
+        # Managed login branding
+        "CreateManagedLoginBranding": _create_managed_login_branding,
+        "DescribeManagedLoginBranding": _describe_managed_login_branding,
+        "DescribeManagedLoginBrandingByClient": _describe_managed_login_branding_by_client,
+        "UpdateManagedLoginBranding": _update_managed_login_branding,
+        "DeleteManagedLoginBranding": _delete_managed_login_branding,
         # Resource Servers
         "CreateResourceServer": _create_resource_server,
         "UpdateResourceServer": _update_resource_server,
@@ -3451,6 +3458,468 @@ def _get_ui_customization(data):
         return err
     ui = pool.get("_ui_customizations", {})
     return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {}})
+
+
+# ---------------------------------------------------------------------------
+# Managed login branding
+# ---------------------------------------------------------------------------
+# One branding per app client, kept on the pool, so it outlives the client it
+# was made for, as on AWS. The checks run in the order AWS ran them in
+# eu-west-2 on 2026-11-04. The hosted UI ministack serves is its own and
+# does not render a branding.
+
+# The managed login style AWS answers for a branding that uses Cognito's values.
+# DescribeManagedLoginBranding with ReturnMergedResources returns these settings
+# with a branding's own merged over them. Captured from
+# DescribeManagedLoginBranding in eu-west-2 on 2026-11-04.
+DEFAULT_SETTINGS = {'components': {'secondaryButton': {'lightMode': {'hover': {'backgroundColor': 'f2f8fdff',
+                                                            'borderColor': '033160ff',
+                                                            'textColor': '033160ff'},
+                                                  'defaults': {'backgroundColor': 'ffffffff',
+                                                               'borderColor': '0972d3ff',
+                                                               'textColor': '0972d3ff'},
+                                                  'active': {'backgroundColor': 'd3e7f9ff',
+                                                             'borderColor': '033160ff',
+                                                             'textColor': '033160ff'}},
+                                    'darkMode': {'hover': {'backgroundColor': '192534ff',
+                                                           'borderColor': '89bdeeff',
+                                                           'textColor': '89bdeeff'},
+                                                 'defaults': {'backgroundColor': '0f1b2aff',
+                                                              'borderColor': '539fe5ff',
+                                                              'textColor': '539fe5ff'},
+                                                 'active': {'backgroundColor': '354150ff',
+                                                            'borderColor': '89bdeeff',
+                                                            'textColor': '89bdeeff'}}},
+                'form': {'lightMode': {'backgroundColor': 'ffffffff', 'borderColor': 'c6c6cdff'},
+                         'borderRadius': 8.0,
+                         'backgroundImage': {'enabled': False},
+                         'logo': {'location': 'CENTER',
+                                  'position': 'TOP',
+                                  'enabled': False,
+                                  'formInclusion': 'IN'},
+                         'darkMode': {'backgroundColor': '0f1b2aff', 'borderColor': '424650ff'}},
+                'alert': {'lightMode': {'error': {'backgroundColor': 'fff7f7ff',
+                                                  'borderColor': 'd91515ff'}},
+                          'borderRadius': 12.0,
+                          'darkMode': {'error': {'backgroundColor': '1a0000ff',
+                                                 'borderColor': 'eb6f6fff'}}},
+                'favicon': {'enabledTypes': ['ICO', 'SVG']},
+                'pageBackground': {'image': {'enabled': True},
+                                   'lightMode': {'color': 'ffffffff'},
+                                   'darkMode': {'color': '0f1b2aff'}},
+                'pageText': {'lightMode': {'bodyColor': '414d5cff',
+                                           'headingColor': '000716ff',
+                                           'descriptionColor': '414d5cff'},
+                             'darkMode': {'bodyColor': 'b6bec9ff',
+                                          'headingColor': 'd1d5dbff',
+                                          'descriptionColor': 'b6bec9ff'}},
+                'phoneNumberSelector': {'displayType': 'TEXT'},
+                'primaryButton': {'lightMode': {'hover': {'backgroundColor': '033160ff',
+                                                          'textColor': 'ffffffff'},
+                                                'defaults': {'backgroundColor': '0972d3ff',
+                                                             'textColor': 'ffffffff'},
+                                                'active': {'backgroundColor': '033160ff',
+                                                           'textColor': 'ffffffff'},
+                                                'disabled': {'backgroundColor': 'ffffffff',
+                                                             'borderColor': 'ffffffff'}},
+                                  'darkMode': {'hover': {'backgroundColor': '89bdeeff',
+                                                         'textColor': '000716ff'},
+                                               'defaults': {'backgroundColor': '539fe5ff',
+                                                            'textColor': '000716ff'},
+                                               'active': {'backgroundColor': '539fe5ff',
+                                                          'textColor': '000716ff'},
+                                               'disabled': {'backgroundColor': 'ffffffff',
+                                                            'borderColor': 'ffffffff'}}},
+                'pageFooter': {'lightMode': {'borderColor': 'd5dbdbff',
+                                             'background': {'color': 'fafafaff'}},
+                               'backgroundImage': {'enabled': False},
+                               'logo': {'location': 'START', 'enabled': False},
+                               'darkMode': {'borderColor': '424650ff',
+                                            'background': {'color': '0f141aff'}}},
+                'pageHeader': {'lightMode': {'borderColor': 'd5dbdbff',
+                                             'background': {'color': 'fafafaff'}},
+                               'backgroundImage': {'enabled': False},
+                               'logo': {'location': 'START', 'enabled': False},
+                               'darkMode': {'borderColor': '424650ff',
+                                            'background': {'color': '0f141aff'}}},
+                'idpButton': {'standard': {'lightMode': {'hover': {'backgroundColor': 'f2f8fdff',
+                                                                   'borderColor': '033160ff',
+                                                                   'textColor': '033160ff'},
+                                                         'defaults': {'backgroundColor': 'ffffffff',
+                                                                      'borderColor': '424650ff',
+                                                                      'textColor': '424650ff'},
+                                                         'active': {'backgroundColor': 'd3e7f9ff',
+                                                                    'borderColor': '033160ff',
+                                                                    'textColor': '033160ff'}},
+                                           'darkMode': {'hover': {'backgroundColor': '192534ff',
+                                                                  'borderColor': '89bdeeff',
+                                                                  'textColor': '89bdeeff'},
+                                                        'defaults': {'backgroundColor': '0f1b2aff',
+                                                                     'borderColor': 'c6c6cdff',
+                                                                     'textColor': 'c6c6cdff'},
+                                                        'active': {'backgroundColor': '354150ff',
+                                                                   'borderColor': '89bdeeff',
+                                                                   'textColor': '89bdeeff'}}},
+                              'custom': {}}},
+ 'componentClasses': {'dropDown': {'lightMode': {'hover': {'itemBackgroundColor': 'f4f4f4ff',
+                                                           'itemBorderColor': '7d8998ff',
+                                                           'itemTextColor': '000716ff'},
+                                                 'defaults': {'itemBackgroundColor': 'ffffffff'},
+                                                 'match': {'itemBackgroundColor': '414d5cff',
+                                                           'itemTextColor': '0972d3ff'}},
+                                   'borderRadius': 8.0,
+                                   'darkMode': {'hover': {'itemBackgroundColor': '081120ff',
+                                                          'itemBorderColor': '5f6b7aff',
+                                                          'itemTextColor': 'e9ebedff'},
+                                                'defaults': {'itemBackgroundColor': '192534ff'},
+                                                'match': {'itemBackgroundColor': 'd1d5dbff',
+                                                          'itemTextColor': '89bdeeff'}}},
+                      'input': {'lightMode': {'defaults': {'backgroundColor': 'ffffffff',
+                                                           'borderColor': '7d8998ff'},
+                                              'placeholderColor': '5f6b7aff'},
+                                'borderRadius': 8.0,
+                                'darkMode': {'defaults': {'backgroundColor': '0f1b2aff',
+                                                          'borderColor': '5f6b7aff'},
+                                             'placeholderColor': '8d99a8ff'}},
+                      'inputDescription': {'lightMode': {'textColor': '5f6b7aff'},
+                                           'darkMode': {'textColor': '8d99a8ff'}},
+                      'buttons': {'borderRadius': 8.0},
+                      'optionControls': {'lightMode': {'defaults': {'backgroundColor': 'ffffffff',
+                                                                    'borderColor': '7d8998ff'},
+                                                       'selected': {'backgroundColor': '0972d3ff',
+                                                                    'foregroundColor': 'ffffffff'}},
+                                         'darkMode': {'defaults': {'backgroundColor': '0f1b2aff',
+                                                                   'borderColor': '7d8998ff'},
+                                                      'selected': {'backgroundColor': '539fe5ff',
+                                                                   'foregroundColor': '000716ff'}}},
+                      'statusIndicator': {'lightMode': {'success': {'backgroundColor': 'f2fcf3ff',
+                                                                    'borderColor': '037f0cff',
+                                                                    'indicatorColor': '037f0cff'},
+                                                        'pending': {'indicatorColor': 'AAAAAAAA'},
+                                                        'warning': {'backgroundColor': 'fffce9ff',
+                                                                    'borderColor': '8d6605ff',
+                                                                    'indicatorColor': '8d6605ff'},
+                                                        'error': {'backgroundColor': 'fff7f7ff',
+                                                                  'borderColor': 'd91515ff',
+                                                                  'indicatorColor': 'd91515ff'}},
+                                          'darkMode': {'success': {'backgroundColor': '001a02ff',
+                                                                   'borderColor': '29ad32ff',
+                                                                   'indicatorColor': '29ad32ff'},
+                                                       'pending': {'indicatorColor': 'AAAAAAAA'},
+                                                       'warning': {'backgroundColor': '1d1906ff',
+                                                                   'borderColor': 'e0ca57ff',
+                                                                   'indicatorColor': 'e0ca57ff'},
+                                                       'error': {'backgroundColor': '1a0000ff',
+                                                                 'borderColor': 'eb6f6fff',
+                                                                 'indicatorColor': 'eb6f6fff'}}},
+                      'divider': {'lightMode': {'borderColor': 'ebebf0ff'},
+                                  'darkMode': {'borderColor': '232b37ff'}},
+                      'idpButtons': {'icons': {'enabled': True}},
+                      'focusState': {'lightMode': {'borderColor': '0972d3ff'},
+                                     'darkMode': {'borderColor': '539fe5ff'}},
+                      'inputLabel': {'lightMode': {'textColor': '000716ff'},
+                                     'darkMode': {'textColor': 'd1d5dbff'}},
+                      'link': {'lightMode': {'hover': {'textColor': '033160ff'},
+                                             'defaults': {'textColor': '0972d3ff'}},
+                               'darkMode': {'hover': {'textColor': '89bdeeff'},
+                                            'defaults': {'textColor': '539fe5ff'}}}},
+ 'categories': {'form': {'sessionTimerDisplay': 'NONE',
+                         'instructions': {'enabled': False},
+                         'languageSelector': {'enabled': False},
+                         'displayGraphics': True,
+                         'location': {'horizontal': 'CENTER', 'vertical': 'CENTER'}},
+                'auth': {'federation': {'interfaceStyle': 'BUTTON_LIST', 'order': []},
+                         'authMethodOrder': [[{'display': 'BUTTON', 'type': 'FEDERATED'},
+                                              {'display': 'INPUT', 'type': 'USERNAME_PASSWORD'}]]},
+                'global': {'colorSchemeMode': 'LIGHT',
+                           'pageFooter': {'enabled': False},
+                           'pageHeader': {'enabled': False},
+                           'spacingDensity': 'REGULAR'},
+                'signUp': {'acceptanceElements': [{'enforcement': 'NONE', 'textKey': 'en'}]}}}
+
+_BRANDING_CATEGORIES = (
+    "PAGE_FOOTER_BACKGROUND", "SMS_GRAPHIC", "PASSWORD_GRAPHIC", "EMAIL_GRAPHIC", "FORM_LOGO",
+    "FORM_BACKGROUND", "FAVICON_ICO", "PAGE_HEADER_LOGO", "PAGE_HEADER_BACKGROUND",
+    "AUTH_APP_GRAPHIC", "PASSKEY_GRAPHIC", "FAVICON_SVG", "IDP_BUTTON_ICON", "PAGE_BACKGROUND",
+    "PAGE_FOOTER_LOGO",
+)
+_BRANDING_COLOR_MODES = ("DARK", "LIGHT", "DYNAMIC")
+_BRANDING_EXTENSIONS = ("SVG", "JPEG", "PNG", "ICO", "WEBP")
+_BRANDING_FAVICON_EXTENSIONS = {"FAVICON_ICO": "ICO", "FAVICON_SVG": "SVG"}
+_BRANDING_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[4][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+_BRANDING_VALUES_ERROR = "useCognitoProvidedValues or settings should be specified (but not both)"
+_BRANDING_NOT_FOUND = "ManagedLoginBranding does not exist."
+
+
+def _branding_invalid(message):
+    return error_response_json("InvalidParameterException", message, 400)
+
+
+def _branding_request_error(data, requires_id=False):
+    """AWS's request validation, which answers ahead of every other check: the
+    id's pattern, then each asset's extension, color mode and category."""
+    bid = data.get("ManagedLoginBrandingId")
+    if requires_id and bid is None:
+        return _branding_invalid("1 validation error detected: Value null at 'managedLoginBrandingId' failed to "
+                                 "satisfy constraint: Member must not be null")
+    if bid is not None and not (isinstance(bid, str) and _BRANDING_ID_RE.match(bid)):
+        return _branding_invalid(
+            f"1 validation error detected: Value '{bid}' at 'managedLoginBrandingId' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_BRANDING_ID_RE.pattern}")
+    problems = []
+    for i, asset in enumerate(data.get("Assets") or [], start=1):
+        for member, key, allowed in (("extension", "Extension", _BRANDING_EXTENSIONS),
+                                     ("colorMode", "ColorMode", _BRANDING_COLOR_MODES),
+                                     ("category", "Category", _BRANDING_CATEGORIES)):
+            if asset.get(key) not in allowed:
+                problems.append(f"Value '{asset.get(key)}' at 'assets.{i}.member.{member}' failed to satisfy "
+                                f"constraint: Member must satisfy enum value set: [{', '.join(allowed)}]")
+    if problems:
+        count = f"{len(problems)} validation error{'s' if len(problems) > 1 else ''} detected"
+        return _branding_invalid(f"{count}: {'; '.join(problems)}")
+    return None
+
+
+def _branding_values_error(data):
+    """AWS needs exactly one of UseCognitoProvidedValues=true and Settings."""
+    if (data.get("UseCognitoProvidedValues") is True) == (data.get("Settings") is not None):
+        return _branding_invalid(_BRANDING_VALUES_ERROR)
+    return None
+
+
+def _branding_asset_key(asset):
+    return asset.get("Category"), asset.get("ColorMode"), asset.get("ResourceId")
+
+
+def _branding_assets_error(pool, assets):
+    keys = [_branding_asset_key(a) for a in assets]
+    repeated = sorted({k for k in keys if keys.count(k) > 1}, key=keys.index)
+    if repeated:
+        names = ", ".join(f"{mode.lower()}-{category.lower()}" + (f"-{rid}" if rid else "")
+                          for category, mode, rid in repeated)
+        return _branding_invalid(f"Multiple instances of assets: [{names}]")
+    problems = []
+    for asset in assets:
+        category, rid = asset["Category"], asset.get("ResourceId")
+        if category in _BRANDING_FAVICON_EXTENSIONS and asset.get("Extension") != _BRANDING_FAVICON_EXTENSIONS[category]:
+            reason = f"{category} extension type must be one of [{_BRANDING_FAVICON_EXTENSIONS[category]}]."
+        elif rid and category != "IDP_BUTTON_ICON":
+            reason = f"Resource Id is not supported for asset category '{category}'"
+        elif rid and rid not in pool.get("_identity_providers", {}):
+            reason = f"Resource Id '{rid}' for asset category '{category}' not found"
+        else:
+            continue
+        rid_part = f", resourceId: {rid}" if rid else ""
+        problems.append(f"{{category: {category}, extension: {asset.get('Extension')}, colorMode: {asset['ColorMode']}"
+                        f"{rid_part}, errorMessage: \"{reason}\"}}")
+    if problems:
+        return _branding_invalid(f"Invalid assets provided. Validation errors: [{','.join(problems)}]")
+    return None
+
+
+def _branding_settings_error(settings):
+    """A property Cognito's own settings lack is refused, and so is a value of another JSON type.
+
+    AWS validates the settings against a schema it does not publish; Cognito's
+    default settings carry the same properties and types, so they stand in
+    for it here. An empty object there, such as idpButton.custom, is a map
+    whose values must be objects, and what goes inside them is not checked.
+    Lists are checked as lists, not item by item."""
+    def first_problem(own, default, path):
+        if isinstance(default, dict) and not default:
+            if not isinstance(own, dict):
+                return path, "InvalidDataType"
+            bad = next((k for k, v in own.items() if not isinstance(v, dict)), None)
+            return (f"{path}.{bad}", "InvalidDataType") if bad is not None else None
+        if isinstance(default, dict):
+            if not isinstance(own, dict):
+                return path, "InvalidDataType"
+            for key, value in own.items():
+                if key not in default:
+                    return f"{path}.{key}", "UnknownProperty"
+                found = first_problem(value, default[key], f"{path}.{key}")
+                if found:
+                    return found
+            return None
+        if isinstance(default, bool) or isinstance(own, bool):
+            same = isinstance(own, bool) and isinstance(default, bool)
+        elif isinstance(default, (int, float)):
+            same = isinstance(own, (int, float))
+        else:
+            same = isinstance(own, type(default))
+        return None if same else (path, "InvalidDataType")
+
+    found = first_problem(settings, DEFAULT_SETTINGS, "$")
+    if found:
+        return _branding_invalid(
+            f"Invalid settings provided. Validation errors: [{{property: {found[0]}, errorType: {found[1]}}}]")
+    return None
+
+
+def _branding_numbers(settings, defaults):
+    """Settings with each whole number a float where Cognito's own is one: AWS answers 4 as 4.0."""
+    if isinstance(settings, dict) and isinstance(defaults, dict):
+        return {k: _branding_numbers(v, defaults.get(k)) for k, v in settings.items()}
+    if (isinstance(settings, int) and not isinstance(settings, bool)
+            and isinstance(defaults, float)):
+        return float(settings)
+    return settings
+
+
+def _branding_assets(assets):
+    return [{k: a[k] for k in ("Category", "ColorMode", "Extension", "Bytes", "ResourceId") if k in a}
+            for a in assets or []]
+
+
+def _merge_branding_settings(defaults, own):
+    """A branding's settings over Cognito's, object by object; a list replaces the default list."""
+    if not isinstance(defaults, dict) or not isinstance(own, dict):
+        return copy.deepcopy(own)
+    merged = copy.deepcopy(defaults)
+    for key, value in own.items():
+        merged[key] = _merge_branding_settings(defaults.get(key), value)
+    return merged
+
+
+def _branding_out(branding, merged=False):
+    out = {
+        "ManagedLoginBrandingId": branding["ManagedLoginBrandingId"],
+        "UserPoolId": branding["UserPoolId"],
+        "UseCognitoProvidedValues": branding["UseCognitoProvidedValues"],
+    }
+    if merged:
+        # AWS also merges its own default artwork into Assets; that artwork is not
+        # redistributed here, so only the settings are merged.
+        out["Settings"] = _merge_branding_settings(DEFAULT_SETTINGS, branding.get("Settings") or {})
+    elif not branding["UseCognitoProvidedValues"]:
+        out["Settings"] = copy.deepcopy(branding["Settings"])
+    out["Assets"] = copy.deepcopy(branding["Assets"])
+    out["CreationDate"] = branding["CreationDate"]
+    out["LastModifiedDate"] = branding["LastModifiedDate"]
+    return {"ManagedLoginBranding": out}
+
+
+def _branding_client_pool(data):
+    """The pool of a call naming a client, or the error AWS answers: it names the pool when that is missing."""
+    pid, cid = data.get("UserPoolId"), data.get("ClientId")
+    pool = _user_pools.get(pid)
+    if not pool:
+        return None, error_response_json(
+            "ResourceNotFoundException", f"User pool client {cid} does not exist in user pool {pid}.", 400)
+    if cid not in pool["_clients"]:
+        return None, error_response_json("ResourceNotFoundException", f"User pool client {cid} does not exist.", 400)
+    return pool, None
+
+
+def _branding_pool(data):
+    """_resolve_pool, with the message the calls naming a branding answer, which has no full stop."""
+    if not data.get("UserPoolId"):
+        return None, _branding_invalid("UserPoolId must not be null")
+    pid = data["UserPoolId"]
+    pool = _user_pools.get(pid)
+    if not pool:
+        return None, error_response_json("ResourceNotFoundException", f"User pool {pid} does not exist", 400)
+    return pool, None
+
+
+def _create_managed_login_branding(data):
+    err = _branding_request_error(data)
+    if err:
+        return err
+    pool, err = _branding_client_pool(data)
+    if err:
+        return err
+    assets = _branding_assets(data.get("Assets"))
+    err = (_branding_values_error(data) or _branding_assets_error(pool, assets)
+           or (data.get("Settings") is not None and _branding_settings_error(data["Settings"])))
+    if err:
+        return err
+    cid = data["ClientId"]
+    brandings = pool.setdefault("_managed_login_brandings", {})
+    if any(b["ClientId"] == cid for b in brandings.values()):
+        return error_response_json("ManagedLoginBrandingExistsException",
+                                   f"A ManagedLoginBranding already exists for client {cid}", 400)
+    now = _now_epoch()
+    ucpv = data.get("UseCognitoProvidedValues") is True
+    branding = {
+        "ManagedLoginBrandingId": new_uuid(),
+        "UserPoolId": pool["Id"],
+        "ClientId": cid,
+        "UseCognitoProvidedValues": ucpv,
+        "Settings": None if ucpv else _branding_numbers(copy.deepcopy(data["Settings"]), DEFAULT_SETTINGS),
+        "Assets": assets,
+        "CreationDate": now,
+        "LastModifiedDate": now,
+    }
+    brandings[branding["ManagedLoginBrandingId"]] = branding
+    return json_response(_branding_out(branding))
+
+
+def _find_branding(data, update=False):
+    """The pool and branding a call names. An update's values, assets and settings are checked
+    ahead of the lookup, as AWS checks them."""
+    err = _branding_request_error(data, requires_id=True)
+    if err:
+        return None, None, err
+    pool, err = _branding_pool(data)
+    if err:
+        return None, None, err
+    if update:
+        err = (_branding_values_error(data) or _branding_assets_error(pool, _branding_assets(data.get("Assets")))
+               or (data.get("Settings") is not None and _branding_settings_error(data["Settings"])))
+        if err:
+            return None, None, err
+    branding = pool.get("_managed_login_brandings", {}).get(data["ManagedLoginBrandingId"])
+    if not branding:
+        return None, None, error_response_json("ResourceNotFoundException", _BRANDING_NOT_FOUND, 400)
+    return pool, branding, None
+
+
+def _describe_managed_login_branding(data):
+    _, branding, err = _find_branding(data)
+    if err:
+        return err
+    return json_response(_branding_out(branding, merged=data.get("ReturnMergedResources") is True))
+
+
+def _describe_managed_login_branding_by_client(data):
+    pool, err = _branding_client_pool(data)
+    if err:
+        return err
+    cid = data["ClientId"]
+    branding = next((b for b in pool.get("_managed_login_brandings", {}).values() if b["ClientId"] == cid), None)
+    if not branding:
+        return error_response_json("ResourceNotFoundException",
+                                   f"ManagedLoginBranding for client {cid} does not exist.", 400)
+    return json_response(_branding_out(branding, merged=data.get("ReturnMergedResources") is True))
+
+
+def _update_managed_login_branding(data):
+    _, branding, err = _find_branding(data, update=True)
+    if err:
+        return err
+    given = _branding_assets(data.get("Assets"))
+    # An asset replaces the one with its category, color mode and resource id and goes last; an update
+    # never removes one. AWS answers the others in an order of its own; they keep their order here.
+    assets = {_branding_asset_key(a): a for a in branding["Assets"]}
+    for asset in given:
+        assets.pop(_branding_asset_key(asset), None)
+        assets[_branding_asset_key(asset)] = asset
+    ucpv = data.get("UseCognitoProvidedValues") is True
+    branding["UseCognitoProvidedValues"] = ucpv
+    branding["Settings"] = None if ucpv else _branding_numbers(copy.deepcopy(data["Settings"]), DEFAULT_SETTINGS)
+    branding["Assets"] = list(assets.values())
+    branding["LastModifiedDate"] = _now_epoch()
+    return json_response(_branding_out(branding))
+
+
+def _delete_managed_login_branding(data):
+    pool, branding, err = _find_branding(data)
+    if err:
+        return err
+    del pool["_managed_login_brandings"][branding["ManagedLoginBrandingId"]]
+    return json_response({})
 
 
 # ---------------------------------------------------------------------------

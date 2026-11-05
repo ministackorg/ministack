@@ -3968,9 +3968,14 @@ def _import_path_item(api_id, path, path_item, scheme_map=None, default_security
             resource_id = child
 
     for method, operation in path_item.items():
-        if method.lower() in _OPENAPI_HTTP_METHODS:
-            _import_operation(api_id, resource_id, method.upper(), operation,
-                              scheme_map, default_security)
+        if method == "x-amazon-apigateway-any-method":
+            http_method = "ANY"
+        elif method.lower() in _OPENAPI_HTTP_METHODS:
+            http_method = method.upper()
+        else:
+            continue
+        _import_operation(api_id, resource_id, http_method, operation,
+                          scheme_map, default_security)
 
 
 def _import_operation(api_id, resource_id, http_method, operation,
@@ -3978,8 +3983,15 @@ def _import_operation(api_id, resource_id, http_method, operation,
     security = (operation or {}).get("security")
     if security is None:
         security = default_security
-    _put_method(api_id, resource_id, http_method,
-                _method_security(security, scheme_map or {}))
+    method_data = _method_security(security, scheme_map or {})
+    path_params = {
+        f"method.request.path.{param['name']}": bool(param.get("required"))
+        for param in (operation or {}).get("parameters") or []
+        if param.get("in") == "path"
+    }
+    if path_params:
+        method_data["requestParameters"] = path_params
+    _put_method(api_id, resource_id, http_method, method_data)
 
     integration = (operation or {}).get("x-amazon-apigateway-integration")
     if integration:

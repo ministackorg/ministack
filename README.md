@@ -553,6 +553,7 @@ subnet = ec2.create_subnet(
 | `AWS::Cognito::IdentityPool` | Pool ID | — |
 | `AWS::Cognito::IdentityPoolPrincipalTag` | `<pool ID>\|<provider name>` | — |
 | `AWS::Cognito::UserPoolDomain` | Domain | CloudFrontDistribution |
+| `AWS::Cognito::ManagedLoginBranding` | `<pool ID>\|<branding ID>` | ManagedLoginBrandingId |
 | `AWS::IoT::Thing` | Thing name | Arn, Id |
 | `AWS::IoT::Certificate` | Certificate id | Arn, Id |
 | `AWS::IoT::ThingPrincipalAttachment` | `{ThingName}\|{Principal}` | None |

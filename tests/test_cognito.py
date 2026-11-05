@@ -13115,6 +13115,66 @@ def test_generated_temporary_passwords_meet_a_long_minimum_length(cognito_idp):
     try:
         cognito_idp.admin_create_user(UserPoolId=pid, Username="invited", MessageAction="SUPPRESS")
         assert cognito_idp.admin_create_user(UserPoolId=pid, Username="invited", MessageAction="RESEND")["User"]["Username"] == "invited"
+# Managed login branding (answers measured on AWS in eu-west-2, 2026-11-04)
+# ---------------------------------------------------------------------------
+
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+_BRANDING_ID_PATTERN = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[4][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+_BRANDING_VALUES = "useCognitoProvidedValues or settings should be specified (but not both)"
+
+
+def _branding_pool(cognito_idp, clients=1):
+    pid = cognito_idp.create_user_pool(PoolName=f"brand-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    cids = [cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName=f"c{i}")["UserPoolClient"]["ClientId"]
+            for i in range(clients)]
+    return pid, cids
+
+
+def _asset(category, mode="LIGHT", extension="PNG", data=_PNG, resource_id=None):
+    asset = {"Category": category, "ColorMode": mode, "Extension": extension, "Bytes": data}
+    if resource_id:
+        asset["ResourceId"] = resource_id
+    return asset
+
+
+def _svg(name):
+    return f"<svg xmlns='http://www.w3.org/2000/svg' id='{name}'/>".encode()
+
+
+def _error(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+
+def test_managed_login_branding_lifecycle(cognito_idp):
+    """Create, describe by id and by client, update and delete, on a pool without a domain."""
+    pid, (cid,) = _branding_pool(cognito_idp)
+    try:
+        created = cognito_idp.create_managed_login_branding(
+            UserPoolId=pid, ClientId=cid, Settings={"components": {"form": {"borderRadius": 4.0}}},
+            Assets=[_asset("FORM_LOGO")],
+        )["ManagedLoginBranding"]
+        bid = created["ManagedLoginBrandingId"]
+        assert _uuid_mod.UUID(bid).version == 4
+        assert created["UserPoolId"] == pid
+        assert created["UseCognitoProvidedValues"] is False
+        assert created["Settings"] == {"components": {"form": {"borderRadius": 4.0}}}
+        assert created["Assets"] == [_asset("FORM_LOGO")]
+        assert created["CreationDate"] == created["LastModifiedDate"]
+        assert cognito_idp.describe_managed_login_branding_by_client(UserPoolId=pid, ClientId=cid)["ManagedLoginBranding"] == created
+
+        updated = cognito_idp.update_managed_login_branding(
+            UserPoolId=pid, ManagedLoginBrandingId=bid, UseCognitoProvidedValues=True)["ManagedLoginBranding"]
+        assert updated["UseCognitoProvidedValues"] is True
+        assert "Settings" not in updated
+        assert updated["Assets"] == created["Assets"]
+
+        cognito_idp.delete_managed_login_branding(UserPoolId=pid, ManagedLoginBrandingId=bid)
+        for call in (cognito_idp.describe_managed_login_branding, cognito_idp.delete_managed_login_branding):
+            assert _error(call, UserPoolId=pid, ManagedLoginBrandingId=bid) == (
+                "ResourceNotFoundException", "ManagedLoginBranding does not exist.")
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
 
@@ -13168,6 +13228,21 @@ def test_sign_up_sends_a_code_only_when_the_pool_verifies_email(cognito_idp):
             ClientId=cid, Username="noverify", Password="Probe-Passw0rd!", UserAttributes=[{"Name": "email", "Value": email}])
         assert "CodeDeliveryDetails" not in response
         assert _messages_to(email) == []
+def test_managed_login_branding_needs_cognito_values_or_settings_but_not_both(cognito_idp):
+    pid, (cid,) = _branding_pool(cognito_idp)
+    try:
+        for kwargs in ({}, {"UseCognitoProvidedValues": False},
+                       {"UseCognitoProvidedValues": True, "Settings": {"components": {}}},
+                       {"Assets": [_asset("FORM_LOGO"), _asset("FORM_LOGO")]}):
+            assert _error(cognito_idp.create_managed_login_branding, UserPoolId=pid, ClientId=cid, **kwargs) == (
+                "InvalidParameterException", _BRANDING_VALUES)
+        bid = cognito_idp.create_managed_login_branding(
+            UserPoolId=pid, ClientId=cid, Settings={})["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+        for kwargs in ({}, {"Assets": []}, {"UseCognitoProvidedValues": False}):
+            assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid, ManagedLoginBrandingId=bid,
+                          **kwargs)[1] == _BRANDING_VALUES
+        assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid,
+                      ManagedLoginBrandingId=str(_uuid_mod.uuid4()))[1] == _BRANDING_VALUES
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
 
@@ -13227,6 +13302,63 @@ def test_password_policy_answers_name_the_first_rule_broken(cognito_idp):
                     call(password)
                 assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
                     "InvalidPasswordException", f"{prefix}: {rule}")
+def test_managed_login_branding_one_per_client_checked_last(cognito_idp):
+    pid, (cid,) = _branding_pool(cognito_idp)
+    try:
+        cognito_idp.create_managed_login_branding(UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True)
+        assert _error(cognito_idp.create_managed_login_branding, UserPoolId=pid, ClientId=cid,
+                      UseCognitoProvidedValues=True) == (
+            "ManagedLoginBrandingExistsException", f"A ManagedLoginBranding already exists for client {cid}")
+        assert _error(cognito_idp.create_managed_login_branding, UserPoolId=pid, ClientId=cid,
+                      UseCognitoProvidedValues=True, Assets=[_asset("FORM_LOGO"), _asset("FORM_LOGO")])[1] == (
+            "Multiple instances of assets: [light-form_logo]")
+        assert _error(cognito_idp.create_managed_login_branding, UserPoolId=pid, ClientId=cid,
+                      Settings={"notAThing": 1})[1] == (
+            "Invalid settings provided. Validation errors: [{property: $.notAThing, errorType: UnknownProperty}]")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_managed_login_branding_not_found_answers(cognito_idp):
+    pid, (cid, other) = _branding_pool(cognito_idp, clients=2)
+    missing_pool, missing_client = "us-east-1_AAAAAAAAA", "1234567890abcdefghijklmnop"
+    try:
+        create = cognito_idp.create_managed_login_branding
+        assert _error(create, UserPoolId=missing_pool, ClientId=cid) == (
+            "ResourceNotFoundException", f"User pool client {cid} does not exist in user pool {missing_pool}.")
+        assert _error(create, UserPoolId=pid, ClientId=missing_client) == (
+            "ResourceNotFoundException", f"User pool client {missing_client} does not exist.")
+        assert _error(create, UserPoolId=pid, ClientId=missing_client, UseCognitoProvidedValues=True,
+                      Assets=[_asset("FAVICON_ICO")])[1] == f"User pool client {missing_client} does not exist."
+        assert _error(cognito_idp.describe_managed_login_branding_by_client, UserPoolId=pid, ClientId=other) == (
+            "ResourceNotFoundException", f"ManagedLoginBranding for client {other} does not exist.")
+        assert _error(cognito_idp.describe_managed_login_branding_by_client, UserPoolId=missing_pool, ClientId=cid)[1] == (
+            f"User pool client {cid} does not exist in user pool {missing_pool}.")
+
+        bid = create(UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True)["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+        bad_id = ("InvalidParameterException",
+                  "1 validation error detected: Value 'nope' at 'managedLoginBrandingId' failed to satisfy constraint: "
+                  f"Member must satisfy regular expression pattern: {_BRANDING_ID_PATTERN}")
+        for call in (cognito_idp.describe_managed_login_branding, cognito_idp.update_managed_login_branding,
+                     cognito_idp.delete_managed_login_branding):
+            assert _error(call, UserPoolId=missing_pool, ManagedLoginBrandingId="nope") == bad_id
+            assert _error(call, UserPoolId=missing_pool, ManagedLoginBrandingId=bid) == (
+                "ResourceNotFoundException", f"User pool {missing_pool} does not exist")
+        assert _error(cognito_idp.update_managed_login_branding, ManagedLoginBrandingId=bid,
+                      UseCognitoProvidedValues=True) == ("InvalidParameterException", "UserPoolId must not be null")
+        assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid, UseCognitoProvidedValues=True) == (
+            "InvalidParameterException", "1 validation error detected: Value null at 'managedLoginBrandingId' "
+            "failed to satisfy constraint: Member must not be null")
+        unknown = str(_uuid_mod.uuid4())
+        assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid, ManagedLoginBrandingId=unknown,
+                      UseCognitoProvidedValues=True, Assets=[_asset("FORM_LOGO"), _asset("FORM_LOGO")])[1] == (
+            "Multiple instances of assets: [light-form_logo]")
+        assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid, ManagedLoginBrandingId=unknown,
+                      Settings={"notAThing": 1})[1] == (
+            "Invalid settings provided. Validation errors: [{property: $.notAThing, errorType: UnknownProperty}]")
+        assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid,
+                      ManagedLoginBrandingId=str(_uuid_mod.uuid4()), UseCognitoProvidedValues=True) == (
+            "ResourceNotFoundException", "ManagedLoginBranding does not exist.")
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
 
@@ -13292,6 +13424,46 @@ def test_a_reset_by_phone_emails_nobody_and_confirm_verifies_where_the_code_went
         cognito_idp.confirm_sign_up(ClientId=cid, Username="signer", ConfirmationCode="123456")
         got = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(UserPoolId=pid, Username="signer")["UserAttributes"]}
         assert got["email_verified"] == "true" and got.get("phone_number_verified") != "true"
+def test_managed_login_branding_outlives_its_client(cognito_idp):
+    pid, (cid,) = _branding_pool(cognito_idp)
+    try:
+        bid = cognito_idp.create_managed_login_branding(
+            UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True)["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+        cognito_idp.delete_user_pool_client(UserPoolId=pid, ClientId=cid)
+        assert cognito_idp.describe_managed_login_branding(
+            UserPoolId=pid, ManagedLoginBrandingId=bid)["ManagedLoginBranding"]["ManagedLoginBrandingId"] == bid
+        assert _error(cognito_idp.describe_managed_login_branding_by_client, UserPoolId=pid, ClientId=cid) == (
+            "ResourceNotFoundException", f"User pool client {cid} does not exist.")
+        cognito_idp.delete_managed_login_branding(UserPoolId=pid, ManagedLoginBrandingId=bid)
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_managed_login_branding_update_upserts_assets_and_replaces_settings(cognito_idp):
+    """An asset replaces the one with its category, color mode and resource id and goes last; an
+    update never removes one. Settings are replaced whole, a whole number coming back as a float."""
+    pid, (cid,) = _branding_pool(cognito_idp)
+    try:
+        bid = cognito_idp.create_managed_login_branding(
+            UserPoolId=pid, ClientId=cid,
+            Settings={"components": {"form": {"borderRadius": 4.0, "lightMode": {"backgroundColor": "123456ff"}}}},
+            Assets=[_asset("FORM_LOGO"), _asset("PAGE_HEADER_LOGO", "DARK", "SVG", _svg("h"))],
+        )["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+
+        def update(**kwargs):
+            return cognito_idp.update_managed_login_branding(
+                UserPoolId=pid, ManagedLoginBrandingId=bid, **kwargs)["ManagedLoginBranding"]
+
+        out = update(Settings={"components": {"form": {"borderRadius": 2}}},
+                     Assets=[_asset("FORM_LOGO", extension="SVG", data=_svg("replaced"))])
+        assert out["Settings"] == {"components": {"form": {"borderRadius": 2.0}}}
+        assert isinstance(out["Settings"]["components"]["form"]["borderRadius"], float)
+        assert [(a["Category"], a["Bytes"]) for a in out["Assets"]] == [
+            ("PAGE_HEADER_LOGO", _svg("h")), ("FORM_LOGO", _svg("replaced"))]
+        assert [a["Category"] for a in update(Settings={}, Assets=[])["Assets"]] == ["PAGE_HEADER_LOGO", "FORM_LOGO"]
+        assert [(a["Category"], a["ColorMode"]) for a in update(
+            UseCognitoProvidedValues=True, Assets=[_asset("FORM_LOGO", "DYNAMIC")])["Assets"]] == [
+            ("PAGE_HEADER_LOGO", "DARK"), ("FORM_LOGO", "LIGHT"), ("FORM_LOGO", "DYNAMIC")]
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
 
@@ -13310,6 +13482,55 @@ def test_password_resets_need_a_verified_address(cognito_idp):
             assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
             assert exc.value.response["Error"]["Message"] == (
                 "Cannot reset password for the user as there is no registered/verified email or phone_number")
+def test_managed_login_branding_asset_validation(cognito_idp):
+    pid, (cid,) = _branding_pool(cognito_idp)
+    create = cognito_idp.create_managed_login_branding
+    categories = ("PAGE_FOOTER_BACKGROUND, SMS_GRAPHIC, PASSWORD_GRAPHIC, EMAIL_GRAPHIC, FORM_LOGO, FORM_BACKGROUND, "
+                  "FAVICON_ICO, PAGE_HEADER_LOGO, PAGE_HEADER_BACKGROUND, AUTH_APP_GRAPHIC, PASSKEY_GRAPHIC, "
+                  "FAVICON_SVG, IDP_BUTTON_ICON, PAGE_BACKGROUND, PAGE_FOOTER_LOGO")
+    try:
+        assert _error(create, UserPoolId=pid, ClientId=cid, Settings={}, Assets=[_asset("FORM_LOGO", extension="GIF")]) == (
+            "InvalidParameterException",
+            "1 validation error detected: Value 'GIF' at 'assets.1.member.extension' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [SVG, JPEG, PNG, ICO, WEBP]")
+        assert _error(create, UserPoolId=pid, ClientId=cid, Settings={},
+                      Assets=[_asset("NOPE", "BOTH", "GIF"), _asset("ALSO_NOPE")])[1] == (
+            "4 validation errors detected: "
+            "Value 'GIF' at 'assets.1.member.extension' failed to satisfy constraint: Member must satisfy enum value set: "
+            "[SVG, JPEG, PNG, ICO, WEBP]; "
+            "Value 'BOTH' at 'assets.1.member.colorMode' failed to satisfy constraint: Member must satisfy enum value "
+            "set: [DARK, LIGHT, DYNAMIC]; "
+            f"Value 'NOPE' at 'assets.1.member.category' failed to satisfy constraint: Member must satisfy enum value set: [{categories}]; "
+            f"Value 'ALSO_NOPE' at 'assets.2.member.category' failed to satisfy constraint: Member must satisfy enum value set: [{categories}]")
+        assert _error(create, UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True, Assets=[
+            _asset("FORM_LOGO"), _asset("PAGE_HEADER_LOGO", "DARK"), _asset("FORM_LOGO"), _asset("PAGE_HEADER_LOGO", "DARK"),
+        ])[1] == "Multiple instances of assets: [light-form_logo, dark-page_header_logo]"
+        assert _error(create, UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True, Assets=[
+            _asset("IDP_BUTTON_ICON", extension="SVG", resource_id="Google"),
+            _asset("IDP_BUTTON_ICON", extension="SVG", resource_id="Google"),
+        ])[1] == "Multiple instances of assets: [light-idp_button_icon-Google]"
+        assert _error(create, UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True, Assets=[
+            _asset("FAVICON_ICO", "DARK", "SVG"), _asset("FAVICON_SVG"),
+        ])[1] == (
+            'Invalid assets provided. Validation errors: [{category: FAVICON_ICO, extension: SVG, colorMode: DARK, '
+            'errorMessage: "FAVICON_ICO extension type must be one of [ICO]."},{category: FAVICON_SVG, extension: PNG, '
+            'colorMode: LIGHT, errorMessage: "FAVICON_SVG extension type must be one of [SVG]."}]')
+        assert _error(create, UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True,
+                      Assets=[_asset("FORM_LOGO", resource_id="Google")])[1] == (
+            'Invalid assets provided. Validation errors: [{category: FORM_LOGO, extension: PNG, colorMode: LIGHT, '
+            "resourceId: Google, errorMessage: \"Resource Id is not supported for asset category 'FORM_LOGO'\"}]")
+        assert _error(create, UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True,
+                      Assets=[_asset("IDP_BUTTON_ICON", extension="SVG", resource_id="Google")])[1] == (
+            'Invalid assets provided. Validation errors: [{category: IDP_BUTTON_ICON, extension: SVG, colorMode: LIGHT, '
+            "resourceId: Google, errorMessage: \"Resource Id 'Google' for asset category 'IDP_BUTTON_ICON' not found\"}]")
+
+        cognito_idp.create_identity_provider(
+            UserPoolId=pid, ProviderName="Google", ProviderType="Google",
+            ProviderDetails={"client_id": "id", "client_secret": "secret", "authorize_scopes": "openid"})
+        assets = create(UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=True, Assets=[
+            _asset("IDP_BUTTON_ICON", extension="SVG", resource_id="Google"), _asset("IDP_BUTTON_ICON", extension="SVG"),
+        ])["ManagedLoginBranding"]["Assets"]
+        assert [a.get("ResourceId") for a in assets] == ["Google", None]
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
 
@@ -13416,3 +13637,53 @@ def test_confirm_sign_up_verifies_the_email_and_resend_needs_auto_verification(a
     finally:
         cognito_idp.delete_user_pool(UserPoolId=verifying)
         cognito_idp.delete_user_pool(UserPoolId=plain)
+def test_managed_login_branding_settings_validation(cognito_idp):
+    pid, (cid,) = _branding_pool(cognito_idp)
+    try:
+        for settings, problem in (({"notAThing": {"x": 1}}, "{property: $.notAThing, errorType: UnknownProperty}"),
+                                  ({"components": {"form": {"borderRadius": "round"}}},
+                                   "{property: $.components.form.borderRadius, errorType: InvalidDataType}"),
+                                  ({"components": {"form": {"borderRadius": "4.0"}}},
+                                   "{property: $.components.form.borderRadius, errorType: InvalidDataType}"),
+                                  ({"components": {"form": {"logo": {"enabled": "true"}}}},
+                                   "{property: $.components.form.logo.enabled, errorType: InvalidDataType}"),
+                                  ({"components": {"idpButton": {"custom": {"foo": 1}}}},
+                                   "{property: $.components.idpButton.custom.foo, errorType: InvalidDataType}")):
+            assert _error(cognito_idp.create_managed_login_branding, UserPoolId=pid, ClientId=cid, Settings=settings) == (
+                "InvalidParameterException", f"Invalid settings provided. Validation errors: [{problem}]")
+        bid = cognito_idp.create_managed_login_branding(
+            UserPoolId=pid, ClientId=cid, UseCognitoProvidedValues=False,
+            Settings={"components": {"favicon": {"enabledTypes": ["SVG"]}}})["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+        assert _error(cognito_idp.update_managed_login_branding, UserPoolId=pid, ManagedLoginBrandingId=bid,
+                      Settings={"notAThing": 1})[1] == (
+            "Invalid settings provided. Validation errors: [{property: $.notAThing, errorType: UnknownProperty}]")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
+
+
+def test_managed_login_branding_merged_settings(cognito_idp):
+    """ReturnMergedResources merges a branding's settings over Cognito's own, object by object;
+    a list replaces the default list."""
+    from ministack.services.cognito import DEFAULT_SETTINGS
+
+    pid, (cid, other) = _branding_pool(cognito_idp, clients=2)
+    try:
+        bid = cognito_idp.create_managed_login_branding(
+            UserPoolId=pid, ClientId=cid,
+            Settings={"components": {"form": {"lightMode": {"backgroundColor": "123456ff"}},
+                                     "favicon": {"enabledTypes": ["SVG"]}}},
+        )["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+        merged = cognito_idp.describe_managed_login_branding(
+            UserPoolId=pid, ManagedLoginBrandingId=bid, ReturnMergedResources=True)["ManagedLoginBranding"]["Settings"]
+        assert merged["components"]["form"]["lightMode"] == {"backgroundColor": "123456ff", "borderColor": "c6c6cdff"}
+        assert merged["components"]["form"]["borderRadius"] == 8.0
+        assert merged["components"]["favicon"]["enabledTypes"] == ["SVG"]
+        assert merged["componentClasses"] == DEFAULT_SETTINGS["componentClasses"]
+
+        cognito_idp.create_managed_login_branding(UserPoolId=pid, ClientId=other, UseCognitoProvidedValues=True)
+        defaults = cognito_idp.describe_managed_login_branding_by_client(
+            UserPoolId=pid, ClientId=other, ReturnMergedResources=True)["ManagedLoginBranding"]
+        assert defaults["UseCognitoProvidedValues"] is True
+        assert defaults["Settings"] == DEFAULT_SETTINGS
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pid)
