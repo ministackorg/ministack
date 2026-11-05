@@ -1042,17 +1042,40 @@ def _signed_jwt(claims: dict, pool_id: str = "", use: str = "") -> str:
     return f"{header}.{payload}.{sig}"
 
 
-class _PreTokenRejected(Exception):
+class _TriggerRejected(Exception):
+    """Raised when a Lambda trigger that can fail a sign-in runs and returns an error."""
+
+
+class _TriggerUnavailable(Exception):
+    """Raised when a Lambda trigger that can fail a sign-in cannot be invoked."""
+
+
+class _PreTokenRejected(_TriggerRejected):
     """Raised when a PreTokenGeneration Lambda runs and returns an error."""
 
 
-class _PreTokenUnavailable(Exception):
+class _PreTokenUnavailable(_TriggerUnavailable):
     """Raised when a PreTokenGeneration Lambda cannot be invoked."""
 
 
+class _PostAuthenticationRejected(_TriggerRejected):
+    """Raised when a PostAuthentication Lambda runs and returns an error."""
+
+
+class _PostAuthenticationUnavailable(_TriggerUnavailable):
+    """Raised when a PostAuthentication Lambda cannot be invoked."""
+
+
+class _PostAuthenticationInvalid(Exception):
+    """Raised when a PostAuthentication Lambda returns something other than the event."""
+
+
 def _pretoken_error_code(exc) -> str:
-    return ("UserLambdaValidationException" if isinstance(exc, _PreTokenRejected)
-            else "UnexpectedLambdaException")
+    if isinstance(exc, _TriggerRejected):
+        return "UserLambdaValidationException"
+    if isinstance(exc, _PostAuthenticationInvalid):
+        return "InvalidLambdaResponseException"
+    return "UnexpectedLambdaException"
 
 
 def _pretoken_error(exc):
@@ -2862,7 +2885,7 @@ def _run_idp_handler(handler, action: str, data: dict):
         return error
     try:
         return handler(data)
-    except (_PreTokenRejected, _PreTokenUnavailable) as e:
+    except (_TriggerRejected, _TriggerUnavailable, _PostAuthenticationInvalid) as e:
         return _pretoken_error(e)
 
 
@@ -5331,10 +5354,85 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
+# Tokens that complete a sign-in. Refresh and the token endpoint's code exchange are not sign-ins.
+_SIGN_IN_TOKEN_SOURCES = frozenset(("TokenGeneration_Authentication", "TokenGeneration_NewPasswordChallenge"))
+
+
+def _apply_postauth_trigger(pool_id: str, client_id: str, user: dict,
+                            client_metadata: dict | None = None, new_device_used: bool = False) -> None:
+    """Invoke the user pool's PostAuthentication Lambda once a password or challenge answer is verified.
+
+    AWS runs it before issuing tokens, and also when a verified temporary
+    password is about to get the NEW_PASSWORD_REQUIRED challenge. Its response
+    changes nothing, but must be the event: a Lambda that returns an error
+    fails the sign-in with ``_PostAuthenticationRejected``
+    (``UserLambdaValidationException``), one that returns anything else with
+    ``_PostAuthenticationInvalid`` (``InvalidLambdaResponseException``), and one
+    that cannot be invoked with ``_PostAuthenticationUnavailable``
+    (``UnexpectedLambdaException``).
+    """
+    pool = _user_pools.get(pool_id)
+    arn = ((pool or {}).get("LambdaConfig") or {}).get("PostAuthentication")
+    if not arn:
+        return
+    attributes = {k: v for k, v in _attr_list_to_dict(user.get("Attributes", [])).items()
+                  if isinstance(v, str)}
+    attributes["cognito:user_status"] = user.get("UserStatus", "")
+    request_block: dict = {"userAttributes": attributes, "newDeviceUsed": new_device_used}
+    # AWS leaves clientMetadata out when the request sent none.
+    if client_metadata:
+        request_block["clientMetadata"] = client_metadata
+    event = {
+        "version": "1",
+        "triggerSource": "PostAuthentication_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": request_block,
+        "response": {},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            # AWS reports a missing function as the invoke being denied
+            raise _PostAuthenticationUnavailable(
+                "PostAuthentication invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PostAuthentication Lambda invocation failed for pool %s: %s", pool_id, e)
+        if isinstance(e, _PostAuthenticationUnavailable):
+            raise
+        raise _PostAuthenticationUnavailable(
+            f"PostAuthentication invocation failed due to error {type(e).__name__}.") from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = _lambda_error_message(result.get("body"))
+        logger.info("PostAuthentication Lambda rejected the sign-in for pool %s: %s", pool_id, reason)
+        raise _PostAuthenticationRejected(f"PostAuthentication failed with error {reason}.")
+    payload = result.get("body") if isinstance(result, dict) else result
+    if isinstance(payload, (bytes, bytearray, str)):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            pass
+    if payload is None:
+        raise _PostAuthenticationInvalid("Invalid lambda function output : Invalid JSON")
+    if not isinstance(payload, dict):
+        raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+
+
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
                         client_metadata: dict | None = None, origin_jti: str = "",
                         scope: str | None = None) -> dict:
+    if trigger_source in _SIGN_IN_TOKEN_SOURCES:
+        # AWS reports the sign-in that sets a new password as one from a new device
+        _apply_postauth_trigger(pool_id, client_id, user, client_metadata,
+                                new_device_used=trigger_source == "TokenGeneration_NewPasswordChallenge")
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -5366,6 +5464,8 @@ def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: 
     _record_auth_event(pool, user, data or {}, "SignIn", "InProgress" if mfa_challenge else "Pass",
                        (("Password", "Success"),), (mfa_challenge or {}).get("Session"))
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        # AWS counts a verified temporary password as an authentication, before asking for a new one
+        _apply_postauth_trigger(pid, cid, user, client_metadata)
         session = base64.b64encode(secrets.token_bytes(32)).decode()
         return json_response({
             "ChallengeName": "NEW_PASSWORD_REQUIRED",
