@@ -448,21 +448,68 @@ fs.write = function(fd, ...args) {
     });
   }
 
+  // GET /2017-03-31/tags/{Resource}
+  function _lambdaListTags(params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const resourceArn = params.Resource || "";
+    const requestPath = "/2017-03-31/tags/" + encodeURIComponent(resourceArn);
+    return new Promise((resolve, reject) => {
+      const req = (ep.protocol === "https:" ? https : http).request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "GET",
+          path: requestPath,
+          headers: _signedHeaders("lambda", "GET", ep, requestPath, "", {}),
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = text ? JSON.parse(text) : {}; } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const type = parsed.__type || parsed.Code || "ResourceNotFoundException";
+              const code = String(type).split("#").pop();
+              const err = new Error(parsed.Message || parsed.message || text || "Lambda ListTags error");
+              err.statusCode = res.statusCode;
+              err.code = code;
+              err.name = code;
+              reject(err);
+            } else {
+              resolve({ Tags: parsed.Tags || {} });
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
   function _makeLambdaClientModule() {
     class Lambda {
       constructor(_cfg) {}
       invoke(params) { return _lambdaInvoke(params); }
+      listTags(params) { return _lambdaListTags(params); }
+      // Lambda is LambdaClient plus the generated convenience methods, so it also has .send().
+      send(cmd) { return cmd._run(); }
     }
     class LambdaClient {
       constructor(_cfg) {}
       send(cmd) { return cmd._run(); }
+    }
+    class ListTagsCommand {
+      constructor(params) { this._p = params; }
+      _run() { return _lambdaListTags(this._p); }
     }
     class InvokeCommand {
       constructor(params) { this._p = params; }
       _run() { return _lambdaInvoke(this._p); }
     }
     async function waitUntilFunctionActiveV2() { return { state: "SUCCESS" }; }
-    return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
+    return { Lambda, LambdaClient, InvokeCommand, ListTagsCommand, waitUntilFunctionActiveV2 };
   }
 
   // ── OpenSearch stub (REST-JSON, not JSON-RPC) ─────────────────────────
