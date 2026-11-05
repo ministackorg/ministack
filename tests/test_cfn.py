@@ -17249,6 +17249,37 @@ def test_cfn_restapi_openapi_body_petstore(cfn, apigw_v1):
     assert api_id not in ids
 
 
+def test_cfn_restapi_openapi_body_any_method(cfn, apigw_v1):
+    """Captured on AWS: a Body with x-amazon-apigateway-any-method, as SAM writes for Method: ANY,
+    gives the resource an ANY method."""
+    stack = f"cfn-restapi-any-{_uuid_mod.uuid4().hex[:6]}"
+    mock = {"x-amazon-apigateway-integration": {
+        "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
+        "responses": {"default": {"statusCode": "200"}}}}
+    body = {
+        "swagger": "2.0",
+        "info": {"version": "1.0", "title": stack},
+        "paths": {"/orgs/{proxy+}": {"x-amazon-apigateway-any-method": mock, "options": mock}},
+    }
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Api": {"Type": "AWS::ApiGateway::RestApi", "Properties": {"Body": body}}},
+        "Outputs": {"ApiId": {"Value": {"Ref": "Api"}}},
+    })
+
+    cfn.create_stack(StackName=stack, TemplateBody=template)
+    try:
+        s = _wait_stack(cfn, stack)
+        assert s["StackStatus"] == "CREATE_COMPLETE"
+        api_id = {o["OutputKey"]: o["OutputValue"] for o in s["Outputs"]}["ApiId"]
+        proxy = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+                     if r["path"] == "/orgs/{proxy+}")
+        assert sorted(proxy["resourceMethods"]) == ["ANY", "OPTIONS"]
+    finally:
+        cfn.delete_stack(StackName=stack)
+        _wait_stack(cfn, stack)
+
+
 def test_cfn_restapi_openapi_body_security_definitions(cfn, apigw_v1, cognito_idp):
     """securityDefinitions in a RestApi Body create authorizers and bind methods.
 

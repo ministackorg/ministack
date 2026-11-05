@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
@@ -6550,6 +6551,53 @@ def test_apigwv1_import_rest_api_loads_the_definition(apigw_v1):
         assert _api_paths(apigw_v1, api["id"]) == ["/", "/ping"]
     finally:
         apigw_v1.delete_rest_api(restApiId=api["id"])
+
+
+_MOCK_OPERATION = {"x-amazon-apigateway-integration": {
+    "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
+    "responses": {"default": {"statusCode": "200"}}}}
+_ANY_METHOD_SPEC = {
+    "swagger": "2.0", "info": {"title": "any-method", "version": "1"},
+    "paths": {
+        "/orgs/{proxy+}": {"x-amazon-apigateway-any-method": _MOCK_OPERATION, "options": _MOCK_OPERATION},
+        "/both": {"get": _MOCK_OPERATION, "x-amazon-apigateway-any-method": _MOCK_OPERATION},
+    },
+}
+
+
+def _resource_methods(apigw_v1, api_id):
+    return {r["path"]: sorted(r.get("resourceMethods") or {})
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]}
+
+
+@pytest.mark.parametrize("mode", ["import", "put"])
+def test_apigwv1_import_creates_the_any_method(apigw_v1, mode):
+    """Captured on AWS: ImportRestApi and PutRestApi make x-amazon-apigateway-any-method an ANY method,
+    and a request with a verb that has no method of its own goes to ANY."""
+    body = json.dumps(_ANY_METHOD_SPEC)
+    if mode == "import":
+        api_id = apigw_v1.import_rest_api(body=body)["id"]
+    else:
+        api_id = apigw_v1.create_rest_api(name=f"any-{_uuid_mod.uuid4().hex[:8]}")["id"]
+        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=body)
+    try:
+        methods = _resource_methods(apigw_v1, api_id)
+        assert methods["/orgs/{proxy+}"] == ["ANY", "OPTIONS"]
+        assert methods["/both"] == ["ANY", "GET"]
+
+        proxy_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+                        if r["path"] == "/orgs/{proxy+}")
+        method = apigw_v1.get_method(restApiId=api_id, resourceId=proxy_id, httpMethod="ANY")
+        assert method["httpMethod"] == "ANY"
+        assert method["methodIntegration"]["type"] == "MOCK"
+
+        apigw_v1.create_deployment(restApiId=api_id, stageName="test")
+        url = f"{_endpoint}/restapis/{api_id}/test/_user_request_/orgs/org1/a"
+        req = urllib.request.Request(url, data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
 
 
 def test_apigwv1_client_certificate_lifecycle(apigw_v1):
