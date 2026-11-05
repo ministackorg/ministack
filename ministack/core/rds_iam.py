@@ -4,9 +4,10 @@
 
 The MySQL AWSAuthenticationPlugin POSTs each IAM login to
 /_ministack/rds/iam-auth with its container's capability; PostgreSQL's ldap
-method binds to a local listener with the capability in the DN. Resource enablement is always required; AUTH=true
-also verifies the token and evaluates rds-db:connect. Capabilities are
-process-local, never persisted, never issued over HTTP.
+method binds to a local listener with the capability in the DN. Resource
+enablement is always required; AUTH=true also verifies the token and
+evaluates rds-db:connect. Capabilities are process-local, never persisted,
+never issued over HTTP.
 """
 
 import asyncio
