@@ -14290,7 +14290,7 @@ def test_bootstrap_that_exits_immediately_fails_fast(worker_factory):
     worker = worker_factory(INSTANT_EXIT_BOOTSTRAP)
 
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match="exited during init with code 3"):
+    with pytest.raises(RuntimeError, match="^Runtime exited with error: exit status 3$"):
         worker.invoke({}, "req-1")
     elapsed = time.monotonic() - started
 

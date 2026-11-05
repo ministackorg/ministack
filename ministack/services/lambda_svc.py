@@ -61,12 +61,15 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
+    RuntimeExitError,
     acquire_worker,
     ensure_spawned,
     execution_credentials,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
+    runtime_exit_message,
+    runtime_exit_reason,
 )
 from ministack.core.persistence import STATE_DIR
 from ministack.core.responses import (
@@ -4087,6 +4090,10 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
 # by urlopen(timeout=timeout).
 _RIE_CONNECT_RETRY_SECONDS = 30.0
 
+_RIE_RUNTIME_EXIT_RE = re.compile(
+    r"Runtime exited (?:with error: (?:exit status \d+|signal: [^\"\n]+?)|without providing a reason)(?= InvokeID=|[\"\n]|$)",
+    re.M)
+
 
 def _rie_failure_is_retryable(exc: BaseException) -> bool:
     """Is a failed RIE request worth retrying while the container comes up?
@@ -4108,7 +4115,7 @@ def _rie_failure_is_retryable(exc: BaseException) -> bool:
     return not isinstance(exc, TimeoutError)
 
 
-def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
+def _rie_terminal_result(exc: BaseException, timeout: int, logs: str, request_id: str = "") -> dict:
     """Shape a terminal RIE failure as AWS shapes it: a function error.
 
     AWS answers `Invoke` with HTTP 200, `X-Amz-Function-Error: Unhandled` and
@@ -4129,8 +4136,13 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             parsed = None
+        exited = _RIE_RUNTIME_EXIT_RE.search(logs or "")
         if isinstance(parsed, dict) and parsed.get("errorMessage"):
             body = parsed
+        elif exited:
+            # The runtime died (RIE answers 502, empty): AWS reports the reason the RIE logged.
+            body = {"errorMessage": runtime_exit_message(request_id, exited.group(0)),
+                    "errorType": "Runtime.ExitError"}
         else:
             err_type = exc.headers.get("Lambda-Runtime-Function-Error-Type") if exc.headers else None
             body = {
@@ -4226,7 +4238,7 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
                 logs = container.logs(
                     stdout=True, stderr=True, since=attempt_start
                 ).decode("utf-8", errors="replace").strip()
-                result = _rie_terminal_result(exc, timeout, logs)
+                result = _rie_terminal_result(exc, timeout, logs, request_id)
                 result["log_source"] = "rie"
                 return result
             time.sleep(0.1)
@@ -5563,7 +5575,7 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:
             error_msg = result.get("error", "Unknown error")
-            error_type = "Runtime.HandlerError"
+            error_type = result.get("error_type") or "Runtime.HandlerError"
             if _RIE_TIMEOUT_TEXT_RE.fullmatch(error_msg):
                 error_type = "Sandbox.Timedout"
             return {
@@ -5578,6 +5590,9 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
         invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
         worker = None  # invalidate_worker already dropped it from the pool
+        if isinstance(e, RuntimeExitError):
+            return {"body": {"errorMessage": runtime_exit_message(request_id, e.reason), "errorType": e.error_type},
+                    "error": True, "log": e.log}
         return {
             "body": {"errorMessage": str(e), "errorType": getattr(e, "error_type", "") or type(e).__name__},
             "error": True,
@@ -5676,6 +5691,9 @@ def _execute_function_provided_warm(func: dict, event: dict,
         error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
         # Do not transparently invoke again: the handler may already have
         # performed side effects before its environment failed.
+        if isinstance(e, RuntimeExitError):
+            return {"body": {"errorMessage": runtime_exit_message(request_id, e.reason), "errorType": error_type},
+                    "error": True, "log": e.log}
         return {
             "body": {"errorMessage": str(e), "errorType": error_type},
             "error": True,
@@ -5818,7 +5836,17 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
                     stderr=subprocess.PIPE,
                 )
 
-            if response_received.wait(timeout=timeout):
+            deadline = time.monotonic() + timeout
+            while not response_received.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
+                if time.monotonic() >= deadline:
+                    break
+                if proc.poll() is not None and not response_received.wait(0.05):
+                    # The bootstrap died before answering: AWS reports how it exited, not a timeout.
+                    stdout, stderr = proc.communicate(timeout=5)
+                    logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
+                    return {"body": {"errorMessage": runtime_exit_message(request_id, runtime_exit_reason(proc.returncode)),
+                                     "errorType": "Runtime.ExitError"}, "error": True, "log": logs}
+            if response_received.is_set():
                 proc.terminate()
                 try:
                     _, stderr_out = proc.communicate(timeout=5)
@@ -5982,6 +6010,14 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
 
             log_tail = proc.stderr.strip()
 
+            if proc.returncode < 0:
+                # Killed by a signal: the runtime died, which AWS reports as Runtime.ExitError.
+                return {
+                    "body": {"errorMessage": runtime_exit_message(request_id, runtime_exit_reason(proc.returncode)),
+                             "errorType": "Runtime.ExitError"},
+                    "error": True,
+                    "log": log_tail,
+                }
             if proc.returncode == 0:
                 stdout = proc.stdout.strip()
                 if not stdout:

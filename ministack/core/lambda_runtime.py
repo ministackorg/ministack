@@ -1393,7 +1393,11 @@ class Worker:
                     stderr_out = self._proc.stderr.read(4096)
                 except Exception:
                     pass
-                raise RuntimeError(f"Worker process exited immediately. stderr: {stderr_out}")
+                try:
+                    returncode = self._proc.wait(timeout=5)
+                except Exception:
+                    returncode = 1
+                raise RuntimeExitError(returncode, stderr_out)
             response_line = response_line.strip()
             if not response_line or not response_line.startswith("{"):
                 continue
@@ -1506,7 +1510,12 @@ class Worker:
                     for _ in range(200):
                         response_line = self._proc.stdout.readline()
                         if not response_line:
-                            result_box.append({"status": "error", "error": "Worker process died"})
+                            try:
+                                returncode = self._proc.wait(timeout=5)
+                            except Exception:
+                                returncode = 1
+                            result_box.append({"status": "error", "error_type": RuntimeExitError.error_type,
+                                               "error": runtime_exit_message(request_id, runtime_exit_reason(returncode))})
                             return
                         response_line = response_line.strip()
                         if not response_line:
@@ -1842,6 +1851,40 @@ _PROVIDED_LOG_MAX_LINES = 10000
 
 # /2018-06-01/runtime/invocation/<request-id>/{response,error}
 _INVOCATION_RESULT_RE = re.compile(r"/runtime/invocation/([^/]+)/(response|error)/?$")
+
+
+# What Go's syscall.Signal.String() names each Linux signal; the RIE reports a
+# runtime killed by a signal as "signal: <name>" (supervisor/model/model.go).
+_GO_SIGNAL_NAMES = {
+    1: "hangup", 2: "interrupt", 3: "quit", 4: "illegal instruction", 5: "trace/breakpoint trap",
+    6: "aborted", 7: "bus error", 8: "floating point exception", 9: "killed", 10: "user defined signal 1",
+    11: "segmentation fault", 12: "user defined signal 2", 13: "broken pipe", 14: "alarm clock",
+    15: "terminated",
+}
+
+
+def runtime_exit_reason(returncode: int) -> str:
+    """The error the Lambda runtime reports when the runtime process exits, as the RIE words it."""
+    if returncode == 0:
+        return "Runtime exited without providing a reason"
+    if returncode < 0:
+        return f"Runtime exited with error: signal: {_GO_SIGNAL_NAMES.get(-returncode, f'signal {-returncode}')}"
+    return f"Runtime exited with error: exit status {returncode}"
+
+
+def runtime_exit_message(request_id: str, reason: str) -> str:
+    return f"RequestId: {request_id} Error: {reason}" if request_id else f"Error: {reason}"
+
+
+class RuntimeExitError(RuntimeError):
+    """The runtime process exited: AWS's Runtime.ExitError, with the process's output as its log."""
+
+    error_type = "Runtime.ExitError"
+
+    def __init__(self, returncode: int, log: str = ""):
+        self.reason = runtime_exit_reason(returncode)
+        self.log = log
+        super().__init__(self.reason)
 
 
 class ProvidedInitTimeout(RuntimeError):
@@ -2206,9 +2249,7 @@ class ProvidedWorker(Worker):
         while not self._init_settled.wait(_PROVIDED_POLL):
             exit_code = self._proc.poll() if self._proc is not None else -1
             if exit_code is not None:
-                raise RuntimeError(
-                    f"bootstrap exited during init with code {exit_code}"
-                    f"{self._init_log_suffix()}")
+                raise RuntimeExitError(exit_code, self._drain_stderr_bounded(first_line_wait=0.1))
             if time.monotonic() >= deadline:
                 raise ProvidedInitTimeout(
                     f"bootstrap did not reach the Runtime API within "
@@ -2269,7 +2310,8 @@ class ProvidedWorker(Worker):
                     # before the HTTP handler thread records it.
                     if self._response_ready.wait(_PROVIDED_POLL):
                         break
-                    failure = "Runtime exited before returning a response"
+                    failure = runtime_exit_message(
+                        request_id, runtime_exit_reason(proc.poll() if proc is not None else 1))
                     break
                 if time.monotonic() >= deadline:
                     failure = f"Task timed out after {timeout}.00 seconds"

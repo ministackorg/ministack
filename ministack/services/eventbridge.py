@@ -1192,7 +1192,10 @@ def _put_events_through_endpoint(data, endpoint):
     """PutEvents to a healthy global endpoint: delivered in its primary region with the endpoint in
     ``resources``, and, with replication enabled, copied to the secondary region's bus of the same name."""
     primary = parse_arn(endpoint["Arn"]).region
-    entries = [{**e, "Resources": list(e.get("Resources") or []) + [endpoint["Arn"]]}
+    now = int(_now_ts())
+    # The replica keeps the event's time, so both regions see one timestamp.
+    entries = [{**e, "Resources": list(e.get("Resources") or []) + [endpoint["Arn"]],
+                "Time": e.get("Time") if e.get("Time") is not None else now}
                for e in data.get("Entries", [])]
     with request_scope(get_account_id(), primary):
         status, headers, body = _put_events({**data, "Entries": entries, "EndpointId": None})
@@ -1208,7 +1211,8 @@ def _put_events_through_endpoint(data, endpoint):
         bus_name, _ = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
         record = {
             "EventId": new_uuid(), "Source": entry.get("Source", ""), "DetailType": entry.get("DetailType", ""),
-            "Detail": entry.get("Detail", "{}"), "EventBusName": bus_name, "Time": int(_now_ts()),
+            "Detail": entry.get("Detail", "{}"), "EventBusName": bus_name,
+            "Time": int(_coerce_timestamp(entry["Time"])) if isinstance(_coerce_timestamp(entry["Time"]), (int, float)) else now,
             "Resources": entry["Resources"], "Account": get_account_id(), "Region": primary,
         }
         with request_scope(get_account_id(), secondary):
@@ -1263,7 +1267,8 @@ def _put_events(data, allow_aws_source=False):
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds
         # (Java SDK v2 chokes on floats). Persisted in the event_record so
         # archive replay also dispatches the int form.
-        event_time = int(_now_ts())
+        sent_time = _coerce_timestamp(entry.get("Time"))
+        event_time = int(sent_time) if isinstance(sent_time, (int, float)) else int(_now_ts())
 
         event_record = {
             "EventId": event_id,
