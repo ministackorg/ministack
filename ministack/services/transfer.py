@@ -189,6 +189,13 @@ async def handle_request(method, path, headers, body, query_params):
 # Server handlers
 # ---------------------------------------------------------------------------
 
+_SERVER_OPTIONAL = (
+    "Certificate", "EndpointDetails", "IdentityProviderDetails", "LoggingRole", "PostAuthenticationLoginBanner",
+    "PreAuthenticationLoginBanner", "ProtocolDetails", "SecurityPolicyName", "WorkflowDetails",
+    "StructuredLogDestinations", "S3StorageOptions",
+)
+
+
 async def _create_server(data):
     sid = _server_id()
     now = now_iso()
@@ -204,7 +211,11 @@ async def _create_server(data):
         "Tags": data.get("Tags", []),
         "UserCount": 0,
         "DateCreated": now,
+        "IpAddressType": data.get("IpAddressType", "IPV4"),
     }
+    for key in _SERVER_OPTIONAL:
+        if data.get(key) is not None:
+            server[key] = data[key]
 
     _servers[sid] = server
 
@@ -248,7 +259,11 @@ def _describe_server(data):
         "State": server["State"],
         "Tags": server.get("Tags", []),
         "UserCount": server.get("UserCount", 0),
+        "IpAddressType": server.get("IpAddressType", "IPV4"),
     }
+    for key in _SERVER_OPTIONAL:
+        if key in server:
+            described[key] = server[key]
     # SFTP port discovery is via GET /_ministack/transfer/sftp-ports —
     # boto3's model-driven deserializer drops fields not in the AWS spec
     # (so DescribeServer can't carry an SftpPort field meaningfully).
@@ -368,6 +383,9 @@ def _create_user(data):
         "SshPublicKeys": ssh_keys,
         "Tags": data.get("Tags", []),
     }
+    for key in ("Policy", "PosixProfile"):
+        if data.get(key) is not None:
+            user[key] = data[key]
 
     _users[uk] = user
     _servers[sid]["UserCount"] = _servers[sid].get("UserCount", 0) + 1
@@ -396,6 +414,9 @@ def _describe_user(data):
     }
     if user.get("HomeDirectory"):
         described["HomeDirectory"] = user["HomeDirectory"]
+    for key in ("Policy", "PosixProfile"):
+        if key in user:
+            described[key] = user[key]
 
     return json_response({"ServerId": sid, "User": described})
 

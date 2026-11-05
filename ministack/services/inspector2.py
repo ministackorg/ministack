@@ -20,6 +20,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     json_response,
+    to_output_shape,
 )
 
 logger = logging.getLogger("inspector2")
@@ -552,10 +553,10 @@ def _matches_filter(finding, filter_criteria):
     return True
 
 
-def _paginate(items, max_results, next_token):
+def _paginate(items, max_results, next_token, cap=100):
     if not max_results or max_results <= 0:
-        max_results = 100
-    max_results = min(max_results, 100)
+        max_results = cap
+    max_results = min(max_results, cap)
 
     start = 0
     if next_token:
@@ -731,25 +732,20 @@ def _list_coverage(data, account_id):
 def _list_coverage_statistics(data, account_id):
     all_coverage = _coverage.get(account_id, [])
 
-    counts_by_resource = {}
-    counts_by_scan = {}
-
+    group_by = data.get("groupBy") or "RESOURCE_TYPE"
+    counts = {}
     for cov in all_coverage:
-        rt = cov.get("resourceType", "UNKNOWN")
-        sc = cov.get("scanStatus", {}).get("statusCode", "UNKNOWN")
-        counts_by_resource[rt] = counts_by_resource.get(rt, 0) + 1
-        counts_by_scan[sc] = counts_by_scan.get(sc, 0) + 1
+        if group_by == "SCAN_STATUS_CODE":
+            key = cov.get("scanStatus", {}).get("statusCode", "UNKNOWN")
+        elif group_by == "SCAN_STATUS_REASON":
+            key = cov.get("scanStatus", {}).get("reason", "UNKNOWN")
+        elif group_by == "ACCOUNT_ID":
+            key = cov.get("accountId", account_id)
+        else:
+            key = cov.get("resourceType", "UNKNOWN")
+        counts[key] = counts.get(key, 0) + 1
 
-    counts_by_group = [
-        {
-            "countBy": "RESOURCE_TYPE",
-            "counts": [{"key": k, "count": v} for k, v in counts_by_resource.items()],
-        },
-        {
-            "countBy": "SCAN_STATUS_CODE",
-            "counts": [{"key": k, "count": v} for k, v in counts_by_scan.items()],
-        },
-    ]
+    counts_by_group = [{"groupKey": k, "count": v} for k, v in counts.items()]
 
     return json_response(
         {
@@ -763,31 +759,25 @@ def _list_finding_aggregations(data, account_id):
     aggregation_type = data.get("aggregationType", "FINDING_TYPE")
     all_findings = _findings.get(account_id, [])
 
+    responses = []
     if aggregation_type == "FINDING_TYPE":
         by_type = {}
         for f in all_findings:
             ft = f.get("type", "UNKNOWN")
             by_type[ft] = by_type.get(ft, 0) + 1
-        return json_response(
-            {
-                "aggregationType": aggregation_type,
-                "responses": [{"findingTypeAggregation": {"severityCounts": {"all": v}}} for v in by_type.values()],
-            }
-        )
-
+        responses = [{"findingTypeAggregation": {"severityCounts": {"all": v}}} for v in by_type.values()]
     elif aggregation_type == "ACCOUNT":
         by_acct = {}
         for f in all_findings:
             aid = f.get("awsAccountId", "UNKNOWN")
             by_acct[aid] = by_acct.get(aid, 0) + 1
-        return json_response(
-            {
-                "aggregationType": aggregation_type,
-                "responses": [{"accountAggregation": {"severityCounts": {"all": v}}} for v in by_acct.values()],
-            }
-        )
+        responses = [{"accountAggregation": {"severityCounts": {"all": v}}} for v in by_acct.values()]
 
-    return json_response({"aggregationType": aggregation_type, "responses": []})
+    page, new_token = _paginate(responses, data.get("maxResults"), data.get("nextToken"))
+    response = {"aggregationType": aggregation_type, "responses": page}
+    if new_token:
+        response["nextToken"] = new_token
+    return json_response(response)
 
 
 def _search_vulnerabilities(data, account_id):
@@ -849,9 +839,9 @@ def _batch_get_finding_details(data, account_id):
 
     for arn in finding_arns:
         if arn not in found:
-            errors.append({"arn": arn, "errorCode": "RESOURCE_NOT_FOUND", "errorMessage": "Finding not found"})
+            errors.append({"findingArn": arn, "errorCode": "RESOURCE_NOT_FOUND", "errorMessage": "Finding not found"})
 
-    return json_response({"findingDetails": list(found.values()), "errors": errors})
+    return json_response({"findingDetails": [to_output_shape("inspector2", "FindingDetail", f) for f in found.values()], "errors": errors})
 
 
 # ---------------------------------------------------------------------------
@@ -938,13 +928,19 @@ def _create_filter(data, account_id):
         "createdAt": now,
         "updatedAt": now,
     }
+    if data.get("reason"):
+        filt["reason"] = data["reason"]
     _filters[account_id][name] = filt
     return json_response({"arn": filt["arn"]})
 
 
 def _list_filters(data, account_id):
     all_filters = list(_filters.get(account_id, {}).values())
-    return json_response({"filters": all_filters})
+    page, new_token = _paginate(all_filters, data.get("maxResults"), data.get("nextToken"))
+    response = {"filters": page}
+    if new_token:
+        response["nextToken"] = new_token
+    return json_response(response)
 
 
 def _delete_filter(data, account_id):
@@ -1082,7 +1078,11 @@ def _list_account_permissions(data, account_id):
 def _list_usage_totals(data, account_id):
     account_ids = data.get("accountIds") or [account_id]
     totals = [{"accountId": aid, "usage": []} for aid in account_ids]
-    return json_response({"totals": totals})
+    page, new_token = _paginate(totals, data.get("maxResults"), data.get("nextToken"), cap=500)
+    response = {"totals": page}
+    if new_token:
+        response["nextToken"] = new_token
+    return json_response(response)
 
 
 def _get_findings_report_status(data, account_id):
@@ -1210,9 +1210,7 @@ async def handle_request(method, path, headers, body, query_params):
             return handler(data, account_id) if "account_id" in handler.__code__.co_varnames else handler(data)
     except Exception as e:
         logger.exception("Error handling %s: %s", path, e)
-        # Don't surface the Python exception text — AWS InternalServerError
-        # responses don't leak internal exception details.
-        return error_response_json("InternalServerError",
+        return error_response_json("InternalServerException",
             "An internal server error occurred.", 500)
 
 

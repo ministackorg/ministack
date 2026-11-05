@@ -79,13 +79,25 @@ def _delete_report_definition(payload: dict):
     return _json(200, {})
 
 
-def _describe_report_definitions(_payload: dict):
-    return _json(
-        200,
-        {
-            "ReportDefinitions": list(_report_definitions.values()),
-        },
-    )
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
+def _describe_report_definitions(payload: dict):
+    page, nxt = _page(list(_report_definitions.values()), payload.get("MaxResults"), payload.get("NextToken"))
+    resp = {"ReportDefinitions": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return _json(200, resp)
 
 
 def _list_tags_for_resource(payload: dict):

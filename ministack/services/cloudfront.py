@@ -87,7 +87,14 @@ from defusedxml.ElementTree import fromstring
 from ministack.core import cloudfront_js
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_offloop, run_reentrant
-from ministack.core.responses import AccountScopedDict, StreamingResponse, get_account_id, new_uuid
+from ministack.core.responses import (
+    AccountScopedDict,
+    StreamingResponse,
+    get_account_id,
+    get_region,
+    new_uuid,
+    request_scope,
+)
 
 logger = logging.getLogger("cloudfront")
 
@@ -4647,6 +4654,22 @@ def _delete_connection_group(identifier, headers):
     return 204, {}, b""
 
 
+def _body_page(el, items):
+    """MaxItems / Marker from a POST list body. Returns ``(page, next_marker)``."""
+    max_raw = _opt_text(el, "MaxItems") if el is not None else None
+    marker = _opt_text(el, "Marker") if el is not None else None
+    try:
+        start = max(int(base64.urlsafe_b64decode((marker or "").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    try:
+        end = start + max(int(max_raw), 1)
+    except (TypeError, ValueError):
+        end = len(items)
+    next_marker = base64.urlsafe_b64encode(str(end).encode()).decode() if end < len(items) else None
+    return items[start:end], next_marker
+
+
 def _list_connection_groups(body):
     el = _parse_body(body)
     anycast_filter = None
@@ -4658,8 +4681,11 @@ def _list_connection_groups(body):
         cg for cg in _connection_groups.values()
         if not anycast_filter or cg.get("AnycastIpListId") == anycast_filter
     ]
+    groups, next_marker = _body_page(el, groups)
 
     def build(root):
+        if next_marker:
+            SubElement(root, "NextMarker").text = next_marker
         items_el = SubElement(root, "ConnectionGroups")
         for cg in groups:
             summary = SubElement(items_el, "ConnectionGroupSummary")
@@ -4868,7 +4894,7 @@ def _list_distribution_tenants(body):
         if (not dist_filter or t["DistributionId"] == dist_filter)
         and (not cg_filter or t["ConnectionGroupId"] == cg_filter)
     ]
-    return _tenant_list_response(tenants, "ListDistributionTenantsResult")
+    return _tenant_list_response(*_body_page(el, tenants), "ListDistributionTenantsResult")
 
 
 def _list_distribution_tenants_by_customization(body):
@@ -4887,13 +4913,15 @@ def _list_distribution_tenants_by_customization(body):
         return True
 
     return _tenant_list_response(
-        [t for t in _distribution_tenants.values() if matches(t)],
+        *_body_page(el, [t for t in _distribution_tenants.values() if matches(t)]),
         "ListDistributionTenantsByCustomizationResult",
     )
 
 
-def _tenant_list_response(tenants, root_tag):
+def _tenant_list_response(tenants, next_marker, root_tag):
     def build(root):
+        if next_marker:
+            SubElement(root, "NextMarker").text = next_marker
         items_el = SubElement(root, "DistributionTenantList")
         for tenant in tenants:
             summary = SubElement(items_el, "DistributionTenantSummary")
@@ -5198,6 +5226,7 @@ def _list_domain_conflicts(body):
         for rtype, rid in _domain_owners(domain, wildcard_overlap=True)
         if rid not in exclude_ids
     ]
+    conflicts, next_marker = _body_page(el, conflicts)
 
     def build(root):
         list_el = SubElement(root, "DomainConflicts")
@@ -5208,6 +5237,8 @@ def _list_domain_conflicts(body):
             SubElement(item, "ResourceType").text = rtype
             SubElement(item, "ResourceId").text = rid
             SubElement(item, "AccountId").text = get_account_id()
+        if next_marker:
+            SubElement(root, "NextMarker").text = next_marker
 
     return _xml_response("ListDomainConflictsResult", build)
 
@@ -5297,10 +5328,11 @@ def _list_distributions_by_connection_mode(mode):
 # ---------------------------------------------------------------------------
 
 
+# Viewer requests are unsigned, so the lookups search every account.
 def find_distribution_for_label(label: str):
     """The distribution whose DomainName is ``<label>.cloudfront.net``."""
     domain = f"{label}.cloudfront.net"
-    for dist in _distributions.values():
+    for _, dist in _distributions.to_dict().items():
         if dist.get("DomainName", "").lower() == domain:
             return dist
     return None
@@ -5310,7 +5342,7 @@ def find_distribution_for_alias(hostname: str):
     """The distribution claiming ``hostname``: an exact alias, else the longest ``*.`` suffix the host ends with."""
     hostname = hostname.lower()
     best, best_len = None, -1
-    for dist in _distributions.values():
+    for _, dist in _distributions.to_dict().items():
         for alias in map(str.lower, _get_distribution_aliases(dist)):
             if alias == hostname:
                 return dist
@@ -6321,7 +6353,15 @@ def _check_stacked_distribution(headers: dict):
 
 async def handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
                           headers: dict, body: bytes, query_params: dict, client_ip: str = "127.0.0.1") -> tuple:
-    """Serve one viewer request against ``dist`` (a cloudfront.py distribution record)."""
+    """Serve one viewer request against ``dist`` (a cloudfront.py distribution record) in its owner's account."""
+    owner = next((account for (account, _), d in _distributions.to_dict().items() if d is dist), get_account_id())
+    with request_scope(owner, get_region()):
+        return await _handle_viewer_request(dist, method, path, raw_uri, raw_query_string, headers, body,
+                                            query_params, client_ip)
+
+
+async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
+                                 headers: dict, body: bytes, query_params: dict, client_ip: str) -> tuple:
     stacked_response = _check_stacked_distribution(headers)
     if stacked_response is not None:
         return stacked_response

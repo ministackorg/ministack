@@ -295,9 +295,12 @@ def _restore_state(data):
 # ---------------------------------------------------------------------------
 
 def _next_port():
+    from ministack.services.rds import _is_host_port_free
     with _port_counter_lock:
         port = _port_counter[0]
-        _port_counter[0] += 1
+        while not _is_host_port_free(port):  # another container may already publish it
+            port += 1
+        _port_counter[0] = port + 1
         return port
 
 
@@ -346,8 +349,17 @@ def _now():
     return int(time.time())
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _json_resp(status, body):
-    return status, {"Content-Type": "application/json"}, json.dumps(body).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps(_drop_none(body)).encode()
 
 
 def _error(status, code, message):
@@ -469,7 +481,7 @@ def _k3s_run_kwargs(
         ],
         security_opt=["seccomp=unconfined", "apparmor=unconfined"],
         devices=["/dev/fuse"],
-        ports={"6443/tcp": port},
+        ports={"6443/tcp": container_reaper.published_port(port)},
         name=f"ministack-eks-{account_id}-{region}-{name}",
         labels=container_reaper.own_labels("eks", cluster_name=name, region=region, account_id=account_id),
         environment={"K3S_KUBECONFIG_MODE": "644"},
@@ -668,6 +680,19 @@ def _extract_ca_cert(container, timeout=30):
 # Clusters
 # ---------------------------------------------------------------------------
 
+def _kubernetes_network_config(request):
+    config = {
+        "serviceIpv4Cidr": request.get("serviceIpv4Cidr", "10.100.0.0/16"),
+        "ipFamily": request.get("ipFamily", "ipv4"),
+    }
+    if config["ipFamily"] == "ipv6":
+        prefix = secrets.token_hex(5)
+        config["serviceIpv6Cidr"] = f"fd{prefix[:2]}:{prefix[2:6]}:{prefix[6:]}::/108"
+    if "elasticLoadBalancing" in request:
+        config["elasticLoadBalancing"] = request["elasticLoadBalancing"]
+    return config
+
+
 def _create_cluster(body, creator_arn=None):
     name = body.get("name", "")
     if not name:
@@ -708,10 +733,7 @@ def _create_cluster(body, creator_arn=None):
             "endpointPrivateAccess": vpc_config.get("endpointPrivateAccess", False),
             "publicAccessCidrs": vpc_config.get("publicAccessCidrs", ["0.0.0.0/0"]),
         },
-        "kubernetesNetworkConfig": {
-            "serviceIpv4Cidr": body.get("kubernetesNetworkConfig", {}).get("serviceIpv4Cidr", "10.100.0.0/16"),
-            "ipFamily": "ipv4",
-        },
+        "kubernetesNetworkConfig": _kubernetes_network_config(body.get("kubernetesNetworkConfig") or {}),
         "logging": body.get("logging", {"clusterLogging": []}),
         "identity": {
             "oidc": {"issuer": _issuer_url(_new_oidc_id())}
@@ -721,7 +743,12 @@ def _create_cluster(body, creator_arn=None):
         "platformVersion": f"eks.{int(time.time()) % 100}",
         "tags": body.get("tags", {}),
         "encryptionConfig": body.get("encryptionConfig", []),
-        "accessConfig": body.get("accessConfig", {}),
+        "accessConfig": {
+            "bootstrapClusterCreatorAdminPermissions": True,
+            "authenticationMode": "CONFIG_MAP",
+            **(body.get("accessConfig") or {}),
+        },
+        "deletionProtection": body.get("deletionProtection", False),
         "_creator_arn": creator_arn,
         # The webhook URL's shared secret. The route is unauthenticated by
         # necessity (the apiserver has no AWS credentials), so without this the
@@ -732,6 +759,13 @@ def _create_cluster(body, creator_arn=None):
         "_docker_id": None,
         "_port": port,
     }
+
+    for field in ("upgradePolicy", "zonalShiftConfig", "remoteNetworkConfig",
+                  "computeConfig", "storageConfig", "outpostConfig",
+                  "controlPlaneScalingConfig", "kubeApiServerConfig",
+                  "kubeSchedulerConfig", "kubeControllerManagerConfig"):
+        if field in body:
+            cluster[field] = body[field]
 
     _clusters[name] = cluster
     if cluster["tags"]:
@@ -766,12 +800,12 @@ def _create_cluster(body, creator_arn=None):
                 client, ms_network, name, account_id, region,
                 cluster.get("_auth_token", ""),
             )
-            container = _start_k3s_container(
-                client, run_kwargs, registries_yaml, auth_webhook_config
-            )
+            container, cluster["_port"] = container_reaper.run_on_free_port(
+                client, lambda kwargs: _start_k3s_container(client, kwargs, registries_yaml, auth_webhook_config),
+                run_kwargs, _next_port)
             cluster["_docker_id"] = container.id
 
-            cluster["endpoint"] = _cluster_endpoint(port)
+            cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             cluster["certificateAuthority"]["data"] = _extract_ca_cert(container)
             cluster["status"] = "ACTIVE"
             _schedule_access_policy_reconcile(name, account_id, region)
@@ -793,10 +827,30 @@ def _describe_cluster(name):
     return _json_resp(200, {"cluster": _sanitize(cluster)})
 
 
+def _page(query, items):
+    try:
+        start = max(int(query.get("nextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(query.get("maxResults") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    end = start + limit
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
+def _paged(key, items, query, extra=None):
+    page, token = _page(query, items)
+    body = dict(extra or {})
+    body[key] = page
+    if token:
+        body["nextToken"] = token
+    return _json_resp(200, body)
+
+
 def _list_clusters(query):
-    max_results = int(query.get("maxResults", 100))
-    names = list(_clusters.keys())[:max_results]
-    return _json_resp(200, {"clusters": names})
+    return _paged("clusters", list(_clusters.keys()), query)
 
 
 
@@ -917,14 +971,21 @@ def _create_nodegroup(cluster_name, body):
         "nodeRole": body.get("nodeRole", f"arn:aws:iam::{get_account_id()}:role/eks-node-role"),
         "labels": body.get("labels", {}),
         "taints": body.get("taints", []),
-        "diskSize": body.get("diskSize", 20),
         "health": {"issues": []},
         "resources": {
             "autoScalingGroups": [{"name": f"eks-{ng_name}-{new_uuid()[:8]}"}],
             "remoteAccessSecurityGroup": f"sg-{new_uuid()[:17].replace('-', '')}",
         },
         "tags": body.get("tags", {}),
+        "nodeRepairConfig": body.get("nodeRepairConfig", {"enabled": False}),
     }
+    if "diskSize" in body:
+        nodegroup["diskSize"] = body["diskSize"]
+    elif "launchTemplate" not in body:
+        nodegroup["diskSize"] = 50 if nodegroup["amiType"].startswith("WINDOWS") else 20
+    for field in ("remoteAccess", "launchTemplate", "updateConfig", "warmPoolConfig"):
+        if field in body:
+            nodegroup[field] = body[field]
 
     _nodegroups[key] = nodegroup
     if nodegroup["tags"]:
@@ -945,10 +1006,9 @@ def _describe_nodegroup(cluster_name, ng_name):
 def _list_nodegroups(cluster_name, query):
     if cluster_name not in _clusters:
         return _error(404, "ResourceNotFoundException", f"No cluster found for name: {cluster_name}.")
-    max_results = int(query.get("maxResults", 100))
     names = [ng["nodegroupName"] for k, ng in _nodegroups.items()
-             if k.startswith(f"{cluster_name}/")][:max_results]
-    return _json_resp(200, {"nodegroups": names})
+             if k.startswith(f"{cluster_name}/")]
+    return _paged("nodegroups", names, query)
 
 
 def _delete_nodegroup(cluster_name, ng_name):
@@ -1003,6 +1063,8 @@ def _create_addon(cluster_name, body):
         "owner": "aws",
         "publisher": "eks",
     }
+    if "namespaceConfig" in body:
+        addon["namespaceConfig"] = body["namespaceConfig"]
     _addons[key] = addon
     if addon["tags"]:
         _tags[arn] = dict(addon["tags"])
@@ -1021,10 +1083,9 @@ def _list_addons(cluster_name, query):
     if cluster_name not in _clusters:
         return _error(404, "ResourceNotFoundException",
                       f"No cluster found for name: {cluster_name}.")
-    max_results = int(query.get("maxResults", 100))
     names = [a["addonName"] for k, a in _addons.items()
-             if k.startswith(f"{cluster_name}/")][:max_results]
-    return _json_resp(200, {"addons": names})
+             if k.startswith(f"{cluster_name}/")]
+    return _paged("addons", names, query)
 
 
 def _delete_addon(cluster_name, addon_name):
@@ -1136,8 +1197,7 @@ def _list_access_entries(cluster_name, query):
             ):
                 continue
         arns.append(e["principalArn"])
-    max_results = int(query.get("maxResults", 100))
-    return _json_resp(200, {"accessEntries": arns[:max_results]})
+    return _paged("accessEntries", arns, query)
 
 
 # ---------------------------------------------------------------------------
@@ -1236,8 +1296,7 @@ def _list_pod_identity_associations(cluster_name, query):
             continue
         summaries.append(_pod_identity_summary(assoc))
     summaries.sort(key=lambda a: a["associationId"])
-    max_results = int(query.get("maxResults", 100))
-    return _json_resp(200, {"associations": summaries[:max_results]})
+    return _paged("associations", summaries, query)
 
 
 def _update_pod_identity_association(cluster_name, association_id, body):
@@ -1372,12 +1431,8 @@ def _list_associated_access_policies(cluster_name, principal_arn, query):
                       f"No access entry for principal {principal_arn}.")
     prefix = f"{cluster_name}\x00{principal_arn}\x00"
     policies = [p for k, p in _access_policies.items() if k.startswith(prefix)]
-    max_results = int(query.get("maxResults", 100))
-    return _json_resp(200, {
-        "clusterName": cluster_name,
-        "principalArn": principal_arn,
-        "associatedAccessPolicies": policies[:max_results],
-    })
+    return _paged("associatedAccessPolicies", policies, query,
+                  {"clusterName": cluster_name, "principalArn": principal_arn})
 
 
 # ---------------------------------------------------------------------------
@@ -1827,9 +1882,9 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
                 client, ms_network, cluster_name, cluster_spec.account_id,
                 cluster_spec.region, cluster["_auth_token"],
             )
-            container = _start_k3s_container(
-                client, run_kwargs, registries_yaml, auth_webhook_config
-            )
+            container, cluster["_port"] = container_reaper.run_on_free_port(
+                client, lambda kwargs: _start_k3s_container(client, kwargs, registries_yaml, auth_webhook_config),
+                run_kwargs, _next_port)
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(cluster["_port"])

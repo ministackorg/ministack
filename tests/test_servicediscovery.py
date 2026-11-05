@@ -592,12 +592,8 @@ def test_servicediscovery_state_is_isolated_by_region():
     )[0] == 200
     west_operation_ids = set(sd_svc._operations.keys())
 
-    assert _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"] == [
-        sd_svc._namespaces[west_namespace_id]
-    ]
-    assert _json_result(sd_svc._list_services({}))[2]["Services"] == [
-        sd_svc._services[west_service_id]
-    ]
+    assert [n["Id"] for n in _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"]] == [west_namespace_id]
+    assert [s["Id"] for s in _json_result(sd_svc._list_services({}))[2]["Services"]] == [west_service_id]
     listed_west_operation_ids = {
         operation["Id"]
         for operation in _json_result(sd_svc._list_operations({}))[2]["Operations"]
@@ -613,9 +609,7 @@ def test_servicediscovery_state_is_isolated_by_region():
     )[0] == 404
 
     set_request_region("us-east-1")
-    assert _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"] == [
-        sd_svc._namespaces[east_namespace_id]
-    ]
+    assert [n["Id"] for n in _json_result(sd_svc._list_namespaces({}))[2]["Namespaces"]] == [east_namespace_id]
     assert _json_result(
         asyncio.run(sd_svc._create_namespace({"Name": namespace_name}))
     )[0] == 409

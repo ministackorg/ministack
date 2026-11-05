@@ -28,6 +28,8 @@ endpoint; its certificate chains to the CA served at
 ``GET /_ministack/elasticache/ca.pem``.
 """
 
+import base64
+import binascii
 import contextvars
 import copy
 import hashlib
@@ -664,7 +666,7 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
     try:
         run_kwargs = dict(
             image=image, detach=True,
-            ports={f"{container_port}/tcp": host_port},
+            ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
             name=name,
             labels=labels,
             volumes={},
@@ -676,7 +678,9 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
-        container = _run_with_acl(docker_client, run_kwargs, acl)
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_with_acl(docker_client, kwargs, acl), run_kwargs, _next_host_port)
+        endpoint_port = host_port
         container_ip = ""
         if DOCKER_NETWORK:
             container.reload()
@@ -1053,6 +1057,7 @@ def _resolve_taggable_elasticache_arn(arn):
 def _record_event(source_id, source_type, message):
     lst = _events_list()
     lst.append({
+        "Seq": lst[-1].get("Seq", len(lst) - 1) + 1 if lst else 0,
         "SourceIdentifier": source_id,
         "SourceType": source_type,
         "Message": message,
@@ -1187,14 +1192,16 @@ def _create_cache_cluster(p):
         "CacheNodeType": node_type,
         "NumCacheNodes": num_nodes,
         "CacheClusterCreateTime": time.time(),
-        "PreferredAvailabilityZone": f"{get_region()}a",
+        "PreferredAvailabilityZone": _p(p, "PreferredAvailabilityZone") or f"{get_region()}a",
         "CacheParameterGroup": {
             "CacheParameterGroupName": param_group_name,
             "ParameterApplyStatus": "in-sync",
         },
         "CacheSubnetGroupName": subnet_group,
-        "AutoMinorVersionUpgrade": True,
-        "SecurityGroups": [],
+        "AutoMinorVersionUpgrade": _p(p, "AutoMinorVersionUpgrade", "true").lower() == "true",
+        "SecurityGroups": _security_group_memberships(p),
+        "LogDeliveryConfigurations": _extract_log_delivery_configs(p),
+        **_sent_members(p),
         "ReplicationGroupId": _p(p, "ReplicationGroupId") or "",
         "SnapshotRetentionLimit": int(_p(p, "SnapshotRetentionLimit") or "0"),
         "SnapshotWindow": _p(p, "SnapshotWindow") or "05:00-06:00",
@@ -1254,6 +1261,9 @@ def _create_cache_cluster(p):
         spawn_background(contextvars.copy_context().run, _finish_cluster_start,
                          thread_name=f"ministack-elasticache-start-{cluster_id}")
 
+    if _p(p, "NotificationTopicArn"):
+        _clusters[cluster_id]["NotificationConfiguration"] = {
+            "TopicArn": _p(p, "NotificationTopicArn"), "TopicStatus": "active"}
     _tags[arn] = _extract_tags(p)
 
     _record_event(cluster_id, "cache-cluster", "Cache cluster created")
@@ -1330,9 +1340,55 @@ def _describe_cache_clusters(p):
         clusters = [cluster]
     else:
         clusters = list(_clusters.values())
+    clusters, marker, err = _marker_page(p, clusters, 100)
+    if err:
+        return err
     members = "".join(_cluster_xml(c) for c in clusters)
     return _xml(200, "DescribeCacheClustersResponse",
-        f"<DescribeCacheClustersResult><CacheClusters>{members}</CacheClusters></DescribeCacheClustersResult>")
+        f"<DescribeCacheClustersResult>{marker}<CacheClusters>{members}</CacheClusters></DescribeCacheClustersResult>")
+
+
+def _security_group_memberships(p):
+    return [{"SecurityGroupId": sg_id, "Status": "active"}
+            for sg_id in _extract_configs(p, "SecurityGroupIds", ("SecurityGroupId", "member"))]
+
+
+def _sent_members(p, members=("NetworkType", "IpDiscovery")):
+    return {m: _p(p, m) for m in members if _p(p, m)}
+
+
+def _modified_log_delivery_configs(p, current):
+    """The log deliveries after a Modify: each LogType sent replaces its entry, Enabled=false removes it."""
+    configs = {c.get("LogType"): c for c in current or []}
+    sent = False
+    for prefix in ("LogDeliveryConfigurations.LogDeliveryConfigurationRequest", "LogDeliveryConfigurations.member"):
+        idx = 1
+        while _p(p, f"{prefix}.{idx}.LogType"):
+            sent = True
+            if _p(p, f"{prefix}.{idx}.Enabled", "true").lower() != "true":
+                configs.pop(_p(p, f"{prefix}.{idx}.LogType"), None)
+            idx += 1
+    for config in _extract_log_delivery_configs(p):
+        configs[config["LogType"]] = config
+    return list(configs.values()) if sent else None
+
+
+def _apply_common_modify(record, p):
+    """The ModifyCacheCluster / ModifyReplicationGroup members a cache cluster stores."""
+    if _p(p, "AutoMinorVersionUpgrade"):
+        record["AutoMinorVersionUpgrade"] = _p(p, "AutoMinorVersionUpgrade").lower() == "true"
+    if _security_group_memberships(p):
+        record["SecurityGroups"] = _security_group_memberships(p)
+    configs = _modified_log_delivery_configs(p, record.get("LogDeliveryConfigurations"))
+    if configs is not None:
+        record["LogDeliveryConfigurations"] = configs
+    record.update(_sent_members(p, ("IpDiscovery",)))
+    if _p(p, "NotificationTopicArn") or _p(p, "NotificationTopicStatus"):
+        notification = record.setdefault("NotificationConfiguration", {"TopicStatus": "active"})
+        if _p(p, "NotificationTopicArn"):
+            notification["TopicArn"] = _p(p, "NotificationTopicArn")
+        if _p(p, "NotificationTopicStatus"):
+            notification["TopicStatus"] = _p(p, "NotificationTopicStatus")
 
 
 def _modify_cache_cluster(p):
@@ -1370,6 +1426,7 @@ def _modify_cache_cluster(p):
         cluster["PreferredMaintenanceWindow"] = _p(p, "PreferredMaintenanceWindow")
     if _p(p, "CacheParameterGroupName"):
         cluster["CacheParameterGroup"]["CacheParameterGroupName"] = _p(p, "CacheParameterGroupName")
+    _apply_common_modify(cluster, p)
 
     _record_event(cluster_id, "cache-cluster", "Cache cluster modified")
     return _xml_cluster_response("ModifyCacheClusterResponse", "ModifyCacheClusterResult", cluster)
@@ -1436,6 +1493,7 @@ def _create_replication_group(p):
     #   (c) Fallback — docker unavailable; endpoints point at the shared sidecar.
     container_ids = []
     node_groups = []
+    ng_configs = _node_group_configs(p)
 
     use_real_cluster = (
         num_node_groups > 1
@@ -1475,7 +1533,8 @@ def _create_replication_group(p):
         account_id = get_account_id()
         region = get_region()
         for ng_idx in range(1, num_node_groups + 1):
-            ng_id = f"{ng_idx:04d}"
+            cfg = ng_configs[ng_idx - 1] if ng_idx <= len(ng_configs) else {}
+            ng_id = cfg.get("NodeGroupId") or f"{ng_idx:04d}"
             shard_host, shard_port, cid = _spawn_redis_container(
                 name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                 engine=engine,
@@ -1494,7 +1553,8 @@ def _create_replication_group(p):
             if cid:
                 container_ids.append(cid)
             members = []
-            for r in range(replicas_per_node_group + 1):
+            replica_count = int(cfg.get("ReplicaCount") or replicas_per_node_group)
+            for r in range(replica_count + 1):
                 role = "primary" if r == 0 else "replica"
                 members.append({
                     "CacheClusterId": f"{rg_id}-{ng_id}-{r + 1:03d}",
@@ -1510,6 +1570,16 @@ def _create_replication_group(p):
                 "ReaderEndpoint": {"Address": shard_host, "Port": shard_port},
                 "NodeGroupMembers": members,
             })
+
+    for ng, cfg in zip(node_groups, ng_configs):
+        if cfg.get("NodeGroupId"):
+            ng["NodeGroupId"] = cfg["NodeGroupId"]
+        if cfg.get("Slots"):
+            ng["Slots"] = cfg["Slots"]
+        azs = [cfg.get("PrimaryAvailabilityZone")] + cfg.get("ReplicaAvailabilityZones", [])
+        for m, az in zip(ng.get("NodeGroupMembers", []), azs):
+            if az:
+                m["PreferredAvailabilityZone"] = az
 
     # Configuration endpoint (cluster-mode-enabled): point at the first shard's
     # primary. With real cluster bootstrap, clients use this to discover full
@@ -1564,12 +1634,16 @@ def _create_replication_group(p):
         "MultiAZ": "enabled" if _p(p, "MultiAZEnabled", "false").lower() == "true" else "disabled",
         "LogDeliveryConfigurations": log_delivery_configs,
         "UserGroupIds": user_group_ids,
+        **_sent_members(p, ("KmsKeyId", "NetworkType", "IpDiscovery", "Durability")),
         "ConfigurationEndpoint": config_ep,
         "ARN": arn,
         "_num_node_groups": num_node_groups,
         "_replicas_per_node_group": replicas_per_node_group,
         "_docker_container_ids": container_ids,
     }
+    if _p(p, "DataTieringEnabled"):
+        _replication_groups[rg_id]["DataTiering"] = (
+            "enabled" if _p(p, "DataTieringEnabled").lower() == "true" else "disabled")
 
     _tags[arn] = _extract_tags(p)
 
@@ -1604,6 +1678,9 @@ def _create_replication_group(p):
                 "AuthTokenEnabled": bool(auth_token),
                 "TransitEncryptionEnabled": transit,
                 "TransitEncryptionMode": transit_mode,
+                **_sent_members(p),
+                **({"NotificationConfiguration": {"TopicArn": _p(p, "NotificationTopicArn"), "TopicStatus": "active"}}
+                   if _p(p, "NotificationTopicArn") else {}),
                 "CacheNodes": [
                     {
                         "CacheNodeId": m.get("CacheNodeId", "0001"),
@@ -1663,11 +1740,14 @@ def _describe_replication_groups(p):
         groups = [rg]
     else:
         groups = list(_replication_groups.values())
+    groups, marker, err = _marker_page(p, groups, 100)
+    if err:
+        return err
     # AWS shape: ReplicationGroupList.member.locationName = "ReplicationGroup".
     # Strict SDKs (aws-sdk-go-v2, Java/Rust v2) parse a <member>-wrapped list as empty.
     members = "".join(f"<ReplicationGroup>{_rg_xml(g)}</ReplicationGroup>" for g in groups)
     return _xml(200, "DescribeReplicationGroupsResponse",
-        f"<DescribeReplicationGroupsResult><ReplicationGroups>{members}</ReplicationGroups></DescribeReplicationGroupsResult>")
+        f"<DescribeReplicationGroupsResult>{marker}<ReplicationGroups>{members}</ReplicationGroups></DescribeReplicationGroupsResult>")
 
 
 def _modify_replication_group(p):
@@ -1701,6 +1781,21 @@ def _modify_replication_group(p):
             return _error("InvalidParameterValue",
                           "The AUTH token modification is only supported when encryption-in-transit is enabled", 400)
         _update_auth_token(rg, _p(p, "AuthToken"), _p(p, "AuthTokenUpdateStrategy") or "ROTATE")
+    if _p(p, "ClusterMode"):
+        rg["ClusterMode"] = _p(p, "ClusterMode")
+    if _p(p, "TransitEncryptionEnabled"):
+        rg["TransitEncryptionEnabled"] = _p(p, "TransitEncryptionEnabled").lower() == "true"
+    if _p(p, "TransitEncryptionMode"):
+        rg["TransitEncryptionMode"] = _p(p, "TransitEncryptionMode")
+    elif _p(p, "TransitEncryptionEnabled"):
+        rg["TransitEncryptionMode"] = (rg.get("TransitEncryptionMode") or "preferred") if rg["TransitEncryptionEnabled"] else None
+    _apply_common_modify(rg, p)
+    for cluster_id in rg.get("MemberClusters") or []:
+        cluster = _clusters.get(cluster_id)
+        if cluster:
+            _apply_common_modify(cluster, p)
+            for member in ("TransitEncryptionEnabled", "TransitEncryptionMode"):
+                cluster[member] = rg.get(member)
 
     user_group_ids_to_add = _extract_configs(p, "UserGroupIdsToAdd", ("member",))
     user_group_ids_to_remove = _extract_configs(p, "UserGroupIdsToRemove", ("member",))
@@ -1885,9 +1980,12 @@ def _describe_subnet_groups(p):
     if name and name not in _subnet_groups:
         return _error("CacheSubnetGroupNotFoundFault", f"Cache subnet group {name} not found.", 400)
     groups = [_subnet_groups[name]] if name else list(_subnet_groups.values())
+    groups, marker, err = _marker_page(p, groups, 100)
+    if err:
+        return err
     members = "".join(f"<CacheSubnetGroup>{_subnet_group_xml(g)}</CacheSubnetGroup>" for g in groups)
     return _xml(200, "DescribeCacheSubnetGroupsResponse",
-        f"<DescribeCacheSubnetGroupsResult><CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
+        f"<DescribeCacheSubnetGroupsResult>{marker}<CacheSubnetGroups>{members}</CacheSubnetGroups></DescribeCacheSubnetGroupsResult>")
 
 
 def _delete_subnet_group(p):
@@ -1957,6 +2055,9 @@ def _describe_param_groups(p):
     if name and name not in _param_groups:
         return _error("CacheParameterGroupNotFound", f"Cache parameter group {name} not found.", 404)
     groups = [_param_groups[name]] if name and name in _param_groups else list(_param_groups.values())
+    groups, marker, err = _marker_page(p, groups, 100)
+    if err:
+        return err
     # CacheParameterGroupList.member.locationName = "CacheParameterGroup"
     members = "".join(
         f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(g['CacheParameterGroupName']))}</CacheParameterGroupName>"
@@ -1966,7 +2067,7 @@ def _describe_param_groups(p):
         for g in groups
     )
     return _xml(200, "DescribeCacheParameterGroupsResponse",
-        f"<DescribeCacheParameterGroupsResult><CacheParameterGroups>{members}</CacheParameterGroups></DescribeCacheParameterGroupsResult>")
+        f"<DescribeCacheParameterGroupsResult>{marker}<CacheParameterGroups>{members}</CacheParameterGroups></DescribeCacheParameterGroupsResult>")
 
 
 def _delete_param_group(p):
@@ -1988,10 +2089,12 @@ def _describe_cache_parameters(p):
     if name not in _param_groups:
         return _error("CacheParameterGroupNotFound",
                        f"Parameter group {name} not found", 404)
-    params = _param_group_params.get(name, {})
+    params, marker, err = _marker_page(p, list(_param_group_params.get(name, {}).items()), 100)
+    if err:
+        return err
     members = ""
     # ParametersList.member.locationName = "Parameter"
-    for pname, pval in params.items():
+    for pname, pval in params:
         members += (
             f"<Parameter>"
             f"<ParameterName>{xml_escape(str(pname))}</ParameterName>"
@@ -2005,7 +2108,7 @@ def _describe_cache_parameters(p):
             f"</Parameter>"
         )
     return _xml(200, "DescribeCacheParametersResponse",
-        f"<DescribeCacheParametersResult><Parameters>{members}</Parameters></DescribeCacheParametersResult>")
+        f"<DescribeCacheParametersResult>{marker}<Parameters>{members}</Parameters></DescribeCacheParametersResult>")
 
 
 def _modify_cache_parameter_group(p):
@@ -2109,14 +2212,17 @@ def _describe_engine_versions(p):
         "valkey": ["8.1", "8.0", "7.2"],
         "memcached": ["1.6.22", "1.6.17", "1.6.12"],
     }
+    page, marker, err = _marker_page(p, versions.get(engine, ["7.0.12"]), 100)
+    if err:
+        return err
     # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
         f"<CacheEngineVersion><Engine>{xml_escape(str(engine))}</Engine><EngineVersion>{xml_escape(str(v))}</EngineVersion>"
         f"<CacheParameterGroupFamily>{xml_escape(str(_param_group_family_for_engine(engine, v)))}</CacheParameterGroupFamily></CacheEngineVersion>"
-        for v in versions.get(engine, ["7.0.12"])
+        for v in page
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
-        f"<DescribeCacheEngineVersionsResult><CacheEngineVersions>{members}</CacheEngineVersions></DescribeCacheEngineVersionsResult>")
+        f"<DescribeCacheEngineVersionsResult>{marker}<CacheEngineVersions>{members}</CacheEngineVersions></DescribeCacheEngineVersionsResult>")
 
 
 # ---- Tags ----
@@ -2147,6 +2253,23 @@ def _extract_configs(p, container, item_names):
         if values:
             break
     return values
+
+
+def _node_group_configs(p):
+    for prefix in ("NodeGroupConfiguration.NodeGroupConfiguration", "NodeGroupConfiguration.member"):
+        configs = []
+        idx = 1
+        while any(k.startswith(f"{prefix}.{idx}.") for k in p):
+            base = f"{prefix}.{idx}"
+            cfg = {k: _p(p, f"{base}.{k}") for k in
+                   ("NodeGroupId", "Slots", "ReplicaCount", "PrimaryAvailabilityZone") if _p(p, f"{base}.{k}")}
+            cfg["ReplicaAvailabilityZones"] = _extract_configs(
+                p, f"{base}.ReplicaAvailabilityZones", ("AvailabilityZone", "member"))
+            configs.append(cfg)
+            idx += 1
+        if configs:
+            return configs
+    return []
 
 
 def _extract_log_delivery_configs(p):
@@ -2342,10 +2465,13 @@ def _describe_snapshots(p):
     if rg_id:
         snaps = [s for s in snaps if s.get("ReplicationGroupId") == rg_id]
 
+    snaps, marker, err = _marker_page(p, snaps, 50)
+    if err:
+        return err
     # SnapshotList.member.locationName = "Snapshot"
     members = "".join(f"<Snapshot>{_snapshot_xml(s)}</Snapshot>" for s in snaps)
     return _xml(200, "DescribeSnapshotsResponse",
-        f"<DescribeSnapshotsResult><Snapshots>{members}</Snapshots></DescribeSnapshotsResult>")
+        f"<DescribeSnapshotsResult>{marker}<Snapshots>{members}</Snapshots></DescribeSnapshotsResult>")
 
 
 # ---- Serverless Caches ----
@@ -2475,7 +2601,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
     image, container_port = _engine_image_and_port(engine, full_version)
     run_kwargs = dict(
         image=image, detach=True, name=name, labels=labels,
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         entrypoint=["sh", "-c", _SERVERLESS_TLS_WRAPPER, "ministack-elasticache-tls"],
         command=[
             "--port", "0", "--tls-port", str(container_port),
@@ -2490,7 +2616,8 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
     )
     if DOCKER_NETWORK:
         run_kwargs["network"] = DOCKER_NETWORK
-    container = docker_client.containers.run(**run_kwargs)
+    container, host_port = container_reaper.run_on_free_port(
+        docker_client, lambda kwargs: docker_client.containers.run(**kwargs), run_kwargs, _next_host_port)
     try:
         address, port, container_ip = _MINISTACK_HOST, host_port, ""
         if DOCKER_NETWORK:
@@ -2842,6 +2969,7 @@ def _create_serverless_cache(p):
         "SnapshotRetentionLimit": retention or 0,
         "DailySnapshotTime": _p(p, "DailySnapshotTime"),
         "NetworkType": _p(p, "NetworkType") or "ipv4",
+        "ConnectionType": _p(p, "ConnectionType") or "vpc",
         "_host_port": host_port,
         "_docker_container_id": None,
     }
@@ -3030,6 +3158,7 @@ def _serverless_cache_xml(c):
         f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
         f"{optional('DailySnapshotTime', c.get('DailySnapshotTime'))}"
         f"<NetworkType>{xml_escape(str(c.get('NetworkType', 'ipv4')))}</NetworkType>"
+        f"<ConnectionType>{xml_escape(str(c.get('ConnectionType', 'vpc')))}</ConnectionType>"
     )
 
 
@@ -3038,15 +3167,24 @@ def _serverless_cache_xml(c):
 def _describe_events(p):
     source_id = _p(p, "SourceIdentifier")
     source_type = _p(p, "SourceType")
-    max_records = int(_p(p, "MaxRecords") or "100")
+    marker = _p(p, "Marker")
+    try:
+        max_records = min(int(_p(p, "MaxRecords") or "100"), 100)
+        before = int(marker) if marker else None
+    except ValueError:
+        return _error("InvalidParameterValue", "Invalid marker.", 400)
 
-    filtered = _events_list()
+    filtered = [dict(e, Seq=e.get("Seq", i)) for i, e in enumerate(_events_list())][::-1]
+    if before is not None:
+        filtered = [e for e in filtered if e["Seq"] < before]
     if source_id:
         filtered = [e for e in filtered if e["SourceIdentifier"] == source_id]
     if source_type:
         filtered = [e for e in filtered if e["SourceType"] == source_type]
 
-    filtered = filtered[-max_records:]
+    more = len(filtered) > max_records
+    filtered = filtered[:max_records]
+    next_marker = f"<Marker>{filtered[-1]['Seq']}</Marker>" if more and filtered else ""
     # EventList.member.locationName = "Event"
     members = "".join(
         f"<Event>"
@@ -3058,7 +3196,7 @@ def _describe_events(p):
         for e in filtered
     )
     return _xml(200, "DescribeEventsResponse",
-        f"<DescribeEventsResult><Events>{members}</Events></DescribeEventsResult>")
+        f"<DescribeEventsResult>{next_marker}<Events>{members}</Events></DescribeEventsResult>")
 
 
 # ---- Users (Redis ACL) ----
@@ -3235,9 +3373,12 @@ def _describe_users(p):
         if engine:
             users = [u for u in users if u.get("Engine") == engine]
 
+    users, marker, err = _marker_page(p, users)
+    if err:
+        return err
     members = "".join(f"<member>{_user_xml(u)}</member>" for u in users)
     return _xml(200, "DescribeUsersResponse",
-        f"<DescribeUsersResult><Users>{members}</Users></DescribeUsersResult>")
+        f"<DescribeUsersResult>{marker}<Users>{members}</Users></DescribeUsersResult>")
 
 
 def _delete_user(p):
@@ -3800,9 +3941,12 @@ def _describe_user_groups(p):
     else:
         groups = list(_user_groups.values())
 
+    groups, marker, err = _marker_page(p, groups)
+    if err:
+        return err
     members = "".join(f"<member>{_user_group_xml(g)}</member>" for g in groups)
     return _xml(200, "DescribeUserGroupsResponse",
-        f"<DescribeUserGroupsResult><UserGroups>{members}</UserGroups></DescribeUserGroupsResult>")
+        f"<DescribeUserGroupsResult>{marker}<UserGroups>{members}</UserGroups></DescribeUserGroupsResult>")
 
 
 def _delete_user_group(p):
@@ -4025,7 +4169,6 @@ def _cluster_xml_inner(c):
         f"<EngineVersion>{xml_escape(str(c['EngineVersion']))}</EngineVersion>"
         f"<CacheNodeType>{xml_escape(str(c['CacheNodeType']))}</CacheNodeType>"
         f"<NumCacheNodes>{xml_escape(str(c['NumCacheNodes']))}</NumCacheNodes>"
-        f"<CacheClusterArn>{xml_escape(str(c['CacheClusterArn']))}</CacheClusterArn>"
         f"<ARN>{xml_escape(str(c.get('CacheClusterArn', '')))}</ARN>"
         f"<PreferredAvailabilityZone>{xml_escape(str(c.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
         f"<PreferredMaintenanceWindow>{xml_escape(str(c.get('PreferredMaintenanceWindow', '')))}</PreferredMaintenanceWindow>"
@@ -4042,7 +4185,21 @@ def _cluster_xml_inner(c):
         f"{_transit_mode_xml(c)}"
         f"<AtRestEncryptionEnabled>{xml_escape(str(str(c.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
         f"<CacheNodes>{nodes_xml}</CacheNodes>"
+        f"<AutoMinorVersionUpgrade>{str(c.get('AutoMinorVersionUpgrade', True)).lower()}</AutoMinorVersionUpgrade>"
+        f"{_notification_xml(c)}{_optional_members_xml(c, ('NetworkType', 'IpDiscovery'))}"
     )
+
+
+def _notification_xml(record):
+    n = record.get("NotificationConfiguration")
+    if not n:
+        return ""
+    return (f"<NotificationConfiguration><TopicArn>{xml_escape(str(n.get('TopicArn', '')))}</TopicArn>"
+            f"<TopicStatus>{xml_escape(str(n.get('TopicStatus', 'active')))}</TopicStatus></NotificationConfiguration>")
+
+
+def _optional_members_xml(record, members):
+    return "".join(f"<{m}>{xml_escape(str(record[m]))}</{m}>" for m in members if record.get(m))
 
 
 def _transit_mode_xml(record):
@@ -4086,6 +4243,7 @@ def _rg_xml(rg):
             f"<Port>{xml_escape(str(pep.get('Port', 6379)))}</Port></PrimaryEndpoint>"
             f"<ReaderEndpoint><Address>{xml_escape(str(rdr.get('Address', 'localhost')))}</Address>"
             f"<Port>{xml_escape(str(rdr.get('Port', 6379)))}</Port></ReaderEndpoint>"
+            f"{_optional_members_xml(ng, ('Slots',))}"
             f"<NodeGroupMembers>{members_xml}</NodeGroupMembers>"
             f"</NodeGroup>"
         )
@@ -4132,6 +4290,7 @@ def _rg_xml(rg):
         + (f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>" if user_group_ids_xml else "")
         + (f"<PendingModifiedValues><UserGroups>{pending_xml}</UserGroups></PendingModifiedValues>" if pending_xml else "")
         + f"<ARN>{xml_escape(str(rg['ARN']))}</ARN>"
+        + _optional_members_xml(rg, ("KmsKeyId", "DataTiering", "NetworkType", "IpDiscovery", "Durability"))
     )
 
 
@@ -4158,6 +4317,23 @@ def _snapshot_xml(snap):
         f"<NodeSnapshots>{nodes_xml}</NodeSnapshots>"
         f"<ARN>{xml_escape(str(snap.get('ARN', '')))}</ARN>"
     )
+
+
+def _marker_page(p, items, default=None):
+    """Return (page, marker_xml, error) for the Marker/MaxRecords contract."""
+    marker = _p(p, "Marker")
+    try:
+        start = int(base64.urlsafe_b64decode(marker.encode()).decode()) if marker else 0
+        limit = int(_p(p, "MaxRecords") or default or len(items) or 1)
+    except (ValueError, binascii.Error, UnicodeError):
+        return None, "", _error("InvalidParameterValue", "Invalid marker.", 400)
+    if start < 0 or limit < 1:
+        return None, "", _error("InvalidParameterValue", "Invalid marker.", 400)
+    end = start + limit
+    token = ""
+    if end < len(items):
+        token = f"<Marker>{base64.urlsafe_b64encode(str(end).encode()).decode()}</Marker>"
+    return items[start:end], token, None
 
 
 def _xml_cluster_response(root_tag, result_tag, cluster):

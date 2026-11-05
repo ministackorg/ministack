@@ -464,6 +464,28 @@ JSON_1_0_CONTENT_TYPE = "application/x-amz-json-1.0"
 REST_JSON_CONTENT_TYPE = "application/json"
 
 
+@functools.lru_cache(maxsize=None)
+def _service_model(service: str):
+    import botocore.session
+
+    return botocore.session.get_session().get_service_model(service)
+
+
+def to_output_shape(service: str, shape_name: str, value):
+    """*value* with only the members the botocore output shape has, recursively (JSON protocols)."""
+    return _trim_to_shape(_service_model(service).shape_for(shape_name), value)
+
+
+def _trim_to_shape(shape, value):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {k: _trim_to_shape(shape.members[k], v) for k, v in value.items() if k in shape.members}
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_trim_to_shape(shape.member, v) for v in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {k: _trim_to_shape(shape.value, v) for k, v in value.items()}
+    return value
+
+
 def json_response(data: dict, status: int = 200, *,
                   content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
     """Build an AWS-style JSON response.

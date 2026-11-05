@@ -136,6 +136,16 @@ def _parse_member_list(params, prefix):
     return items
 
 
+def _page(p, items, default=50, high=100):
+    """MaxRecords/NextToken offset paging; returns (page, NextToken XML or "")."""
+    raw = _p(p, "MaxRecords")
+    size = int(raw) if re.fullmatch(r"-?[0-9]+", raw or "") else default
+    token = _p(p, "NextToken")
+    start = int(token) if token.isdigit() else 0
+    end = start + min(max(size, 1), high)
+    return items[start:end], (f"<NextToken>{end}</NextToken>" if end < len(items) else "")
+
+
 def _xml(status, root_tag, inner):
     body = (f'<?xml version="1.0" encoding="UTF-8"?>'
             f'<{root_tag} xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">'
@@ -307,6 +317,9 @@ def _shape_xml(value, shape):
     return escape(str(value))
 
 
+_SPOT_STRATEGIES = ("lowest-price", "capacity-optimized", "capacity-optimized-prioritized", "price-capacity-optimized")
+
+
 def resolve_mixed_instances_policy(policy, stored=None):
     """(policy, error message): the policy as AWS stores it, its launch templates resolved like a group's.
     On an update, *stored* is the group's policy and the members not sent are kept from it."""
@@ -334,6 +347,9 @@ def resolve_mixed_instances_policy(policy, stored=None):
             overrides.append(override)
         lt["Overrides"] = overrides
     sent = policy.get("InstancesDistribution") or {}
+    strategy = sent.get("SpotAllocationStrategy")
+    if strategy is not None and strategy not in _SPOT_STRATEGIES:
+        return None, f"SpotAllocationStrategy is not valid. Valid options are: [{', '.join(_SPOT_STRATEGIES)}]."
     distribution = {**_INSTANCES_DISTRIBUTION_DEFAULTS, **(stored.get("InstancesDistribution") or {}), **sent}
     if distribution.get("SpotMaxPrice") == "":
         del distribution["SpotMaxPrice"]
@@ -360,6 +376,45 @@ def _mixed_instances_policy(p, stored=None):
 
 def _has_member(p, name):
     return any(k == name or k.startswith(name + ".") for k in p)
+
+
+def _input_members(p, operation, members):
+    """The *members* sent to *operation*, typed by its botocore input shape."""
+    _model_shape("AutoScalingGroup")
+    shape = _MODEL.operation_model(operation).input_shape
+    out = {}
+    for member in members:
+        value = _query_value(p, member, shape.members[member])
+        if value is not None:
+            out[member] = value
+    return out
+
+
+_GROUP_MEMBERS = (
+    "LoadBalancerNames", "TargetGroupARNs", "PlacementGroup", "ServiceLinkedRoleARN", "MaxInstanceLifetime",
+    "CapacityRebalance", "Context", "DesiredCapacityType", "DefaultInstanceWarmup", "TrafficSources",
+    "InstanceMaintenancePolicy", "DeletionProtection", "AvailabilityZoneDistribution",
+    "AvailabilityZoneImpairmentPolicy", "CapacityReservationSpecification", "InstanceLifecyclePolicy",
+    "AvailabilityZoneIds",
+)
+_GROUP_UPDATE_MEMBERS = tuple(m for m in _GROUP_MEMBERS if m not in ("LoadBalancerNames", "TargetGroupARNs",
+                                                                      "TrafficSources"))
+
+
+def _group_defaults():
+    return {
+        "ServiceLinkedRoleARN": (f"arn:aws:iam::{get_account_id()}:role/aws-service-role/"
+                                 "autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"),
+        "DesiredCapacityType": "units",
+        "DeletionProtection": "none",
+        "AvailabilityZoneDistribution": {"CapacityDistributionStrategy": "balanced-best-effort"},
+    }
+
+
+def _group_members_xml(asg):
+    shape = _model_shape("AutoScalingGroup")
+    return "".join(f"<{m}>{_shape_xml(asg[m], shape.members[m])}</{m}>"
+                   for m in _GROUP_MEMBERS if asg.get(m) not in (None, ""))
 
 
 def _launch_template_xml(lt):
@@ -422,13 +477,14 @@ def _create_asg(p):
         "DefaultCooldown": int(_p(p, "DefaultCooldown") or 300),
         "AvailabilityZones": _parse_member_list(p, "AvailabilityZones") or [f"{get_region()}a"],
         "HealthCheckType": _p(p, "HealthCheckType") or "EC2",
-        "HealthCheckGracePeriod": int(_p(p, "HealthCheckGracePeriod") or 300),
+        "HealthCheckGracePeriod": int(_p(p, "HealthCheckGracePeriod") or 0),
         "Instances": [],
         "CreatedTime": now_iso(),
         "VPCZoneIdentifier": _p(p, "VPCZoneIdentifier") or "",
         "TerminationPolicies": _parse_member_list(p, "TerminationPolicies") or ["Default"],
         "NewInstancesProtectedFromScaleIn": _p(p, "NewInstancesProtectedFromScaleIn") == "true",
-        "ServiceLinkedRoleARN": _p(p, "ServiceLinkedRoleARN") or "",
+        **_group_defaults(),
+        **_input_members(p, "CreateAutoScalingGroup", _GROUP_MEMBERS),
         "Tags": [],
         "Status": "",
     }
@@ -452,6 +508,9 @@ def _create_asg(p):
         i += 1
     _asgs[name]["Tags"] = tags
     _tags[name] = tags
+    for spec in _input_members(p, "CreateAutoScalingGroup", ("LifecycleHookSpecificationList",)).get(
+            "LifecycleHookSpecificationList", []):
+        _hooks[f"{name}/{spec['LifecycleHookName']}"] = _hook_record(name, spec["LifecycleHookName"], spec)
 
     _reconcile_instances(_asgs[name])
 
@@ -462,9 +521,8 @@ def _create_asg(p):
 def _describe_asgs(p):
     names = _parse_member_list(p, "AutoScalingGroupNames")
     members = ""
-    for name, asg in _asgs.items():
-        if names and name not in names:
-            continue
+    groups, next_xml = _page(p, [(n, a) for n, a in _asgs.items() if not names or n in names])
+    for name, asg in groups:
         azs = "".join(f"<member>{az}</member>" for az in asg["AvailabilityZones"])
         tp = "".join(f"<member>{t}</member>" for t in asg["TerminationPolicies"])
         tags_xml = "".join(
@@ -494,13 +552,14 @@ def _describe_asgs(p):
                     f"<VPCZoneIdentifier>{asg['VPCZoneIdentifier']}</VPCZoneIdentifier>"
                     f"<TerminationPolicies>{tp}</TerminationPolicies>"
                     f"<NewInstancesProtectedFromScaleIn>{'true' if asg['NewInstancesProtectedFromScaleIn'] else 'false'}</NewInstancesProtectedFromScaleIn>"
+                    f"{_group_members_xml(asg)}"
                     f"<Tags>{tags_xml}</Tags>"
                     f"{_instances_xml(asg)}"
                     f"{lt_xml}"
                     f"<LaunchConfigurationName>{asg.get('LaunchConfigurationName', '')}</LaunchConfigurationName>"
                     f"</member>")
     return _xml(200, "DescribeAutoScalingGroupsResponse",
-                f"<DescribeAutoScalingGroupsResult><AutoScalingGroups>{members}</AutoScalingGroups></DescribeAutoScalingGroupsResult>")
+                f"<DescribeAutoScalingGroupsResult><AutoScalingGroups>{members}</AutoScalingGroups>{next_xml}</DescribeAutoScalingGroupsResult>")
 
 
 def _update_asg(p):
@@ -521,15 +580,28 @@ def _update_asg(p):
         asg["LaunchTemplate"] = {}
     elif launch_template:
         asg.pop("MixedInstancesPolicy", None)
+    if mixed or launch_template:
+        asg["LaunchConfigurationName"] = ""
+    elif _p(p, "LaunchConfigurationName"):
+        asg["LaunchConfigurationName"] = _p(p, "LaunchConfigurationName")
+        asg["LaunchTemplate"] = {}
+        asg.pop("MixedInstancesPolicy", None)
     for k, pk in [("MinSize", "MinSize"), ("MaxSize", "MaxSize"), ("DesiredCapacity", "DesiredCapacity"),
                    ("DefaultCooldown", "DefaultCooldown"), ("HealthCheckGracePeriod", "HealthCheckGracePeriod")]:
         v = _p(p, pk)
-        if v:
+        if v != "":
             asg[k] = int(v)
     if _p(p, "HealthCheckType"):
         asg["HealthCheckType"] = _p(p, "HealthCheckType")
     if _p(p, "VPCZoneIdentifier"):
         asg["VPCZoneIdentifier"] = _p(p, "VPCZoneIdentifier")
+    if _parse_member_list(p, "AvailabilityZones"):
+        asg["AvailabilityZones"] = _parse_member_list(p, "AvailabilityZones")
+    if _parse_member_list(p, "TerminationPolicies"):
+        asg["TerminationPolicies"] = _parse_member_list(p, "TerminationPolicies")
+    if _p(p, "NewInstancesProtectedFromScaleIn"):
+        asg["NewInstancesProtectedFromScaleIn"] = _p(p, "NewInstancesProtectedFromScaleIn") == "true"
+    asg.update(_input_members(p, "UpdateAutoScalingGroup", _GROUP_UPDATE_MEMBERS))
     if launch_template:
         asg["LaunchTemplate"] = launch_template
     _reconcile_instances(asg)
@@ -560,14 +632,12 @@ def _delete_asg(p):
 
 def _describe_asg_instances(p):
     wanted = _parse_member_list(p, "InstanceIds")
-    members = ""
-    for name, asg in _asgs.items():
-        for inst in asg["Instances"]:
-            if wanted and inst["InstanceId"] not in wanted:
-                continue
-            members += _instance_member_xml(inst, include_group_name=name)
+    found = [(name, inst) for name, asg in _asgs.items() for inst in asg["Instances"]
+             if not wanted or inst["InstanceId"] in wanted]
+    found, next_xml = _page(p, found, 50, 50)
+    members = "".join(_instance_member_xml(inst, include_group_name=name) for name, inst in found)
     return _xml(200, "DescribeAutoScalingInstancesResponse",
-                f"<DescribeAutoScalingInstancesResult><AutoScalingInstances>{members}</AutoScalingInstances></DescribeAutoScalingInstancesResult>")
+                f"<DescribeAutoScalingInstancesResult><AutoScalingInstances>{members}</AutoScalingInstances>{next_xml}</DescribeAutoScalingInstancesResult>")
 
 
 def _describe_scaling_activities(p):
@@ -583,6 +653,18 @@ def _describe_scaling_activities(p):
 # terraform-provider-aws contract, which polls DescribeInstanceRefreshes until
 # the refresh reaches a terminal state.
 # ---------------------------------------------------------------------------
+
+def _refresh_preferences(asg, sent):
+    maintenance = asg.get("InstanceMaintenancePolicy") or {}
+    prefs = {"MinHealthyPercentage": maintenance.get("MinHealthyPercentage", 90),
+             "MaxHealthyPercentage": maintenance.get("MaxHealthyPercentage", 100),
+             "SkipMatching": False, "AutoRollback": False,
+             "ScaleInProtectedInstances": "Wait", "StandbyInstances": "Wait",
+             **sent.get("Preferences", {})}
+    if prefs.get("CheckpointPercentages"):
+        prefs.setdefault("CheckpointDelay", 3600)
+    return prefs
+
 
 def _start_instance_refresh(p):
     name = _p(p, "AutoScalingGroupName")
@@ -600,10 +682,9 @@ def _start_instance_refresh(p):
         "EndTime": ts,
         "PercentageComplete": 100,
         "InstancesToUpdate": 0,
-        "Preferences": {
-            "MinHealthyPercentage": _p(p, "Preferences.MinHealthyPercentage"),
-            "InstanceWarmup": _p(p, "Preferences.InstanceWarmup"),
-        },
+        "Strategy": "Rolling",
+        **_input_members(p, "StartInstanceRefresh", ("Strategy", "DesiredConfiguration")),
+        "Preferences": _refresh_preferences(asg, _input_members(p, "StartInstanceRefresh", ("Preferences",))),
     }
     # Most-recent-first, matching AWS describe ordering.
     asg.setdefault("InstanceRefreshes", []).insert(0, refresh)
@@ -617,10 +698,11 @@ def _describe_instance_refreshes(p):
     if not asg:
         return _error("ValidationError", f"AutoScalingGroup {name} not found")
     wanted = _parse_member_list(p, "InstanceRefreshIds")
+    shape = _model_shape("InstanceRefresh")
     members = ""
-    for r in asg.get("InstanceRefreshes", []):
-        if wanted and r["InstanceRefreshId"] not in wanted:
-            continue
+    refreshes, next_xml = _page(p, [r for r in asg.get("InstanceRefreshes", [])
+                                    if not wanted or r["InstanceRefreshId"] in wanted])
+    for r in refreshes:
         members += (f"<member>"
                     f"<InstanceRefreshId>{r['InstanceRefreshId']}</InstanceRefreshId>"
                     f"<AutoScalingGroupName>{r['AutoScalingGroupName']}</AutoScalingGroupName>"
@@ -630,9 +712,10 @@ def _describe_instance_refreshes(p):
                     f"<EndTime>{r['EndTime']}</EndTime>"
                     f"<PercentageComplete>{r['PercentageComplete']}</PercentageComplete>"
                     f"<InstancesToUpdate>{r['InstancesToUpdate']}</InstancesToUpdate>"
+                    f"{''.join(f'<{m}>{_shape_xml(r[m], shape.members[m])}</{m}>' for m in ('Preferences', 'DesiredConfiguration', 'Strategy') if r.get(m))}"
                     f"</member>")
     return _xml(200, "DescribeInstanceRefreshesResponse",
-                f"<DescribeInstanceRefreshesResult><InstanceRefreshes>{members}</InstanceRefreshes></DescribeInstanceRefreshesResult>")
+                f"<DescribeInstanceRefreshesResult><InstanceRefreshes>{members}</InstanceRefreshes>{next_xml}</DescribeInstanceRefreshesResult>")
 
 
 def _cancel_instance_refresh(p):
@@ -657,6 +740,11 @@ def _cancel_instance_refresh(p):
 # LaunchConfiguration
 # ---------------------------------------------------------------------------
 
+_LC_MEMBERS = ("KeyName", "UserData", "KernelId", "RamdiskId", "BlockDeviceMappings", "InstanceMonitoring",
+               "SpotPrice", "IamInstanceProfile", "EbsOptimized", "AssociatePublicIpAddress", "PlacementTenancy",
+               "MetadataOptions")
+
+
 def _create_lc(p):
     name = _p(p, "LaunchConfigurationName")
     if not name:
@@ -673,16 +761,19 @@ def _create_lc(p):
         "SecurityGroups": _parse_member_list(p, "SecurityGroups"),
         "UserData": _p(p, "UserData") or "",
         "CreatedTime": now_iso(),
+        "InstanceMonitoring": {"Enabled": True},
+        "EbsOptimized": False,
+        **_input_members(p, "CreateLaunchConfiguration", _LC_MEMBERS),
     }
     return _xml(200, "CreateLaunchConfigurationResponse", "<CreateLaunchConfigurationResult/>")
 
 
 def _describe_lcs(p):
     names = _parse_member_list(p, "LaunchConfigurationNames")
+    shape = _model_shape("LaunchConfiguration")
     members = ""
-    for name, lc in _launch_configs.items():
-        if names and name not in names:
-            continue
+    configs, next_xml = _page(p, [(n, lc) for n, lc in _launch_configs.items() if not names or n in names])
+    for name, lc in configs:
         sgs = "".join(f"<member>{sg}</member>" for sg in lc.get("SecurityGroups", []))
         members += (f"<member>"
                     f"<LaunchConfigurationName>{name}</LaunchConfigurationName>"
@@ -691,9 +782,10 @@ def _describe_lcs(p):
                     f"<InstanceType>{lc['InstanceType']}</InstanceType>"
                     f"<CreatedTime>{lc['CreatedTime']}</CreatedTime>"
                     f"<SecurityGroups>{sgs}</SecurityGroups>"
+                    f"{''.join(f'<{m}>{_shape_xml(lc[m], shape.members[m])}</{m}>' for m in _LC_MEMBERS if lc.get(m) not in (None, ''))}"
                     f"</member>")
     return _xml(200, "DescribeLaunchConfigurationsResponse",
-                f"<DescribeLaunchConfigurationsResult><LaunchConfigurations>{members}</LaunchConfigurations></DescribeLaunchConfigurationsResult>")
+                f"<DescribeLaunchConfigurationsResult><LaunchConfigurations>{members}</LaunchConfigurations>{next_xml}</DescribeLaunchConfigurationsResult>")
 
 
 def _delete_lc(p):
@@ -911,9 +1003,9 @@ def _member_xml(value):
 def _describe_policies(p):
     asg_name = _p(p, "AutoScalingGroupName")
     members = ""
-    for key, pol in _policies.items():
-        if asg_name and pol["AutoScalingGroupName"] != asg_name:
-            continue
+    policies, next_xml = _page(p, [pol for pol in _policies.values()
+                                   if not asg_name or pol["AutoScalingGroupName"] == asg_name])
+    for pol in policies:
         body = dict(pol)
         body.setdefault("Enabled", True)
         body.setdefault("StepAdjustments", [])
@@ -922,7 +1014,7 @@ def _describe_policies(p):
             body["MinAdjustmentStep"] = body["MinAdjustmentMagnitude"]
         members += f"<member>{_member_xml(body)}</member>"
     return _xml(200, "DescribePoliciesResponse",
-                f"<DescribePoliciesResult><ScalingPolicies>{members}</ScalingPolicies></DescribePoliciesResult>")
+                f"<DescribePoliciesResult><ScalingPolicies>{members}</ScalingPolicies>{next_xml}</DescribePoliciesResult>")
 
 
 def _delete_policy(p):
@@ -974,6 +1066,7 @@ def _describe_lifecycle_hooks(p):
                     f"<LifecycleHookName>{hook['LifecycleHookName']}</LifecycleHookName>"
                     f"<AutoScalingGroupName>{hook['AutoScalingGroupName']}</AutoScalingGroupName>"
                     f"<LifecycleTransition>{hook['LifecycleTransition']}</LifecycleTransition>"
+                    f"{''.join(f'<{m}>{escape(hook[m])}</{m}>' for m in ('NotificationTargetARN', 'RoleARN') if hook.get(m))}"
                     f"{metadata_xml}"
                     f"<HeartbeatTimeout>{hook['HeartbeatTimeout']}</HeartbeatTimeout>"
                     f"<DefaultResult>{hook['DefaultResult']}</DefaultResult>"
@@ -1037,9 +1130,9 @@ def _put_scheduled_action(p):
 def _describe_scheduled_actions(p):
     asg_name = _p(p, "AutoScalingGroupName")
     members = ""
-    for key, sa in _scheduled_actions.items():
-        if asg_name and sa["AutoScalingGroupName"] != asg_name:
-            continue
+    actions, next_xml = _page(p, [sa for sa in _scheduled_actions.values()
+                                  if not asg_name or sa["AutoScalingGroupName"] == asg_name])
+    for sa in actions:
         members += (f"<member>"
                     f"<ScheduledActionARN>{sa['ScheduledActionARN']}</ScheduledActionARN>"
                     f"<ScheduledActionName>{sa['ScheduledActionName']}</ScheduledActionName>"
@@ -1058,7 +1151,7 @@ def _describe_scheduled_actions(p):
                 members += f"<{member}>{escape(sa[member])}</{member}>"
         members += "</member>"
     return _xml(200, "DescribeScheduledActionsResponse",
-                f"<DescribeScheduledActionsResult><ScheduledUpdateGroupActions>{members}</ScheduledUpdateGroupActions></DescribeScheduledActionsResult>")
+                f"<DescribeScheduledActionsResult><ScheduledUpdateGroupActions>{members}</ScheduledUpdateGroupActions>{next_xml}</DescribeScheduledActionsResult>")
 
 
 def _delete_scheduled_action(p):
@@ -1095,16 +1188,16 @@ def _create_or_update_tags(p):
 
 def _describe_tags(p):
     members = ""
-    for asg_name, tag_list in _tags.items():
-        for t in tag_list:
-            members += (f"<member>"
-                        f"<Key>{t['Key']}</Key><Value>{t['Value']}</Value>"
-                        f"<ResourceId>{t['ResourceId']}</ResourceId>"
-                        f"<ResourceType>{t['ResourceType']}</ResourceType>"
-                        f"<PropagateAtLaunch>{'true' if t.get('PropagateAtLaunch') else 'false'}</PropagateAtLaunch>"
-                        f"</member>")
+    tags, next_xml = _page(p, [t for tag_list in _tags.values() for t in tag_list])
+    for t in tags:
+        members += (f"<member>"
+                    f"<Key>{t['Key']}</Key><Value>{t['Value']}</Value>"
+                    f"<ResourceId>{t['ResourceId']}</ResourceId>"
+                    f"<ResourceType>{t['ResourceType']}</ResourceType>"
+                    f"<PropagateAtLaunch>{'true' if t.get('PropagateAtLaunch') else 'false'}</PropagateAtLaunch>"
+                    f"</member>")
     return _xml(200, "DescribeTagsResponse",
-                f"<DescribeTagsResult><Tags>{members}</Tags></DescribeTagsResult>")
+                f"<DescribeTagsResult><Tags>{members}</Tags>{next_xml}</DescribeTagsResult>")
 
 
 def _delete_tags(p):

@@ -1193,14 +1193,12 @@ def _validate_template(params):
     for name, defn in param_defs.items():
         default = defn.get("Default", "")
         no_echo = str(defn.get("NoEcho", "false")).lower()
-        ptype = defn.get("Type", "String")
         desc = defn.get("Description", "")
         params_xml += (
             "<member>"
             f"<ParameterKey>{_esc(name)}</ParameterKey>"
             f"<DefaultValue>{_esc(str(default))}</DefaultValue>"
             f"<NoEcho>{no_echo}</NoEcho>"
-            f"<ParameterType>{_esc(ptype)}</ParameterType>"
             f"<Description>{_esc(desc)}</Description>"
             "</member>"
         )
@@ -1282,14 +1280,12 @@ def _get_template_summary(params):
     for name, defn in param_defs.items():
         default = defn.get("Default", "")
         no_echo = str(defn.get("NoEcho", "false")).lower()
-        ptype = defn.get("Type", "String")
         desc = defn.get("Description", "")
         params_xml += (
             "<member>"
             f"<ParameterKey>{_esc(name)}</ParameterKey>"
             f"<DefaultValue>{_esc(str(default))}</DefaultValue>"
             f"<NoEcho>{no_echo}</NoEcho>"
-            f"<ParameterType>{_esc(ptype)}</ParameterType>"
             f"<Description>{_esc(desc)}</Description>"
             "</member>"
         )

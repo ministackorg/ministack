@@ -90,6 +90,59 @@ def _inherited_testcontainers_labels() -> dict:
     return _testcontainers_labels
 
 
+_LOOPBACK = ("127.0.0.1", "::1", "localhost")
+_publish_on_loopback: bool | None = None
+
+
+def _gateway_on_loopback() -> bool:
+    """Whether MiniStack's own port is reachable on loopback only: its container's binding in Docker, else BIND_HOST."""
+    if not (os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")):
+        return os.environ.get("BIND_HOST", "0.0.0.0").strip().lower() in _LOOPBACK
+    try:
+        import docker
+        me = docker.from_env(timeout=5).containers.get(os.environ.get("HOSTNAME", ""))
+        port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+        bindings = (me.attrs.get("NetworkSettings", {}).get("Ports") or {}).get(f"{port}/tcp") or []
+        return bool(bindings) and all(b.get("HostIp") in _LOOPBACK for b in bindings)
+    except Exception as exc:
+        logger.debug("reaper: own port bindings unavailable: %s", exc)
+        return False
+
+
+def published_port(host_port):
+    """A docker-py ``ports`` value: on loopback when MiniStack's own port is, else every interface as before."""
+    global _publish_on_loopback
+    if _publish_on_loopback is None:
+        _publish_on_loopback = _gateway_on_loopback()
+    return ("127.0.0.1", host_port) if _publish_on_loopback else host_port
+
+
+def _port_taken(exc) -> bool:
+    text = str(exc)
+    return "port is already allocated" in text or "address already in use" in text
+
+
+def run_on_free_port(docker_client, start, run_kwargs, next_port, tries=5):
+    """``start(run_kwargs)``, moving the one published host port to ``next_port()`` while Docker
+    reports it taken. Returns ``(container, host_port)``."""
+    (key, binding), = run_kwargs["ports"].items()
+    host_port = binding[1] if isinstance(binding, tuple) else binding
+    for attempt in range(tries):
+        try:
+            return start(run_kwargs), host_port
+        except Exception as exc:
+            if host_port is None or attempt == tries - 1 or not _port_taken(exc):
+                raise
+            logger.info("Host port %s is taken; retrying %s on another", host_port, run_kwargs.get("name"))
+            if run_kwargs.get("name"):  # containers.run leaves the created container behind
+                try:
+                    docker_client.containers.get(run_kwargs["name"]).remove(force=True, v=True)
+                except Exception:
+                    pass
+            host_port = next_port()
+            run_kwargs["ports"] = {key: published_port(host_port)}
+
+
 def own_labels(service: str, **extra) -> dict:
     """Labels every MiniStack-created container must carry.
 
@@ -290,6 +343,26 @@ def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = Fa
             # instance label is off limits however it was found.
             _collect([service_label], lambda c: not _labels(c).get(INSTANCE_LABEL))
     return drop_containers(targets, stop_timeout=stop_timeout)
+
+
+def reap_volumes(docker_client, service: str) -> int:
+    """Remove this instance's named volumes of ``service``. Process boundaries only, after the
+    containers using them are gone. Returns how many went away."""
+    if docker_client is None:
+        return 0
+    try:
+        found = docker_client.volumes.list(filters={"label": [f"ministack={service}", f"{INSTANCE_LABEL}={instance_id()}"]})
+    except Exception as exc:
+        logger.warning("reap_volumes: listing %s volumes failed: %s", service, exc)
+        return 0
+    removed = 0
+    for volume in found:
+        try:
+            volume.remove()
+            removed += 1
+        except Exception as exc:
+            logger.warning("reap_volumes: removing %s failed: %s", volume.name, exc)
+    return removed
 
 
 def drop_containers(containers, stop_timeout: int = 2, force: bool = False) -> int:

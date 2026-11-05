@@ -42,6 +42,7 @@ from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
     get_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("bedrock")
@@ -123,8 +124,24 @@ def _camelize(obj):
     return obj
 
 
+_DOCUMENT_MEMBERS = frozenset(('additionalModelRequestFields', 'value'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _json(payload: dict, status: int = 200) -> tuple:
-    return status, {"Content-Type": "application/json"}, json.dumps(_camelize(payload)).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps(_drop_none(_camelize(payload))).encode()
+
+
+def _shaped(shape: str, payload: dict, status: int = 200) -> tuple:
+    return _json(to_output_shape("bedrock", shape, _camelize(payload)), status)
 
 
 def _empty(status: int = 200) -> tuple:
@@ -627,6 +644,7 @@ def _create_guardrail(body) -> tuple:
         "BlockedOutputsMessaging": body_obj["blockedOutputsMessaging"],
         "KmsKeyArn": body_obj.get("kmsKeyId"),
     }
+    _apply_guardrail_extras(rec, body_obj)
     _guardrails[gid] = rec
     if body_obj.get("tags"):
         _tags[arn] = {t["key"]: t["value"] for t in body_obj["tags"]}
@@ -698,6 +716,7 @@ def _update_guardrail(identifier: str, body) -> tuple:
         if k in body_obj:
             internal = _to_internal_guardrail(k)
             rec[internal] = body_obj[k]
+    _apply_guardrail_extras(rec, body_obj)
     rec["UpdatedAt"] = _now_iso()
     return _json({
         "GuardrailId": rec["GuardrailId"],
@@ -705,6 +724,21 @@ def _update_guardrail(identifier: str, body) -> tuple:
         "Version": rec["Version"],
         "UpdatedAt": rec["UpdatedAt"],
     }, status=202)
+
+
+def _apply_guardrail_extras(rec: dict, body_obj: dict) -> None:
+    if "automatedReasoningPolicyConfig" in body_obj:
+        rec["AutomatedReasoningPolicy"] = body_obj["automatedReasoningPolicyConfig"]
+    if "crossRegionConfig" in body_obj:
+        ident = (body_obj["crossRegionConfig"] or {}).get("guardrailProfileIdentifier") or ""
+        if ident.startswith("arn:"):
+            details = {"GuardrailProfileId": ident.split("guardrail-profile/", 1)[-1], "GuardrailProfileArn": ident}
+        else:
+            details = {"GuardrailProfileId": ident, "GuardrailProfileArn": _arn("guardrail-profile", ident)}
+        if ident:
+            rec["CrossRegionDetails"] = details
+        else:
+            rec.pop("CrossRegionDetails", None)
 
 
 def _to_internal_guardrail(wire_key: str) -> str:
@@ -759,6 +793,8 @@ def _create_guardrail_version(identifier: str, body) -> tuple:
     snapshot = dict(rec)
     snapshot["Version"] = next_version
     snapshot["CreatedAt"] = _now_iso()
+    if "description" in body_obj:
+        snapshot["Description"] = body_obj["description"]
     _guardrail_versions[f"{rec['GuardrailId']}/{next_version}"] = snapshot
     return _json({
         "GuardrailId": rec["GuardrailId"],
@@ -924,12 +960,12 @@ def _get_provisioned(pid: str) -> tuple:
                 break
     if rec is None:
         return _not_found(f"Provisioned model {pid} not found.")
-    return _json(rec)
+    return _shaped("GetProvisionedModelThroughputResponse", rec)
 
 
 def _list_provisioned(query_params) -> tuple:
     summaries = list(_provisioned_throughputs.values())
-    return _json({"ProvisionedModelSummaries": summaries})
+    return _shaped("ListProvisionedModelThroughputsResponse", {"ProvisionedModelSummaries": summaries})
 
 
 def _update_provisioned(pid: str, body) -> tuple:
@@ -976,8 +1012,20 @@ def _job_record(job_type: str, body_obj: dict, name_field: str = "jobName") -> d
         "Status": "InProgress",
         "CreationTime": now,
         "LastModifiedTime": now,
-        "BodyEcho": body_obj,  # carry original input for shape introspection
     }
+
+
+def _kms_key_arn(key_id: str) -> str:
+    if key_id.startswith("arn:"):
+        return key_id
+    resource = key_id if key_id.startswith("alias/") else f"key/{key_id}"
+    return f"arn:aws:kms:{get_region()}:{get_account_id()}:{resource}"
+
+
+def _copy_present(rec: dict, body_obj: dict, fields: tuple) -> None:
+    for field in fields:
+        if body_obj.get(field) is not None:
+            rec[field[0].upper() + field[1:]] = body_obj[field]
 
 
 def _create_model_customization_job(body) -> tuple:
@@ -991,11 +1039,16 @@ def _create_model_customization_job(body) -> tuple:
     if not body_obj.get("jobName"):
         return _validation("jobName is required.")
     rec = _job_record("model-customization-job", body_obj)
-    rec["BaseModelIdentifier"] = body_obj["baseModelIdentifier"]
-    rec["CustomModelName"] = body_obj["customModelName"]
+    base = body_obj["baseModelIdentifier"]
+    rec["BaseModelArn"] = base if base.startswith("arn:") else _model_arn(base)
+    rec["OutputModelName"] = body_obj["customModelName"]
     rec["RoleArn"] = body_obj.get("roleArn", "")
     rec["TrainingDataConfig"] = body_obj.get("trainingDataConfig")
     rec["OutputDataConfig"] = body_obj.get("outputDataConfig")
+    _copy_present(rec, body_obj, ("clientRequestToken", "customizationType", "hyperParameters",
+                                  "validationDataConfig", "vpcConfig", "customizationConfig"))
+    if body_obj.get("customModelKmsKeyId"):
+        rec["OutputModelKmsKeyArn"] = _kms_key_arn(body_obj["customModelKmsKeyId"])
     _model_customization_jobs[rec["JobArn"]] = rec
     return _json({"JobArn": rec["JobArn"]}, status=201)
 
@@ -1008,7 +1061,13 @@ def _get_model_customization_job(identifier: str) -> tuple:
 
 
 def _list_model_customization_jobs(query_params) -> tuple:
-    return _json({"ModelCustomizationJobSummaries": list(_model_customization_jobs.values())})
+    summaries = []
+    for r in _model_customization_jobs.values():
+        summary = {k: r[k] for k in ("JobArn", "BaseModelArn", "JobName", "Status", "LastModifiedTime",
+                                     "CreationTime", "CustomizationType") if k in r}
+        summary["CustomModelName"] = r.get("OutputModelName")
+        summaries.append(summary)
+    return _json({"ModelCustomizationJobSummaries": summaries})
 
 
 def _stop_model_customization_job(identifier: str) -> tuple:
@@ -1031,6 +1090,9 @@ def _create_model_import_job(body) -> tuple:
     rec["ImportedModelName"] = body_obj["importedModelName"]
     rec["RoleArn"] = body_obj.get("roleArn", "")
     rec["ModelDataSource"] = body_obj.get("modelDataSource", {})
+    _copy_present(rec, body_obj, ("vpcConfig",))
+    if body_obj.get("importedModelKmsKeyId"):
+        rec["ImportedModelKmsKeyArn"] = _kms_key_arn(body_obj["importedModelKmsKeyId"])
     _model_import_jobs[rec["JobArn"]] = rec
     # Side effect: also create imported model record
     im_arn = _imported_model_arn(body_obj["importedModelName"])
@@ -1068,6 +1130,9 @@ def _create_model_copy_job(body) -> tuple:
     rec["SourceModelArn"] = body_obj["sourceModelArn"]
     rec["TargetModelName"] = body_obj["targetModelName"]
     rec["TargetModelArn"] = _custom_model_arn(body_obj["targetModelName"])
+    if body_obj.get("modelKmsKeyId"):
+        rec["TargetModelKmsKeyArn"] = _kms_key_arn(body_obj["modelKmsKeyId"])
+    _copy_present(rec, body_obj, ("targetModelTags",))
     _model_copy_jobs[rec["JobArn"]] = rec
     return _json({"JobArn": rec["JobArn"]}, status=201)
 
@@ -1075,12 +1140,12 @@ def _create_model_copy_job(body) -> tuple:
 def _get_model_copy_job(identifier: str) -> tuple:
     for r in _model_copy_jobs.values():
         if r["JobArn"] == identifier:
-            return _json(r)
+            return _shaped("GetModelCopyJobResponse", r)
     return _not_found(f"Model copy job {identifier} not found.")
 
 
 def _list_model_copy_jobs(query_params) -> tuple:
-    return _json({"ModelCopyJobSummaries": list(_model_copy_jobs.values())})
+    return _shaped("ListModelCopyJobsResponse", {"ModelCopyJobSummaries": list(_model_copy_jobs.values())})
 
 
 def _create_model_invocation_job(body) -> tuple:
@@ -1096,19 +1161,25 @@ def _create_model_invocation_job(body) -> tuple:
     rec["RoleArn"] = body_obj.get("roleArn", "")
     rec["InputDataConfig"] = body_obj.get("inputDataConfig")
     rec["OutputDataConfig"] = body_obj.get("outputDataConfig")
+    _copy_present(rec, body_obj, ("clientRequestToken", "vpcConfig", "timeoutDurationInHours", "modelInvocationType"))
     _model_invocation_jobs[rec["JobArn"]] = rec
     return _json({"JobArn": rec["JobArn"]})
+
+
+def _invocation_job_view(rec: dict) -> dict:
+    return {**rec, "SubmitTime": rec.get("SubmitTime", rec["CreationTime"])}
 
 
 def _get_model_invocation_job(identifier: str) -> tuple:
     for r in _model_invocation_jobs.values():
         if r["JobArn"] == identifier or r["JobName"] == identifier:
-            return _json(r)
+            return _shaped("GetModelInvocationJobResponse", _invocation_job_view(r))
     return _not_found(f"Model invocation job {identifier} not found.")
 
 
 def _list_model_invocation_jobs(query_params) -> tuple:
-    return _json({"InvocationJobSummaries": list(_model_invocation_jobs.values())})
+    return _shaped("ListModelInvocationJobsResponse",
+                   {"InvocationJobSummaries": [_invocation_job_view(r) for r in _model_invocation_jobs.values()]})
 
 
 def _stop_model_invocation_job(identifier: str) -> tuple:
@@ -1132,6 +1203,7 @@ def _create_evaluation_job(body) -> tuple:
     rec["EvaluationConfig"] = body_obj.get("evaluationConfig")
     rec["InferenceConfig"] = body_obj.get("inferenceConfig")
     rec["OutputDataConfig"] = body_obj.get("outputDataConfig")
+    _copy_present(rec, body_obj, ("jobDescription", "customerEncryptionKeyId", "applicationType"))
     _evaluation_jobs[rec["JobArn"]] = rec
     return _json({"JobArn": rec["JobArn"]}, status=202)
 
@@ -1144,7 +1216,7 @@ def _get_evaluation_job(identifier: str) -> tuple:
 
 
 def _list_evaluation_jobs(query_params) -> tuple:
-    return _json({"JobSummaries": list(_evaluation_jobs.values())})
+    return _shaped("ListEvaluationJobsResponse", {"JobSummaries": list(_evaluation_jobs.values())})
 
 
 def _stop_evaluation_job(identifier: str) -> tuple:

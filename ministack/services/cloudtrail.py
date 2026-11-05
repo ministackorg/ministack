@@ -412,10 +412,18 @@ def _lookup_events(body: dict):
         if "EventSource" in attrs and ev.get("EventSource", "") != attrs["EventSource"]:
             continue
         filtered.append(ev)
-        if len(filtered) >= max_results:
-            break
 
-    return _ok({"Events": filtered})
+    start = 0
+    token = body.get("NextToken")
+    if token:
+        ids = [ev["EventId"] for ev in filtered]
+        if token not in ids:
+            return _err("InvalidNextTokenException", "Invalid NextToken.")
+        start = ids.index(token)
+    out = {"Events": filtered[start:start + max_results]}
+    if start + max_results < len(filtered):
+        out["NextToken"] = filtered[start + max_results]["EventId"]
+    return _ok(out)
 
 
 def _is_non_aws_trail_arn_partition(raw: str) -> bool:
@@ -468,6 +476,9 @@ def _create_trail(body: dict):
         "RecursiveLogging": body.get("RecursiveLogging", True),
         "IsLogging": False,
     }
+    for key in ("CloudWatchLogsLogGroupArn", "CloudWatchLogsRoleArn"):
+        if body.get(key):
+            trail[key] = body[key]
     # CreateTrail must persist KmsKeyId so DescribeTrails/GetTrail echo it; otherwise a
     # CMK set at create is dropped and Terraform's aws_cloudtrail needs a second apply to
     # converge (only UpdateTrail stored it). Stored normalized to a key ARN, and only when
@@ -487,6 +498,9 @@ def _create_trail(body: dict):
         "IsOrganizationTrail": trail["IsOrganizationTrail"],
         "RecursiveLogging": trail["RecursiveLogging"],
     }
+    for key in ("CloudWatchLogsLogGroupArn", "CloudWatchLogsRoleArn"):
+        if trail.get(key):
+            resp[key] = trail[key]
     if kms:
         resp["KmsKeyId"] = kms
     return _ok(resp)

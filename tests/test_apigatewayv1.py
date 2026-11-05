@@ -107,7 +107,7 @@ def test_apigwv1_account_settings_are_region_isolated():
     set_request_region("us-east-1")
     status, _headers, body = apigateway_v1._get_account()
     assert status == 200
-    assert json.loads(body)["cloudwatchRoleArn"] is None
+    assert "cloudwatchRoleArn" not in json.loads(body)
 
     status, _headers, _body = apigateway_v1._update_account(
         {"patchOperations": [{"op": "replace", "path": "/cloudwatchRoleArn", "value": east_role}]}
@@ -6583,6 +6583,10 @@ def test_apigwv1_import_keeps_the_path_parameters(apigw_v1, mode):
             "method.request.path.orgId": True,
             "method.request.path.proxy": True,
         }
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
 _MOCK_OPERATION = {"x-amazon-apigateway-integration": {
     "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
     "responses": {"default": {"statusCode": "200"}}}}

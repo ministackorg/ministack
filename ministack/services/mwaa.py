@@ -175,8 +175,11 @@ def _next_port():
         if _freed_ports:
             port = _freed_ports.pop()
         else:
+            from ministack.services.rds import _is_host_port_free
             port = _port_counter[0]
-            _port_counter[0] += 1
+            while not _is_host_port_free(port):  # another container may already publish it
+                port += 1
+            _port_counter[0] = port + 1
         _allocated_ports.add(port)
     return port
 
@@ -362,7 +365,7 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
             detach=True,
             command="standalone",
             environment=container_env,
-            ports={f"{container_port}/tcp": host_port},
+            ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
             name=container_name,
             labels=container_reaper.own_labels("mwaa", region=region, env_name=env_name, account_id=account_id),
         )
@@ -384,7 +387,9 @@ def _start_airflow_container_in_scope(account_id, region, env_name, env):
                 db_volume_name: {"bind": "/opt/airflow", "mode": "rw"},
             }
 
-        container = docker_client.containers.run(**container_kwargs)
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: docker_client.containers.run(**kwargs), container_kwargs, _next_port)
+        env["_host_port"] = host_port
         env["_docker_container_id"] = container.id
 
         internal_host = "localhost"
@@ -452,6 +457,13 @@ def _build_env_response(env):
 # ── API Handlers ──────────────────────────────────────────────────────────────
 
 
+_OPTIONAL_ENV_FIELDS = (
+    "PluginsS3Path", "PluginsS3ObjectVersion", "RequirementsS3Path",
+    "RequirementsS3ObjectVersion", "StartupScriptS3Path", "StartupScriptS3ObjectVersion",
+    "WeeklyMaintenanceWindowStart",
+)
+
+
 def _create_environment(method, path, headers, body, query_params):
     data = json.loads(body) if body else {}
     name = path.strip("/").split("/")[-1]
@@ -495,6 +507,9 @@ def _create_environment(method, path, headers, body, query_params):
         "ServiceRoleArn": f"arn:aws:iam::{account_id}:role/aws-service-role/airflow.amazonaws.com/AWSServiceRoleForAmazonMWAA",
         "_docker_container_id": None,
     }
+    for field in _OPTIONAL_ENV_FIELDS + ("KmsKey", "EndpointManagement"):
+        if field in data:
+            env[field] = data[field]
 
     _environments[name] = env
 
@@ -556,17 +571,39 @@ def _update_environment(method, path, headers, body, query_params):
     for field in ("AirflowConfigurationOptions", "LoggingConfiguration",
                   "MaxWorkers", "MinWorkers", "Schedulers",
                   "EnvironmentClass", "ExecutionRoleArn", "SourceBucketArn",
-                  "DagS3Path", "NetworkConfiguration", "WebserverAccessMode"):
+                  "DagS3Path", "WebserverAccessMode",
+                  "AirflowVersion", "MaxWebservers", "MinWebservers") + _OPTIONAL_ENV_FIELDS:
         if field in data:
             env[field] = data[field]
+
+    if "NetworkConfiguration" in data:
+        env["NetworkConfiguration"] = {**env.get("NetworkConfiguration", {}),
+                                       **data["NetworkConfiguration"]}
 
     env["LastUpdate"] = {"Status": "SUCCESS"}
     return json_response({"Arn": env["Arn"]})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_environments(method, path, headers, body, query_params):
-    names = list(_environments.keys())
-    return json_response({"Environments": names})
+    q = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
+    names, nxt = _page(list(_environments.keys()), q.get("MaxResults"), q.get("NextToken"))
+    resp = {"Environments": names}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _create_web_login_token(method, path, headers, body, query_params):

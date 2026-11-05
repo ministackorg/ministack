@@ -126,8 +126,17 @@ def _camelize(obj):
     return obj
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _json(payload: dict, status: int = 200) -> tuple:
-    return status, {"Content-Type": "application/json"}, json.dumps(_camelize(payload)).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps(_drop_none(_camelize(payload))).encode()
 
 
 def _error(code: str, message: str, status: int) -> tuple:
@@ -293,6 +302,12 @@ def _create_cluster(body) -> tuple:
         "ZookeeperConnectString": "",
         "ZookeeperConnectStringTls": "",
     }
+    if req.get("storageMode"):
+        info["StorageMode"] = req["storageMode"]
+    if req.get("rebalancing"):
+        info["Rebalancing"] = req["rebalancing"]
+    elif str((req.get("brokerNodeGroupInfo") or {}).get("instanceType", "")).startswith("express."):
+        info["Rebalancing"] = {"Status": "ACTIVE"}
     _clusters[arn] = info
     if info["Tags"]:
         _tags[arn] = dict(info["Tags"])

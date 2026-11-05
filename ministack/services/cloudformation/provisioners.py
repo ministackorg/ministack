@@ -11128,6 +11128,10 @@ def _apigw_v2_api_props(props, stack_name, logical_id):
     }
 
 
+def _apigw_v2_cors(cfg):
+    return {k[:1].lower() + k[1:]: v for k, v in cfg.items()}
+
+
 def _apigw_v2_api_create(logical_id, props, stack_name):
     api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
     protocol = props.get("ProtocolType", "HTTP")
@@ -11140,7 +11144,7 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
         **_apigw_v2_api_props(props, stack_name, logical_id),
     }
     if props.get("CorsConfiguration"):
-        api["corsConfiguration"] = props["CorsConfiguration"]
+        api["corsConfiguration"] = _apigw_v2_cors(props["CorsConfiguration"])
     _apigw_v2._apis[api_id] = api
     _apigw_v2._routes[api_id] = {}
     _apigw_v2._integrations[api_id] = {}
@@ -11173,7 +11177,7 @@ def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_
         return replaced
     payload = _apigw_v2_api_props(new_props, stack_name, logical_id or physical_id)
     if new_props.get("CorsConfiguration"):
-        payload["corsConfiguration"] = new_props["CorsConfiguration"]
+        payload["corsConfiguration"] = _apigw_v2_cors(new_props["CorsConfiguration"])
     resp = _apigw_v2._update_api(physical_id, payload)
     if resp[0] >= 400:
         raise ValueError(f"AWS::ApiGatewayV2::Api update failed: {resp[2]!r}")

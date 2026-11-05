@@ -56,12 +56,28 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
     now_iso,
 )
+from ministack.core.responses import (
+    json_response as _core_json_response,
+)
 
 logger = logging.getLogger("states")
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
 
 # Scale factor for Wait state durations and retry intervals.
 # 0 = skip all waits, 0.01 = 1% of normal, 1 = normal (default).
@@ -307,6 +323,8 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
+    if action in ("StartExecution", "StartSyncExecution") and headers.get("x-amzn-trace-id"):
+        data["traceHeader"] = headers["x-amzn-trace-id"]
     if action == "GetActivityTask":
         return _finalize_response(await _get_activity_task(data))
     if action in _OFF_LOOP_ACTIONS:
@@ -582,6 +600,8 @@ def _create_state_machine(data):
             {"level": "OFF", "includeExecutionData": False}),
         # Machines without a customer managed key report AWS_OWNED_KEY.
         "encryptionConfiguration": encryption,
+        **({"tracingConfiguration": data["tracingConfiguration"]}
+           if data.get("tracingConfiguration") else {}),
         # AWS rotates revisionId on every Create/Update. Callers use it
         # as an optimistic-concurrency precondition when publishing a
         # version (see _publish_state_machine_version).
@@ -619,6 +639,8 @@ def _create_state_machine(data):
                 _state_machines[arn]["loggingConfiguration"]),
             "encryptionConfiguration": copy.deepcopy(
                 _state_machines[arn]["encryptionConfiguration"]),
+            **({"tracingConfiguration": copy.deepcopy(_state_machines[arn]["tracingConfiguration"])}
+               if _state_machines[arn].get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
     return json_response(response)
@@ -672,6 +694,8 @@ def _describe_state_machine(data):
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
             "encryptionConfiguration": version.get("encryptionConfiguration")
                 or _default_encryption(),
+            **({"tracingConfiguration": version["tracingConfiguration"]}
+               if version.get("tracingConfiguration") else {}),
             "revisionId": version.get("stateMachineRevisionId", ""),
         })
     # DescribeStateMachine on an alias ARN: AWS accepts it and returns
@@ -734,6 +758,8 @@ def _update_state_machine(data):
         sm["roleArn"] = data["roleArn"]
     if "loggingConfiguration" in data:
         sm["loggingConfiguration"] = data["loggingConfiguration"]
+    if data.get("tracingConfiguration"):
+        sm["tracingConfiguration"] = data["tracingConfiguration"]
     if encryption is not None:
         sm["encryptionConfiguration"] = _stored_encryption(encryption)
     # Rotate revisionId so subsequent PublishStateMachineVersion calls
@@ -761,6 +787,8 @@ def _update_state_machine(data):
             "loggingConfiguration": copy.deepcopy(sm["loggingConfiguration"]),
             "encryptionConfiguration": copy.deepcopy(
                 sm.get("encryptionConfiguration") or _default_encryption()),
+            **({"tracingConfiguration": copy.deepcopy(sm["tracingConfiguration"])}
+               if sm.get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
         response["revisionId"] = sm["revisionId"]
@@ -773,18 +801,22 @@ def _list_state_machines(data):
          "type": sm["type"], "creationDate": sm["creationDate"]}
         for sm in _state_machines.values()
     ]
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
+    return _offset_page(data, "stateMachines", all_machines)
+
+
+def _offset_page(data, key, items):
     start = 0
-    if next_token:
+    if data.get("nextToken"):
         try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_machines[start:start + max_results]
-    resp = {"stateMachines": page}
-    if start + max_results < len(all_machines):
-        resp["nextToken"] = str(start + max_results)
+            start = int(data["nextToken"])
+        except (TypeError, ValueError):
+            start = -1
+        if start < 0:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
+    end = start + (data.get("maxResults") or 100)
+    resp = {key: items[start:end]}
+    if end < len(items):
+        resp["nextToken"] = str(end)
     return json_response(resp)
 
 
@@ -883,6 +915,7 @@ def _start_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        **({"traceHeader": data["traceHeader"]} if data.get("traceHeader") else {}),
         # DescribeStateMachineForExecution reports the encryption configuration
         # the execution started with: the version's when a version or an alias
         # was named.
@@ -971,6 +1004,8 @@ def _describe_execution(data):
         result["cause"] = execution["cause"]
     if execution.get("mapRunArn"):
         result["mapRunArn"] = execution["mapRunArn"]
+    if execution.get("traceHeader"):
+        result["traceHeader"] = execution["traceHeader"]
     return json_response(result)
 
 
@@ -985,7 +1020,7 @@ def _list_map_runs(data):
     runs = [{"executionArn": r["executionArn"], "mapRunArn": r["mapRunArn"], "stateMachineArn": r["_stateMachineArn"],
              "startDate": r["startDate"], **({"stopDate": r["stopDate"]} if r.get("stopDate") else {})}
             for r in _map_runs.values() if r["executionArn"] == exec_arn]
-    return json_response({"mapRuns": runs})
+    return _offset_page(data, "mapRuns", runs)
 
 
 def _describe_map_run(data):
@@ -1172,6 +1207,7 @@ def _start_sync_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        **({"traceHeader": data["traceHeader"]} if data.get("traceHeader") else {}),
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -1197,6 +1233,8 @@ def _start_sync_execution(data):
         "output": execution.get("output") or "{}",
         "outputDetails": {"included": True},
     }
+    if execution.get("traceHeader"):
+        resp["traceHeader"] = execution["traceHeader"]
     # Include error/cause for failed executions (matches AWS SFN behaviour)
     if execution["status"] == "FAILED":
         failed_events = [
@@ -1286,6 +1324,14 @@ def _create_activity(data):
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
 
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption) or _encryption_configuration_error(encryption)
+    if invalid:
+        return invalid
+
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:activity:{name}"
     if arn in _activities:
         return error_response_json(
@@ -1293,6 +1339,8 @@ def _create_activity(data):
 
     ts = now_iso()
     _activities[arn] = {"activityArn": arn, "name": name, "creationDate": ts}
+    if encryption is not None:
+        _activities[arn]["encryptionConfiguration"] = _stored_encryption(encryption)
     _activity_tasks[arn] = []
 
     tags = data.get("tags", [])
@@ -1327,7 +1375,7 @@ def _list_activities(data):
         {"activityArn": a["activityArn"], "name": a["name"], "creationDate": a["creationDate"]}
         for a in _activities.values()
     ]
-    return json_response({"activities": acts})
+    return _offset_page(data, "activities", acts)
 
 
 async def _get_activity_task(data):
@@ -6045,10 +6093,7 @@ def _list_state_machine_versions(data):
     # AWS returns versions in descending creationDate order (newest first).
     matching.sort(key=lambda v: v["creationDate"], reverse=True)
 
-    max_results = data.get("maxResults") or len(matching)
-    return json_response({
-        "stateMachineVersions": matching[:max_results],
-    })
+    return _offset_page(data, "stateMachineVersions", matching)
 
 
 # ---------------------------------------------------------------------------
@@ -6244,7 +6289,4 @@ def _list_state_machine_aliases(data):
         })
     matching.sort(key=lambda a: a["creationDate"], reverse=True)
 
-    max_results = data.get("maxResults") or len(matching)
-    return json_response({
-        "stateMachineAliases": matching[:max_results],
-    })
+    return _offset_page(data, "stateMachineAliases", matching)

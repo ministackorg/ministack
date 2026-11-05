@@ -533,6 +533,8 @@ def _put_cluster(data):
     }
     if data.get("configuration"):
         cluster["configuration"] = data["configuration"]
+    if "serviceConnectDefaults" in data:
+        cluster["serviceConnectDefaults"] = data["serviceConnectDefaults"]
     _clusters[name] = cluster
     if cluster["tags"]:
         _tags[arn] = list(cluster["tags"])
@@ -692,9 +694,10 @@ def _register_task_definition(data):
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
         "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
     }
-    for field in ("requiresCompatibilities", "cpu", "memory"):
+    for field in ("requiresCompatibilities", "cpu", "memory", "inferenceAccelerators"):
         if field in data:
             td[field] = data[field]
+    td["enableFaultInjection"] = data.get("enableFaultInjection", False)
     _task_defs[td_key] = td
 
     req_tags = data.get("tags", [])
@@ -758,6 +761,10 @@ def _list_task_definitions(data):
 # ---------------------------------------------------------------------------
 # Services
 # ---------------------------------------------------------------------------
+
+_DEPLOYMENT_CONFIG_FIELDS = ("serviceConnectConfiguration", "volumeConfigurations",
+                             "vpcLatticeConfigurations")
+
 
 def _make_deployment(task_definition, desired_count, status="PRIMARY"):
     dep_id = f"ecs-svc/{new_uuid().replace('-', '')[:20]}"
@@ -1421,6 +1428,9 @@ def _create_service(data):
     deployment = _make_deployment(td_arn, desired)
     deployment["launchType"] = launch_type
     deployment["capacityProviderStrategy"] = strategy
+    for field in _DEPLOYMENT_CONFIG_FIELDS:
+        if data.get(field) is not None:
+            deployment[field] = data[field]
 
     svc = {
         "serviceArn": arn,
@@ -1438,6 +1448,9 @@ def _create_service(data):
         "networkConfiguration": data.get("networkConfiguration", {}),
         "loadBalancers": data.get("loadBalancers", []),
         "serviceRegistries": data.get("serviceRegistries", []),
+        "placementConstraints": data.get("placementConstraints", []),
+        "placementStrategy": data.get("placementStrategy", []),
+        "availabilityZoneRebalancing": data.get("availabilityZoneRebalancing", "ENABLED"),
         "healthCheckGracePeriodSeconds": data.get("healthCheckGracePeriodSeconds", 0),
         "schedulingStrategy": data.get("schedulingStrategy", "REPLICA"),
         "deploymentController": data.get("deploymentController", {"type": "ECS"}),
@@ -1456,6 +1469,9 @@ def _create_service(data):
         "enableExecuteCommand": data.get("enableExecuteCommand", False),
         "tags": data.get("tags", []),
     }
+    for field in _DEPLOYMENT_CONFIG_FIELDS:
+        if data.get(field) is not None:
+            svc[f"_{field}"] = data[field]
     _services[svc_key] = svc
 
     if svc["tags"]:
@@ -1579,8 +1595,13 @@ def _update_service(data):
         td_arn = _task_defs[td_key]["taskDefinitionArn"] if td_key in _task_defs else new_td
 
     is_rolling = (svc.get("deploymentController") or {}).get("type", "ECS") == "ECS"
+    config_changed = False
+    for field in _DEPLOYMENT_CONFIG_FIELDS:
+        if data.get(field) is not None and data[field] != svc.get(f"_{field}"):
+            svc[f"_{field}"] = data[field]
+            config_changed = True
     if (td_arn != svc["taskDefinition"]
-            or (is_rolling and data.get("forceNewDeployment", False))):
+            or (is_rolling and (config_changed or data.get("forceNewDeployment", False)))):
         # Bind legacy tasks to their deployment before a same-definition one is added.
         for task in _tasks.values():
             if (task.get("group") == f"service:{svc_name}"
@@ -1593,6 +1614,9 @@ def _update_service(data):
             td_arn, new_desired if new_desired is not None else svc["desiredCount"])
         new_dep["launchType"] = svc.get("launchType")
         new_dep["capacityProviderStrategy"] = svc.get("capacityProviderStrategy")
+        for field in _DEPLOYMENT_CONFIG_FIELDS:
+            if svc.get(f"_{field}") is not None:
+                new_dep[field] = svc[f"_{field}"]
         # A replacement remains IN_PROGRESS until its own tasks stabilize.
         new_dep["rolloutState"] = "IN_PROGRESS"
         new_dep["rolloutStateReason"] = ""
@@ -1617,8 +1641,11 @@ def _update_service(data):
         svc["deploymentConfiguration"] = data["deploymentConfiguration"]
     if "platformVersion" in data:
         svc["platformVersion"] = data["platformVersion"]
-    if "loadBalancers" in data:
-        svc["loadBalancers"] = data["loadBalancers"]
+    for field in ("loadBalancers", "placementConstraints", "placementStrategy",
+                  "availabilityZoneRebalancing", "enableECSManagedTags", "propagateTags",
+                  "serviceRegistries", "deploymentController"):
+        if field in data:
+            svc[field] = data[field]
     if "capacityProviderStrategy" in data:
         # An empty strategy moves the service back to a launch type.
         strategy = _service_strategy(data["capacityProviderStrategy"])
@@ -1809,7 +1836,7 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     kwargs = dict(
         detach=True,
         environment=env,
-        ports=port_bindings or None,
+        ports={k: container_reaper.published_port(v) for k, v in port_bindings.items()} or None,
         name=f"ministack-ecs-{task_id[:8]}-{cdef['name']}",
         labels={
             **container_reaper.own_labels("ecs"),
@@ -2347,28 +2374,18 @@ class _ImagePullError(Exception):
     """An image pull failed and the launch type has no usable cache."""
 
 
-_DOCKER_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
-
-
 def _load_held_image(docker_client, image, platform, principal_arn=None):
     """Load an image held in this MiniStack's ECR into the daemon; return the reference to run, or None when
     the image belongs to another registry. Raises _ImagePullError when the repository has no such image."""
-    from ministack.services import ecr
     if ecr._held_image(image) is None:
         return None
     if not ecr.held_image_readable(image, principal_arn or f"arn:aws:iam::{get_account_id()}:root"):
         raise _ImagePullError(f"{image}: the repository policy does not allow this account to pull it")
-    if platform:
-        architecture = platform.rsplit("/", 1)[-1]
-    else:
-        reported = (docker_client.info() or {}).get("Architecture", "")
-        architecture = _DOCKER_ARCHITECTURES.get(reported, reported)
-    built = ecr.held_image_archive(image, architecture)
-    if built is None:
-        raise _ImagePullError(f"{image}: not found in this MiniStack's ECR for linux/{architecture}")
-    archive, config_digest = built
-    docker_client.images.load(archive)
-    return config_digest if "@" in image.rsplit("/", 1)[-1] else image
+    architecture = platform.rsplit("/", 1)[-1] if platform else None
+    loaded = ecr.load_held_image(docker_client, image, architecture)
+    if loaded is None:
+        raise _ImagePullError(f"{image}: not found in this MiniStack's ECR for {platform or 'the host platform'}")
+    return loaded
 
 
 def _run_docker_container(
@@ -2671,7 +2688,7 @@ def _run_task(data):
             platform_version = "1.0.0" if os_family.startswith("WINDOWS") else "1.4.0"
         if os_family == "LINUX":
             platform_family = "Linux"
-    group = data.get("group", "")
+    group = data.get("group") or f"family:{td['family']}"
     started_by = data.get("startedBy", "")
     enable_exec = data.get("enableExecuteCommand", False)
     req_tags = data.get("tags", [])
@@ -3119,6 +3136,12 @@ def _create_capacity_provider(data):
         "updateStatus": "UPDATE_COMPLETE",
         "tags": data.get("tags", []),
     }
+    if "managedInstancesProvider" in data:
+        del cp["autoScalingGroupProvider"]
+        cp["managedInstancesProvider"] = data["managedInstancesProvider"]
+        cp["type"] = "MANAGED_INSTANCES"
+    if "cluster" in data:
+        cp["cluster"] = data["cluster"]
     _capacity_providers[name] = cp
 
     if cp["tags"]:
@@ -3483,8 +3506,10 @@ def _update_capacity_provider(data):
     if not cp:
         return error_response_json("ClientException", f"Capacity provider {name} not found", 400)
     auto_scaling = data.get("autoScalingGroupProvider")
-    if auto_scaling:
+    if auto_scaling and "autoScalingGroupProvider" in cp:
         cp["autoScalingGroupProvider"].update(auto_scaling)
+    if data.get("managedInstancesProvider") and "managedInstancesProvider" in cp:
+        cp["managedInstancesProvider"].update(data["managedInstancesProvider"])
     cp["updateStatus"] = "UPDATE_COMPLETE"
     return json_response({"capacityProvider": cp})
 
@@ -3530,12 +3555,55 @@ def _discover_poll_endpoint(data):
 # Task protection stubs
 # ---------------------------------------------------------------------------
 
+def _task_protection_view(task):
+    protection = task.get("_protection") or {}
+    expires = protection.get("expirationDate")
+    if expires is not None and expires <= int(time.time()):
+        protection = {}
+    view = {"taskArn": task["taskArn"], "protectionEnabled": bool(protection)}
+    if protection:
+        view["expirationDate"] = expires
+    return view
+
+
+def _task_protection_targets(data):
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None or cluster_name not in _clusters:
+        return None, error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
+    found, failures = [], []
+    for ref in data.get("tasks") or []:
+        task = _resolve_task(ref, cluster_name)
+        if task and str(task.get("group", "")).startswith("service:"):
+            found.append(task)
+        else:
+            arn = task["taskArn"] if task else ref if ref.startswith("arn:") else \
+                f"arn:aws:ecs:{get_region()}:{get_account_id()}:task/{cluster_name}/{ref}"
+            failures.append({"arn": arn, "reason": "TASK_NOT_VALID" if task else "MISSING"})
+    return (found, failures), None
+
+
 def _update_task_protection(data):
-    return json_response({"protectedTasks": [], "failures": []})
+    targets, err = _task_protection_targets(data)
+    if err:
+        return err
+    found, failures = targets
+    for task in found:
+        if data.get("protectionEnabled"):
+            minutes = data.get("expiresInMinutes") or 120
+            task["_protection"] = {"expirationDate": int(time.time()) + int(minutes) * 60}
+        else:
+            task.pop("_protection", None)
+    return json_response({"protectedTasks": [_task_protection_view(t) for t in found],
+                          "failures": failures})
 
 
 def _get_task_protection(data):
-    return json_response({"protectedTasks": [], "failures": []})
+    targets, err = _task_protection_targets(data)
+    if err:
+        return err
+    found, failures = targets
+    return json_response({"protectedTasks": [_task_protection_view(t) for t in found],
+                          "failures": failures})
 
 
 # ---------------------------------------------------------------------------

@@ -2287,12 +2287,13 @@ async def _handle_alb_request(
         return None
 
     alb_module = _get_module("alb")
-    load_balancer = alb_module.find_lb_for_host(host)
+    load_balancer = None
     dispatch_path = path
     # Instance and IP targets get the path as the client sent it, percent-encoding included.
     raw_dispatch_path = raw_path
 
-    if load_balancer is None and path.startswith(_ALB_PATH_PREFIX):
+    # /_alb/<name>/ names the load balancer dialed; Host then only feeds its listener rules.
+    if path.startswith(_ALB_PATH_PREFIX):
         path_parts = path[len(_ALB_PATH_PREFIX) :].split("/", 1)
         load_balancer = alb_module._find_lb_by_name(path_parts[0])
         if load_balancer:
@@ -2301,6 +2302,8 @@ async def _handle_alb_request(
                 raw_parts = raw_path[len(_ALB_PATH_PREFIX) :].split("/", 1)
                 raw_dispatch_path = "/" + raw_parts[1] if len(raw_parts) > 1 else "/"
 
+    if load_balancer is None:
+        load_balancer = alb_module.find_lb_for_host(host)
     if load_balancer is None:
         return None
 
@@ -3769,6 +3772,9 @@ def _stop_docker_containers(include_unlabelled: bool = False):
     if client is None:
         return
     container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
+    # RDS_PERSIST=0 keeps no database data across a restart, Aurora cluster volumes included.
+    if os.environ.get("RDS_PERSIST", "0").lower() not in ("1", "true", "yes"):
+        container_reaper.reap_volumes(client, "rds")
 
 
 def _build_persistence_save_dict():

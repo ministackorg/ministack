@@ -137,6 +137,28 @@ def _invalid(msg: str):
     return error_response_json("InvalidArgumentException", msg, 400)
 
 
+def _s3_dest_description(cfg: dict) -> dict:
+    """S3DestinationDescription for an S3DestinationConfiguration."""
+    desc = {
+        "RoleARN": cfg.get("RoleARN", ""),
+        "BucketARN": cfg.get("BucketARN", ""),
+        "Prefix": cfg.get("Prefix", ""),
+        "ErrorOutputPrefix": cfg.get("ErrorOutputPrefix", ""),
+        "BufferingHints": cfg.get("BufferingHints", {"SizeInMBs": 5, "IntervalInSeconds": 300}),
+        "CompressionFormat": cfg.get("CompressionFormat", "UNCOMPRESSED"),
+        "EncryptionConfiguration": cfg.get("EncryptionConfiguration", {"NoEncryptionConfig": "NoEncryption"}),
+    }
+    if "CloudWatchLoggingOptions" in cfg:
+        desc["CloudWatchLoggingOptions"] = cfg["CloudWatchLoggingOptions"]
+    return desc
+
+
+def _merged_s3_config(cfg: dict, create_key: str, update_key: str):
+    if create_key not in cfg and update_key not in cfg:
+        return None
+    return {**cfg.get(create_key, {}), **cfg.get(update_key, {})}
+
+
 def _dest_description(dest: dict) -> dict:
     """Return the destination description block for DescribeDeliveryStream."""
     dtype = dest["type"]
@@ -162,14 +184,37 @@ def _dest_description(dest: dict) -> dict:
         ):
             if opt in cfg:
                 desc[opt] = cfg[opt]
+        if dtype == "ExtendedS3":
+            for opt in ("FileExtension", "CustomTimeZone"):
+                if opt in cfg:
+                    desc[opt] = cfg[opt]
+            backup = _merged_s3_config(cfg, "S3BackupConfiguration", "S3BackupUpdate")
+            if backup is not None:
+                desc["S3BackupDescription"] = _s3_dest_description(backup)
         out[key] = desc
     elif dtype == "HttpEndpoint":
         cfg = dest["config"]
-        out["HttpEndpointDestinationDescription"] = {
-            "EndpointConfiguration": cfg.get("EndpointConfiguration", {}),
+        endpoint = cfg.get("EndpointConfiguration", {})
+        desc = {
+            # HttpEndpointDescription has no AccessKey.
+            "EndpointConfiguration": {k: endpoint[k] for k in ("Url", "Name") if k in endpoint},
             "BufferingHints": cfg.get("BufferingHints", {"SizeInMBs": 5, "IntervalInSeconds": 300}),
             "S3BackupMode": cfg.get("S3BackupMode", "FailedDataOnly"),
         }
+        for opt in ("CloudWatchLoggingOptions", "RequestConfiguration", "ProcessingConfiguration", "RoleARN",
+                    "RetryOptions", "SecretsManagerConfiguration"):
+            if opt in cfg:
+                desc[opt] = cfg[opt]
+        s3_cfg = _merged_s3_config(cfg, "S3Configuration", "S3Update")
+        if s3_cfg is not None:
+            desc["S3DestinationDescription"] = _s3_dest_description(s3_cfg)
+        out["HttpEndpointDestinationDescription"] = desc
+    elif dtype == "Iceberg":
+        cfg = dest["config"]
+        desc = {k: v for k, v in cfg.items() if k != "S3Configuration"}
+        if "S3Configuration" in cfg:
+            desc["S3DestinationDescription"] = _s3_dest_description(cfg["S3Configuration"])
+        out["IcebergDestinationDescription"] = desc
     else:
         out[f"{dtype}DestinationDescription"] = dest["config"]
     return out
@@ -193,6 +238,8 @@ def _build_description(stream: dict) -> dict:
     # Source block — only present for non-DirectPut streams
     if stream["type"] == "KinesisStreamAsSource" and stream.get("kinesis_source"):
         desc["Source"] = {"KinesisStreamSourceDescription": stream["kinesis_source"]}
+    elif stream.get("source"):
+        desc["Source"] = stream["source"]
     return desc
 
 
@@ -1087,6 +1134,12 @@ def _create_delivery_stream(data: dict):
                 "DeliveryStartTimestamp": now,
             }
 
+        if data.get("DirectPutSourceConfiguration"):
+            stream["source"] = {"DirectPutSourceDescription": dict(data["DirectPutSourceConfiguration"])}
+        elif data.get("MSKSourceConfiguration"):
+            stream["source"] = {"MSKSourceDescription": {**data["MSKSourceConfiguration"],
+                                                         "DeliveryStartTimestamp": now}}
+
         enc_input = data.get("DeliveryStreamEncryptionConfigurationInput")
         if enc_input:
             enc = {"Status": "ENABLED", "KeyType": enc_input.get("KeyType", "AWS_OWNED_CMK")}
@@ -1210,7 +1263,7 @@ def _put_record_batch(data: dict):
                         _deliver_records_to_s3(stream, dest, [(record_id, decoded)])
                     elif dest["type"] == "Iceberg":
                         _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
-                responses.append({"RecordId": record_id, "Encrypted": False})
+                responses.append({"RecordId": record_id})
             except Exception as e:
                 failed += 1
                 responses.append(

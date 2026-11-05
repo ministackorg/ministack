@@ -40,7 +40,13 @@ import unicodedata
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, request_scope
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    get_account_id,
+    get_region,
+    request_scope,
+    to_output_shape,
+)
 from ministack.services import kms, secretsmanager
 
 logger = logging.getLogger("appconfig")
@@ -204,10 +210,24 @@ def _get_application(app_id):
     return _json(200, app)
 
 
+def _page(items, query):
+    try:
+        start = int(base64.urlsafe_b64decode(query["next_token"]).decode()) if query.get("next_token") else 0
+        limit = int(query["max_results"]) if query.get("max_results") else None
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return _error(400, "BadRequestException", "Invalid pagination token")
+    if start < 0 or (limit is not None and limit < 1):
+        return _error(400, "BadRequestException", "Invalid pagination token")
+    end = len(items) if limit is None else start + limit
+    out = {"Items": items[start:end]}
+    if end < len(items):
+        out["NextToken"] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return _json(200, out)
+
+
 def _list_applications(query):
-    max_results = int(query.get("max_results", 50))
     items = list(_applications.values())
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _update_application(app_id, body):
@@ -272,22 +292,25 @@ def _create_environment(app_id, body):
     _environments[f"{app_id}/{env_id}"] = record
     _apply_tags(_env_arn(app_id, env_id), body.get("Tags", {}))
     logger.info("CreateEnvironment: %s/%s (%s)", app_id, name, env_id)
-    return _json(201, record)
+    return _json(201, _env_view(record))
 
 
 def _get_environment(app_id, env_id):
     env = _environments.get(f"{app_id}/{env_id}")
     if not env:
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
-    return _json(200, env)
+    return _json(200, _env_view(env))
+
+
+def _env_view(env):
+    return to_output_shape("appconfig", "Environment", env)
 
 
 def _list_environments(app_id, query):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
-    max_results = int(query.get("max_results", 50))
-    items = [e for e in _environments.values() if e["ApplicationId"] == app_id]
-    return _json(200, {"Items": items[:max_results]})
+    items = [_env_view(e) for e in _environments.values() if e["ApplicationId"] == app_id]
+    return _page(items, query)
 
 
 def _update_environment(app_id, env_id, body):
@@ -300,7 +323,7 @@ def _update_environment(app_id, env_id, body):
         env["Description"] = body["Description"]
     if "Monitors" in body:
         env["Monitors"] = body["Monitors"]
-    return _json(200, env)
+    return _json(200, _env_view(env))
 
 
 def _delete_environment(app_id, env_id):
@@ -548,22 +571,33 @@ def _create_configuration_profile(app_id, body):
     _config_profiles[f"{app_id}/{profile_id}"] = record
     _apply_tags(_profile_arn(app_id, profile_id), body.get("Tags", {}))
     logger.info("CreateConfigurationProfile: %s/%s (%s)", app_id, name, profile_id)
-    return _json(201, record)
+    return _json(201, _profile_view(record))
 
 
 def _get_configuration_profile(app_id, profile_id):
     profile = _config_profiles.get(f"{app_id}/{profile_id}")
     if not profile:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
-    return _json(200, profile)
+    return _json(200, _profile_view(profile))
+
+
+def _profile_view(profile):
+    return to_output_shape("appconfig", "ConfigurationProfile", profile)
+
+
+def _profile_summary(profile):
+    summary = to_output_shape("appconfig", "ConfigurationProfileSummary", profile)
+    validator_types = [v["Type"] for v in profile.get("Validators") or [] if v.get("Type")]
+    if validator_types:
+        summary["ValidatorTypes"] = validator_types
+    return summary
 
 
 def _list_configuration_profiles(app_id, query):
     if app_id not in _applications:
         return _error(404, "ResourceNotFoundException", f"Application {app_id} not found")
-    max_results = int(query.get("max_results", 50))
-    items = [p for p in _config_profiles.values() if p["ApplicationId"] == app_id]
-    return _json(200, {"Items": items[:max_results]})
+    items = [_profile_summary(p) for p in _config_profiles.values() if p["ApplicationId"] == app_id]
+    return _page(items, query)
 
 
 def _update_configuration_profile(app_id, profile_id, body):
@@ -578,7 +612,7 @@ def _update_configuration_profile(app_id, profile_id, body):
         profile.pop("KmsKeyArn", None)
         if body["KmsKeyIdentifier"]:
             profile.update(_kms_key_fields(body["KmsKeyIdentifier"]))
-    return _json(200, profile)
+    return _json(200, _profile_view(profile))
 
 
 def _delete_configuration_profile(app_id, profile_id):
@@ -678,7 +712,6 @@ def _get_hosted_configuration_version(app_id, profile_id, version_number):
 def _list_hosted_configuration_versions(app_id, profile_id, query):
     if f"{app_id}/{profile_id}" not in _config_profiles:
         return _error(404, "ResourceNotFoundException", f"Configuration profile {profile_id} not found")
-    max_results = int(query.get("max_results", 50))
     items = []
     for k, v in _hosted_versions.items():
         if k.startswith(f"{app_id}/{profile_id}/"):
@@ -691,7 +724,7 @@ def _list_hosted_configuration_versions(app_id, profile_id, query):
                 **({"VersionLabel": v["VersionLabel"]} if v.get("VersionLabel") else {}),
                 **({"KmsKeyArn": v["KmsKeyArn"]} if v.get("KmsKeyArn") else {}),
             })
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _delete_hosted_configuration_version(app_id, profile_id, version_number):
@@ -786,9 +819,8 @@ def _get_deployment_strategy(strategy_id):
 
 
 def _list_deployment_strategies(query):
-    max_results = int(query.get("max_results", 50))
     items = [*_deployment_strategies.values(), *_PREDEFINED_DEPLOYMENT_STRATEGIES.values()]
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _update_deployment_strategy(strategy_id, body):
@@ -957,7 +989,7 @@ def _refresh_environment(app_id, env_id):
 def _deployment_view(record):
     view = {k: v for k, v in record.items() if not k.startswith("_")}
     view["EventLog"] = list(reversed(record.get("_Events", [])))  # most recent first
-    return view
+    return to_output_shape("appconfig", "Deployment", view)
 
 
 def _secret_id_for_location(location_uri):
@@ -1320,14 +1352,13 @@ def _get_deployment(app_id, env_id, deploy_num):
 def _list_deployments(app_id, env_id, query):
     if f"{app_id}/{env_id}" not in _environments:
         return _error(404, "ResourceNotFoundException", f"Environment {env_id} not found")
-    max_results = int(query.get("max_results", 50))
     items = []
     for v in reversed(_refresh_environment(app_id, env_id)):
         item = {
             "DeploymentNumber": v["DeploymentNumber"],
             "ConfigurationProfileId": v.get("ConfigurationProfileId", ""),
             "ConfigurationName": v.get("ConfigurationName", ""),
-            "ConfigurationVersion": v.get("ConfigurationVersion", ""),
+            "ConfigurationVersion": str(v.get("ConfigurationVersion", "")),
             "DeploymentDurationInMinutes": v.get("DeploymentDurationInMinutes", 0),
             "GrowthType": v.get("GrowthType", "LINEAR"),
             "GrowthFactor": v.get("GrowthFactor", 100.0),
@@ -1341,7 +1372,7 @@ def _list_deployments(app_id, env_id, query):
             if v.get(optional):
                 item[optional] = v[optional]
         items.append(item)
-    return _json(200, {"Items": items[:max_results]})
+    return _page(items, query)
 
 
 def _stop_deployment(app_id, env_id, deploy_num, allow_revert=False):

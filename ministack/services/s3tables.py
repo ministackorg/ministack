@@ -29,6 +29,7 @@ REST API paths from botocore s3tables service model:
   PUT    /tables/{arn}/{namespace}/{name}/metadata-location UpdateTableMetadataLocation
 """
 
+import base64
 import copy
 import json
 import logging
@@ -46,6 +47,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    to_output_shape,
 )
 
 logger = logging.getLogger("s3tables")
@@ -362,8 +364,28 @@ def _bucket_view(bucket):
     return {k: bucket[k] for k in _BUCKET_FIELDS if k in bucket}
 
 
-def _list_table_buckets():
-    return json_response({"tableBuckets": [_bucket_view(b) for b in _table_buckets.values()]})
+def _continuation_page(query_params, items, limit_key, key):
+    """``limit_key`` / continuationToken over a list; builds the list response."""
+    def first(name):
+        value = (query_params or {}).get(name, "")
+        return (value[0] if value else "") if isinstance(value, list) else value
+    try:
+        start = max(int(base64.urlsafe_b64decode(first("continuationToken").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    try:
+        end = start + max(int(first(limit_key)), 1)
+    except (TypeError, ValueError):
+        end = len(items)
+    out = {key: items[start:end]}
+    if end < len(items):
+        out["continuationToken"] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return json_response(out)
+
+
+def _list_table_buckets(query_params=None):
+    return _continuation_page(
+        query_params, [_bucket_view(b) for b in _table_buckets.values()], "maxBuckets", "tableBuckets")
 
 
 def _get_table_bucket(arn):
@@ -421,13 +443,14 @@ def _create_namespace(bucket_arn, data):
     return json_response({"namespace": [namespace], "tableBucketARN": bucket_arn})
 
 
-def _list_namespaces(bucket_arn):
+def _list_namespaces(bucket_arn, query_params=None):
     raw_bucket_arn = bucket_arn
     bucket_arn = _existing_bucket_arn(bucket_arn)
     if not bucket_arn:
         return _bucket_not_found(raw_bucket_arn)
-    result = [ns for ns in _namespaces.values() if ns.get("tableBucketARN") == bucket_arn]
-    return json_response({"namespaces": result})
+    result = [to_output_shape("s3tables", "NamespaceSummary", ns)
+              for ns in _namespaces.values() if ns.get("tableBucketARN") == bucket_arn]
+    return _continuation_page(query_params, result, "maxNamespaces", "namespaces")
 
 
 def _get_namespace(bucket_arn, namespace):
@@ -439,7 +462,7 @@ def _get_namespace(bucket_arn, namespace):
     ns = _namespaces.get(key)
     if not ns:
         return error_response_json("NotFoundException", f"Namespace {namespace} not found", 404)
-    return json_response(ns)
+    return json_response(to_output_shape("s3tables", "GetNamespaceResponse", ns))
 
 
 def _delete_namespace(bucket_arn, namespace):
@@ -542,7 +565,7 @@ def _create_table(bucket_arn, namespace, data):
     return json_response({"tableARN": arn, "versionToken": _tables[key]["versionToken"]})
 
 
-def _list_tables(bucket_arn, namespace=None):
+def _list_tables(bucket_arn, namespace=None, query_params=None):
     raw_bucket_arn = bucket_arn
     bucket_arn = _existing_bucket_arn(bucket_arn)
     if not bucket_arn:
@@ -565,7 +588,7 @@ def _list_tables(bucket_arn, namespace=None):
                 "tableBucketId": table.get("tableBucketId"),
             }
         )
-    return json_response({"tables": result})
+    return _continuation_page(query_params, result, "maxTables", "tables")
 
 
 _TABLE_FIELDS = (
@@ -1466,7 +1489,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "PUT":
             return _create_table_bucket(data)
         if method == "GET":
-            return _list_table_buckets()
+            return _list_table_buckets(query_params)
 
     # GET|DELETE /buckets/{arn...} -> GetTableBucket|DeleteTableBucket
     if len(parts) >= 2 and parts[0] == "buckets":
@@ -1501,7 +1524,7 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PUT":
                 return _create_namespace(arn, data)
             if method == "GET":
-                return _list_namespaces(arn)
+                return _list_namespaces(arn, query_params)
 
     # PUT /tables/{arn...}/{namespace} -> CreateTable
     # GET /tables/{arn...} -> ListTables
@@ -1518,7 +1541,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if isinstance(query_params.get("namespace"), list)
                 else query_params.get("namespace", "")
             )
-            return _list_tables(arn, namespace or None)
+            return _list_tables(arn, namespace or None, query_params)
         # suffix could be "namespace", "namespace/table", or "namespace/table/metadata-location"
         suffix_parts = suffix.split("/")
         if len(suffix_parts) == 1:

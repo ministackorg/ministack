@@ -45,8 +45,10 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("logs")
@@ -113,6 +115,19 @@ _live_tail_sessions: dict[str, dict] = {}
 # 10 buffered sessionUpdate events before the oldest is dropped.
 _LIVE_TAIL_IDLE_SECONDS = 1.0
 _LIVE_TAIL_QUEUE_MAX = 10
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -288,6 +303,15 @@ def _encode_token(offset):
     return base64.b64encode(str(offset).encode()).decode()
 
 
+def _offset_paged(data, key, items):
+    start = max(_decode_token(data.get("nextToken")), 0)
+    end = start + (data.get("limit") or len(items))
+    resp = {key: items[start:end]}
+    if end < len(items):
+        resp["nextToken"] = _encode_token(end)
+    return json_response(resp)
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -398,6 +422,7 @@ def _create_log_group(data):
         "retentionInDays": None,
         "logGroupClass": group_class,
         "kmsKeyId": data.get("kmsKeyId") or None,
+        "deletionProtectionEnabled": bool(data.get("deletionProtectionEnabled", False)),
         "tags": dict(data.get("tags", {})),
         "subscriptionFilters": {},
         "streams": {},
@@ -460,6 +485,7 @@ def _describe_log_groups(data):
             # a replacement when the member is missing. A group created before
             # the field was stored reads as the default.
             "logGroupClass": g.get("logGroupClass") or "STANDARD",
+            "deletionProtectionEnabled": g.get("deletionProtectionEnabled", False),
         }
         if g.get("retentionInDays") is not None:
             entry["retentionInDays"] = g["retentionInDays"]
@@ -1369,18 +1395,25 @@ def _filter_log_events(data):
             ranges.append(_stream_event_range(history, sn, start, end))
 
     # merge is stable across input streams and only pulls the next candidate.
-    scanned = 0
+    skip = _decode_token(data.get("nextToken"))
+    position = 0
+    more = False
     for event, sn in heapq.merge(*ranges, key=lambda entry: (entry[0]["timestamp"], entry[0].get("ingestionTime", 0))):
+        if position < skip:
+            position += 1
+            continue
         if len(events) >= limit:
+            more = True
             break
-        scanned += 1
+        position += 1
         if pattern_fn(event.get("message", "")):
             events.append({**event, "logStreamName": sn})
-            if len(events) >= limit:
-                break
     logger.debug("FilterLogEvents streams=%d scanned=%d returned=%d limit=%s",
-                 len(ranges), scanned, len(events), limit)
-    return json_response({"events": events, "searchedLogStreams": []})
+                 len(ranges), position - skip, len(events), limit)
+    resp = {"events": events, "searchedLogStreams": []}
+    if more:
+        resp["nextToken"] = _encode_token(position)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -1780,7 +1813,7 @@ def _describe_resource_policies(data):
         policies = list(_log_group_policies.values())
     else:
         policies = list(_resource_policies.values())
-    return json_response({"resourcePolicies": [_format_resource_policy(p) for p in policies]})
+    return _offset_paged(data, "resourcePolicies", [_format_resource_policy(p) for p in policies])
 
 
 def _delete_resource_policy(data):
@@ -2423,6 +2456,8 @@ def _put_delivery_source(data):
         existing["service"] = derived_service
         if "tags" in data:
             existing["tags"] = dict(data["tags"])
+        if data.get("deliverySourceConfiguration") is not None:
+            existing["deliverySourceConfiguration"] = dict(data["deliverySourceConfiguration"])
         source = existing
     else:
         source = {
@@ -2433,6 +2468,8 @@ def _put_delivery_source(data):
             "service": derived_service,
             "tags": dict(data.get("tags", {})),
         }
+        if data.get("deliverySourceConfiguration") is not None:
+            source["deliverySourceConfiguration"] = dict(data["deliverySourceConfiguration"])
         _delivery_sources[name] = source
     return json_response({"deliverySource": _format_delivery_source(source)})
 
@@ -2445,6 +2482,8 @@ def _format_delivery_source(source):
         "service": source.get("service", ""),
         "logType": source.get("logType", ""),
         "tags": dict(source.get("tags", {})),
+        **({"deliverySourceConfiguration": dict(source["deliverySourceConfiguration"])}
+           if "deliverySourceConfiguration" in source else {}),
     }
 
 
@@ -2472,7 +2511,7 @@ def _delete_delivery_source(data):
 
 def _describe_delivery_sources(data):
     sources = [_format_delivery_source(s) for s in _delivery_sources.values()]
-    return json_response({"deliverySources": sources})
+    return _offset_paged(data, "deliverySources", sources)
 
 
 def _put_delivery_destination(data):
@@ -2569,7 +2608,7 @@ def _delete_delivery_destination(data):
 
 def _describe_delivery_destinations(data):
     dests = [_format_delivery_destination(d) for d in _delivery_destinations.values()]
-    return json_response({"deliveryDestinations": dests})
+    return _offset_paged(data, "deliveryDestinations", dests)
 
 
 def _put_delivery_destination_policy(data):
@@ -2711,4 +2750,4 @@ def _delete_delivery(data):
 
 def _describe_deliveries(data):
     deliveries = [_format_delivery(d) for d in _deliveries.values()]
-    return json_response({"deliveries": deliveries})
+    return _offset_paged(data, "deliveries", deliveries)

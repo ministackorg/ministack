@@ -1718,12 +1718,16 @@ def _create_table(data):
             "MaxReadRequestUnits": int(on_demand.get("MaxReadRequestUnits", -1)),
             "MaxWriteRequestUnits": int(on_demand.get("MaxWriteRequestUnits", -1)),
         }
+    if data.get("WarmThroughput"):
+        _tables[name]["WarmThroughput"] = _warm_throughput_description(data["WarmThroughput"])
     if data.get("StreamSpecification"):
         stream_label = _stream_label()
         _tables[name]["LatestStreamLabel"] = stream_label
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
     if data.get("Tags"):
         _tags[_tables[name]["TableArn"]] = data["Tags"]
+    if data.get("ResourcePolicy"):
+        _resource_policies[_tables[name]["TableArn"]] = {"Policy": data["ResourcePolicy"], "RevisionId": new_uuid()}
     logger.info("DynamoDB table created: %s", name)
     return json_response({"TableDescription": _table_description(name)})
 
@@ -1879,6 +1883,15 @@ def _replicate_write(table, event_name, old_item, new_item):
                                copy.deepcopy(new_item) if new_item is not None else None, replicate=False)
 
 
+def _warm_throughput_description(requested, current=None):
+    desc = dict(current or {"ReadUnitsPerSecond": 0, "WriteUnitsPerSecond": 0})
+    for key in ("ReadUnitsPerSecond", "WriteUnitsPerSecond"):
+        if requested.get(key) is not None:
+            desc[key] = int(requested[key])
+    desc["Status"] = "ACTIVE"
+    return desc
+
+
 def _update_table(data):
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
@@ -1976,6 +1989,8 @@ def _update_table(data):
             "MaxReadRequestUnits": int(odt.get("MaxReadRequestUnits", -1)),
             "MaxWriteRequestUnits": int(odt.get("MaxWriteRequestUnits", -1)),
         }
+    if data.get("WarmThroughput"):
+        table["WarmThroughput"] = _warm_throughput_description(data["WarmThroughput"], table.get("WarmThroughput"))
 
     existing_idx_names = {g["IndexName"] for g in table.get("GlobalSecondaryIndexes", [])}
     # A new index's key attributes must all appear in the REQUEST's own
@@ -5159,6 +5174,8 @@ def _describe_continuous_backups(data):
     pitr_desc: dict = {
         "PointInTimeRecoveryStatus": "ENABLED" if pitr_enabled else "DISABLED",
     }
+    if pitr_enabled:
+        pitr_desc["RecoveryPeriodInDays"] = 35 if pitr_enabled is True else pitr_enabled
     # AWS only meaningfully populates the restorable-date-time fields when PITR
     # is enabled; emitting `0` (Unix epoch 1970) misleads SDK consumers that
     # parse them into datetimes. Omit when disabled.
@@ -5180,13 +5197,15 @@ def _update_continuous_backups(data):
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("PointInTimeRecoverySpecification", {})
     enabled = spec.get("PointInTimeRecoveryEnabled", False)
-    _pitr_settings[name] = enabled
+    # Stored as the recovery period in days when enabled, False when disabled.
+    _pitr_settings[name] = int(spec.get("RecoveryPeriodInDays") or 35) if enabled else False
+    pitr_desc = {"PointInTimeRecoveryStatus": "ENABLED" if enabled else "DISABLED"}
+    if enabled:
+        pitr_desc["RecoveryPeriodInDays"] = _pitr_settings[name]
     return json_response({
         "ContinuousBackupsDescription": {
             "ContinuousBackupsStatus": "ENABLED",
-            "PointInTimeRecoveryDescription": {
-                "PointInTimeRecoveryStatus": "ENABLED" if enabled else "DISABLED",
-            }
+            "PointInTimeRecoveryDescription": pitr_desc,
         }
     })
 
@@ -5515,17 +5534,22 @@ def _update_contributor_insights(data):
     # ENABLE moves through ENABLING; AWS reports ENABLING immediately and
     # transitions to ENABLED on the next describe. Match that.
     new_status = "ENABLING" if action == "ENABLE" else "DISABLING"
+    mode = data.get("ContributorInsightsMode") or (_contributor_insights.get(key) or {}).get("ContributorInsightsMode")
     _contributor_insights[key] = {
         "ContributorInsightsStatus": new_status,
         "LastUpdateDateTime": int(time.time()),
         "ContributorInsightsRuleList": [],
     }
+    if mode:
+        _contributor_insights[key]["ContributorInsightsMode"] = mode
     resp = {
         "TableName": name,
         "ContributorInsightsStatus": new_status,
     }
     if index_name:
         resp["IndexName"] = index_name
+    if mode:
+        resp["ContributorInsightsMode"] = mode
     return json_response(resp)
 
 
@@ -5573,6 +5597,8 @@ def _describe_contributor_insights(data):
         resp["IndexName"] = index_name
     if last_update is not None:
         resp["LastUpdateDateTime"] = last_update
+    if entry and entry.get("ContributorInsightsMode"):
+        resp["ContributorInsightsMode"] = entry["ContributorInsightsMode"]
     return json_response(resp)
 
 
@@ -5599,6 +5625,8 @@ def _list_contributor_insights(data):
         }
         if iname:
             summary["IndexName"] = iname
+        if entry.get("ContributorInsightsMode"):
+            summary["ContributorInsightsMode"] = entry["ContributorInsightsMode"]
         summaries.append(summary)
     # Simple offset-based pagination
     start = 0
@@ -5859,9 +5887,18 @@ def _validate_csv_import_options(data):
     return None
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _import_description(desc):
     """The stored import without the result the grace window still holds back."""
-    return {k: v for k, v in desc.items() if not k.startswith("_")}
+    return _drop_none({k: v for k, v in desc.items() if not k.startswith("_")})
 
 
 class _ImportFailed(Exception):
@@ -6234,7 +6271,7 @@ def _list_imports(data):
     for desc in _imports.values():
         if table_arn_filter and desc.get("TableArn") != table_arn_filter:
             continue
-        summaries.append({
+        summaries.append(_drop_none({
             "ImportArn": desc["ImportArn"],
             "ImportStatus": desc["ImportStatus"],
             "TableArn": desc.get("TableArn"),
@@ -6243,7 +6280,7 @@ def _list_imports(data):
             "InputFormat": desc.get("InputFormat"),
             "StartTime": desc.get("StartTime"),
             "EndTime": desc.get("EndTime"),
-        })
+        }))
     start = 0
     if next_token:
         try:
@@ -6332,7 +6369,7 @@ def _describe_backup(data):
         return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
     # Strip the internal items snapshot from the wire response.
     public = {k: v for k, v in desc.items() if not k.startswith("_")}
-    return json_response({"BackupDescription": public})
+    return json_response({"BackupDescription": _drop_none(public)})
 
 
 def _delete_backup(data):
@@ -6344,7 +6381,7 @@ def _delete_backup(data):
     if not desc:
         return error_response_json("BackupNotFoundException", f"Backup not found: {arn}", 400)
     public = {k: v for k, v in desc.items() if not k.startswith("_")}
-    return json_response({"BackupDescription": public})
+    return json_response({"BackupDescription": _drop_none(public)})
 
 
 def _list_backups(data):

@@ -316,13 +316,27 @@ def _get_schedule(name, query):
     return _json_resp(200, result)
 
 
+def _paged(query, key, items):
+    try:
+        start = max(int(query.get("NextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        end = start + int(query.get("MaxResults") or 100)
+    except (TypeError, ValueError):
+        end = start + 100
+    body = {key: items[start:end]}
+    if end < len(items):
+        body["NextToken"] = str(end)
+    return _json_resp(200, body)
+
+
 def _list_schedules(query):
     _ensure_default_group()
 
     group_filter = query.get("ScheduleGroup")
     name_prefix = query.get("NamePrefix", "")
     state_filter = query.get("State")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for key, sched in _schedules.items():
@@ -342,8 +356,7 @@ def _list_schedules(query):
             "Target": {"Arn": sched["Target"].get("Arn", "")},
         })
 
-    results = results[:max_results]
-    return _json_resp(200, {"Schedules": results})
+    return _paged(query, "Schedules", results)
 
 
 def _delete_schedule(name, query):
@@ -406,7 +419,6 @@ def _list_schedule_groups(query):
     _ensure_default_group()
 
     name_prefix = query.get("NamePrefix", "")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for name, group in _schedule_groups.items():
@@ -414,8 +426,7 @@ def _list_schedule_groups(query):
             continue
         results.append(group)
 
-    results = results[:max_results]
-    return _json_resp(200, {"ScheduleGroups": results})
+    return _paged(query, "ScheduleGroups", results)
 
 
 def _delete_schedule_group(name, query):

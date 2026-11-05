@@ -437,7 +437,7 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "POST":
                 return _create_api(data)
             if method == "GET":
-                return _get_apis()
+                return _get_apis(query_params)
 
         # /v2/apis/{apiId}
         if api_id and not sub:
@@ -460,13 +460,13 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_route(api_id, data)
                 if method == "GET":
-                    return _get_routes(api_id)
+                    return _get_routes(api_id, query_params)
             elif rr_segment == "routeresponses":
                 if not rr_id:
                     if method == "POST":
                         return _create_route_response(api_id, sub_id, data)
                     if method == "GET":
-                        return _get_route_responses(api_id, sub_id)
+                        return _get_route_responses(api_id, sub_id, query_params)
                 else:
                     if method == "GET":
                         return _get_route_response(api_id, sub_id, rr_id)
@@ -490,13 +490,13 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_integration(api_id, data)
                 if method == "GET":
-                    return _get_integrations(api_id)
+                    return _get_integrations(api_id, query_params)
             elif ir_segment == "integrationresponses":
                 if not ir_id:
                     if method == "POST":
                         return _create_integration_response(api_id, sub_id, data)
                     if method == "GET":
-                        return _get_integration_responses(api_id, sub_id)
+                        return _get_integration_responses(api_id, sub_id, query_params)
                 else:
                     if method == "GET":
                         return _get_integration_response(api_id, sub_id, ir_id)
@@ -518,7 +518,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_stage(api_id, data)
                 if method == "GET":
-                    return _get_stages(api_id)
+                    return _get_stages(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_stage(api_id, sub_id)
@@ -533,7 +533,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_deployment(api_id, data)
                 if method == "GET":
-                    return _get_deployments(api_id)
+                    return _get_deployments(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_deployment(api_id, sub_id)
@@ -546,7 +546,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_authorizer(api_id, data)
                 if method == "GET":
-                    return _get_authorizers(api_id)
+                    return _get_authorizers(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_authorizer(api_id, sub_id)
@@ -1904,6 +1904,8 @@ def _create_api(data):
     }
     if data.get("corsConfiguration"):
         api["corsConfiguration"] = data["corsConfiguration"]
+    if data.get("ipAddressType"):
+        api["ipAddressType"] = data["ipAddressType"]
     _apis[api_id] = api
     _routes[api_id] = {}
     _integrations[api_id] = {}
@@ -1920,8 +1922,8 @@ def _get_api(api_id):
     return _apigw_response(api)
 
 
-def _get_apis():
-    return _apigw_response({"items": list(_apis.values())})
+def _get_apis(query_params=None):
+    return _page(list(_apis.values()), query_params)
 
 
 def _api_not_found(api_id):
@@ -1952,7 +1954,7 @@ def _update_api(api_id, data):
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
     for k in ("name", "routeSelectionExpression", "apiKeySelectionExpression",
               "disableSchemaValidation", "disableExecuteApiEndpoint", "version",
-              "description"):
+              "description", "ipAddressType"):
         if k in data:
             api[k] = data[k]
     # A CORS configuration is replaced wholesale, never removed here: the API
@@ -2037,10 +2039,10 @@ def _create_route(api_id, data):
     return _apigw_response(route, 201)
 
 
-def _get_routes(api_id):
+def _get_routes(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_routes.get(api_id, {}).values())})
+    return _page(list(_routes.get(api_id, {}).values()), query_params)
 
 
 def _get_route(api_id, route_id):
@@ -2107,20 +2109,33 @@ def _delete_route(api_id, route_id):
 
 # ---- Control plane: Integrations ----
 
+_INTEGRATION_OPTIONAL_FIELDS = (
+    "connectionId", "credentialsArn", "integrationSubtype", "passthroughBehavior",
+    "templateSelectionExpression", "tlsConfig",
+)
+
+
 def _create_integration(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
     int_id = new_uuid()[:8]
+    websocket = _apis[api_id].get("protocolType") == "WEBSOCKET"
+    integration_type = data.get("integrationType", "AWS_PROXY")
+    # Lambda proxy on an HTTP API takes 1.0 or 2.0; every other integration only 1.0.
+    default_pfv = "2.0" if integration_type == "AWS_PROXY" and not websocket else "1.0"
     integration = {
         "integrationId": int_id,
-        "integrationType": data.get("integrationType", "AWS_PROXY"),
+        "integrationType": integration_type,
         "integrationUri": data.get("integrationUri", ""),
         "integrationMethod": data.get("integrationMethod", "POST"),
-        "payloadFormatVersion": data.get("payloadFormatVersion", "2.0"),
-        "timeoutInMillis": data.get("timeoutInMillis", 30000),
+        "payloadFormatVersion": data.get("payloadFormatVersion", default_pfv),
+        "timeoutInMillis": data.get("timeoutInMillis", 29000 if websocket else 30000),
         "connectionType": data.get("connectionType", "INTERNET"),
         "description": data.get("description", ""),
     }
+    for k in _INTEGRATION_OPTIONAL_FIELDS:
+        if data.get(k):
+            integration[k] = data[k]
     if data.get("requestParameters"):
         integration["requestParameters"] = data["requestParameters"]
     if data.get("requestTemplates"):
@@ -2136,10 +2151,10 @@ def _create_integration(api_id, data):
     return _apigw_response(integration, 201)
 
 
-def _get_integrations(api_id):
+def _get_integrations(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_integrations.get(api_id, {}).values())})
+    return _page(list(_integrations.get(api_id, {}).values()), query_params)
 
 
 def _get_integration(api_id, int_id):
@@ -2160,11 +2175,12 @@ def _update_integration(api_id, int_id, data):
     for k in ("integrationType", "integrationUri", "integrationMethod",
               "payloadFormatVersion", "timeoutInMillis", "connectionType",
               "description", "requestParameters", "requestTemplates", "responseParameters",
-              "contentHandlingStrategy"):
+              "contentHandlingStrategy", *_INTEGRATION_OPTIONAL_FIELDS):
         if k not in data:
             continue
         v = data[k]
-        if k in ("requestParameters", "requestTemplates", "responseParameters"):
+        if k in ("requestParameters", "requestTemplates", "responseParameters",
+                 *_INTEGRATION_OPTIONAL_FIELDS):
             if v:
                 integration[k] = v
             else:
@@ -2211,10 +2227,10 @@ def _create_stage(api_id, data):
     return _apigw_response(stage, 201)
 
 
-def _get_stages(api_id):
+def _get_stages(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_stages.get(api_id, {}).values())})
+    return _page(list(_stages.get(api_id, {}).values()), query_params)
 
 
 def _get_stage(api_id, stage_name):
@@ -2271,10 +2287,10 @@ def _create_deployment(api_id, data):
     return _apigw_response(deployment, 201)
 
 
-def _get_deployments(api_id):
+def _get_deployments(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_deployments.get(api_id, {}).values())})
+    return _page(list(_deployments.get(api_id, {}).values()), query_params)
 
 
 def _get_deployment(api_id, deployment_id):
@@ -2670,14 +2686,16 @@ def _create_authorizer(api_id, data):
         "enableSimpleResponses": data.get("enableSimpleResponses", False),
         "authorizerCredentialsArn": data.get("authorizerCredentialsArn", ""),
     }
+    if data.get("identityValidationExpression"):
+        authorizer["identityValidationExpression"] = data["identityValidationExpression"]
     _authorizers.setdefault(api_id, {})[auth_id] = authorizer
     return _apigw_response(authorizer, 201)
 
 
-def _get_authorizers(api_id):
+def _get_authorizers(api_id, query_params=None):
     if err := _require_api(api_id):
         return err
-    return _apigw_response({"items": list(_authorizers.get(api_id, {}).values())})
+    return _page(list(_authorizers.get(api_id, {}).values()), query_params)
 
 
 def _get_authorizer(api_id, auth_id):
@@ -2697,7 +2715,7 @@ def _update_authorizer(api_id, auth_id, data):
         return _apigw_error("NotFoundException", f"Authorizer {auth_id} not found", 404)
     for k in ("name", "identitySource", "jwtConfiguration", "authorizerUri",
               "authorizerPayloadFormatVersion", "authorizerResultTtlInSeconds",
-              "enableSimpleResponses", "authorizerCredentialsArn"):
+              "enableSimpleResponses", "authorizerCredentialsArn", "identityValidationExpression"):
         if k in data:
             authorizer[k] = data[k]
     return _apigw_response(authorizer)
@@ -2756,13 +2774,13 @@ def _create_route_response(api_id, route_id, data):
     return _apigw_response(rr, 201)
 
 
-def _get_route_responses(api_id, route_id):
+def _get_route_responses(api_id, route_id, query_params=None):
     if err := _require_api(api_id):
         return err
     if route_id not in _routes.get(api_id, {}):
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     items = list(_route_responses.get(api_id, {}).get(route_id, {}).values())
-    return _apigw_response({"items": items})
+    return _page(items, query_params)
 
 
 def _get_route_response(api_id, route_id, rr_id):
@@ -2823,13 +2841,13 @@ def _create_integration_response(api_id, integration_id, data):
     return _apigw_response(ir, 201)
 
 
-def _get_integration_responses(api_id, integration_id):
+def _get_integration_responses(api_id, integration_id, query_params=None):
     if err := _require_api(api_id):
         return err
     if integration_id not in _integrations.get(api_id, {}):
         return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     items = list(_integration_responses.get(api_id, {}).get(integration_id, {}).values())
-    return _apigw_response({"items": items})
+    return _page(items, query_params)
 
 
 def _get_integration_response(api_id, integration_id, ir_id):

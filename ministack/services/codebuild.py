@@ -14,6 +14,7 @@ Builds are metadata-only by default. Set MINISTACK_CODEBUILD_EXECUTE=1 to
 really run them (see "Build execution" below).
 """
 
+import base64
 import contextvars
 import copy
 import json
@@ -33,6 +34,7 @@ from ministack.core.responses import (
     get_region,
     json_response,
     new_uuid,
+    to_output_shape,
 )
 
 logger = logging.getLogger("codebuild")
@@ -129,7 +131,7 @@ def _build_id(project_name):
 def _make_build_record(project, build_id, source_version=None):
     """Create a build record that immediately shows SUCCEEDED."""
     now = int(time.time())
-    return {
+    record = {
         "id": build_id,
         "arn": _build_arn(build_id),
         "buildNumber": len([b for b in _builds.values()
@@ -153,16 +155,64 @@ def _make_build_record(project, build_id, source_version=None):
             {"phaseType": "COMPLETED", "phaseStatus": "SUCCEEDED", "startTime": now, "endTime": now},
         ],
         "source": project.get("source", {}),
-        "artifacts": project.get("artifacts", {"type": "NO_ARTIFACTS"}),
+        "artifacts": to_output_shape("codebuild", "BuildArtifacts", project.get("artifacts") or {}),
         "environment": project.get("environment", {}),
         "logs": {
             "groupName": f"/aws/codebuild/{project['name']}",
             "streamName": build_id.replace(":", "/"),
         },
+        "serviceRole": project.get("serviceRole", ""),
         "timeoutInMinutes": project.get("timeoutInMinutes", 60),
         "initiator": f"{get_account_id()}/user",
-        "encryptionKey": f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild",
+        "encryptionKey": project.get("encryptionKey") or
+        f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild",
     }
+    for key in ("secondarySources", "secondarySourceVersions", "cache",
+                "queuedTimeoutInMinutes", "vpcConfig", "fileSystemLocations"):
+        if key in project:
+            record[key] = project[key]
+    return record
+
+
+def _apply_build_overrides(project, data):
+    """Return a copy of the project with StartBuild's *Override fields applied."""
+    project = copy.deepcopy(project)
+    source = project.setdefault("source", {})
+    env = project.setdefault("environment", {})
+    for field, key in (("sourceTypeOverride", "type"), ("sourceLocationOverride", "location"),
+                       ("buildspecOverride", "buildspec"), ("sourceAuthOverride", "auth"),
+                       ("gitCloneDepthOverride", "gitCloneDepth"),
+                       ("gitSubmodulesConfigOverride", "gitSubmodulesConfig"),
+                       ("insecureSslOverride", "insecureSsl"),
+                       ("reportBuildStatusOverride", "reportBuildStatus"),
+                       ("buildStatusConfigOverride", "buildStatusConfig")):
+        if field in data:
+            source[key] = data[field]
+    for field, key in (("environmentTypeOverride", "type"), ("imageOverride", "image"),
+                       ("computeTypeOverride", "computeType"),
+                       ("certificateOverride", "certificate"),
+                       ("privilegedModeOverride", "privilegedMode"),
+                       ("registryCredentialOverride", "registryCredential"),
+                       ("imagePullCredentialsTypeOverride", "imagePullCredentialsType"),
+                       ("fleetOverride", "fleet"), ("hostKernelOverride", "hostKernel")):
+        if field in data:
+            env[key] = data[field]
+    if "environmentVariablesOverride" in data:
+        overrides = {v.get("name"): v for v in data["environmentVariablesOverride"] or []}
+        merged = [overrides.pop(v.get("name"), v) for v in env.get("environmentVariables") or []]
+        env["environmentVariables"] = merged + list(overrides.values())
+    for field, key in (("artifactsOverride", "artifacts"),
+                       ("secondarySourcesOverride", "secondarySources"),
+                       ("secondarySourcesVersionOverride", "secondarySourceVersions"),
+                       ("secondaryArtifactsOverride", "secondaryArtifacts"),
+                       ("cacheOverride", "cache"), ("serviceRoleOverride", "serviceRole"),
+                       ("timeoutInMinutesOverride", "timeoutInMinutes"),
+                       ("queuedTimeoutInMinutesOverride", "queuedTimeoutInMinutes"),
+                       ("encryptionKeyOverride", "encryptionKey"),
+                       ("logsConfigOverride", "logsConfig")):
+        if field in data:
+            project[key] = data[field]
+    return project
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +446,19 @@ def _execute_build(build_id, project):
         _record_phase(build, "QUEUED", "SUCCEEDED")
         build["buildStatus"] = "IN_PROGRESS"
 
+        image_name = env.get("image", "aws/codebuild/standard:7.0")
+        from ministack.services import ecr
+        if ecr._held_image(image_name) is not None:
+            # An image in this MiniStack's ECR is loaded for the agent, never pulled from the real registry.
+            image_name = ecr.load_held_image(client, image_name)
+            if image_name is None:
+                raise RuntimeError(f"{env['image']}: not found in this MiniStack's ECR for the host platform")
+
         run_kwargs = dict(
             detach=True,
             environment={
                 "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
-                "IMAGE_NAME": env.get("image", "aws/codebuild/standard:7.0"),
+                "IMAGE_NAME": image_name,
                 "SOURCE": source_dir,
                 "MOUNT_SOURCE_DIRECTORY": "TRUE",
                 "ARTIFACTS": artifacts_dir,
@@ -592,16 +650,26 @@ def _create_project(data):
         "lastModified": now,
         "encryptionKey": data.get("encryptionKey",
                                   f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild"),
-        "badge": {"badgeEnabled": False},
+        "badge": {"badgeEnabled": bool(data.get("badgeEnabled", False))},
     }
+    for key in _OPTIONAL_PROJECT_FIELDS:
+        if key in data:
+            project[key] = data[key]
     _projects[name] = project
     logger.info("CreateProject: %s", name)
     return json_response({"project": _project_shape(project)})
 
 
+_OPTIONAL_PROJECT_FIELDS = (
+    "secondarySources", "secondarySourceVersions", "secondaryArtifacts", "cache",
+    "queuedTimeoutInMinutes", "vpcConfig", "logsConfig", "fileSystemLocations",
+    "buildBatchConfig", "concurrentBuildLimit", "autoRetryLimit",
+)
+
+
 def _project_shape(project):
     """Return the project dict in the shape boto3 expects."""
-    return {
+    shape = {
         "name": project["name"],
         "arn": project["arn"],
         "description": project.get("description", ""),
@@ -617,6 +685,10 @@ def _project_shape(project):
         "encryptionKey": project.get("encryptionKey", ""),
         "badge": project.get("badge", {}),
     }
+    for key in _OPTIONAL_PROJECT_FIELDS:
+        if key in project:
+            shape[key] = project[key]
+    return shape
 
 
 def _batch_get_projects(data):
@@ -633,6 +705,18 @@ def _batch_get_projects(data):
     return json_response({"projects": found, "projectsNotFound": not_found})
 
 
+def _page(data, items, key):
+    try:
+        start = max(int(base64.b64decode(data.get("nextToken") or "", validate=True).decode() or 0), 0)
+    except ValueError:
+        start = 0
+    end = start + 100
+    out = {key: items[start:end]}
+    if end < len(items):
+        out["nextToken"] = base64.b64encode(str(end).encode()).decode()
+    return out
+
+
 def _list_projects(data):
     sort_by = data.get("sortBy", "NAME")
     sort_order = data.get("sortOrder", "ASCENDING")
@@ -642,7 +726,7 @@ def _list_projects(data):
     elif sort_by == "LAST_MODIFIED_TIME":
         names.sort(key=lambda n: _projects[n].get("lastModified", ""),
                    reverse=(sort_order == "DESCENDING"))
-    return json_response({"projects": names})
+    return json_response(_page(data, names, "projects"))
 
 
 def _update_project(data):
@@ -653,9 +737,11 @@ def _update_project(data):
     project = _projects[name]
     for key in ("description", "source", "sourceVersion", "artifacts",
                 "environment", "serviceRole", "timeoutInMinutes", "tags",
-                "encryptionKey"):
+                "encryptionKey") + _OPTIONAL_PROJECT_FIELDS:
         if key in data:
             project[key] = data[key]
+    if "badgeEnabled" in data:
+        project["badge"] = {"badgeEnabled": bool(data["badgeEnabled"])}
     project["lastModified"] = int(time.time())
     logger.info("UpdateProject: %s", name)
     return json_response({"project": _project_shape(project)})
@@ -680,7 +766,7 @@ def _start_build(data):
     if not project_name or project_name not in _projects:
         return error_response_json("ResourceNotFoundException",
                                    f"Project not found: {project_name}", 400)
-    project = _projects[project_name]
+    project = _apply_build_overrides(_projects[project_name], data)
     bid = _build_id(project_name)
     build = _make_build_record(project, bid, data.get("sourceVersion"))
 
@@ -751,7 +837,7 @@ def _list_builds(data):
     ids = list(_builds.keys())
     ids.sort(key=lambda bid: _builds[bid].get("startTime", ""),
              reverse=(sort_order == "DESCENDING"))
-    return json_response({"ids": ids})
+    return json_response(_page(data, ids, "ids"))
 
 
 def _list_builds_for_project(data):
@@ -763,7 +849,7 @@ def _list_builds_for_project(data):
     ids = [bid for bid, b in _builds.items() if b["projectName"] == project_name]
     ids.sort(key=lambda bid: _builds[bid].get("startTime", ""),
              reverse=(sort_order == "DESCENDING"))
-    return json_response({"ids": ids})
+    return json_response(_page(data, ids, "ids"))
 
 
 def _batch_delete_builds(data):

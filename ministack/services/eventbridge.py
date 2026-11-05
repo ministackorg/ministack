@@ -31,7 +31,9 @@ import json
 import logging
 import operator
 import os
+import random
 import re
+import string
 import threading
 import time
 import urllib.error
@@ -52,6 +54,7 @@ from ministack.core.responses import (
     request_scope,
     set_request_account_id,
     set_request_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("events")
@@ -415,7 +418,7 @@ def _list_event_buses(data):
             if policy:
                 entry["Policy"] = json.dumps(policy, separators=(",", ":"))
             buses.append(entry)
-    return json_response({"EventBuses": buses})
+    return _offset_page(data, "EventBuses", buses)
 
 
 def _describe_event_bus(data):
@@ -580,6 +583,18 @@ def _opaque_offset_decode(token: str) -> int:
         return 0
 
 
+def _offset_page(data, key, items, limit_key="Limit"):
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    try:
+        limit = int(data.get(limit_key) or len(items) or 1)
+    except (TypeError, ValueError):
+        limit = len(items) or 1
+    resp = {key: items[start:start + max(limit, 1)]}
+    if start + max(limit, 1) < len(items):
+        resp["NextToken"] = _opaque_offset_encode(start + max(limit, 1))
+    return json_response(resp)
+
+
 def _list_rules(data):
     prefix = data.get("NamePrefix", "")
     bus = data.get("EventBusName", "default")
@@ -593,7 +608,7 @@ def _list_rules(data):
             continue
         if prefix and not r["Name"].startswith(prefix):
             continue
-        rules.append(_rule_out(r))
+        rules.append(to_output_shape("events", "Rule", _rule_out(r)))
     rules.sort(key=lambda x: x["Name"])
     start = _opaque_offset_decode(data.get("NextToken", ""))
     page = rules[start:start + limit]
@@ -763,7 +778,7 @@ def _list_targets_by_rule(data):
     bus = data.get("EventBusName", "default")
     key = _rule_key(rule_name, bus)
     targets = _targets.get(key, [])
-    return json_response({"Targets": targets})
+    return _offset_page(data, "Targets", list(targets))
 
 
 def _list_rule_names_by_target(data):
@@ -1167,8 +1182,51 @@ def _foreign_bus_denial(entries):
     return None
 
 
+def _endpoint_by_id(endpoint_id):
+    """The caller's global endpoint with *endpoint_id*, in whatever region it was created."""
+    return next((ep for (account, _region, _name), ep in _endpoints.all_items()
+                 if account == get_account_id() and ep.get("EndpointId") == endpoint_id), None)
+
+
+def _put_events_through_endpoint(data, endpoint):
+    """PutEvents to a healthy global endpoint: delivered in its primary region with the endpoint in
+    ``resources``, and, with replication enabled, copied to the secondary region's bus of the same name."""
+    primary = parse_arn(endpoint["Arn"]).region
+    now = int(_now_ts())
+    # The replica keeps the event's time, so both regions see one timestamp.
+    entries = [{**e, "Resources": list(e.get("Resources") or []) + [endpoint["Arn"]],
+                "Time": e.get("Time") if e.get("Time") is not None else now}
+               for e in data.get("Entries", [])]
+    with request_scope(get_account_id(), primary):
+        status, headers, body = _put_events({**data, "Entries": entries, "EndpointId": None})
+    secondary = (((endpoint.get("RoutingConfig") or {}).get("FailoverConfig") or {})
+                 .get("Secondary") or {}).get("Route")
+    if (status != 200 or not secondary or secondary == primary
+            or (endpoint.get("ReplicationConfig") or {}).get("State", "ENABLED") != "ENABLED"):
+        return status, headers, body
+    sent = json.loads(body).get("Entries", [])
+    for entry, result in zip(entries, sent):
+        if "EventId" not in result:
+            continue
+        bus_name, _ = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
+        record = {
+            "EventId": new_uuid(), "Source": entry.get("Source", ""), "DetailType": entry.get("DetailType", ""),
+            "Detail": entry.get("Detail", "{}"), "EventBusName": bus_name,
+            "Time": int(_coerce_timestamp(entry["Time"])) if isinstance(_coerce_timestamp(entry["Time"]), (int, float)) else now,
+            "Resources": entry["Resources"], "Account": get_account_id(), "Region": primary,
+        }
+        with request_scope(get_account_id(), secondary):
+            _events_log_list().append(record)
+            view = _pattern_event_view(record)
+            _dispatch_event(record, view)
+            _archive_event(record, view)
+    return status, headers, body
+
+
 def _put_events(data, allow_aws_source=False):
     """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
+    if data.get("EndpointId") and (endpoint := _endpoint_by_id(data["EndpointId"])):
+        return _put_events_through_endpoint(data, endpoint)
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -1209,7 +1267,8 @@ def _put_events(data, allow_aws_source=False):
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds
         # (Java SDK v2 chokes on floats). Persisted in the event_record so
         # archive replay also dispatches the int form.
-        event_time = int(_now_ts())
+        sent_time = _coerce_timestamp(entry.get("Time"))
+        event_time = int(sent_time) if isinstance(sent_time, (int, float)) else int(_now_ts())
 
         event_record = {
             "EventId": event_id,
@@ -3392,7 +3451,7 @@ def _describe_archive(data):
     archive = _archives.get(name)
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
-    return json_response(archive)
+    return json_response(to_output_shape("events", "DescribeArchiveResponse", archive))
 
 
 def _update_archive(data):
@@ -3445,7 +3504,7 @@ def _list_archives(data):
         if state and archive.get("State") != state:
             continue
         results.append({k: archive[k] for k in _ARCHIVE_SUMMARY_KEYS if k in archive})
-    return json_response({"Archives": results})
+    return _offset_page(data, "Archives", results)
 
 
 # ---------------------------------------------------------------------------
@@ -3569,12 +3628,11 @@ def _list_replays(data):
             continue
         results.append({
             "ReplayName": rep["ReplayName"],
-            "ReplayArn": rep["ReplayArn"],
             "State": rep["State"],
             "EventSourceArn": rep.get("EventSourceArn", ""),
             "ReplayStartTime": rep.get("ReplayStartTime", ""),
         })
-    return json_response({"Replays": results})
+    return _offset_page(data, "Replays", results)
 
 
 def _cancel_replay(data):
@@ -3601,70 +3659,186 @@ def _cancel_replay(data):
 # Global endpoints + SaaS partner event sources (minimal / stub)
 # ---------------------------------------------------------------------------
 
-def _create_endpoint(data):
+_ENDPOINT_NAME_RE = re.compile(r"[\.\-_A-Za-z0-9]+")
+_HEALTH_CHECK_RE = re.compile(r"^arn:aws([a-z]|\-)*:route53:::healthcheck/[\-a-z0-9]+$")
+_ROUTE_RE = re.compile(r"^[\-a-z0-9]+$")
+_ENDPOINT_BUS_ARN_RE = re.compile(r"^arn:aws[a-z-]*:events:[a-z]+-[a-z-]+-\d+:\d{12}:event-bus/[\w.-]+$")
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$")
+# An endpoint answers CREATING, then ACTIVE about a second later, as on AWS.
+_ENDPOINT_ACTIVATION_SECONDS = 1
+
+
+def _endpoint_shape_errors(data, create):
+    """The request's constraint violations, worded as EventBridge words them."""
+    errors = []
+
+    def null(path):
+        errors.append(f"Value null at '{path}' failed to satisfy constraint: Member must not be null")
+
+    def bad(value, path, constraint):
+        errors.append(f"Value '{value}' at '{path}' failed to satisfy constraint: {constraint}")
+
+    def string(value, path, lo, hi, pattern=None, pattern_text=None):
+        if len(value) < lo:
+            bad(value, path, f"Member must have length greater than or equal to {lo}")
+        elif len(value) > hi:
+            bad(value, path, f"Member must have length less than or equal to {hi}")
+        elif pattern is not None and not pattern.fullmatch(value):
+            bad(value, path, f"Member must satisfy regular expression pattern: {pattern_text or pattern.pattern}")
+
     name = data.get("Name")
-    if not name:
-        return error_response_json("ValidationException", "Name is required", 400)
-    if name in _endpoints:
-        return error_response_json("ResourceAlreadyExistsException",
-                                   f"Endpoint {name} already exists", 400)
+    if name is None:
+        null("name")
+    else:
+        string(name, "name", 1, 64, _ENDPOINT_NAME_RE)
+    if data.get("Description") is not None and len(data["Description"]) > 512:
+        bad(data["Description"], "description", "Member must have length less than or equal to 512")
+    routing = data.get("RoutingConfig")
+    if routing is None:
+        if create:
+            null("routingConfig")
+    else:
+        failover = routing.get("FailoverConfig")
+        if failover is None:
+            null("routingConfig.failoverConfig")
+        else:
+            primary, secondary = failover.get("Primary"), failover.get("Secondary")
+            if primary is None:
+                null("routingConfig.failoverConfig.primary")
+            elif primary.get("HealthCheck") is None:
+                null("routingConfig.failoverConfig.primary.healthCheck")
+            else:
+                string(primary["HealthCheck"], "routingConfig.failoverConfig.primary.healthCheck", 1, 1600,
+                       _HEALTH_CHECK_RE)
+            if secondary is None:
+                null("routingConfig.failoverConfig.secondary")
+            elif secondary.get("Route") is None:
+                null("routingConfig.failoverConfig.secondary.route")
+            else:
+                string(secondary["Route"], "routingConfig.failoverConfig.secondary.route", 9, 20, _ROUTE_RE)
+    replication = data.get("ReplicationConfig")
+    if replication is not None and replication.get("State") is not None \
+            and replication["State"] not in ("ENABLED", "DISABLED"):
+        bad(replication["State"], "replicationConfig.state", "Member must satisfy enum value set: [ENABLED, DISABLED]")
+    buses = data.get("EventBuses")
+    if buses is None:
+        if create:
+            null("eventBuses")
+    else:
+        if len(buses) != 2:
+            listed = ", ".join(f"EndpointEventBus(eventBusArn={b.get('EventBusArn')})" for b in buses)
+            bad(f"[{listed}]", "eventBuses", "Member must have length greater than or equal to 2" if len(buses) < 2
+                else "Member must have length less than or equal to 2")
+        for i, bus in enumerate(buses, start=1):
+            arn = bus.get("EventBusArn")
+            if arn is None:
+                null(f"eventBuses.{i}.member.eventBusArn")
+            else:
+                string(arn, f"eventBuses.{i}.member.eventBusArn", 1, 512, _ENDPOINT_BUS_ARN_RE)
+    if data.get("RoleArn"):
+        string(data["RoleArn"], "roleArn", 1, 256, _ROLE_ARN_RE)
+    if not errors:
+        return None
+    count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+    return error_response_json("ValidationException", count + "; ".join(errors), 400)
+
+
+def _endpoint_config_error(config):
+    """The checks EventBridge makes on a well-formed endpoint configuration."""
+    from ministack.services import iam as _iam
+    from ministack.services import route53 as _route53
+
+    replication = (config.get("ReplicationConfig") or {}).get("State", "ENABLED")
+    role_arn = config.get("RoleArn") or ""
+    if replication == "ENABLED" and not role_arn:
+        return error_response_json("ValidationException", "When replication is enabled, role cannot be empty.", 400)
+    failover = config["RoutingConfig"]["FailoverConfig"]
+    route = failover["Secondary"]["Route"]
+    if route == get_region():
+        return error_response_json("ValidationException", "Parameter Route is not valid. Reason: Provided route "
+                                   "for the secondary region cannot be the same as the primary region.", 400)
+    buses = [parse_arn(b["EventBusArn"]) for b in config["EventBuses"]]
+    if sorted(b.region for b in buses) != sorted([get_region(), route]):
+        return error_response_json("ValidationException", "Parameter EventBuses is not valid. Reason: An event bus "
+                                   "must be provided in both the primary and secondary regions.", 400)
+    if buses[0].resource != buses[1].resource:
+        return error_response_json("ValidationException", "Parameter EventBuses is not valid. Reason: Event bus "
+                                   "names must match in the primary and secondary regions.", 400)
+    health_check = failover["Primary"]["HealthCheck"]
+    if health_check.rsplit("/", 1)[-1] not in _route53._health_checks:
+        return error_response_json("ValidationException", f"A health check with ARN {health_check} does not exist.",
+                                   400)
+    if role_arn:
+        role = _iam._roles.get_scoped(get_account_id(), None, role_arn.rsplit("/", 1)[-1])
+        if role is None or role.get("Arn") != role_arn or not _events_may_assume(role, {"Arn": config["Arn"]}):
+            return error_response_json("ValidationException", f"Provided role '{role_arn}' cannot be assumed by "
+                                       "principal 'events.amazonaws.com'.", 400)
+    return None
+
+
+def _endpoint_view(ep, full=True):
+    """The endpoint as AWS reports it: CREATING first, and its EndpointId and URL only once ACTIVE."""
+    if ep["State"] == "CREATING" and _now_ts() >= ep["_active_at"]:
+        ep["State"], ep["LastModifiedTime"] = "ACTIVE", ep["_active_at"]
+    out = {"Name": ep["Name"]}
+    if ep.get("Description"):
+        out["Description"] = ep["Description"]
+    out.update({"Arn": ep["Arn"], "RoutingConfig": ep["RoutingConfig"], "ReplicationConfig": ep["ReplicationConfig"],
+                "EventBuses": ep["EventBuses"], "RoleArn": ep["RoleArn"]})
+    if ep["State"] != "CREATING":
+        out.update({"EndpointId": ep["EndpointId"], "EndpointUrl": ep["EndpointUrl"]})
+    out["State"] = ep["State"]
+    if full:
+        out.update({"CreationTime": ep["CreationTime"], "LastModifiedTime": ep["LastModifiedTime"]})
+    return out
+
+
+def _endpoint_not_found(name):
+    return error_response_json("ResourceNotFoundException", f"Endpoint {name} does not exist in region {get_region()}.",
+                               400)
+
+
+def _create_endpoint(data):
+    err = _endpoint_shape_errors(data, create=True)
+    if err:
+        return err
+    name = data["Name"]
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:endpoint/{name}"
+    config = {"RoutingConfig": data["RoutingConfig"], "ReplicationConfig": data.get("ReplicationConfig") or {},
+              "EventBuses": data["EventBuses"], "RoleArn": data.get("RoleArn") or "", "Arn": arn}
+    err = _endpoint_config_error(config)
+    if err:
+        return err
+    if name in _endpoints:
+        return error_response_json("ResourceAlreadyExistsException", f"Endpoint {name} already exists.", 400)
     now = _now_ts()
+    endpoint_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "." + \
+        "".join(random.choices(string.ascii_lowercase, k=3))
     _endpoints[name] = {
+        **config,
         "Name": name,
         "Description": data.get("Description", ""),
-        "RoutingConfig": data.get("RoutingConfig", {}),
-        "ReplicationConfig": data.get("ReplicationConfig", {}),
-        "EventBuses": data.get("EventBuses", []),
-        "RoleArn": data.get("RoleArn", ""),
-        "Arn": arn,
-        "EndpointUrl": f"https://{name}.global-events.{get_region()}.amazonaws.com",
-        "State": "ACTIVE",
+        "EndpointId": endpoint_id,
+        "EndpointUrl": f"https://{endpoint_id}.endpoint.events.amazonaws.com",
+        "State": "CREATING",
         "CreationTime": now,
         "LastModifiedTime": now,
+        "_active_at": now + _ENDPOINT_ACTIVATION_SECONDS,
     }
-    ep = _endpoints[name]
-    return json_response({
-        "Name": ep["Name"],
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep["RoutingConfig"],
-        "ReplicationConfig": ep["ReplicationConfig"],
-        "EventBuses": ep["EventBuses"],
-        "RoleArn": ep["RoleArn"],
-        "State": ep["State"],
-    })
+    return json_response(_endpoint_view(_endpoints[name], full=False))
 
 
 def _delete_endpoint(data):
-    name = data.get("Name")
-    if name not in _endpoints:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    del _endpoints[name]
+    # Deleting an endpoint that does not exist succeeds, as on AWS.
+    _endpoints.pop(data.get("Name"), None)
     return json_response({})
 
 
 def _describe_endpoint(data):
-    name = data.get("Name")
-    ep = _endpoints.get(name)
+    ep = _endpoints.get(data.get("Name"))
     if not ep:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    return json_response({
-        "Name": ep["Name"],
-        "Description": ep.get("Description", ""),
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep.get("RoutingConfig", {}),
-        "ReplicationConfig": ep.get("ReplicationConfig", {}),
-        "EventBuses": ep.get("EventBuses", []),
-        "RoleArn": ep.get("RoleArn", ""),
-        "EndpointId": ep["Name"],
-        "EndpointUrl": ep["EndpointUrl"],
-        "State": ep["State"],
-        "StateReason": "",
-        "CreationTime": ep["CreationTime"],
-        "LastModifiedTime": ep.get("LastModifiedTime", ep["CreationTime"]),
-    })
+        return _endpoint_not_found(data.get("Name"))
+    return json_response(_endpoint_view(ep))
 
 
 def _list_endpoints(data):
@@ -3672,43 +3846,33 @@ def _list_endpoints(data):
     home = data.get("HomeRegion", "")
     results = []
     for n in sorted(_endpoints.keys()):
-        ep = _endpoints[n]
         if prefix and not n.startswith(prefix):
             continue
         if home and get_region() != home:
             continue
-        results.append({
-            "Name": ep["Name"],
-            "Arn": ep["Arn"],
-            "EndpointUrl": ep["EndpointUrl"],
-            "State": ep["State"],
-            "CreationTime": ep["CreationTime"],
-        })
-    return json_response({"Endpoints": results})
+        results.append(_endpoint_view(_endpoints[n]))
+    return _offset_page(data, "Endpoints", results, "MaxResults")
 
 
 def _update_endpoint(data):
-    name = data.get("Name")
-    if name not in _endpoints:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    ep = _endpoints[name]
-    now = _now_ts()
-    for key in ("Description", "RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn"):
-        if key in data:
-            ep[key] = data[key]
-    ep["LastModifiedTime"] = now
-    return json_response({
-        "Name": ep["Name"],
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep["RoutingConfig"],
-        "ReplicationConfig": ep["ReplicationConfig"],
-        "EventBuses": ep["EventBuses"],
-        "RoleArn": ep["RoleArn"],
-        "EndpointId": ep["Name"],
-        "EndpointUrl": ep["EndpointUrl"],
-        "State": ep["State"],
-    })
+    err = _endpoint_shape_errors(data, create=False)
+    if err:
+        return err
+    name = data["Name"]
+    ep = _endpoints.get(name)
+    if not ep:
+        return _endpoint_not_found(name)
+    config = {key: data[key] if key in data else ep[key]
+              for key in ("RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn")}
+    config["Arn"] = ep["Arn"]
+    err = _endpoint_config_error(config)
+    if err:
+        return err
+    ep.update({k: v for k, v in config.items() if k != "Arn"})
+    if "Description" in data:
+        ep["Description"] = data["Description"]
+    ep["LastModifiedTime"] = _now_ts()
+    return json_response(_endpoint_view(ep, full=False))
 
 
 def _activate_event_source(data):
@@ -3772,7 +3936,6 @@ def _describe_partner_event_source(data):
             return json_response({
                 "Name": rec["Name"],
                 "Arn": rec["EventSourceArn"],
-                "State": "ACTIVE",
             })
     return error_response_json("ResourceNotFoundException",
                                f"Partner event source {name} does not exist.", 400)
@@ -3787,14 +3950,13 @@ def _list_partner_event_sources(data):
         results.append({
             "Name": rec["Name"],
             "Arn": rec["EventSourceArn"],
-            "State": "ACTIVE",
         })
-    return json_response({"PartnerEventSources": results})
+    return _offset_page(data, "PartnerEventSources", results)
 
 
 def _list_partner_event_source_accounts(data):
     _ = data.get("EventSourceName", "")
-    return json_response({"PartnerEventSourceAccounts": [], "NextToken": ""})
+    return json_response({"PartnerEventSourceAccounts": []})
 
 
 def _list_event_sources(data):
@@ -4005,11 +4167,28 @@ def _create_connection(data):
         "LastModifiedTime": now,
         "LastAuthorizedTime": now,
     }
+    _apply_connection_extras(_connections[name], data)
     return json_response({
         "ConnectionArn": arn,
         "ConnectionState": "AUTHORIZED",
         "CreationTime": now,
     })
+
+
+def _apply_connection_extras(conn, data):
+    if data.get("KmsKeyIdentifier"):
+        conn["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+    connectivity = data.get("InvocationConnectivityParameters")
+    if isinstance(connectivity, dict) and isinstance(connectivity.get("ResourceParameters"), dict):
+        config_arn = connectivity["ResourceParameters"].get("ResourceConfigurationArn")
+        current = (conn.get("InvocationConnectivityParameters") or {}).get("ResourceParameters", {})
+        association = current.get("ResourceAssociationArn") if current.get("ResourceConfigurationArn") == config_arn else None
+        conn["InvocationConnectivityParameters"] = {"ResourceParameters": {
+            "ResourceConfigurationArn": config_arn,
+            "ResourceAssociationArn": association or (
+                f"arn:aws:vpc-lattice:{get_region()}:{get_account_id()}:servicenetworkresourceassociation/"
+                f"snra-{new_uuid().replace('-', '')[:17]}"),
+        }}
 
 
 def _describe_connection(data):
@@ -4018,7 +4197,7 @@ def _describe_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
-    return json_response(conn)
+    return json_response(to_output_shape("events", "DescribeConnectionResponse", conn))
 
 
 def _delete_connection(data):
@@ -4054,7 +4233,25 @@ def _list_connections(data):
             "LastModifiedTime": conn["LastModifiedTime"],
             "LastAuthorizedTime": conn.get("LastAuthorizedTime", ""),
         })
-    return json_response({"Connections": results})
+    return _offset_page(data, "Connections", results)
+
+
+_AUTH_TYPE_BLOCKS = {
+    "BASIC": "BasicAuthParameters",
+    "API_KEY": "ApiKeyAuthParameters",
+    "OAUTH_CLIENT_CREDENTIALS": "OAuthParameters",
+}
+
+
+def _merge_auth_params(stored, sent):
+    if not isinstance(sent, dict):
+        return sent
+    for key, value in sent.items():
+        if isinstance(value, dict) and isinstance(stored.get(key), dict):
+            stored[key] = _merge_auth_params(stored[key], value)
+        else:
+            stored[key] = copy.deepcopy(value)
+    return stored
 
 
 def _update_connection(data):
@@ -4073,9 +4270,17 @@ def _update_connection(data):
             return endpoint_error
     conn = _connections[name]
     now = _now_ts()
-    for key in ("AuthorizationType", "AuthParameters", "Description"):
+    if "AuthParameters" in data:
+        stored = copy.deepcopy(conn.get("AuthParameters")) if isinstance(conn.get("AuthParameters"), dict) else {}
+        new_type = data.get("AuthorizationType")
+        if new_type and new_type != conn.get("AuthorizationType"):
+            for block in _AUTH_TYPE_BLOCKS.values():
+                stored.pop(block, None)
+        conn["AuthParameters"] = _merge_auth_params(stored, data["AuthParameters"])
+    for key in ("AuthorizationType", "Description"):
         if key in data:
             conn[key] = data[key]
+    _apply_connection_extras(conn, data)
     if "AuthParameters" in data or "AuthorizationType" in data:
         # Re-authorization: the new credentials, not the cached token, decide
         # what the next invocation carries. A description-only update does not
@@ -4197,7 +4402,7 @@ def _list_api_destinations(data):
             "CreationTime": dest["CreationTime"],
             "LastModifiedTime": dest["LastModifiedTime"],
         })
-    return json_response({"ApiDestinations": results})
+    return _offset_page(data, "ApiDestinations", results)
 
 
 def _update_api_destination(data):

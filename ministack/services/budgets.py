@@ -295,6 +295,23 @@ def _apply_show_filter_expression(budget: dict, show: bool) -> dict:
 # -- Budgets ----------------------------------------------------------------
 
 
+# CostTypes members and their documented defaults; only COST budgets have CostTypes.
+_COST_TYPE_DEFAULTS = {
+    "IncludeTax": True, "IncludeSubscription": True, "UseBlended": False, "IncludeRefund": True,
+    "IncludeCredit": True, "IncludeUpfront": True, "IncludeRecurring": True,
+    "IncludeOtherSubscription": True, "IncludeSupport": True, "IncludeDiscount": True,
+    "UseAmortized": False,
+}
+
+
+def _apply_cost_type_defaults(budget: dict):
+    if budget.get("BudgetType") != "COST":
+        return
+    cost_types = budget.get("CostTypes") or {}
+    budget["CostTypes"] = {k: (cost_types[k] if cost_types.get(k) is not None else v)
+                           for k, v in _COST_TYPE_DEFAULTS.items()}
+
+
 def _create_budget(data):
     budget = data.get("Budget")
     err = _validate_budget_shape(budget)
@@ -337,6 +354,7 @@ def _create_budget(data):
 
     stored_budget = copy.deepcopy(budget)
     _apply_time_period_defaults(stored_budget)
+    _apply_cost_type_defaults(stored_budget)
     stored_budget["CalculatedSpend"] = _calculated_spend(stored_budget)
     stored_budget["LastUpdatedTime"] = time.time()
 
@@ -383,6 +401,7 @@ def _update_budget(data):
     stored_budget = copy.deepcopy(new_budget)
     stored_budget.setdefault("TimePeriod", copy.deepcopy(_budgets[budget_name].get("TimePeriod")))
     _apply_time_period_defaults(stored_budget)
+    _apply_cost_type_defaults(stored_budget)
     stored_budget["CalculatedSpend"] = _calculated_spend(stored_budget)
     stored_budget["LastUpdatedTime"] = time.time()
     _budgets[budget_name] = stored_budget

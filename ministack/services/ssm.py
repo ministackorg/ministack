@@ -413,7 +413,7 @@ def _put_parameter(data):
         "Description": data.get("Description", existing.get("Description", "") if existing else ""),
         "Tier": data.get("Tier") or _default_tier(data, value, existing),
         "AllowedPattern": data.get("AllowedPattern", ""),
-        "Policies": data.get("Policies", []),
+        "Policies": data["Policies"] if "Policies" in data else (existing.get("Policies", []) if existing else []),
         "Labels": [],
     }
 
@@ -628,6 +628,20 @@ def _delete_parameters(data):
     return json_response({"DeletedParameters": deleted, "InvalidParameters": invalid})
 
 
+def _inline_policies(raw):
+    """Stored Policies (the JSON text sent) as ParameterInlinePolicy entries, one per policy."""
+    if not raw:
+        return []
+    try:
+        policies = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return []
+    if isinstance(policies, dict):
+        policies = [policies]
+    return [{"PolicyText": json.dumps(pol), "PolicyType": pol.get("Type", ""), "PolicyStatus": "Pending"}
+            for pol in policies if isinstance(pol, dict)]
+
+
 def _describe_parameters(data):
     filters = data.get("ParameterFilters", [])
     string_filters = data.get("Filters", [])
@@ -679,7 +693,7 @@ def _describe_parameters(data):
         if param.get("KeyId"):
             desc["KeyId"] = param["KeyId"]
         if param.get("Policies"):
-            desc["Policies"] = param["Policies"]
+            desc["Policies"] = _inline_policies(param["Policies"])
         results.append(desc)
 
     resp = {"Parameters": results}
@@ -750,7 +764,7 @@ def _get_parameter_history(data):
             "DataType": entry.get("DataType", "text"),
             "Tier": entry.get("Tier", "Standard"),
             "Labels": entry.get("Labels", []),
-            "Policies": entry.get("Policies", []),
+            "Policies": _inline_policies(entry.get("Policies")),
         }
         # ParameterHistory carries the same member as ParameterMetadata.
         if entry.get("KeyId"):
@@ -1029,6 +1043,8 @@ def _send_command(data):
         "DeliveryTimedOutCount": 0,
         "ServiceRole": data.get("ServiceRoleArn", ""),
         "TimeoutSeconds": data.get("TimeoutSeconds", 3600),
+        **{k: data[k] for k in ("NotificationConfig", "CloudWatchOutputConfig", "AlarmConfiguration")
+           if data.get(k)},
         "Invocations": {
             instance_id: {
                 "CommandId": command_id,
@@ -1297,6 +1313,9 @@ def _document_description(doc, for_describe=False):
         desc["Parameters"] = doc["Parameters"]
     if doc.get("AssumeRole"):
         desc["AssumeRole"] = doc["AssumeRole"]
+    for key in ("DisplayName", "VersionName", "TargetType", "Requires"):
+        if doc.get(key):
+            desc[key] = doc[key]
     if for_describe:
         desc["DocumentId"] = doc["DocumentId"]
         desc["Category"] = []
@@ -1377,6 +1396,7 @@ def _create_document(data):
         "PlatformTypes": parsed.get("platformTypes") or ["Windows", "Linux", "MacOS"],
         "AssumeRole": parsed.get("assumeRole", ""),
         "Tags": data.get("Tags", []),
+        **{k: data[k] for k in ("DisplayName", "VersionName", "TargetType", "Requires") if data.get(k)},
     }
     _documents[name] = doc
     spawn_background(_activate_document, name)
@@ -1462,7 +1482,19 @@ def _list_documents(data):
         for d in _documents.values()
         if owner_self and (names is None or d["Name"] in names)
     ]
-    return json_response({"DocumentIdentifiers": items})
+    items, token = _offset_token_page(data, items)
+    resp = {"DocumentIdentifiers": items}
+    if token:
+        resp["NextToken"] = token
+    return json_response(resp)
+
+
+def _offset_token_page(data, items):
+    """MaxResults / NextToken over a list; no MaxResults returns the rest."""
+    start = _decode_next_token(data.get("NextToken") or "")
+    limit = data.get("MaxResults") or len(items)
+    end = start + limit
+    return items[start:end], (_encode_next_token(end) if end < len(items) else None)
 
 
 # ── Automation executions ─────────────────────────────────
@@ -1665,6 +1697,10 @@ def _automation_execution_out(record):
         out["ExecutionEndTime"] = record["ExecutionEndTime"]
     if record.get("FailureMessage"):
         out["FailureMessage"] = record["FailureMessage"]
+    for key in ("TargetParameterName", "TargetMaps", "TargetLocations", "TargetLocationsURL",
+                "AlarmConfiguration", "MaxConcurrency", "MaxErrors"):
+        if record.get(key):
+            out[key] = record[key]
     return out
 
 
@@ -1733,7 +1769,12 @@ def _start_automation_execution(data, caller):
         "Mode": data.get("Mode", "Auto"),
         "Targets": data.get("Targets", []),
         "StepExecutions": steps,
+        **{k: data[k] for k in ("TargetParameterName", "TargetMaps", "TargetLocations",
+                                "TargetLocationsURL", "AlarmConfiguration", "MaxConcurrency", "MaxErrors")
+           if data.get(k)},
     }
+    if (data.get("Targets") or data.get("TargetMaps")) and not data.get("MaxConcurrency"):
+        _automation_executions[execution_id]["MaxConcurrency"] = "10"
     spawn_background(_run_automation, execution_id)
     return json_response({"AutomationExecutionId": execution_id})
 
@@ -1788,7 +1829,11 @@ def _describe_automation_executions(data):
         if r.get("FailureMessage"):
             meta["FailureMessage"] = r["FailureMessage"]
         items.append(meta)
-    return json_response({"AutomationExecutionMetadataList": items})
+    items, token = _offset_token_page(data, items)
+    resp = {"AutomationExecutionMetadataList": items}
+    if token:
+        resp["NextToken"] = token
+    return json_response(resp)
 
 
 def _stop_automation_execution(data):

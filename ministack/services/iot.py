@@ -106,6 +106,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     request_scope,
+    to_output_shape,
 )
 from ministack.core.router import extract_access_key_id
 from ministack.core.x509_utils import (
@@ -1781,7 +1782,9 @@ def _describe_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
         return _error_not_found("ThingGroup", name)
-    return json_response({k: v for k, v in g.items() if k != "tags"})
+    out = {k: v for k, v in g.items() if k not in ("tags", "things", "creationDate")}
+    out["thingGroupMetadata"] = {**g.get("thingGroupMetadata", {}), "creationDate": g.get("creationDate")}
+    return json_response(to_output_shape("iot", "DescribeThingGroupResponse", out))
 
 
 def _list_thing_groups(qp: dict) -> tuple:

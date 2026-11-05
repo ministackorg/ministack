@@ -39,6 +39,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     set_request_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("appsync")
@@ -219,6 +220,9 @@ def _create_graphql_api(body):
         record["openIDConnectConfig"] = openid_config
     if lambda_auth:
         record["lambdaAuthorizerConfig"] = lambda_auth
+    for member in ("ownerContact", "mergedApiExecutionRoleArn", "enhancedMetricsConfig"):
+        if body.get(member):
+            record[member] = body[member]
 
     _apis[api_id] = record
     _api_keys[api_id] = {}
@@ -236,7 +240,20 @@ def _api_with_tags(api):
     """AWS returns tags on the GraphqlApi itself, which is where the Terraform
     provider reads them. Merged in on read rather than copied onto the record so
     TagResource and UntagResource stay reflected without a second write."""
-    return {**api, "tags": dict(_tags.get(api.get("arn", ""), {}))}
+    return _drop_none(to_output_shape("appsync", "GraphqlApi", {**api, "tags": dict(_tags.get(api.get("arn", ""), {}))}))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def _out(shape, record):
+    return _drop_none(to_output_shape("appsync", shape, record))
 
 
 def _get_graphql_api(api_id):
@@ -272,9 +289,18 @@ def _update_graphql_api(api_id, body):
         api["xrayEnabled"] = body["xrayEnabled"]
     if "lambdaAuthorizerConfig" in body:
         api["lambdaAuthorizerConfig"] = body["lambdaAuthorizerConfig"]
+    for member in ("introspectionConfig", "queryDepthLimit", "resolverCountLimit"):
+        if member in body:
+            api[member] = body[member]
+    for member in ("ownerContact", "mergedApiExecutionRoleArn", "enhancedMetricsConfig"):
+        if member in body:
+            if body[member]:
+                api[member] = body[member]
+            else:
+                api.pop(member, None)
 
     api["lastUpdatedAt"] = _now()
-    return _json(200, {"graphqlApi": api})
+    return _json(200, {"graphqlApi": _api_with_tags(api)})
 
 
 def _delete_graphql_api(api_id):
@@ -322,7 +348,7 @@ def _create_api_key(api_id, body):
     }
 
     _api_keys.setdefault(api_id, {})[key_id] = record
-    return _json(200, {"apiKey": record})
+    return _json(200, {"apiKey": _out("ApiKey", record)})
 
 
 def _list_api_keys(api_id):
@@ -330,7 +356,7 @@ def _list_api_keys(api_id):
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
 
     keys = list(_api_keys.get(api_id, {}).values())
-    return _json(200, {"apiKeys": keys})
+    return _json(200, {"apiKeys": [_out("ApiKey", k) for k in keys]})
 
 
 def _delete_api_key(api_id, key_id):
@@ -375,8 +401,10 @@ def _create_data_source(api_id, body):
                                     **body.get("dynamodbConfig", {})}
     elif ds_type == "AWS_LAMBDA":
         record["lambdaConfig"] = body.get("lambdaConfig", {})
-    elif ds_type == "AMAZON_ELASTICSEARCH" or ds_type == "AMAZON_OPENSEARCH_SERVICE":
+    elif ds_type == "AMAZON_ELASTICSEARCH":
         record["elasticsearchConfig"] = body.get("elasticsearchConfig", {})
+    elif ds_type == "AMAZON_OPENSEARCH_SERVICE":
+        record["openSearchServiceConfig"] = body.get("openSearchServiceConfig", {})
     elif ds_type == "HTTP":
         record["httpConfig"] = body.get("httpConfig", {})
     elif ds_type == "RELATIONAL_DATABASE":
@@ -385,7 +413,7 @@ def _create_data_source(api_id, body):
         record["eventBridgeConfig"] = body.get("eventBridgeConfig", {})
 
     _data_sources.setdefault(api_id, {})[name] = record
-    return _json(200, {"dataSource": record})
+    return _json(200, {"dataSource": _out("DataSource", record)})
 
 
 def _get_data_source(api_id, name):
@@ -396,7 +424,7 @@ def _get_data_source(api_id, name):
     if not ds:
         return error_response_json("NotFoundException", f"Data source {name} not found", 404)
 
-    return _json(200, {"dataSource": ds})
+    return _json(200, {"dataSource": _out("DataSource", ds)})
 
 
 def _list_data_sources(api_id):
@@ -404,7 +432,7 @@ def _list_data_sources(api_id):
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
 
     sources = list(_data_sources.get(api_id, {}).values())
-    return _json(200, {"dataSources": sources})
+    return _json(200, {"dataSources": [_out("DataSource", d) for d in sources]})
 
 
 def _delete_data_source(api_id, name):
@@ -466,7 +494,7 @@ def _create_resolver(api_id, type_name, body):
             record[optional] = body[optional]
 
     _resolvers.setdefault(api_id, {}).setdefault(type_name, {})[field_name] = record
-    return _json(200, {"resolver": record})
+    return _json(200, {"resolver": _out("Resolver", record)})
 
 
 def _get_resolver(api_id, type_name, field_name):
@@ -478,7 +506,7 @@ def _get_resolver(api_id, type_name, field_name):
         return error_response_json("NotFoundException",
                                    f"Resolver {type_name}.{field_name} not found", 404)
 
-    return _json(200, {"resolver": resolver})
+    return _json(200, {"resolver": _out("Resolver", resolver)})
 
 
 def _list_resolvers(api_id, type_name):
@@ -486,7 +514,7 @@ def _list_resolvers(api_id, type_name):
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
 
     resolvers = list(_resolvers.get(api_id, {}).get(type_name, {}).values())
-    return _json(200, {"resolvers": resolvers})
+    return _json(200, {"resolvers": [_out("Resolver", r) for r in resolvers]})
 
 
 def _delete_resolver(api_id, type_name, field_name):
@@ -530,7 +558,7 @@ def _create_type(api_id, body):
     }
 
     _types.setdefault(api_id, {})[type_name] = record
-    return _json(200, {"type": record})
+    return _json(200, {"type": _out("Type", record)})
 
 
 def _get_type(api_id, type_name, query_params):
@@ -541,7 +569,7 @@ def _get_type(api_id, type_name, query_params):
     if not t:
         return error_response_json("NotFoundException", f"Type {type_name} not found", 404)
 
-    return _json(200, {"type": t})
+    return _json(200, {"type": _out("Type", t)})
 
 
 def _list_types(api_id, query_params):
@@ -549,7 +577,7 @@ def _list_types(api_id, query_params):
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
 
     types = list(_types.get(api_id, {}).values())
-    return _json(200, {"types": types})
+    return _json(200, {"types": [_out("Type", t) for t in types]})
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +694,7 @@ def _update_data_source(api_id, name, body):
     record = _data_sources[api_id][name]
     if created_at:
         record["createdAt"] = created_at
-    return _json(200, {"dataSource": record})
+    return _json(200, {"dataSource": _out("DataSource", record)})
 
 
 def _update_resolver(api_id, type_name, field_name, body):
@@ -684,7 +712,7 @@ def _update_resolver(api_id, type_name, field_name, body):
     record = _resolvers[api_id][type_name][field_name]
     if created_at:
         record["createdAt"] = created_at
-    return _json(200, {"resolver": record})
+    return _json(200, {"resolver": _out("Resolver", record)})
 
 
 def _update_type(api_id, type_name, body):
@@ -709,7 +737,7 @@ def _update_api_key(api_id, key_id, body):
         key["description"] = body["description"]
     if body.get("expires") is not None:
         key["expires"] = int(body["expires"])
-    return _json(200, {"apiKey": key})
+    return _json(200, {"apiKey": _out("ApiKey", key)})
 
 
 def _put_environment_variables(api_id, body):
@@ -766,7 +794,7 @@ def _create_function(api_id, body):
     function_id = new_uuid().replace("-", "")[:26]
     record = _function_record(api_id, function_id, body)
     _functions.setdefault(api_id, {})[function_id] = record
-    return _json(200, {"functionConfiguration": record})
+    return _json(200, {"functionConfiguration": _out("FunctionConfiguration", record)})
 
 
 def _get_function(api_id, function_id):
@@ -775,13 +803,13 @@ def _get_function(api_id, function_id):
     record = _functions.get(api_id, {}).get(function_id)
     if not record:
         return error_response_json("NotFoundException", f"Function {function_id} not found", 404)
-    return _json(200, {"functionConfiguration": record})
+    return _json(200, {"functionConfiguration": _out("FunctionConfiguration", record)})
 
 
 def _list_functions(api_id):
     if api_id not in _apis:
         return error_response_json("NotFoundException", f"GraphQL API {api_id} not found", 404)
-    return _json(200, {"functions": list(_functions.get(api_id, {}).values())})
+    return _json(200, {"functions": [_out("FunctionConfiguration", f) for f in _functions.get(api_id, {}).values()]})
 
 
 def _update_function(api_id, function_id, body):
@@ -795,7 +823,7 @@ def _update_function(api_id, function_id, body):
         return error_response_json("BadRequestException", "dataSourceName is required", 400)
     record = _function_record(api_id, function_id, body)
     _functions[api_id][function_id] = record
-    return _json(200, {"functionConfiguration": record})
+    return _json(200, {"functionConfiguration": _out("FunctionConfiguration", record)})
 
 
 def _delete_function(api_id, function_id):

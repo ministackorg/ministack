@@ -359,6 +359,18 @@ def _build_record_set_el(parent: Element, rs: dict):
         crc = SubElement(rrs, "CidrRoutingConfig")
         SubElement(crc, "CollectionId").text = rs["CidrRoutingConfig"].get("CollectionId", "")
         SubElement(crc, "LocationName").text = rs["CidrRoutingConfig"].get("LocationName", "")
+    if rs.get("GeoProximityLocation"):
+        gpl = SubElement(rrs, "GeoProximityLocation")
+        loc = rs["GeoProximityLocation"]
+        for field in ("AWSRegion", "LocalZoneGroup"):
+            if loc.get(field):
+                SubElement(gpl, field).text = loc[field]
+        if loc.get("Coordinates"):
+            coords = SubElement(gpl, "Coordinates")
+            SubElement(coords, "Latitude").text = loc["Coordinates"].get("Latitude", "")
+            SubElement(coords, "Longitude").text = loc["Coordinates"].get("Longitude", "")
+        if loc.get("Bias") is not None:
+            SubElement(gpl, "Bias").text = str(loc["Bias"])
 
 
 # ─── record set XML parser ────────────────────────────────────────────────────
@@ -409,6 +421,19 @@ def _parse_record_set(el) -> dict:
             "CollectionId": _text(crc_el, "CollectionId"),
             "LocationName": _text(crc_el, "LocationName"),
         }
+    gpl_el = _find(el, "GeoProximityLocation")
+    if gpl_el is not None:
+        loc = {}
+        for field in ("AWSRegion", "LocalZoneGroup"):
+            if _find(gpl_el, field) is not None:
+                loc[field] = _text(gpl_el, field)
+        coords_el = _find(gpl_el, "Coordinates")
+        if coords_el is not None:
+            loc["Coordinates"] = {"Latitude": _text(coords_el, "Latitude"),
+                                  "Longitude": _text(coords_el, "Longitude")}
+        if _find(gpl_el, "Bias") is not None:
+            loc["Bias"] = int(_text(gpl_el, "Bias", "0"))
+        rs["GeoProximityLocation"] = loc
     return rs
 
 
@@ -428,7 +453,8 @@ def _build_health_check_el(parent: Element, hc: dict):
         "InsufficientDataHealthStatus",
     ):
         if field in cfg:
-            SubElement(cfg_el, field).text = str(cfg[field])
+            value = cfg[field]
+            SubElement(cfg_el, field).text = str(value).lower() if isinstance(value, bool) else str(value)
     if "ChildHealthChecks" in cfg:
         chc = SubElement(cfg_el, "ChildHealthChecks")
         for c in cfg["ChildHealthChecks"]:
@@ -919,6 +945,9 @@ def _create_health_check(body: bytes):
 
     cfg_el = _find(root, "HealthCheckConfig")
     cfg = _parse_health_check_config(cfg_el) if cfg_el is not None else {}
+    if cfg.get("Type") != "RECOVERY_CONTROL":
+        cfg.setdefault("RequestInterval", 30)
+        cfg.setdefault("FailureThreshold", 3)
 
     with _lock:
         if caller_ref in _hc_caller_refs:

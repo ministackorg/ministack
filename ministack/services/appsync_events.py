@@ -37,8 +37,10 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("appsync_events")
@@ -63,6 +65,19 @@ _connections: dict[str, dict] = {}
 _connections_lock: asyncio.Lock | None = None
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
+
 def _get_connections_lock() -> asyncio.Lock:
     global _connections_lock
     if _connections_lock is None:
@@ -71,11 +86,10 @@ def _get_connections_lock() -> asyncio.Lock:
 
 
 def _discover_api_scope(api_id: str, account_id: str) -> tuple[str, str] | None:
-    """Return the API's account/region scope without crossing tenants."""
-    for (scoped_account_id, region, scoped_api_id), _api in _apis.all_items():
-        if scoped_account_id == account_id and scoped_api_id == api_id:
-            return scoped_account_id, region
-    return None
+    """Return the API's account/region scope, *account_id* first: API-key requests carry no signed scope."""
+    matches = [(scoped_account_id, region) for (scoped_account_id, region, scoped_api_id), _api in _apis.all_items()
+               if scoped_api_id == api_id]
+    return next((m for m in matches if m[0] == account_id), matches[0] if matches else None)
 
 
 # ---------------------------------------------------------------------------
@@ -947,9 +961,9 @@ async def _publish_from_host(
     if api_scope is None:
         return _publish_api_not_found()
 
-    from ministack.core.responses import _request_region
+    from ministack.core.responses import _request_account_id, _request_region
 
-    region_token = _request_region.set(api_scope[1])
+    account_token, region_token = _request_account_id.set(api_scope[0]), _request_region.set(api_scope[1])
     try:
         if (
             not _is_advertised_dns_host(api_id, host, "HTTP")
@@ -960,6 +974,7 @@ async def _publish_from_host(
         return await _publish(api_id, headers, body)
     finally:
         _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
 
 
 async def _publish(api_id: str, headers: dict, body: bytes):

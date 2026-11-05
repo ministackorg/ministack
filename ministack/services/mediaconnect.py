@@ -24,6 +24,8 @@ Supports:
   Tags:  ListTagsForResource
 """
 
+import base64
+import binascii
 import copy
 import json
 import logging
@@ -156,7 +158,7 @@ _LISTED_FLOW_FIELDS = (
 # UpdateFlow only accepts these top-level fields per the AWS API model.
 _UPDATE_FLOW_FIELDS = (
     "sourceFailoverConfig", "maintenance",
-    "sourceMonitoringConfig", "ndiConfig",
+    "sourceMonitoringConfig", "ndiConfig", "flowSize", "encodingConfig",
 )
 
 
@@ -167,6 +169,18 @@ def _source_type(flow):
     if src.get("entitlementArn"):
         return "ENTITLED"
     return "OWNED"
+
+
+_TRANSPORT_KEYS = ("maxBitrate", "maxLatency", "maxSyncBuffer", "minLatency", "ndiSourceSettings",
+                   "protocol", "sourceListenerAddress", "sourceListenerPort", "streamId")
+
+
+def _source_from_request(req):
+    src = {k: v for k, v in (req or {}).items() if k not in _TRANSPORT_KEYS and k != "sourceTags"}
+    transport = {k: req[k] for k in _TRANSPORT_KEYS if k in (req or {})}
+    if transport:
+        src["transport"] = {**src.get("transport", {}), **transport}
+    return src
 
 
 def _build_flow(body):
@@ -184,9 +198,9 @@ def _build_flow(body):
         "entitlements": body.get("entitlements", []),
         "mediaStreams": body.get("mediaStreams", []),
         "outputs": body.get("outputs", []),
-        "source": body.get("source", {}),
+        "source": _source_from_request(body.get("source")),
         "sourceFailoverConfig": body.get("sourceFailoverConfig", {}),
-        "sources": body.get("sources", []),
+        "sources": [_source_from_request(x) for x in body.get("sources", [])],
         # AWS starts new flows in STANDBY; StartFlow moves them to ACTIVE.
         # Start/Stop are out of scope — clients typically just describe.
         "status": "STANDBY",
@@ -196,6 +210,8 @@ def _build_flow(body):
         "flowSize": body.get("flowSize", "MEDIUM"),
         "ndiConfig": body.get("ndiConfig", {}),
     }
+    if body.get("encodingConfig"):
+        flow["encodingConfig"] = body["encodingConfig"]
     return flow
 
 
@@ -218,13 +234,23 @@ def _create_flow(body):
 
 
 def _list_flows(query):
-    max_results = int(query.get("maxResults", 100))
+    try:
+        start = int(base64.urlsafe_b64decode(query["nextToken"]).decode()) if query.get("nextToken") else 0
+        max_results = int(query.get("maxResults") or 10)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return _error(400, "BadRequestException", "Invalid nextToken.")
+    if start < 0 or max_results < 1:
+        return _error(400, "BadRequestException", "Invalid nextToken.")
     listed = []
     for arn, f in _flows.items():
         projection = {k: f.get(k) for k in _LISTED_FLOW_FIELDS if k in f}
         projection["sourceType"] = _source_type(f)
         listed.append(projection)
-    return json_response({"flows": listed[:max_results]})
+    end = start + max_results
+    out = {"flows": listed[start:end]}
+    if end < len(listed):
+        out["nextToken"] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return json_response(out)
 
 
 def _describe_flow(arn):

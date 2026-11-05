@@ -449,8 +449,14 @@ def _summary(pipe):
     return out
 
 
+_OPTIONAL_PIPE_FIELDS = (
+    "SourceParameters", "Enrichment", "EnrichmentParameters", "TargetParameters",
+    "LogConfiguration", "KmsKeyIdentifier",
+)
+
+
 def _describe_response(pipe):
-    return {
+    out = {
         "Arn": pipe.get("Arn", ""),
         "Name": pipe.get("Name", ""),
         "Description": pipe.get("Description", ""),
@@ -464,6 +470,50 @@ def _describe_response(pipe):
         "CreationTime": int(pipe.get("CreationTime", 0)),
         "LastModifiedTime": int(pipe.get("LastModifiedTime", pipe.get("CreationTime", 0))),
     }
+    for key in _OPTIONAL_PIPE_FIELDS:
+        if pipe.get(key):
+            out[key] = pipe[key]
+    return out
+
+
+# Source fields only CreatePipe takes (absent from the UpdatePipeSource* shapes).
+_CREATE_ONLY_SOURCE_FIELDS = {
+    "KinesisStreamParameters": ("StartingPosition", "StartingPositionTimestamp"),
+    "DynamoDBStreamParameters": ("StartingPosition",),
+    "ActiveMQBrokerParameters": ("QueueName",),
+    "RabbitMQBrokerParameters": ("QueueName", "VirtualHost"),
+    "ManagedStreamingKafkaParameters": ("ConsumerGroupID", "StartingPosition", "TopicName"),
+    "SelfManagedKafkaParameters": (
+        "AdditionalBootstrapServers", "ConsumerGroupID", "StartingPosition", "TopicName"),
+}
+
+
+def _apply_optional_fields(pipe, body):
+    for key in ("Enrichment", "KmsKeyIdentifier"):
+        if key in body:
+            if body[key]:
+                pipe[key] = body[key]
+            else:
+                pipe.pop(key, None)
+    if "LogConfiguration" in body:
+        if body["LogConfiguration"]:
+            pipe["LogConfiguration"] = copy.deepcopy(body["LogConfiguration"])
+        else:
+            pipe.pop("LogConfiguration", None)
+    for key in ("SourceParameters", "EnrichmentParameters", "TargetParameters"):
+        sent = body.get(key)
+        if not isinstance(sent, dict):
+            continue
+        merged = copy.deepcopy(pipe.get(key) or {})
+        for sub, value in sent.items():
+            kept = {}
+            if key == "SourceParameters" and isinstance(merged.get(sub), dict):
+                kept = {f: merged[sub][f] for f in _CREATE_ONLY_SOURCE_FIELDS.get(sub, ())
+                        if f in merged[sub]}
+            merged[sub] = copy.deepcopy(value)
+            if kept and isinstance(merged[sub], dict):
+                merged[sub].update(kept)
+        pipe[key] = merged
 
 
 def _find_pipe_by_arn(arn):
@@ -486,6 +536,12 @@ def _create_pipe(name, body):
             "ValidationException",
             f"DesiredState must be one of {list(_VALID_REQUESTED_STATE)}.",
         )
+    source_params = body.get("SourceParameters") or {}
+    stream_params = (
+        source_params.get("DynamoDBStreamParameters")
+        or source_params.get("KinesisStreamParameters")
+        or {}
+    ) if isinstance(source_params, dict) else {}
     try:
         pipe = register_pipe(
             name=name,
@@ -493,11 +549,14 @@ def _create_pipe(name, body):
             target=target,
             role_arn=role_arn,
             desired_state=desired,
+            starting_position=stream_params.get("StartingPosition") or "LATEST",
             tags=body.get("Tags") or {},
             description=body.get("Description", "") or "",
         )
     except ValueError as e:
         return _error(400, "ValidationException", str(e))
+    _apply_optional_fields(pipe, body)
+    _pipes[name] = pipe
     return _json_resp(200, _lifecycle_response(pipe))
 
 
@@ -532,6 +591,7 @@ def _update_pipe(name, body):
             )
         pipe["DesiredState"] = desired
         pipe["CurrentState"] = desired
+    _apply_optional_fields(pipe, body)
     pipe["LastModifiedTime"] = int(time.time())
     _pipes[name] = pipe
     return _json_resp(200, _lifecycle_response(pipe))

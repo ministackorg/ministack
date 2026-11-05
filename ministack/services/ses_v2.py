@@ -683,6 +683,8 @@ def _create_config_set(name, data):
     for key in _CONFIG_SET_OPTIONS.values():
         if isinstance(data.get(key), dict):
             _put_config_set_option(rec, key, data[key])
+    if isinstance(data.get("MessageSecurityOptions"), dict):
+        rec["MessageSecurityOptions"] = copy.deepcopy(data["MessageSecurityOptions"])
     _config_sets[name] = rec
     _ses_tags[_resource_arn("configuration-set", name)] = list(rec["Tags"])
     return rec
@@ -694,6 +696,8 @@ def _config_set_view(name, rec):
         value = rec.get(key, _CONFIG_SET_DEFAULTS.get(key))
         if value is not None:
             out[key] = copy.deepcopy(value)
+    if rec.get("MessageSecurityOptions"):
+        out["MessageSecurityOptions"] = copy.deepcopy(rec["MessageSecurityOptions"])
     out["Tags"] = _ses_tags.get(_resource_arn("configuration-set", name), rec.get("Tags", []))
     return out
 
@@ -810,7 +814,7 @@ async def handle_request(method, path, headers, body, query_params):
             "ProductionAccessEnabled": account.get("ProductionAccessEnabled", True),
             "SendQuota": {"Max24HourSend": 50000.0, "MaxSendRate": 14.0, "SentLast24Hours": float(sent_24h)},
             "SendingEnabled": True,
-            "SuppressionAttributes": {"SuppressedReasons": []},
+            "SuppressionAttributes": copy.deepcopy(account.get("SuppressionAttributes") or {"SuppressedReasons": []}),
         }
         if account.get("Details"):
             out["Details"] = account["Details"]
@@ -833,6 +837,12 @@ async def handle_request(method, path, headers, body, query_params):
 
     # PUT /v2/email/account/suppression
     if sub == "/account/suppression" and method == "PUT":
+        account = dict(_account_details.get("account") or {})
+        attrs = {"SuppressedReasons": list(data.get("SuppressedReasons") or [])}
+        if data.get("ValidationAttributes"):
+            attrs["ValidationAttributes"] = copy.deepcopy(data["ValidationAttributes"])
+        account["SuppressionAttributes"] = attrs
+        _account_details["account"] = account
         return json_response({})
 
     # GET /v2/email/suppression/addresses
@@ -1003,6 +1013,8 @@ async def handle_request(method, path, headers, body, query_params):
             "Tags": data.get("Tags", []),
             "CreatedTimestamp": now_iso(),
         }
+        if data.get("ConfigurationSetName"):
+            _identities[identity]["ConfigurationSetName"] = data["ConfigurationSetName"]
         _ses_tags[_resource_arn("identity", identity)] = list(data.get("Tags", []))
         return json_response({
             "IdentityType": identity_type,

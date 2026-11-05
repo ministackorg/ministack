@@ -259,13 +259,13 @@ def _validation_options(domain, method):
 
 
 def _cert_shape(cert):
-    return {
+    shape = {
         "CertificateArn": cert["CertificateArn"],
         "DomainName": cert["DomainName"],
         "SubjectAlternativeNames": cert.get("SubjectAlternativeNames", [cert["DomainName"]]),
         "Status": cert["Status"],
         "Type": cert.get("Type", "AMAZON_ISSUED"),
-        "KeyAlgorithm": "RSA_2048",
+        "KeyAlgorithm": cert.get("KeyAlgorithm", "RSA_2048"),
         "SignatureAlgorithm": "SHA256WITHRSA",
         "InUseBy": cert.get("InUseBy", []) + _signing_profiles_using(cert["CertificateArn"]),
         "CreatedAt": _epoch(cert["CreatedAt"]),
@@ -274,8 +274,12 @@ def _cert_shape(cert):
         "NotAfter": _epoch(cert.get("NotAfter", _future_iso(365 * 24 * 3600))),
         "DomainValidationOptions": cert.get("DomainValidationOptions", []),
         "Options": cert.get("Options", {}),
-        "Tags": cert.get("Tags", []),
     }
+    if cert.get("CertificateAuthorityArn"):
+        shape["CertificateAuthorityArn"] = cert["CertificateAuthorityArn"]
+    if cert.get("ManagedBy"):
+        shape["ManagedBy"] = cert["ManagedBy"]
+    return shape
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -330,6 +334,7 @@ def _request_certificate(data):
     sans = data.get("SubjectAlternativeNames", [domain])
     if domain not in sans:
         sans = [domain] + sans
+    ca_arn = data.get("CertificateAuthorityArn")
     arn = _cert_arn()
     now = now_iso()
     _certificates[arn] = {
@@ -337,12 +342,12 @@ def _request_certificate(data):
         "DomainName": domain,
         "SubjectAlternativeNames": sans,
         "Status": "ISSUED",
-        "Type": "AMAZON_ISSUED",
+        "Type": "PRIVATE" if ca_arn else "AMAZON_ISSUED",
         "CreatedAt": now,
         "IssuedAt": now,
         "NotBefore": now,
         "NotAfter": _future_iso(365 * 24 * 3600),
-        "DomainValidationOptions": [_validation_options(d, method) for d in sans],
+        "DomainValidationOptions": [] if ca_arn else [_validation_options(d, method) for d in sans],
         "ValidationMethod": method,
         "Tags": data.get("Tags", []),
         "Options": {
@@ -350,6 +355,9 @@ def _request_certificate(data):
                 options.get("CertificateTransparencyLoggingPreference") or "ENABLED",
             "Export": options.get("Export") or "DISABLED",
         },
+        "KeyAlgorithm": data.get("KeyAlgorithm", "RSA_2048"),
+        "CertificateAuthorityArn": ca_arn,
+        "ManagedBy": data.get("ManagedBy"),
         "_pem_body": _synthetic_pem(domain),
         "_pem_chain": "",
         "_private_key": "",
@@ -366,6 +374,19 @@ def _describe_certificate(data):
     return json_response({"Certificate": _cert_shape(cert)})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_certificates(data):
     statuses = data.get("CertificateStatuses", [])
     summaries = []
@@ -379,13 +400,11 @@ def _list_certificates(data):
             "DomainName": cert["DomainName"],
             "Status": cert["Status"],
         })
-    # Real AWS omits NextToken when there's no next page. boto3 strips
-    # null fields client-side so it tolerates `"NextToken": null`, but
-    # other SDKs (Java, Go, raw HTTP) and pagination loops checking
-    # `if "NextToken" in response` see the literal null and loop
-    # forever. ACM emulator currently emits a single page, so always
-    # omit the key.
-    return json_response({"CertificateSummaryList": summaries})
+    page, nxt = _page(summaries, data.get("MaxItems"), data.get("NextToken"))
+    resp = {"CertificateSummaryList": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _signing_profiles_using(arn):

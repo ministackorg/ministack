@@ -241,7 +241,7 @@ def test_kinesis_split_shard(kin):
     kin.split_shard(StreamName=sname, ShardToSplit=shard_id, NewStartingHashKey=mid)
     time.sleep(0.3)
     desc2 = kin.describe_stream(StreamName=sname)
-    assert len(desc2["StreamDescription"]["Shards"]) == 2
+    assert len([s for s in desc2["StreamDescription"]["Shards"] if "EndingSequenceNumber" not in s["SequenceNumberRange"]]) == 2
     kin.delete_stream(StreamName=sname)
 
 def test_kinesis_merge_shards(kin):
@@ -262,7 +262,7 @@ def test_kinesis_merge_shards(kin):
     )
     time.sleep(0.3)
     desc2 = kin.describe_stream(StreamName=sname)
-    assert len(desc2["StreamDescription"]["Shards"]) == 1
+    assert len([s for s in desc2["StreamDescription"]["Shards"] if "EndingSequenceNumber" not in s["SequenceNumberRange"]]) == 1
     kin.delete_stream(StreamName=sname)
 
 def test_kinesis_update_shard_count(kin):

@@ -231,13 +231,34 @@ def _update_compute_environment(p):
     })
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
+def _paged(key, items, p, default):
+    page, nxt = _page(items, p.get("maxResults") or default, p.get("nextToken"))
+    out = {key: page}
+    if nxt:
+        out["nextToken"] = nxt
+    return _json(200, out)
+
+
 def _describe_compute_environments(p):
     names = p.get("computeEnvironments") or []
     if names:
         out = [_compute_envs[n] for n in names if n in _compute_envs]
     else:
         out = list(_compute_envs.values())
-    return _json(200, {"computeEnvironments": out})
+    return _paged("computeEnvironments", out, p, 100)
 
 
 # ─── job queues ─────────────────────────────────────────────────
@@ -275,7 +296,7 @@ def _describe_job_queues(p):
                 out.append(_job_queues[short])
     else:
         out = list(_job_queues.values())
-    return _json(200, {"jobQueues": out})
+    return _paged("jobQueues", out, p, 100)
 
 
 # ─── job definitions ────────────────────────────────────────────
@@ -307,7 +328,7 @@ def _describe_job_definitions(p):
         # all
         for n, rs in _job_definitions.items():
             revs.extend(rs)
-    return _json(200, {"jobDefinitions": revs})
+    return _paged("jobDefinitions", revs, p, 100)
 
 
 # ─── jobs ───────────────────────────────────────────────────────
@@ -357,7 +378,7 @@ def _list_jobs(p):
             "jobId": j["jobId"], "jobArn": j["jobArn"], "jobName": j["jobName"],
             "status": j["status"], "createdAt": j["createdAt"],
         })
-    return _json(200, {"jobSummaryList": out})
+    return _paged("jobSummaryList", out, p, 1000)
 
 
 _DISPATCH = {

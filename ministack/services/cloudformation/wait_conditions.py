@@ -176,17 +176,22 @@ def deliver_signal(token: str, payload: dict) -> bool:
         }
         waiters = [(key, w) for key, w in _waiting.items() if w["token"] == token]
         _changed.notify_all()
+    from ministack.core.arn import parse_arn
+    from ministack.core.responses import request_scope
+
     from .stacks import _add_event
 
     for (stack_id, logical_id), waiter in waiters:
-        _add_event(
-            stack_id,
-            waiter["stack_name"],
-            logical_id,
-            waiter["resource_type"],
-            "CREATE_IN_PROGRESS",
-            f"Received {status} signal with UniqueId {unique_id}",
-        )
+        owner = parse_arn(stack_id)
+        with request_scope(owner.account_id, owner.region):
+            _add_event(
+                stack_id,
+                waiter["stack_name"],
+                logical_id,
+                waiter["resource_type"],
+                "CREATE_IN_PROGRESS",
+                f"Received {status} signal with UniqueId {unique_id}",
+            )
     return True
 
 

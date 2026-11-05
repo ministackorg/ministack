@@ -30,6 +30,7 @@ from ministack.core.responses import (
     AccountRegionScopedDict,
     get_account_id,
     get_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("bedrock-agent")
@@ -51,8 +52,24 @@ def _camelize(obj):
     return obj
 
 
+_DOCUMENT_MEMBERS = frozenset(('additionalModelRequestFields', 'connectorParameters', 'json', 'modelConfiguration'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _json(payload: dict, status: int = 200) -> tuple:
-    return status, {"Content-Type": "application/json"}, json.dumps(_camelize(payload)).encode()
+    return status, {"Content-Type": "application/json"}, json.dumps(_drop_none(_camelize(payload))).encode()
+
+
+def _shaped(shape: str, payload: dict, status: int = 200) -> tuple:
+    return _json(to_output_shape("bedrock-agent", shape, _camelize(payload)), status)
 
 
 def _empty(status: int = 200) -> tuple:
@@ -291,7 +308,10 @@ def _create_agent(body) -> tuple:
         "GuardrailConfiguration": body_obj.get("guardrailConfiguration"),
         "MemoryConfiguration": body_obj.get("memoryConfiguration"),
         "PromptOverrideConfiguration": body_obj.get("promptOverrideConfiguration"),
+        "OrchestrationType": body_obj.get("orchestrationType") or "DEFAULT",
     }
+    if body_obj.get("customOrchestration"):
+        rec["CustomOrchestration"] = body_obj["customOrchestration"]
     _agents[aid] = rec
     if body_obj.get("tags"):
         _tags[rec["AgentArn"]] = dict(body_obj["tags"])
@@ -329,7 +349,8 @@ def _update_agent(agent_id: str, body) -> tuple:
     for k in ("agentName", "agentResourceRoleArn", "description", "foundationModel",
               "instruction", "idleSessionTTLInSeconds", "agentCollaboration",
               "customerEncryptionKeyArn", "guardrailConfiguration",
-              "memoryConfiguration", "promptOverrideConfiguration"):
+              "memoryConfiguration", "promptOverrideConfiguration",
+              "orchestrationType", "customOrchestration"):
         if k in body_obj:
             rec[k[0].upper() + k[1:]] = body_obj[k]
     rec["UpdatedAt"] = _now_iso()
@@ -426,6 +447,7 @@ def _create_agent_alias(agent_id: str, body) -> tuple:
         "RoutingConfiguration": body_obj.get("routingConfiguration", []),
         "UpdatedAt": now,
         "ClientToken": body_obj.get("clientToken", ""),
+        "AliasInvocationState": "ACCEPT_INVOCATIONS",
     }
     _agent_aliases[f"{agent_id}/{alias_id}"] = rec
     return _json({"AgentAlias": rec}, status=202)
@@ -451,6 +473,7 @@ def _list_agent_aliases(agent_id: str, body) -> tuple:
             "Description": r["Description"],
             "RoutingConfiguration": r["RoutingConfiguration"],
             "UpdatedAt": r["UpdatedAt"],
+            "AliasInvocationState": r.get("AliasInvocationState", "ACCEPT_INVOCATIONS"),
         })
     return _json({"AgentAliasSummaries": summaries})
 
@@ -469,6 +492,8 @@ def _update_agent_alias(agent_id: str, alias_id: str, body) -> tuple:
         rec["Description"] = body_obj["description"]
     if "routingConfiguration" in body_obj:
         rec["RoutingConfiguration"] = body_obj["routingConfiguration"]
+    if "aliasInvocationState" in body_obj:
+        rec["AliasInvocationState"] = body_obj["aliasInvocationState"]
     rec["UpdatedAt"] = _now_iso()
     return _json({"AgentAlias": rec}, status=202)
 
@@ -511,6 +536,8 @@ def _create_agent_action_group(agent_id: str, version: str, body) -> tuple:
         "ParentActionSignature": body_obj.get("parentActionGroupSignature"),
         "UpdatedAt": now,
     }
+    if body_obj.get("parentActionGroupSignatureParams"):
+        rec["ParentActionGroupSignatureParams"] = body_obj["parentActionGroupSignatureParams"]
     _agent_action_groups[f"{agent_id}/{version}/{ag_id}"] = rec
     return _json({"AgentActionGroup": rec})
 
@@ -547,7 +574,7 @@ def _update_agent_action_group(agent_id: str, version: str, ag_id: str, body) ->
         return _not_found(f"Action group {ag_id} not found.")
     for k in ("actionGroupName", "actionGroupState", "actionGroupExecutor",
               "apiSchema", "description", "functionSchema",
-              "parentActionGroupSignature"):
+              "parentActionGroupSignature", "parentActionGroupSignatureParams"):
         if k in body_obj:
             internal_key = "ParentActionSignature" if k == "parentActionGroupSignature" else (k[0].upper() + k[1:])
             rec[internal_key] = body_obj[k]
@@ -1037,7 +1064,7 @@ def _list_ingestion_jobs(kb_id: str, ds_id: str, body) -> tuple:
         parts = key.split("/")
         if len(parts) >= 3 and parts[0] == kb_id and parts[1] == ds_id:
             summaries.append(r)
-    return _json({"IngestionJobSummaries": summaries})
+    return _shaped("ListIngestionJobsResponse", {"IngestionJobSummaries": summaries})
 
 
 def _stop_ingestion_job(kb_id: str, ds_id: str, job_id: str) -> tuple:
@@ -1215,14 +1242,14 @@ def _create_flow_version(flow_id: str, body) -> tuple:
     rec["Version"] = next_ver
     rec["CreatedAt"] = _now_iso()
     _flow_versions[f"{flow_id}/{next_ver}"] = rec
-    return _json(rec, status=201)
+    return _shaped("CreateFlowVersionResponse", rec, status=201)
 
 
 def _get_flow_version(flow_id: str, version: str) -> tuple:
     rec = _flow_versions.get(f"{flow_id}/{version}")
     if rec is None:
         return _not_found(f"Flow version {version} not found.")
-    return _json(rec)
+    return _shaped("GetFlowVersionResponse", rec)
 
 
 def _list_flow_versions(flow_id: str, query_params) -> tuple:
@@ -1268,6 +1295,8 @@ def _create_flow_alias(flow_id: str, body) -> tuple:
         "UpdatedAt": now,
         "Description": body_obj.get("description", ""),
     }
+    if body_obj.get("concurrencyConfiguration"):
+        rec["ConcurrencyConfiguration"] = body_obj["concurrencyConfiguration"]
     _flow_aliases[f"{flow_id}/{alias_id}"] = rec
     return _json(rec, status=201)
 
@@ -1295,7 +1324,7 @@ def _update_flow_alias(flow_id: str, alias_id: str, body) -> tuple:
     rec = _flow_aliases.get(key)
     if rec is None:
         return _not_found(f"Flow alias {alias_id} not found.")
-    for k in ("name", "description", "routingConfiguration"):
+    for k in ("name", "description", "routingConfiguration", "concurrencyConfiguration"):
         if k in body_obj:
             rec[k[0].upper() + k[1:]] = body_obj[k]
     rec["UpdatedAt"] = _now_iso()

@@ -61,12 +61,15 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
+    RuntimeExitError,
     acquire_worker,
     ensure_spawned,
     execution_credentials,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
+    runtime_exit_message,
+    runtime_exit_reason,
 )
 from ministack.core.persistence import STATE_DIR
 from ministack.core.responses import (
@@ -82,6 +85,7 @@ from ministack.core.responses import (
     get_request_client_ip,
     json_response,
     new_uuid,
+    to_output_shape,
 )
 from ministack.core.router import extract_access_key_id
 
@@ -374,6 +378,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "_HANDLER",
     "_LAMBDA_CODE_DIR",
     "_LAMBDA_HANDLER_MODULE",
+    "_LAMBDA_HANDLER_MODNAME",
     "_LAMBDA_HANDLER_FUNC",
     "_LAMBDA_FUNCTION_ARN",
     "_LAMBDA_LAYERS_DIRS",
@@ -853,12 +858,45 @@ class LambdaContext:
 # that one) and before the handler module builds any client.
 _ms_install_invoke_depth()
 
-_mod = __import__(_mod_path)
-for _part in _mod_path.split(".")[1:]:
-    _mod = getattr(_mod, _part)
-_result = getattr(_mod, _fn_name)(event, LambdaContext())
+import traceback
+_rid = os.environ["_LAMBDA_REQUEST_ID"]
+_modname = os.environ.get("_LAMBDA_HANDLER_MODNAME") or _mod_path
+
+def _fail(doc):
+    # A handler or init error is the runtime's error document, marked so a process exit stays distinct.
+    _REAL_STDOUT.write("\\x1eMINISTACK-ERROR\\x1e" + json.dumps(doc))
+    _REAL_STDOUT.flush()
+    sys.exit(0)
+
+def _doc(msg, etype, trace, rid=_rid):
+    return {"errorMessage": msg, "errorType": etype, "requestId": rid, "stackTrace": trace}
+
+try:
+    _mod = __import__(_mod_path)
+    for _part in _mod_path.split(".")[1:]:
+        _mod = getattr(_mod, _part)
+except ImportError as e:
+    _fail(_doc("Unable to import module '%s': %s" % (_modname, e), "Runtime.ImportModuleError", [], ""))
+except SyntaxError as e:
+    _fail(_doc("Syntax error in module '%s': %s" % (_modname, e), "Runtime.UserCodeSyntaxError",
+               ['  File "%s" Line %s\\n    %s' % (e.filename, e.lineno, e.text)], ""))
+except Exception as e:
+    _fail(_doc(str(e), type(e).__name__, traceback.format_list(traceback.extract_tb(e.__traceback__)[1:]), ""))
+try:
+    _fn = getattr(_mod, _fn_name)
+except AttributeError:
+    _fail(_doc("Handler '%s' missing on module '%s'" % (_fn_name, _modname), "Runtime.HandlerNotFound", [], ""))
+try:
+    _result = _fn(event, LambdaContext())
+except Exception as e:
+    traceback.print_exc()
+    _fail(_doc(str(e), type(e).__name__, traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])))
 if _result is not None:
-    _REAL_STDOUT.write(json.dumps(_result))
+    try:
+        _out = json.dumps(_result)
+    except Exception as e:
+        _fail(_doc("Unable to marshal response: %s" % e, "Runtime.MarshalError", []))
+    _REAL_STDOUT.write(_out)
     _REAL_STDOUT.flush()
 """
 
@@ -954,6 +992,32 @@ const context = {
   getRemainingTimeInMillis: () => parseFloat(process.env._LAMBDA_TIMEOUT || '3') * 1000,
 };
 
+function formatError(error) {
+  try {
+    if (error instanceof Error) {
+      return {
+        errorType: error.name?.replaceAll('\\x7F', '%7F'),
+        errorMessage: error.message?.replaceAll('\\x7F', '%7F'),
+        trace: error.stack?.replaceAll('\\x7F', '%7F').split('\\n') || [],
+      };
+    }
+    return { errorType: typeof error, errorMessage: String(error), trace: [] };
+  } catch {
+    return { errorType: 'handled', errorMessage: 'callback called with Error argument, but there was a problem while retrieving one or more of its message, name, and stack', trace: [] };
+  }
+}
+function runtimeError(name, message, stack) {
+  const e = new Error(message);
+  e.name = name;
+  e.stack = stack || String(e.stack).replace(/^Error/, name);
+  return e;
+}
+function fail(error) {
+  // A handler or init error is the runtime's error document, marked so a process exit stays distinct.
+  realStdoutWrite('\\x1eMINISTACK-ERROR\\x1e' + JSON.stringify(formatError(error)));
+  process.exit(0);
+}
+
 let input = '';
 process.stdin.on('data', d => input += d);
 process.stdin.on('end', async () => {
@@ -961,6 +1025,7 @@ process.stdin.on('end', async () => {
   const fullPath = path.resolve(codeDir, modPath);
   let mod;
   let resolvedPath;
+  try {
   try {
     resolvedPath = require.resolve(fullPath);
     mod = require(resolvedPath);
@@ -981,18 +1046,35 @@ process.stdin.on('end', async () => {
       throw reqErr;
     }
   }
+  } catch (e) {
+    if (e instanceof SyntaxError) fail(runtimeError('Runtime.UserCodeSyntaxError', String(e), e.stack));
+    if (e instanceof Error && e.code === 'MODULE_NOT_FOUND') fail(runtimeError('Runtime.ImportModuleError', String(e)));
+    fail(e);
+  }
   const handler = mod[fnName] || (mod.default && mod.default[fnName]) || mod.default;
   if (typeof handler !== 'function') {
-    process.stderr.write(
-      "Handler '" + fnName + "' in module '" + modPath + "' is undefined or not a function"
-    );
-    process.exit(1);
+    const full = modPath + '.' + fnName;
+    fail(runtimeError('Runtime.HandlerNotFound',
+      handler === undefined ? full + ' is undefined or not exported' : full + ' is not a function'));
   }
-  Promise.resolve(handler(event, context)).then(result => {
-    if (result !== undefined) realStdoutWrite(JSON.stringify(result));
+  let pending;
+  try {
+    pending = Promise.resolve(handler(event, context));
+  } catch (err) {
+    process.stderr.write(String((err && err.stack) || err));
+    fail(err);
+  }
+  pending.then(result => {
+    let out;
+    try {
+      out = JSON.stringify(result === undefined ? null : result);
+    } catch (_e) {
+      fail(runtimeError('Runtime.JSONStringifyError', 'Unable to stringify response body'));
+    }
+    if (result !== undefined) realStdoutWrite(out);
   }).catch(err => {
-    process.stderr.write(String(err.stack || err));
-    process.exit(1);
+    process.stderr.write(String((err && err.stack) || err));
+    fail(err);
   });
 });
 """
@@ -1725,13 +1807,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
         "SnapStart": _snapstart_response(data.get("SnapStart")),
-        "LoggingConfig": data.get(
-            "LoggingConfig",
-            {
-                "LogFormat": "Text",
-                "LogGroup": f"/aws/lambda/{name}",
-            },
-        ),
+        "LoggingConfig": _logging_config(name, data.get("LoggingConfig")),
         "RuntimeVersionConfig": {
             "RuntimeVersionArn": "",
         },
@@ -2487,7 +2563,7 @@ def _create_function(data: dict):
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     runtime_or_image = config.get("Runtime") or ("image=" + image_uri if image_uri else "?")
     logger.info("Lambda function created: %s (%s)", name, runtime_or_image)
-    return json_response(response, 201)
+    return json_response(_fn_config_out(response), 201)
 
 
 def _get_function(name: str, qualifier: str | None = None):
@@ -2529,7 +2605,7 @@ def _get_function(name: str, qualifier: str | None = None):
         if func.get("s3_object_storage_mode") == "REFERENCE" and func.get("s3_object_ref"):
             code_info["ResolvedS3Object"] = func["s3_object_ref"]
     result: dict = {
-        "Configuration": effective_config,
+        "Configuration": _fn_config_out(effective_config),
         "Code": code_info,
         "Tags": func.get("tags", {}),
     }
@@ -2554,7 +2630,7 @@ def _get_function_config(name: str, qualifier: str | None = None):
             f"Function not found: {_func_arn(name)}",
             404,
         )
-    return json_response(effective_config)
+    return json_response(_fn_config_out(effective_config))
 
 
 def _list_function_event_invoke_configs(func_name: str, query_params: dict):
@@ -2571,8 +2647,28 @@ def _list_function_event_invoke_configs(func_name: str, query_params: dict):
     legacy = func.get("event_invoke_config")
     if legacy and "" not in configs:
         configs[""] = legacy
-    items = list(configs.values())
-    return json_response({"FunctionEventInvokeConfigs": items})
+    items, next_marker = _offset_marker_page(list(configs.values()), query_params)
+    result = {"FunctionEventInvokeConfigs": items}
+    if next_marker:
+        result["NextMarker"] = next_marker
+    return json_response(result)
+
+
+def _offset_marker_page(items: list, query_params: dict, cap: int | None = None):
+    """MaxItems / Marker over a list. Returns ``(page, next_marker)``."""
+    try:
+        start = max(int(base64.urlsafe_b64decode(_qp_first(query_params, "Marker").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        start = 0
+    try:
+        limit = max(int(_qp_first(query_params, "MaxItems")), 1)
+    except (TypeError, ValueError):
+        limit = cap or len(items)
+    if cap:
+        limit = min(limit, cap)
+    end = start + limit
+    next_marker = base64.urlsafe_b64encode(str(end).encode()).decode() if end < len(items) else None
+    return items[start:end], next_marker
 
 
 def _presigned_code_url(func_name: str) -> str:
@@ -2770,7 +2866,7 @@ def _list_functions(query_params: dict):
                 break
 
     page = all_names[start : start + max_items]
-    configs = [_functions[n]["config"] for n in page]
+    configs = [_fn_config_out(_functions[n]["config"]) for n in page]
     result: dict = {"Functions": configs}
     if start + max_items < len(all_names):
         result["NextMarker"] = page[-1] if page else ""
@@ -2946,9 +3042,9 @@ def _update_code(name: str, data: dict):
         func["versions"][str(ver_num)] = ver_record
         if _stamp_snapstart_published_version(ver_config):
             _snapstart_provision_version_async(name, ver_record)
-        return json_response({**func["config"], "Version": str(ver_num)})
+        return json_response(_fn_config_out({**func["config"], "Version": str(ver_num)}))
 
-    return json_response(func["config"])
+    return json_response(_fn_config_out(func["config"]))
 
 
 @_serialized_revision_update()
@@ -3030,6 +3126,8 @@ def _update_config(name: str, data: dict):
                 config["SnapStart"] = _snapstart_response(data["SnapStart"])
             elif key == "VpcConfig":
                 config[key] = _vpc_config_with_id(data[key])
+            elif key == "LoggingConfig":
+                config[key] = _logging_config(name, data[key])
             else:
                 config[key] = data[key]
     if "Architectures" in data:
@@ -3068,7 +3166,7 @@ def _update_config(name: str, data: dict):
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     if "Layers" in data:
         _sweep_extract_cache()
-    return json_response(config)
+    return json_response(_fn_config_out(config))
 
 
 # ---------------------------------------------------------------------------
@@ -4070,6 +4168,11 @@ def _classify_function_error(parsed, err_header: str) -> str | None:
 # by urlopen(timeout=timeout).
 _RIE_CONNECT_RETRY_SECONDS = 30.0
 
+# RIE logs the error it answers a failed invoke with ("Invoke failed error=<err> InvokeID=<id>", or
+# "Init failed ... error=<err>") and its type ("First fatal error stored in appctx: <type>").
+_RIE_FAILED_RE = re.compile(r"\b(Invoke|Init) failed\b.*?\berror=(.+?)(?= InvokeID=|[\"\n]|$)", re.M)
+_RIE_FATAL_TYPE_RE = re.compile(r"First fatal error stored in appctx: ([\w.]+)")
+
 
 def _rie_failure_is_retryable(exc: BaseException) -> bool:
     """Is a failed RIE request worth retrying while the container comes up?
@@ -4091,7 +4194,7 @@ def _rie_failure_is_retryable(exc: BaseException) -> bool:
     return not isinstance(exc, TimeoutError)
 
 
-def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
+def _rie_terminal_result(exc: BaseException, timeout: int, logs: str, request_id: str = "") -> dict:
     """Shape a terminal RIE failure as AWS shapes it: a function error.
 
     AWS answers `Invoke` with HTTP 200, `X-Amz-Function-Error: Unhandled` and
@@ -4112,8 +4215,15 @@ def _rie_terminal_result(exc: BaseException, timeout: int, logs: str) -> dict:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
             parsed = None
+        failures = {m.group(1): m.group(2) for m in _RIE_FAILED_RE.finditer(logs or "")}
+        failed = failures.get("Invoke") or failures.get("Init")
+        fatal = _RIE_FATAL_TYPE_RE.search(logs or "")
         if isinstance(parsed, dict) and parsed.get("errorMessage"):
             body = parsed
+        elif failed:
+            # RIE answers a failed init or invoke with 502 and no body: AWS reports the error RIE logged.
+            body = {"errorMessage": runtime_exit_message(request_id, failed),
+                    "errorType": fatal.group(1) if fatal else "Runtime.Unknown"}
         else:
             err_type = exc.headers.get("Lambda-Runtime-Function-Error-Type") if exc.headers else None
             body = {
@@ -4209,7 +4319,7 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
                 logs = container.logs(
                     stdout=True, stderr=True, since=attempt_start
                 ).decode("utf-8", errors="replace").strip()
-                result = _rie_terminal_result(exc, timeout, logs)
+                result = _rie_terminal_result(exc, timeout, logs, request_id)
                 result["log_source"] = "rie"
                 return result
             time.sleep(0.1)
@@ -4849,6 +4959,18 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         run_kwargs.setdefault("extra_hosts", {}).setdefault(
             "host.docker.internal", "host-gateway"
         )
+
+    from ministack.services import ecr
+    if package_type == "Image" and ecr._held_image(image) is not None:
+        # An image in this MiniStack's ECR is loaded from it, never pulled from the real registry.
+        architecture = docker_arch or _host_docker_arch(client)
+        held = ecr.load_held_image(client, image, architecture)
+        if held is None:
+            reason = f"{image}: not found in this MiniStack's ECR for linux/{architecture}"
+            if docker_platform:
+                return _platform_fallback(reason)
+            raise RuntimeError(f"Failed to pull image {reason}")
+        image = run_kwargs["image"] = held
 
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
@@ -5544,9 +5666,13 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
+        if isinstance(result.get("payload"), dict):
+            # The runtime's own error document, as AWS's runtime client posts it.
+            return {"body": result["payload"], "error": True,
+                    "log": "\n".join(filter(None, [result.get("log", ""), result.get("trace", "")]))}
         else:
             error_msg = result.get("error", "Unknown error")
-            error_type = "Runtime.HandlerError"
+            error_type = result.get("error_type") or "Runtime.HandlerError"
             if _RIE_TIMEOUT_TEXT_RE.fullmatch(error_msg):
                 error_type = "Sandbox.Timedout"
             return {
@@ -5561,6 +5687,11 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         logger.error("Warm worker execution error for %s: %s", func_name, e)
         invalidate_worker(func_name, qualifier=qualifier, account=get_account_id(), region=get_region())
         worker = None  # invalidate_worker already dropped it from the pool
+        if isinstance(e, RuntimeExitError):
+            return {"body": {"errorMessage": runtime_exit_message(request_id, e.reason), "errorType": e.error_type},
+                    "error": True, "log": e.log}
+        if isinstance(getattr(e, "payload", None), dict):
+            return {"body": e.payload, "error": True, "log": ""}
         return {
             "body": {"errorMessage": str(e), "errorType": getattr(e, "error_type", "") or type(e).__name__},
             "error": True,
@@ -5659,6 +5790,9 @@ def _execute_function_provided_warm(func: dict, event: dict,
         error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
         # Do not transparently invoke again: the handler may already have
         # performed side effects before its environment failed.
+        if isinstance(e, RuntimeExitError):
+            return {"body": {"errorMessage": runtime_exit_message(request_id, e.reason), "errorType": error_type},
+                    "error": True, "log": e.log}
         return {
             "body": {"errorMessage": str(e), "errorType": error_type},
             "error": True,
@@ -5801,7 +5935,17 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
                     stderr=subprocess.PIPE,
                 )
 
-            if response_received.wait(timeout=timeout):
+            deadline = time.monotonic() + timeout
+            while not response_received.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
+                if time.monotonic() >= deadline:
+                    break
+                if proc.poll() is not None and not response_received.wait(0.05):
+                    # The bootstrap died before answering: AWS reports how it exited, not a timeout.
+                    stdout, stderr = proc.communicate(timeout=5)
+                    logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
+                    return {"body": {"errorMessage": runtime_exit_message(request_id, runtime_exit_reason(proc.returncode)),
+                                     "errorType": "Runtime.ExitError"}, "error": True, "log": logs}
+            if response_received.is_set():
                 proc.terminate()
                 try:
                     _, stderr_out = proc.communicate(timeout=5)
@@ -5917,6 +6061,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
                     "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
                     "_LAMBDA_CODE_DIR": code_dir,
                     "_LAMBDA_HANDLER_MODULE": module_name,
+                    "_LAMBDA_HANDLER_MODNAME": handler.rsplit(".", 1)[0],
                     "_LAMBDA_HANDLER_FUNC": func_name,
                     "_LAMBDA_FUNCTION_ARN": config["FunctionArn"],
                     "_LAMBDA_TIMEOUT": str(timeout),
@@ -5965,23 +6110,24 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
 
             log_tail = proc.stderr.strip()
 
-            if proc.returncode == 0:
-                stdout = proc.stdout.strip()
-                if not stdout:
-                    return {"body": None, "log": log_tail}
-                try:
-                    return {"body": json.loads(stdout), "log": log_tail}
-                except json.JSONDecodeError:
-                    return {"body": stdout, "log": log_tail, "raw_payload": True}
-            else:
+            marker = "\x1eMINISTACK-ERROR\x1e"
+            if proc.returncode == 0 and proc.stdout.startswith(marker):
+                return {"body": json.loads(proc.stdout[len(marker):]), "error": True, "log": log_tail}
+            if proc.returncode != 0:
+                # The wrapper reports handler errors itself, so any other exit is the runtime dying.
                 return {
-                    "body": {
-                        "errorMessage": log_tail or "Unknown error",
-                        "errorType": "Runtime.HandlerError",
-                    },
+                    "body": {"errorMessage": runtime_exit_message(request_id, runtime_exit_reason(proc.returncode)),
+                             "errorType": "Runtime.ExitError"},
                     "error": True,
                     "log": log_tail,
                 }
+            stdout = proc.stdout.strip()
+            if not stdout:
+                return {"body": None, "log": log_tail}
+            try:
+                return {"body": json.loads(stdout), "log": log_tail}
+            except json.JSONDecodeError:
+                return {"body": stdout, "log": log_tail, "raw_payload": True}
 
     except subprocess.TimeoutExpired as exc:
         try:
@@ -6067,7 +6213,7 @@ def _publish_version(name: str, data: dict):
     # haven't changed since the last version": the latest version comes back.
     latest = max(func["versions"], key=int, default=None)
     if latest and func["versions"][latest].get("function_revision") == func["config"].get("RevisionId"):
-        return json_response(func["versions"][latest]["config"], 201)
+        return json_response(_fn_config_out(func["versions"][latest]["config"]), 201)
     ver_num = func["next_version"]
     func["next_version"] = ver_num + 1
 
@@ -6086,7 +6232,7 @@ def _publish_version(name: str, data: dict):
     func["versions"][str(ver_num)] = ver_record
     if _stamp_snapstart_published_version(ver_config):
         _snapstart_provision_version_async(name, ver_record)
-    return json_response(ver_config, 201)
+    return json_response(_fn_config_out(ver_config), 201)
 
 
 def _list_versions(name: str, query_params: dict):
@@ -6111,7 +6257,7 @@ def _list_versions(name: str, query_params: dict):
                 break
 
     page = versions[start : start + max_items]
-    result: dict = {"Versions": page}
+    result: dict = {"Versions": [_fn_config_out(v) for v in page]}
     if start + max_items < len(versions):
         result["NextMarker"] = page[-1]["Version"] if page else ""
     return json_response(result)
@@ -6625,7 +6771,7 @@ def _list_layer_versions(layer_name: str, query_params: dict):
                 break
 
     page = all_versions[start : start + max_items]
-    result: dict = {"LayerVersions": page}
+    result: dict = {"LayerVersions": [to_output_shape("lambda", "LayerVersionsListItem", v) for v in page]}
     if start + max_items < len(all_versions):
         result["NextMarker"] = str(page[-1]["Version"]) if page else ""
     return json_response(result)
@@ -6736,7 +6882,7 @@ def _list_layers(query_params: dict):
                 {
                     "LayerName": name,
                     "LayerArn": _layer_arn(name),
-                    "LatestMatchingVersion": {k: v for k, v in latest.items() if not k.startswith("_")},
+                    "LatestMatchingVersion": to_output_shape("lambda", "LayerVersionsListItem", latest),
                 }
             )
 
@@ -7268,6 +7414,18 @@ def esm_source_defaults(is_sqs: bool) -> dict:
     }
 
 
+def _logging_config(name: str, sent) -> dict:
+    """LoggingConfig as sent, over the default Text format and /aws/lambda/<name> group."""
+    out = {"LogFormat": "Text", "LogGroup": f"/aws/lambda/{name}"}
+    if isinstance(sent, dict):
+        out.update({k: v for k, v in sent.items() if v})
+    return out
+
+
+def _fn_config_out(config: dict) -> dict:
+    return to_output_shape("lambda", "FunctionConfiguration", config)
+
+
 def _esm_response(esm: dict, state: str | None = None, modified_now: bool = False) -> dict:
     """Return ESM dict without internal-only fields.
 
@@ -7281,7 +7439,7 @@ def _esm_response(esm: dict, state: str | None = None, modified_now: bool = Fals
     it too. Callers cannot construct this ARN themselves, and ListTags is keyed
     on it, so omitting it leaves tags unreadable.
     """
-    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled", "Qualifier", "Tags")}
     if state:
         out["State"] = state
     if (not modified_now and isinstance(out.get("LastModified"), float)
@@ -7426,7 +7584,12 @@ def _create_esm(data: dict):
     # the poller can honor MaximumRecordAgeInSeconds + the OnFailure destination.
     for _opt in ("MaximumRetryAttempts", "MaximumRecordAgeInSeconds",
                  "BisectBatchOnFunctionError", "ParallelizationFactor",
-                 "DestinationConfig", "TumblingWindowInSeconds"):
+                 "DestinationConfig", "TumblingWindowInSeconds", "KMSKeyArn",
+                 "MetricsConfig", "LoggingConfig", "ProvisionedPollerConfig",
+                 "StartingPositionTimestamp", "Topics", "Queues",
+                 "SourceAccessConfigurations", "SelfManagedEventSource",
+                 "AmazonManagedKafkaEventSourceConfig", "SelfManagedKafkaEventSourceConfig",
+                 "DocumentDBEventSourceConfig"):
         if _opt in data:
             esm[_opt] = data[_opt]
     if event_source_spec.service != "sqs":
@@ -7506,6 +7669,15 @@ def _update_esm(esm_id: str, data: dict):
         "DestinationConfig",
         "FilterCriteria",
         "ScalingConfig",
+        "TumblingWindowInSeconds",
+        "KMSKeyArn",
+        "MetricsConfig",
+        "LoggingConfig",
+        "ProvisionedPollerConfig",
+        "SourceAccessConfigurations",
+        "AmazonManagedKafkaEventSourceConfig",
+        "SelfManagedKafkaEventSourceConfig",
+        "DocumentDBEventSourceConfig",
     ):
         if key in data:
             esm[key] = data[key]
@@ -8263,7 +8435,7 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
     if data.get("Cors"):
         cfg["Cors"] = data["Cors"]
     _function_urls[key] = cfg
-    return json_response(cfg, status=201)
+    return json_response({k: v for k, v in cfg.items() if k != "LastModifiedTime"}, status=201)
 
 
 def _get_function_url_config(func_name: str, qualifier: str | None):
@@ -8308,7 +8480,11 @@ def _delete_function_url_config(func_name: str, qualifier: str | None):
 
 def _list_function_url_configs(func_name: str, query_params: dict):
     configs = [v for k, v in _function_urls.items() if k == func_name or k.startswith(f"{func_name}:")]
-    return json_response({"FunctionUrlConfigs": configs})
+    configs, next_marker = _offset_marker_page(configs, query_params, cap=50)
+    result = {"FunctionUrlConfigs": configs}
+    if next_marker:
+        result["NextMarker"] = next_marker
+    return json_response(result)
 
 
 # ---------------------------------------------------------------------------

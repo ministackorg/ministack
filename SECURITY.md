@@ -6,8 +6,7 @@ MiniStack is designed **exclusively for local development and CI/CD testing**.
 
 **Do not expose MiniStack to the internet or any untrusted network.**
 
-- It has no authentication — any request is accepted
-- Credentials (`aws_access_key_id`, `aws_secret_access_key`) are ignored
+- By default it has no authentication: any request is accepted and credentials (`aws_access_key_id`, `aws_secret_access_key`) are ignored. `AUTH=true` checks SigV4 signatures for IAM user and STS session keys and evaluates IAM policies
 - All data is stored in-memory and is not encrypted
 - The Docker socket mount (for ECS/RDS/ElastiCache) gives container-level access to your host
 
@@ -24,5 +23,7 @@ Since this is a local dev tool with no auth by design, most "vulnerabilities" ar
 ports:
   - "127.0.0.1:4566:4566"
 ```
+
+The containers MiniStack starts through the Docker socket (RDS, ElastiCache, OpenSearch, MWAA, EKS, DocumentDB, ECS task ports) publish their ports the same way MiniStack's own port is published: on `127.0.0.1` only when MiniStack's `4566` is bound to loopback (as above, or `BIND_HOST=127.0.0.1` when MiniStack runs on the host), otherwise on every interface. Several of them accept connections without credentials by default (an ElastiCache cache without a user group or `AuthToken`, an OpenSearch domain), so keep MiniStack on loopback on any shared or untrusted network.
 
 Never run with `S3_PERSIST=1` pointing to sensitive directories.

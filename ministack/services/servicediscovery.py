@@ -20,8 +20,11 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 from ministack.services import route53
 
@@ -39,6 +42,19 @@ _resource_tags = AccountScopedDict()        # resource_arn -> [{"Key": ..., "Val
 _service_attributes = AccountRegionScopedDict()      # svc_id -> {key: value}
 _instance_health_status = AccountRegionScopedDict()  # svc_id -> {instance_id: status}
 _instances_revision = AccountRegionScopedDict()      # svc_id -> int
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def get_state():
@@ -406,6 +422,7 @@ def _create_service(data):
         "Arn": _service_arn(svc_id),
         "Name": name,
         "NamespaceId": ns_id,
+        "Type": data.get("Type") or ("DNS_HTTP" if data.get("DnsConfig") else "HTTP"),
         "Description": data.get("Description"),
         "DnsConfig": data.get("DnsConfig"),
         "HealthCheckConfig": data.get("HealthCheckConfig"),
@@ -463,7 +480,8 @@ def _get_service(data):
 
 
 def _list_services(data):
-    return json_response({"Services": list(_services.values())})
+    return json_response({"Services": [to_output_shape("servicediscovery", "ServiceSummary", v)
+                                       for v in _services.values()]})
 
 
 def _register_instance(data):
@@ -642,7 +660,7 @@ def _list_operations(data):
     start = int(next_token) if str(next_token).isdigit() else 0
     page = ops[start:start + max_results]
 
-    result = {"Operations": page}
+    result = {"Operations": [to_output_shape("servicediscovery", "OperationSummary", o) for o in page]}
     if start + max_results < len(ops):
         result["NextToken"] = str(start + max_results)
     return json_response(result)

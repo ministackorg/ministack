@@ -28,8 +28,10 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("secretsmanager")
@@ -47,6 +49,19 @@ _resource_policies = AccountRegionScopedDict()
 #   ReplicationStatus: [{Region, Status, StatusMessage}],
 #   Versions: { version_id: {SecretString, SecretBinary, CreatedDate, Stages: [str]} }
 # }
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -611,7 +626,18 @@ def _create_secret(data):
         rotation_lambda_arn=data.get("RotationLambdaARN"),
         rotation_rules=data.get("RotationRules"),
     )
-    return json_response({"ARN": arn, "Name": name, "VersionId": vid})
+    result = {"ARN": arn, "Name": name, "VersionId": vid}
+    if data.get("AddReplicaRegions"):
+        replicated = _replicate_secret_to_regions({
+            "SecretId": arn,
+            "AddReplicaRegions": data["AddReplicaRegions"],
+            "ForceOverwriteReplicaSecret": data.get("ForceOverwriteReplicaSecret", False),
+        })
+        if replicated[0] != 200:
+            _secrets.pop(name, None)
+            return replicated
+        result["ReplicationStatus"] = _secrets[name]["ReplicationStatus"]
+    return json_response(result)
 
 
 def _get_secret_value(data):

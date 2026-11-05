@@ -93,10 +93,12 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     get_request_client_ip,
-    json_response,
     new_uuid,
     set_request_account_id,
     set_request_region,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("cognito")
@@ -245,6 +247,22 @@ _POOL_KEYS_DIR = os.path.join(_STATE_DIR, "cognito-pool-keys")
 _POOL_KEY_USES = ("access", "id")
 _pool_keys: dict = {}  # (pool id, use) -> (private key, JWK), a cache of the key files
 _pool_keys_lock = threading.Lock()
+
+
+_DOCUMENT_MEMBERS = frozenset(('Settings', 'CredentialCreationOptions'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def _pool_signing_key(pool_id: str, use: str):
@@ -3234,6 +3252,8 @@ def _update_user_pool(data):
     for k in updatable:
         if k in data:
             pool[k] = data[k]
+    if data.get("PoolName"):
+        pool["Name"] = data["PoolName"]
     if "EmailConfiguration" in data:
         pool["EmailConfiguration"] = _email_configuration_out(data["EmailConfiguration"])
     pool["LastModifiedDate"] = _now_epoch()
@@ -3713,6 +3733,45 @@ def _branding_invalid(message):
     return error_response_json("InvalidParameterException", message, 400)
 
 
+def _branding_serialization_error(value, structure=False):
+    """The deserialization error AWS's JSON protocol answers for a member of the wrong JSON type."""
+    if isinstance(value, list):
+        message = "Start of list found where not expected"
+    elif structure:
+        message = "Expected null"
+    elif isinstance(value, bool):
+        message = f"{'TRUE' if value else 'FALSE'}_VALUE can not be converted to a String"
+    elif isinstance(value, (int, float)):
+        message = "NUMBER_VALUE can not be converted to a String"
+    else:
+        message = "Start of structure or map found where not expected."
+    return error_response_json("SerializationException", message, 400, message_key="Message")
+
+
+def _branding_shape_error(data, assets):
+    for key in ("UserPoolId", "ClientId", "ManagedLoginBrandingId"):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            return _branding_serialization_error(data[key])
+    if not isinstance(assets, list):
+        return _branding_serialization_error(assets, structure=not isinstance(assets, dict))
+    for asset in assets:
+        if not isinstance(asset, dict):
+            return _branding_serialization_error(asset, structure=True)
+    return None
+
+
+def _branding_asset_repr(asset):
+    """An asset as AWS's validator prints it in a list-length error (a Java object dump)."""
+    try:
+        size = len(base64.b64decode(asset.get("Bytes") or "", validate=False))
+    except (ValueError, TypeError):
+        size = 0
+    rid = asset.get("ResourceId")
+    return (f"AssetType(category={asset.get('Category')}, colorMode={asset.get('ColorMode')}, "
+            f"extension={asset.get('Extension')}, bytes=java.nio.HeapByteBuffer[pos=0 lim={size} cap={size}], "
+            f"resourceId={'null' if rid is None else rid})")
+
+
 def _branding_request_error(data, requires_id=False):
     """AWS's request validation, which answers ahead of every other check: the
     id's pattern, then each asset's extension, color mode and category."""
@@ -3724,8 +3783,20 @@ def _branding_request_error(data, requires_id=False):
         return _branding_invalid(
             f"1 validation error detected: Value '{bid}' at 'managedLoginBrandingId' failed to satisfy constraint: "
             f"Member must satisfy regular expression pattern: {_BRANDING_ID_RE.pattern}")
+    assets = data.get("Assets") or []
+    invalid = _branding_shape_error(data, assets)
+    if invalid:
+        return invalid
     problems = []
-    for i, asset in enumerate(data.get("Assets") or [], start=1):
+    if len(assets) > 40:
+        listed = ", ".join(_branding_asset_repr(a) for a in assets)
+        problems.append(f"Value '[{listed}]' at 'assets' failed to satisfy constraint: "
+                        "Member must have length less than or equal to 40")
+    for i, asset in enumerate(assets, start=1):
+        rid = asset.get("ResourceId")
+        if rid is not None and not re.fullmatch(r"[\w\- ]+", str(rid)):
+            problems.append(f"Value '{rid}' at 'assets.{i}.member.resourceId' failed to satisfy constraint: "
+                            "Member must satisfy regular expression pattern: ^[\\w\\- ]+$")
         for member, key, allowed in (("extension", "Extension", _BRANDING_EXTENSIONS),
                                      ("colorMode", "ColorMode", _BRANDING_COLOR_MODES),
                                      ("category", "Category", _BRANDING_CATEGORIES)):
@@ -3860,6 +3931,9 @@ def _branding_out(branding, merged=False):
 def _branding_client_pool(data):
     """The pool of a call naming a client, or the error AWS answers: it names the pool when that is missing."""
     pid, cid = data.get("UserPoolId"), data.get("ClientId")
+    for value in (pid, cid):
+        if value is not None and not isinstance(value, str):
+            return None, _branding_serialization_error(value)
     pool = _user_pools.get(pid)
     if not pool:
         return None, error_response_json(
@@ -4530,11 +4604,11 @@ def _esdk_encrypt(plaintext: bytes, data_key: bytes, encrypted_data_key: bytes, 
             + struct.pack(">I", len(content)) + content + tag)
 
     signed = header + header_auth + body
-    while True:
+    for _ in range(64):
         signature = private_key.sign(signed, ec.ECDSA(hashes.SHA384()))
         if len(signature) == _ESDK_SIGNATURE_LENGTH:
-            break
-    return signed + _esdk_field(signature)
+            return signed + _esdk_field(signature)
+    raise RuntimeError("could not produce a fixed-length ECDSA signature")
 
 
 def _send_to_custom_email_sender(pool, attr_dict, trigger, user_name, user_status, code,

@@ -560,7 +560,7 @@ def test_acm_certificate_arn_operations_reject_out_of_scope_arns(acm_service_mod
     cert = _json_body(mod._describe_certificate({"CertificateArn": good_arn}))["Certificate"]
     assert cert["CertificateArn"] == good_arn
     assert cert["Options"] == {"CertificateTransparencyLoggingPreference": "ENABLED", "Export": "DISABLED"}
-    assert cert["Tags"] == []
+    assert _json_body(mod._list_tags({"CertificateArn": good_arn}))["Tags"] == []
 
 
 @pytest.mark.parametrize(
