@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **KMS — the `aws/s3` AWS managed key** — an S3 write with `aws:kms` and no key ID (or `alias/aws/s3`) was refused. S3 now creates the account's `aws/s3` key on first use (KeyManager `AWS`, AWS's description and key policy, alias `alias/aws/s3`) and encrypts with it, as does a bucket default of `aws:kms` without `KMSMasterKeyID`. (#2605)
+- **S3 — PutObject through another account's access point** — it was refused. It now succeeds when the caller's identity policy, the access point policy and the owner's bucket policy all allow it, and lands in the owner's bucket under its default encryption; a missing grant answers AWS's AccessDenied for that step. (#2605)
+
+### Fixed
+- **S3 — SSE-KMS keys are resolved through KMS** — a write stored and echoed the key reference as given and accepted keys that do not exist. It now stores and echoes the key ARN, and refuses an unknown key with KMS's `KMS.NotFoundException` (or AccessDenied for another account's), a key ID without `aws:kms` with `InvalidArgument`, and an unknown upload with AWS's `NoSuchUpload`; these answers now come before any authorization, as on AWS. A write that names, or whose bucket default names, a key that does not exist in KMS now fails, as on AWS; create the key first. (#2605)
+- **S3 — bucket policies on `s3:x-amz-server-side-encryption-aws-kms-key-id`** — with `AUTH=true` the condition key was never set, so a policy denying uploads with any other KMS key also denied the upload that named the right one. A `PutObject`, `CopyObject` or `CreateMultipartUpload` now carries the key ARN, whether it names the key by ID, alias, alias ARN or ARN (another account's too), or carries the bucket's default key when it sends no SSE header, also through an access point; a part, a part copy and the completion carry the key their upload started with. (#2605)
+
 ## [1.5.38] — 2026-11-05
 
 ### Added
