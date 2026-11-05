@@ -9,6 +9,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 def _uid(prefix="test"):
@@ -1944,8 +1945,12 @@ def test_xml_special_characters_are_escaped(autoscaling):
         tags = autoscaling.describe_tags(Filters=[{"Name": "auto-scaling-group", "Values": [name]}])["Tags"]
         assert [t["Value"] for t in tags] == ["R&D <ops>"]
         with pytest.raises(ClientError) as exc:
-            autoscaling.update_auto_scaling_group(AutoScalingGroupName="no&such<group>", MinSize=0)
+            autoscaling.set_desired_capacity(AutoScalingGroupName="no&such<group>", DesiredCapacity=0)
         assert "no&such<group>" in exc.value.response["Error"]["Message"]
+        # UpdateAutoScalingGroup doesn't echo the name (captured, us-east-2, 2026-11-05).
+        with pytest.raises(ClientError) as exc:
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName="no&such<group>", MinSize=0)
+        assert exc.value.response["Error"]["Message"] == "AutoScalingGroup name not found - null"
     finally:
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
 
@@ -2002,3 +2007,464 @@ def test_delete_asg_with_instances_requires_force_delete(autoscaling):
     assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"]) == (400, "ResourceInUse")
     autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
     assert autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"] == []
+
+_IR = {"VCpuCount": {"Min": 1, "Max": 2}, "MemoryMiB": {"Min": 512}}
+
+
+def _capacity_type(autoscaling, name):
+    return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0].get(
+        "DesiredCapacityType")
+
+
+def _validation_message(exc):
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    return exc.value.response["Error"]["Message"]
+
+
+def _unvalidated_autoscaling():
+    return make_client("autoscaling", {"parameter_validation": False})
+
+
+_TYPE_EMPTY = ("Value '' at 'desiredCapacityType' failed to satisfy constraint: Member must have length greater "
+               "than or equal to 1")
+_NAME_NULL = "Value null at 'autoScalingGroupName' failed to satisfy constraint: Member must not be null"
+_LENGTH_MESSAGE = f"1 validation error detected: {_TYPE_EMPTY}"
+
+
+def _enum_message(value):
+    return f"Invalid DesiredCapacityType value '{value}', it should be one of vcpu, memory-mib, units"
+
+
+def _create_requirements_message(value):
+    return (f"The DesiredCapacityType {value} is only allowed in mixed instances groups containing "
+            "InstanceRequirements. Please include a MixedInstancesPolicy with InstanceRequirements for your group "
+            "and try again.")
+
+
+def _update_requirements_message(value):
+    return (f"The DesiredCapacityType {value} is only allowed in mixed instances groups using instance "
+            "requirements. Please include instance requirements in the launch template or launch template "
+            "overrides and try again.")
+
+
+@pytest.fixture
+def capacity_type_templates(ec2):
+    plain = ec2.create_launch_template(LaunchTemplateName=_uid("lt-dct"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    with_ir = ec2.create_launch_template(LaunchTemplateName=_uid("lt-dct-ir"), LaunchTemplateData={
+        "InstanceRequirements": _IR, "ImageId": "ami-12345678"})["LaunchTemplate"]
+    spec = {"LaunchTemplateId": plain["LaunchTemplateId"], "Version": "$Latest"}
+    ir_spec = {"LaunchTemplateId": with_ir["LaunchTemplateId"], "Version": "$Latest"}
+    yield {
+        "spec": spec,
+        "ir": {"LaunchTemplate": {"LaunchTemplateSpecification": spec, "Overrides": [{"InstanceRequirements": _IR}]}},
+        "types": {"LaunchTemplate": {"LaunchTemplateSpecification": spec,
+                                     "Overrides": [{"InstanceType": "t3.micro"}]}},
+        "template_ir": {"LaunchTemplate": {"LaunchTemplateSpecification": ir_spec}},
+        "template_ir_types": {"LaunchTemplate": {"LaunchTemplateSpecification": ir_spec,
+                                                 "Overrides": [{"InstanceType": "t3.micro"}]}},
+    }
+    ec2.delete_launch_template(LaunchTemplateId=plain["LaunchTemplateId"])
+    ec2.delete_launch_template(LaunchTemplateId=with_ir["LaunchTemplateId"])
+
+
+_DCT_BASE = dict(MinSize=0, MaxSize=1, DesiredCapacity=0, AvailabilityZones=["us-east-1a"])
+
+
+def test_asg_desired_capacity_type_follows_aws(autoscaling, capacity_type_templates):
+    """#2604, captured on AWS (us-east-2, 2026-11-05): only a group with a MixedInstancesPolicy reports a
+    DesiredCapacityType, "units" included; vcpu and memory-mib need InstanceRequirements in the policy's
+    overrides or, without overrides, in its launch template."""
+    t = capacity_type_templates
+    groups = []
+    try:
+        for suffix, kwargs, expected in (
+                ("unset", {"LaunchTemplate": t["spec"]}, None),
+                ("units", {"LaunchTemplate": t["spec"], "DesiredCapacityType": "units"}, None),
+                ("unset-mip", {"MixedInstancesPolicy": t["ir"]}, None),
+                ("units-mip", {"MixedInstancesPolicy": t["types"], "DesiredCapacityType": "units"}, "units"),
+                ("vcpu", {"MixedInstancesPolicy": t["ir"], "DesiredCapacityType": "vcpu"}, "vcpu"),
+                ("memory", {"MixedInstancesPolicy": t["ir"], "DesiredCapacityType": "memory-mib"}, "memory-mib"),
+                ("lt-ir", {"MixedInstancesPolicy": t["template_ir"], "DesiredCapacityType": "vcpu"}, "vcpu")):
+            name = _uid(f"asg-dct-{suffix}")
+            autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, **_DCT_BASE, **kwargs)
+            groups.append(name)
+            assert _capacity_type(autoscaling, name) == expected
+
+        for kwargs, value in (({"LaunchTemplate": t["spec"]}, "vcpu"), ({"LaunchTemplate": t["spec"]}, "memory-mib"),
+                              ({"MixedInstancesPolicy": t["types"]}, "vcpu"),
+                              ({"MixedInstancesPolicy": t["types"]}, "memory-mib"),
+                              ({"MixedInstancesPolicy": t["template_ir_types"]}, "vcpu")):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-dct-bad"), **_DCT_BASE,
+                                                      **kwargs, DesiredCapacityType=value)
+            assert _validation_message(exc) == _create_requirements_message(value)
+        for value in ("bogus", "Units"):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-dct-bad"), **_DCT_BASE,
+                                                      LaunchTemplate=t["spec"], DesiredCapacityType=value)
+            assert _validation_message(exc) == _enum_message(value)
+    finally:
+        for name in groups:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+
+
+def test_asg_desired_capacity_type_validation_order_follows_aws(autoscaling, capacity_type_templates):
+    """#2604, captured on AWS (us-east-2, 2026-11-05). CreateAutoScalingGroup: the empty value, then the launch
+    source, the enum, the launch template, InstanceRequirements and last an existing name.
+    UpdateAutoScalingGroup: the empty value, both launch sources, the enum, then the group ("AutoScalingGroup name
+    not found - null")."""
+    t = capacity_type_templates
+    unvalidated = _unvalidated_autoscaling()
+    both = {"LaunchTemplate": t["spec"], "MixedInstancesPolicy": t["ir"]}
+    missing_lt = {"LaunchTemplate": {"LaunchTemplateName": _uid("missing-lt")}}
+    source_message = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
+                      "MixedInstancesPolicy parameter.")
+    existing = _uid("asg-dct-order")
+    autoscaling.create_auto_scaling_group(AutoScalingGroupName=existing, LaunchTemplate=t["spec"], **_DCT_BASE)
+    try:
+        for name, kwargs, value, message in (
+                (_uid("asg-dct-order"), both, "", _LENGTH_MESSAGE),
+                (_uid("asg-dct-order"), {}, "", _LENGTH_MESSAGE),
+                (_uid("asg-dct-order"), both, "bogus", source_message),
+                (_uid("asg-dct-order"), {}, "vcpu", source_message),
+                (_uid("asg-dct-order"), missing_lt, "bogus", _enum_message("bogus")),
+                (_uid("asg-dct-order"), missing_lt, "vcpu",
+                 f"The specified launch template, with template name {missing_lt['LaunchTemplate']['LaunchTemplateName']}, "
+                 "does not exist."),
+                (existing, {"LaunchTemplate": t["spec"]}, "", _LENGTH_MESSAGE),
+                (existing, {"LaunchTemplate": t["spec"]}, "bogus", _enum_message("bogus")),
+                (existing, {"LaunchTemplate": t["spec"]}, "vcpu", _create_requirements_message("vcpu"))):
+            with pytest.raises(ClientError) as exc:
+                unvalidated.create_auto_scaling_group(AutoScalingGroupName=name, **_DCT_BASE, **kwargs,
+                                                      DesiredCapacityType=value)
+            assert _validation_message(exc) == message
+
+        missing = _uid("no-such-group")
+        update_source = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName or "
+                         "MixedInstancesPolicy parameter.")
+        for name, kwargs, message in (
+                (missing, {"DesiredCapacityType": ""}, _LENGTH_MESSAGE),
+                (existing, {**both, "DesiredCapacityType": ""}, _LENGTH_MESSAGE),
+                (missing, both, update_source),
+                (existing, {**both, "DesiredCapacityType": "bogus"}, update_source),
+                (missing, {"DesiredCapacityType": "bogus"}, _enum_message("bogus")),
+                (missing, {"DesiredCapacityType": "vcpu"}, "AutoScalingGroup name not found - null"),
+                (missing, {"MaxSize": 1}, "AutoScalingGroup name not found - null"),
+                (missing, {**missing_lt, "DesiredCapacityType": "vcpu"}, "AutoScalingGroup name not found - null"),
+                (existing, {**missing_lt, "DesiredCapacityType": "bogus"}, _enum_message("bogus"))):
+            with pytest.raises(ClientError) as exc:
+                unvalidated.update_auto_scaling_group(AutoScalingGroupName=name, **kwargs)
+            assert _validation_message(exc) == message
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=existing, ForceDelete=True)
+
+
+def test_asg_update_desired_capacity_type_follows_aws(autoscaling, capacity_type_templates):
+    """#2604, captured on AWS (us-east-2, 2026-11-05): an update sets vcpu or memory-mib alone, but "units"
+    only together with a MixedInstancesPolicy; leaving the member out keeps the type; a group moved off its
+    MixedInstancesPolicy loses it, and a vcpu or memory-mib group can't move to a source without
+    InstanceRequirements."""
+    t = capacity_type_templates
+    plain, mixed, typed = _uid("asg-dct-up"), _uid("asg-dct-up-mip"), _uid("asg-dct-up-types")
+    try:
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=plain, LaunchTemplate=t["spec"], **_DCT_BASE)
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=mixed, MixedInstancesPolicy=t["ir"],
+                                              DesiredCapacityType="vcpu", **_DCT_BASE)
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=typed, MixedInstancesPolicy=t["types"],
+                                              **_DCT_BASE)
+
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=plain, DesiredCapacityType="units")
+        assert _capacity_type(autoscaling, plain) is None
+        for value, message in (("vcpu", _update_requirements_message("vcpu")),
+                               ("memory-mib", _update_requirements_message("memory-mib")),
+                               ("bogus", _enum_message("bogus"))):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.update_auto_scaling_group(AutoScalingGroupName=plain, DesiredCapacityType=value)
+            assert _validation_message(exc) == message
+        assert _capacity_type(autoscaling, plain) is None
+
+        dist = {"InstancesDistribution": {"OnDemandBaseCapacity": 0}}
+        for kwargs, expected in (({"MaxSize": 1}, "vcpu"), ({"DesiredCapacityType": "memory-mib"}, "memory-mib"),
+                                 ({"DesiredCapacityType": "units"}, "memory-mib"),
+                                 ({"MixedInstancesPolicy": dist, "DesiredCapacityType": "units"}, "units"),
+                                 ({"DesiredCapacityType": "vcpu"}, "vcpu"),
+                                 ({"MixedInstancesPolicy": t["template_ir"]}, "vcpu")):
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=mixed, **kwargs)
+            assert _capacity_type(autoscaling, mixed) == expected
+        for kwargs in ({"LaunchTemplate": t["spec"]}, {"MixedInstancesPolicy": t["types"]},
+                       {"LaunchTemplate": t["spec"], "DesiredCapacityType": "vcpu"}):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.update_auto_scaling_group(AutoScalingGroupName=mixed, **kwargs)
+            assert _validation_message(exc) == _update_requirements_message("vcpu")
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[mixed])["AutoScalingGroups"][0]
+        assert (group["DesiredCapacityType"], "MixedInstancesPolicy" in group) == ("vcpu", True)
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=mixed, LaunchTemplate=t["spec"],
+                                              DesiredCapacityType="units")
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[mixed])["AutoScalingGroups"][0]
+        assert ("DesiredCapacityType" in group, "MixedInstancesPolicy" in group) == (False, False)
+
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=typed, DesiredCapacityType="units")
+        assert _capacity_type(autoscaling, typed) is None
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=typed, MixedInstancesPolicy=t["types"],
+                                              DesiredCapacityType="units")
+        assert _capacity_type(autoscaling, typed) == "units"
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=typed, LaunchTemplate=t["spec"])
+        assert _capacity_type(autoscaling, typed) is None
+    finally:
+        for name in (plain, mixed, typed):
+            try:
+                autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+            except ClientError:
+                pass
+
+
+def test_asg_desired_capacity_type_template_and_override_rules_follow_aws(autoscaling, ec2, capacity_type_templates):
+    """#2604, captured on AWS (us-east-2, 2026-11-05): the policy's launch template counts at the version it
+    names ($Default when none); an override's own launch template doesn't count; a memory-mib group can't move
+    to a source without InstanceRequirements; a missing name and an empty type are reported together."""
+    t = capacity_type_templates
+    versioned = ec2.create_launch_template(LaunchTemplateName=_uid("lt-dct-ver"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    ec2.create_launch_template_version(LaunchTemplateId=versioned["LaunchTemplateId"], LaunchTemplateData={
+        "InstanceRequirements": _IR, "ImageId": "ami-12345678"})
+    ir_template = t["template_ir"]["LaunchTemplate"]["LaunchTemplateSpecification"]
+    groups = []
+    try:
+        for version, accepted in ((None, False), ("$Default", False), ("1", False), ("$Latest", True), ("2", True)):
+            spec = {"LaunchTemplateId": versioned["LaunchTemplateId"], **({"Version": version} if version else {})}
+            kwargs = dict(AutoScalingGroupName=_uid("asg-dct-ver"), DesiredCapacityType="vcpu", **_DCT_BASE,
+                          MixedInstancesPolicy={"LaunchTemplate": {"LaunchTemplateSpecification": spec}})
+            if accepted:
+                autoscaling.create_auto_scaling_group(**kwargs)
+                groups.append(kwargs["AutoScalingGroupName"])
+                assert _capacity_type(autoscaling, kwargs["AutoScalingGroupName"]) == "vcpu"
+            else:
+                with pytest.raises(ClientError) as exc:
+                    autoscaling.create_auto_scaling_group(**kwargs)
+                assert _validation_message(exc) == _create_requirements_message("vcpu")
+
+        for override, accepted in (({"InstanceType": "t3.micro", "LaunchTemplateSpecification": ir_template}, False),
+                                   ({"InstanceRequirements": _IR, "LaunchTemplateSpecification": ir_template}, True)):
+            kwargs = dict(AutoScalingGroupName=_uid("asg-dct-ov"), DesiredCapacityType="vcpu", **_DCT_BASE,
+                          MixedInstancesPolicy={"LaunchTemplate": {"LaunchTemplateSpecification": t["spec"],
+                                                                   "Overrides": [override]}})
+            if accepted:
+                autoscaling.create_auto_scaling_group(**kwargs)
+                groups.append(kwargs["AutoScalingGroupName"])
+                assert _capacity_type(autoscaling, kwargs["AutoScalingGroupName"]) == "vcpu"
+            else:
+                with pytest.raises(ClientError) as exc:
+                    autoscaling.create_auto_scaling_group(**kwargs)
+                assert _validation_message(exc) == _create_requirements_message("vcpu")
+
+        memory = _uid("asg-dct-mem")
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=memory, MixedInstancesPolicy=t["ir"],
+                                              DesiredCapacityType="memory-mib", **_DCT_BASE)
+        groups.append(memory)
+        for kwargs in ({"LaunchTemplate": t["spec"]}, {"MixedInstancesPolicy": t["types"]}):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.update_auto_scaling_group(AutoScalingGroupName=memory, **kwargs)
+            assert _validation_message(exc) == _update_requirements_message("memory-mib")
+        assert _capacity_type(autoscaling, memory) == "memory-mib"
+
+        unvalidated = _unvalidated_autoscaling()
+        for call, kwargs in ((unvalidated.create_auto_scaling_group, dict(**_DCT_BASE, LaunchTemplate=t["spec"])),
+                             (unvalidated.update_auto_scaling_group, {})):
+            for value, message in (("", f"2 validation errors detected: {_TYPE_EMPTY}; {_NAME_NULL}"),
+                                   ("bogus", f"1 validation error detected: {_NAME_NULL}"),
+                                   ("vcpu", f"1 validation error detected: {_NAME_NULL}")):
+                with pytest.raises(ClientError) as exc:
+                    call(**kwargs, DesiredCapacityType=value)
+                assert _validation_message(exc) == message
+    finally:
+        for name in groups:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+        ec2.delete_launch_template(LaunchTemplateId=versioned["LaunchTemplateId"])
+
+
+def test_asg_desired_capacity_type_recheck_and_names_follow_aws(autoscaling, ec2, capacity_type_templates):
+    """#2604, captured on AWS (us-east-2, 2026-11-05): a stored vcpu type is checked again only when an update
+    changes the launch source or sends a type, so a template whose $Latest lost InstanceRequirements still
+    takes unrelated updates; AlreadyExists comes after the launch source checks; an empty group name has its
+    own constraint error."""
+    t = capacity_type_templates
+    versioned = ec2.create_launch_template(LaunchTemplateName=_uid("lt-dct-re"), LaunchTemplateData={
+        "InstanceRequirements": _IR, "ImageId": "ami-12345678"})["LaunchTemplate"]
+    latest = {"LaunchTemplateId": versioned["LaunchTemplateId"], "Version": "$Latest"}
+    first, second = _uid("asg-dct-re"), _uid("asg-dct-re-v1")
+    try:
+        for name in (first, second):
+            autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, DesiredCapacityType="vcpu", **_DCT_BASE,
+                                                  MixedInstancesPolicy={"LaunchTemplate": {
+                                                      "LaunchTemplateSpecification": latest}})
+        ec2.create_launch_template_version(LaunchTemplateId=versioned["LaunchTemplateId"], LaunchTemplateData={
+            "InstanceType": "t3.micro", "ImageId": "ami-12345678"})
+
+        for kwargs in ({"MaxSize": 1}, {"MixedInstancesPolicy": {"InstancesDistribution": {"OnDemandBaseCapacity": 0}}},
+                       {"DesiredCapacityType": "units"}):
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=first, **kwargs)
+            assert _capacity_type(autoscaling, first) == "vcpu"
+        for kwargs, value in (({"DesiredCapacityType": "vcpu"}, "vcpu"),
+                              ({"DesiredCapacityType": "memory-mib"}, "memory-mib"),
+                              ({"MixedInstancesPolicy": {"LaunchTemplate": {
+                                  "Overrides": [{"InstanceType": "t3.micro"}]}}}, "vcpu"),
+                              ({"MixedInstancesPolicy": {"LaunchTemplate": {"LaunchTemplateSpecification": latest}}},
+                               "vcpu"),
+                              ({"LaunchTemplate": t["spec"]}, "vcpu")):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.update_auto_scaling_group(AutoScalingGroupName=first, **kwargs)
+            assert _validation_message(exc) == _update_requirements_message(value)
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=first, MixedInstancesPolicy={
+            "LaunchTemplate": {"Overrides": [{"InstanceRequirements": _IR}]}})
+        assert _capacity_type(autoscaling, first) == "vcpu"
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=second, MixedInstancesPolicy={"LaunchTemplate": {
+            "LaunchTemplateSpecification": {"LaunchTemplateId": versioned["LaunchTemplateId"], "Version": "1"}}})
+        assert _capacity_type(autoscaling, second) == "vcpu"
+
+        missing_lt = {"LaunchTemplate": {"LaunchTemplateName": _uid("missing-lt")}}
+        source_message = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
+                          "MixedInstancesPolicy parameter.")
+        for kwargs, message in (
+                (missing_lt, f"The specified launch template, with template name "
+                             f"{missing_lt['LaunchTemplate']['LaunchTemplateName']}, does not exist."),
+                ({"LaunchTemplate": t["spec"], "MixedInstancesPolicy": t["ir"]}, source_message),
+                ({}, source_message),
+                ({"MixedInstancesPolicy": {"InstancesDistribution": {"OnDemandBaseCapacity": 0}}},
+                 "A launch template is required when configuring an Auto Scaling group with a mixed instances policy. "
+                 "Add a launch template to the mixed instances policy and try again.")):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=first, **_DCT_BASE, **kwargs)
+            assert _validation_message(exc) == message
+        with pytest.raises(ClientError) as exc:
+            autoscaling.create_auto_scaling_group(AutoScalingGroupName=first, **_DCT_BASE, LaunchTemplate=t["spec"])
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "AlreadyExists", f"AutoScalingGroup by this name already exists - A group with the name {first} already "
+                             "exists")
+
+        unvalidated = _unvalidated_autoscaling()
+        name_empty = ("Value '' at 'autoScalingGroupName' failed to satisfy constraint: Member must have length "
+                      "greater than or equal to 1")
+        for call, kwargs in ((unvalidated.create_auto_scaling_group, dict(**_DCT_BASE, LaunchTemplate=t["spec"])),
+                             (unvalidated.update_auto_scaling_group, {})):
+            for extra, message in (({}, f"1 validation error detected: {name_empty}"),
+                                   ({"DesiredCapacityType": "bogus"}, f"1 validation error detected: {name_empty}"),
+                                   ({"DesiredCapacityType": ""},
+                                    f"2 validation errors detected: {_TYPE_EMPTY}; {name_empty}")):
+                with pytest.raises(ClientError) as exc:
+                    call(AutoScalingGroupName="", **kwargs, **extra)
+                assert _validation_message(exc) == message
+    finally:
+        for name in (first, second):
+            try:
+                autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+            except ClientError:
+                pass
+        ec2.delete_launch_template(LaunchTemplateId=versioned["LaunchTemplateId"])
+
+
+def test_asg_desired_capacity_type_lengths_and_spot_order_follow_aws(autoscaling, capacity_type_templates):
+    """#2604, captured on AWS (us-east-2, 2026-11-05): a DesiredCapacityType or group name longer than 255
+    characters (code points) is a constraint error, reported with the others; the enum check comes before the
+    MixedInstancesPolicy's Spot checks, and the InstanceRequirements check and AlreadyExists after them."""
+    t = capacity_type_templates
+    unvalidated = _unvalidated_autoscaling()
+    long_type, long_name = "a" * 256, "n" * 256
+    type_long = (f"Value '{long_type}' at 'desiredCapacityType' failed to satisfy constraint: Member must have "
+                 "length less than or equal to 255")
+    name_long = (f"Value '{long_name}' at 'autoScalingGroupName' failed to satisfy constraint: Member must have "
+                 "length less than or equal to 255")
+    group = _uid("asg-dct-len")
+    autoscaling.create_auto_scaling_group(AutoScalingGroupName=group, MixedInstancesPolicy=t["types"], **_DCT_BASE)
+    try:
+        with pytest.raises(ClientError) as exc:
+            unvalidated.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-dct-len"), **_DCT_BASE,
+                                                  LaunchTemplate=t["spec"], DesiredCapacityType="a" * 255)
+        assert _validation_message(exc) == _enum_message("a" * 255)
+        # Length counts code points: 128 emoji are 256 UTF-16 units but still reach the enum check.
+        emoji = "\U0001F600"
+        with pytest.raises(ClientError) as exc:
+            unvalidated.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-dct-len"), **_DCT_BASE,
+                                                  LaunchTemplate=t["spec"], DesiredCapacityType=emoji * 128)
+        assert _validation_message(exc) == _enum_message(emoji * 128)
+        with pytest.raises(ClientError) as exc:
+            unvalidated.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-dct-len"), **_DCT_BASE,
+                                                  LaunchTemplate=t["spec"], DesiredCapacityType=emoji * 256)
+        assert _validation_message(exc) == (f"1 validation error detected: Value '{emoji * 256}' at "
+                                            "'desiredCapacityType' failed to satisfy constraint: Member must have "
+                                            "length less than or equal to 255")
+        create = dict(**_DCT_BASE, LaunchTemplate=t["spec"])
+        for call, kwargs, message in (
+                (unvalidated.create_auto_scaling_group, {**create, "AutoScalingGroupName": _uid("asg-dct-len"),
+                                                         "DesiredCapacityType": long_type},
+                 f"1 validation error detected: {type_long}"),
+                (unvalidated.create_auto_scaling_group, {**create, "DesiredCapacityType": long_type},
+                 f"2 validation errors detected: {type_long}; {_NAME_NULL}"),
+                (unvalidated.update_auto_scaling_group, {"AutoScalingGroupName": group, "DesiredCapacityType": long_type},
+                 f"1 validation error detected: {type_long}")):
+            with pytest.raises(ClientError) as exc:
+                call(**kwargs)
+            assert _validation_message(exc) == message
+        for call, kwargs in ((unvalidated.create_auto_scaling_group, create),
+                             (unvalidated.update_auto_scaling_group, {})):
+            for extra, message in (({}, f"1 validation error detected: {name_long}"),
+                                   ({"DesiredCapacityType": "bogus"}, f"1 validation error detected: {name_long}"),
+                                   ({"DesiredCapacityType": ""}, f"2 validation errors detected: {_TYPE_EMPTY}; {name_long}"),
+                                   ({"DesiredCapacityType": long_type},
+                                    f"2 validation errors detected: {type_long}; {name_long}")):
+                with pytest.raises(ClientError) as exc:
+                    call(AutoScalingGroupName=long_name, **kwargs, **extra)
+                assert _validation_message(exc) == message
+
+        strategy_message = ("SpotAllocationStrategy is not valid. Valid options are: [lowest-price, capacity-optimized, "
+                            "capacity-optimized-prioritized, price-capacity-optimized].")
+        pools_message = "SpotInstancePools option is only available with the lowest-price allocation strategy."
+        for dist, message in (({"SpotAllocationStrategy": "bogus"}, strategy_message),
+                              ({"SpotAllocationStrategy": "capacity-optimized", "SpotInstancePools": 3}, pools_message)):
+            # As captured: bogus with InstanceRequirements overrides, vcpu with InstanceType overrides.
+            for value, policy, expected in (("bogus", t["ir"], _enum_message("bogus")), ("vcpu", t["types"], message)):
+                with pytest.raises(ClientError) as exc:
+                    autoscaling.create_auto_scaling_group(
+                        AutoScalingGroupName=_uid("asg-dct-spot"), **_DCT_BASE, DesiredCapacityType=value,
+                        MixedInstancesPolicy={"LaunchTemplate": policy["LaunchTemplate"], "InstancesDistribution": dist})
+                assert _validation_message(exc) == expected
+                with pytest.raises(ClientError) as exc:
+                    autoscaling.update_auto_scaling_group(AutoScalingGroupName=group, DesiredCapacityType=value,
+                                                          MixedInstancesPolicy={"InstancesDistribution": dist})
+                assert _validation_message(exc) == expected
+            for extra in ({}, {"DesiredCapacityType": "units"}):
+                with pytest.raises(ClientError) as exc:
+                    autoscaling.create_auto_scaling_group(
+                        AutoScalingGroupName=group, **_DCT_BASE, **extra,
+                        MixedInstancesPolicy={"LaunchTemplate": t["types"]["LaunchTemplate"], "InstancesDistribution": dist})
+                assert _validation_message(exc) == message
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=group, ForceDelete=True)
+
+
+def test_restore_drops_desired_capacity_type_from_groups_without_a_policy():
+    """#2604: v1.5.38 saved DesiredCapacityType "units" on every group. On AWS (captured, us-east-2, 2026-11-05)
+    a group without a MixedInstancesPolicy never has a type, so restored state drops it there, in every
+    account and region; policy groups keep theirs."""
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import autoscaling as service
+
+    policy = {"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": "lt-0123456789abcdef0"}}}
+    asgs = AccountRegionScopedDict()
+    for account_id, region in (("111111111111", "us-east-1"), ("222222222222", "eu-west-1")):
+        asgs.set_scoped(account_id, region, "plain", {"AutoScalingGroupName": "plain", "DesiredCapacityType": "units"})
+        asgs.set_scoped(account_id, region, "mixed-units", {"AutoScalingGroupName": "mixed-units",
+                                                            "DesiredCapacityType": "units",
+                                                            "MixedInstancesPolicy": policy})
+        asgs.set_scoped(account_id, region, "mixed-vcpu", {"AutoScalingGroupName": "mixed-vcpu",
+                                                           "DesiredCapacityType": "vcpu",
+                                                           "MixedInstancesPolicy": policy})
+    service.reset()
+    try:
+        service.load_persisted_state({"asgs": asgs})
+        for account_id, region in (("111111111111", "us-east-1"), ("222222222222", "eu-west-1")):
+            types = {name: service._asgs.get_scoped(account_id, region, name).get("DesiredCapacityType")
+                     for name in ("plain", "mixed-units", "mixed-vcpu")}
+            assert types == {"plain": None, "mixed-units": "units", "mixed-vcpu": "vcpu"}
+    finally:
+        service.reset()
