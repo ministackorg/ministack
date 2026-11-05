@@ -203,7 +203,7 @@ def _lambda_function_name_from_arn_spec(spec) -> str | None:
 
 def _invalid_subscription_endpoint(protocol: str, endpoint: str):
     return _error(
-        "InvalidParameterException",
+        "InvalidParameter",
         f"Invalid parameter: Endpoint {endpoint} is not a valid {protocol.upper()} ARN",
         400,
     )
@@ -231,7 +231,7 @@ def _resolve_topic_tag_arn(arn: str, action: str):
     try:
         spec = parse_arn(arn)
     except ArnParseError:
-        return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
+        return arn, None, _error("InvalidParameter", f"Invalid SNS topic ARN: {arn}", 400)
 
     if (
         spec.partition != "aws"
@@ -242,14 +242,14 @@ def _resolve_topic_tag_arn(arn: str, action: str):
         or ":" in spec.resource
         or "/" in spec.resource
     ):
-        return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
+        return arn, None, _error("InvalidParameter", f"Invalid SNS topic ARN: {arn}", 400)
 
     if spec.region != get_region():
-        return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+        return arn, None, _error("ResourceNotFound", "Resource not found", 404)
 
     topic = _topic_by_arn_any_scope(arn)
     if not topic:
-        return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+        return arn, None, _error("ResourceNotFound", "Resource not found", 404)
     denied = _enforce_topic_policy(topic, action)
     if denied is not None:
         return arn, None, denied
@@ -358,7 +358,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
 def _create_topic(params):
     name = _p(params, "Name")
     if not name:
-        return _error("InvalidParameterException", "Name is required", 400)
+        return _error("InvalidParameter", "Name is required", 400)
 
     # ── Collect explicit attributes from the request ──
     explicit_attrs = {}
@@ -375,7 +375,7 @@ def _create_topic(params):
     # FIFO naming validation: FifoTopic=true requires .fifo suffix
     if fifo_attr == "true" and not is_fifo_name:
         return _error(
-            "InvalidParameterException",
+            "InvalidParameter",
             "Invalid parameter: Topic names with FIFO attribute must end with .fifo suffix",
             400,
         )
@@ -610,7 +610,7 @@ def _subscribe(params):
     topic_arn = topic["arn"]
 
     if not protocol:
-        return _error("InvalidParameterException", "Protocol is required", 400)
+        return _error("InvalidParameter", "Protocol is required", 400)
     endpoint_error = _validate_subscription_endpoint(protocol, endpoint)
     if endpoint_error:
         return endpoint_error
@@ -678,7 +678,7 @@ def _confirm_subscription(params):
         return err
 
     if not token:
-        return _error("InvalidParameterException", "Token is required", 400)
+        return _error("InvalidParameter", "Token is required", 400)
 
     for sub in topic["subscriptions"]:
         if sub.get("token") == token:
@@ -690,7 +690,7 @@ def _confirm_subscription(params):
             return _xml(200, "ConfirmSubscriptionResponse",
                         f"<ConfirmSubscriptionResult><SubscriptionArn>{sub['arn']}</SubscriptionArn></ConfirmSubscriptionResult>")
 
-    return _error("InvalidParameterException", "Invalid token", 400)
+    return _error("InvalidParameter", "Invalid token", 400)
 
 
 def _unsubscribe(params):
@@ -793,14 +793,14 @@ def _set_subscription_attributes(params):
     allowed = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
                "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
     if attr_name not in allowed:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       f"Invalid attribute name: {attr_name}", 400)
 
     if attr_name == "FilterPolicy" and attr_val:
         try:
             json.loads(attr_val)
         except json.JSONDecodeError:
-            return _error("InvalidParameterException", "Invalid JSON in FilterPolicy", 400)
+            return _error("InvalidParameter", "Invalid JSON in FilterPolicy", 400)
 
     sub["attributes"][attr_name] = attr_val
     return _xml(200, "SetSubscriptionAttributesResponse", "")
@@ -912,7 +912,7 @@ def publish_internal(
     if _is_fifo_topic(topic):
         if not message_group_id:
             raise SnsPublishError(
-                "InvalidParameterException",
+                "InvalidParameter",
                 "Invalid parameter: The MessageGroupId parameter is required for FIFO topics",
             )
         # Resolve dedup ID: explicit > CBD SHA-256 > error
@@ -921,7 +921,7 @@ def publish_internal(
                 topic, {"MessageDeduplicationId": message_deduplication_id}, message
             )
         except ValueError as exc:
-            raise SnsPublishError("InvalidParameterException", str(exc)) from exc
+            raise SnsPublishError("InvalidParameter", str(exc)) from exc
 
         # Prune expired cache entries, then check for duplicate
         with _fifo_lock:
@@ -985,7 +985,7 @@ def _publish(params):
                     f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
 
     if not topic_arn:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       "TopicArn, TargetArn, or PhoneNumber is required", 400)
 
     topic, err = _get_topic(topic_arn, "sns:Publish")
@@ -1023,7 +1023,7 @@ def _publish(params):
 def _publish_batch(params):
     topic_arn = _normalize_arn(_p(params, "TopicArn"))
     if not topic_arn:
-        return _error("InvalidParameterException", "TopicArn is required", 400)
+        return _error("InvalidParameter", "TopicArn is required", 400)
     topic, err = _get_topic(topic_arn, "sns:Publish")
     if err is not None:
         return err
@@ -1031,7 +1031,7 @@ def _publish_batch(params):
 
     entries = _parse_batch_entries(params)
     if not entries:
-        return _error("InvalidParameterException",
+        return _error("InvalidParameter",
                       "PublishBatchRequestEntries is required", 400)
     if len(entries) > 10:
         return _error("TooManyEntriesInBatchRequest",
@@ -1433,7 +1433,7 @@ def _create_platform_application(params):
     name = _p(params, "Name")
     platform = _p(params, "Platform")
     if not name or not platform:
-        return _error("InvalidParameterException", "Name and Platform are required", 400)
+        return _error("InvalidParameter", "Name and Platform are required", 400)
 
     arn = f"arn:aws:sns:{get_region()}:{get_account_id()}:app/{platform}/{name}"
     attrs = {}
@@ -1555,7 +1555,7 @@ def _create_platform_endpoint(params):
     if app_arn not in _platform_applications:
         return _error("NotFound", f"PlatformApplication does not exist: {app_arn}", 404)
     if not token:
-        return _error("InvalidParameterException", "Token is required", 400)
+        return _error("InvalidParameter", "Token is required", 400)
 
     # CustomUserData is a top-level request param (not an Attributes entry).
     custom_user_data = _p(params, "CustomUserData")

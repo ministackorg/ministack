@@ -1034,8 +1034,8 @@ def _resolve_taggable_elasticache_arn(arn):
             "ARN",
         ),
         "snapshot": (_snapshots, "SnapshotNotFoundFault", f"Snapshot {name} not found", "ARN"),
-        "user": (_users, "UserNotFoundFault", f"User {name} not found", "ARN"),
-        "usergroup": (_user_groups, "UserGroupNotFoundFault", f"User group {name} not found", "ARN"),
+        "user": (_users, "UserNotFound", f"User {name} not found", "ARN"),
+        "usergroup": (_user_groups, "UserGroupNotFound", f"User group {name} not found", "ARN"),
         "serverlesscache": (
             _serverless_caches,
             "ServerlessCacheNotFoundFault",
@@ -1050,7 +1050,8 @@ def _resolve_taggable_elasticache_arn(arn):
     store, code, message, arn_key = entry
     record = store.get(name)
     if not record or record.get(arn_key) != arn:
-        return None, _error(code, message, 404)
+        # botocore: every one of these faults is 404 except CacheSubnetGroupNotFoundFault (400).
+        return None, _error(code, message, 400 if code == "CacheSubnetGroupNotFoundFault" else 404)
     return arn, None
 
 

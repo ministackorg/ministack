@@ -2028,12 +2028,7 @@ def _oidc_get_userinfo(url, access_token, timeout=10.0):
             conn.close()
 
 
-# The key the emulator signs x-amzn-oidc-data with. AWS signs with a regional
-# key served from public-keys.auth.elb.<region>.amazonaws.com/<kid>; there is
-# no such endpoint locally, so the signature is real ES256 but verifiable only
-# in principle. Apps that decode the payload (the common pattern) work; apps
-# that fetch the AWS key endpoint fail loudly, exactly as they would against
-# any non-AWS host.
+# Per-process signing key; app.py serves its public half by kid.
 _OIDC_SIGNING_KEY = None
 _OIDC_KID = None
 
@@ -2048,6 +2043,18 @@ def _oidc_signing_material():
         except Exception:
             _OIDC_SIGNING_KEY = None
     return _OIDC_SIGNING_KEY, _OIDC_KID
+
+
+def oidc_public_key_pem(kid: str):
+    """The PEM public key for ``kid``, or None if it is not the current signing kid."""
+    if _OIDC_SIGNING_KEY is None or kid != _OIDC_KID:
+        return None
+    from cryptography.hazmat.primitives import serialization
+
+    return _OIDC_SIGNING_KEY.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
 
 
 def _oidc_b64url(raw: bytes) -> str:
