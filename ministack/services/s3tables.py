@@ -631,7 +631,8 @@ def _get_table_metadata_location(bucket_arn, namespace, table_name):
     table = _tables.get(key)
     if not table:
         return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
-    out = {"versionToken": table["versionToken"], "metadataLocation": table.get("metadataLocation"),
+    # Tables made before tokens were kept (or by CloudFormation) get one on first read.
+    out = {"versionToken": table.setdefault("versionToken", new_uuid()[:8]), "metadataLocation": table.get("metadataLocation"),
            "warehouseLocation": table.get("warehouseLocation")}
     return json_response({k: v for k, v in out.items() if v is not None})
 
@@ -645,7 +646,7 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
     table = _tables.get(key)
     if not table:
         return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
-    if data.get("versionToken") != table.get("versionToken"):
+    if data.get("versionToken") != table.setdefault("versionToken", new_uuid()[:8]):
         return error_response_json("ConflictException", "The version token does not match the current version", 409)
     new_loc = data.get("metadataLocation", "")
     table["metadataLocation"] = new_loc

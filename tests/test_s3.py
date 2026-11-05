@@ -12859,7 +12859,7 @@ def test_object_lock_retention_and_legal_hold_survive_a_restart(monkeypatch, tmp
         for k in [k for k in store._data if k[1] == bucket or (isinstance(k[1], tuple) and k[1][0] == bucket)]:
             del store._data[k]
     _s3_mod._load_persisted_data()
-    _s3_mod._restore_state(state)
+    _s3_mod.load_persisted_state(state)
     query = {"versionId": [vid]}
     status, _, body = _lock_call("GET", f"/{bucket}/k", {}, b"", {"retention": [""], **query})
     assert status == 200 and b"<Mode>COMPLIANCE</Mode>" in body
