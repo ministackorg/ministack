@@ -31,7 +31,6 @@ import random
 import re
 import string
 import time
-import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -788,7 +787,7 @@ def _policy_locks_out_caller(statements):
             continue
         principal = statement.get("Principal")
         if isinstance(principal, dict):
-            values = [v for value in principal.values() for v in (value if isinstance(value, list) else [value])]
+            values = [v for _, value in _pairs(principal) for v in (value if isinstance(value, list) else [value])]
         else:
             values = [principal]
         if "*" not in values:
@@ -800,6 +799,129 @@ def _policy_locks_out_caller(statements):
     return False
 
 
+class _InvalidPolicyStructure(Exception):
+    pass
+
+
+class _JsonNumber(str):
+    """A number literal, kept as text the way AWS echoes it."""
+
+
+_POLICY_KEYS = ("Version", "Id", "Statement")
+_STATEMENT_KEYS = ("Sid", "Effect", "Principal", "NotPrincipal", "Action", "NotAction",
+                   "Resource", "NotResource", "Condition")
+_JSON_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r",
+                       "\t": "\\t"}
+
+
+class _PolicyObject(dict):
+    """A JSON object that remembers every key/value pair; AWS keeps repeated keys inside Principal."""
+
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.pairs = list(pairs)
+
+
+def _policy_object(pairs):
+    return _PolicyObject(pairs)
+
+
+def _pairs(value):
+    return value.pairs if isinstance(value, _PolicyObject) else list(value.items())
+
+
+def _repeats_key(value):
+    return isinstance(value, dict) and len(_pairs(value)) != len(value)
+
+
+def _policy_constant(text):
+    raise _InvalidPolicyStructure
+
+
+def _policy_number(text):
+    """AWS refuses a number with more than 1000 digits, counting exponent digits but not the sign."""
+    if sum(char.isdigit() for char in text) > 1000:
+        raise _InvalidPolicyStructure
+    return _JsonNumber("0" if text == "-0" else text)
+
+
+def _parse_policy(raw):
+    return json.loads(raw, object_pairs_hook=_policy_object, parse_int=_policy_number,
+                      parse_float=_policy_number, parse_constant=_policy_constant)
+
+
+def _is_text(value):
+    return isinstance(value, str) and not isinstance(value, _JsonNumber)
+
+
+def _canonical_value(value):
+    if value is None:
+        raise _InvalidPolicyStructure
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        if any(isinstance(item, bool) for item in value):
+            raise _InvalidPolicyStructure
+        items = [_canonical_value(item) for item in value]
+        return items[0] if len(items) == 1 else items
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _canonical_policy(policy, statements, file_system_arn):
+    """The policy as AWS stores it: known keys in a fixed order, scalars as strings,
+    one-element lists as their element, and a missing Resource set to the file system."""
+    if not all(_is_text(item.get(key, "")) for item, key in
+               [(policy, "Version"), (policy, "Id")] + [(statement, "Sid") for statement in statements]):
+        raise _InvalidPolicyStructure
+    canonical = {"Version": _canonical_value(policy.get("Version", "2008-10-17"))}
+    if "Id" in policy:
+        canonical["Id"] = policy["Id"]
+    canonical["Statement"] = []
+    for source in statements:
+        if "Resource" not in source and "NotResource" not in source:
+            source = dict(source, Resource=file_system_arn)
+        condition = source.get("Condition")
+        if _repeats_key(condition) or isinstance(condition, dict) and any(map(_repeats_key, condition.values())):
+            raise _InvalidPolicyStructure
+        statement = {key: _canonical_value(source[key]) for key in _STATEMENT_KEYS if key in source}
+        for key in ("Principal", "NotPrincipal"):
+            if isinstance(source.get(key), dict):
+                statement[key] = _PolicyObject([(k, _canonical_value(v)) for k, v in _pairs(source[key])])
+        if isinstance(statement.get("Condition"), dict):
+            statement["Condition"] = {op: values for op, values in statement["Condition"].items() if values != {}}
+        canonical["Statement"].append(statement)
+    return canonical
+
+
+def _policy_string(text):
+    text = re.sub("[\ud800-\udfff]", "?", text)  # AWS writes a lone surrogate as "?"
+    return '"' + re.sub(r'["\\\x00-\x1f]',
+                        lambda m: _JSON_SHORT_ESCAPES.get(m.group(), f"\\u{ord(m.group()):04X}"), text) + '"'
+
+
+def _policy_json(value, pretty=False, depth=0):
+    """Compact for PutFileSystemPolicy, indented for DescribeFileSystemPolicy, with AWS's spacing and escapes."""
+    if isinstance(value, str):
+        return _policy_string(value)
+    if isinstance(value, list):
+        if not value:
+            return "[ ]" if pretty else "[]"
+        items = (", " if pretty else ",").join(_policy_json(item, pretty, depth) for item in value)
+        return f"[ {items} ]" if pretty else f"[{items}]"
+    if isinstance(value, dict):
+        if not value:
+            return "{ }" if pretty else "{}"
+        if not pretty:
+            return "{" + ",".join(f"{_policy_string(k)}:{_policy_json(v)}" for k, v in _pairs(value)) + "}"
+        pad = "  " * (depth + 1)
+        fields = ",\n".join(f"{pad}{_policy_string(k)} : {_policy_json(v, True, depth + 1)}"
+                             for k, v in _pairs(value))
+        return "{\n" + fields + "\n" + "  " * depth + "}"
+    return json.dumps(value)  # policies stored before the canonical form can hold JSON numbers and booleans
+
+
 def _put_file_system_policy(fs_id, body):
     fs = _file_systems.get(fs_id)
     if not fs:
@@ -808,29 +930,37 @@ def _put_file_system_policy(fs_id, body):
     if not isinstance(raw, str) or not 1 <= len(raw) <= _POLICY_MAX_LENGTH:
         return _error(400, "BadRequest", f"Policy must be between 1 and {_POLICY_MAX_LENGTH} characters.")
     try:
-        policy = json.loads(raw)
+        policy = _parse_policy(raw)
+    except _InvalidPolicyStructure:
+        return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
     except ValueError:
         return _error(400, "InvalidPolicyException", "The file system policy is not valid JSON.")
     statements = policy.get("Statement") if isinstance(policy, dict) else None
     if isinstance(statements, dict):
         statements = [statements]
+    if isinstance(policy, dict) and (set(policy) - set(_POLICY_KEYS) or _repeats_key(policy) or isinstance(
+            statements, list) and any(isinstance(s, dict) and (set(s) - set(_STATEMENT_KEYS) or _repeats_key(s))
+                                      for s in statements)):
+        return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
+    # AWS checks value types before it looks for an Effect or an Action. The Effect/Action check below only
+    # passes for a dict policy whose statements are all dicts, so canonical is always set past it.
+    canonical = None
+    if isinstance(policy, dict) and isinstance(statements, list) and all(isinstance(s, dict) for s in statements):
+        try:
+            canonical = _canonical_policy(policy, statements, fs["FileSystemArn"])
+        except _InvalidPolicyStructure:
+            return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
     if not statements or not all(
             isinstance(s, dict) and s.get("Effect") in ("Allow", "Deny") and ("Action" in s or "NotAction" in s)
             for s in statements):
         return _error(400, "InvalidPolicyException",
                       "The file system policy needs a Statement list whose entries have an Effect and an Action.")
-    if not body.get("BypassPolicyLockoutSafetyCheck") and _policy_locks_out_caller(statements):
+    policy = canonical
+    if not body.get("BypassPolicyLockoutSafetyCheck") and _policy_locks_out_caller(policy["Statement"]):
         return _error(400, "InvalidPolicyException",
                       "The policy would lock out the caller from PutFileSystemPolicy; "
                       "set BypassPolicyLockoutSafetyCheck to override.")
-    # Id, Sid and Resource are filled in as the API reference examples show.
-    policy["Statement"] = statements
-    policy.setdefault("Id", "1")
-    for statement in statements:
-        statement.setdefault("Sid", f"efs-statement-{uuid.uuid4()}")
-        if "Resource" not in statement and "NotResource" not in statement:
-            statement["Resource"] = fs["FileSystemArn"]
-    stored = json.dumps(policy)
+    stored = _policy_json(policy)
     fs["FileSystemPolicy"] = stored
     return _json(200, {"FileSystemId": fs_id, "Policy": stored})
 
@@ -842,7 +972,7 @@ def _describe_file_system_policy(fs_id):
     policy = fs.get("FileSystemPolicy")
     if not policy:
         return _error(404, "PolicyNotFound", f"File system '{fs_id}' has no file system policy.")
-    return _json(200, {"FileSystemId": fs_id, "Policy": policy})
+    return _json(200, {"FileSystemId": fs_id, "Policy": _policy_json(json.loads(policy, object_pairs_hook=_PolicyObject), pretty=True)})
 
 
 def _delete_file_system_policy(fs_id):
