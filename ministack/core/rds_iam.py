@@ -1,11 +1,13 @@
 # Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
-"""RDS IAM database authentication for the MySQL AWSAuthenticationPlugin.
+"""RDS IAM database authentication for MySQL and PostgreSQL.
 
-The plugin POSTs each IAM login to /_ministack/rds/iam-auth with its
-container's capability. Resource enablement is always required; AUTH=true
-also verifies the token and evaluates rds-db:connect. Capabilities are
-process-local, never persisted, never issued over HTTP.
+The MySQL AWSAuthenticationPlugin POSTs each IAM login to
+/_ministack/rds/iam-auth with its container's capability; PostgreSQL's ldap
+method binds to a local listener with the capability in the DN. Resource
+enablement is always required; AUTH=true also verifies the token and
+evaluates rds-db:connect. Capabilities are process-local, never persisted,
+never issued over HTTP.
 """
 
 import asyncio
@@ -13,8 +15,10 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
+import socketserver
 import threading
 import time
 from dataclasses import dataclass
@@ -198,6 +202,10 @@ def verify_rds_iam_token(
 # Stage 5 of #1744: resource-bound authorization. No runtime callers, no AUTH
 # lookup; integration gates AUTH at its call site.
 
+_STANDALONE_ENGINES = ("mysql", "postgres")
+_CLUSTER_ENGINES = ("aurora", "aurora-mysql", "aurora-postgresql")
+_INSTANCE_ENGINES = _STANDALONE_ENGINES + _CLUSTER_ENGINES
+
 @dataclass(frozen=True)
 class RdsIamAuthorizationError:
     """A bounded failure code, with no client token or credential material."""
@@ -247,10 +255,11 @@ def authorize_rds_iam_token(
     target = store.get_scoped(account_id, region, resource_identifier)
     if target is None:
         return RdsIamAuthorizationError("ResourceNotFound")
-    engines = ("mysql", "aurora", "aurora-mysql") if resource_kind == "instance" else ("aurora", "aurora-mysql")
+    engines = _INSTANCE_ENGINES if resource_kind == "instance" else _CLUSTER_ENGINES
     if target.get("Engine") not in engines:
         return RdsIamAuthorizationError("UnsupportedEngine")
-    if resource_kind == "instance" and target.get("Engine") != "mysql" and not target.get("DBClusterIdentifier"):
+    if (resource_kind == "instance" and target.get("Engine") not in _STANDALONE_ENGINES
+            and not target.get("DBClusterIdentifier")):
         return RdsIamAuthorizationError("InvalidTarget")
 
     owner = target
@@ -259,7 +268,7 @@ def authorize_rds_iam_token(
         owner = rds._clusters.get_scoped(account_id, region, target["DBClusterIdentifier"])
         if owner is None:
             return RdsIamAuthorizationError("ResourceNotFound")
-        if owner.get("Engine") not in ("aurora", "aurora-mysql"):
+        if owner.get("Engine") not in _CLUSTER_ENGINES:
             return RdsIamAuthorizationError("UnsupportedEngine")
         resource_id_key = "DbClusterResourceId"
     if owner.get("IAMDatabaseAuthenticationEnabled") is not True:
@@ -326,16 +335,16 @@ def _resources(account_id, region, resource_kind, resource_identifier):
 
     store = rds._instances if resource_kind == "instance" else rds._clusters
     target = store.get_scoped(account_id, region, resource_identifier)
-    if not target or target.get("Engine") not in ("mysql", "aurora", "aurora-mysql"):
+    if not target or target.get("Engine") not in _INSTANCE_ENGINES:
         return None, None
     owner = target
     if resource_kind == "instance" and target.get("DBClusterIdentifier"):
         owner = rds._clusters.get_scoped(account_id, region, target["DBClusterIdentifier"])
-        if not owner or owner.get("Engine") not in ("aurora", "aurora-mysql"):
+        if not owner or owner.get("Engine") not in _CLUSTER_ENGINES:
             return None, None
-    elif target.get("Engine") != "mysql" and resource_kind == "instance":
+    elif target.get("Engine") not in _STANDALONE_ENGINES and resource_kind == "instance":
         return None, None
-    if resource_kind == "cluster" and target.get("Engine") == "mysql":
+    if resource_kind == "cluster" and target.get("Engine") in _STANDALONE_ENGINES:
         return None, None
     return target, owner
 
@@ -473,3 +482,83 @@ async def handle(scope, receive, send, *, auth_enabled):
         (b"content-type", b"application/json"), (b"cache-control", b"no-store"),
     ]})
     await send({"type": "http.response.body", "body": b'{"allowed":true}' if allowed else b'{"allowed":false}'})
+
+
+def _ber(tag, content):
+    n = len(content)
+    if n < 128:
+        return bytes([tag, n]) + content
+    width = (n.bit_length() + 7) // 8
+    return bytes([tag, 0x80 | width]) + n.to_bytes(width, "big") + content
+
+
+def _ber_read(data, pos):
+    tag, n = data[pos], data[pos + 1]
+    pos += 2
+    if n & 0x80:
+        width = n & 0x7F
+        if not 1 <= width <= 3:
+            raise ValueError("Bad length")
+        n = int.from_bytes(data[pos:pos + width], "big")
+        pos += width
+    if pos + n > len(data):
+        raise ValueError("Truncated")
+    return tag, data[pos:pos + n], pos + n
+
+
+class _LdapBind(socketserver.BaseRequestHandler):
+    """Answers the simple bind PostgreSQL's ldap method sends. The DN is
+    cap=<capability>,uid=<user> and the password is the token."""
+
+    def handle(self):
+        self.request.settimeout(BODY_TIMEOUT)
+        stream = self.request.makefile("rb")
+        try:
+            head = stream.read(2)
+            if len(head) != 2 or head[0] != 0x30:
+                return
+            extra = head[1] & 0x7F if head[1] & 0x80 else 0
+            if extra > 3:
+                return
+            raw = stream.read(extra)
+            length = int.from_bytes(raw, "big") if extra else head[1]
+            if length > MAX_BODY:
+                return
+            tag, message, _ = _ber_read(head + raw + stream.read(length), 0)
+            tag, message_id, pos = _ber_read(message, 0)
+            tag, bind, _ = _ber_read(message, pos)
+            if tag != 0x60:
+                return
+            _, _, pos = _ber_read(bind, 0)
+            _, dn, pos = _ber_read(bind, pos)
+            tag, password, _ = _ber_read(bind, pos)
+            match = re.fullmatch(rb"cap=([0-9a-f]{64}),uid=(.+)", dn, re.S)
+            allowed = False
+            if tag == 0x80 and match:
+                username = match.group(2).decode("utf-8")
+                payload = {"username": username, "token": password.decode("ascii")}
+                if "\x00" not in username and len(username) <= 256 and len(password) <= 65536:
+                    from ministack.app import AUTH  # the same switch the HTTP broker is called with
+                    allowed = _decision(match.group(1), payload, AUTH)
+        except Exception:
+            return
+        result = _ber(0x0A, b"\x00" if allowed else b"\x31") + _ber(0x04, b"") + _ber(0x04, b"")
+        try:
+            self.request.sendall(_ber(0x30, _ber(0x02, message_id) + _ber(0x61, result)))
+        except OSError:
+            pass
+
+
+_ldap_server = None
+
+
+def ldap_port():
+    """Start the bind listener once; returns its port."""
+    global _ldap_server
+    with _lock:
+        if _ldap_server is None:
+            server = socketserver.ThreadingTCPServer((os.environ.get("BIND_HOST", "0.0.0.0"), 0), _LdapBind)
+            server.daemon_threads = True
+            threading.Thread(target=server.serve_forever, name="ministack-rds-iam-ldap", daemon=True).start()
+            _ldap_server = server
+        return _ldap_server.server_address[1]

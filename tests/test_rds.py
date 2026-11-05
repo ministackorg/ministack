@@ -15799,6 +15799,42 @@ def _pg_connect(endpoint, user="admin", password=PASSWORD, database=DATABASE):
     )
 
 
+@pytest.mark.skipif(
+    not os.environ.get("DOCKER_NETWORK"),
+    reason="DOCKER_NETWORK not set -- live PostgreSQL",
+)
+def test_postgres_iam_auth_rds_iam_member_logs_in_with_token(rds):
+    import psycopg2
+
+    db_id = f"pgiam-{uuid.uuid4().hex[:8]}"
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id, Engine="postgres", DBInstanceClass="db.t3.micro",
+        MasterUsername="admin", MasterUserPassword=PASSWORD, DBName=DATABASE,
+        AllocatedStorage=20, EnableIAMDatabaseAuthentication=True,
+    )
+    try:
+        endpoint = _wait_for_instance(rds, db_id, timeout=180)["Endpoint"]
+        with _pg_connect(endpoint) as conn, conn.cursor() as cursor:
+            conn.autocommit = True
+            cursor.execute("CREATE USER iam_user; GRANT rds_iam TO iam_user")
+        token = rds.generate_db_auth_token(
+            DBHostname=endpoint["Address"], Port=endpoint["Port"], DBUsername="iam_user",
+        )
+        with _pg_connect(endpoint, user="iam_user", password=token) as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT current_user")
+            assert cursor.fetchone() == ("iam_user",)
+
+        rds.modify_db_instance(DBInstanceIdentifier=db_id,
+                               EnableIAMDatabaseAuthentication=False, ApplyImmediately=True)
+        with pytest.raises(psycopg2.OperationalError, match="authentication failed"):
+            _pg_connect(endpoint, user="iam_user", password=token)
+        with _pg_connect(endpoint) as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT current_user")
+            assert cursor.fetchone() == ("admin",)
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
 @contextlib.contextmanager
 def _live_pg_cluster(rds):
     suffix = uuid.uuid4().hex[:10]

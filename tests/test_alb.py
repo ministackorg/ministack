@@ -2105,6 +2105,76 @@ def test_oidc_data_is_an_alb_format_claims_jwt(elbv2, lam):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
 
 
+def test_oidc_data_verifies_against_served_public_key(elbv2, lam):
+    """The kid in x-amzn-oidc-data resolves to a PEM key on the AWS key host and
+    /_ministack/elb/public-keys/; the raw r||s ES256 signature verifies. An
+    unknown kid gets AWS's 403 AccessDenied XML."""
+    import base64
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+    def fetch(kid, aws_host):
+        if aws_host:
+            req = _req.Request(f"{_endpoint}/{kid}", method="GET")
+            req.add_header("Host", "public-keys.auth.elb.us-east-1.amazonaws.com")
+        else:
+            req = _req.Request(f"{_endpoint}/_ministack/elb/public-keys/{kid}", method="GET")
+        try:
+            with _req.urlopen(req) as resp:
+                return resp.status, resp.headers.get("Content-Type"), resp.read()
+        except HTTPError as e:
+            return e.code, e.headers.get("Content-Type"), e.read()
+
+    name = "oidc-dp-key"
+    fn_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    h = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+        "    return {'statusCode': 200, 'headers': {'Content-Type': 'application/json'},\n"
+        "            'body': json.dumps({'data': h.get('x-amzn-oidc-data')})}\n"
+    )
+    lb_arn, tg_arn, l_arn, _ = _alb_setup(elbv2, lam, name, f"{name}-fn", fn_code)
+    try:
+        elbv2.modify_listener(
+            ListenerArn=l_arn,
+            DefaultActions=[
+                _oidc_action(order=1),
+                {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
+            ],
+        )
+        from ministack.services import alb
+
+        session = {"claims": {"sub": "user-78"}, "access_token": "at", "exp": int(time.time()) + 600}
+        cookies = alb._oidc_session_cookies("AWSELBAuthSessionCookie", session, 600, False)
+        jar = "; ".join(c.split(";", 1)[0] for c in cookies)
+        status, _, body = _oidc_get("/private", name, {"Cookie": jar})
+        assert status == 200
+        head, payload, sig = json.loads(body)["data"].split(".")
+        kid = json.loads(base64.urlsafe_b64decode(head))["kid"]
+
+        status, _, pem = fetch(kid, aws_host=True)
+        assert status == 200
+        assert pem.startswith(b"-----BEGIN PUBLIC KEY-----")
+        assert fetch(kid, aws_host=False)[2] == pem
+
+        raw = base64.urlsafe_b64decode(sig)
+        assert len(raw) == 64
+        der = utils.encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big"))
+        serialization.load_pem_public_key(pem).verify(der, f"{head}.{payload}".encode(), ec.ECDSA(hashes.SHA256()))
+
+        unknown = str(_uuid_mod.uuid4())
+        for aws_host in (True, False):
+            assert fetch(unknown, aws_host) == (
+                403,
+                "application/xml",
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            )
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+
+
 # ------------------------------------------------------- the fixed behaviours
 
 def _run_auth(action_cfg, path, query=None, cookie=None):

@@ -3315,7 +3315,7 @@ def test_cloudfront_vpc_origin_create_answers_deploying(cloudfront):
         assert vo["Status"] == "Deploying"
         assert vo["CreatedTime"] == vo["LastModifiedTime"]
         assert vo["VpcOriginEndpointConfig"] == {**cfg, "OriginSslProtocols": {
-            "Quantity": 3, "Items": ["TLSv1", "TLSv1.1", "TLSv1.2"]}}
+            "Quantity": 3, "Items": ["TLSv1", "TLSv1.1", "TLSv1.2"]}, "IpAddressType": "ipv4"}
     finally:
         _vo_delete(cloudfront, vo["Id"])
 
@@ -3830,7 +3830,8 @@ def test_cloudfront_vpc_origin_list_summary(cloudfront, vpc_origin):
     summary = next(s for s in cloudfront.list_vpc_origins()["VpcOriginList"]["Items"] if s["Id"] == vo["Id"])
     assert summary == {"Id": vo["Id"], "Name": vo["VpcOriginEndpointConfig"]["Name"], "Status": "Deployed",
                        "CreatedTime": vo["CreatedTime"], "LastModifiedTime": vo["LastModifiedTime"], "Arn": vo["Arn"],
-                       "AccountId": _VO_ACCOUNT, "OriginEndpointArn": vo["VpcOriginEndpointConfig"]["Arn"]}
+                       "AccountId": _VO_ACCOUNT, "OriginEndpointArn": vo["VpcOriginEndpointConfig"]["Arn"],
+                       "IpAddressType": "ipv4"}
 
 
 @pytest.mark.parametrize("max_items,expected", [

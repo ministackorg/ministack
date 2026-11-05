@@ -421,7 +421,7 @@ class TestResourceBoundAuthorization:
 
     @pytest.mark.parametrize("kind", ["instance", "cluster"])
     def test_unsupported_engine(self, state, kind):
-        state["Engine"] = "postgres"
+        state["Engine"] = "sqlserver-ex"
         rds._clusters.set_scoped(ACCOUNT, REGION, "database", state)
         assert authorize_rds_iam_token(_authz_token(), **{**AUTHZ_ARGS, "resource_kind": kind}).code == "UnsupportedEngine"
 

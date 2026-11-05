@@ -855,7 +855,7 @@ def _create_db_instance(params):
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExistsFault", f"DB instance {db_id} already exists", 400)
+        return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
 
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id) if cluster_id else None
@@ -1635,7 +1635,7 @@ def _failover_db_cluster(params):
         target = next((m for m in members if m.get("DBInstanceIdentifier") == target_id), None)
         if not target or target.get("IsClusterWriter"):
             return _error(
-                "InvalidDBInstanceStateFault",
+                "InvalidDBInstanceState",
                 f"DBInstance {target_id} is not a reader member of DB cluster {cluster_id}.",
                 400,
             )

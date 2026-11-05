@@ -825,7 +825,11 @@ def _restore_state(data, *, resume_runtime=False):
                     else cluster.get("DatabaseName") or "mydb",
                     _container_alive,
                 )
-                if authenticated_ready and _is_mysql_engine(
+                if authenticated_ready and _is_postgres_engine(
+                    cluster.get("Engine", ""),
+                ):
+                    _ensure_pg_iam_auth(container_id, cluster.get("Engine", ""), cluster_id)
+                elif authenticated_ready and _is_mysql_engine(
                     cluster.get("Engine", ""),
                 ):
                     _ensure_mysql_compatibility(
@@ -1147,11 +1151,11 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
     client using sslmode=verify-full with our CA connects. Plaintext clients
     keep working, as they do on AWS without rds.force_ssl.
     """
+    if engine in ("postgres", "aurora-postgresql") or _is_mysql_engine(engine):
+        # IAM database authentication calls back to a host-run MiniStack.
+        container_kwargs.setdefault("extra_hosts", {}).setdefault(
+            "host.docker.internal", "host-gateway")
     if engine not in ("postgres", "aurora-postgresql"):
-        if _is_mysql_engine(engine):
-            # The IAM auth plugin calls back to a host-run MiniStack.
-            container_kwargs.setdefault("extra_hosts", {}).setdefault(
-                "host.docker.internal", "host-gateway")
         return docker_client.containers.run(**container_kwargs)
     # Injecting the certificate needs create -> put_archive -> start, so a
     # client that cannot do that keeps the plain launch and serves plaintext.
@@ -2549,7 +2553,9 @@ def _start_rds_container_for_instance(db_id, instance):
             pass
     instance["_internal_address"] = internal_host
     instance["_internal_port"] = internal_port
-    if _is_mysql_engine(engine):
+    if _is_postgres_engine(engine):
+        _ensure_pg_iam_auth(container.id, engine, instance.get("DBClusterIdentifier") or db_id)
+    elif _is_mysql_engine(engine):
         _ensure_mysql_compatibility(
             container.id,
             internal_host or "127.0.0.1",
@@ -3011,6 +3017,61 @@ def _iam_broker_host():
             pass
     # Mapped to host-gateway on every MySQL container (_run_rds_container).
     return "host.docker.internal"
+
+
+# rds_iam members authenticate through MiniStack's IAM broker; on AWS "IAM
+# authentication takes precedence over password authentication" for them.
+_PG_IAM_AUTH_SCRIPT = """set -eu
+i=0
+until pg_isready -q -h 127.0.0.1 -p 5432; do
+    i=$((i + 1)); [ "$i" -lt 300 ] || exit 1; sleep 1
+done
+psql -v ON_ERROR_STOP=1 -q --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_iam') THEN
+        CREATE ROLE rds_iam;
+    END IF;
+END
+$do$;
+SQL
+{ printf 'host all +rds_iam all ldap ldapserver=%s ldapport=%s ldapprefix="cap=%s,uid=" # ministack-rds-iam\\n' \\
+    "$MINISTACK_IAM_HOST" "$MINISTACK_IAM_PORT" "$MINISTACK_IAM_CAPABILITY"
+  grep -v ' # ministack-rds-iam$' "$PGDATA/pg_hba.conf" || true; } > /tmp/ministack-pg_hba.conf
+cat /tmp/ministack-pg_hba.conf > "$PGDATA/pg_hba.conf"
+rm -f /tmp/ministack-pg_hba.conf
+psql -v ON_ERROR_STOP=1 -q --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \\
+    -c "SELECT pg_reload_conf()" >/dev/null
+"""
+
+
+def _ensure_pg_iam_auth(container_id, engine, resource_id):
+    """Route rds_iam members' logins to the IAM broker (best effort)."""
+    from ministack.core import rds_iam
+
+    docker_client = _get_docker()
+    if not docker_client or not container_id:
+        return False
+    try:
+        container = docker_client.containers.get(container_id)
+        capability = rds_iam.issue_capability(
+            account_id=get_account_id(), region=get_region(),
+            resource_kind="cluster" if engine.startswith("aurora") else "instance",
+            resource_identifier=resource_id,
+        )
+        exit_code, output = container.exec_run(["sh", "-c", _PG_IAM_AUTH_SCRIPT], environment={
+            "MINISTACK_IAM_HOST": _iam_broker_host(),
+            "MINISTACK_IAM_PORT": str(rds_iam.ldap_port()),
+            "MINISTACK_IAM_CAPABILITY": capability,
+        })
+    except Exception as e:
+        logger.warning("RDS: failed to configure IAM authentication for %s: %s", resource_id, e)
+        return False
+    if exit_code != 0:
+        logger.warning("RDS: IAM authentication setup for %s exited %s: %s", resource_id, exit_code,
+                       output.decode(errors="replace") if isinstance(output, bytes) else output)
+        return False
+    return True
 
 
 def _mysql_replication_connection(cluster, *, timeout=None):
@@ -5505,7 +5566,9 @@ def _create_db_instance_impl(p):
                 ready_host, ready_port, engine, readiness_user,
                 readiness_master_pass, readiness_db_name, _container_alive,
             )
-            if database_ready and _is_mysql_engine(engine):
+            if database_ready and _is_postgres_engine(engine):
+                _ensure_pg_iam_auth(container_id, engine, cluster_id or db_id)
+            elif database_ready and _is_mysql_engine(engine):
                 _ensure_mysql_compatibility(
                     container_id,
                     ready_host,
@@ -8138,7 +8201,9 @@ def _start_db_cluster(p):
             ready_host, ready_port, engine, readiness_user,
             readiness_pass, readiness_db, _container_alive,
         )
-        if database_ready and _is_mysql_engine(engine):
+        if database_ready and _is_postgres_engine(engine):
+            _ensure_pg_iam_auth(container_id, engine, cluster_id)
+        elif database_ready and _is_mysql_engine(engine):
             _ensure_mysql_compatibility(
                 container_id,
                 ready_host,

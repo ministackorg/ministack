@@ -33,6 +33,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _request_account_id,
     error_response_json,
     get_account_id,
     get_region,
@@ -102,20 +103,27 @@ def _validate_tag_resource_arn(arn):
     return None
 
 
+def _select_api_owner(account_id, region):
+    """Run the rest of an unsigned data request as the API's own account and region."""
+    _request_account_id.set(account_id)
+    set_request_region(region)
+
+
 def _select_api_region(api_id):
-    """Select the unique stored region for an unsigned GraphQL data request."""
+    """Select the API's account and region for an unsigned GraphQL data request.
+
+    An unsigned request carries no account, and an API key or API ID reaches its API whatever account owns it,
+    so every account is searched."""
     if api_id in _apis:
         return True
-
-    account_id = get_account_id()
     matches = [
-        region
+        (stored_account, region)
         for (stored_account, region, stored_api_id), _api in _apis.all_items()
-        if stored_account == account_id and stored_api_id == api_id
+        if stored_api_id == api_id
     ]
     if len(matches) != 1:
         return False
-    set_request_region(matches[0])
+    _select_api_owner(*matches[0])
     return True
 
 
@@ -133,10 +141,9 @@ def _api_from_graphql_host(headers, query_params):
         return api_id if api_id in _apis else None
     if host_region is None:
         return api_id if _select_api_region(api_id) else None
-    account_id = get_account_id()
     for (stored_account, region, stored_api_id), _api in _apis.all_items():
-        if stored_account == account_id and region == host_region and stored_api_id == api_id:
-            set_request_region(region)
+        if region == host_region and stored_api_id == api_id:
+            _select_api_owner(stored_account, region)
             return api_id
     return None
 
@@ -1397,16 +1404,14 @@ def _resolve_api_by_key(api_key_value, allow_cross_region=True):
             return next(iter(_apis))
         return None
 
-    account_id = get_account_id()
     for (stored_account, region, api_id), keys in _api_keys.all_items():
-        if stored_account != account_id:
-            continue
         for kid, key in keys.items():
             if kid == api_key_value or key.get("id") == api_key_value:
-                set_request_region(region)
+                _select_api_owner(stored_account, region)
                 return api_id
 
     # Fallback: if only one API exists in this account, use its region.
+    account_id = get_account_id()
     matches = [
         (region, api_id)
         for (stored_account, region, api_id), _api in _apis.all_items()

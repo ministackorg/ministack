@@ -231,7 +231,7 @@ def test_sns_subscribe_rejects_invalid_sqs_and_lambda_endpoint_arns(sns, protoco
 
     with pytest.raises(ClientError) as exc:
         sns.subscribe(TopicArn=topic_arn, Protocol=protocol, Endpoint=endpoint)
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_sqs_fanout_does_not_tail_match_foreign_account_endpoint(sns, sqs):
@@ -331,12 +331,12 @@ def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
 def test_sns_topic_tag_apis_reject_invalid_arns(sns):
     arn = sns.create_topic(Name=f"intg-sns-invalid-tags-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
     invalid_cases = [
-        ("not-an-arn", "InvalidParameterException"),
-        ("arn:aws:sns:us-east-1", "InvalidParameterException"),
-        (arn.replace(":sns:", ":sqs:"), "InvalidParameterException"),
-        (arn.replace(":000000000000:", ":111111111111:"), "ResourceNotFoundException"),
-        (arn.replace(":us-east-1:", ":us-west-2:"), "ResourceNotFoundException"),
-        ("arn:aws:sns:us-east-1:000000000000:app/APNS/example", "InvalidParameterException"),
+        ("not-an-arn", "InvalidParameter"),
+        ("arn:aws:sns:us-east-1", "InvalidParameter"),
+        (arn.replace(":sns:", ":sqs:"), "InvalidParameter"),
+        (arn.replace(":000000000000:", ":111111111111:"), "ResourceNotFound"),
+        (arn.replace(":us-east-1:", ":us-west-2:"), "ResourceNotFound"),
+        ("arn:aws:sns:us-east-1:000000000000:app/APNS/example", "InvalidParameter"),
     ]
 
     for bad_arn, expected_code in invalid_cases:
@@ -355,7 +355,7 @@ def test_sns_topic_list_and_untag_reject_invalid_arns(sns):
     ]:
         with pytest.raises(ClientError) as exc:
             operation(ResourceArn="arn:aws:sqs:us-east-1:000000000000:not-a-topic", **kwargs)
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_subscription_attributes(sns):
@@ -791,7 +791,7 @@ def test_sns_fifo_create_topic_without_fifo_suffix_returns_error(sns):
             Name="intg-fifo-no-suffix",
             Attributes={"FifoTopic": "true"},
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_fifo_auto_detect_from_suffix(sns):
@@ -858,7 +858,7 @@ def test_sns_fifo_publish_without_message_group_id_returns_error(sns):
 
     with pytest.raises(ClientError) as exc:
         sns.publish(TopicArn=arn, Message="missing group id")
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_fifo_publish_without_dedup_id_cbd_false_returns_error(sns):
@@ -874,7 +874,7 @@ def test_sns_fifo_publish_without_dedup_id_cbd_false_returns_error(sns):
             Message="missing dedup id",
             MessageGroupId="grp-1",
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 def test_sns_standard_topic_publish_without_message_group_id_succeeds(sns):
@@ -1377,7 +1377,7 @@ def test_sns_fifo_publish_fails_without_dedup_id_after_disabling_cbd(sns):
             Message="should fail with cbd off",
             MessageGroupId="grp-1",
         )
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Code"] == "InvalidParameter"
 
 
 # ---------------------------------------------------------------------------
@@ -2143,7 +2143,7 @@ def test_sns_publish_internal_rejections(sns_internal):
     )
     with pytest.raises(sns_internal.SnsPublishError) as ei:
         sns_internal.publish_internal(fifo, "hi", message_deduplication_id="d1")
-    assert ei.value.code == "InvalidParameterException"
+    assert ei.value.code == "InvalidParameter"
     assert "MessageGroupId" in str(ei.value)
 
     # ...and with a group id but no way to derive a dedup id.
