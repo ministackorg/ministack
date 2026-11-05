@@ -12922,6 +12922,117 @@ Outputs:
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
+def test_cfn_cognito_managed_login_branding(cfn, cognito_idp):
+    """Ref is "{UserPoolId}|{ManagedLoginBrandingId}" and GetAtt ManagedLoginBrandingId the id. Settings
+    and UseCognitoProvidedValues update in place, an asset dropped from the template stays, a String
+    parameter's number reaches Settings as a number, and a new ClientId or UserPoolId replaces the
+    branding (measured on AWS, eu-west-2, 2026-11-04)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    template = f"""
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Radius: {{Type: String, Default: "8.0"}}
+  LogoShown: {{Type: String, Default: "true"}}
+  OnPool: {{Type: String, Default: A}}
+  WithAsset: {{Type: String, Default: "yes"}}
+  Ucpv: {{Type: String, Default: "no"}}
+Conditions:
+  PoolA: !Equals [!Ref OnPool, A]
+  HasAsset: !Equals [!Ref WithAsset, "yes"]
+  UseCognito: !Equals [!Ref Ucpv, "yes"]
+Resources:
+  PoolA:
+    Type: AWS::Cognito::UserPool
+    Properties: {{UserPoolName: cfn-branding-a-{suffix}}}
+  PoolB:
+    Type: AWS::Cognito::UserPool
+    Properties: {{UserPoolName: cfn-branding-b-{suffix}}}
+  ClientA:
+    Type: AWS::Cognito::UserPoolClient
+    Properties: {{UserPoolId: !Ref PoolA, ClientName: a}}
+  ClientB:
+    Type: AWS::Cognito::UserPoolClient
+    Properties: {{UserPoolId: !Ref PoolB, ClientName: b}}
+  Branding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !If [PoolA, !Ref PoolA, !Ref PoolB]
+      ClientId: !If [PoolA, !Ref ClientA, !Ref ClientB]
+      UseCognitoProvidedValues: !If [UseCognito, "true", !Ref AWS::NoValue]
+      Assets: !If
+        - HasAsset
+        - - Category: FORM_LOGO
+            ColorMode: LIGHT
+            Extension: PNG
+            Bytes: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==
+        - !Ref AWS::NoValue
+      Settings: !If
+        - UseCognito
+        - !Ref AWS::NoValue
+        - components:
+            form:
+              borderRadius: !Ref Radius
+              logo:
+                enabled: !Ref LogoShown
+Outputs:
+  PoolA: {{Value: !Ref PoolA}}
+  PoolB: {{Value: !Ref PoolB}}
+  ClientA: {{Value: !Ref ClientA}}
+  ClientB: {{Value: !Ref ClientB}}
+  BrandingRef: {{Value: !Ref Branding}}
+  BrandingId: {{Value: !GetAtt Branding.ManagedLoginBrandingId}}
+"""
+    stack_name = f"cfn-branding-{suffix}"
+
+    def outputs():
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] in ("CREATE_COMPLETE", "UPDATE_COMPLETE"), stack["StackStatus"]
+        return {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+
+    def update(**params):
+        cfn.update_stack(StackName=stack_name, TemplateBody=template,
+                         Parameters=[{"ParameterKey": k, "ParameterValue": v} for k, v in params.items()])
+        return outputs()
+
+    def branding(pool, client):
+        return cognito_idp.describe_managed_login_branding_by_client(UserPoolId=pool, ClientId=client)["ManagedLoginBranding"]
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=template)
+    first = None
+    try:
+        first = outputs()
+        pid, bid = first["PoolA"], first["BrandingId"]
+        assert first["BrandingRef"] == f"{pid}|{bid}"
+        created = branding(pid, first["ClientA"])
+        assert created["ManagedLoginBrandingId"] == bid
+        assert created["Settings"] == {"components": {"form": {"borderRadius": 8.0, "logo": {"enabled": True}}}}
+        assert [a["Category"] for a in created["Assets"]] == ["FORM_LOGO"]
+
+        assert update(Radius="4.0", WithAsset="no")["BrandingId"] == bid
+        kept = branding(pid, first["ClientA"])
+        assert kept["Settings"] == {"components": {"form": {"borderRadius": 4.0, "logo": {"enabled": True}}}}
+        assert [a["Category"] for a in kept["Assets"]] == ["FORM_LOGO"]
+
+        assert update(WithAsset="no", Ucpv="yes")["BrandingId"] == bid
+        cognito_values = branding(pid, first["ClientA"])
+        assert cognito_values["UseCognitoProvidedValues"] is True
+        assert "Settings" not in cognito_values
+
+        moved = update(WithAsset="no", Ucpv="yes", OnPool="B")
+        assert moved["BrandingId"] != bid
+        assert moved["BrandingRef"] == f"{first['PoolB']}|{moved['BrandingId']}"
+        assert branding(first["PoolB"], first["ClientB"])["Assets"] == []
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.describe_managed_login_branding(UserPoolId=pid, ManagedLoginBrandingId=bid)
+        assert exc.value.response["Error"]["Message"] == "ManagedLoginBranding does not exist."
+    finally:
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+    if first:
+        with pytest.raises(ClientError):
+            cognito_idp.describe_user_pool(UserPoolId=first["PoolB"])
+
+
 def test_cfn_cognito_user_pool_group(cfn, cognito_idp):
     """CFN AWS::Cognito::UserPoolGroup creates a group whose Ref resolves to
     its GroupName, matching real AWS, and admin_add_user_to_group can then
