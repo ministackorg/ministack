@@ -3079,3 +3079,20 @@ def test_kms_key_arn_from_another_account(auth_enabled):
     with pytest.raises(ClientError) as exc:
         other.encrypt(KeyId=closed["Arn"].replace(":us-east-1:", ":us-west-2:"), Plaintext=b"x")
     assert exc.value.response["Error"] == {"Code": "NotFoundException", "Message": "Invalid arn us-west-2"}
+
+
+def test_kms_aws_s3_alias_is_listed_before_its_key_and_describe_key_creates_it():
+    """Recorded on AWS (sa-east-1, us-west-1, us-west-2): ListAliases names alias/aws/s3 without a target
+    before the key exists; DescribeKey of alias/aws/s3 creates the AWS managed key and the alias then targets it."""
+    import random
+    account = "".join(random.choices("123456789", k=12))
+    kms = boto3.client("kms", endpoint_url=ENDPOINT, region_name="sa-east-1", aws_access_key_id=account,
+                       aws_secret_access_key="test")
+    listed = [a for a in kms.list_aliases()["Aliases"] if a["AliasName"] == "alias/aws/s3"]
+    assert listed == [{"AliasName": "alias/aws/s3", "AliasArn": f"arn:aws:kms:sa-east-1:{account}:alias/aws/s3"}]
+    meta = kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]
+    assert meta["KeyManager"] == "AWS"
+    assert meta["Description"] == "Default key that protects my S3 objects when no other key is defined"
+    listed = [a for a in kms.list_aliases()["Aliases"] if a["AliasName"] == "alias/aws/s3"]
+    assert [a["TargetKeyId"] for a in listed] == [meta["KeyId"]]
+    assert kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]["KeyId"] == meta["KeyId"]
