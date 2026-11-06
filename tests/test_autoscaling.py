@@ -2747,7 +2747,9 @@ def _raw_query(action, region="us-east-1", pairs=(), **params):
 
 def _raw_error(body):
     import re
-    return tuple(re.search(f"<{tag}>(.*?)</{tag}>", body, re.S).group(1) for tag in ("Type", "Code", "Message"))
+    found = {tag: re.search(f"<{tag}>(.*?)</{tag}>", body, re.S) for tag in ("Type", "Code", "Message")}
+    return tuple(match.group(1) if match else "" for match in found.values())    # no <Message> element is ''
+
 
 
 _WIRE_PREFIX = "MixedInstancesPolicy.LaunchTemplate."
@@ -2960,7 +2962,7 @@ def test_asg_more_than_40_overrides_on_create(autoscaling, plain_and_mip_groups,
                    "LaunchTemplate.Version": "$Latest"}, "ValidationError",
                   "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
                   "MixedInstancesPolicy parameter.")
-    _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"), _wire_policy(name, {**_typed(*range(1, 41)), 60: _IT}),
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"), _wire_policy(name, _typed(*range(1, 41), 60)),
                   _MALFORMED, _sparse(20))                                          # i-c-41-sparse-1-40-and-60
     # edges6 c6-41-dense-bad-subnet, -missing-base-lt, -missing-override-lt, -neither-at-41, -weights-some
     _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"),
@@ -2970,10 +2972,13 @@ def test_asg_more_than_40_overrides_on_create(autoscaling, plain_and_mip_groups,
                   "ValidationError", count)
     spec = {"LaunchTemplateSpecification.LaunchTemplateName": "no-such-lt-edges6",
             "LaunchTemplateSpecification.Version": "$Latest"}
-    for overrides in ({**_typed(*range(1, 41)), 41: spec},                       # c6-41-neither-at-41
+    existing = {"LaunchTemplateSpecification.LaunchTemplateName": name,
+                "LaunchTemplateSpecification.Version": "$Latest"}
+    weights = {1: "2", 5: "6", 17: "4", 33: "6", 41: "7"}
+    for overrides in ({**_typed(*range(1, 41)), 41: existing},                   # c6-41-neither-at-41
                       {**_typed(*range(1, 42)), 41: {**_typed(41)[41], **spec}},  # c6-41-dense-missing-override-lt
-                      {**_typed(*range(1, 42)), 1: {**_typed(1)[1], "WeightedCapacity": "2"},
-                       41: {**_typed(41)[41], "WeightedCapacity": "7"}}):          # c6-41-weights-some
+                      {number: {**members, **({"WeightedCapacity": weights[number]} if number in weights else {})}
+                       for number, members in _typed(*range(1, 42)).items()}):    # c6-41-weights-some
         _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"), _wire_policy(name, overrides),
                       "ValidationError", count)
 
@@ -2992,6 +2997,7 @@ def test_asg_more_than_40_overrides_on_update(autoscaling, plain_and_mip_groups,
     spec = {"LaunchTemplateSpecification.LaunchTemplateName": name,
             "LaunchTemplateSpecification.Version": "$Latest"}
     bogus = {"DesiredCapacityType": "bogus"}
+    weights = {1: "2", 5: "6", 17: "4", 33: "6", 41: "7"}
     cases = [
         (mip, dense41, {}),                                                           # u6-41-dense-mip
         (_uid("asg-missing"), dense41, {}),                                           # u6-41-dense-missing-group
@@ -3000,9 +3006,9 @@ def test_asg_more_than_40_overrides_on_update(autoscaling, plain_and_mip_groups,
         (_uid("asg-missing"), dense41, bogus),                                        # u6-41-dense-bogus-dct-missing
         (mip, {**_typed(*range(1, 41)), 41: _typed(1)[1]}, {}),                       # u6-41-dup-first-last
         (mip, {**_typed(*range(1, 41)), 41: spec}, {}),                               # u6-41-neither-at-41
-        (mip, {**dense41, 3: {"InstanceType": _TYPES[2], **requirements}}, {}),  # u6-41-ir-at-3-mix
-        (mip, {**dense41, 1: {**dense41[1], "WeightedCapacity": "2"},
-               41: {**dense41[41], "WeightedCapacity": "7"}}, {}),                    # u6-41-weights-some
+        (mip, {**dense41, 3: requirements}, {}),                                      # u6-41-ir-at-3-mix
+        (mip, {number: {**members, **({"WeightedCapacity": weights[number]} if number in weights else {})}
+               for number, members in dense41.items()}, {}),                          # u6-41-weights-some
         (mip, dense41, {"MinSize": "5", "MaxSize": "1"}),                             # u6-41-dense-min5-max1
     ]
     for group, overrides, extra in cases:
@@ -3014,7 +3020,7 @@ def test_asg_more_than_40_overrides_on_update(autoscaling, plain_and_mip_groups,
                   {**_wire_policy(name, dense41), "LaunchTemplate.LaunchTemplateName": name,
                    "LaunchTemplate.Version": "$Latest"}, "ValidationError", _SOURCE)
     # u6-41-sparse-1-40-and-60: the index error comes first
-    _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name, {**_typed(*range(1, 41)), 60: _IT}),
+    _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name, _typed(*range(1, 41), 60)),
                   _MALFORMED, _sparse(20))
     # u6-41-dense-longname-256: the name constraint comes first
     long_name = "x" * 256
@@ -3074,8 +3080,10 @@ def test_asg_index_errors_come_before_the_name_constraint_and_the_source_check(a
     for action in ("CreateAutoScalingGroup", "UpdateAutoScalingGroup"):
         for index, message in ((0, zero), (60, _sparse(59))):
             _wire_refusal(action, long_name, _wire_policy(name, {index: _IT}), _MALFORMED, message)
-        _wire_refusal(action, long_name, _wire_policy(name, {1: _IT}), "ValidationError", length)    # -control
     template = {"LaunchTemplate.LaunchTemplateName": name, "LaunchTemplate.Version": "$Latest"}
+    _wire_refusal("CreateAutoScalingGroup", long_name, template, "ValidationError", length)    # r-c-long-name-control
+    status, body = _raw_query("UpdateAutoScalingGroup", AutoScalingGroupName=long_name, MinSize="0")
+    assert (status, *_raw_error(body)) == (400, "Sender", "ValidationError", length)          # r-u-long-name-control
     for index, message in ((0, zero), (60, _sparse(59))):
         _wire_refusal("UpdateAutoScalingGroup", mip, {**_wire_policy(name, {index: _IT}), **template},
                       _MALFORMED, message)                                         # s-u-lt-mip-idx0, -idx60
@@ -3107,10 +3115,11 @@ def test_asg_repeated_override_key_and_blank_weight_do_not_crash(autoscaling, pl
 def test_asg_non_numeric_requirement_value_is_malformed_input(autoscaling, plain_and_mip_groups,
                                                               capacity_type_templates):
     """#2607 (edges4 v-c-memory-max-abc, v-u-memory-max-abc, v-u-vcpu-min-abc): AWS answers MalformedInput with an
-    empty message, where MiniStack ended in a server error."""
+    no <Message> element, where MiniStack ended in a server error."""
     _, mip = plain_and_mip_groups
     name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
-    requirements = {"InstanceRequirements.VCpuCount.Min": "1", "InstanceRequirements.MemoryMiB.Min": "512"}
+    requirements = {"InstanceRequirements.VCpuCount.Min": "1", "InstanceRequirements.VCpuCount.Max": "2",
+                    "InstanceRequirements.MemoryMiB.Min": "512"}
     for action, group, member, value in (("CreateAutoScalingGroup", _uid("asg-abc"), "MemoryMiB.Max", "abc"),
                                          ("UpdateAutoScalingGroup", mip, "MemoryMiB.Max", "abc"),
                                          ("UpdateAutoScalingGroup", mip, "VCpuCount.Min", "abc")):
@@ -3139,7 +3148,7 @@ def test_asg_non_numeric_wire_values_are_malformed_input(autoscaling, plain_and_
     """#2607 (edges7 b7-*, g7-*): every numeric InstanceRequirements field and MinSize, MaxSize and DesiredCapacity
     answer MalformedInput for a non-numeric value, ahead of the DesiredCapacityType enum, the group name length
     constraint and the group lookup on update. A blank VCpuCount.Min has its own message."""
-    _, mip = plain_and_mip_groups
+    plain, mip = plain_and_mip_groups
     name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
     fields = ("VCpuCount.Max", "MemoryGiBPerVCpu.Min", "TotalLocalStorageGB.Min", "NetworkInterfaceCount.Min",
               "BaselineEbsBandwidthMbps.Min", "AcceleratorCount.Min", "VCpuCount.Min")
@@ -3147,12 +3156,14 @@ def test_asg_non_numeric_wire_values_are_malformed_input(autoscaling, plain_and_
         for field in fields:
             requirements = {**_IR_BASE, f"InstanceRequirements.{field}": "abc"}
             _wire_refusal(action, group, _wire_policy(name, {1: requirements}), _MALFORMED, "")
-        for size in ("MinSize", "MaxSize", "DesiredCapacity"):        # g7-*
-            _wire_refusal(action, group, {**_wire_policy(name, {1: _IT}), size: "abc"}, _MALFORMED, "")
+    plain_template = {"LaunchTemplate.LaunchTemplateName": name, "LaunchTemplate.Version": "$Latest"}
+    for action, group in (("CreateAutoScalingGroup", _uid("asg-abc")), ("UpdateAutoScalingGroup", plain)):
+        for size in ("MinSize", "MaxSize", "DesiredCapacity"):        # g7-create-*, g7-update-* (plain LaunchTemplate)
+            _wire_refusal(action, group, {**plain_template, size: "abc"}, _MALFORMED, "")
     bad = {1: {**_IR_BASE, "InstanceRequirements.VCpuCount.Min": "abc"}}
     _wire_refusal("CreateAutoScalingGroup", _uid("asg-abc"), {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"},
                   _MALFORMED, "")                                    # b7-create-vcpumin-abc-bogus-dct
-    _wire_refusal("CreateAutoScalingGroup", "g" * 256, {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"},
+    _wire_refusal("CreateAutoScalingGroup", "x" * 256, {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"},
                   _MALFORMED, "")                                    # b7-create-long256-vcpumin-abc-bogus-dct
     _wire_refusal("UpdateAutoScalingGroup", _uid("asg-missing"),
                   {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"}, _MALFORMED, "")

@@ -208,8 +208,10 @@ def _xml(status, root_tag, inner):
 def _error(code, message, status=400):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if status < 500 else "Receiver"
+    # An empty message has no <Message> element (AWS MalformedInput for a non-numeric value).
+    message_xml = f"<Message>{escape(message)}</Message>" if message else ""
     body = (f'<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">'
-            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{escape(message)}</Message></Error>'
+            f'<Error><Type>{fault_type}</Type><Code>{code}</Code>{message_xml}</Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
