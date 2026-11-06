@@ -6299,6 +6299,23 @@ def _describe_events(p):
     return _xml(200, "DescribeEventsResponse", f"<DescribeEventsResult><Events>{members}</Events>{next_marker}</DescribeEventsResult>")
 
 
+def _reboot_credentials(instance, cluster):
+    """Credentials the restarted database accepts.
+
+    A cluster member copies the master password when it attaches, but
+    ModifyDBCluster updates only the cluster. Reading the member's copy after a
+    rotation never authenticates, so the reboot never completes. A rotation
+    still pending has not reached the database, which keeps the old password.
+    """
+    user = instance.get("MasterUsername", "root")
+    password = instance.get("_MasterUserPassword", "password")
+    if cluster:
+        user = cluster.get("MasterUsername", user)
+        pending = cluster.get("_pending_master_password_rotation")
+        password = pending["old_password"] if pending else cluster.get("_MasterUserPassword", password)
+    return user, password
+
+
 def _finish_instance_reboot(instance, cluster):
     db_id = instance["DBInstanceIdentifier"]
 
@@ -6324,10 +6341,10 @@ def _finish_instance_reboot(instance, cluster):
             endpoint = instance.get("Endpoint", {})
             host = instance.get("_internal_address") or "127.0.0.1"
             port = instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port")
+            user, password = _reboot_credentials(instance, cluster)
             if not _wait_for_database_ready(
                 host, port, instance.get("Engine", "mysql"),
-                instance.get("MasterUsername", "root"),
-                instance.get("_MasterUserPassword", "password"),
+                user, password,
                 instance.get("DBName"), alive,
             ):
                 raise RuntimeError("database stopped before reboot readiness")

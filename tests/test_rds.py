@@ -5319,6 +5319,35 @@ def test_rds_reboot_does_not_resurrect_a_replaced_instance(monkeypatch, reboot_i
     assert reboot_instance["DBInstanceStatus"] == "rebooting"
 
 
+def test_rds_reboot_authenticates_cluster_member_with_rotated_password(monkeypatch, reboot_instance):
+    """A member keeps its attach-time password copy; ModifyDBCluster rotates only the cluster's."""
+    cluster = {"DBClusterIdentifier": "reboot-cluster", "MasterUsername": "admin", "_MasterUserPassword": "rotated"}
+    reboot_instance.update({"_shared_cluster_id": "reboot-cluster", "_MasterUserPassword": "stale"})
+    seen = []
+
+    def ready(host, port, engine, user, password, db_name, alive):
+        seen.append((user, password))
+        return True
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None, reload=lambda: None, status="running")
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    monkeypatch.setattr(_imm_rds, "_end_mysql_global_instance_mutation", lambda cluster: None)
+    monkeypatch.setattr(_imm_rds, "_apply_deferred_global_writer_alias", lambda cluster: None)
+
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert seen == [("admin", "rotated")]
+    assert reboot_instance["DBInstanceStatus"] == "available"
+
+    # A rotation parked while compute was down has not reached the database yet.
+    cluster["_pending_master_password_rotation"] = {"old_password": "previous"}
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert seen[-1] == ("admin", "previous")
+
+
 @pytest.fixture
 def clean_rds_events():
     saved = dict(_imm_rds._events.items())
