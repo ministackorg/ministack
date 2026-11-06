@@ -666,9 +666,10 @@ def _override_numbering_error(members):
 
 
 _OVERRIDE_COUNT_ERROR = "The number of LaunchTemplateOverrides must be fewer than 40."
+_UPDATE_OVERRIDE_COUNT_ERROR = "The number of LaunchTemplateOverrides must be between 1 and 40."
 
 
-def _override_shape_error(p, scan, limit_count=False):
+def _override_shape_error(p, scan, count_error=None):
     """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: a duplicated InstanceType; partial WeightedCapacity; then the entries in index
     order, the first wrong one decides (neither InstanceType nor InstanceRequirements, or both); then InstanceType
     entries mixed with InstanceRequirements ones. A gap in the numbering is an empty override; the shared
@@ -676,10 +677,12 @@ def _override_shape_error(p, scan, limit_count=False):
     members, types, modelled = scan
     if not members or not modelled:
         return None
-    # More than 40 overrides on create (edges5 i-c-41-*, edges4 p-c-dense-41; 40 are accepted). It comes after the
-    # source and DesiredCapacityType errors and before the duplicate check; the update position is not captured.
-    if limit_count and len(members) > 40:
-        return "ValidationError", _OVERRIDE_COUNT_ERROR
+    # More than 40 overrides (40 are accepted). On create (edges5 i-c-41-*, edges4 p-c-dense-41, edges6 c6-41-*) it
+    # comes after the source and DesiredCapacityType errors; on update (edges6 u6-41-*) after the index, name
+    # constraint and source errors and before the DesiredCapacityType enum. Either way before the duplicate,
+    # neither, mix and weight errors and before every lookup.
+    if count_error and len(members) > 40:
+        return "ValidationError", count_error
     if duplicate_error := _duplicate_type_error([types[i] for i in sorted(types)]):
         return "ValidationError", duplicate_error
     entries = [members.get(index, set()) for index in range(1, max(members) + 1)]
@@ -711,7 +714,7 @@ def _create_asg(p):
         return _error("ValidationError", _SOURCE_ERROR)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
-    if shape_error := _override_shape_error(p, scan, limit_count=True):
+    if shape_error := _override_shape_error(p, scan, _OVERRIDE_COUNT_ERROR):
         return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
@@ -845,7 +848,7 @@ def _update_asg(p):
         return _error("ValidationError", _UPDATE_SOURCE_ERROR)
     # On update every override error, duplicate InstanceTypes included, comes before the DesiredCapacityType
     # enum check (a-* captures; d-u-aa-* carry no enum value).
-    if shape_error := _override_shape_error(p, scan):
+    if shape_error := _override_shape_error(p, scan, _UPDATE_OVERRIDE_COUNT_ERROR):
         return _error(*shape_error)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)

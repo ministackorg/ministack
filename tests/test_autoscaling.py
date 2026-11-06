@@ -2875,7 +2875,7 @@ def _wire_accepted(autoscaling, action, group, params):
 def test_asg_dense_override_lists_are_accepted(autoscaling, plain_and_mip_groups, capacity_type_templates):
     """#2607 (edges4 p-c-dense-10, -11, -12, -13, -20, -40, p-u-dense-12, p-u-dense-40, p-describe-after-dense): a
     list numbered 1..N without gaps is never sparse, up to the 40 overrides AWS takes. 41 are refused on create
-    (test_asg_more_than_40_overrides_on_create); on update the limit is not captured."""
+    (test_asg_more_than_40_overrides_on_create) and on update (test_asg_more_than_40_overrides_on_update)."""
     _, mip = plain_and_mip_groups
     name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
     for count in (10, 11, 12, 13, 20, 40):
@@ -2940,8 +2940,9 @@ def test_asg_first_sparse_gap_is_reported(autoscaling, plain_and_mip_groups, cap
 
 def test_asg_more_than_40_overrides_on_create(autoscaling, plain_and_mip_groups, capacity_type_templates):
     """#2607 (edges5 i-c-41-*, edges4 p-c-dense-41): more than 40 overrides on create is a ValidationError. It
-    comes after the source and DesiredCapacityType errors and the index errors, before the duplicate check. The
-    update position is not captured and not implemented."""
+    comes after the source and DesiredCapacityType errors and the index errors, before the duplicate check; the
+    edges6 c6-* shapes are answered with the count first (MinSize above MaxSize is a known difference: AWS
+    answers the 'Max bound' error before the count and MiniStack has no such check)."""
     name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
     count = "The number of LaunchTemplateOverrides must be fewer than 40."
     dense41 = _typed(*range(1, 42))
@@ -2961,6 +2962,71 @@ def test_asg_more_than_40_overrides_on_create(autoscaling, plain_and_mip_groups,
                   "MixedInstancesPolicy parameter.")
     _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"), _wire_policy(name, {**_typed(*range(1, 41)), 60: _IT}),
                   _MALFORMED, _sparse(20))                                          # i-c-41-sparse-1-40-and-60
+    # edges6 c6-41-dense-bad-subnet, -missing-base-lt, -missing-override-lt, -neither-at-41, -weights-some
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"),
+                  {**_wire_policy(name, dense41), "VPCZoneIdentifier": "subnet-0123456789abcdef0"},
+                  "ValidationError", count)
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"), _wire_policy("no-such-lt-edges6", dense41),
+                  "ValidationError", count)
+    spec = {"LaunchTemplateSpecification.LaunchTemplateName": "no-such-lt-edges6",
+            "LaunchTemplateSpecification.Version": "$Latest"}
+    for overrides in ({**_typed(*range(1, 41)), 41: spec},                       # c6-41-neither-at-41
+                      {**_typed(*range(1, 42)), 41: {**_typed(41)[41], **spec}},  # c6-41-dense-missing-override-lt
+                      {**_typed(*range(1, 42)), 1: {**_typed(1)[1], "WeightedCapacity": "2"},
+                       41: {**_typed(41)[41], "WeightedCapacity": "7"}}):          # c6-41-weights-some
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-n"), _wire_policy(name, overrides),
+                      "ValidationError", count)
+
+
+def test_asg_more_than_40_overrides_on_update(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges6 u6-41-*, u6-40-*): more than 40 overrides on update is a ValidationError worded 'between 1
+    and 40' (create says 'fewer than 40'). It comes after the index, name-constraint and source errors and before
+    the DesiredCapacityType enum, the duplicate, neither, mix and weight errors, the group lookup and any
+    min/max check; 40 are accepted."""
+    plain, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    count = "The number of LaunchTemplateOverrides must be between 1 and 40."
+    dense41 = _typed(*range(1, 42))
+    requirements = {"InstanceRequirements.VCpuCount.Min": "1", "InstanceRequirements.VCpuCount.Max": "2",
+                    "InstanceRequirements.MemoryMiB.Min": "512"}
+    spec = {"LaunchTemplateSpecification.LaunchTemplateName": name,
+            "LaunchTemplateSpecification.Version": "$Latest"}
+    bogus = {"DesiredCapacityType": "bogus"}
+    cases = [
+        (mip, dense41, {}),                                                           # u6-41-dense-mip
+        (_uid("asg-missing"), dense41, {}),                                           # u6-41-dense-missing-group
+        (plain, dense41, {}),                                                         # u6-41-dense-plain-group
+        (mip, dense41, bogus),                                                        # u6-41-dense-bogus-dct-mip
+        (_uid("asg-missing"), dense41, bogus),                                        # u6-41-dense-bogus-dct-missing
+        (mip, {**_typed(*range(1, 41)), 41: _typed(1)[1]}, {}),                       # u6-41-dup-first-last
+        (mip, {**_typed(*range(1, 41)), 41: spec}, {}),                               # u6-41-neither-at-41
+        (mip, {**dense41, 3: {"InstanceType": _TYPES[2], **requirements}}, {}),  # u6-41-ir-at-3-mix
+        (mip, {**dense41, 1: {**dense41[1], "WeightedCapacity": "2"},
+               41: {**dense41[41], "WeightedCapacity": "7"}}, {}),                    # u6-41-weights-some
+        (mip, dense41, {"MinSize": "5", "MaxSize": "1"}),                             # u6-41-dense-min5-max1
+    ]
+    for group, overrides, extra in cases:
+        params = {"AutoScalingGroupName": group, **extra, **_wire_policy(name, overrides)}
+        status, body = _raw_query("UpdateAutoScalingGroup", **params)
+        assert (status, *_raw_error(body)) == (400, "Sender", "ValidationError", count), group
+    # u6-41-dense-lt-and-mip: the source error comes first
+    _wire_refusal("UpdateAutoScalingGroup", mip,
+                  {**_wire_policy(name, dense41), "LaunchTemplate.LaunchTemplateName": name,
+                   "LaunchTemplate.Version": "$Latest"}, "ValidationError", _SOURCE)
+    # u6-41-sparse-1-40-and-60: the index error comes first
+    _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name, {**_typed(*range(1, 41)), 60: _IT}),
+                  _MALFORMED, _sparse(20))
+    # u6-41-dense-longname-256: the name constraint comes first
+    long_name = "x" * 256
+    _wire_refusal("UpdateAutoScalingGroup", long_name, _wire_policy(name, dense41), "ValidationError",
+                  f"1 validation error detected: Value '{long_name}' at 'autoScalingGroupName' failed to satisfy "
+                  "constraint: Member must have length less than or equal to 255")
+    # u6-40-dup-at-40-control: 40 with a duplicate is the duplicate error
+    _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name, {**_typed(*range(1, 40)), 40: _typed(1)[1]}),
+                  "ValidationError", _dup(_TYPES[0]))
+    # u6-40-dense-accepted-control
+    _wire_accepted(autoscaling, "UpdateAutoScalingGroup", mip, _wire_policy(name, _typed(*range(1, 41))))
+    assert _stored_overrides(autoscaling, mip) == [{"InstanceType": t} for t in _TYPES[:40]]
 
 
 def test_asg_repeated_query_key_stores_the_first_value(autoscaling, plain_and_mip_groups, capacity_type_templates):
