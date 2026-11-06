@@ -5378,6 +5378,41 @@ def test_rds_reboot_keeps_cluster_status_when_another_cluster_loses_a_member(mon
     assert other["DBClusterMembers"] == []
 
 
+def test_rds_reboot_follows_container_to_its_new_address(monkeypatch, reboot_instance):
+    """Docker may give a restarted container a new IP; readiness and endpoints must follow it."""
+    cluster = {"DBClusterIdentifier": "reboot-cluster", "MasterUsername": "admin", "_MasterUserPassword": "pw",
+               "_shared_internal_address": "10.0.0.7", "_shared_internal_port": 3306,
+               "_shared_endpoint": {"Address": "10.0.0.7", "Port": 3306}}
+    reboot_instance.update({"_shared_cluster_id": "reboot-cluster", "_internal_address": "10.0.0.7",
+                            "_internal_port": 3306, "Endpoint": {"Address": "10.0.0.7", "Port": 3306}})
+    sibling = {"DBInstanceIdentifier": "reboot-sibling", "_internal_address": "10.0.0.7",
+               "Endpoint": {"Address": "10.0.0.7", "Port": 3306}}
+    monkeypatch.setitem(_imm_rds._instances, "reboot-sibling", sibling)
+    monkeypatch.setattr(_imm_rds, "_ministack_network", "ms-net")
+    seen = []
+
+    def ready(host, port, engine, user, password, db_name, alive):
+        seen.append((host, port))
+        return True
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None, reload=lambda: None, status="running",
+                                      attrs={"NetworkSettings": {"Networks": {"ms-net": {"IPAddress": "10.0.0.4"}}}})
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    monkeypatch.setattr(_imm_rds, "_end_mysql_global_instance_mutation", lambda cluster: None)
+    monkeypatch.setattr(_imm_rds, "_apply_deferred_global_writer_alias", lambda cluster: None)
+
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert seen == [("10.0.0.4", 3306)]
+    assert reboot_instance["DBInstanceStatus"] == "available"
+    assert reboot_instance["Endpoint"]["Address"] == "10.0.0.4"
+    assert sibling["_internal_address"] == "10.0.0.4" and sibling["Endpoint"]["Address"] == "10.0.0.4"
+    assert cluster["_shared_internal_address"] == "10.0.0.4"
+    assert cluster["_shared_endpoint"]["Address"] == "10.0.0.4"
+
+
 @pytest.fixture
 def clean_rds_events():
     saved = dict(_imm_rds._events.items())
