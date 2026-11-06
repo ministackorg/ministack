@@ -621,6 +621,7 @@ def _scan_overrides(p):
         index, _, rest = key[len(_OVERRIDES_PREFIX):].partition(".")
         if not index.isdigit():
             continue
+        value = _p(p, key)      # a repeated key counts once, as _query_value reads it
         try:
             number = int(index)
         except ValueError:      # more digits than int() converts
@@ -632,6 +633,8 @@ def _scan_overrides(p):
             modelled = False
         elif name == "" and not value:      # a blank member.N= is an entry with no member (edges3 e-u-wire-member1-blank)
             pass
+        elif name == "WeightedCapacity" and not value:     # blank: a field-length error first (edges3 b-c-blank-wc-*)
+            modelled = False
         elif name == "InstanceType":
             types[number] = value
             modelled = modelled and bool(value)
@@ -646,13 +649,19 @@ def _scan_overrides(p):
 
 
 def _override_numbering_error(members):
-    """Index 0 is refused, and so is a highest index N >= 12 (captured, us-east-2, 2026-11-06: edges3
-    t-c-idx-12..20, t-u-idx-12/15/20/21; index 11 gives the shape error, edges2 s-c-idx-11); the count carries
-    thousands separators. Both come before every other check except the group-name constraint (edges3 o-*)."""
+    """Index 0 is refused, and so is a gap that skips 11 or more list elements: with the present indexes sorted
+    ascending and the previous one starting at 1, an index i after p skips i - p (captured, us-east-2, 2026-11-06:
+    single index 12 gives 11, 21 gives 20, {1,60} gives 59, edges4 q-c-*; dense lists up to 40 are accepted, edges4
+    p-c-dense-*). The count carries thousands separators. The first gap in ascending order is reported; which gap AWS
+    reports when several offend is not captured. These errors come before every other check, the group-name
+    constraint and the source check included (edges4 r-*, s-u-*)."""
     if 0 in members:
         return "MalformedInput", "0 is not a valid index"
-    if members and max(members) >= 12:
-        return "MalformedInput", f"Excessively sparse input would skip {max(members) - 1:,} list elements"
+    previous = 1
+    for index in sorted(members):
+        if index - previous >= 11:
+            return "MalformedInput", f"Excessively sparse input would skip {index - previous:,} list elements"
+        previous = index
     return None
 
 
@@ -684,11 +693,11 @@ def _override_shape_error(p, scan):
 
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
-    if constraint_error := _constraint_error(p):
-        return _error("ValidationError", constraint_error)
     scan = _scan_overrides(p)
     if numbering_error := _override_numbering_error(scan[0]):
         return _error(*numbering_error)
+    if constraint_error := _constraint_error(p):
+        return _error("ValidationError", constraint_error)
     sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")] + [
         bool(_p(p, "LaunchConfigurationName"))]
     if sum(sources) > 1 or not (any(sources) or _p(p, "InstanceId")):
@@ -700,7 +709,10 @@ def _create_asg(p):
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
-    mixed, mixed_error = _mixed_instances_policy(p)
+    try:
+        mixed, mixed_error = _mixed_instances_policy(p)
+    except ValueError:      # a non-numeric requirement value (edges4 v-c-memory-max-abc)
+        return _error("MalformedInput", "")
     if mixed_error:
         return _error("ValidationError", mixed_error)
     capacity_type = _p(p, "DesiredCapacityType") or None
@@ -814,11 +826,11 @@ def _describe_asgs(p):
 
 def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
-    if constraint_error := _constraint_error(p):
-        return _error("ValidationError", constraint_error)
     scan = _scan_overrides(p)
     if numbering_error := _override_numbering_error(scan[0]):
         return _error(*numbering_error)
+    if constraint_error := _constraint_error(p):
+        return _error("ValidationError", constraint_error)
     # Any two of LaunchTemplate, MixedInstancesPolicy and LaunchConfigurationName (captured, us-east-2, 2026-11-06:
     # edges3 u-mip-and-lc, u-lt-it-and-lc, u-all-three, u-lt-ir-and-lc-vcpu).
     if sum([_has_member(p, "LaunchTemplate"), _has_member(p, "MixedInstancesPolicy"),
@@ -837,7 +849,10 @@ def _update_asg(p):
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
-    mixed, mixed_error = _mixed_instances_policy(p, asg.get("MixedInstancesPolicy"))
+    try:
+        mixed, mixed_error = _mixed_instances_policy(p, asg.get("MixedInstancesPolicy"))
+    except ValueError:      # a non-numeric requirement value (edges4 v-u-vcpu-min-abc)
+        return _error("MalformedInput", "")
     if mixed_error:
         return _error("ValidationError", mixed_error)
     sent_type = _p(p, "DesiredCapacityType") or None

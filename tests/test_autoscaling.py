@@ -2730,8 +2730,9 @@ def test_asg_update_override_shape_errors_come_before_the_capacity_type_value(au
     assert _stored_overrides(autoscaling, mip) == [it]
 
 
-def _raw_query(action, region="us-east-1", **params):
-    body = urllib.parse.urlencode({"Action": action, "Version": "2011-01-01", **params}).encode()
+def _raw_query(action, region="us-east-1", pairs=(), **params):
+    """POST a Query body; *pairs* are extra (key, value) pairs, which may repeat a key."""
+    body = urllib.parse.urlencode([("Action", action), ("Version", "2011-01-01"), *params.items(), *pairs]).encode()
     req = urllib.request.Request(
         os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566") + "/", data=body, method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded",
@@ -2805,8 +2806,9 @@ def test_asg_override_numbering_gap_is_an_empty_override(autoscaling, plain_and_
 
 def test_asg_override_numbering_errors_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
     """#2607 (edges2 s-c-idx-*, u-u-idx-*, edges d-*-wire-idx-*, edges3 t-c-idx-*, t-u-idx-*): member 0 is not
-    a valid index, and a highest member N >= 12 is excessively sparse; the count is N-1 with thousands
-    separators, whatever members are present. Indexes 2 to 11 give the override shape error."""
+    a valid index, and a single member N >= 12 skips N-1 list elements (the count carries thousands
+    separators). Indexes 2 to 11 give the override shape error. The general rule is in
+    test_asg_sparse_override_shapes_follow_aws."""
     _, mip = plain_and_mip_groups
     name_spec = capacity_type_templates["name_spec"]["LaunchTemplateName"]
     zero = "0 is not a valid index"
@@ -2843,6 +2845,132 @@ def test_asg_override_numbering_errors_follow_aws(autoscaling, plain_and_mip_gro
     )
     for overrides, code, message in update:
         _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name_spec, overrides), code, message)
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+_TYPES = ["t3.nano", "t3.micro", "t3.small", "t3.medium", "t3.large", "t3.xlarge", "t3.2xlarge", "t3a.nano",
+          "t3a.micro", "t3a.small", "t3a.medium", "t3a.large", "t3a.xlarge", "t3a.2xlarge", "m5.large", "m5.xlarge",
+          "m5.2xlarge", "m5.4xlarge", "c5.large", "c5.xlarge", "c5.2xlarge", "c5.4xlarge", "c5.9xlarge", "m5a.large",
+          "m5a.xlarge", "m5a.2xlarge", "m5a.4xlarge", "c5a.large", "c5a.xlarge", "c5a.2xlarge", "c5a.4xlarge",
+          "r5.large", "r5.xlarge", "r5.2xlarge", "r5.4xlarge", "m6i.large", "m6i.xlarge", "m6i.2xlarge",
+          "m6i.4xlarge", "c6i.large", "c6i.xlarge"]
+
+
+def _typed(*indexes):
+    """Overrides at the given member numbers, each with a different InstanceType (edges4 p-*, q-*)."""
+    return {number: {"InstanceType": _TYPES[position]} for position, number in enumerate(indexes)}
+
+
+def _wire_accepted(autoscaling, action, group, params):
+    """Send a captured wire body that AWS accepts; a created group is deleted again."""
+    base = {"AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0"}
+    if action == "CreateAutoScalingGroup":
+        base["AvailabilityZones.member.1"] = "us-east-1a"
+    pairs = params.pop("pairs", ()) if isinstance(params, dict) else ()
+    status, body = _raw_query(action, pairs=pairs, **base, **params)
+    assert (status, body) == (200, "")
+    if action == "CreateAutoScalingGroup":
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=group, ForceDelete=True)
+
+
+def test_asg_dense_override_lists_are_accepted(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges4 p-c-dense-10, -11, -12, -13, -20, -40, p-u-dense-12, p-u-dense-40, p-describe-after-dense): a
+    list numbered 1..N without gaps is never sparse, up to the 40 overrides AWS takes. 41 overrides are refused by
+    AWS (p-c-dense-41, known difference)."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    for count in (10, 11, 12, 13, 20, 40):
+        _wire_accepted(autoscaling, "CreateAutoScalingGroup", _uid("asg-dense"),
+                       _wire_policy(name, _typed(*range(1, count + 1))))
+    for count in (12, 40):
+        _wire_accepted(autoscaling, "UpdateAutoScalingGroup", mip, _wire_policy(name, _typed(*range(1, count + 1))))
+    assert _stored_overrides(autoscaling, mip) == [{"InstanceType": t} for t in _TYPES[:40]]
+
+
+def test_asg_sparse_override_shapes_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges4 q-c-*): with the member numbers sorted, an index that skips 11 or more list elements after the
+    previous one (the first being 1) is excessively sparse and the count of the first such gap is reported;
+    anything less is a gap, an override with neither member. The order the members arrive in does not matter.
+    Which gap AWS reports when several are too wide is not captured."""
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    sparse = (
+        ((1, 13), 12),                       # q-c-1-13
+        ((1, 2, 3, 15), 12),                 # q-c-1-2-3-15
+        ((5, 17), 12),                       # q-c-5-17
+        ((1, 12), 11),                       # q-c-1-12
+    )
+    for indexes, skipped in sparse:
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-q"), _wire_policy(name, _typed(*indexes)), _MALFORMED,
+                      _sparse(skipped))
+    neither = (
+        (1, 11),                             # q-c-1-11
+        (*range(1, 12), 13),                 # q-c-1-11-13
+        (*range(1, 13), 14),                 # q-c-1-12-14
+        tuple(range(2, 14)),                 # q-c-2-13-no1
+        (1, 5, 9, 13, 17, 21, 25),           # q-c-step4-1-25
+    )
+    for indexes in neither:
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-q"), _wire_policy(name, _typed(*indexes)),
+                      "ValidationError", _OVR1)
+    order = (3, 1, 2, *range(12, 3, -1))     # q-c-order-3-1-2-then-12-4: dense, arriving unordered
+    _wire_accepted(autoscaling, "CreateAutoScalingGroup", _uid("asg-q"), _wire_policy(name, _typed(*order)))
+
+
+def test_asg_index_errors_come_before_the_name_constraint_and_the_source_check(autoscaling, plain_and_mip_groups,
+                                                                                capacity_type_templates):
+    """#2607 (edges4 r-c-long-name-idx0, -idx60, -control, r-u-long-name-*, r-u-mipg-idx0, -idx60, s-u-lt-mip-idx0,
+    -idx60, s-u-lt-lc-idx0): the index errors are answered before the group-name length constraint and, on
+    update, before the source error and a missing group."""
+    plain, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    long_name = "a" * 256
+    zero = "0 is not a valid index"
+    length = (f"1 validation error detected: Value '{long_name}' at 'autoScalingGroupName' failed to satisfy "
+              "constraint: Member must have length less than or equal to 255")
+    for action in ("CreateAutoScalingGroup", "UpdateAutoScalingGroup"):
+        for index, message in ((0, zero), (60, _sparse(59))):
+            _wire_refusal(action, long_name, _wire_policy(name, {index: _IT}), _MALFORMED, message)
+        _wire_refusal(action, long_name, _wire_policy(name, {1: _IT}), "ValidationError", length)    # -control
+    template = {"LaunchTemplate.LaunchTemplateName": name, "LaunchTemplate.Version": "$Latest"}
+    for index, message in ((0, zero), (60, _sparse(59))):
+        _wire_refusal("UpdateAutoScalingGroup", mip, {**_wire_policy(name, {index: _IT}), **template},
+                      _MALFORMED, message)                                         # s-u-lt-mip-idx0, -idx60
+        _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name, {index: _IT}), _MALFORMED, message)   # r-u-mipg-*
+    _wire_refusal("UpdateAutoScalingGroup", plain, {
+        **_wire_policy(name, {0: _IT}), **template, "LaunchConfigurationName": "no-such-lc"}, _MALFORMED, zero)
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_repeated_override_key_and_blank_weight_do_not_crash(autoscaling, plain_and_mip_groups,
+                                                                 capacity_type_templates):
+    """#2607 (edges4 t-c-repeat-key, t-u-repeat-key: AWS answers 200; t-u-blank-wc-no-it, t-u-blank-wc-with-it and
+    edges3 b-c-blank-wc-*: AWS answers a field-length error that MiniStack does not reproduce, known difference).
+    Neither request may end in a server error."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    key = _WIRE_PREFIX + "Overrides.member.1.InstanceType"
+    pairs = ((key, "t3.micro"), (key, "t3.small"))
+    _wire_accepted(autoscaling, "CreateAutoScalingGroup", _uid("asg-repeat"), {**_wire_policy(name), "pairs": pairs})
+    _wire_accepted(autoscaling, "UpdateAutoScalingGroup", mip, {**_wire_policy(name), "pairs": pairs})
+    weight = _WIRE_PREFIX + "Overrides.member.1.WeightedCapacity"
+    for instance_type in (None, "t3.micro"):             # t-u-blank-wc-no-it, t-u-blank-wc-with-it
+        params = {**_wire_policy(name), weight: "", **({key: instance_type} if instance_type else {})}
+        status, _ = _raw_query("UpdateAutoScalingGroup", AutoScalingGroupName=mip, MinSize="0", MaxSize="1",
+                               DesiredCapacity="0", **params)
+        assert status == 200
+
+
+def test_asg_non_numeric_requirement_value_is_malformed_input(autoscaling, plain_and_mip_groups,
+                                                              capacity_type_templates):
+    """#2607 (edges4 v-c-memory-max-abc, v-u-memory-max-abc, v-u-vcpu-min-abc): AWS answers MalformedInput with an
+    empty message, where MiniStack ended in a server error."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    requirements = {"InstanceRequirements.VCpuCount.Min": "1", "InstanceRequirements.MemoryMiB.Min": "512"}
+    for action, group, member, value in (("CreateAutoScalingGroup", _uid("asg-abc"), "MemoryMiB.Max", "abc"),
+                                         ("UpdateAutoScalingGroup", mip, "MemoryMiB.Max", "abc"),
+                                         ("UpdateAutoScalingGroup", mip, "VCpuCount.Min", "abc")):
+        _wire_refusal(action, group, _wire_policy(name, {1: {**requirements, f"InstanceRequirements.{member}": value}}),
+                      _MALFORMED, "")
     assert _stored_overrides(autoscaling, mip) == [_IT]
 
 
@@ -3076,12 +3204,14 @@ def test_asg_update_source_error_for_any_two_sources(autoscaling, plain_and_mip_
     """#2607 (edges3 u-mip-and-lc, u-lt-it-and-lc, u-all-three, u-lt-ir-and-lc-vcpu)."""
     t, (plain, mip) = capacity_type_templates, plain_and_mip_groups
     spec, policy, lc = t["name_spec"], _policy(t["name_spec"], [_IT]), "msc-2607-no-such-lc"
-    for kwargs in ({"MixedInstancesPolicy": policy, "LaunchConfigurationName": lc},
-                   {"LaunchTemplate": spec, "LaunchConfigurationName": lc},
-                   {"LaunchTemplate": spec, "MixedInstancesPolicy": policy, "LaunchConfigurationName": lc},
-                   {"LaunchTemplate": t["ir_name_spec"], "LaunchConfigurationName": lc,
-                    "DesiredCapacityType": "vcpu"}):
-        _update_refused(autoscaling, mip, "ValidationError", _SOURCE, **kwargs)
+    # u-lt-it-and-lc and u-lt-ir-and-lc-vcpu ran on the plain group, u-mip-and-lc and u-all-three on the policy group
+    for group, kwargs in (
+            (mip, {"MixedInstancesPolicy": policy, "LaunchConfigurationName": lc}),
+            (plain, {"LaunchTemplate": spec, "LaunchConfigurationName": lc}),
+            (mip, {"LaunchTemplate": spec, "MixedInstancesPolicy": policy, "LaunchConfigurationName": lc}),
+            (plain, {"LaunchTemplate": t["ir_name_spec"], "LaunchConfigurationName": lc,
+                     "DesiredCapacityType": "vcpu"})):
+        _update_refused(autoscaling, group, "ValidationError", _SOURCE, **kwargs)
     assert _stored_overrides(autoscaling, mip) == [_IT]
 
 
@@ -3089,20 +3219,26 @@ def test_asg_update_empty_overrides_and_blank_member(autoscaling, plain_and_mip_
     """#2607 (edges3 e-u-overrides-empty-list, e-u-overrides-empty-struct, e-u-wire-overrides-blank accepted;
     e-u-wire-member1-blank refused as an entry with neither member)."""
     spec, (_, mip) = capacity_type_templates["name_spec"], plain_and_mip_groups
+    def unchanged():       # e-describe-after-empty-list, -empty-struct, -wire: the stored override is untouched
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[mip])["AutoScalingGroups"][0]
+        assert (_stored_overrides(autoscaling, mip), group["MinSize"], group["MaxSize"]) == ([_IT], 0, 1)
+
     for overrides in ([], [{}]):
         autoscaling.update_auto_scaling_group(AutoScalingGroupName=mip,
                                               MixedInstancesPolicy=_policy(spec, overrides))
+        unchanged()
     name = spec["LaunchTemplateName"]
     status, _ = _raw_query("UpdateAutoScalingGroup", AutoScalingGroupName=mip,
                            **{**_wire_policy(name), _WIRE_PREFIX + "Overrides": ""})
     assert status == 200
     _wire_refusal("UpdateAutoScalingGroup", mip, {**_wire_policy(name), _WIRE_PREFIX + "Overrides.member.1": ""},
                   "ValidationError", _OVR1)
+    unchanged()
 
 
 def test_asg_update_override_shape_comes_before_size_checks(autoscaling, plain_and_mip_groups,
                                                               capacity_type_templates):
-    """#2607 (edges3 c-u-min-gt-max-lts, c-u-min-neg-lts, c-u-name256-bad-ov, with -nx variants)."""
+    """#2607 (edges3 c-u-min-gt-max-lts, c-u-min-neg-lts, c-u-name256-bad-ov)."""
     spec, (_, mip) = capacity_type_templates["name_spec"], plain_and_mip_groups
     bad = _policy(spec, [{"LaunchTemplateSpecification": spec}])
     for group in (mip, _uid("asg-nx-never-created")):
