@@ -592,8 +592,13 @@ _LTNC_ERROR = ("The launch template is not compatible with the configuration of 
 
 
 def _duplicate_type_error(types):
-    """AWS names every InstanceType sent more than once, in first-seen order (captured, us-east-2, 2026-11-06)."""
-    duplicated = [t for t in dict.fromkeys(types) if types.count(t) > 1]
+    """AWS names every InstanceType sent more than once, in the order each is first detected as a repeat, that is
+    at its second occurrence (captured, us-east-2, 2026-11-06: edges3 d-c-abba, d-c-baab, d-c-abccb)."""
+    seen, duplicated = set(), []
+    for t in types:
+        if t in seen and t not in duplicated:
+            duplicated.append(t)
+        seen.add(t)
     if not duplicated:
         return None
     return ("Cannot add same instance type override more than once. Remove these duplicates from the request "
@@ -623,8 +628,10 @@ def _scan_overrides(p):
         parts = rest.split(".")
         name = parts[0]
         members.setdefault(number, set()).add(name)
-        if not rest or (name in ("InstanceRequirements", "LaunchTemplateSpecification") and len(parts) == 1):
+        if (not rest and value) or (name in ("InstanceRequirements", "LaunchTemplateSpecification") and len(parts) == 1):
             modelled = False
+        elif name == "" and not value:      # a blank member.N= is an entry with no member (edges3 e-u-wire-member1-blank)
+            pass
         elif name == "InstanceType":
             types[number] = value
             modelled = modelled and bool(value)
@@ -639,24 +646,22 @@ def _scan_overrides(p):
 
 
 def _override_numbering_error(members):
-    """Index 0 is refused, and so is a highest index N with N-1 >= 20 (captured, us-east-2, 2026-11-05/06; the
-    count carries thousands separators). Indexes 12 to 20 are not captured and are accepted here."""
+    """Index 0 is refused, and so is a highest index N >= 12 (captured, us-east-2, 2026-11-06: edges3
+    t-c-idx-12..20, t-u-idx-12/15/20/21; index 11 gives the shape error, edges2 s-c-idx-11); the count carries
+    thousands separators. Both come before every other check except the group-name constraint (edges3 o-*)."""
     if 0 in members:
         return "MalformedInput", "0 is not a valid index"
-    if members and max(members) - 1 >= 20:
+    if members and max(members) >= 12:
         return "MalformedInput", f"Excessively sparse input would skip {max(members) - 1:,} list elements"
     return None
 
 
-def _override_shape_error(p):
-    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: the numbering
-    (index 0, a sparse index); a duplicated InstanceType; partial WeightedCapacity; then the entries in index
+def _override_shape_error(p, scan):
+    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: a duplicated InstanceType; partial WeightedCapacity; then the entries in index
     order, the first wrong one decides (neither InstanceType nor InstanceRequirements, or both); then InstanceType
     entries mixed with InstanceRequirements ones. A gap in the numbering is an empty override; the shared
     _query_value parser is left alone."""
-    members, types, modelled = _scan_overrides(p)
-    if numbering_error := _override_numbering_error(members):
-        return numbering_error
+    members, types, modelled = scan
     if not members or not modelled:
         return None
     if duplicate_error := _duplicate_type_error([types[i] for i in sorted(types)]):
@@ -681,13 +686,16 @@ def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
     if constraint_error := _constraint_error(p):
         return _error("ValidationError", constraint_error)
+    scan = _scan_overrides(p)
+    if numbering_error := _override_numbering_error(scan[0]):
+        return _error(*numbering_error)
     sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")] + [
         bool(_p(p, "LaunchConfigurationName"))]
     if sum(sources) > 1 or not (any(sources) or _p(p, "InstanceId")):
         return _error("ValidationError", _SOURCE_ERROR)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
-    if shape_error := _override_shape_error(p):
+    if shape_error := _override_shape_error(p, scan):
         return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
@@ -808,14 +816,17 @@ def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
     if constraint_error := _constraint_error(p):
         return _error("ValidationError", constraint_error)
-    # LaunchTemplate with MixedInstancesPolicy or with LaunchConfigurationName; MixedInstancesPolicy with
-    # LaunchConfigurationName is not captured on update.
-    if _has_member(p, "LaunchTemplate") and (_has_member(p, "MixedInstancesPolicy")
-                                             or _p(p, "LaunchConfigurationName")):
+    scan = _scan_overrides(p)
+    if numbering_error := _override_numbering_error(scan[0]):
+        return _error(*numbering_error)
+    # Any two of LaunchTemplate, MixedInstancesPolicy and LaunchConfigurationName (captured, us-east-2, 2026-11-06:
+    # edges3 u-mip-and-lc, u-lt-it-and-lc, u-all-three, u-lt-ir-and-lc-vcpu).
+    if sum([_has_member(p, "LaunchTemplate"), _has_member(p, "MixedInstancesPolicy"),
+            bool(_p(p, "LaunchConfigurationName"))]) > 1:
         return _error("ValidationError", _UPDATE_SOURCE_ERROR)
     # On update every override error, duplicate InstanceTypes included, comes before the DesiredCapacityType
     # enum check (a-* captures; d-u-aa-* carry no enum value).
-    if shape_error := _override_shape_error(p):
+    if shape_error := _override_shape_error(p, scan):
         return _error(*shape_error)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)

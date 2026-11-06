@@ -2804,9 +2804,9 @@ def test_asg_override_numbering_gap_is_an_empty_override(autoscaling, plain_and_
 
 
 def test_asg_override_numbering_errors_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
-    """#2607 (edges2 s-c-idx-*, u-u-idx-*, edges d-*-wire-idx-*): member 0 is not a valid index, and a highest
-    member N with N-1 >= 20 is excessively sparse; the count is N-1 with thousands separators, whatever members
-    are present. Indexes 2 to 11 give the override shape error."""
+    """#2607 (edges2 s-c-idx-*, u-u-idx-*, edges d-*-wire-idx-*, edges3 t-c-idx-*, t-u-idx-*): member 0 is not
+    a valid index, and a highest member N >= 12 is excessively sparse; the count is N-1 with thousands
+    separators, whatever members are present. Indexes 2 to 11 give the override shape error."""
     _, mip = plain_and_mip_groups
     name_spec = capacity_type_templates["name_spec"]["LaunchTemplateName"]
     zero = "0 is not a valid index"
@@ -2814,6 +2814,7 @@ def test_asg_override_numbering_errors_follow_aws(autoscaling, plain_and_mip_gro
         ({0: _IT}, zero),                                   # d-c-wire-idx-0
         ({0: _IT, 1: _SMALL}, zero),                        # s-c-idx-0-and-1
         ({50: _IT}, _sparse(49)),                           # d-c-wire-idx-50
+        *(({number: _IT}, _sparse(number - 1)) for number in range(12, 21)),   # t-c-idx-12 ... t-c-idx-20
         ({21: _IT}, _sparse(20)),                           # s-c-idx-21
         ({33: _IT}, _sparse(32)),                           # s-c-idx-33
         ({49: _IT}, _sparse(48)),                           # s-c-idx-49
@@ -2832,6 +2833,11 @@ def test_asg_override_numbering_errors_follow_aws(autoscaling, plain_and_mip_gro
     update = (
         ({0: _IT}, _MALFORMED, zero),                       # u-u-idx-0, d-u-wire-idx-0
         ({50: _IT}, _MALFORMED, _sparse(49)),               # u-u-idx-50, d-u-wire-idx-50
+        ({11: _IT}, "ValidationError", _OVR1),              # t-u-idx-11
+        ({12: _IT}, _MALFORMED, _sparse(11)),               # t-u-idx-12
+        ({15: _IT}, _MALFORMED, _sparse(14)),               # t-u-idx-15
+        ({20: _IT}, _MALFORMED, _sparse(19)),               # t-u-idx-20
+        ({21: _IT}, _MALFORMED, _sparse(20)),               # t-u-idx-21
         ({2: _IT}, "ValidationError", _OVR1),               # u-u-idx-2
         ({3: _IT}, "ValidationError", _OVR1),               # u-u-idx-3
     )
@@ -2864,7 +2870,7 @@ def test_asg_source_check_with_launch_configuration(autoscaling, plain_and_mip_g
 
 
 def test_asg_duplicate_instance_types_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
-    """#2607 (edges2 d-c-*, d-u-*): the duplicated InstanceTypes are named once each, in first-seen order, on
+    """#2607 (edges2 d-c-*, d-u-*): the duplicated InstanceTypes are named once each, in the order their repeats are detected (edges3 test below), on
     create and on update; on update before the group lookup. On create they come after the DesiredCapacityType
     value and the source error and before the base and override template lookups."""
     t, (_, mip) = capacity_type_templates, plain_and_mip_groups
@@ -2986,3 +2992,141 @@ def test_asg_template_lookup_stays_in_the_request_region(autoscaling, capacity_t
             other.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-region"), MinSize=0, MaxSize=1,
                                             AvailabilityZones=["eu-west-1a"], **kwargs)
         _assert_refusal(exc, "ValidationError", message)
+
+
+def _update_refused(autoscaling, group, code, message, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=group, **kwargs)
+    _assert_refusal(exc, code, message)
+
+
+def test_asg_index_errors_come_before_every_other_check(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges3 o-c-idx0-bogus-dct, o-c-idx60-bogus-dct, o-c-idx0-lt-and-mip, o-c-idx60-lt-and-mip,
+    o-c-idx0-missing-base, o-c-idx60-missing-base, o-c-idx0-dup-pair, o-c-idx0-and-60, o-u-idx0-bogus-dct,
+    o-u-idx60-bogus-dct, -nx variants): an index error wins over the DesiredCapacityType value, the source
+    error, a missing base template and duplicates, on create and update, existing group or not."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    never = _uid("lt-never-created")
+    zero, sparse60 = "0 is not a valid index", _sparse(59)
+    for index, message in ((0, zero), (60, sparse60)):
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"), {
+            **_wire_policy(name, {index: _IT}), "DesiredCapacityType": "bogus"}, _MALFORMED, message)
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"), {
+            **_wire_policy(name, {index: _IT}), "LaunchTemplate.LaunchTemplateName": name,
+            "LaunchTemplate.Version": "$Latest"}, _MALFORMED, message)
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"), _wire_policy(never, {index: _IT}),
+                      _MALFORMED, message)
+        for group in (mip, _uid("asg-nx-never-created")):
+            _wire_refusal("UpdateAutoScalingGroup", group, {
+                **_wire_policy(name, {index: _IT}), "DesiredCapacityType": "bogus"}, _MALFORMED, message)
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"),
+                  _wire_policy(name, {0: _IT, 1: _SMALL, 2: _SMALL}), _MALFORMED, zero)       # o-c-idx0-dup-pair
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"),
+                  _wire_policy(name, {0: _IT, 60: _SMALL}), _MALFORMED, zero)                 # o-c-idx0-and-60
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_duplicate_types_are_named_in_the_order_detected(autoscaling, plain_and_mip_groups,
+                                                               capacity_type_templates):
+    """#2607 (edges3 d-c-abba, d-c-baab, d-c-abccb, d-u-aa-bogus-dct, d-u-aa-bogus-dct-nx, d-u-aa-lt-and-mip,
+    d-u-aa-wonly, d-u-aw1-aw2-ir): each duplicated type is listed when its repeat is first seen; on update the
+    duplicates come after the source error and before the DesiredCapacityType value, the group lookup and
+    weight or InstanceRequirements entries."""
+    t, (_, mip) = capacity_type_templates, plain_and_mip_groups
+    spec = t["name_spec"]
+    micro, small, large = _IT, _SMALL, {"InstanceType": "t3.large"}
+    for overrides, message in (([micro, small, small, micro], _dup("t3.small, t3.micro")),           # d-c-abba
+                               ([small, micro, micro, small], _dup("t3.micro, t3.small")),           # d-c-baab
+                               ([micro, small, large, large, small], _dup("t3.large, t3.small"))):   # d-c-abccb
+        _refused(autoscaling, "ValidationError", message, MixedInstancesPolicy=_policy(spec, overrides))
+    for group in (mip, _uid("asg-nx-never-created")):                                  # d-u-aa-bogus-dct(-nx)
+        _update_refused(autoscaling, group, "ValidationError", _DUP, DesiredCapacityType="bogus",
+                        MixedInstancesPolicy=_policy(spec, [micro, micro]))
+    _update_refused(autoscaling, mip, "ValidationError", _SOURCE, LaunchTemplate=spec,
+                    MixedInstancesPolicy=_policy(spec, [micro, micro]))                # d-u-aa-lt-and-mip
+    _update_refused(autoscaling, mip, "ValidationError", _DUP,
+                    MixedInstancesPolicy=_policy(spec, [micro, micro, {"WeightedCapacity": "2"}]))  # d-u-aa-wonly
+    _update_refused(autoscaling, mip, "ValidationError", _DUP, MixedInstancesPolicy=_policy(spec, [
+        {**micro, "WeightedCapacity": "1"}, {**micro, "WeightedCapacity": "2"},
+        {"InstanceRequirements": _IR}]))                                               # d-u-aw1-aw2-ir
+    assert _stored_overrides(autoscaling, mip) == [micro]
+
+
+def test_asg_three_entry_override_lists_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges3 m-c-*, m-u-*): with three entries the first wrong entry in index order decides, a
+    duplicate type comes first, and InstanceType entries next to InstanceRequirements ones are a mix."""
+    t, (_, mip) = capacity_type_templates, plain_and_mip_groups
+    spec = t["name_spec"]
+    ir, lts, both = {"InstanceRequirements": _IR}, {"LaunchTemplateSpecification": spec}, {**_IT, "InstanceRequirements": _IR}
+    for overrides, message in (([_IT, ir, lts], _OVR1),            # m-c-it-ir-lts, m-u-it-ir-lts
+                               ([lts, _IT, ir], _OVR1),            # m-c-lts-it-ir
+                               ([ir, lts, _IT], _OVR1),            # m-c-ir-lts-it
+                               ([_IT, ir, both], _DUP),            # m-c-it-ir-both
+                               ([both, _IT, ir], _DUP),            # m-c-both-it-ir, m-u-both-it-ir
+                               ([_IT, _IT, ir], _DUP),             # m-c-it-it-ir
+                               ([ir, ir, _IT], _MIX)):             # m-c-ir-ir-it
+        _refused(autoscaling, "ValidationError", message, MixedInstancesPolicy=_policy(spec, overrides))
+    for overrides, message in (([_IT, ir, lts], _OVR1), ([both, _IT, ir], _DUP)):
+        _update_refused(autoscaling, mip, "ValidationError", message, MixedInstancesPolicy=_policy(spec, overrides))
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_update_source_error_for_any_two_sources(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges3 u-mip-and-lc, u-lt-it-and-lc, u-all-three, u-lt-ir-and-lc-vcpu)."""
+    t, (plain, mip) = capacity_type_templates, plain_and_mip_groups
+    spec, policy, lc = t["name_spec"], _policy(t["name_spec"], [_IT]), "msc-2607-no-such-lc"
+    for kwargs in ({"MixedInstancesPolicy": policy, "LaunchConfigurationName": lc},
+                   {"LaunchTemplate": spec, "LaunchConfigurationName": lc},
+                   {"LaunchTemplate": spec, "MixedInstancesPolicy": policy, "LaunchConfigurationName": lc},
+                   {"LaunchTemplate": t["ir_name_spec"], "LaunchConfigurationName": lc,
+                    "DesiredCapacityType": "vcpu"}):
+        _update_refused(autoscaling, mip, "ValidationError", _SOURCE, **kwargs)
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_update_empty_overrides_and_blank_member(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges3 e-u-overrides-empty-list, e-u-overrides-empty-struct, e-u-wire-overrides-blank accepted;
+    e-u-wire-member1-blank refused as an entry with neither member)."""
+    spec, (_, mip) = capacity_type_templates["name_spec"], plain_and_mip_groups
+    for overrides in ([], [{}]):
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=mip,
+                                              MixedInstancesPolicy=_policy(spec, overrides))
+    name = spec["LaunchTemplateName"]
+    status, _ = _raw_query("UpdateAutoScalingGroup", AutoScalingGroupName=mip,
+                           **{**_wire_policy(name), _WIRE_PREFIX + "Overrides": ""})
+    assert status == 200
+    _wire_refusal("UpdateAutoScalingGroup", mip, {**_wire_policy(name), _WIRE_PREFIX + "Overrides.member.1": ""},
+                  "ValidationError", _OVR1)
+
+
+def test_asg_update_override_shape_comes_before_size_checks(autoscaling, plain_and_mip_groups,
+                                                              capacity_type_templates):
+    """#2607 (edges3 c-u-min-gt-max-lts, c-u-min-neg-lts, c-u-name256-bad-ov, with -nx variants)."""
+    spec, (_, mip) = capacity_type_templates["name_spec"], plain_and_mip_groups
+    bad = _policy(spec, [{"LaunchTemplateSpecification": spec}])
+    for group in (mip, _uid("asg-nx-never-created")):
+        for sizes in ({"MinSize": 5, "MaxSize": 1}, {"MinSize": -1}):
+            _update_refused(autoscaling, group, "ValidationError", _OVR1, MixedInstancesPolicy=bad, **sizes)
+    long_name = "a" * 256
+    _update_refused(autoscaling, long_name, "ValidationError",
+                    f"1 validation error detected: Value '{long_name}' at 'autoScalingGroupName' failed to "
+                    "satisfy constraint: Member must have length less than or equal to 255",
+                    MixedInstancesPolicy=bad)
+
+
+def test_asg_policy_base_template_without_instance_type_is_accepted(autoscaling, ec2):
+    """#2607 (edges3 n-c-mip-image-only-base): a template with an image and no instance type is accepted as
+    the base of a policy with InstanceType overrides. AWS refuses it for a plain group (n-c-plain-image-only,
+    n-u-plain-to-image-only); MiniStack deliberately accepts it there too (known difference)."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-image-only"), LaunchTemplateData={
+        "ImageId": "ami-12345678"})["LaunchTemplate"]
+    name = _uid("asg-image-only")
+    try:
+        autoscaling.create_auto_scaling_group(
+            AutoScalingGroupName=name, **_DCT_BASE, MixedInstancesPolicy=_policy(
+                {"LaunchTemplateName": lt["LaunchTemplateName"], "Version": "$Latest"}, [_IT, _SMALL]))
+        assert _stored_overrides(autoscaling, name) == [_IT, _SMALL]
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
