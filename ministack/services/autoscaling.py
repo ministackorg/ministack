@@ -77,6 +77,11 @@ def _restore_state(data):
     _clear_state()
     _asgs.update(data.get("asgs", {}))
     _launch_configs.update(data.get("launch_configs", {}))
+    # v1.5.38 saved DesiredCapacityType "units" on every group. A group without a MixedInstancesPolicy never
+    # has a type on AWS (captured, us-east-2, 2026-11-05), so restored state drops it there.
+    for asg in _asgs.all_values():
+        if not asg.get("MixedInstancesPolicy"):
+            asg["DesiredCapacityType"] = None
 
     asg_regions = {
         (account_id, asg_name): region
@@ -307,6 +312,9 @@ def _launch_template_spec(p):
 
 _SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
                  "MixedInstancesPolicy parameter.")
+# UpdateAutoScalingGroup words it without InstanceId (captured, us-east-2, 2026-11-05).
+_UPDATE_SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName or "
+                        "MixedInstancesPolicy parameter.")
 _INSTANCES_DISTRIBUTION_DEFAULTS = {
     "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
     "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price",
@@ -443,14 +451,13 @@ _GROUP_MEMBERS = (
     "AvailabilityZoneIds",
 )
 _GROUP_UPDATE_MEMBERS = tuple(m for m in _GROUP_MEMBERS if m not in ("LoadBalancerNames", "TargetGroupARNs",
-                                                                      "TrafficSources"))
+                                                                      "TrafficSources", "DesiredCapacityType"))
 
 
 def _group_defaults():
     return {
         "ServiceLinkedRoleARN": (f"arn:aws:iam::{get_account_id()}:role/aws-service-role/"
                                  "autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"),
-        "DesiredCapacityType": "units",
         "DeletionProtection": "none",
         "AvailabilityZoneDistribution": {"CapacityDistributionStrategy": "balanced-best-effort"},
     }
@@ -460,6 +467,81 @@ def _group_members_xml(asg):
     shape = _model_shape("AutoScalingGroup")
     return "".join(f"<{m}>{_shape_xml(asg[m], shape.members[m])}</{m}>"
                    for m in _GROUP_MEMBERS if asg.get(m) not in (None, ""))
+
+
+_DESIRED_CAPACITY_TYPES = ("vcpu", "memory-mib", "units")
+_REQUIREMENT_CAPACITY_TYPES = ("vcpu", "memory-mib")    # need InstanceRequirements
+
+
+def _length_constraint(p, member, wire_name):
+    value = _p(p, member)
+    if value == "":
+        return f"Value '' at '{wire_name}' failed to satisfy constraint: Member must have length greater than or equal to 1"
+    if len(value) > 255:
+        return (f"Value '{value}' at '{wire_name}' failed to satisfy constraint: "
+                "Member must have length less than or equal to 255")
+    return None
+
+
+def _constraint_error(p):
+    """AWS's request constraint errors for DesiredCapacityType and AutoScalingGroupName (missing name, empty,
+    longer than 255), reported together and before the launch source checks (captured, us-east-2, 2026-11-05)."""
+    errors = []
+    if _has_member(p, "DesiredCapacityType"):
+        errors.append(_length_constraint(p, "DesiredCapacityType", "desiredCapacityType"))
+    if not _has_member(p, "AutoScalingGroupName"):
+        errors.append("Value null at 'autoScalingGroupName' failed to satisfy constraint: Member must not be null")
+    else:
+        errors.append(_length_constraint(p, "AutoScalingGroupName", "autoScalingGroupName"))
+    errors = [e for e in errors if e]
+    if not errors:
+        return None
+    return f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: {'; '.join(errors)}"
+
+
+def _capacity_type_value_error(p):
+    value = _p(p, "DesiredCapacityType")
+    if value and value not in _DESIRED_CAPACITY_TYPES:
+        return (f"Invalid DesiredCapacityType value '{value}', it should be one of "
+                f"{', '.join(_DESIRED_CAPACITY_TYPES)}")
+    return None
+
+
+# DesiredCapacityType as AWS handles it (captured, us-east-2, 2026-11-05): only a group with a
+# MixedInstancesPolicy has one; "units" on an update takes effect only with a MixedInstancesPolicy; vcpu and
+# memory-mib need InstanceRequirements, in the policy's overrides or, without overrides, its launch template.
+def _template_has_requirements(spec):
+    from ministack.services import ec2
+
+    record = ec2._launch_templates.get(spec.get("LaunchTemplateId") or "")
+    if not record:
+        return False
+    version = spec.get("Version") or "$Default"
+    number = {"$Default": record.get("DefaultVersionNumber"), "$Latest": record.get("LatestVersionNumber")}.get(
+        version, version)
+    data = next((v.get("LaunchTemplateData") or {} for v in record.get("Versions", [])
+                 if str(v.get("VersionNumber")) == str(number)), {})
+    return bool(data.get("InstanceRequirements"))
+
+
+def _has_instance_requirements(mixed):
+    launch_template = (mixed or {}).get("LaunchTemplate") or {}
+    overrides = launch_template.get("Overrides") or []
+    if overrides:
+        return any(o.get("InstanceRequirements") for o in overrides)
+    return _template_has_requirements(launch_template.get("LaunchTemplateSpecification") or {})
+
+
+def _capacity_type_requirements_error(capacity_type, mixed, operation):
+    if capacity_type not in _REQUIREMENT_CAPACITY_TYPES or _has_instance_requirements(mixed):
+        return None
+    if operation == "create":
+        return (f"The DesiredCapacityType {capacity_type} is only allowed in mixed instances groups containing "
+                "InstanceRequirements. Please include a MixedInstancesPolicy with InstanceRequirements for your "
+                "group and try again.")
+    return (f"The DesiredCapacityType {capacity_type} is only allowed in mixed instances groups using instance "
+            "requirements. Please include instance requirements in the launch template or launch template "
+            "overrides and try again.")
 
 
 def _launch_template_xml(lt):
@@ -496,19 +578,25 @@ def _instances_xml(asg):
 
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
-    if not name:
-        return _error("ValidationError", "AutoScalingGroupName is required")
-    if name in _asgs:
-        return _error("AlreadyExists", f"AutoScalingGroup {name} already exists")
+    if constraint_error := _constraint_error(p):
+        return _error("ValidationError", constraint_error)
     sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")]
     if all(sources) or not (any(sources) or _p(p, "LaunchConfigurationName") or _p(p, "InstanceId")):
         return _error("ValidationError", _SOURCE_ERROR)
+    if value_error := _capacity_type_value_error(p):
+        return _error("ValidationError", value_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
     mixed, mixed_error = _mixed_instances_policy(p)
     if mixed_error:
         return _error("ValidationError", mixed_error)
+    capacity_type = _p(p, "DesiredCapacityType") or None
+    if requirements_error := _capacity_type_requirements_error(capacity_type, mixed, "create"):
+        return _error("ValidationError", requirements_error)
+    if name in _asgs:
+        return _error("AlreadyExists", "AutoScalingGroup by this name already exists - A group with the name "
+                                       f"{name} already exists")
 
     arn = _asg_arn(name)
     _asgs[name] = {
@@ -530,6 +618,7 @@ def _create_asg(p):
         "NewInstancesProtectedFromScaleIn": _p(p, "NewInstancesProtectedFromScaleIn") == "true",
         **_group_defaults(),
         **_input_members(p, "CreateAutoScalingGroup", _GROUP_MEMBERS),
+        "DesiredCapacityType": capacity_type if mixed else None,
         "Tags": [],
         "Status": "",
     }
@@ -611,17 +700,36 @@ def _describe_asgs(p):
 
 def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
+    if constraint_error := _constraint_error(p):
+        return _error("ValidationError", constraint_error)
+    if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
+        return _error("ValidationError", _UPDATE_SOURCE_ERROR)
+    if value_error := _capacity_type_value_error(p):
+        return _error("ValidationError", value_error)
     asg = _asgs.get(name)
     if not asg:
-        return _error("ValidationError", f"AutoScalingGroup {name} not found")
-    if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
-        return _error("ValidationError", _SOURCE_ERROR)
+        # UpdateAutoScalingGroup's text for a missing group (captured, us-east-2, 2026-11-05).
+        return _error("ValidationError", "AutoScalingGroup name not found - null")
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
     mixed, mixed_error = _mixed_instances_policy(p, asg.get("MixedInstancesPolicy"))
     if mixed_error:
         return _error("ValidationError", mixed_error)
+    sent_type = _p(p, "DesiredCapacityType") or None
+    replaces_source = launch_template or _p(p, "LaunchConfigurationName")
+    final_mixed = mixed or (None if replaces_source else asg.get("MixedInstancesPolicy"))
+    # The stored type is checked again only when the launch source changes (captured, us-east-2, 2026-11-05).
+    source_changed = replaces_source or _has_member(p, "MixedInstancesPolicy.LaunchTemplate")
+    checked_type = sent_type or (asg.get("DesiredCapacityType") if source_changed else None)
+    if requirements_error := _capacity_type_requirements_error(checked_type, final_mixed, "update"):
+        return _error("ValidationError", requirements_error)
+    if not final_mixed:
+        capacity_type = None
+    elif sent_type and (sent_type != "units" or mixed):
+        capacity_type = sent_type
+    else:
+        capacity_type = asg.get("DesiredCapacityType")
     if mixed:
         asg["MixedInstancesPolicy"] = mixed
         asg["LaunchTemplate"] = {}
@@ -649,6 +757,7 @@ def _update_asg(p):
     if _p(p, "NewInstancesProtectedFromScaleIn"):
         asg["NewInstancesProtectedFromScaleIn"] = _p(p, "NewInstancesProtectedFromScaleIn") == "true"
     asg.update(_input_members(p, "UpdateAutoScalingGroup", _GROUP_UPDATE_MEMBERS))
+    asg["DesiredCapacityType"] = capacity_type
     if launch_template:
         asg["LaunchTemplate"] = launch_template
     _reconcile_instances(asg)
