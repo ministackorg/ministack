@@ -5292,6 +5292,7 @@ def test_rds_reboot_preserves_mysql_data_and_breaks_sessions(monkeypatch, reboot
         container.remove(force=True, v=True)
 
 
+@pytest.mark.data_plane
 def test_rds_reboot_on_default_bridge_ends_sessions_without_restart(monkeypatch, reboot_instance):
     """A restart on the default bridge can move the endpoint; AWS keeps it, so sessions end in place."""
     import docker
