@@ -591,37 +591,75 @@ _LTNC_ERROR = ("The launch template is not compatible with the configuration of 
                "instead of the InstanceRequirements parameter, and try again.")
 
 
-def _duplicate_type_error(p, indexes):
-    """AWS's refusal of one InstanceType named twice (captured on create, us-east-2, 2026-11-06). Only the
-    one-duplicated-type form is captured, so a request duplicating several types is not answered here."""
-    seen, duplicated = set(), []
-    for index in indexes:
-        instance_type = p.get(f"{_OVERRIDES_PREFIX}{index}.InstanceType")
-        if not instance_type:
+def _duplicate_type_error(types):
+    """AWS names every InstanceType sent more than once, in first-seen order (captured, us-east-2, 2026-11-06)."""
+    duplicated = [t for t in dict.fromkeys(types) if types.count(t) > 1]
+    if not duplicated:
+        return None
+    return ("Cannot add same instance type override more than once. Remove these duplicates from the request "
+            f"and try again: [{', '.join(duplicated)}]")
+
+
+_REQUIREMENT_NUMBERS = ("VCpuCount.Min", "VCpuCount.Max", "MemoryMiB.Min", "MemoryMiB.Max")
+
+
+def _scan_overrides(p):
+    """The override entries sent, from the numbering alone: ({index: {member names}}, {index: InstanceType},
+    modelled). Nothing proportional to the highest index is allocated. *modelled* is False for input whose
+    AWS answer is a field-level or wire-format error that is not reproduced (a scalar where a structure belongs,
+    an empty InstanceType, InstanceRequirements without MemoryMiB or VCpuCount, non-numeric requirement values);
+    those requests get no override checks, as before the checks existed."""
+    members, types, requirement_parts, modelled = {}, {}, {}, True
+    for key, value in p.items():
+        if not key.startswith(_OVERRIDES_PREFIX):
             continue
-        if instance_type in seen and instance_type not in duplicated:
-            duplicated.append(instance_type)
-        seen.add(instance_type)
-    if len(duplicated) == 1:
-        return ("Cannot add same instance type override more than once. Remove these duplicates from the request "
-                f"and try again: [{duplicated[0]}]")
+        index, _, rest = key[len(_OVERRIDES_PREFIX):].partition(".")
+        if not index.isdigit():
+            continue
+        try:
+            number = int(index)
+        except ValueError:      # more digits than int() converts
+            continue
+        parts = rest.split(".")
+        name = parts[0]
+        members.setdefault(number, set()).add(name)
+        if not rest or (name in ("InstanceRequirements", "LaunchTemplateSpecification") and len(parts) == 1):
+            modelled = False
+        elif name == "InstanceType":
+            types[number] = value
+            modelled = modelled and bool(value)
+        elif name == "InstanceRequirements":
+            requirement_parts.setdefault(number, set()).add(parts[1])
+            if ".".join(parts[1:]) in _REQUIREMENT_NUMBERS and not str(value).isdigit():
+                modelled = False
+    for number, present in requirement_parts.items():
+        if not {"VCpuCount", "MemoryMiB"} <= present:
+            modelled = False
+    return members, types, modelled
+
+
+def _override_numbering_error(members):
+    """Index 0 is refused, and so is a highest index N with N-1 >= 20 (captured, us-east-2, 2026-11-05/06; the
+    count carries thousands separators). Indexes 12 to 20 are not captured and are accepted here."""
+    if 0 in members:
+        return "MalformedInput", "0 is not a valid index"
+    if members and max(members) - 1 >= 20:
+        return "MalformedInput", f"Excessively sparse input would skip {max(members) - 1:,} list elements"
     return None
 
 
-def _override_shape_error(p, create=False):
-    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: on create a
-    duplicated InstanceType; partial WeightedCapacity; then the entries in index order, the first wrong one decides (neither InstanceType nor
-    InstanceRequirements, or both); then InstanceType entries mixed with InstanceRequirements ones. A gap in the
-    numbering is an empty override; the shared _query_value parser is left alone."""
-    members = {}
-    for key in p:
-        if key.startswith(_OVERRIDES_PREFIX):
-            index, _, rest = key[len(_OVERRIDES_PREFIX):].partition(".")
-            if index.isdigit():
-                members.setdefault(int(index), set()).add(rest.split(".")[0])
-    if not members:
+def _override_shape_error(p):
+    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: the numbering
+    (index 0, a sparse index); a duplicated InstanceType; partial WeightedCapacity; then the entries in index
+    order, the first wrong one decides (neither InstanceType nor InstanceRequirements, or both); then InstanceType
+    entries mixed with InstanceRequirements ones. A gap in the numbering is an empty override; the shared
+    _query_value parser is left alone."""
+    members, types, modelled = _scan_overrides(p)
+    if numbering_error := _override_numbering_error(members):
+        return numbering_error
+    if not members or not modelled:
         return None
-    if create and (duplicate_error := _duplicate_type_error(p, sorted(members))):
+    if duplicate_error := _duplicate_type_error([types[i] for i in sorted(types)]):
         return "ValidationError", duplicate_error
     entries = [members.get(index, set()) for index in range(1, max(members) + 1)]
     weighted = sum("WeightedCapacity" in present for present in entries)
@@ -649,7 +687,7 @@ def _create_asg(p):
         return _error("ValidationError", _SOURCE_ERROR)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
-    if shape_error := _override_shape_error(p, create=True):
+    if shape_error := _override_shape_error(p):
         return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
@@ -770,9 +808,13 @@ def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
     if constraint_error := _constraint_error(p):
         return _error("ValidationError", constraint_error)
-    if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
+    # LaunchTemplate with MixedInstancesPolicy or with LaunchConfigurationName; MixedInstancesPolicy with
+    # LaunchConfigurationName is not captured on update.
+    if _has_member(p, "LaunchTemplate") and (_has_member(p, "MixedInstancesPolicy")
+                                             or _p(p, "LaunchConfigurationName")):
         return _error("ValidationError", _UPDATE_SOURCE_ERROR)
-    # On update every override shape error comes before the DesiredCapacityType enum check (a-* captures).
+    # On update every override error, duplicate InstanceTypes included, comes before the DesiredCapacityType
+    # enum check (a-* captures; d-u-aa-* carry no enum value).
     if shape_error := _override_shape_error(p):
         return _error(*shape_error)
     if value_error := _capacity_type_value_error(p):

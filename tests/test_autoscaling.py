@@ -2018,7 +2018,8 @@ def _capacity_type(autoscaling, name):
 
 def _validation_message(exc):
     error = exc.value.response["Error"]
-    assert (error["Code"], error["Type"]) == ("ValidationError", "Sender")
+    assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], error["Code"], error["Type"]) == (
+        400, "ValidationError", "Sender")
     return error["Message"]
 
 
@@ -2487,10 +2488,18 @@ _OVR1 = "A launch template override must contain one of InstanceType or Instance
 _MIX = ("You cannot mix single instance and instance requirements launch template override in the same mixed "
         "instance policy. Remove the launch template overrides that use single instance types, or the ones using "
         "instance requirements.")
-_DUP = ("Cannot add same instance type override more than once. Remove these duplicates from the request and try "
-        "again: [t3.micro]")
+
+
+def _dup(types="t3.micro"):
+    return ("Cannot add same instance type override more than once. Remove these duplicates from the request and "
+            f"try again: [{types}]")
+
+
+_DUP = _dup()
 _SOURCE = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName or MixedInstancesPolicy "
            "parameter.")
+_CREATE_SOURCE = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
+                  "MixedInstancesPolicy parameter.")
 _IR2 = {"VCpuCount": {"Min": 2, "Max": 4}, "MemoryMiB": {"Min": 1024}}
 _W2 = {"WeightedCapacity": "2"}
 
@@ -2536,10 +2545,13 @@ def test_asg_plain_launch_template_with_instance_requirements_refused(autoscalin
     t = capacity_type_templates
     for spec in (t["ir_name_spec"], t["ir_name_only"], t["ir_name_default"], t["ir_id_spec"]):
         _refused(autoscaling, "InvalidQueryParameter", _LTNC, LaunchTemplate=spec)
-    # on create the template check comes before vcpu / memory-mib (p-ir-id-latest-vcpu, p-ir-name-latest-vcpu)
-    for capacity_type in ("vcpu", "memory-mib"):
-        _refused(autoscaling, "InvalidQueryParameter", _LTNC, LaunchTemplate=t["ir_id_spec"],
-                 DesiredCapacityType=capacity_type)
+    # on create the template check comes before vcpu / memory-mib
+    _refused(autoscaling, "InvalidQueryParameter", _LTNC, LaunchTemplate=t["ir_id_spec"],
+             DesiredCapacityType="vcpu")                                        # p-ir-id-latest-vcpu
+    _refused(autoscaling, "InvalidQueryParameter", _LTNC, LaunchTemplate=t["ir_name_spec"],
+             DesiredCapacityType="vcpu")                                        # p-ir-name-latest-vcpu
+    _refused(autoscaling, "InvalidQueryParameter", _LTNC, LaunchTemplate=t["ir_id_spec"],
+             DesiredCapacityType="memory-mib")                                  # l-lt-ir-id-memory-mib
     # an invalid DesiredCapacityType value is answered before it (p-ir-name-latest-bogus-dct)
     _refused(autoscaling, "ValidationError", _enum_message("bogus"), LaunchTemplate=t["ir_name_spec"],
              DesiredCapacityType="bogus")
@@ -2737,51 +2749,197 @@ def _raw_error(body):
     return tuple(re.search(f"<{tag}>(.*?)</{tag}>", body, re.S).group(1) for tag in ("Type", "Code", "Message"))
 
 
+_WIRE_PREFIX = "MixedInstancesPolicy.LaunchTemplate."
+
+
+def _wire_policy(template_name, overrides=()):
+    """MixedInstancesPolicy query keys; *overrides* maps the member number to {member name: value}."""
+    params = {_WIRE_PREFIX + "LaunchTemplateSpecification.LaunchTemplateName": template_name,
+              _WIRE_PREFIX + "LaunchTemplateSpecification.Version": "$Latest"}
+    for number, members in dict(overrides).items():
+        params.update({f"{_WIRE_PREFIX}Overrides.member.{number}.{name}": value for name, value in members.items()})
+    return params
+
+
+def _wire_refusal(action, group, params, code, message):
+    """Send a captured wire body and assert the whole refusal: status, Type, Code and Message."""
+    base = {"AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0"}
+    if action == "CreateAutoScalingGroup":
+        base["AvailabilityZones.member.1"] = "us-east-1a"
+    status, body = _raw_query(action, **base, **params)
+    assert (status, *_raw_error(body)) == (400, "Sender", code, message)
+
+
+_IT = {"InstanceType": "t3.micro"}
+_SMALL = {"InstanceType": "t3.small"}
+_MALFORMED = "MalformedInput"
+
+
+def _sparse(skipped):
+    return f"Excessively sparse input would skip {skipped} list elements"
+
+
 def test_asg_override_numbering_gap_is_an_empty_override(autoscaling, plain_and_mip_groups, capacity_type_templates):
-    """#2607 (edges d-c-wire-gap-*, d-u-wire-gap-*, mixed-ov m-wire-gap-it-ir, ov-lt-only o-wire-override-gap): a gap
-    in Overrides.member.N counts as an override with neither member."""
+    """#2607 (edges d-c-wire-gap-*, d-u-wire-gap-*, mixed-ov m-wire-gap-it-ir, ov-lt-only o-wire-override-gap,
+    edges2 u-u-idx-2): a gap in Overrides.member.N counts as an override with neither member."""
     _, mip = plain_and_mip_groups
     name_spec = capacity_type_templates["name_spec"]["LaunchTemplateName"]
-    base = {"MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName": name_spec,
-            "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version": "$Latest"}
-    prefix = "MixedInstancesPolicy.LaunchTemplate.Overrides.member."
-    requirements = {prefix + "2.InstanceRequirements.VCpuCount.Min": "1",
-                    prefix + "2.InstanceRequirements.VCpuCount.Max": "2",
-                    prefix + "2.InstanceRequirements.MemoryMiB.Min": "512"}
-    cases = (
-        ({prefix + "1.InstanceType": "t3.micro", prefix + "1.WeightedCapacity": "2",
-          prefix + "3.InstanceType": "t3.small", prefix + "3.WeightedCapacity": "3"}, _WGT),    # d-*-wire-gap-itw-1-3
-        ({prefix + "2.InstanceType": "t3.micro", **requirements}, _OVR1),                       # d-*-wire-gap-both-at-2
-        ({prefix + "2.InstanceType": "t3.micro"}, _OVR1),                                       # o-wire-override-gap
-    )
-    for extra, message in cases:
-        status, body = _raw_query("CreateAutoScalingGroup", AutoScalingGroupName=_uid("asg-gap"), MinSize="0",
-                                  MaxSize="1", DesiredCapacity="0", **{"AvailabilityZones.member.1": "us-east-1a"},
-                                  **base, **extra)
-        assert (status, *_raw_error(body)) == (400, "Sender", "ValidationError", message)
-        status, body = _raw_query("UpdateAutoScalingGroup", AutoScalingGroupName=mip, **base, **extra)
-        assert (status, *_raw_error(body)) == (400, "Sender", "ValidationError", message)
+    requirements = {"InstanceRequirements.VCpuCount.Min": "1", "InstanceRequirements.VCpuCount.Max": "2",
+                    "InstanceRequirements.MemoryMiB.Min": "512"}
+    weighted = {1: {**_IT, "WeightedCapacity": "2"}, 3: {**_SMALL, "WeightedCapacity": "3"}}
+    both_at_2 = {2: {**_IT, **requirements}}
+    # d-*-wire-gap-itw-1-3 and d-*-wire-gap-both-at-2, on create and update
+    for overrides, message in ((weighted, _WGT), (both_at_2, _OVR1)):
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-gap"), _wire_policy(name_spec, overrides),
+                      "ValidationError", message)
+        _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name_spec, overrides), "ValidationError", message)
+    # o-wire-override-gap (create) and u-u-idx-2 (update)
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-gap"), _wire_policy(name_spec, {2: _IT}),
+                  "ValidationError", _OVR1)
+    _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name_spec, {2: _IT}), "ValidationError", _OVR1)
     assert _stored_overrides(autoscaling, mip) == [{"InstanceType": "t3.micro"}]
     # a gap before an InstanceRequirements entry, with an InstanceType before it (m-wire-gap-it-ir)
-    status, body = _raw_query("CreateAutoScalingGroup", AutoScalingGroupName=_uid("asg-gap"), MinSize="0",
-                              MaxSize="1", DesiredCapacity="0", **{"AvailabilityZones.member.1": "us-east-1a"}, **base,
-                              **{prefix + "1.InstanceType": "t3.micro",
-                                 **{k.replace("member.2", "member.3"): v for k, v in requirements.items()}})
-    assert (status, *_raw_error(body)) == (400, "Sender", "ValidationError", _OVR1)
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-gap"),
+                  _wire_policy(name_spec, {1: _IT, 3: requirements}), "ValidationError", _OVR1)
 
 
-def test_asg_source_check_covers_launch_configuration_pairs(autoscaling, capacity_type_templates):
-    """#2607: LaunchConfigurationName with LaunchTemplate or MixedInstancesPolicy is a source error."""
-    t = capacity_type_templates
-    source = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
-              "MixedInstancesPolicy parameter.")
-    for extra in ({"LaunchTemplate": t["spec"]}, {"MixedInstancesPolicy": t["types"]}):
-        name = _uid("asg-src")
+def test_asg_override_numbering_errors_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges2 s-c-idx-*, u-u-idx-*, edges d-*-wire-idx-*): member 0 is not a valid index, and a highest
+    member N with N-1 >= 20 is excessively sparse; the count is N-1 with thousands separators, whatever members
+    are present. Indexes 2 to 11 give the override shape error."""
+    _, mip = plain_and_mip_groups
+    name_spec = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    zero = "0 is not a valid index"
+    create = (
+        ({0: _IT}, zero),                                   # d-c-wire-idx-0
+        ({0: _IT, 1: _SMALL}, zero),                        # s-c-idx-0-and-1
+        ({50: _IT}, _sparse(49)),                           # d-c-wire-idx-50
+        ({21: _IT}, _sparse(20)),                           # s-c-idx-21
+        ({33: _IT}, _sparse(32)),                           # s-c-idx-33
+        ({49: _IT}, _sparse(48)),                           # s-c-idx-49
+        ({51: _IT}, _sparse(50)),                           # s-c-idx-51
+        ({100: _IT}, _sparse(99)),                          # s-c-idx-100
+        ({1000: _IT}, _sparse(999)),                        # s-c-idx-1000
+        ({100000: _IT}, _sparse("99,999")),                 # s-c-idx-100000
+        ({1: _IT, 60: _SMALL}, _sparse(59)),                # s-c-idx-1-and-60
+    )
+    for overrides, message in create:
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"), _wire_policy(name_spec, overrides), _MALFORMED,
+                      message)
+    for number in (2, 3, 4, 5, 6, 8, 11):                   # s-c-idx-2 ... s-c-idx-11
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-idx"), _wire_policy(name_spec, {number: _IT}),
+                      "ValidationError", _OVR1)
+    update = (
+        ({0: _IT}, _MALFORMED, zero),                       # u-u-idx-0, d-u-wire-idx-0
+        ({50: _IT}, _MALFORMED, _sparse(49)),               # u-u-idx-50, d-u-wire-idx-50
+        ({2: _IT}, "ValidationError", _OVR1),               # u-u-idx-2
+        ({3: _IT}, "ValidationError", _OVR1),               # u-u-idx-3
+    )
+    for overrides, code, message in update:
+        _wire_refusal("UpdateAutoScalingGroup", mip, _wire_policy(name_spec, overrides), code, message)
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_source_check_with_launch_configuration(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607: a LaunchConfigurationName next to a LaunchTemplate or MixedInstancesPolicy is a source error on
+    create (p-ord-lc-too, o-ord-lc-too, m-ord-lc-too, c-both-lc-too) and, with a LaunchTemplate, on update
+    (v-lt-ir-name-and-lc, which words it without InstanceId). A launch configuration cannot be created in the
+    capture account, so only these invalid-body shapes are asserted."""
+    t, (plain, mip) = capacity_type_templates, plain_and_mip_groups
+    spec, ir_spec = t["name_spec"], t["ir_name_spec"]
+    ir, it = {"InstanceRequirements": _IR}, {"InstanceType": "t3.micro"}
+    missing = "msc-2607-no-such-lc"
+    for kwargs in (
+            {"LaunchTemplate": ir_spec},                                                      # p-ord-lc-too
+            {"MixedInstancesPolicy": _policy(spec, [{"LaunchTemplateSpecification": ir_spec}])},  # o-ord-lc-too
+            {"MixedInstancesPolicy": _policy(spec, [ir, it])},                                # m-ord-lc-too
+            {"MixedInstancesPolicy": _policy(spec, [dict(it, **ir)])}):                       # c-both-lc-too
+        _refused(autoscaling, "ValidationError", _CREATE_SOURCE, LaunchConfigurationName=missing, **kwargs)
+    with pytest.raises(ClientError) as exc:                                                   # v-lt-ir-name-and-lc
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=plain, LaunchTemplate=ir_spec,
+                                              LaunchConfigurationName="msc-2607-edges2-lc-never-created")
+    assert _validation_message(exc) == _SOURCE
+    group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[plain])["AutoScalingGroups"][0]
+    assert group["LaunchTemplate"]["LaunchTemplateName"] == spec["LaunchTemplateName"]
+
+
+def test_asg_duplicate_instance_types_follow_aws(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges2 d-c-*, d-u-*): the duplicated InstanceTypes are named once each, in first-seen order, on
+    create and on update; on update before the group lookup. On create they come after the DesiredCapacityType
+    value and the source error and before the base and override template lookups."""
+    t, (_, mip) = capacity_type_templates, plain_and_mip_groups
+    spec = t["name_spec"]
+    micro, small = {"InstanceType": "t3.micro"}, {"InstanceType": "t3.small"}
+    ir = {"InstanceRequirements": _IR}
+    never = {"LaunchTemplateName": _uid("lt-never-created"), "Version": "$Latest"}
+    for overrides, message in (([micro, micro, small, small], _dup("t3.micro, t3.small")),   # d-c-aabb
+                               ([micro, micro, micro], _dup()),                              # d-c-aaa
+                               ([micro, small, micro], _dup())):                             # d-c-aba
+        _refused(autoscaling, "ValidationError", message, MixedInstancesPolicy=_policy(spec, overrides))
+    _refused(autoscaling, "ValidationError", _enum_message("bogus"), DesiredCapacityType="bogus",
+             MixedInstancesPolicy=_policy(spec, [micro, micro]))                              # d-c-aa-bogus-dct
+    _refused(autoscaling, "ValidationError", _CREATE_SOURCE, LaunchTemplate=spec,
+             MixedInstancesPolicy=_policy(spec, [micro, micro]))                              # d-c-aa-lt-and-mip
+    _refused(autoscaling, "ValidationError", _DUP,
+             MixedInstancesPolicy=_policy(never, [micro, micro]))                             # d-c-aa-missing-base
+    _refused(autoscaling, "ValidationError", _DUP, MixedInstancesPolicy=_policy(
+        spec, [micro, micro, {"LaunchTemplateSpecification": never}]))                        # d-c-aa-missing-override
+    for group, overrides in ((mip, [micro, micro]),                                           # d-u-aa-mip
+                             (_uid("asg-nx-never-created"), [micro, micro]),                  # d-u-aa-nx
+                             (mip, [micro, micro, ir])):                                      # d-u-aa-ir-mip
         with pytest.raises(ClientError) as exc:
-            autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, **_DCT_BASE,
-                                                  LaunchConfigurationName="lc", **extra)
-        assert _validation_message(exc) == source
-    _refused(autoscaling, "ValidationError", source, LaunchTemplate=t["spec"], MixedInstancesPolicy=t["types"])
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=group,
+                                                  MixedInstancesPolicy=_policy(spec, overrides))
+        assert _validation_message(exc) == _DUP
+    assert _stored_overrides(autoscaling, mip) == [micro]
+
+
+def test_asg_refused_update_leaves_the_policy_group_unchanged(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges2 m-refused-update-lto, m-describe-before, m-describe-after)."""
+    spec, (_, mip) = capacity_type_templates["name_spec"], plain_and_mip_groups
+
+    def describe():
+        return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[mip])["AutoScalingGroups"][0]
+
+    before = describe()["MixedInstancesPolicy"]
+    with pytest.raises(ClientError) as exc:
+        autoscaling.update_auto_scaling_group(
+            AutoScalingGroupName=mip,
+            MixedInstancesPolicy=_policy(spec, [{"LaunchTemplateSpecification": spec}]))
+    assert _validation_message(exc) == _OVR1
+    assert describe()["MixedInstancesPolicy"] == before
+
+
+def test_asg_weighted_and_instance_requirements_policies_describe(autoscaling, capacity_type_templates):
+    """#2607 (edges2 w-c-weighted, w-describe-weighted, w-c-ir-units, w-c-ir-units-mip, w-describe-ir-units-mip):
+    weights read back as strings; an InstanceRequirements template is refused as a plain launch template with
+    units and accepted as the base of a policy without overrides."""
+    t = capacity_type_templates
+    weighted = [{"InstanceType": "t3.micro", "WeightedCapacity": "2"},
+                {"InstanceType": "t3.small", "WeightedCapacity": "3"}]
+    weighted_name, units_name = _uid("asg-weighted"), _uid("asg-ir-units")
+    autoscaling.create_auto_scaling_group(AutoScalingGroupName=weighted_name, **_DCT_BASE,
+                                          MixedInstancesPolicy=_policy(t["name_spec"], weighted))
+    _refused(autoscaling, "InvalidQueryParameter", _LTNC, LaunchTemplate=t["ir_name_spec"],
+             DesiredCapacityType="units")                                                     # w-c-ir-units
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=units_name, **_DCT_BASE, DesiredCapacityType="units",
+        MixedInstancesPolicy={"LaunchTemplate": {"LaunchTemplateSpecification": t["ir_name_spec"]}})
+    try:
+        assert _stored_overrides(autoscaling, weighted_name) == weighted
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[units_name])["AutoScalingGroups"][0]
+        assert group["DesiredCapacityType"] == "units"
+        assert group["MixedInstancesPolicy"]["LaunchTemplate"]["Overrides"] == []
+    finally:
+        for name in (weighted_name, units_name):
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+
+
+def test_asg_launch_template_id_with_policy_is_a_source_error(autoscaling, capacity_type_templates):
+    """#2607 (edges2 l-lt-id-and-mip): a LaunchTemplate by id next to a MixedInstancesPolicy."""
+    t = capacity_type_templates
+    _refused(autoscaling, "ValidationError", _CREATE_SOURCE, LaunchTemplate=t["spec"],
+             MixedInstancesPolicy=_policy(t["name_spec"], [{"InstanceType": "t3.micro"}]))
 
 
 def test_asg_stored_group_is_not_rechecked_for_launch_template_drift(autoscaling, ec2):
