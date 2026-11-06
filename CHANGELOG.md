@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Secrets Manager — `RemoveRegionsFromReplication` and `StopReplicationToReplica`** — both answered `Unknown action`, so `terraform destroy` of a secret with a `replica` block failed. `RemoveRegionsFromReplication` deletes the replicas in the listed regions and returns the remaining `ReplicationStatus`; `StopReplicationToReplica`, called in a replica's region, makes it a standalone secret. Both make AWS's checks in AWS's order, with its `ValidationException`, `SerializationException` and `InvalidParameterException` messages. Reported by @kharabasz.
+
+### Changed
+- **Secrets Manager — a request body that is not one JSON object** — an empty or blank body was read as `{}`, and `[]`, `null` or a bare string crashed with a 500. Every action now answers `SerializationException` for a body that is not a single JSON object (a list names itself, the rest carry no message), as AWS does; whitespace around the object is fine.
+- **Secrets Manager — `DeleteSecret` on a primary that still has replicas** — it deleted the replicas with the primary. It now answers `InvalidParameterException` ("You can't delete secret … that still has replica regions [...]") for every delete form, as AWS does, so replicas are removed first. `DeleteSecret` called in a replica's region answers AWS's "Operation not permitted on a replica secret" after the request's own checks.
+
 ## [1.5.38] — 2026-11-05
 
 ### Added

@@ -2063,6 +2063,55 @@ def test_secretsmanager_resource_policies_survive_warm_boot():
     mod.reset()
 
 
+def test_secretsmanager_replication_changes_survive_warm_boot():
+    """RemoveRegionsFromReplication and StopReplicationToReplica change a primary and its replica in two
+    regions. Both must come back from disk as they were left, not as the replication they replaced."""
+    import json as _json
+
+    from ministack.core.responses import get_region, set_request_region
+
+    mod = _get_module("secretsmanager")
+    original_region = get_region()
+
+    def call(region, fn, **data):
+        set_request_region(region)
+        status, _, body = fn(data)
+        return status, _json.loads(body)
+
+    mod.reset()
+    try:
+        for name in ("kept", "removed", "stopped"):
+            call("us-east-1", mod._create_secret, Name=name, SecretString="v1")
+            call("us-east-1", mod._replicate_secret_to_regions, SecretId=name,
+                 AddReplicaRegions=[{"Region": "us-west-2"}])
+        call("us-east-1", mod._remove_regions_from_replication, SecretId="removed",
+             RemoveReplicaRegions=["us-west-2"])
+        call("us-west-2", mod._stop_replication_to_replica, SecretId="stopped")
+
+        _round_trip_dict(mod, "secretsmanager")
+
+        _, kept = call("us-east-1", mod._describe_secret, SecretId="kept")
+        assert [s["Region"] for s in kept["ReplicationStatus"]] == ["us-west-2"]
+        assert call("us-west-2", mod._describe_secret, SecretId="kept")[1]["PrimaryRegion"] == "us-east-1"
+
+        _, removed = call("us-east-1", mod._describe_secret, SecretId="removed")
+        assert "ReplicationStatus" not in removed
+        assert call("us-west-2", mod._describe_secret, SecretId="removed")[0] == 400
+
+        _, stopped = call("us-east-1", mod._describe_secret, SecretId="stopped")
+        assert "ReplicationStatus" not in stopped
+        status, west = call("us-west-2", mod._describe_secret, SecretId="stopped")
+        assert status == 200 and "PrimaryRegion" not in west
+        # The restored replica is standalone and writable, and the restored link still holds for the other.
+        assert call("us-west-2", mod._put_secret_value, SecretId="stopped", SecretString="v2")[0] == 200
+        assert call("us-west-2", mod._put_secret_value, SecretId="kept", SecretString="v2")[0] == 400
+        assert call("us-east-1", mod._delete_secret, SecretId="kept", ForceDeleteWithoutRecovery=True)[0] == 400
+        assert call("us-east-1", mod._delete_secret, SecretId="removed", ForceDeleteWithoutRecovery=True)[0] == 200
+    finally:
+        mod.reset()
+        set_request_region(original_region)
+
+
 # ── kinesis._consumers ─────────────────────────────────────────────────
 
 def test_kinesis_consumers_survive_warm_boot():
