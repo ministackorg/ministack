@@ -591,9 +591,26 @@ _LTNC_ERROR = ("The launch template is not compatible with the configuration of 
                "instead of the InstanceRequirements parameter, and try again.")
 
 
-def _override_shape_error(p):
-    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05). Order: partial
-    WeightedCapacity; then the entries in index order, the first wrong one decides (neither InstanceType nor
+def _duplicate_type_error(p, indexes):
+    """AWS's refusal of one InstanceType named twice (captured on create, us-east-2, 2026-11-06). Only the
+    one-duplicated-type form is captured, so a request duplicating several types is not answered here."""
+    seen, duplicated = set(), []
+    for index in indexes:
+        instance_type = p.get(f"{_OVERRIDES_PREFIX}{index}.InstanceType")
+        if not instance_type:
+            continue
+        if instance_type in seen and instance_type not in duplicated:
+            duplicated.append(instance_type)
+        seen.add(instance_type)
+    if len(duplicated) == 1:
+        return ("Cannot add same instance type override more than once. Remove these duplicates from the request "
+                f"and try again: [{duplicated[0]}]")
+    return None
+
+
+def _override_shape_error(p, create=False):
+    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: on create a
+    duplicated InstanceType; partial WeightedCapacity; then the entries in index order, the first wrong one decides (neither InstanceType nor
     InstanceRequirements, or both); then InstanceType entries mixed with InstanceRequirements ones. A gap in the
     numbering is an empty override; the shared _query_value parser is left alone."""
     members = {}
@@ -604,6 +621,8 @@ def _override_shape_error(p):
                 members.setdefault(int(index), set()).add(rest.split(".")[0])
     if not members:
         return None
+    if create and (duplicate_error := _duplicate_type_error(p, sorted(members))):
+        return "ValidationError", duplicate_error
     entries = [members.get(index, set()) for index in range(1, max(members) + 1)]
     weighted = sum("WeightedCapacity" in present for present in entries)
     if 0 < weighted < len(entries):
@@ -630,7 +649,7 @@ def _create_asg(p):
         return _error("ValidationError", _SOURCE_ERROR)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
-    if shape_error := _override_shape_error(p):
+    if shape_error := _override_shape_error(p, create=True):
         return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
@@ -639,7 +658,7 @@ def _create_asg(p):
     if mixed_error:
         return _error("ValidationError", mixed_error)
     capacity_type = _p(p, "DesiredCapacityType") or None
-    if launch_template and _template_has_requirements(launch_template):
+    if launch_template and not _p(p, "InstanceId") and _template_has_requirements(launch_template):
         return _error("InvalidQueryParameter", _LTNC_ERROR)
     if requirements_error := _capacity_type_requirements_error(capacity_type, mixed, "create"):
         return _error("ValidationError", requirements_error)
@@ -753,14 +772,11 @@ def _update_asg(p):
         return _error("ValidationError", constraint_error)
     if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
         return _error("ValidationError", _UPDATE_SOURCE_ERROR)
-    # On update a partial-weights or both-members answer comes before the DesiredCapacityType enum check.
-    shape_error = _override_shape_error(p)
-    if shape_error and shape_error[1] in (_OVERRIDE_WEIGHT_ERROR, _OVERRIDE_BOTH_ERROR):
+    # On update every override shape error comes before the DesiredCapacityType enum check (a-* captures).
+    if shape_error := _override_shape_error(p):
         return _error(*shape_error)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
-    if shape_error:
-        return _error(*shape_error)
     asg = _asgs.get(name)
     if not asg:
         # UpdateAutoScalingGroup's text for a missing group (captured, us-east-2, 2026-11-05).
