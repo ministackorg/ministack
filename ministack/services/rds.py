@@ -6321,6 +6321,42 @@ def _reboot_credentials(instance, cluster):
     return user, password
 
 
+def _end_database_sessions(instance, user, password):
+    """Disconnect every client session, as a reboot does, without a restart."""
+    endpoint = instance.get("Endpoint", {})
+    host = instance.get("_internal_address") or "127.0.0.1"
+    port = int(instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port"))
+    engine = instance.get("Engine", "mysql")
+    if _is_mysql_engine(engine):
+        import pymysql
+        conn = pymysql.connect(host=host, port=port, user=user, password=password, autocommit=True, connect_timeout=10)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM information_schema.processlist "
+                    "WHERE id <> CONNECTION_ID() AND command NOT IN ('Daemon', 'Binlog Dump', 'Binlog Dump GTID') "
+                    "AND user NOT IN ('system user', 'event_scheduler')")
+                for (session_id,) in cur.fetchall():
+                    try:
+                        cur.execute(f"KILL {int(session_id)}")
+                    except pymysql.Error:
+                        pass  # already gone
+        finally:
+            conn.close()
+    else:
+        import psycopg2
+        conn = psycopg2.connect(host=host, port=port, user=user, password=password,
+                                dbname=instance.get("DBName") or "postgres", connect_timeout=10)
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'")
+        finally:
+            conn.close()
+
+
 def _refresh_restarted_container_address(client, container, instance, cluster):
     """Record the address Docker gave a restarted container.
 
@@ -6366,11 +6402,19 @@ def _finish_instance_reboot(instance, cluster):
         container_id = instance.get("_docker_container_id")
         if client and container_id:
             container = client.containers.get(container_id)
-            container.stop(timeout=5)
-            if not current():
-                return
-            container.start()
-            _refresh_restarted_container_address(client, container, instance, cluster)
+            user, password = _reboot_credentials(instance, cluster)
+            network = _get_ministack_network(client)
+            if network and not _network_supports_aliases(network):
+                # On the default bridge the endpoint is the container's
+                # address, which a restart may hand to another container.
+                # A reboot keeps the endpoint on AWS, so end sessions in place.
+                _end_database_sessions(instance, user, password)
+            else:
+                container.stop(timeout=5)
+                if not current():
+                    return
+                container.start()
+                _refresh_restarted_container_address(client, container, instance, cluster)
 
             def alive():
                 if not current():
@@ -6381,7 +6425,6 @@ def _finish_instance_reboot(instance, cluster):
             endpoint = instance.get("Endpoint", {})
             host = instance.get("_internal_address") or "127.0.0.1"
             port = instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port")
-            user, password = _reboot_credentials(instance, cluster)
             if not _wait_for_database_ready(
                 host, port, instance.get("Engine", "mysql"),
                 user, password,
