@@ -5411,6 +5411,7 @@ def test_rds_reboot_follows_container_to_its_new_address(monkeypatch, reboot_ins
     assert sibling["_internal_address"] == "10.0.0.4" and sibling["Endpoint"]["Address"] == "10.0.0.4"
     assert cluster["_shared_internal_address"] == "10.0.0.4"
     assert cluster["_shared_endpoint"]["Address"] == "10.0.0.4"
+    assert cluster["Endpoint"] == "10.0.0.4"
 
 
 @pytest.fixture

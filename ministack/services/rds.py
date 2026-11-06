@@ -6350,6 +6350,8 @@ def _refresh_restarted_container_address(client, container, instance, cluster):
         endpoint = cluster.get("_shared_endpoint")
         if isinstance(endpoint, dict) and endpoint.get("Address") == old_ip:
             endpoint["Address"] = new_ip
+        # Outside alias mode the published cluster endpoints are addresses too.
+        _sync_cluster_endpoints(cluster)
     logger.info("RDS: %s restarted at %s (was %s)", instance.get("DBInstanceIdentifier"), new_ip, old_ip)
 
 
