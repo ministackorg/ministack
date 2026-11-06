@@ -2956,7 +2956,7 @@ def test_asg_repeated_override_key_and_blank_weight_do_not_crash(autoscaling, pl
         params = {**_wire_policy(name), weight: "", **({key: instance_type} if instance_type else {})}
         status, _ = _raw_query("UpdateAutoScalingGroup", AutoScalingGroupName=mip, MinSize="0", MaxSize="1",
                                DesiredCapacity="0", **params)
-        assert status == 200
+        assert status < 500        # AWS refuses these; MiniStack's answer is not pinned, only that it does not crash
 
 
 def test_asg_non_numeric_requirement_value_is_malformed_input(autoscaling, plain_and_mip_groups,
