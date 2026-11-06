@@ -652,8 +652,8 @@ def _override_numbering_error(members):
     """Index 0 is refused, and so is a gap that skips 11 or more list elements: with the present indexes sorted
     ascending and the previous one starting at 1, an index i after p skips i - p (captured, us-east-2, 2026-11-06:
     single index 12 gives 11, 21 gives 20, {1,60} gives 59, edges4 q-c-*; dense lists up to 40 are accepted, edges4
-    p-c-dense-*). The count carries thousands separators. The first gap in ascending order is reported; which gap AWS
-    reports when several offend is not captured. These errors come before every other check, the group-name
+    p-c-dense-*). The count carries thousands separators. The first offending gap in ascending index order is
+    reported, whatever the wire order (edges5 g-c-*, g-u-1-20-40, i-c-41-sparse-1-40-and-60). These errors come before every other check, the group-name
     constraint and the source check included (edges4 r-*, s-u-*)."""
     if 0 in members:
         return "MalformedInput", "0 is not a valid index"
@@ -665,7 +665,10 @@ def _override_numbering_error(members):
     return None
 
 
-def _override_shape_error(p, scan):
+_OVERRIDE_COUNT_ERROR = "The number of LaunchTemplateOverrides must be fewer than 40."
+
+
+def _override_shape_error(p, scan, limit_count=False):
     """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: a duplicated InstanceType; partial WeightedCapacity; then the entries in index
     order, the first wrong one decides (neither InstanceType nor InstanceRequirements, or both); then InstanceType
     entries mixed with InstanceRequirements ones. A gap in the numbering is an empty override; the shared
@@ -673,6 +676,10 @@ def _override_shape_error(p, scan):
     members, types, modelled = scan
     if not members or not modelled:
         return None
+    # More than 40 overrides on create (edges5 i-c-41-*, edges4 p-c-dense-41; 40 are accepted). It comes after the
+    # source and DesiredCapacityType errors and before the duplicate check; the update position is not captured.
+    if limit_count and len(members) > 40:
+        return "ValidationError", _OVERRIDE_COUNT_ERROR
     if duplicate_error := _duplicate_type_error([types[i] for i in sorted(types)]):
         return "ValidationError", duplicate_error
     entries = [members.get(index, set()) for index in range(1, max(members) + 1)]
@@ -704,7 +711,7 @@ def _create_asg(p):
         return _error("ValidationError", _SOURCE_ERROR)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
-    if shape_error := _override_shape_error(p, scan):
+    if shape_error := _override_shape_error(p, scan, limit_count=True):
         return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
