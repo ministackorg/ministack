@@ -267,13 +267,7 @@ AUTH=false pytest tests/ -m auth_contract -v
 
 ## What We're Looking For
 
-High-value contributions right now:
-
-- **CloudFront** — distribution CRUD, invalidations, origin configuration
-- **CodeBuild / CodePipeline** — CI/CD pipeline stubs
-- **AppSync** — GraphQL API CRUD
-- **SQS FIFO** — message group / deduplication support
-- **More Cognito flows** — hosted UI, federated identity providers, custom auth triggers
+ONLY REAL AWS USERS WHO BUMP INTO REAL LIFE ISSUES.
 
 ---
 
