@@ -576,15 +576,62 @@ def _instances_xml(asg):
     return "<Instances>" + "".join(_instance_member_xml(i) for i in asg["Instances"]) + "</Instances>"
 
 
+_OVERRIDES_PREFIX = "MixedInstancesPolicy.LaunchTemplate.Overrides.member."
+_OVERRIDE_SHAPE_ERROR = "A launch template override must contain one of InstanceType or InstanceRequirements"
+_OVERRIDE_MIX_ERROR = ("You cannot mix single instance and instance requirements launch template override in the "
+                       "same mixed instance policy. Remove the launch template overrides that use single instance "
+                       "types, or the ones using instance requirements.")
+_OVERRIDE_BOTH_ERROR = ("The parameter InstanceType cannot be used in a launch template override using instance "
+                        "requirements.")
+_OVERRIDE_WEIGHT_ERROR = ("Not all instance types have a defined WeightedCapacity. Specify missing weights, or "
+                          "remove all weights, and try again.")
+_LTNC_ERROR = ("The launch template is not compatible with the configuration of the Auto Scaling group. This launch "
+               "template can only be used if MixedInstancesPolicy is set on the Auto Scaling group. Specify the "
+               "MixedInstancesPolicy parameter or use a launch template that contains the InstanceType parameter "
+               "instead of the InstanceRequirements parameter, and try again.")
+
+
+def _override_shape_error(p):
+    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05). Order: partial
+    WeightedCapacity; then the entries in index order, the first wrong one decides (neither InstanceType nor
+    InstanceRequirements, or both); then InstanceType entries mixed with InstanceRequirements ones. A gap in the
+    numbering is an empty override; the shared _query_value parser is left alone."""
+    members = {}
+    for key in p:
+        if key.startswith(_OVERRIDES_PREFIX):
+            index, _, rest = key[len(_OVERRIDES_PREFIX):].partition(".")
+            if index.isdigit():
+                members.setdefault(int(index), set()).add(rest.split(".")[0])
+    if not members:
+        return None
+    entries = [members.get(index, set()) for index in range(1, max(members) + 1)]
+    weighted = sum("WeightedCapacity" in present for present in entries)
+    if 0 < weighted < len(entries):
+        return "ValidationError", _OVERRIDE_WEIGHT_ERROR
+    for present in entries:
+        has_type, has_requirements = "InstanceType" in present, "InstanceRequirements" in present
+        if not (has_type or has_requirements):
+            return "ValidationError", _OVERRIDE_SHAPE_ERROR
+        if has_type and has_requirements:
+            return "ValidationError", _OVERRIDE_BOTH_ERROR
+    if any("InstanceType" in present for present in entries) and any(
+            "InstanceRequirements" in present for present in entries):
+        return "ValidationError", _OVERRIDE_MIX_ERROR
+    return None
+
+
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
     if constraint_error := _constraint_error(p):
         return _error("ValidationError", constraint_error)
-    sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")]
-    if all(sources) or not (any(sources) or _p(p, "LaunchConfigurationName") or _p(p, "InstanceId")):
+    sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")] + [
+        bool(_p(p, "LaunchConfigurationName"))]
+    if sum(sources) > 1 or not (any(sources) or _p(p, "InstanceId")):
         return _error("ValidationError", _SOURCE_ERROR)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
+    if shape_error := _override_shape_error(p):
+        return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
@@ -592,6 +639,8 @@ def _create_asg(p):
     if mixed_error:
         return _error("ValidationError", mixed_error)
     capacity_type = _p(p, "DesiredCapacityType") or None
+    if launch_template and _template_has_requirements(launch_template):
+        return _error("InvalidQueryParameter", _LTNC_ERROR)
     if requirements_error := _capacity_type_requirements_error(capacity_type, mixed, "create"):
         return _error("ValidationError", requirements_error)
     if name in _asgs:
@@ -704,8 +753,14 @@ def _update_asg(p):
         return _error("ValidationError", constraint_error)
     if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
         return _error("ValidationError", _UPDATE_SOURCE_ERROR)
+    # On update a partial-weights or both-members answer comes before the DesiredCapacityType enum check.
+    shape_error = _override_shape_error(p)
+    if shape_error and shape_error[1] in (_OVERRIDE_WEIGHT_ERROR, _OVERRIDE_BOTH_ERROR):
+        return _error(*shape_error)
     if value_error := _capacity_type_value_error(p):
         return _error("ValidationError", value_error)
+    if shape_error:
+        return _error(*shape_error)
     asg = _asgs.get(name)
     if not asg:
         # UpdateAutoScalingGroup's text for a missing group (captured, us-east-2, 2026-11-05).
@@ -724,6 +779,8 @@ def _update_asg(p):
     checked_type = sent_type or (asg.get("DesiredCapacityType") if source_changed else None)
     if requirements_error := _capacity_type_requirements_error(checked_type, final_mixed, "update"):
         return _error("ValidationError", requirements_error)
+    if launch_template and _template_has_requirements(launch_template):
+        return _error("InvalidQueryParameter", _LTNC_ERROR)
     if not final_mixed:
         capacity_type = None
     elif sent_type and (sent_type != "units" or mixed):
