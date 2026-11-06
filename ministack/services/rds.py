@@ -5036,7 +5036,12 @@ def _unregister_instance_from_clusters(db_id):
     """Remove instance from any cluster member list."""
     for cl in _clusters.values():
         mem = cl.get("DBClusterMembers") or []
-        cl["DBClusterMembers"] = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        kept = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        if len(kept) == len(mem):
+            # Another cluster's status must not change; a member of it may be
+            # mid-reboot, and nothing would restore its status afterward.
+            continue
+        cl["DBClusterMembers"] = kept
         _sync_cluster_endpoints(cl)
         _refresh_cluster_status(cl.get("DBClusterIdentifier"))
 
@@ -6359,6 +6364,7 @@ def _finish_instance_reboot(instance, cluster):
         if cluster:
             _end_mysql_global_instance_mutation(cluster)
             _apply_deferred_global_writer_alias(cluster)
+            _refresh_cluster_status(cluster.get("DBClusterIdentifier"))
 
 
 # ---------------------------------------------------------------------------

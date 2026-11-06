@@ -5348,6 +5348,36 @@ def test_rds_reboot_authenticates_cluster_member_with_rotated_password(monkeypat
     assert seen[-1] == ("admin", "previous")
 
 
+def test_rds_reboot_keeps_cluster_status_when_another_cluster_loses_a_member(monkeypatch, reboot_instance):
+    """Deleting another cluster's instance mid-reboot must not leave this cluster ``creating``."""
+    cluster = {"DBClusterIdentifier": "reboot-cluster", "Status": "available", "MasterUsername": "admin",
+               "DBClusterMembers": [{"DBInstanceIdentifier": reboot_instance["DBInstanceIdentifier"]}]}
+    other = {"DBClusterIdentifier": "other-cluster", "Status": "available",
+             "DBClusterMembers": [{"DBInstanceIdentifier": "other-instance"}]}
+    monkeypatch.setitem(_imm_rds._clusters, "reboot-cluster", cluster)
+    monkeypatch.setitem(_imm_rds._clusters, "other-cluster", other)
+    reboot_instance["_shared_cluster_id"] = "reboot-cluster"
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None, reload=lambda: None, status="running")
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_end_mysql_global_instance_mutation", lambda cluster: None)
+    monkeypatch.setattr(_imm_rds, "_apply_deferred_global_writer_alias", lambda cluster: None)
+
+    def ready(host, port, engine, user, password, db_name, alive):
+        _imm_rds._unregister_instance_from_clusters("other-instance")
+        assert cluster["Status"] == "available"
+        cluster["Status"] = "creating"  # any other refresh while the member is rebooting
+        return True
+
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert reboot_instance["DBInstanceStatus"] == "available"
+    assert cluster["Status"] == "available"
+    assert other["DBClusterMembers"] == []
+
+
 @pytest.fixture
 def clean_rds_events():
     saved = dict(_imm_rds._events.items())
