@@ -614,7 +614,7 @@ def _scan_overrides(p):
     AWS answer is a field-level or wire-format error that is not reproduced (a scalar where a structure belongs,
     an empty InstanceType, InstanceRequirements without MemoryMiB or VCpuCount, non-numeric requirement values);
     those requests get no override checks, as before the checks existed."""
-    members, types, requirement_parts, modelled = {}, {}, {}, True
+    members, types, requirement_parts, modelled, illegal = {}, {}, {}, True, None
     for key, value in p.items():
         if not key.startswith(_OVERRIDES_PREFIX):
             continue
@@ -622,6 +622,11 @@ def _scan_overrides(p):
         if not index.isdigit():
             continue
         value = _p(p, key)      # a repeated key counts once, as _query_value reads it
+        significant = index.lstrip("0")
+        if len(significant) > _MAX_LISTED_DIGITS or significant == "9" * _MAX_LISTED_DIGITS:
+            # Compared as text, never through int(): the digit string is untrusted and can be thousands long.
+            illegal = illegal or index
+            continue
         try:
             number = int(index)
         except ValueError:      # more digits than int() converts
@@ -645,10 +650,44 @@ def _scan_overrides(p):
     for number, present in requirement_parts.items():
         if not {"VCpuCount", "MemoryMiB"} <= present:
             modelled = False
-    return members, types, modelled
+    return members, types, modelled, illegal
 
 
-def _override_numbering_error(members):
+# AWS reads a member index below 999,999,999 as a position (sparse-list error above a gap of 10) and refuses
+# 999,999,999 and above as "Index N is illegal" (captured, us-east-2, 2026-11-06: edges8 h8-*, edges7 h7-*). The range
+# between 99,999,999 and 999,999,999 is not captured, so the sparse error is kept there.
+_MAX_LISTED_DIGITS = 9
+
+
+_INTEGER_REQUIREMENTS = ("VCpuCount", "MemoryMiB", "NetworkInterfaceCount", "BaselineEbsBandwidthMbps",
+                         "AcceleratorCount", "AcceleratorTotalMemoryMiB")
+_DECIMAL_REQUIREMENTS = ("MemoryGiBPerVCpu", "TotalLocalStorageGB", "NetworkBandwidthGbps")
+_REQUIREMENT_KEY = re.compile(r"\.InstanceRequirements\.(\w+)\.(Min|Max)$")
+_INTEGER = re.compile(r"-?[0-9]+")
+_DECIMAL = re.compile(r"-?([0-9]+\.?[0-9]*|\.[0-9]+)")
+
+
+def _malformed_number_error(p):
+    """The message of the MalformedInput AWS answers for a non-numeric wire value, or None. It covers the group size
+    parameters and every numeric InstanceRequirements field, and comes right after the index errors, before every
+    other check (captured, us-east-2, 2026-11-06: edges7 b7-*, g7-*; the order against the index errors is not
+    captured). The message is empty, except for a blank VCpuCount.Min (b7-create-vcpumin-blank)."""
+    for key, value in p.items():
+        value = _p(p, key)
+        if key in ("MinSize", "MaxSize", "DesiredCapacity"):
+            if value != "" and not _INTEGER.fullmatch(value):
+                return ""
+        elif match := _REQUIREMENT_KEY.search(key):
+            if value == "" and key.endswith(".VCpuCount.Min"):
+                return "missing value for decimal type"
+            if match[1] in _INTEGER_REQUIREMENTS and value != "" and not _INTEGER.fullmatch(value):
+                return ""
+            if match[1] in _DECIMAL_REQUIREMENTS and value != "" and not _DECIMAL.fullmatch(value):
+                return ""
+    return None
+
+
+def _override_numbering_error(members, illegal=None):
     """Index 0 is refused, and so is a gap that skips 11 or more list elements: with the present indexes sorted
     ascending and the previous one starting at 1, an index i after p skips i - p (captured, us-east-2, 2026-11-06:
     single index 12 gives 11, 21 gives 20, {1,60} gives 59, edges4 q-c-*; dense lists up to 40 are accepted, edges4
@@ -662,6 +701,8 @@ def _override_numbering_error(members):
         if index - previous >= 11:
             return "MalformedInput", f"Excessively sparse input would skip {index - previous:,} list elements"
         previous = index
+    if illegal:
+        return "MalformedInput", f"Index {illegal} is illegal"
     return None
 
 
@@ -674,14 +715,15 @@ def _override_shape_error(p, scan, count_error=None):
     order, the first wrong one decides (neither InstanceType nor InstanceRequirements, or both); then InstanceType
     entries mixed with InstanceRequirements ones. A gap in the numbering is an empty override; the shared
     _query_value parser is left alone."""
-    members, types, modelled = scan
+    members, types, modelled = scan[:3]
     if not members or not modelled:
         return None
-    # More than 40 overrides (40 are accepted). On create (edges5 i-c-41-*, edges4 p-c-dense-41, edges6 c6-41-*) it
+    # More than 40 overrides: AWS counts the list size, the highest index, not the entries present (edges7 a7-*:
+    # {1,11,21,31,41} and 1..40 plus 50 are refused; 40 are accepted). On create (edges5 i-c-41-*, edges4 p-c-dense-41, edges6 c6-41-*) it
     # comes after the source and DesiredCapacityType errors; on update (edges6 u6-41-*) after the index, name
     # constraint and source errors and before the DesiredCapacityType enum. Either way before the duplicate,
     # neither, mix and weight errors and before every lookup.
-    if count_error and len(members) > 40:
+    if count_error and max(members) > 40:
         return "ValidationError", count_error
     if duplicate_error := _duplicate_type_error([types[i] for i in sorted(types)]):
         return "ValidationError", duplicate_error
@@ -704,8 +746,10 @@ def _override_shape_error(p, scan, count_error=None):
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
     scan = _scan_overrides(p)
-    if numbering_error := _override_numbering_error(scan[0]):
+    if numbering_error := _override_numbering_error(scan[0], scan[3]):
         return _error(*numbering_error)
+    if (malformed := _malformed_number_error(p)) is not None:
+        return _error("MalformedInput", malformed)
     if constraint_error := _constraint_error(p):
         return _error("ValidationError", constraint_error)
     sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")] + [
@@ -837,8 +881,10 @@ def _describe_asgs(p):
 def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
     scan = _scan_overrides(p)
-    if numbering_error := _override_numbering_error(scan[0]):
+    if numbering_error := _override_numbering_error(scan[0], scan[3]):
         return _error(*numbering_error)
+    if (malformed := _malformed_number_error(p)) is not None:
+        return _error("MalformedInput", malformed)
     if constraint_error := _constraint_error(p):
         return _error("ValidationError", constraint_error)
     # Any two of LaunchTemplate, MixedInstancesPolicy and LaunchConfigurationName (captured, us-east-2, 2026-11-06:

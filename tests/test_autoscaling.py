@@ -2767,7 +2767,7 @@ def _wire_refusal(action, group, params, code, message):
     base = {"AutoScalingGroupName": group, "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0"}
     if action == "CreateAutoScalingGroup":
         base["AvailabilityZones.member.1"] = "us-east-1a"
-    status, body = _raw_query(action, **base, **params)
+    status, body = _raw_query(action, **{**base, **params})
     assert (status, *_raw_error(body)) == (400, "Sender", code, message)
 
 
@@ -3117,6 +3117,84 @@ def test_asg_non_numeric_requirement_value_is_malformed_input(autoscaling, plain
         _wire_refusal(action, group, _wire_policy(name, {1: {**requirements, f"InstanceRequirements.{member}": value}}),
                       _MALFORMED, "")
     assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_override_count_is_the_list_size(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges7 a7-*): the count limit applies to the highest member index, not the entries present; the
+    sparse-gap error still comes first."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    create = ("CreateAutoScalingGroup", _uid("asg-size"), "The number of LaunchTemplateOverrides must be fewer than 40.")
+    update = ("UpdateAutoScalingGroup", mip, "The number of LaunchTemplateOverrides must be between 1 and 40.")
+    for action, group, message in (create, update):
+        for numbers in ((1, 11, 21, 31, 41), (*range(1, 41), 50)):      # a7-*-sparse-5-max41, a7-*-40dense-plus-50
+            _wire_refusal(action, group, _wire_policy(name, _typed(*numbers)), "ValidationError", message)
+        _wire_refusal(action, group, _wire_policy(name, _typed(1, 2, 3, 43)), _MALFORMED, _sparse(40))
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+_IR_BASE = {"InstanceRequirements.VCpuCount.Min": "1", "InstanceRequirements.MemoryMiB.Min": "512"}
+
+
+def test_asg_non_numeric_wire_values_are_malformed_input(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges7 b7-*, g7-*): every numeric InstanceRequirements field and MinSize, MaxSize and DesiredCapacity
+    answer MalformedInput for a non-numeric value, ahead of the DesiredCapacityType enum, the group name length
+    constraint and the group lookup on update. A blank VCpuCount.Min has its own message."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    fields = ("VCpuCount.Max", "MemoryGiBPerVCpu.Min", "TotalLocalStorageGB.Min", "NetworkInterfaceCount.Min",
+              "BaselineEbsBandwidthMbps.Min", "AcceleratorCount.Min", "VCpuCount.Min")
+    for action, group in (("CreateAutoScalingGroup", _uid("asg-abc")), ("UpdateAutoScalingGroup", mip)):
+        for field in fields:
+            requirements = {**_IR_BASE, f"InstanceRequirements.{field}": "abc"}
+            _wire_refusal(action, group, _wire_policy(name, {1: requirements}), _MALFORMED, "")
+        for size in ("MinSize", "MaxSize", "DesiredCapacity"):        # g7-*
+            _wire_refusal(action, group, {**_wire_policy(name, {1: _IT}), size: "abc"}, _MALFORMED, "")
+    bad = {1: {**_IR_BASE, "InstanceRequirements.VCpuCount.Min": "abc"}}
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-abc"), {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"},
+                  _MALFORMED, "")                                    # b7-create-vcpumin-abc-bogus-dct
+    _wire_refusal("CreateAutoScalingGroup", "g" * 256, {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"},
+                  _MALFORMED, "")                                    # b7-create-long256-vcpumin-abc-bogus-dct
+    _wire_refusal("UpdateAutoScalingGroup", _uid("asg-missing"),
+                  {**_wire_policy(name, bad), "DesiredCapacityType": "bogus"}, _MALFORMED, "")
+    for value, message in (("1.5", ""), ("", "missing value for decimal type")):   # b7-create-vcpumin-1.5, -blank
+        requirements = {**_IR_BASE, "InstanceRequirements.VCpuCount.Min": value}
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-abc"), _wire_policy(name, {1: requirements}), _MALFORMED,
+                      message)
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_huge_override_indexes(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges8 h8-*, edges7 h7-*): indexes up to 99,999,999 are a sparse-list error; 999,999,999 and above,
+    however long the digit string, are 'Index N is illegal' with the digits as sent. 00001 is index 1."""
+    _, mip = plain_and_mip_groups
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    for number, message in ((1000000, _sparse("999,999")), (99999999, _sparse("99,999,998"))):
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-big"), _wire_policy(name, {number: _IT}), _MALFORMED,
+                      message)
+    huge = ("999999999", "1000000000", "9223372036854775808", "9" * 40, "1" * 4300, "1" * 4301, "1" * 5000)
+    for number in huge:
+        for action, group in (("CreateAutoScalingGroup", _uid("asg-big")), ("UpdateAutoScalingGroup", mip)):
+            _wire_refusal(action, group, _wire_policy(name, {number: _IT}), _MALFORMED, f"Index {number} is illegal")
+    _wire_accepted(autoscaling, "CreateAutoScalingGroup", _uid("asg-big"), _wire_policy(name, {"00001": _IT}))
+    assert _stored_overrides(autoscaling, mip) == [_IT]
+
+
+def test_asg_edges7_confirmed_shapes(autoscaling, plain_and_mip_groups, capacity_type_templates):
+    """#2607 (edges7 c7-create-member1-blank*, e7-lt-mip-lcname, f7-dup-different-weights): a blank
+    Overrides.member.1= is an entry with neither member; a LaunchTemplate with a MixedInstancesPolicy and a
+    LaunchConfigurationName is a source error; repeated types with different weights are duplicates."""
+    name = capacity_type_templates["name_spec"]["LaunchTemplateName"]
+    blank = {_WIRE_PREFIX + "Overrides.member.1": ""}
+    spec = _wire_policy(name)
+    for extra in ({}, {_WIRE_PREFIX + "Overrides.member.2.InstanceType": "t3.small"}):
+        _wire_refusal("CreateAutoScalingGroup", _uid("asg-c7"), {**spec, **blank, **extra}, "ValidationError",
+                      "A launch template override must contain one of InstanceType or InstanceRequirements")
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-e7"),
+                  {**_wire_policy(name, {1: _IT}), "LaunchTemplate.LaunchTemplateName": name,
+                   "LaunchTemplate.Version": "$Latest", "LaunchConfigurationName": "no-such-lc"},
+                  "ValidationError", _CREATE_SOURCE)
+    weighted = {1: {**_IT, "WeightedCapacity": "1"}, 2: {**_IT, "WeightedCapacity": "2"}}
+    _wire_refusal("CreateAutoScalingGroup", _uid("asg-f7"), _wire_policy(name, weighted), "ValidationError", _DUP)
 
 
 def test_asg_source_check_with_launch_configuration(autoscaling, plain_and_mip_groups, capacity_type_templates):
