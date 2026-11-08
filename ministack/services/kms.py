@@ -17,6 +17,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -288,7 +290,7 @@ def _key_metadata(rec):
         "KeyUsage": rec["KeyUsage"],
         "KeyState": rec["KeyState"],
         "Origin": rec["Origin"],
-        "KeyManager": "CUSTOMER",
+        "KeyManager": rec.get("KeyManager", "CUSTOMER"),
         "CustomerMasterKeySpec": rec["KeySpec"],
         "KeySpec": rec["KeySpec"],
     }
@@ -326,6 +328,128 @@ def _key_metadata(rec):
         if rec.get("KeyState") == "PendingReplicaDeletion" and rec.get("_pending_window_days"):
             metadata["PendingDeletionWindowInDays"] = rec["_pending_window_days"]
     return metadata
+
+
+_AWS_S3_ALIAS = "alias/aws/s3"
+# GetKeyPolicy of the aws/s3 key, byte for byte as AWS returns it (recorded on AWS, us-east-2).
+_AWS_S3_KEY_POLICY = (
+    '{\n  "Version" : "2012-10-17",\n  "Id" : "auto-s3-2",\n  "Statement" : [ {\n'
+    '    "Sid" : "Allow access through S3 for all principals in the account that are authorized to use S3",\n'
+    '    "Effect" : "Allow",\n    "Principal" : {\n      "AWS" : "*"\n    },\n'
+    '    "Action" : [ "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey" ],\n'
+    '    "Resource" : "*",\n    "Condition" : {\n      "StringEquals" : {\n'
+    '        "kms:ViaService" : "s3.<region>.amazonaws.com",\n        "kms:CallerAccount" : "<account>"\n'
+    '      }\n    }\n  }, {\n    "Sid" : "Allow direct access to key metadata to the account",\n'
+    '    "Effect" : "Allow",\n    "Principal" : {\n      "AWS" : "arn:aws:iam::<account>:root"\n    },\n'
+    '    "Action" : [ "kms:Describe*", "kms:Get*", "kms:List*" ],\n    "Resource" : "*"\n  } ]\n}'
+)
+_KEY_ID_RE = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|mrk-[0-9a-fA-F]{32})")
+
+
+# Serializes the first use of aws/s3, so two concurrent first writes do not create two keys. _create_key does not
+# come back here, so the lock is never taken twice.
+_aws_s3_key_lock = threading.Lock()
+
+
+def aws_managed_s3_key():
+    """The account's AWS managed key ``aws/s3`` in this Region, created on first use by S3 or DescribeKey (recorded
+    on AWS in sa-east-1, us-west-2 and eu-west-1)."""
+    alias_arn = _alias_arn(_AWS_S3_ALIAS)
+    with _aws_s3_key_lock:
+        rec = _keys.get(_aliases[alias_arn]) if alias_arn in _aliases else None
+        if rec is None:
+            rec = _create_aws_s3_key(alias_arn)
+    return rec
+
+
+def _create_aws_s3_key(alias_arn):
+    created = _create_key({
+        "Description": "Default key that protects my S3 objects when no other key is defined",
+        "Policy": _AWS_S3_KEY_POLICY.replace("<region>", get_region()).replace("<account>", get_account_id()),
+    })
+    key_id = json.loads(created[2])["KeyMetadata"]["KeyId"]
+    rec = _keys[key_id]
+    rec["KeyManager"] = "AWS"
+    _aliases[alias_arn] = key_id
+    _stamp_alias(alias_arn, created=True)
+    return rec
+
+
+def _s3_key_arn(key_ref):
+    """``(key ARN, None)`` or ``(None, (code, message, status))`` for the key an S3 write names.
+
+    Recorded on AWS, us-east-2: no key (or ``alias/aws/s3``) is the account's ``aws/s3`` key; a key ID,
+    alias, alias ARN or key ARN of this account resolves to the key ARN, another account's only when it
+    exists; anything else is refused with the KMS error S3 relays.
+    """
+    region, account = get_region(), get_account_id()
+    not_found = "KMS.NotFoundException"
+    if not key_ref or key_ref in (_AWS_S3_ALIAS, f"arn:aws:kms:{region}:{account}:{_AWS_S3_ALIAS}"):
+        return aws_managed_s3_key()["Arn"], None
+    if key_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(key_ref)
+        except ArnParseError:
+            return None, (not_found, f"Invalid arn {key_ref}", 400)
+        if spec.service != "kms":
+            return None, (not_found, f"Invalid arn {spec.service}", 400)
+        if spec.region != region:
+            return None, (not_found, f"Invalid arn {spec.region}", 400)
+        if not spec.account_id or not spec.resource.startswith(("key/", "alias/")):
+            return None, (not_found, f"Invalid arn {key_ref}", 400)
+        if spec.account_id != account:
+            _, rec = _foreign_key(key_ref)
+            if rec:
+                return rec["Arn"], None
+            from ministack.core.iam_evaluator import caller_arn
+            return None, ("AccessDenied", f"User: {caller_arn()} is not authorized to perform: "
+                          "kms:GenerateDataKey on this resource because the resource does not exist in this "
+                          "Region, no resource-based policies allow access, or a resource-based policy "
+                          "explicitly denies access", 403)
+        if spec.resource.startswith("alias/"):
+            rec = _keys.get(_aliases.get(key_ref)) if key_ref in _aliases else None
+            if rec:
+                return rec["Arn"], None
+            return None, (not_found, f"Alias {key_ref} is not found.", 400)
+        key_id = spec.resource[len("key/"):]
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None, (not_found, f"Invalid keyId {key_id}", 400)
+        rec = _keys.get(key_id)
+        if rec and rec.get("Arn") == key_ref:
+            return rec["Arn"], None
+        return None, (not_found, f"Key '{key_ref}' does not exist", 400)
+    if key_ref.startswith("alias/"):
+        alias_arn = _alias_arn(key_ref)
+        rec = _keys.get(_aliases[alias_arn]) if alias_arn in _aliases else None
+        if rec:
+            return rec["Arn"], None
+        return None, (not_found, f"Alias {alias_arn} is not found.", 400)
+    if not _KEY_ID_RE.fullmatch(key_ref):
+        return None, (not_found, f"Invalid keyId '{key_ref}'", 400)
+    rec = _keys.get(key_ref)
+    if rec:
+        return rec["Arn"], None
+    return None, (not_found, f"Key '{_arn(key_ref)}' does not exist", 400)
+
+
+def resolve_key_for_s3(key_ref):
+    """``(key ARN, None)`` or ``(None, (code, message, status))`` for the key an S3 write names.
+
+    The reference rules of ``_s3_key_arn``; a key that is disabled, pending deletion or pending import is
+    refused with KMS's error, this account's or another's, ahead of any authorization (recorded on AWS,
+    us-east-2, by key ID and ARN).
+    """
+    arn, err = _s3_key_arn(key_ref)
+    if err or not arn:
+        return arn, err
+    rec = _keys.get(arn.rsplit("/", 1)[-1]) if arn.split(":")[4] == get_account_id() else _foreign_key(arn)[1]
+    state = (rec or {}).get("KeyState")
+    if state == "Disabled":
+        return None, ("KMS.DisabledException", f"{arn} is disabled.", 400)
+    if state in ("PendingDeletion", "PendingImport"):
+        words = "pending deletion" if state == "PendingDeletion" else "pending import"
+        return None, ("KMS.KMSInvalidStateException", f"{arn} is {words}.", 400)
+    return arn, None
 
 
 def _key_ref_from_arn(key_id_or_arn):
@@ -726,6 +850,9 @@ def _list_keys(data):
 
 def _describe_key(data):
     key_id = data.get("KeyId", "")
+    if key_id in (_AWS_S3_ALIAS, _alias_arn(_AWS_S3_ALIAS)):
+        # DescribeKey of alias/aws/s3 creates the AWS managed key (recorded on AWS, sa-east-1).
+        aws_managed_s3_key()
     rec = _resolve_key(key_id)
     if not rec:
         return _key_not_found(key_id)
@@ -1634,6 +1761,11 @@ def _list_aliases(data):
             "CreationDate": dates["CreationDate"],
             "LastUpdatedDate": dates["LastUpdatedDate"],
         })
+    s3_alias_arn = _alias_arn(_AWS_S3_ALIAS)
+    if not key_id and s3_alias_arn not in _aliases:
+        # alias/aws/s3 is listed before its key exists, without a target (recorded on AWS in sa-east-1, us-west-1,
+        # us-west-2 and eu-west-1).
+        items.append({"AliasName": _AWS_S3_ALIAS, "AliasArn": s3_alias_arn})
     return _marker_page(data, items, lambda a: a["AliasArn"], 50, "Aliases")
 
 

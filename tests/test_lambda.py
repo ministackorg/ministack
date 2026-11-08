@@ -7543,7 +7543,7 @@ def test_route_async_failure_unknown_target_logs_and_returns():
 # ──────────────────── RIE result → function_error classification ────────────
 
 def test_lambda_strict_hard_fails_when_docker_unavailable(monkeypatch):
-    """LAMBDA_STRICT=1 + no Docker → Runtime.DockerUnavailable, NO fallback to warm/local."""
+    """LAMBDA_STRICT=1 + no Docker → ServiceException (the service failed), NO fallback to warm/local."""
     monkeypatch.setattr(lsvc, "LAMBDA_STRICT", True)
     monkeypatch.setattr(lsvc, "_docker_available", False)
     func = {"config": {
@@ -7556,7 +7556,8 @@ def test_lambda_strict_hard_fails_when_docker_unavailable(monkeypatch):
     }, "code_zip": b"\x00"}
     result = lsvc._execute_function_docker(func, {"k": "v"}, request_id="request-1")
     assert result.get("error") is True
-    assert result["body"]["errorType"] == "Runtime.DockerUnavailable"
+    assert result.get("service_error") is True
+    assert result["body"]["__type"] == "ServiceException"
 
 
 def test_lambda_permissive_falls_back_to_warm_without_docker(monkeypatch):
@@ -14328,6 +14329,7 @@ def test_a_missing_bootstrap_is_runtime_invalid_entrypoint(worker_factory):
     with pytest.raises(lambda_runtime.ProvidedRuntimeError) as excinfo:
         worker.invoke({}, "req-1")
     assert excinfo.value.error_type == "Runtime.InvalidEntrypoint"
+    assert str(excinfo.value) == "Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]"
 
 
 # ---------------------------------------------------------------------------
@@ -14776,7 +14778,9 @@ def test_provided_failure_is_scoped_and_not_retried(monkeypatch, isolated_pool):
     monkeypatch.setattr(lambda_svc, "_execute_function_provided", fallback)
     result = lambda_svc._execute_function_provided_warm({"config": config, "code_zip": b"zip"}, {}, request_id="request-1")
     assert result["error"] is True
-    assert result["body"]["errorMessage"] == "bootstrap crashed"
+    assert result["service_error"] is True
+    assert result["body"] == {"__type": "ServiceException",
+                              "message": "MiniStack could not run the function's bootstrap: bootstrap crashed"}
     assert fail.call_count == 1
     fallback.assert_not_called()
     remaining = [w for entries in lambda_runtime._workers.values() for w in entries]

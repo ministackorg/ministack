@@ -1047,6 +1047,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, b"", query_params)
     if path == "/logout" and method == "GET":
         return _get_module("cognito").handle_logout(method, path, headers, query_params)
+    if path == "/forgotPassword" and method == "GET":
+        return _get_module("cognito").handle_forgot_password_page(method, path, headers, query_params)
     return None
 
 
@@ -2467,8 +2469,9 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
                                                      query_params, url)
     if ap_match and s3.signed_service(headers, query_params) in ("s3", None):
-        target = s3.resolve_access_point_host(ap_match.group("name"), ap_match.group("account"),
-                                              s3._signed_region(headers, query_params))
+        target = s3.resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), s3._signed_region(headers, query_params),
+            allow_foreign=s3.is_foreign_access_point_put(method, path.lstrip("/"), headers, query_params))
         if target is not None:
             ap_bucket, ap_region, ap_error = target
             if ap_error:
@@ -2504,6 +2507,11 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     if AUTH:
         object_error = (None if method in {"HEAD", "DELETE"} and access_point_region is not None else
                         _get_module("s3").validate_object_request(method, vhost_path, headers, query_params))
+        if object_error is None:
+            # An access point ARN host is validated as its alias, which names another account's access point.
+            write_path = (vhost_path if access_point_alias is None
+                          else f"/{access_point_alias}{vhost_path[len(bucket) + 1:]}")
+            object_error = _get_module("s3").validate_write_request(method, write_path, headers, query_params)
         if object_error is not None:
             return object_error
         from ministack.core.iam_actions import (
@@ -2522,10 +2530,12 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         if s3_action:
             s3_resource = extract_resource_arn("s3", method, iam_path, s3_headers, body, query_params, "", "")
             service_context = s3_service_context(f"s3:{s3_action}", query_params, iam_path, s3_headers)
-            for resource, keys in s3_access_point_resources(s3_resource):
+            for resource, keys in s3_access_point_resources(s3_resource, f"s3:{s3_action}"):
                 denied = _enforce_data_plane(
                     "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
                     service_context={**service_context, **keys},
+                    denied_response=(lambda result, keys=keys, resource=resource: _s3_foreign_denied(
+                        keys, f"s3:{s3_action}", result, resource, headers, query_params)),
                 )
                 if denied:
                     return denied
@@ -2659,6 +2669,17 @@ def _enforce_data_plane(
             fix_error_content_type(service, response[0], response[1])
         return response
     return None
+
+
+def _s3_foreign_denied(keys: dict, iam_action: str, denied, resource: str, headers: dict, query_params: dict):
+    """The answer to a denial in a step of a PutObject through another account's access point, or None."""
+    from ministack.core.iam_actions import access_denied_response, s3_foreign_denial_message
+
+    message = s3_foreign_denial_message(keys, iam_action, denied.principal_arn, denied, resource)
+    if not message:
+        return None
+    return access_denied_response("s3", iam_action, denied.principal_arn, "", headers=headers, message=message,
+                                  explicit_deny=denied.decision == "Deny")
 
 
 def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
@@ -3101,6 +3122,8 @@ async def _dispatch_service_request(
 
     if AUTH and service == "s3":
         object_error = _get_module("s3").validate_object_request(method, path, headers, query_params)
+        if object_error is None:
+            object_error = _get_module("s3").validate_write_request(method, path, headers, query_params)
         if object_error is not None:
             return object_error
 
@@ -3122,6 +3145,7 @@ async def _dispatch_service_request(
             logs_service_context,
             request_tag_context,
             s3_access_point_resources,
+            s3_foreign_denial_message,
             s3_service_context,
             verified_access_resource_arns,
         )
@@ -3130,6 +3154,7 @@ async def _dispatch_service_request(
 
         pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
+        denial_message = ""
         if service == "ses" and (path.startswith("/v2/") or "sesv2" in headers.get("x-amz-target", "").lower()):
             # SES v2 also answers on paths without /v2/email when the target header names it: authorize the call
             # as the /v2/email operation it performs, never as an action the target header names.
@@ -3189,13 +3214,16 @@ async def _dispatch_service_request(
                         break
             else:
                 # Through an S3 access point alias the check is made on the access point and on its bucket.
-                for checked_arn, keys in (s3_access_point_resources(resource_arn) if service == "s3"
+                for checked_arn, keys in (s3_access_point_resources(resource_arn, iam_action) if service == "s3"
                                           else [(resource_arn, {})]):
                     denied = enforce(
                         access_key, iam_action, service, region,
                         resource_arn=checked_arn, service_context={**service_context, **keys},
                     )
                     if denied:
+                        denial_message = (s3_foreign_denial_message(keys, iam_action, denied.principal_arn, denied,
+                                                                    checked_arn)
+                                          if service == "s3" and not isinstance(denied, AuthError) else "")
                         break
             # A malformed Logs tagging ARN fails validation ahead of a policy denial.
             if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
@@ -3282,7 +3310,7 @@ async def _dispatch_service_request(
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
-                    resource_policy_arn=denied.resource_policy_arn,
+                    resource_policy_arn=denied.resource_policy_arn, message=denial_message,
                 )
 
     handler = SERVICE_HANDLERS.get(service)
@@ -3804,9 +3832,10 @@ def _stop_docker_containers(include_unlabelled: bool = False):
     if client is None:
         return
     container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
-    # RDS_PERSIST=0 keeps no database data across a restart, Aurora cluster volumes included.
-    if os.environ.get("RDS_PERSIST", "0").lower() not in ("1", "true", "yes"):
-        container_reaper.reap_volumes(client, "rds")
+    # *_PERSIST=0 keeps no data across a restart, so that service's named volumes go too.
+    for service, flag in (("rds", "RDS_PERSIST"), ("mwaa", "MWAA_PERSIST"), ("dsql", "DSQL_PERSIST")):
+        if os.environ.get(flag, "0").lower() not in ("1", "true", "yes"):
+            container_reaper.reap_volumes(client, service)
 
 
 def _build_persistence_save_dict():

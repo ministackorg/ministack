@@ -160,6 +160,13 @@ def _job_queue_matches(stored_ref, query_ref, queue_name):
     return stored_ref in {query_ref, queue_name, _jq_arn(queue_name)}
 
 
+_JOB_DEFINITION_MEMBERS = (
+    "parameters", "schedulingPriority", "containerProperties", "nodeProperties", "retryStrategy",
+    "propagateTags", "timeout", "platformCapabilities", "eksProperties", "ecsProperties",
+    "consumableResourceProperties",
+)
+
+
 def _now_ms():
     return int(time.time() * 1000)
 
@@ -255,6 +262,9 @@ def _paged(key, items, p, default):
 def _describe_compute_environments(p):
     names = p.get("computeEnvironments") or []
     if names:
+        # Names or full ARNs (service-2.json).
+        names = [n.split(":compute-environment/", 1)[1] if n.startswith("arn:") and ":compute-environment/" in n
+                 else n for n in names]
         out = [_compute_envs[n] for n in names if n in _compute_envs]
     else:
         out = list(_compute_envs.values())
@@ -279,6 +289,9 @@ def _create_job_queue(p):
         "computeEnvironmentOrder": p.get("computeEnvironmentOrder", []),
         "tags": p.get("tags", {}),
     }
+    for key in ("schedulingPolicyArn", "jobStateTimeLimitActions"):
+        if p.get(key) is not None:
+            rec[key] = p[key]
     _job_queues[name] = rec
     return _json(200, {"jobQueueName": name, "jobQueueArn": rec["jobQueueArn"]})
 
@@ -312,22 +325,45 @@ def _register_job_definition(p):
         "revision": revision,
         "status": "ACTIVE",
         "type": p.get("type", "container"),
-        "containerProperties": p.get("containerProperties", {}),
         "tags": p.get("tags", {}),
     }
+    for key in _JOB_DEFINITION_MEMBERS:
+        if p.get(key) is not None:
+            rec[key] = p[key]
     revisions.append(rec)
     return _json(200, {"jobDefinitionName": name,
                        "jobDefinitionArn": rec["jobDefinitionArn"],
                        "revision": revision})
 
 
+def _job_definition_refs(ref):
+    """(name, revision or None) of a job definition name, name:revision or ARN."""
+    if ref.startswith("arn:"):
+        ref = ref.split(":job-definition/", 1)[1] if ":job-definition/" in ref else ""
+    name, _, revision = ref.partition(":")
+    return name, (int(revision) if revision.isdigit() else None)
+
+
+def _find_job_definitions(ref):
+    name, revision = _job_definition_refs(ref)
+    revs = _job_definitions.get(name, [])
+    if revision is not None:
+        return [r for r in revs if r["revision"] == revision]
+    return list(revs)
+
+
 def _describe_job_definitions(p):
+    refs = p.get("jobDefinitions") or []
     name = p.get("jobDefinitionName")
-    revs = _job_definitions.get(name, []) if name else []
-    if not name:
-        # all
-        for n, rs in _job_definitions.items():
-            revs.extend(rs)
+    if refs:
+        revs = [r for ref in refs for r in _find_job_definitions(ref)]
+    elif name:
+        revs = list(_job_definitions.get(name, []))
+    else:
+        revs = [r for rs in _job_definitions.values() for r in rs]
+    status = p.get("status")
+    if status:
+        revs = [r for r in revs if r.get("status") == status]
     return _paged("jobDefinitions", revs, p, 100)
 
 
@@ -336,6 +372,13 @@ def _submit_job(p):
     name = p.get("jobName")
     if not name:
         return error_response_json("ClientException", "jobName is required", 400)
+    queue_ref = p.get("jobQueue", "")
+    queue_name = queue_ref.split(":job-queue/", 1)[1] if ":job-queue/" in queue_ref else queue_ref
+    if queue_name not in _job_queues:
+        return error_response_json("ClientException", f"JobQueue {queue_ref} not found", 400)
+    jd_ref = p.get("jobDefinition", "")
+    if not [r for r in _find_job_definitions(jd_ref) if r.get("status") == "ACTIVE"]:
+        return error_response_json("ClientException", f"JobDefinition {jd_ref} not found", 400)
     job_id = new_uuid()
     now = _now_ms()
     rec = {

@@ -1211,7 +1211,7 @@ def _put_record(data: dict):
         if not stream:
             return _not_found(name)
         if stream["status"] != "ACTIVE":
-            return error_response_json("ServiceUnavailableException", "Service unavailable.", 503)
+            return error_response_json("ServiceUnavailableException", "Service unavailable.", 500)
 
         try:
             decoded = base64.b64decode(raw_data)
@@ -1246,7 +1246,7 @@ def _put_record_batch(data: dict):
         if not stream:
             return _not_found(name)
         if stream["status"] != "ACTIVE":
-            return error_response_json("ServiceUnavailableException", "Service unavailable.", 503)
+            return error_response_json("ServiceUnavailableException", "Service unavailable.", 500)
 
         responses = []
         failed = 0

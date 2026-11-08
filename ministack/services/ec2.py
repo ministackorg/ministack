@@ -964,12 +964,12 @@ def _run_instances(p):
                 return _error(
                     "InvalidAMIID.Unavailable",
                     f"The image id '[{image_id}]' is not in a state from which you "
-                    f"can launch an instance: {_esc(image['ImageLocation'])} could "
-                    f"not be pulled ({_esc(str(e))})", 400)
+                    f"can launch an instance: {image['ImageLocation']} could "
+                    f"not be pulled ({e})", 400)
             return _error(
                 "InternalError",
-                f"failed to start instance from {_esc(image['ImageLocation'])}: "
-                f"{_esc(str(e))}", 500)
+                f"failed to start instance from {image['ImageLocation']}: "
+                f"{e}", 500)
 
     # Process TagSpecifications
     i = 1
@@ -1081,11 +1081,11 @@ def _describe_instance_status(p):
             continue
         az = inst.get("Placement", {}).get("AvailabilityZone", "us-east-1a")
         results.append(f"""<item>
-            <instanceId>{iid}</instanceId>
-            <availabilityZone>{az}</availabilityZone>
+            <instanceId>{_esc(str(iid))}</instanceId>
+            <availabilityZone>{_esc(str(az))}</availabilityZone>
             <instanceState>
-                <code>{inst['State']['Code']}</code>
-                <name>{state}</name>
+                <code>{_esc(str(inst['State']['Code']))}</code>
+                <name>{_esc(str(state))}</name>
             </instanceState>
             <systemStatus>
                 <status>ok</status>
@@ -1259,8 +1259,8 @@ def _terminate_instances(p):
             if assoc:
                 _mark_iam_instance_profile_association_disassociated(assoc)
             items += f"""<item>
-                <instanceId>{iid}</instanceId>
-                <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
+                <instanceId>{_esc(str(iid))}</instanceId>
+                <previousState><code>{_esc(str(prev['Code']))}</code><name>{_esc(str(prev['Name']))}</name></previousState>
                 <currentState><code>48</code><name>terminated</name></currentState>
             </item>"""
     return _xml(200, "TerminateInstancesResponse", f"<instancesSet>{items}</instancesSet>")
@@ -1286,8 +1286,8 @@ def _stop_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 80, "Name": "stopped"}
             items += f"""<item>
-                <instanceId>{iid}</instanceId>
-                <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
+                <instanceId>{_esc(str(iid))}</instanceId>
+                <previousState><code>{_esc(str(prev['Code']))}</code><name>{_esc(str(prev['Name']))}</name></previousState>
                 <currentState><code>80</code><name>stopped</name></currentState>
             </item>"""
     return _xml(200, "StopInstancesResponse", f"<instancesSet>{items}</instancesSet>")
@@ -1312,8 +1312,8 @@ def _start_instances(p):
             prev = inst["State"].copy()
             inst["State"] = {"Code": 16, "Name": "running"}
             items += f"""<item>
-                <instanceId>{iid}</instanceId>
-                <previousState><code>{prev['Code']}</code><name>{prev['Name']}</name></previousState>
+                <instanceId>{_esc(str(iid))}</instanceId>
+                <previousState><code>{_esc(str(prev['Code']))}</code><name>{_esc(str(prev['Name']))}</name></previousState>
                 <currentState><code>16</code><name>running</name></currentState>
             </item>"""
     return _xml(200, "StartInstancesResponse", f"<instancesSet>{items}</instancesSet>")
@@ -1491,9 +1491,9 @@ def _image_bdm_xml(view):
                     <deviceName>{_esc(m['DeviceName'])}</deviceName>
                     <ebs>
                         {snapshot}
-                        <volumeSize>{ebs.get('VolumeSize', '8')}</volumeSize>
-                        <volumeType>{ebs.get('VolumeType', 'gp2')}</volumeType>
-                        <deleteOnTermination>{ebs.get('DeleteOnTermination', 'true')}</deleteOnTermination>
+                        <volumeSize>{_esc(str(ebs.get('VolumeSize', '8')))}</volumeSize>
+                        <volumeType>{_esc(str(ebs.get('VolumeType', 'gp2')))}</volumeType>
+                        <deleteOnTermination>{_esc(str(ebs.get('DeleteOnTermination', 'true')))}</deleteOnTermination>
                     </ebs>
                 </item>"""
     return f"<blockDeviceMapping>{items}</blockDeviceMapping>"
@@ -1573,9 +1573,9 @@ def _describe_images(p):
         # RootDeviceName + BlockDeviceMappings are required by Terraform's AWS
         # provider on aws_instance — it resolves them from DescribeImages before
         # RunInstances and fails with "finding Root Device Name for AMI" if absent.
-        platform_xml = f"<platform>{view['Platform']}</platform>" if view["Platform"] else ""
+        platform_xml = f"<platform>{_esc(str(view['Platform']))}</platform>" if view["Platform"] else ""
         owner_alias_xml = (
-            f"<imageOwnerAlias>{view['ImageOwnerAlias']}</imageOwnerAlias>"
+            f"<imageOwnerAlias>{_esc(str(view['ImageOwnerAlias']))}</imageOwnerAlias>"
             if view.get("ImageOwnerAlias") else ""
         )
         tag_items = "".join(
@@ -1583,21 +1583,21 @@ def _describe_images(p):
             for t in _tags.get(view["ImageId"], []))
         tag_xml = f"<tagSet>{tag_items}</tagSet>" if tag_items else ""
         items += f"""<item>
-            <imageId>{view['ImageId']}</imageId>
+            <imageId>{_esc(str(view['ImageId']))}</imageId>
             <imageLocation>{_esc(view['Name'])}</imageLocation>
             <imageState>available</imageState>
-            <imageOwnerId>{view['OwnerId']}</imageOwnerId>
+            <imageOwnerId>{_esc(str(view['OwnerId']))}</imageOwnerId>
             {owner_alias_xml}
-            <isPublic>{view['IsPublic']}</isPublic>
-            <architecture>{view['Architecture']}</architecture>
+            <isPublic>{_esc(str(view['IsPublic']))}</isPublic>
+            <architecture>{_esc(str(view['Architecture']))}</architecture>
             <imageType>machine</imageType>
             <name>{_esc(view['Name'])}</name>
             <description>{_esc(view['Description'])}</description>
             {platform_xml}
-            <rootDeviceType>{view['RootDeviceType']}</rootDeviceType>
-            <rootDeviceName>{view['RootDeviceName']}</rootDeviceName>
+            <rootDeviceType>{_esc(str(view['RootDeviceType']))}</rootDeviceType>
+            <rootDeviceName>{_esc(str(view['RootDeviceName']))}</rootDeviceName>
             {_image_bdm_xml(view)}
-            <virtualizationType>{view['VirtualizationType']}</virtualizationType>
+            <virtualizationType>{_esc(str(view['VirtualizationType']))}</virtualizationType>
             <hypervisor>xen</hypervisor>
             {_image_options_xml(view)}
             {tag_xml}
@@ -1640,7 +1640,7 @@ def _create_security_group(p):
     }
     _parse_tag_specs(p, "security-group", sg_id)
     return _xml(200, "CreateSecurityGroupResponse",
-                f"<return>true</return><groupId>{sg_id}</groupId><securityGroupArn>{_security_group_arn(sg_id)}</securityGroupArn>")
+                f"<return>true</return><groupId>{_esc(str(sg_id))}</groupId><securityGroupArn>{_esc(str(_security_group_arn(sg_id)))}</securityGroupArn>")
 
 
 def _delete_security_group(p):
@@ -1654,7 +1654,7 @@ def _delete_security_group(p):
     elif sg_id:
         return _error("InvalidGroup.NotFound",
                       f"The security group '{sg_id}' does not exist", 400)
-    group_id_xml = f"<groupId>{sg_id}</groupId>" if sg_id else ""
+    group_id_xml = f"<groupId>{_esc(str(sg_id))}</groupId>" if sg_id else ""
     return _xml(200, "DeleteSecurityGroupResponse", f"<return>true</return>{group_id_xml}")
 
 
@@ -1731,7 +1731,7 @@ def _sg_rule_tag_suffix(rule_id):
     """AWS returns securityGroupRuleArn and a tagSet on every rule. Tags are
     keyed by the content-derived rule id in the shared ``_tags`` store (set at
     authorize time or via CreateTags on the sgr- id)."""
-    suffix = f"<securityGroupRuleArn>{_sg_rule_arn(rule_id)}</securityGroupRuleArn>"
+    suffix = f"<securityGroupRuleArn>{_esc(str(_sg_rule_arn(rule_id)))}</securityGroupRuleArn>"
     tags = _tags.get(rule_id) or []
     if tags:
         tag_items = "".join(
@@ -1764,40 +1764,40 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
     items = ""
     for cidr in rule.get("IpRanges", []):
         items += (f"<item>"
-                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
-                  f"<groupId>{sg_id}</groupId>"
+                  f"<securityGroupRuleId>{_esc(str(rule_id))}</securityGroupRuleId>"
+                  f"<groupId>{_esc(str(sg_id))}</groupId>"
                   f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
                   f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
-                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
-                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
-                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
-                  f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>"
+                  f"<ipProtocol>{_esc(str(rule.get('IpProtocol', '-1')))}</ipProtocol>"
+                  f"<fromPort>{_esc(str(rule.get('FromPort', -1)))}</fromPort>"
+                  f"<toPort>{_esc(str(rule.get('ToPort', -1)))}</toPort>"
+                  f"<cidrIpv4>{_esc(str(cidr.get('CidrIp', '')))}</cidrIpv4>"
                   f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     for cidr6 in rule.get("Ipv6Ranges", []):
         items += (f"<item>"
-                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
-                  f"<groupId>{sg_id}</groupId>"
+                  f"<securityGroupRuleId>{_esc(str(rule_id))}</securityGroupRuleId>"
+                  f"<groupId>{_esc(str(sg_id))}</groupId>"
                   f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
                   f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
-                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
-                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
-                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
-                  f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>"
+                  f"<ipProtocol>{_esc(str(rule.get('IpProtocol', '-1')))}</ipProtocol>"
+                  f"<fromPort>{_esc(str(rule.get('FromPort', -1)))}</fromPort>"
+                  f"<toPort>{_esc(str(rule.get('ToPort', -1)))}</toPort>"
+                  f"<cidrIpv6>{_esc(str(cidr6.get('CidrIpv6', '')))}</cidrIpv6>"
                   f"{desc_xml}"
                   f"{suffix}"
                   f"</item>")
     for prefix in rule.get("PrefixListIds", []):
         prefix_id = prefix.get("PrefixListId", "") if isinstance(prefix, dict) else str(prefix)
         items += (f"<item>"
-                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
-                  f"<groupId>{sg_id}</groupId>"
+                  f"<securityGroupRuleId>{_esc(str(rule_id))}</securityGroupRuleId>"
+                  f"<groupId>{_esc(str(sg_id))}</groupId>"
                   f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
                   f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
-                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
-                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
-                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<ipProtocol>{_esc(str(rule.get('IpProtocol', '-1')))}</ipProtocol>"
+                  f"<fromPort>{_esc(str(rule.get('FromPort', -1)))}</fromPort>"
+                  f"<toPort>{_esc(str(rule.get('ToPort', -1)))}</toPort>"
                   f"<prefixListId>{_esc(prefix_id)}</prefixListId>"
                   f"{desc_xml}"
                   f"{suffix}"
@@ -1805,15 +1805,15 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
     for pair in rule.get("UserIdGroupPairs", []):
         ref_gid = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
         items += (f"<item>"
-                  f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
-                  f"<groupId>{sg_id}</groupId>"
+                  f"<securityGroupRuleId>{_esc(str(rule_id))}</securityGroupRuleId>"
+                  f"<groupId>{_esc(str(sg_id))}</groupId>"
                   f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
                   f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
-                  f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
-                  f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
-                  f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                  f"<ipProtocol>{_esc(str(rule.get('IpProtocol', '-1')))}</ipProtocol>"
+                  f"<fromPort>{_esc(str(rule.get('FromPort', -1)))}</fromPort>"
+                  f"<toPort>{_esc(str(rule.get('ToPort', -1)))}</toPort>"
                   f"<referencedGroupInfo>"
-                  f"<groupId>{ref_gid}</groupId>"
+                  f"<groupId>{_esc(str(ref_gid))}</groupId>"
                   f"<userId>{get_account_id()}</userId>"
                   f"</referencedGroupInfo>"
                   f"{desc_xml}"
@@ -1822,13 +1822,13 @@ def _sg_rule_xml(sg_id, rule, is_egress=False):
     if not items:
         # No CIDR ranges — still return the rule (e.g. referenced group)
         items = (f"<item>"
-                 f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
-                 f"<groupId>{sg_id}</groupId>"
+                 f"<securityGroupRuleId>{_esc(str(rule_id))}</securityGroupRuleId>"
+                 f"<groupId>{_esc(str(sg_id))}</groupId>"
                  f"<groupOwnerId>{get_account_id()}</groupOwnerId>"
                  f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
-                 f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
-                 f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
-                 f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+                 f"<ipProtocol>{_esc(str(rule.get('IpProtocol', '-1')))}</ipProtocol>"
+                 f"<fromPort>{_esc(str(rule.get('FromPort', -1)))}</fromPort>"
+                 f"<toPort>{_esc(str(rule.get('ToPort', -1)))}</toPort>"
                  f"{desc_xml}"
                  f"{suffix}"
                  f"</item>")
@@ -1841,14 +1841,14 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
     def _item(extra_xml=""):
         # A rule stored without ports (IpProtocol -1) is reported as -1/-1, as
         # in DescribeSecurityGroupRules.
-        from_port = f"<fromPort>{rule.get('FromPort', -1)}</fromPort>"
-        to_port = f"<toPort>{rule.get('ToPort', -1)}</toPort>"
+        from_port = f"<fromPort>{_esc(str(rule.get('FromPort', -1)))}</fromPort>"
+        to_port = f"<toPort>{_esc(str(rule.get('ToPort', -1)))}</toPort>"
         return (
             "<item>"
-            f"<securityGroupRuleId>{rule_id}</securityGroupRuleId>"
-            f"<groupId>{sg_id}</groupId>"
+            f"<securityGroupRuleId>{_esc(str(rule_id))}</securityGroupRuleId>"
+            f"<groupId>{_esc(str(sg_id))}</groupId>"
             f"<isEgress>{'true' if is_egress else 'false'}</isEgress>"
-            f"<ipProtocol>{rule.get('IpProtocol', '-1')}</ipProtocol>"
+            f"<ipProtocol>{_esc(str(rule.get('IpProtocol', '-1')))}</ipProtocol>"
             f"{from_port}{to_port}{extra_xml}"
             "</item>"
         )
@@ -1856,10 +1856,10 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
     items = ""
     for cidr in rule.get("IpRanges", []):
         desc_xml = f"<description>{_esc(cidr['Description'])}</description>" if cidr.get("Description") else ""
-        items += _item(f"<cidrIpv4>{cidr.get('CidrIp', '')}</cidrIpv4>{desc_xml}")
+        items += _item(f"<cidrIpv4>{_esc(str(cidr.get('CidrIp', '')))}</cidrIpv4>{desc_xml}")
     for cidr6 in rule.get("Ipv6Ranges", []):
         desc_xml = f"<description>{_esc(cidr6['Description'])}</description>" if cidr6.get("Description") else ""
-        items += _item(f"<cidrIpv6>{cidr6.get('CidrIpv6', '')}</cidrIpv6>{desc_xml}")
+        items += _item(f"<cidrIpv6>{_esc(str(cidr6.get('CidrIpv6', '')))}</cidrIpv6>{desc_xml}")
     for prefix in rule.get("PrefixListIds", []):
         if isinstance(prefix, dict):
             prefix_id = prefix.get("PrefixListId", "")
@@ -1867,11 +1867,11 @@ def _revoked_sg_rule_xml(sg_id, rule, is_egress=False):
         else:
             prefix_id = prefix
             desc_xml = ""
-        items += _item(f"<prefixListId>{prefix_id}</prefixListId>{desc_xml}")
+        items += _item(f"<prefixListId>{_esc(str(prefix_id))}</prefixListId>{desc_xml}")
     for pair in rule.get("UserIdGroupPairs", []):
         ref_group_id = pair.get("GroupId", "") if isinstance(pair, dict) else str(pair)
         desc_xml = f"<description>{_esc(pair['Description'])}</description>" if isinstance(pair, dict) and pair.get("Description") else ""
-        items += _item(f"<referencedGroupId>{ref_group_id}</referencedGroupId>{desc_xml}")
+        items += _item(f"<referencedGroupId>{_esc(str(ref_group_id))}</referencedGroupId>{desc_xml}")
     return items or _item()
 
 
@@ -2094,10 +2094,10 @@ def _create_key_pair(p):
     }
     _parse_tag_specs(p, "key-pair", _key_pairs[name]['KeyPairId'])
     return _xml(200, "CreateKeyPairResponse", f"""
-        <keyName>{name}</keyName>
-        <keyFingerprint>{fingerprint}</keyFingerprint>
-        <keyMaterial>{material}</keyMaterial>
-        <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>
+        <keyName>{_esc(str(name))}</keyName>
+        <keyFingerprint>{_esc(str(fingerprint))}</keyFingerprint>
+        <keyMaterial>{_esc(str(material))}</keyMaterial>
+        <keyPairId>{_esc(str(_key_pairs[name]['KeyPairId']))}</keyPairId>
         {_tag_set_xml(_key_pairs[name]['KeyPairId'])}""")
 
 
@@ -2120,13 +2120,13 @@ def _describe_key_pairs(p):
             continue
         extra = f"<keyType>{_esc(kp.get('KeyType', 'rsa'))}</keyType>"
         if kp.get("CreateTime"):
-            extra += f"<createTime>{kp['CreateTime']}</createTime>"
+            extra += f"<createTime>{_esc(str(kp['CreateTime']))}</createTime>"
         if include_public_key and kp.get("PublicKey"):
             extra += f"<publicKey>{_esc(kp['PublicKey'])}</publicKey>"
         items += f"""<item>
-            <keyName>{kp['KeyName']}</keyName>
-            <keyFingerprint>{kp['KeyFingerprint']}</keyFingerprint>
-            <keyPairId>{kp['KeyPairId']}</keyPairId>
+            <keyName>{_esc(str(kp['KeyName']))}</keyName>
+            <keyFingerprint>{_esc(str(kp['KeyFingerprint']))}</keyFingerprint>
+            <keyPairId>{_esc(str(kp['KeyPairId']))}</keyPairId>
             {extra}
             {_tag_set_xml(kp['KeyPairId'])}
         </item>"""
@@ -2153,9 +2153,9 @@ def _import_key_pair(p):
     }
     _parse_tag_specs(p, "key-pair", _key_pairs[name]['KeyPairId'])
     return _xml(200, "ImportKeyPairResponse", f"""
-        <keyName>{name}</keyName>
-        <keyFingerprint>{fingerprint}</keyFingerprint>
-        <keyPairId>{_key_pairs[name]['KeyPairId']}</keyPairId>
+        <keyName>{_esc(str(name))}</keyName>
+        <keyFingerprint>{_esc(str(fingerprint))}</keyFingerprint>
+        <keyPairId>{_esc(str(_key_pairs[name]['KeyPairId']))}</keyPairId>
         {_tag_set_xml(_key_pairs[name]['KeyPairId'])}""")
 
 
@@ -2344,7 +2344,7 @@ def _register_image(p):
     if _p(p, "EnaSupport"):
         _images[image_id]["EnaSupport"] = _p(p, "EnaSupport").lower() == "true"
     _parse_tag_specs(p, "image", image_id)
-    return _xml(200, "RegisterImageResponse", f"<imageId>{image_id}</imageId>")
+    return _xml(200, "RegisterImageResponse", f"<imageId>{_esc(str(image_id))}</imageId>")
 
 
 def _deregister_image(p):
@@ -2437,22 +2437,22 @@ def _describe_image_attribute(p):
                       f"The image id '[{image_id}]' does not exist", 400)
     if attribute == "launchPermission":
         items = "".join(
-            (f"<item><userId>{perm['UserId']}</userId></item>" if perm.get("UserId")
-             else f"<item><group>{perm['Group']}</group></item>")
+            (f"<item><userId>{_esc(str(perm['UserId']))}</userId></item>" if perm.get("UserId")
+             else f"<item><group>{_esc(str(perm['Group']))}</group></item>")
             for perm in image.get("LaunchPermissions") or [])
         return _xml(200, "DescribeImageAttributeResponse",
-                    f"<imageId>{image_id}</imageId>"
+                    f"<imageId>{_esc(str(image_id))}</imageId>"
                     f"<launchPermission>{items}</launchPermission>")
     if attribute == "description":
         return _xml(200, "DescribeImageAttributeResponse",
-                    f"<imageId>{image_id}</imageId>"
+                    f"<imageId>{_esc(str(image_id))}</imageId>"
                     f"<description><value>{_esc(image.get('Description') or '')}</value></description>")
     attr_members = {"kernel": "KernelId", "ramdisk": "RamdiskId", "sriovNetSupport": "SriovNetSupport",
                     "bootMode": "BootMode", "tpmSupport": "TpmSupport", "imdsSupport": "ImdsSupport"}
     if attribute in attr_members:
         value = image.get(attr_members[attribute])
         body = f"<{attribute}><value>{_esc(value)}</value></{attribute}>" if value else f"<{attribute}/>"
-        return _xml(200, "DescribeImageAttributeResponse", f"<imageId>{image_id}</imageId>{body}")
+        return _xml(200, "DescribeImageAttributeResponse", f"<imageId>{_esc(str(image_id))}</imageId>{body}")
     return _error("InvalidParameterValue",
                   f"Value ({attribute}) for parameter attribute is invalid.", 400)
 
@@ -2855,13 +2855,13 @@ def _placement_group_inner_xml(pg, tag="placementGroup"):
     # omits it otherwise, so mirror that shape.
     partition_xml = ""
     if pg["Strategy"] == "partition" and pg.get("PartitionCount"):
-        partition_xml = f"<partitionCount>{pg['PartitionCount']}</partitionCount>"
+        partition_xml = f"<partitionCount>{_esc(str(pg['PartitionCount']))}</partitionCount>"
     return f"""<{tag}>
         <groupName>{_esc(pg['GroupName'])}</groupName>
-        <state>{pg['State']}</state>
-        <strategy>{pg['Strategy']}</strategy>
-        <groupId>{pg['GroupId']}</groupId>
-        <groupArn>{pg['GroupArn']}</groupArn>
+        <state>{_esc(str(pg['State']))}</state>
+        <strategy>{_esc(str(pg['Strategy']))}</strategy>
+        <groupId>{_esc(str(pg['GroupId']))}</groupId>
+        <groupArn>{_esc(str(pg['GroupArn']))}</groupArn>
         {partition_xml}
         {f"<spreadLevel>{_esc(pg['SpreadLevel'])}</spreadLevel>" if pg.get("SpreadLevel") else ""}
         {_tag_set_xml(pg['GroupId'])}
@@ -3315,17 +3315,17 @@ def _describe_vpc_attribute(p):
     if attribute == "enableDnsSupport":
         val = vpc.get("EnableDnsSupport", True)
         return _xml(200, "DescribeVpcAttributeResponse",
-                    f"<vpcId>{vpc_id}</vpcId><enableDnsSupport><value>{'true' if val else 'false'}</value></enableDnsSupport>")
+                    f"<vpcId>{_esc(str(vpc_id))}</vpcId><enableDnsSupport><value>{'true' if val else 'false'}</value></enableDnsSupport>")
     elif attribute == "enableDnsHostnames":
         val = vpc.get("EnableDnsHostnames", False)
         return _xml(200, "DescribeVpcAttributeResponse",
-                    f"<vpcId>{vpc_id}</vpcId><enableDnsHostnames><value>{'true' if val else 'false'}</value></enableDnsHostnames>")
+                    f"<vpcId>{_esc(str(vpc_id))}</vpcId><enableDnsHostnames><value>{'true' if val else 'false'}</value></enableDnsHostnames>")
     elif attribute == "enableNetworkAddressUsageMetrics":
         return _xml(200, "DescribeVpcAttributeResponse",
-                    f"<vpcId>{vpc_id}</vpcId><enableNetworkAddressUsageMetrics><value>"
+                    f"<vpcId>{_esc(str(vpc_id))}</vpcId><enableNetworkAddressUsageMetrics><value>"
                     f"{'true' if vpc.get('EnableNetworkAddressUsageMetrics') else 'false'}"
                     "</value></enableNetworkAddressUsageMetrics>")
-    return _xml(200, "DescribeVpcAttributeResponse", f"<vpcId>{vpc_id}</vpcId>")
+    return _xml(200, "DescribeVpcAttributeResponse", f"<vpcId>{_esc(str(vpc_id))}</vpcId>")
 
 
 def _describe_vpc_classic_link(p):
@@ -3457,7 +3457,7 @@ def _associate_route_table(p):
         "AssociationState": {"State": "associated"},
     })
     return _xml(200, "AssociateRouteTableResponse",
-                f"<associationId>{assoc_id}</associationId>")
+                f"<associationId>{_esc(str(assoc_id))}</associationId>")
 
 
 def _disassociate_route_table(p):
@@ -3620,7 +3620,7 @@ def _attach_network_interface(p):
         "AttachTime": _now_ts(),
     }
     return _xml(200, "AttachNetworkInterfaceResponse",
-                f"<attachmentId>{attachment_id}</attachmentId>")
+                f"<attachmentId>{_esc(str(attachment_id))}</attachmentId>")
 
 
 def _detach_network_interface(p):
@@ -3712,8 +3712,8 @@ def _describe_vpc_endpoint_services(p):
         selected.append((name, stype))
 
     selected, next_xml = _page(p, selected, (1, 1000))
-    name_items = "".join(f"<item>{n}</item>" for n, _ in selected)
-    az_items = "".join(f"<item>{az}</item>" for az in azs)
+    name_items = "".join(f"<item>{_esc(str(n))}</item>" for n, _ in selected)
+    az_items = "".join(f"<item>{_esc(str(az))}</item>" for az in azs)
 
     detail_items = []
     for name, stype in selected:
@@ -3725,14 +3725,14 @@ def _describe_vpc_endpoint_services(p):
             base_dns = f"<item>{short}.{region}.vpce.amazonaws.com</item>"
             private_dns = f"<privateDnsName>{short}.{region}.amazonaws.com</privateDnsName>"
         detail_items.append(f"""<item>
-            <serviceName>{name}</serviceName>
+            <serviceName>{_esc(str(name))}</serviceName>
             <serviceId>vpce-svc-{hashlib.sha256(name.encode()).hexdigest()[:12]}</serviceId>
-            <serviceType><item><serviceType>{stype}</serviceType></item></serviceType>
+            <serviceType><item><serviceType>{_esc(str(stype))}</serviceType></item></serviceType>
             <availabilityZoneSet>{az_items}</availabilityZoneSet>
             <owner>amazon</owner>
             <baseEndpointDnsNameSet>{base_dns}</baseEndpointDnsNameSet>
             {private_dns}
-            <vpcEndpointPolicySupported>{'false' if stype == 'Gateway' else 'true'}</vpcEndpointPolicySupported>
+            <vpcEndpointPolicySupported>{_esc(str('false' if stype == 'Gateway' else 'true'))}</vpcEndpointPolicySupported>
             <acceptanceRequired>false</acceptanceRequired>
             <managesVpcEndpoints>false</managesVpcEndpoints>
             <supportedIpAddressTypeSet><item>ipv4</item></supportedIpAddressTypeSet>
@@ -3760,12 +3760,12 @@ def _describe_availability_zones(p):
     # never require an opt-in.
     group_name = f"{region}-zg-1"
     items = "".join(f"""<item>
-        <zoneName>{name}</zoneName>
+        <zoneName>{_esc(str(name))}</zoneName>
         <zoneState>available</zoneState>
-        <regionName>{region}</regionName>
-        <zoneId>{zone_id}</zoneId>
-        <groupName>{group_name}</groupName>
-        <networkBorderGroup>{region}</networkBorderGroup>
+        <regionName>{_esc(str(region))}</regionName>
+        <zoneId>{_esc(str(zone_id))}</zoneId>
+        <groupName>{_esc(str(group_name))}</groupName>
+        <networkBorderGroup>{_esc(str(region))}</networkBorderGroup>
         <optInStatus>opt-in-not-required</optInStatus>
         <zoneType>availability-zone</zoneType>
     </item>""" for name, zone_id in zones)
@@ -3822,9 +3822,9 @@ def _describe_regions(p):
         # The stub treats every listed region as enabled, so AllRegions has no
         # filtering effect here — it's accepted for SDK compatibility.
         items_xml.append(
-            f"<item><regionName>{name}</regionName>"
+            f"<item><regionName>{_esc(str(name))}</regionName>"
             f"<regionEndpoint>ec2.{name}.amazonaws.com</regionEndpoint>"
-            f"<optInStatus>{opt_in}</optInStatus></item>"
+            f"<optInStatus>{_esc(str(opt_in))}</optInStatus></item>"
         )
     _ = all_regions
     return _xml(200, "DescribeRegionsResponse",
@@ -3854,9 +3854,9 @@ def _allocate_address(p):
     }
     _parse_tag_specs(p, "elastic-ip", allocation_id)
     return _xml(200, "AllocateAddressResponse", f"""
-        <publicIp>{public_ip}</publicIp>
-        <domain>{domain}</domain>
-        <allocationId>{allocation_id}</allocationId>
+        <publicIp>{_esc(str(public_ip))}</publicIp>
+        <domain>{_esc(str(domain))}</domain>
+        <allocationId>{_esc(str(allocation_id))}</allocationId>
         <publicIpv4Pool>{_esc(pool)}</publicIpv4Pool>
         <networkBorderGroup>{_esc(border_group)}</networkBorderGroup>""")
 
@@ -3890,7 +3890,7 @@ def _associate_address(p):
     addr["PrivateIpAddress"] = _p(p, "PrivateIpAddress") or (
         eni.get("PrivateIpAddress") if eni else _instances.get(instance_id, {}).get("PrivateIpAddress")) or None
     return _xml(200, "AssociateAddressResponse",
-                f"<return>true</return><associationId>{association_id}</associationId>")
+                f"<return>true</return><associationId>{_esc(str(association_id))}</associationId>")
 
 
 def _disassociate_address(p):
@@ -3911,8 +3911,8 @@ def _describe_addresses(p):
     for addr in _addresses.values():
         if filter_ids and addr["AllocationId"] not in filter_ids:
             continue
-        assoc = f"<associationId>{addr['AssociationId']}</associationId>" if addr["AssociationId"] else ""
-        inst = f"<instanceId>{addr['InstanceId']}</instanceId>" if addr["InstanceId"] else ""
+        assoc = f"<associationId>{_esc(str(addr['AssociationId']))}</associationId>" if addr["AssociationId"] else ""
+        inst = f"<instanceId>{_esc(str(addr['InstanceId']))}</instanceId>" if addr["InstanceId"] else ""
         for key, tag in (("NetworkInterfaceId", "networkInterfaceId"), ("PrivateIpAddress", "privateIpAddress"),
                          ("PublicIpv4Pool", "publicIpv4Pool"), ("NetworkBorderGroup", "networkBorderGroup")):
             if addr.get(key):
@@ -3920,9 +3920,9 @@ def _describe_addresses(p):
         if addr.get("NetworkInterfaceId"):
             inst += f"<networkInterfaceOwnerId>{get_account_id()}</networkInterfaceOwnerId>"
         items += f"""<item>
-            <allocationId>{addr['AllocationId']}</allocationId>
-            <publicIp>{addr['PublicIp']}</publicIp>
-            <domain>{addr['Domain']}</domain>
+            <allocationId>{_esc(str(addr['AllocationId']))}</allocationId>
+            <publicIp>{_esc(str(addr['PublicIp']))}</publicIp>
+            <domain>{_esc(str(addr['Domain']))}</domain>
             {assoc}{inst}
             {_tag_set_xml(addr['AllocationId'])}
         </item>"""
@@ -3992,8 +3992,8 @@ def _describe_tags(p):
             if filter_values and tag.get("Value", "") not in filter_values:
                 continue
             items.append(f"""<item>
-                <resourceId>{rid}</resourceId>
-                <resourceType>{resource_type}</resourceType>
+                <resourceId>{_esc(str(rid))}</resourceId>
+                <resourceType>{_esc(str(resource_type))}</resourceType>
                 <key>{_esc(tag['Key'])}</key>
                 <value>{_esc(tag['Value'])}</value>
             </item>""")
@@ -4120,8 +4120,8 @@ def _describe_volume_status(p):
         if filter_ids and vol["VolumeId"] not in filter_ids:
             continue
         items.append(f"""<item>
-            <volumeId>{vol['VolumeId']}</volumeId>
-            <availabilityZone>{vol['AvailabilityZone']}</availabilityZone>
+            <volumeId>{_esc(str(vol['VolumeId']))}</volumeId>
+            <availabilityZone>{_esc(str(vol['AvailabilityZone']))}</availabilityZone>
             <volumeStatus>
                 <status>ok</status>
                 <details><item><name>io-enabled</name><status>passed</status></item></details>
@@ -4154,11 +4154,11 @@ def _attach_volume(p):
     vol["Attachments"] = [attachment]
     vol["State"] = "in-use"
     return _xml(200, "AttachVolumeResponse", f"""
-        <volumeId>{vol_id}</volumeId>
-        <instanceId>{instance_id}</instanceId>
-        <device>{device}</device>
+        <volumeId>{_esc(str(vol_id))}</volumeId>
+        <instanceId>{_esc(str(instance_id))}</instanceId>
+        <device>{_esc(str(device))}</device>
         <status>attached</status>
-        <attachTime>{now}</attachTime>
+        <attachTime>{_esc(str(now))}</attachTime>
         <deleteOnTermination>false</deleteOnTermination>""")
 
 
@@ -4170,7 +4170,7 @@ def _detach_volume(p):
     vol["Attachments"] = []
     vol["State"] = "available"
     return _xml(200, "DetachVolumeResponse", f"""
-        <volumeId>{vol_id}</volumeId>
+        <volumeId>{_esc(str(vol_id))}</volumeId>
         <status>detached</status>""")
 
 
@@ -4192,14 +4192,14 @@ def _modify_volume(p):
     now = _now_ts()
     return _xml(200, "ModifyVolumeResponse", f"""
         <volumeModification>
-            <volumeId>{vol_id}</volumeId>
+            <volumeId>{_esc(str(vol_id))}</volumeId>
             <modificationState>completed</modificationState>
-            <targetSize>{vol['Size']}</targetSize>
-            <targetVolumeType>{vol['VolumeType']}</targetVolumeType>
-            <targetIops>{vol['Iops']}</targetIops>
+            <targetSize>{_esc(str(vol['Size']))}</targetSize>
+            <targetVolumeType>{_esc(str(vol['VolumeType']))}</targetVolumeType>
+            <targetIops>{_esc(str(vol['Iops']))}</targetIops>
             {_volume_target_extras_xml(vol)}
-            <startTime>{now}</startTime>
-            <endTime>{now}</endTime>
+            <startTime>{_esc(str(now))}</startTime>
+            <endTime>{_esc(str(now))}</endTime>
             <progress>100</progress>
         </volumeModification>""")
 
@@ -4212,14 +4212,14 @@ def _describe_volumes_modifications(p):
             continue
         now = _now_ts()
         items.append(f"""<item>
-            <volumeId>{vol['VolumeId']}</volumeId>
+            <volumeId>{_esc(str(vol['VolumeId']))}</volumeId>
             <modificationState>completed</modificationState>
-            <targetSize>{vol['Size']}</targetSize>
-            <targetVolumeType>{vol['VolumeType']}</targetVolumeType>
-            <targetIops>{vol['Iops']}</targetIops>
+            <targetSize>{_esc(str(vol['Size']))}</targetSize>
+            <targetVolumeType>{_esc(str(vol['VolumeType']))}</targetVolumeType>
+            <targetIops>{_esc(str(vol['Iops']))}</targetIops>
             {_volume_target_extras_xml(vol)}
-            <startTime>{now}</startTime>
-            <endTime>{now}</endTime>
+            <startTime>{_esc(str(now))}</startTime>
+            <endTime>{_esc(str(now))}</endTime>
             <progress>100</progress>
         </item>""")
     items, next_xml = _page(p, items, (1, 500))
@@ -4233,7 +4233,7 @@ def _enable_volume_io(p):
 def _volume_target_extras_xml(vol):
     out = f"<targetMultiAttachEnabled>{'true' if vol.get('MultiAttachEnabled') else 'false'}</targetMultiAttachEnabled>"
     if vol.get("Throughput"):
-        out = f"<targetThroughput>{vol['Throughput']}</targetThroughput>" + out
+        out = f"<targetThroughput>{_esc(str(vol['Throughput']))}</targetThroughput>" + out
     return out
 
 
@@ -4251,33 +4251,33 @@ def _describe_volume_attribute(p):
     vol_id = _p(p, "VolumeId")
     auto_enable = (_volumes.get(vol_id) or {}).get("AutoEnableIO", False)
     return _xml(200, "DescribeVolumeAttributeResponse", f"""
-        <volumeId>{vol_id}</volumeId>
+        <volumeId>{_esc(str(vol_id))}</volumeId>
         <autoEnableIO><value>{'true' if auto_enable else 'false'}</value></autoEnableIO>""")
 
 
 def _volume_inner_xml(vol):
     attachments = "".join(f"""<item>
-        <volumeId>{a['VolumeId']}</volumeId>
-        <instanceId>{a['InstanceId']}</instanceId>
-        <device>{a['Device']}</device>
-        <status>{a['State']}</status>
-        <attachTime>{a['AttachTime']}</attachTime>
+        <volumeId>{_esc(str(a['VolumeId']))}</volumeId>
+        <instanceId>{_esc(str(a['InstanceId']))}</instanceId>
+        <device>{_esc(str(a['Device']))}</device>
+        <status>{_esc(str(a['State']))}</status>
+        <attachTime>{_esc(str(a['AttachTime']))}</attachTime>
         <deleteOnTermination>{'true' if a['DeleteOnTermination'] else 'false'}</deleteOnTermination>
     </item>""" for a in vol.get("Attachments", []))
-    snap = f"<snapshotId>{vol['SnapshotId']}</snapshotId>" if vol.get("SnapshotId") else "<snapshotId/>"
-    iops = f"<iops>{vol['Iops']}</iops>" if vol.get("Iops") else ""
+    snap = f"<snapshotId>{_esc(str(vol['SnapshotId']))}</snapshotId>" if vol.get("SnapshotId") else "<snapshotId/>"
+    iops = f"<iops>{_esc(str(vol['Iops']))}</iops>" if vol.get("Iops") else ""
     return f"""
-        <volumeId>{vol['VolumeId']}</volumeId>
-        <size>{vol['Size']}</size>
-        <availabilityZone>{vol['AvailabilityZone']}</availabilityZone>
-        <status>{vol['State']}</status>
-        <createTime>{vol['CreateTime']}</createTime>
-        <volumeType>{vol['VolumeType']}</volumeType>
+        <volumeId>{_esc(str(vol['VolumeId']))}</volumeId>
+        <size>{_esc(str(vol['Size']))}</size>
+        <availabilityZone>{_esc(str(vol['AvailabilityZone']))}</availabilityZone>
+        <status>{_esc(str(vol['State']))}</status>
+        <createTime>{_esc(str(vol['CreateTime']))}</createTime>
+        <volumeType>{_esc(str(vol['VolumeType']))}</volumeType>
         {snap}
         {iops}
         <encrypted>{'true' if vol['Encrypted'] else 'false'}</encrypted>
         {f"<kmsKeyId>{_esc(vol['KmsKeyId'])}</kmsKeyId>" if vol.get("KmsKeyId") else ""}
-        {f"<throughput>{vol['Throughput']}</throughput>" if vol.get("Throughput") else ""}
+        {f"<throughput>{_esc(str(vol['Throughput']))}</throughput>" if vol.get("Throughput") else ""}
         <multiAttachEnabled>{'true' if vol['MultiAttachEnabled'] else 'false'}</multiAttachEnabled>
         <attachmentSet>{attachments}</attachmentSet>
         {_tag_set_xml(vol['VolumeId'])}"""
@@ -4397,7 +4397,7 @@ def _copy_snapshot(p):
         _snapshots[new_snap_id]["KmsKeyId"] = _p(p, "KmsKeyId")
     _parse_tag_specs(p, "snapshot", new_snap_id)
     return _xml(200, "CopySnapshotResponse",
-                f"<snapshotId>{new_snap_id}</snapshotId>{_tag_set_xml(new_snap_id)}")
+                f"<snapshotId>{_esc(str(new_snap_id))}</snapshotId>{_tag_set_xml(new_snap_id)}")
 
 
 def _modify_snapshot_attribute(p):
@@ -4435,23 +4435,23 @@ def _describe_snapshot_attribute(p):
                 f"<{tag}>{_esc(pp[k])}</{tag}>" for k, tag in (("UserId", "userId"), ("Group", "group")) if pp.get(k)
             ) + "</item>"
     return _xml(200, "DescribeSnapshotAttributeResponse", f"""
-        <snapshotId>{snap_id}</snapshotId>
+        <snapshotId>{_esc(str(snap_id))}</snapshotId>
         <createVolumePermission>{perms_xml}</createVolumePermission>""")
 
 
 def _snapshot_inner_xml(snap):
     return f"""
-        <snapshotId>{snap['SnapshotId']}</snapshotId>
-        <volumeId>{snap['VolumeId']}</volumeId>
-        <status>{snap['State']}</status>
-        <startTime>{snap['StartTime']}</startTime>
-        <progress>{snap['Progress']}</progress>
-        <ownerId>{snap['OwnerId']}</ownerId>
-        <volumeSize>{snap['VolumeSize']}</volumeSize>
+        <snapshotId>{_esc(str(snap['SnapshotId']))}</snapshotId>
+        <volumeId>{_esc(str(snap['VolumeId']))}</volumeId>
+        <status>{_esc(str(snap['State']))}</status>
+        <startTime>{_esc(str(snap['StartTime']))}</startTime>
+        <progress>{_esc(str(snap['Progress']))}</progress>
+        <ownerId>{_esc(str(snap['OwnerId']))}</ownerId>
+        <volumeSize>{_esc(str(snap['VolumeSize']))}</volumeSize>
         <description>{_esc(snap['Description'])}</description>
         <encrypted>{'true' if snap['Encrypted'] else 'false'}</encrypted>
         {f"<kmsKeyId>{_esc(snap['KmsKeyId'])}</kmsKeyId>" if snap.get("KmsKeyId") else ""}
-        <storageTier>{snap['StorageTier']}</storageTier>
+        <storageTier>{_esc(str(snap['StorageTier']))}</storageTier>
         {_tag_set_xml(snap['SnapshotId'])}"""
 
 
@@ -4554,7 +4554,7 @@ def _struct_xml(data, members):
 
 def _instance_xml(inst):
     sgs = "".join(
-        f"""<item><groupId>{sg['GroupId']}</groupId><groupName>{sg['GroupName']}</groupName></item>"""
+        f"""<item><groupId>{_esc(str(sg['GroupId']))}</groupId><groupName>{_esc(str(sg['GroupName']))}</groupName></item>"""
         for sg in inst.get("SecurityGroups", [])
     )
     tags = "".join(
@@ -4562,35 +4562,35 @@ def _instance_xml(inst):
         for t in _tags.get(inst["InstanceId"], [])
     )
     return f"""<item>
-        <instanceId>{inst['InstanceId']}</instanceId>
-        <imageId>{inst['ImageId']}</imageId>
+        <instanceId>{_esc(str(inst['InstanceId']))}</instanceId>
+        <imageId>{_esc(str(inst['ImageId']))}</imageId>
         <instanceState>
-            <code>{inst['State']['Code']}</code>
-            <name>{inst['State']['Name']}</name>
+            <code>{_esc(str(inst['State']['Code']))}</code>
+            <name>{_esc(str(inst['State']['Name']))}</name>
         </instanceState>
-        <instanceType>{inst['InstanceType']}</instanceType>
-        <keyName>{inst.get('KeyName','')}</keyName>
-        <launchTime>{inst['LaunchTime']}</launchTime>
+        <instanceType>{_esc(str(inst['InstanceType']))}</instanceType>
+        <keyName>{_esc(str(inst.get('KeyName','')))}</keyName>
+        <launchTime>{_esc(str(inst['LaunchTime']))}</launchTime>
         <placement>{_struct_xml(inst['Placement'], _PLACEMENT_MEMBERS)}</placement>
-        <privateDnsName>{inst['PrivateDnsName']}</privateDnsName>
-        <privateIpAddress>{inst['PrivateIpAddress']}</privateIpAddress>
+        <privateDnsName>{_esc(str(inst['PrivateDnsName']))}</privateDnsName>
+        <privateIpAddress>{_esc(str(inst['PrivateIpAddress']))}</privateIpAddress>
         <!-- public address wire tags are dnsName/ipAddress (not publicDnsName/
              publicIpAddress) - the SDKs map those to PublicDnsName/PublicIpAddress -->
-        <dnsName>{inst['PublicDnsName']}</dnsName>
-        <ipAddress>{inst['PublicIpAddress']}</ipAddress>
+        <dnsName>{_esc(str(inst['PublicDnsName']))}</dnsName>
+        <ipAddress>{_esc(str(inst['PublicIpAddress']))}</ipAddress>
         <sourceDestCheck>{'true' if inst.get('SourceDestCheck', True) else 'false'}</sourceDestCheck>
-        <subnetId>{inst['SubnetId']}</subnetId>
-        <vpcId>{inst['VpcId']}</vpcId>
-        <architecture>{inst['Architecture']}</architecture>
-        <rootDeviceType>{inst['RootDeviceType']}</rootDeviceType>
-        <rootDeviceName>{inst['RootDeviceName']}</rootDeviceName>
+        <subnetId>{_esc(str(inst['SubnetId']))}</subnetId>
+        <vpcId>{_esc(str(inst['VpcId']))}</vpcId>
+        <architecture>{_esc(str(inst['Architecture']))}</architecture>
+        <rootDeviceType>{_esc(str(inst['RootDeviceType']))}</rootDeviceType>
+        <rootDeviceName>{_esc(str(inst['RootDeviceName']))}</rootDeviceName>
         <blockDeviceMapping>{_inst_bdm_xml(inst)}</blockDeviceMapping>
-        {_inst_iam_xml(inst)}<virtualizationType>{inst['Virtualization']}</virtualizationType>
-        <hypervisor>{inst['Hypervisor']}</hypervisor>
-        <monitoring><state>{inst['Monitoring']['State']}</state></monitoring>
+        {_inst_iam_xml(inst)}<virtualizationType>{_esc(str(inst['Virtualization']))}</virtualizationType>
+        <hypervisor>{_esc(str(inst['Hypervisor']))}</hypervisor>
+        <monitoring><state>{_esc(str(inst['Monitoring']['State']))}</state></monitoring>
         <groupSet>{sgs}</groupSet>
         <tagSet>{tags}</tagSet>
-        <amiLaunchIndex>{inst['AmiLaunchIndex']}</amiLaunchIndex>
+        <amiLaunchIndex>{_esc(str(inst['AmiLaunchIndex']))}</amiLaunchIndex>
         {_instance_options_xml(inst)}
     </item>"""
 
@@ -4667,7 +4667,7 @@ def _inst_bdm_xml(inst):
             out += f"<volumeId>{_esc(ebs['VolumeId'])}</volumeId>"
         out += f"<status>{_esc(ebs.get('Status', 'attached'))}</status>"
         if "AttachTime" in ebs:
-            out += f"<attachTime>{ebs['AttachTime']}</attachTime>"
+            out += f"<attachTime>{_esc(str(ebs['AttachTime']))}</attachTime>"
         out += f"<deleteOnTermination>{str(ebs.get('DeleteOnTermination', True)).lower()}</deleteOnTermination>"
         out += "</ebs>"
         out += "</item>"
@@ -4678,11 +4678,11 @@ def _sg_xml(sg):
     ingress = "".join(_perm_xml(r) for r in sg.get("IpPermissions", []))
     egress = "".join(_perm_xml(r) for r in sg.get("IpPermissionsEgress", []))
     return f"""<item>
-        <ownerId>{sg['OwnerId']}</ownerId>
-        <groupId>{sg['GroupId']}</groupId>
-        <groupName>{sg['GroupName']}</groupName>
-        <groupDescription>{sg['Description']}</groupDescription>
-        <vpcId>{sg['VpcId']}</vpcId>
+        <ownerId>{_esc(str(sg['OwnerId']))}</ownerId>
+        <groupId>{_esc(str(sg['GroupId']))}</groupId>
+        <groupName>{_esc(str(sg['GroupName']))}</groupName>
+        <groupDescription>{_esc(str(sg['Description']))}</groupDescription>
+        <vpcId>{_esc(str(sg['VpcId']))}</vpcId>
         <ipPermissions>{ingress}</ipPermissions>
         <ipPermissionsEgress>{egress}</ipPermissionsEgress>
         {_tag_set_xml(sg['GroupId'])}
@@ -4695,7 +4695,7 @@ def _perm_xml(r):
                 if isinstance(entry, dict) and entry.get("Description") else "")
 
     ranges = "".join(
-        f"<item><cidrIp>{ip['CidrIp']}</cidrIp>{_range_desc(ip)}</item>"
+        f"<item><cidrIp>{_esc(str(ip['CidrIp']))}</cidrIp>{_range_desc(ip)}</item>"
         for ip in r.get("IpRanges", [])
     )
     # Every family the permission carries is reported: the members are
@@ -4720,12 +4720,12 @@ def _perm_xml(r):
             desc = f"<description>{_esc(pair['Description'])}</description>" if pair.get("Description") else ""
         else:
             gid, uid, gname, vpc, desc = str(pair), get_account_id(), "", "", ""
-        groups += (f"<item><userId>{uid}</userId><groupId>{gid}</groupId>"
+        groups += (f"<item><userId>{_esc(str(uid))}</userId><groupId>{_esc(str(gid))}</groupId>"
                    f"{gname}{vpc}{desc}</item>")
-    from_port = f"<fromPort>{r['FromPort']}</fromPort>" if "FromPort" in r else ""
-    to_port = f"<toPort>{r['ToPort']}</toPort>" if "ToPort" in r else ""
+    from_port = f"<fromPort>{_esc(str(r['FromPort']))}</fromPort>" if "FromPort" in r else ""
+    to_port = f"<toPort>{_esc(str(r['ToPort']))}</toPort>" if "ToPort" in r else ""
     return f"""<item>
-        <ipProtocol>{r.get('IpProtocol','-1')}</ipProtocol>
+        <ipProtocol>{_esc(str(r.get('IpProtocol','-1')))}</ipProtocol>
         {from_port}{to_port}
         <ipRanges>{ranges}</ipRanges>
         <ipv6Ranges>{ranges6}</ipv6Ranges>
@@ -4737,20 +4737,20 @@ def _vpc_fields_xml(vpc, tag="item"):
     cidr = vpc['CidrBlock']
     assoc_id = vpc.get('_cidr_assoc_id', f"vpc-cidr-assoc-{vpc['VpcId'][4:]}")
     return f"""<{tag}>
-        <vpcId>{vpc['VpcId']}</vpcId>
-        <state>{vpc['State']}</state>
-        <cidrBlock>{cidr}</cidrBlock>
+        <vpcId>{_esc(str(vpc['VpcId']))}</vpcId>
+        <state>{_esc(str(vpc['State']))}</state>
+        <cidrBlock>{_esc(str(cidr))}</cidrBlock>
         <cidrBlockAssociationSet>
             <item>
-                <cidrBlock>{cidr}</cidrBlock>
-                <associationId>{assoc_id}</associationId>
+                <cidrBlock>{_esc(str(cidr))}</cidrBlock>
+                <associationId>{_esc(str(assoc_id))}</associationId>
                 <cidrBlockState><state>associated</state></cidrBlockState>
             </item>
         </cidrBlockAssociationSet>
-        <dhcpOptionsId>{vpc['DhcpOptionsId']}</dhcpOptionsId>
-        <instanceTenancy>{vpc['InstanceTenancy']}</instanceTenancy>
+        <dhcpOptionsId>{_esc(str(vpc['DhcpOptionsId']))}</dhcpOptionsId>
+        <instanceTenancy>{_esc(str(vpc['InstanceTenancy']))}</instanceTenancy>
         <isDefault>{'true' if vpc['IsDefault'] else 'false'}</isDefault>
-        <ownerId>{vpc['OwnerId']}</ownerId>
+        <ownerId>{_esc(str(vpc['OwnerId']))}</ownerId>
         {_tag_set_xml(vpc['VpcId'])}
     </{tag}>"""
 
@@ -4763,22 +4763,22 @@ def _subnet_fields_xml(subnet, tag="item"):
     # No IPv6 block is modelled, so the two IPv6 members are always false.
     dns_options = _subnet_dns_name_options(subnet)
     return f"""<{tag}>
-        <subnetId>{subnet['SubnetId']}</subnetId>
-        <subnetArn>arn:aws:ec2:{get_region()}:{get_account_id()}:subnet/{subnet['SubnetId']}</subnetArn>
-        <state>{subnet['State']}</state>
-        <vpcId>{subnet['VpcId']}</vpcId>
-        <cidrBlock>{subnet['CidrBlock']}</cidrBlock>
-        <availableIpAddressCount>{subnet['AvailableIpAddressCount']}</availableIpAddressCount>
-        <availabilityZone>{subnet['AvailabilityZone']}</availabilityZone>
-        <availabilityZoneId>{subnet['AvailabilityZoneId']}</availabilityZoneId>
+        <subnetId>{_esc(str(subnet['SubnetId']))}</subnetId>
+        <subnetArn>arn:aws:ec2:{get_region()}:{get_account_id()}:subnet/{_esc(subnet['SubnetId'])}</subnetArn>
+        <state>{_esc(str(subnet['State']))}</state>
+        <vpcId>{_esc(str(subnet['VpcId']))}</vpcId>
+        <cidrBlock>{_esc(str(subnet['CidrBlock']))}</cidrBlock>
+        <availableIpAddressCount>{_esc(str(subnet['AvailableIpAddressCount']))}</availableIpAddressCount>
+        <availabilityZone>{_esc(str(subnet['AvailabilityZone']))}</availabilityZone>
+        <availabilityZoneId>{_esc(str(subnet['AvailabilityZoneId']))}</availabilityZoneId>
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
-        <ownerId>{subnet['OwnerId']}</ownerId>
+        <ownerId>{_esc(str(subnet['OwnerId']))}</ownerId>
         <assignIpv6AddressOnCreation>false</assignIpv6AddressOnCreation>
         <enableDns64>{'true' if subnet.get('EnableDns64') else 'false'}</enableDns64>
         <ipv6Native>false</ipv6Native>
         <privateDnsNameOptionsOnLaunch>
-            <hostnameType>{dns_options['HostnameType']}</hostnameType>
+            <hostnameType>{_esc(str(dns_options['HostnameType']))}</hostnameType>
             <enableResourceNameDnsARecord>{'true' if dns_options['EnableResourceNameDnsARecord'] else 'false'}</enableResourceNameDnsARecord>
             <enableResourceNameDnsAAAARecord>{'true' if dns_options['EnableResourceNameDnsAAAARecord'] else 'false'}</enableResourceNameDnsAAAARecord>
         </privateDnsNameOptionsOnLaunch>
@@ -4792,12 +4792,12 @@ def _subnet_xml(subnet):
 
 def _igw_fields_xml(igw, tag="item"):
     attachments = "".join(
-        f"<item><vpcId>{a['VpcId']}</vpcId><state>{a['State']}</state></item>"
+        f"<item><vpcId>{_esc(str(a['VpcId']))}</vpcId><state>{_esc(str(a['State']))}</state></item>"
         for a in igw.get("Attachments", [])
     )
     return f"""<{tag}>
-        <internetGatewayId>{igw['InternetGatewayId']}</internetGatewayId>
-        <ownerId>{igw['OwnerId']}</ownerId>
+        <internetGatewayId>{_esc(str(igw['InternetGatewayId']))}</internetGatewayId>
+        <ownerId>{_esc(str(igw['OwnerId']))}</ownerId>
         <attachmentSet>{attachments}</attachmentSet>
         {_tag_set_xml(igw['InternetGatewayId'])}
     </{tag}>"""
@@ -4832,45 +4832,45 @@ def _rtb_fields_xml(rtb, tag="item"):
             f"<{element}>{_esc(r[key])}</{element}>"
             for key, element in _ROUTE_MEMBERS if r.get(key))
         if not any(r.get(key) for key in ("DestinationIpv6CidrBlock", "DestinationPrefixListId")):
-            target = f"<destinationCidrBlock>{r.get('DestinationCidrBlock', '')}</destinationCidrBlock>" + target
+            target = f"<destinationCidrBlock>{_esc(str(r.get('DestinationCidrBlock', '')))}</destinationCidrBlock>" + target
         return f"""<item>
         {target}
-        <state>{r.get('State','active')}</state>
-        <origin>{r.get('Origin','')}</origin>
+        <state>{_esc(str(r.get('State','active')))}</state>
+        <origin>{_esc(str(r.get('Origin','')))}</origin>
     </item>"""
     routes = "".join(_route_xml(r) for r in rtb.get("Routes", []))
     assocs = "".join(f"""<item>
-        <routeTableAssociationId>{a['RouteTableAssociationId']}</routeTableAssociationId>
-        <routeTableId>{a['RouteTableId']}</routeTableId>
+        <routeTableAssociationId>{_esc(str(a['RouteTableAssociationId']))}</routeTableAssociationId>
+        <routeTableId>{_esc(str(a['RouteTableId']))}</routeTableId>
         <main>{'true' if a.get('Main') else 'false'}</main>
-        {'<subnetId>' + a['SubnetId'] + '</subnetId>' if a.get('SubnetId') else ''}
+        {'<subnetId>' + _esc(a['SubnetId']) + '</subnetId>' if a.get('SubnetId') else ''}
         <associationState><state>associated</state></associationState>
     </item>""" for a in rtb.get("Associations", []))
     return f"""<{tag}>
-        <routeTableId>{rtb['RouteTableId']}</routeTableId>
-        <vpcId>{rtb['VpcId']}</vpcId>
-        <ownerId>{rtb['OwnerId']}</ownerId>
+        <routeTableId>{_esc(str(rtb['RouteTableId']))}</routeTableId>
+        <vpcId>{_esc(str(rtb['VpcId']))}</vpcId>
+        <ownerId>{_esc(str(rtb['OwnerId']))}</ownerId>
         <routeSet>{routes}</routeSet>
         <associationSet>{assocs}</associationSet>
-        <propagatingVgwSet>{"".join(f"<item><gatewayId>{g}</gatewayId></item>" for g in rtb.get("PropagatingVgws", []))}</propagatingVgwSet>
+        <propagatingVgwSet>{"".join(f"<item><gatewayId>{_esc(g)}</gatewayId></item>" for g in rtb.get("PropagatingVgws", []))}</propagatingVgwSet>
         {_tag_set_xml(rtb['RouteTableId'])}
     </{tag}>"""
 
 
 def _eni_fields_xml(eni, tag="item"):
     groups = "".join(
-        f"<item><groupId>{g['GroupId']}</groupId><groupName>{g['GroupName']}</groupName></item>"
+        f"<item><groupId>{_esc(str(g['GroupId']))}</groupId><groupName>{_esc(str(g['GroupName']))}</groupName></item>"
         for g in eni.get("Groups", [])
     )
     attachment = ""
     if eni.get("Attachment"):
         a = eni["Attachment"]
         attachment = f"""<attachment>
-            <attachmentId>{a['AttachmentId']}</attachmentId>
-            <instanceId>{a.get('InstanceId','')}</instanceId>
-            <deviceIndex>{a.get('DeviceIndex',0)}</deviceIndex>
-            <status>{a.get('Status','attached')}</status>
-            <attachTime>{a.get('AttachTime','')}</attachTime>
+            <attachmentId>{_esc(str(a['AttachmentId']))}</attachmentId>
+            <instanceId>{_esc(str(a.get('InstanceId','')))}</instanceId>
+            <deviceIndex>{_esc(str(a.get('DeviceIndex',0)))}</deviceIndex>
+            <status>{_esc(str(a.get('Status','attached')))}</status>
+            <attachTime>{_esc(str(a.get('AttachTime','')))}</attachTime>
         </attachment>"""
     private_ip = eni['PrivateIpAddress']
     private_ips = "".join(
@@ -4878,17 +4878,17 @@ def _eni_fields_xml(eni, tag="item"):
         f"<primary>{'true' if e.get('Primary') else 'false'}</primary></item>"
         for e in eni.get("PrivateIpAddresses") or [{"PrivateIpAddress": private_ip, "Primary": True}])
     return f"""<{tag}>
-        <networkInterfaceId>{eni['NetworkInterfaceId']}</networkInterfaceId>
-        <subnetId>{eni['SubnetId']}</subnetId>
-        <vpcId>{eni['VpcId']}</vpcId>
-        <availabilityZone>{eni.get('AvailabilityZone', get_region() + 'a')}</availabilityZone>
-        <description>{eni['Description']}</description>
-        <ownerId>{eni['OwnerId']}</ownerId>
-        <status>{eni['Status']}</status>
-        <privateIpAddress>{private_ip}</privateIpAddress>
+        <networkInterfaceId>{_esc(str(eni['NetworkInterfaceId']))}</networkInterfaceId>
+        <subnetId>{_esc(str(eni['SubnetId']))}</subnetId>
+        <vpcId>{_esc(str(eni['VpcId']))}</vpcId>
+        <availabilityZone>{_esc(str(eni.get('AvailabilityZone', get_region() + 'a')))}</availabilityZone>
+        <description>{_esc(str(eni['Description']))}</description>
+        <ownerId>{_esc(str(eni['OwnerId']))}</ownerId>
+        <status>{_esc(str(eni['Status']))}</status>
+        <privateIpAddress>{_esc(str(private_ip))}</privateIpAddress>
         <sourceDestCheck>{'true' if eni.get('SourceDestCheck', True) else 'false'}</sourceDestCheck>
-        <interfaceType>{eni.get('InterfaceType', 'interface')}</interfaceType>
-        <macAddress>{eni['MacAddress']}</macAddress>
+        <interfaceType>{_esc(str(eni.get('InterfaceType', 'interface')))}</interfaceType>
+        <macAddress>{_esc(str(eni['MacAddress']))}</macAddress>
         <groupSet>{groups}</groupSet>
         <privateIpAddressesSet>{private_ips}</privateIpAddressesSet>
         {attachment}
@@ -4919,8 +4919,8 @@ def _apply_vpce_options(ep, p):
 
 
 def _vpce_fields_xml(ep, tag="item"):
-    rtb_ids = "".join(f"<item>{r}</item>" for r in ep.get("RouteTableIds", []))
-    subnet_ids = "".join(f"<item>{s}</item>" for s in ep.get("SubnetIds", []))
+    rtb_ids = "".join(f"<item>{_esc(str(r))}</item>" for r in ep.get("RouteTableIds", []))
+    subnet_ids = "".join(f"<item>{_esc(str(s))}</item>" for s in ep.get("SubnetIds", []))
     extra = ""
     if ep.get("PolicyDocument"):
         extra += f"<policyDocument>{_esc(ep['PolicyDocument'])}</policyDocument>"
@@ -4940,12 +4940,12 @@ def _vpce_fields_xml(ep, tag="item"):
     if "PrivateDnsEnabled" in ep:
         extra += f"<privateDnsEnabled>{'true' if ep['PrivateDnsEnabled'] else 'false'}</privateDnsEnabled>"
     return f"""<{tag}>
-        <vpcEndpointId>{ep['VpcEndpointId']}</vpcEndpointId>
-        <vpcEndpointType>{ep['VpcEndpointType']}</vpcEndpointType>
-        <vpcId>{ep['VpcId']}</vpcId>
-        <serviceName>{ep['ServiceName']}</serviceName>
-        <state>{ep['State']}</state>
-        <ownerId>{ep['OwnerId']}</ownerId>
+        <vpcEndpointId>{_esc(str(ep['VpcEndpointId']))}</vpcEndpointId>
+        <vpcEndpointType>{_esc(str(ep['VpcEndpointType']))}</vpcEndpointType>
+        <vpcId>{_esc(str(ep['VpcId']))}</vpcId>
+        <serviceName>{_esc(str(ep['ServiceName']))}</serviceName>
+        <state>{_esc(str(ep['State']))}</state>
+        <ownerId>{_esc(str(ep['OwnerId']))}</ownerId>
         <routeTableIdSet>{rtb_ids}</routeTableIdSet>
         <subnetIdSet>{subnet_ids}</subnetIdSet>
         {extra}
@@ -5005,7 +5005,7 @@ def _page(p, items, bounds=None, default=None):
     low, high = bounds or (1, None)
     size = max(size, low) if high is None else min(max(size, low), high)
     end = start + size
-    return items[start:end], (f"<nextToken>{end}</nextToken>" if end < len(items) else "")
+    return items[start:end], (f"<nextToken>{_esc(str(end))}</nextToken>" if end < len(items) else "")
 
 
 def _parse_tags(params):
@@ -5305,7 +5305,7 @@ def _xml(status, root_tag, inner):
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <{root_tag} xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
     {inner}
-    <requestId>{_uuid()}</requestId>
+    <requestId>{_esc(str(_uuid()))}</requestId>
 </{root_tag}>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
@@ -5316,9 +5316,9 @@ def _error(code, message, status):
 <Response>
     <Errors><Error>
         <Code>{code}</Code>
-        <Message>{message}</Message>
+        <Message>{_esc(str(message))}</Message>
     </Error></Errors>
-    <RequestID>{_uuid()}</RequestID>
+    <RequestID>{_esc(str(_uuid()))}</RequestID>
 </Response>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
@@ -5380,12 +5380,12 @@ def _create_nat_gateway(params):
         _tags[nat_id] = tags
     _parse_tag_specs(params, "natgateway", nat_id)
     inner = f"""<natGateway>
-        <natGatewayId>{nat_id}</natGatewayId>
-        <subnetId>{subnet_id}</subnetId>
-        <vpcId>{vpc_id}</vpcId>
+        <natGatewayId>{_esc(str(nat_id))}</natGatewayId>
+        <subnetId>{_esc(str(subnet_id))}</subnetId>
+        <vpcId>{_esc(str(vpc_id))}</vpcId>
         <state>available</state>
-        <connectivityType>{connectivity}</connectivityType>
-        <createTime>{_now_ts()}</createTime>
+        <connectivityType>{_esc(str(connectivity))}</connectivityType>
+        <createTime>{_esc(str(_now_ts()))}</createTime>
         <natGatewayAddressSet>{_nat_addresses_xml(record)}</natGatewayAddressSet>
         {_tag_set_xml(nat_id)}
     </natGateway>"""
@@ -5420,12 +5420,12 @@ def _describe_nat_gateways(params):
         if filters.get("subnet-id") and nat["SubnetId"] not in filters["subnet-id"]:
             continue
         items.append(f"""<item>
-            <natGatewayId>{nat['NatGatewayId']}</natGatewayId>
-            <subnetId>{nat['SubnetId']}</subnetId>
-            <vpcId>{nat['VpcId']}</vpcId>
-            <state>{nat['State']}</state>
-            <connectivityType>{nat['ConnectivityType']}</connectivityType>
-            <createTime>{nat['CreateTime']}</createTime>
+            <natGatewayId>{_esc(str(nat['NatGatewayId']))}</natGatewayId>
+            <subnetId>{_esc(str(nat['SubnetId']))}</subnetId>
+            <vpcId>{_esc(str(nat['VpcId']))}</vpcId>
+            <state>{_esc(str(nat['State']))}</state>
+            <connectivityType>{_esc(str(nat['ConnectivityType']))}</connectivityType>
+            <createTime>{_esc(str(nat['CreateTime']))}</createTime>
             <natGatewayAddressSet>{_nat_addresses_xml(nat)}</natGatewayAddressSet>
             {_tag_set_xml(nat['NatGatewayId'])}
         </item>""")
@@ -5445,7 +5445,7 @@ def _delete_nat_gateway(params):
         if eip and eip.get("NetworkInterfaceId") == address.get("NetworkInterfaceId"):
             eip.update({"AssociationId": None, "NetworkInterfaceId": None, "PrivateIpAddress": None})
     return _xml(200, "DeleteNatGatewayResponse",
-                f"<natGatewayId>{nat_id}</natGatewayId>")
+                f"<natGatewayId>{_esc(str(nat_id))}</natGatewayId>")
 
 
 # ---------------------------------------------------------------------------
@@ -5454,14 +5454,14 @@ def _delete_nat_gateway(params):
 
 def _network_acl_entry_xml(entry):
     cidr = (
-        f"<cidrBlock>{entry['CidrBlock']}</cidrBlock>"
+        f"<cidrBlock>{_esc(str(entry['CidrBlock']))}</cidrBlock>"
         if entry.get("CidrBlock")
-        else f"<ipv6CidrBlock>{entry['Ipv6CidrBlock']}</ipv6CidrBlock>"
+        else f"<ipv6CidrBlock>{_esc(str(entry['Ipv6CidrBlock']))}</ipv6CidrBlock>"
     )
     return f"""<item>
-            <ruleNumber>{entry['RuleNumber']}</ruleNumber>
-            <protocol>{entry['Protocol']}</protocol>
-            <ruleAction>{entry['RuleAction']}</ruleAction>
+            <ruleNumber>{_esc(str(entry['RuleNumber']))}</ruleNumber>
+            <protocol>{_esc(str(entry['Protocol']))}</protocol>
+            <ruleAction>{_esc(str(entry['RuleAction']))}</ruleAction>
             <egress>{'true' if entry['Egress'] else 'false'}</egress>
             {cidr}{_struct_xml(entry, _NACL_ENTRY_STRUCTS)}
         </item>"""
@@ -5501,8 +5501,8 @@ def _create_network_acl(params):
         _tags[acl_id] = tags
     _parse_tag_specs(params, "network-acl", acl_id)
     inner = f"""<networkAcl>
-        <networkAclId>{acl_id}</networkAclId>
-        <vpcId>{vpc_id}</vpcId>
+        <networkAclId>{_esc(str(acl_id))}</networkAclId>
+        <vpcId>{_esc(str(vpc_id))}</vpcId>
         <default>false</default>
         <entrySet/>
         <associationSet/>
@@ -5529,18 +5529,18 @@ def _describe_network_acls(params):
                 continue
         entries = "".join(_network_acl_entry_xml(e) for e in acl["Entries"])
         assocs = "".join(f"""<item>
-            <networkAclAssociationId>{a['NetworkAclAssociationId']}</networkAclAssociationId>
-            <networkAclId>{acl['NetworkAclId']}</networkAclId>
-            <subnetId>{a['SubnetId']}</subnetId>
+            <networkAclAssociationId>{_esc(str(a['NetworkAclAssociationId']))}</networkAclAssociationId>
+            <networkAclId>{_esc(str(acl['NetworkAclId']))}</networkAclId>
+            <subnetId>{_esc(str(a['SubnetId']))}</subnetId>
         </item>""" for a in acl["Associations"])
         items.append(f"""<item>
-            <networkAclId>{acl['NetworkAclId']}</networkAclId>
-            <vpcId>{acl['VpcId']}</vpcId>
+            <networkAclId>{_esc(str(acl['NetworkAclId']))}</networkAclId>
+            <vpcId>{_esc(str(acl['VpcId']))}</vpcId>
             <default>{'true' if acl['IsDefault'] else 'false'}</default>
             <entrySet>{entries}</entrySet>
             <associationSet>{assocs}</associationSet>
             {_tag_set_xml(acl['NetworkAclId'])}
-            <ownerId>{acl['OwnerId']}</ownerId>
+            <ownerId>{_esc(str(acl['OwnerId']))}</ownerId>
         </item>""")
     items, next_xml = _page(params, items, (5, 1000))
     return _xml(200, "DescribeNetworkAclsResponse",
@@ -5637,7 +5637,7 @@ def _replace_network_acl_association(params):
         "SubnetId": subnet_id,
     })
     return _xml(200, "ReplaceNetworkAclAssociationResponse",
-                f"<newAssociationId>{new_assoc_id}</newAssociationId>")
+                f"<newAssociationId>{_esc(str(new_assoc_id))}</newAssociationId>")
 
 
 # ---------------------------------------------------------------------------
@@ -5673,7 +5673,7 @@ def _create_flow_logs(params):
                 "FileFormat": "plain-text", "HiveCompatiblePartitions": False, "PerHourPartition": False, **options}
         _parse_tag_specs(params, "flow-log", fl_id)
         created.append(fl_id)
-    ids_xml = "".join(f"<item>{fid}</item>" for fid in created)
+    ids_xml = "".join(f"<item>{_esc(str(fid))}</item>" for fid in created)
     return _xml(200, "CreateFlowLogsResponse",
                 f"<flowLogIdSet>{ids_xml}</flowLogIdSet><unsuccessful/>")
 
@@ -5693,7 +5693,7 @@ def _flow_log_extras_xml(fl):
         if fl.get(member):
             out += f"<{tag}>{_esc(fl[member])}</{tag}>"
     if fl.get("MaxAggregationInterval"):
-        out += f"<maxAggregationInterval>{fl['MaxAggregationInterval']}</maxAggregationInterval>"
+        out += f"<maxAggregationInterval>{_esc(str(fl['MaxAggregationInterval']))}</maxAggregationInterval>"
     if fl.get("DestinationOptions"):
         out += f"<destinationOptions>{_struct_xml(fl['DestinationOptions'], _FLOW_LOG_DESTINATION_MEMBERS)}</destinationOptions>"
     return out
@@ -5711,13 +5711,13 @@ def _describe_flow_logs(params):
         if filters.get("resource-id") and fl["ResourceId"] not in filters["resource-id"]:
             continue
         items.append(f"""<item>
-            <flowLogId>{fl['FlowLogId']}</flowLogId>
-            <resourceId>{fl['ResourceId']}</resourceId>
-            <trafficType>{fl['TrafficType']}</trafficType>
-            <logDestinationType>{fl['LogDestinationType']}</logDestinationType>
-            <logDestination>{fl.get('LogDestination','')}</logDestination>
-            <flowLogStatus>{fl['FlowLogStatus']}</flowLogStatus>
-            <creationTime>{fl['CreationTime']}</creationTime>
+            <flowLogId>{_esc(str(fl['FlowLogId']))}</flowLogId>
+            <resourceId>{_esc(str(fl['ResourceId']))}</resourceId>
+            <trafficType>{_esc(str(fl['TrafficType']))}</trafficType>
+            <logDestinationType>{_esc(str(fl['LogDestinationType']))}</logDestinationType>
+            <logDestination>{_esc(str(fl.get('LogDestination','')))}</logDestination>
+            <flowLogStatus>{_esc(str(fl['FlowLogStatus']))}</flowLogStatus>
+            <creationTime>{_esc(str(fl['CreationTime']))}</creationTime>
             {_flow_log_extras_xml(fl)}
             {_tag_set_xml(fl['FlowLogId'])}
         </item>""")
@@ -5766,9 +5766,9 @@ def _create_vpc_peering_connection(params):
     # TagSpecifications support for aws_vpc_peering_connection.tags on create.
     _parse_tag_specs(params, "vpc-peering-connection", pcx_id)
     inner = f"""<vpcPeeringConnection>
-        <vpcPeeringConnectionId>{pcx_id}</vpcPeeringConnectionId>
-        <requesterVpcInfo><vpcId>{vpc_id}</vpcId><ownerId>{get_account_id()}</ownerId><region>{get_region()}</region></requesterVpcInfo>
-        <accepterVpcInfo><vpcId>{peer_vpc_id}</vpcId><ownerId>{peer_owner_id}</ownerId><region>{peer_region}</region></accepterVpcInfo>
+        <vpcPeeringConnectionId>{_esc(str(pcx_id))}</vpcPeeringConnectionId>
+        <requesterVpcInfo><vpcId>{_esc(str(vpc_id))}</vpcId><ownerId>{get_account_id()}</ownerId><region>{get_region()}</region></requesterVpcInfo>
+        <accepterVpcInfo><vpcId>{_esc(str(peer_vpc_id))}</vpcId><ownerId>{_esc(str(peer_owner_id))}</ownerId><region>{_esc(str(peer_region))}</region></accepterVpcInfo>
         <status><code>pending-acceptance</code></status>
         {_tag_set_xml(pcx_id)}
     </vpcPeeringConnection>"""
@@ -5783,9 +5783,9 @@ def _accept_vpc_peering_connection(params):
     pcx = _vpc_peering[pcx_id]
     _set_vpc_peering_status(pcx, "active", "Active")
     inner = f"""<vpcPeeringConnection>
-        <vpcPeeringConnectionId>{pcx_id}</vpcPeeringConnectionId>
-        <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId><region>{pcx['RequesterVpcInfo']['Region']}</region></requesterVpcInfo>
-        <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['AccepterVpcInfo']['OwnerId']}</ownerId><region>{pcx['AccepterVpcInfo']['Region']}</region></accepterVpcInfo>
+        <vpcPeeringConnectionId>{_esc(str(pcx_id))}</vpcPeeringConnectionId>
+        <requesterVpcInfo><vpcId>{_esc(str(pcx['RequesterVpcInfo']['VpcId']))}</vpcId><ownerId>{_esc(str(pcx['RequesterVpcInfo']['OwnerId']))}</ownerId><region>{_esc(str(pcx['RequesterVpcInfo']['Region']))}</region></requesterVpcInfo>
+        <accepterVpcInfo><vpcId>{_esc(str(pcx['AccepterVpcInfo']['VpcId']))}</vpcId><ownerId>{_esc(str(pcx['AccepterVpcInfo']['OwnerId']))}</ownerId><region>{_esc(str(pcx['AccepterVpcInfo']['Region']))}</region></accepterVpcInfo>
         <status><code>active</code></status>
         {_tag_set_xml(pcx_id)}
     </vpcPeeringConnection>"""
@@ -5804,10 +5804,10 @@ def _describe_vpc_peering_connections(params):
         if filters.get("status-code") and pcx["Status"]["Code"] not in filters["status-code"]:
             continue
         items.append(f"""<item>
-            <vpcPeeringConnectionId>{pcx['VpcPeeringConnectionId']}</vpcPeeringConnectionId>
-            <requesterVpcInfo><vpcId>{pcx['RequesterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['RequesterVpcInfo']['OwnerId']}</ownerId><region>{pcx['RequesterVpcInfo']['Region']}</region></requesterVpcInfo>
-            <accepterVpcInfo><vpcId>{pcx['AccepterVpcInfo']['VpcId']}</vpcId><ownerId>{pcx['AccepterVpcInfo']['OwnerId']}</ownerId><region>{pcx['AccepterVpcInfo']['Region']}</region></accepterVpcInfo>
-            <status><code>{pcx['Status']['Code']}</code><message>{pcx['Status']['Message']}</message></status>
+            <vpcPeeringConnectionId>{_esc(str(pcx['VpcPeeringConnectionId']))}</vpcPeeringConnectionId>
+            <requesterVpcInfo><vpcId>{_esc(str(pcx['RequesterVpcInfo']['VpcId']))}</vpcId><ownerId>{_esc(str(pcx['RequesterVpcInfo']['OwnerId']))}</ownerId><region>{_esc(str(pcx['RequesterVpcInfo']['Region']))}</region></requesterVpcInfo>
+            <accepterVpcInfo><vpcId>{_esc(str(pcx['AccepterVpcInfo']['VpcId']))}</vpcId><ownerId>{_esc(str(pcx['AccepterVpcInfo']['OwnerId']))}</ownerId><region>{_esc(str(pcx['AccepterVpcInfo']['Region']))}</region></accepterVpcInfo>
+            <status><code>{_esc(str(pcx['Status']['Code']))}</code><message>{_esc(str(pcx['Status']['Message']))}</message></status>
             {_tag_set_xml(pcx['VpcPeeringConnectionId'])}
         </item>""")
     items, next_xml = _page(params, items, (5, 1000))
@@ -5858,12 +5858,12 @@ def _create_dhcp_options(params):
     if tags:
         _tags[dopt_id] = tags
     configs_xml = "".join(f"""<item>
-        <key>{c['Key']}</key>
-        <valueSet>{"".join(f'<item><value>{v}</value></item>' for v in c['Values'])}</valueSet>
+        <key>{_esc(str(c['Key']))}</key>
+        <valueSet>{"".join(f'<item><value>{_esc(v)}</value></item>' for v in c['Values'])}</valueSet>
     </item>""" for c in configs)
     _parse_tag_specs(params, "dhcp-options", dopt_id)
     inner = f"""<dhcpOptions>
-        <dhcpOptionsId>{dopt_id}</dhcpOptionsId>
+        <dhcpOptionsId>{_esc(str(dopt_id))}</dhcpOptionsId>
         <dhcpConfigurationSet>{configs_xml}</dhcpConfigurationSet>
         <ownerId>{get_account_id()}</ownerId>
         {_tag_set_xml(dopt_id)}
@@ -5891,13 +5891,13 @@ def _describe_dhcp_options(params):
         if ids and dopt["DhcpOptionsId"] not in ids:
             continue
         configs_xml = "".join(f"""<item>
-            <key>{c['Key']}</key>
-            <valueSet>{"".join(f'<item><value>{v}</value></item>' for v in c['Values'])}</valueSet>
+            <key>{_esc(str(c['Key']))}</key>
+            <valueSet>{"".join(f'<item><value>{_esc(v)}</value></item>' for v in c['Values'])}</valueSet>
         </item>""" for c in dopt["DhcpConfigurations"])
         items.append(f"""<item>
-            <dhcpOptionsId>{dopt['DhcpOptionsId']}</dhcpOptionsId>
+            <dhcpOptionsId>{_esc(str(dopt['DhcpOptionsId']))}</dhcpOptionsId>
             <dhcpConfigurationSet>{configs_xml}</dhcpConfigurationSet>
-            <ownerId>{dopt['OwnerId']}</ownerId>
+            <ownerId>{_esc(str(dopt['OwnerId']))}</ownerId>
             {_tag_set_xml(dopt['DhcpOptionsId'])}
         </item>""")
     items, next_xml = _page(params, items, (5, 1000))
@@ -5934,10 +5934,10 @@ def _create_egress_only_igw(params):
         _tags[eigw_id] = tags
     _parse_tag_specs(params, "egress-only-internet-gateway", eigw_id)
     inner = f"""<egressOnlyInternetGateway>
-        <egressOnlyInternetGatewayId>{eigw_id}</egressOnlyInternetGatewayId>
+        <egressOnlyInternetGatewayId>{_esc(str(eigw_id))}</egressOnlyInternetGatewayId>
         <attachmentSet>
             <item>
-                <vpcId>{vpc_id}</vpcId>
+                <vpcId>{_esc(str(vpc_id))}</vpcId>
                 <state>attached</state>
             </item>
         </attachmentSet>
@@ -5953,11 +5953,11 @@ def _describe_egress_only_igws(params):
         if ids and eigw["EgressOnlyInternetGatewayId"] not in ids:
             continue
         items.append(f"""<item>
-            <egressOnlyInternetGatewayId>{eigw['EgressOnlyInternetGatewayId']}</egressOnlyInternetGatewayId>
+            <egressOnlyInternetGatewayId>{_esc(str(eigw['EgressOnlyInternetGatewayId']))}</egressOnlyInternetGatewayId>
             <attachmentSet>
                 <item>
-                    <vpcId>{eigw['VpcId']}</vpcId>
-                    <state>{eigw['State']}</state>
+                    <vpcId>{_esc(str(eigw['VpcId']))}</vpcId>
+                    <state>{_esc(str(eigw['State']))}</state>
                 </item>
             </attachmentSet>
             {_tag_set_xml(eigw['EgressOnlyInternetGatewayId'])}
@@ -6000,7 +6000,7 @@ def _replace_route_table_association(p):
                     "AssociationState": {"State": "associated"},
                 })
                 return _xml(200, "ReplaceRouteTableAssociationResponse",
-                            f"<newAssociationId>{new_assoc_id}</newAssociationId>")
+                            f"<newAssociationId>{_esc(str(new_assoc_id))}</newAssociationId>")
     return _error("InvalidAssociationID.NotFound", f"Association '{assoc_id}' not found", 400)
 
 
@@ -6181,9 +6181,9 @@ def _describe_prefix_lists(p):
         if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
             continue
         items.append(f"""<item>
-            <prefixListId>{pl_id}</prefixListId>
-            <prefixListName>{name}</prefixListName>
-            <cidrSet><item>{cidr}</item></cidrSet>
+            <prefixListId>{_esc(str(pl_id))}</prefixListId>
+            <prefixListName>{_esc(str(name))}</prefixListName>
+            <cidrSet><item>{_esc(str(cidr))}</item></cidrSet>
         </item>""")
     # User-created managed prefix lists
     for pl in _prefix_lists.values():
@@ -6193,10 +6193,10 @@ def _describe_prefix_lists(p):
             continue
         if filters.get("prefix-list-name") and pl.get("PrefixListName", "") not in filters["prefix-list-name"]:
             continue
-        entries = "".join(f"<item>{e['Cidr']}</item>" for e in pl.get("Entries", []))
+        entries = "".join(f"<item>{_esc(str(e['Cidr']))}</item>" for e in pl.get("Entries", []))
         items.append(f"""<item>
-            <prefixListId>{pl['PrefixListId']}</prefixListId>
-            <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
+            <prefixListId>{_esc(str(pl['PrefixListId']))}</prefixListId>
+            <prefixListName>{_esc(str(pl.get('PrefixListName','')))}</prefixListName>
             <cidrSet>{entries}</cidrSet>
         </item>""")
     items, next_xml = _page(p, items)
@@ -6250,11 +6250,11 @@ def _describe_managed_prefix_lists(p):
         if filters.get("owner-id") and "AWS" not in filters["owner-id"]:
             continue
         items.append(f"""<item>
-        <prefixListId>{pl_id}</prefixListId>
-        <prefixListName>{name}</prefixListName>
+        <prefixListId>{_esc(str(pl_id))}</prefixListId>
+        <prefixListName>{_esc(str(name))}</prefixListName>
         <state>create-complete</state>
-        <addressFamily>{aws_pl['AddressFamily']}</addressFamily>
-        <maxEntries>{aws_pl['MaxEntries']}</maxEntries>
+        <addressFamily>{_esc(str(aws_pl['AddressFamily']))}</addressFamily>
+        <maxEntries>{_esc(str(aws_pl['MaxEntries']))}</maxEntries>
         <version>1</version>
         <prefixListArn>arn:aws:ec2:{get_region()}:aws:prefix-list/{pl_id}</prefixListArn>
         <ownerId>AWS</ownerId>
@@ -6283,8 +6283,8 @@ def _get_managed_prefix_list_entries(p):
         cidr = aws_pl["Cidr"]
         name = aws_pl["PrefixListName"]
         entries = f"""<item>
-        <cidr>{cidr}</cidr>
-        <description>{name}</description>
+        <cidr>{_esc(str(cidr))}</cidr>
+        <description>{_esc(str(name))}</description>
     </item>"""
         return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>")
     # User-created managed prefix lists
@@ -6293,8 +6293,8 @@ def _get_managed_prefix_list_entries(p):
         return _error("InvalidPrefixListID.NotFound", f"Prefix list '{pl_id}' not found", 400)
     page, next_xml = _page(p, pl.get("Entries", []), (1, 100))
     entries = "".join(f"""<item>
-        <cidr>{e['Cidr']}</cidr>
-        <description>{e.get('Description','')}</description>
+        <cidr>{_esc(str(e['Cidr']))}</cidr>
+        <description>{_esc(str(e.get('Description','')))}</description>
     </item>""" for e in page)
     return _xml(200, "GetManagedPrefixListEntriesResponse", f"<entrySet>{entries}</entrySet>{next_xml}")
 
@@ -6345,14 +6345,14 @@ def _delete_managed_prefix_list(p):
 
 def _prefix_list_xml(pl, tag="item"):
     return f"""<{tag}>
-        <prefixListId>{pl['PrefixListId']}</prefixListId>
-        <prefixListName>{pl.get('PrefixListName','')}</prefixListName>
-        <state>{pl.get('State','create-complete')}</state>
-        <addressFamily>{pl.get('AddressFamily','IPv4')}</addressFamily>
-        <maxEntries>{pl.get('MaxEntries',10)}</maxEntries>
-        <version>{pl.get('Version',1)}</version>
-        <prefixListArn>{pl.get('PrefixListArn','')}</prefixListArn>
-        <ownerId>{pl.get('OwnerId', get_account_id())}</ownerId>
+        <prefixListId>{_esc(str(pl['PrefixListId']))}</prefixListId>
+        <prefixListName>{_esc(str(pl.get('PrefixListName','')))}</prefixListName>
+        <state>{_esc(str(pl.get('State','create-complete')))}</state>
+        <addressFamily>{_esc(str(pl.get('AddressFamily','IPv4')))}</addressFamily>
+        <maxEntries>{_esc(str(pl.get('MaxEntries',10)))}</maxEntries>
+        <version>{_esc(str(pl.get('Version',1)))}</version>
+        <prefixListArn>{_esc(str(pl.get('PrefixListArn','')))}</prefixListArn>
+        <ownerId>{_esc(str(pl.get('OwnerId', get_account_id())))}</ownerId>
         {_tag_set_xml(pl['PrefixListId'])}
     </{tag}>"""
 
@@ -6403,7 +6403,7 @@ def _attach_vpn_gateway(p):
         return _error("InvalidVpnGatewayID.NotFound", f"VPN gateway '{vgw_id}' not found", 400)
     vgw["Attachments"] = [{"VpcId": vpc_id, "State": "attached"}]
     return _xml(200, "AttachVpnGatewayResponse",
-                f"<attachment><vpcId>{vpc_id}</vpcId><state>attached</state></attachment>")
+                f"<attachment><vpcId>{_esc(str(vpc_id))}</vpcId><state>attached</state></attachment>")
 
 
 def _detach_vpn_gateway(p):
@@ -6426,15 +6426,15 @@ def _delete_vpn_gateway(p):
 
 def _vgw_xml(vgw, tag="item"):
     attachments = "".join(
-        f"<item><vpcId>{a['VpcId']}</vpcId><state>{a['State']}</state></item>"
+        f"<item><vpcId>{_esc(str(a['VpcId']))}</vpcId><state>{_esc(str(a['State']))}</state></item>"
         for a in vgw.get("Attachments", [])
     )
     return f"""<{tag}>
-        <vpnGatewayId>{vgw['VpnGatewayId']}</vpnGatewayId>
-        <state>{vgw['State']}</state>
-        <type>{vgw['Type']}</type>
-        <availabilityZone>{vgw.get('AvailabilityZone','')}</availabilityZone>
-        <amazonSideAsn>{vgw.get('AmazonSideAsn','64512')}</amazonSideAsn>
+        <vpnGatewayId>{_esc(str(vgw['VpnGatewayId']))}</vpnGatewayId>
+        <state>{_esc(str(vgw['State']))}</state>
+        <type>{_esc(str(vgw['Type']))}</type>
+        <availabilityZone>{_esc(str(vgw.get('AvailabilityZone','')))}</availabilityZone>
+        <amazonSideAsn>{_esc(str(vgw.get('AmazonSideAsn','64512')))}</amazonSideAsn>
         <attachments>{attachments}</attachments>
         {_tag_set_xml(vgw['VpnGatewayId'])}
     </{tag}>"""
@@ -6511,11 +6511,11 @@ def _delete_customer_gateway(p):
 
 def _cgw_xml(cgw, tag="item"):
     return f"""<{tag}>
-        <customerGatewayId>{cgw['CustomerGatewayId']}</customerGatewayId>
-        <bgpAsn>{cgw['BgpAsn']}</bgpAsn>
-        <ipAddress>{cgw['IpAddress']}</ipAddress>
-        <type>{cgw['Type']}</type>
-        <state>{cgw['State']}</state>
+        <customerGatewayId>{_esc(str(cgw['CustomerGatewayId']))}</customerGatewayId>
+        <bgpAsn>{_esc(str(cgw['BgpAsn']))}</bgpAsn>
+        <ipAddress>{_esc(str(cgw['IpAddress']))}</ipAddress>
+        <type>{_esc(str(cgw['Type']))}</type>
+        <state>{_esc(str(cgw['State']))}</state>
         {"".join(f"<{m[0].lower() + m[1:]}>{_esc(cgw[m])}</{m[0].lower() + m[1:]}>"
                  for m in ("CertificateArn", "DeviceName", "BgpAsnExtended") if cgw.get(m))}
         {_tag_set_xml(cgw['CustomerGatewayId'])}
@@ -6621,17 +6621,17 @@ def _vpn_tunnel_lists_xml(tunnel):
 
 def _vpn_conn_xml(vpn, tag="item"):
     routes = "".join(
-        f"<item><destinationCidrBlock>{r['DestinationCidrBlock']}</destinationCidrBlock><state>{r['State']}</state></item>"
+        f"<item><destinationCidrBlock>{_esc(str(r['DestinationCidrBlock']))}</destinationCidrBlock><state>{_esc(str(r['State']))}</state></item>"
         for r in vpn.get("Routes", [])
     )
     return f"""<{tag}>
-        <vpnConnectionId>{vpn['VpnConnectionId']}</vpnConnectionId>
-        <state>{vpn['State']}</state>
-        <type>{vpn['Type']}</type>
-        <customerGatewayId>{vpn['CustomerGatewayId']}</customerGatewayId>
-        <vpnGatewayId>{vpn['VpnGatewayId']}</vpnGatewayId>
-        <transitGatewayId>{vpn['TransitGatewayId']}</transitGatewayId>
-        <category>{vpn['Category']}</category>
+        <vpnConnectionId>{_esc(str(vpn['VpnConnectionId']))}</vpnConnectionId>
+        <state>{_esc(str(vpn['State']))}</state>
+        <type>{_esc(str(vpn['Type']))}</type>
+        <customerGatewayId>{_esc(str(vpn['CustomerGatewayId']))}</customerGatewayId>
+        <vpnGatewayId>{_esc(str(vpn['VpnGatewayId']))}</vpnGatewayId>
+        <transitGatewayId>{_esc(str(vpn['TransitGatewayId']))}</transitGatewayId>
+        <category>{_esc(str(vpn['Category']))}</category>
         <options><staticRoutesOnly>{'true' if vpn['Options']['StaticRoutesOnly'] else 'false'}</staticRoutesOnly>{_struct_xml(vpn['Options'], _VPN_OPTION_MEMBERS)}{
             "<tunnelOptionSet>" + "".join(f"<item>{_struct_xml(t, _VPN_TUNNEL_MEMBERS)}{_vpn_tunnel_lists_xml(t)}</item>"
                                           for t in vpn['Options']['TunnelOptions']) + "</tunnelOptionSet>"
@@ -6718,19 +6718,19 @@ def _describe_instance_attribute(p):
     elif attribute == "enclaveOptions":
         value_xml = f"<enclaveOptions><enabled>{_bool((inst.get('EnclaveOptions') or {}).get('Enabled'))}</enabled></enclaveOptions>"
     elif attribute == "instanceType":
-        value_xml = f"<instanceType><value>{inst.get('InstanceType', 't2.micro')}</value></instanceType>"
+        value_xml = f"<instanceType><value>{_esc(str(inst.get('InstanceType', 't2.micro')))}</value></instanceType>"
     elif attribute == "userData":
         value_xml = (f"<userData><value>{_esc(inst['UserData'])}</value></userData>"
                      if inst.get("UserData") else "<userData/>")
     elif attribute == "rootDeviceName":
-        value_xml = f"<rootDeviceName><value>{inst.get('RootDeviceName', '/dev/xvda')}</value></rootDeviceName>"
+        value_xml = f"<rootDeviceName><value>{_esc(str(inst.get('RootDeviceName', '/dev/xvda')))}</value></rootDeviceName>"
     elif attribute == "blockDeviceMapping":
         value_xml = f"<blockDeviceMapping>{_inst_bdm_xml(inst)}</blockDeviceMapping>"
     elif attribute == "sourceDestCheck":
         value_xml = f"<sourceDestCheck><value>{_bool(inst.get('SourceDestCheck', True))}</value></sourceDestCheck>"
     elif attribute == "groupSet":
         sgs = "".join(
-            f"<item><groupId>{sg['GroupId']}</groupId><groupName>{sg['GroupName']}</groupName></item>"
+            f"<item><groupId>{_esc(str(sg['GroupId']))}</groupId><groupName>{_esc(str(sg['GroupName']))}</groupName></item>"
             for sg in inst.get("SecurityGroups", [])
         )
         value_xml = f"<groupSet>{sgs}</groupSet>"
@@ -6744,7 +6744,7 @@ def _describe_instance_attribute(p):
         value_xml = f"<{attribute}/>"
 
     return _xml(200, "DescribeInstanceAttributeResponse",
-                f"<instanceId>{instance_id}</instanceId>{value_xml}")
+                f"<instanceId>{_esc(str(instance_id))}</instanceId>{value_xml}")
 
 
 def _describe_instance_types(p):
@@ -6762,7 +6762,7 @@ def _describe_instance_types(p):
         vcpus = 2 if "micro" in itype else 4 if "small" in itype else 8
         mem_mib = 1024 if "micro" in itype else 2048 if "small" in itype else 4096
         items.append(f"""<item>
-            <instanceType>{itype}</instanceType>
+            <instanceType>{_esc(str(itype))}</instanceType>
             <currentGeneration>true</currentGeneration>
             <freeTierEligible>{'true' if itype == 't2.micro' else 'false'}</freeTierEligible>
             <supportedUsageClasses><item>on-demand</item><item>spot</item></supportedUsageClasses>
@@ -6775,11 +6775,11 @@ def _describe_instance_types(p):
                 <sustainedClockSpeedInGhz>2.5</sustainedClockSpeedInGhz>
             </processorInfo>
             <vCpuInfo>
-                <defaultVCpus>{vcpus}</defaultVCpus>
-                <defaultCores>{vcpus}</defaultCores>
+                <defaultVCpus>{_esc(str(vcpus))}</defaultVCpus>
+                <defaultCores>{_esc(str(vcpus))}</defaultCores>
                 <defaultThreadsPerCore>1</defaultThreadsPerCore>
             </vCpuInfo>
-            <memoryInfo><sizeInMiB>{mem_mib}</sizeInMiB></memoryInfo>
+            <memoryInfo><sizeInMiB>{_esc(str(mem_mib))}</sizeInMiB></memoryInfo>
             <instanceStorageSupported>false</instanceStorageSupported>
             <ebsInfo>
                 <ebsOptimizedSupport>unsupported</ebsOptimizedSupport>
@@ -6830,7 +6830,7 @@ def _describe_instance_credit_specifications(p):
     instance_ids = _parse_member_list(p, "InstanceId")
     ids, next_xml = (instance_ids, "") if instance_ids else _page(p, list(_instances.keys()), (5, 1000))
     items = "".join(
-        f"<item><instanceId>{iid}</instanceId><cpuCredits>"
+        f"<item><instanceId>{_esc(str(iid))}</instanceId><cpuCredits>"
         f"{_esc((_instances.get(iid, {}).get('CreditSpecification') or {}).get('CpuCredits', 'standard'))}"
         "</cpuCredits></item>"
         for iid in ids
@@ -6873,7 +6873,7 @@ def _describe_addresses_attribute(p):
     alloc_id = _p(p, "AllocationId") or _parse_member_list(p, "AllocationId")
     alloc_ids = alloc_id if isinstance(alloc_id, list) else [alloc_id] if alloc_id else []
     alloc_ids, next_xml = _page(p, alloc_ids, (1, 1000))
-    items = "".join(f"<item><allocationId>{aid}</allocationId><ptrRecord></ptrRecord></item>" for aid in alloc_ids)
+    items = "".join(f"<item><allocationId>{_esc(str(aid))}</allocationId><ptrRecord></ptrRecord></item>" for aid in alloc_ids)
     return _xml(200, "DescribeAddressesAttributeResponse", f"<addressSet>{items}</addressSet>{next_xml}")
 
 
@@ -7122,7 +7122,7 @@ def _instance_requirements_xml(req):
         tag = member[0].lower() + member[1:]
         value = req[member]
         if kind.endswith("_range"):
-            inner = "".join(f"<{b.lower()}>{value[b]}</{b.lower()}>" for b in ("Min", "Max") if b in value)
+            inner = "".join(f"<{b.lower()}>{_esc(str(value[b]))}</{b.lower()}>" for b in ("Min", "Max") if b in value)
             xml += f"<{tag}>{inner}</{tag}>"
         elif kind == "list":
             inner = "".join(f"<item>{_esc(str(v))}</item>" for v in value)
@@ -7379,7 +7379,7 @@ def _lt_data_xml(data):
                 if "KmsKeyId" in ebs:
                     inner += f"<kmsKeyId>{_esc(ebs['KmsKeyId'])}</kmsKeyId>"
                 if "VolumeSize" in ebs:
-                    inner += f"<volumeSize>{ebs['VolumeSize']}</volumeSize>"
+                    inner += f"<volumeSize>{_esc(str(ebs['VolumeSize']))}</volumeSize>"
                 if "VolumeType" in ebs:
                     inner += f"<volumeType>{_esc(ebs['VolumeType'])}</volumeType>"
                 if "Encrypted" in ebs:
@@ -7389,9 +7389,9 @@ def _lt_data_xml(data):
                 if "SnapshotId" in ebs:
                     inner += f"<snapshotId>{_esc(ebs['SnapshotId'])}</snapshotId>"
                 if "Iops" in ebs:
-                    inner += f"<iops>{ebs['Iops']}</iops>"
+                    inner += f"<iops>{_esc(str(ebs['Iops']))}</iops>"
                 if "Throughput" in ebs:
-                    inner += f"<throughput>{ebs['Throughput']}</throughput>"
+                    inner += f"<throughput>{_esc(str(ebs['Throughput']))}</throughput>"
                 inner += "</ebs>"
             inner += "</item>"
         xml += f"<blockDeviceMappingSet>{inner}</blockDeviceMappingSet>"
@@ -7400,7 +7400,7 @@ def _lt_data_xml(data):
         for ni in data["NetworkInterfaces"]:
             inner += "<item>"
             if "DeviceIndex" in ni:
-                inner += f"<deviceIndex>{ni['DeviceIndex']}</deviceIndex>"
+                inner += f"<deviceIndex>{_esc(str(ni['DeviceIndex']))}</deviceIndex>"
             if "SubnetId" in ni:
                 inner += f"<subnetId>{_esc(ni['SubnetId'])}</subnetId>"
             if "AssociatePublicIpAddress" in ni:
@@ -7474,10 +7474,10 @@ def _lt_version_inner_xml(ver):
     list-context boundary, not on the inner struct."""
     return f"""<launchTemplateId>{_esc(ver['LaunchTemplateId'])}</launchTemplateId>
         <launchTemplateName>{_esc(ver['LaunchTemplateName'])}</launchTemplateName>
-        <versionNumber>{ver['VersionNumber']}</versionNumber>
+        <versionNumber>{_esc(str(ver['VersionNumber']))}</versionNumber>
         <versionDescription>{_esc(ver.get('VersionDescription', ''))}</versionDescription>
         <defaultVersion>{str(ver.get('DefaultVersion', False)).lower()}</defaultVersion>
-        <createTime>{ver['CreateTime']}</createTime>
+        <createTime>{_esc(str(ver['CreateTime']))}</createTime>
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
         <launchTemplateData>{_lt_data_xml(ver.get('LaunchTemplateData', {}))}</launchTemplateData>"""
 
@@ -7543,9 +7543,9 @@ def _create_launch_template(p):
     for t in tags:
         tags_xml += f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
     return _xml(200, "CreateLaunchTemplateResponse", f"""<launchTemplate>
-        <launchTemplateId>{lt_id}</launchTemplateId>
+        <launchTemplateId>{_esc(str(lt_id))}</launchTemplateId>
         <launchTemplateName>{_esc(name)}</launchTemplateName>
-        <createTime>{now}</createTime>
+        <createTime>{_esc(str(now))}</createTime>
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
         <defaultVersionNumber>1</defaultVersionNumber>
         <latestVersionNumber>1</latestVersionNumber>
@@ -7620,12 +7620,12 @@ def _describe_launch_templates(p):
         for t in lt.get("Tags", _tags.get(lt["LaunchTemplateId"], [])):
             tags_xml += f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
         items.append(f"""<item>
-            <launchTemplateId>{lt['LaunchTemplateId']}</launchTemplateId>
+            <launchTemplateId>{_esc(str(lt['LaunchTemplateId']))}</launchTemplateId>
             <launchTemplateName>{_esc(lt['LaunchTemplateName'])}</launchTemplateName>
-            <createTime>{lt['CreateTime']}</createTime>
+            <createTime>{_esc(str(lt['CreateTime']))}</createTime>
             <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
-            <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
-            <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
+            <defaultVersionNumber>{_esc(str(lt['DefaultVersionNumber']))}</defaultVersionNumber>
+            <latestVersionNumber>{_esc(str(lt['LatestVersionNumber']))}</latestVersionNumber>
             <tagSet>{tags_xml}</tagSet>
         </item>""")
     items, next_xml = _page(p, items, (1, 200))
@@ -7697,12 +7697,12 @@ def _modify_launch_template(p):
         for v in lt["Versions"]:
             v["DefaultVersion"] = v["VersionNumber"] == ver_num
     return _xml(200, "ModifyLaunchTemplateResponse", f"""<launchTemplate>
-        <launchTemplateId>{lt['LaunchTemplateId']}</launchTemplateId>
+        <launchTemplateId>{_esc(str(lt['LaunchTemplateId']))}</launchTemplateId>
         <launchTemplateName>{_esc(lt['LaunchTemplateName'])}</launchTemplateName>
-        <createTime>{lt['CreateTime']}</createTime>
+        <createTime>{_esc(str(lt['CreateTime']))}</createTime>
         <createdBy>arn:aws:iam::{get_account_id()}:root</createdBy>
-        <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
-        <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
+        <defaultVersionNumber>{_esc(str(lt['DefaultVersionNumber']))}</defaultVersionNumber>
+        <latestVersionNumber>{_esc(str(lt['LatestVersionNumber']))}</latestVersionNumber>
     </launchTemplate>""")
 
 
@@ -7724,11 +7724,11 @@ def _delete_launch_template(p):
     _launch_templates.pop(lt_id, None)
     _tags.pop(lt_id, None)
     return _xml(200, "DeleteLaunchTemplateResponse", f"""<launchTemplate>
-        <launchTemplateId>{lt['LaunchTemplateId']}</launchTemplateId>
+        <launchTemplateId>{_esc(str(lt['LaunchTemplateId']))}</launchTemplateId>
         <launchTemplateName>{_esc(lt['LaunchTemplateName'])}</launchTemplateName>
-        <createTime>{lt['CreateTime']}</createTime>
-        <defaultVersionNumber>{lt['DefaultVersionNumber']}</defaultVersionNumber>
-        <latestVersionNumber>{lt['LatestVersionNumber']}</latestVersionNumber>
+        <createTime>{_esc(str(lt['CreateTime']))}</createTime>
+        <defaultVersionNumber>{_esc(str(lt['DefaultVersionNumber']))}</defaultVersionNumber>
+        <latestVersionNumber>{_esc(str(lt['LatestVersionNumber']))}</latestVersionNumber>
     </launchTemplate>""")
 
 
@@ -8125,8 +8125,8 @@ def _describe_fleets(p):
             <createTime>{_esc(f['CreateTime'])}</createTime>
             <fleetId>{_esc(f['FleetId'])}</fleetId>
             <fleetState>{_esc(f['FleetState'])}</fleetState>
-            <fulfilledCapacity>{f['FulfilledCapacity']}</fulfilledCapacity>
-            <fulfilledOnDemandCapacity>{f['FulfilledOnDemandCapacity']}</fulfilledOnDemandCapacity>
+            <fulfilledCapacity>{_esc(str(f['FulfilledCapacity']))}</fulfilledCapacity>
+            <fulfilledOnDemandCapacity>{_esc(str(f['FulfilledOnDemandCapacity']))}</fulfilledOnDemandCapacity>
             <targetCapacitySpecification>
                 <totalTargetCapacity>{int(tcs['TotalTargetCapacity'])}</totalTargetCapacity>
                 <onDemandTargetCapacity>{int(tcs['OnDemandTargetCapacity'])}</onDemandTargetCapacity>
@@ -8249,19 +8249,19 @@ def _va_indexed(p, prefix):
 
 
 def _va_invalid(message):
-    return _error("InvalidParameterValue", _esc(message), 400)
+    return _error("InvalidParameterValue", message, 400)
 
 
 def _va_missing_value(message):
-    return _error("MissingParameter", _esc(message), 400)
+    return _error("MissingParameter", message, 400)
 
 
 def _va_combination(message):
-    return _error("InvalidParameterCombination", _esc(message), 400)
+    return _error("InvalidParameterCombination", message, 400)
 
 
 def _va_unsupported(message):
-    return _error("UnsupportedOperation", _esc(message), 400)
+    return _error("UnsupportedOperation", message, 400)
 
 
 def _va_missing(*names):
@@ -8362,7 +8362,7 @@ def _va_sse_from(p, current=None):
 def _va_sse_xml(sse):
     sse = sse or {}
     return ("<sseSpecification>"
-            f"<customerManagedKeyEnabled>{_va_bool(sse.get('CustomerManagedKeyEnabled'))}</customerManagedKeyEnabled>"
+            f"<customerManagedKeyEnabled>{_esc(str(_va_bool(sse.get('CustomerManagedKeyEnabled'))))}</customerManagedKeyEnabled>"
             f"{_va_text('kmsKeyArn', sse.get('KmsKeyArn'))}"
             "</sseSpecification>")
 
@@ -8378,7 +8378,7 @@ def _va_tags_xml(resource_id, with_tags):
 
 
 def _va_next_token_xml(token):
-    return f"<nextToken>{token}</nextToken>" if token else ""
+    return f"<nextToken>{_esc(str(token))}</nextToken>" if token else ""
 
 
 def _va_describe(p, kind, bounds, members=(), exclusive=False):
@@ -8440,9 +8440,9 @@ def _va_trust_provider_condensed_xml(tp, with_description):
     return ("<item>"
             f"{description}"
             f"{_va_text('deviceTrustProviderType', tp.get('DeviceTrustProviderType'))}"
-            f"<trustProviderType>{tp['TrustProviderType']}</trustProviderType>"
+            f"<trustProviderType>{_esc(str(tp['TrustProviderType']))}</trustProviderType>"
             f"{_va_text('userTrustProviderType', tp.get('UserTrustProviderType'))}"
-            f"<verifiedAccessTrustProviderId>{tp['VerifiedAccessTrustProviderId']}</verifiedAccessTrustProviderId>"
+            f"<verifiedAccessTrustProviderId>{_esc(str(tp['VerifiedAccessTrustProviderId']))}</verifiedAccessTrustProviderId>"
             "</item>")
 
 
@@ -8468,18 +8468,18 @@ def _va_trust_provider_xml(tp, tag="verifiedAccessTrustProvider", with_tags=Fals
                     f"{_va_text('userInfoEndpoint', oidc.get('UserInfoEndpoint'))}"
                     "</oidcOptions>")
     return (f"<{tag}>"
-            f"<creationTime>{tp['CreationTime']}</creationTime>"
+            f"<creationTime>{_esc(str(tp['CreationTime']))}</creationTime>"
             f"{_va_description_xml(tp)}"
             f"{device_xml}"
             f"{_va_text('deviceTrustProviderType', tp.get('DeviceTrustProviderType'))}"
-            f"<lastUpdatedTime>{tp['LastUpdatedTime']}</lastUpdatedTime>"
+            f"<lastUpdatedTime>{_esc(str(tp['LastUpdatedTime']))}</lastUpdatedTime>"
             f"{oidc_xml}"
             f"<policyReferenceName>{_esc(tp['PolicyReferenceName'])}</policyReferenceName>"
             f"{_va_sse_xml(tp.get('SseSpecification'))}"
             f"{_va_tags_xml(tp['VerifiedAccessTrustProviderId'], with_tags)}"
-            f"<trustProviderType>{tp['TrustProviderType']}</trustProviderType>"
+            f"<trustProviderType>{_esc(str(tp['TrustProviderType']))}</trustProviderType>"
             f"{_va_text('userTrustProviderType', tp.get('UserTrustProviderType'))}"
-            f"<verifiedAccessTrustProviderId>{tp['VerifiedAccessTrustProviderId']}</verifiedAccessTrustProviderId>"
+            f"<verifiedAccessTrustProviderId>{_esc(str(tp['VerifiedAccessTrustProviderId']))}</verifiedAccessTrustProviderId>"
             f"</{tag}>")
 
 
@@ -8676,12 +8676,12 @@ def _va_instance_xml(inst, tag="verifiedAccessInstance", with_tags=False):
         for tp_id in inst["TrustProviderIds"] if tp_id in _va_trust_providers
     )
     return (f"<{tag}>"
-            f"<creationTime>{inst['CreationTime']}</creationTime>"
+            f"<creationTime>{_esc(str(inst['CreationTime']))}</creationTime>"
             f"{_va_description_xml(inst)}"
-            f"<fipsEnabled>{_va_bool(inst.get('FipsEnabled'))}</fipsEnabled>"
-            f"<lastUpdatedTime>{inst['LastUpdatedTime']}</lastUpdatedTime>"
+            f"<fipsEnabled>{_esc(str(_va_bool(inst.get('FipsEnabled'))))}</fipsEnabled>"
+            f"<lastUpdatedTime>{_esc(str(inst['LastUpdatedTime']))}</lastUpdatedTime>"
             f"{_va_tags_xml(inst['VerifiedAccessInstanceId'], with_tags)}"
-            f"<verifiedAccessInstanceId>{inst['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"<verifiedAccessInstanceId>{_esc(str(inst['VerifiedAccessInstanceId']))}</verifiedAccessInstanceId>"
             f"<verifiedAccessTrustProviderSet>{providers}</verifiedAccessTrustProviderSet>"
             f"</{tag}>")
 
@@ -8858,13 +8858,13 @@ def _va_logging_xml(inst, tag="loggingConfiguration"):
     return (f"<{tag}>"
             "<accessLogs>"
             + dest_xml("CloudWatchLogs", "cloudWatchLogs", (("LogGroup", "logGroup"),))
-            + f"<includeTrustContext>{_va_bool(logs['IncludeTrustContext'])}</includeTrustContext>"
+            + f"<includeTrustContext>{_esc(str(_va_bool(logs['IncludeTrustContext'])))}</includeTrustContext>"
             + dest_xml("KinesisDataFirehose", "kinesisDataFirehose", (("DeliveryStream", "deliveryStream"),))
             + f"<logVersion>{_esc(logs['LogVersion'])}</logVersion>"
             + dest_xml("S3", "s3", (("BucketName", "bucketName"), ("BucketOwner", "bucketOwner"),
                                     ("Prefix", "prefix")))
             + "</accessLogs>"
-            f"<verifiedAccessInstanceId>{inst['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"<verifiedAccessInstanceId>{_esc(str(inst['VerifiedAccessInstanceId']))}</verifiedAccessInstanceId>"
             f"</{tag}>")
 
 
@@ -8952,16 +8952,16 @@ def _describe_verified_access_instance_logging_configurations(p):
 
 def _va_group_xml(group, tag="verifiedAccessGroup", with_tags=False):
     return (f"<{tag}>"
-            f"<creationTime>{group['CreationTime']}</creationTime>"
+            f"<creationTime>{_esc(str(group['CreationTime']))}</creationTime>"
             f"{_va_text('deletionTime', group.get('DeletionTime'))}"
             f"{_va_description_xml(group)}"
-            f"<lastUpdatedTime>{group['LastUpdatedTime']}</lastUpdatedTime>"
-            f"<owner>{group['Owner']}</owner>"
+            f"<lastUpdatedTime>{_esc(str(group['LastUpdatedTime']))}</lastUpdatedTime>"
+            f"<owner>{_esc(str(group['Owner']))}</owner>"
             f"{_va_sse_xml(group.get('SseSpecification'))}"
             f"{_va_tags_xml(group['VerifiedAccessGroupId'], with_tags)}"
-            f"<verifiedAccessGroupArn>{group['VerifiedAccessGroupArn']}</verifiedAccessGroupArn>"
-            f"<verifiedAccessGroupId>{group['VerifiedAccessGroupId']}</verifiedAccessGroupId>"
-            f"<verifiedAccessInstanceId>{group['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"<verifiedAccessGroupArn>{_esc(str(group['VerifiedAccessGroupArn']))}</verifiedAccessGroupArn>"
+            f"<verifiedAccessGroupId>{_esc(str(group['VerifiedAccessGroupId']))}</verifiedAccessGroupId>"
+            f"<verifiedAccessInstanceId>{_esc(str(group['VerifiedAccessInstanceId']))}</verifiedAccessInstanceId>"
             f"</{tag}>")
 
 
@@ -9070,7 +9070,7 @@ def _delete_verified_access_group(p):
 
 
 def _va_get_policy_xml(record):
-    body = f"<policyEnabled>{_va_bool(record.get('PolicyEnabled'))}</policyEnabled>"
+    body = f"<policyEnabled>{_esc(str(_va_bool(record.get('PolicyEnabled'))))}</policyEnabled>"
     return body + _va_text("policyDocument", record.get("PolicyDocument"))
 
 
@@ -9096,7 +9096,7 @@ def _va_modify_policy(record, p):
 
 def _va_modify_policy_xml(record):
     return (f"{_va_text('policyDocument', record.get('PolicyDocument'))}"
-            f"<policyEnabled>{_va_bool(record.get('PolicyEnabled'))}</policyEnabled>"
+            f"<policyEnabled>{_esc(str(_va_bool(record.get('PolicyEnabled'))))}</policyEnabled>"
             f"{_va_sse_xml(record.get('SseSpecification'))}")
 
 
@@ -9146,23 +9146,23 @@ def _va_target_options_xml(tag, opts, arn_key, arn_tag):
 def _va_endpoint_xml(ep, tag="verifiedAccessEndpoint", with_tags=False):
     return (f"<{tag}>"
             f"{_va_text('applicationDomain', ep.get('ApplicationDomain'))}"
-            f"<attachmentType>{ep['AttachmentType']}</attachmentType>"
-            f"<creationTime>{ep['CreationTime']}</creationTime>"
+            f"<attachmentType>{_esc(str(ep['AttachmentType']))}</attachmentType>"
+            f"<creationTime>{_esc(str(ep['CreationTime']))}</creationTime>"
             f"{_va_description_xml(ep)}"
             f"{_va_text('deviceValidationDomain', ep.get('DeviceValidationDomain') if _va_has_device_provider(ep) else '')}"
             f"{_va_text('domainCertificateArn', ep.get('DomainCertificateArn'))}"
             f"{_va_text('endpointDomain', ep.get('EndpointDomain'))}"
-            f"<endpointType>{ep['EndpointType']}</endpointType>"
-            f"<lastUpdatedTime>{ep['LastUpdatedTime']}</lastUpdatedTime>"
+            f"<endpointType>{_esc(str(ep['EndpointType']))}</endpointType>"
+            f"<lastUpdatedTime>{_esc(str(ep['LastUpdatedTime']))}</lastUpdatedTime>"
             f"{_va_target_options_xml('loadBalancerOptions', ep.get('LoadBalancerOptions'), 'LoadBalancerArn', 'loadBalancerArn')}"
             f"{_va_target_options_xml('networkInterfaceOptions', ep.get('NetworkInterfaceOptions'), 'NetworkInterfaceId', 'networkInterfaceId')}"
             f"<securityGroupIdSet>{_va_member_items(ep.get('SecurityGroupIds'))}</securityGroupIdSet>"
             f"{_va_sse_xml(ep.get('SseSpecification'))}"
-            f"<status><code>{ep['Status']}</code></status>"
+            f"<status><code>{_esc(str(ep['Status']))}</code></status>"
             f"{_va_tags_xml(ep['VerifiedAccessEndpointId'], with_tags)}"
-            f"<verifiedAccessEndpointId>{ep['VerifiedAccessEndpointId']}</verifiedAccessEndpointId>"
-            f"<verifiedAccessGroupId>{ep['VerifiedAccessGroupId']}</verifiedAccessGroupId>"
-            f"<verifiedAccessInstanceId>{ep['VerifiedAccessInstanceId']}</verifiedAccessInstanceId>"
+            f"<verifiedAccessEndpointId>{_esc(str(ep['VerifiedAccessEndpointId']))}</verifiedAccessEndpointId>"
+            f"<verifiedAccessGroupId>{_esc(str(ep['VerifiedAccessGroupId']))}</verifiedAccessGroupId>"
+            f"<verifiedAccessInstanceId>{_esc(str(ep['VerifiedAccessInstanceId']))}</verifiedAccessInstanceId>"
             f"</{tag}>")
 
 

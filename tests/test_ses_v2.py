@@ -226,6 +226,21 @@ def test_ses_v2_create_email_address_identity_has_no_dkim_tokens(ses_v2):
     assert body["DkimAttributes"]["Tokens"] == []
 
 
+def test_ses_v2_get_email_identity_returns_only_get_email_identity_response_members(ses_v2):
+    _call(ses_v2, "POST", "/v2/email/identities",
+          body={"EmailIdentity": "shape.example.com", "Tags": [{"Key": "a", "Value": "1"}]})
+    _call(ses_v2, "POST", "/v2/email/tags", body={
+        "ResourceArn": _arn("identity", "shape.example.com"), "Tags": [{"Key": "b", "Value": "2"}]})
+
+    status, body = _call(ses_v2, "GET", "/v2/email/identities/shape.example.com")
+    assert status == 200
+    assert set(body) == {"IdentityType", "FeedbackForwardingStatus", "VerifiedForSendingStatus",
+                         "DkimAttributes", "Tags", "VerificationStatus"}
+    assert body["FeedbackForwardingStatus"] is True
+    assert body["VerificationStatus"] == "SUCCESS"
+    assert body["Tags"] == [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]
+
+
 def test_ses_v2_configuration_set_tag_resource_uses_parser_backed_resource_arn(ses_v2):
     config_set_name = "parser-config"
     resource_arn = _arn("configuration-set", config_set_name)
@@ -385,7 +400,8 @@ def test_ses_v2_email_template_crud(ses_v2):
     status, body = _call(ses_v2, "GET", "/v2/email/templates")
     assert status == 200
     assert [t["TemplateName"] for t in body["TemplatesMetadata"]] == ["welcome"]
-    assert body["TemplatesMetadata"][0]["CreatedTimestamp"]
+    # restJson1 timestamp without timestampFormat: epoch seconds
+    assert isinstance(body["TemplatesMetadata"][0]["CreatedTimestamp"], int)
 
     status, _body = _call(
         ses_v2,
@@ -1320,3 +1336,59 @@ def test_dedicated_ip_pool_lifecycle(sesv2):
         sesv2.get_dedicated_ip_pool(PoolName=name)
     assert exc.value.response["Error"]["Code"] == "NotFoundException"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def _capture_relay(monkeypatch, service):
+    sent = []
+    monkeypatch.setattr(service, "_smtp_relay", lambda src, rcpts, msg: sent.append((src, rcpts, msg)))
+    return sent
+
+
+def test_ses_v2_send_email_carries_reply_to_headers_and_attachments(ses_v2, monkeypatch):
+    from email import message_from_string
+
+    _verify(ses_v2)
+    sent = _capture_relay(monkeypatch, ses_v2)
+    extras = {
+        "Headers": [{"Name": "X-Campaign", "Value": "spring"}],
+        "Attachments": [{"FileName": "a.txt", "RawContent": "aGVsbG8=", "ContentType": "text/plain"}],
+    }
+    contents = [
+        {"Simple": {"Subject": {"Data": "S"}, "Body": {"Text": {"Data": "T"}}, **extras}},
+        {"Template": {"TemplateContent": {"Subject": "S", "Text": "T"}, "TemplateData": "{}", **extras}},
+    ]
+    for content in contents:
+        status, _ = _call(ses_v2, "POST", "/v2/email/outbound-emails", body={
+            "FromEmailAddress": "sender@example.com",
+            "Destination": {"ToAddresses": ["to@example.com"]},
+            "ReplyToAddresses": ["reply@example.com"],
+            "Content": content,
+        })
+        assert status == 200
+        msg = message_from_string(sent[-1][2])
+        assert msg["Reply-To"] == "reply@example.com"
+        assert msg["X-Campaign"] == "spring"
+        parts = [p for p in msg.walk() if p.get_filename() == "a.txt"]
+        assert parts and parts[0].get_payload(decode=True) == b"hello"
+        record = ses_v2._sent_emails_list()[-1]
+        assert record["ReplyToAddresses"] == ["reply@example.com"]
+        assert record["Attachments"] == [{"FileName": "a.txt", "ContentType": "text/plain"}]
+
+
+def test_ses_v2_send_raw_email_relays_message_bytes_unchanged(ses_v2, monkeypatch):
+    import base64
+
+    _verify(ses_v2)
+    sent = _capture_relay(monkeypatch, ses_v2)
+    raw = ("From: sender@example.com\r\nTo: to@example.com\r\nCc: cc@example.com\r\n"
+           "Reply-To: reply@example.com\r\nX-Custom: keep\r\nMessage-ID: <client@x>\r\n"
+           "Subject: Raw\r\nContent-Type: text/plain\r\n\r\nbody\r\n")
+    status, body = _call(ses_v2, "POST", "/v2/email/outbound-emails", body={
+        "Content": {"Raw": {"Data": base64.b64encode(raw.encode()).decode()}},
+    })
+    assert status == 200
+    source, recipients, relayed = sent[-1]
+    assert source == "sender@example.com"
+    assert recipients == ["to@example.com", "cc@example.com"]
+    expected = raw.replace("Message-ID: <client@x>\r\n", "")
+    assert relayed == f"Message-ID: <{body['MessageId']}>\r\n" + expected

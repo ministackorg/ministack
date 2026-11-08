@@ -655,11 +655,11 @@ def test_waf_association_validates_web_acl_arn_but_not_resource_arn_direct(direc
     }))
     assert status == 200
 
-    status, payload = _waf_payload(waf_service._list_resources_for_web_acl({
-        "WebACLArn": web_acl_arn,
+    status, payload = _waf_payload(waf_service._get_web_acl_for_resource({
+        "ResourceArn": opaque_resource_arn,
     }))
     assert status == 200
-    assert payload["ResourceArns"] == [opaque_resource_arn]
+    assert payload["WebACL"]["ARN"] == web_acl_arn
 
     cloudfront_web_acl_arn = _direct_cloudfront_web_acl_arn("direct-assoc-cf-acl")
     cloudfront_resource_arn = "arn:aws:cloudfront::000000000000:distribution/dist"
@@ -668,11 +668,11 @@ def test_waf_association_validates_web_acl_arn_but_not_resource_arn_direct(direc
         "ResourceArn": cloudfront_resource_arn,
     }))
     assert status == 200
-    status, payload = _waf_payload(waf_service._list_resources_for_web_acl({
-        "WebACLArn": cloudfront_web_acl_arn,
+    status, payload = _waf_payload(waf_service._get_web_acl_for_resource({
+        "ResourceArn": cloudfront_resource_arn,
     }))
     assert status == 200
-    assert payload["ResourceArns"] == [cloudfront_resource_arn]
+    assert payload["WebACL"]["ARN"] == cloudfront_web_acl_arn
 
     global_web_acl_arn = _direct_cloudfront_web_acl_arn(
         "direct-assoc-global-acl",
@@ -684,11 +684,11 @@ def test_waf_association_validates_web_acl_arn_but_not_resource_arn_direct(direc
         "ResourceArn": global_resource_arn,
     }))
     assert status == 200
-    status, payload = _waf_payload(waf_service._list_resources_for_web_acl({
-        "WebACLArn": global_web_acl_arn,
+    status, payload = _waf_payload(waf_service._get_web_acl_for_resource({
+        "ResourceArn": global_resource_arn,
     }))
     assert status == 200
-    assert payload["ResourceArns"] == [global_resource_arn]
+    assert payload["WebACL"]["ARN"] == global_web_acl_arn
 
     wrong_service_arn = web_acl_arn.replace(":wafv2:", ":s3:")
     _assert_waf_error(
@@ -1008,3 +1008,17 @@ def test_waf_ip_set_and_rule_group_names_are_unique_per_scope(wafv2):
     # deleting frees the name
     wafv2.delete_ip_set(Name=ip_name, Scope="REGIONAL", Id=ip["Id"], LockToken=ip["LockToken"])
     wafv2.create_ip_set(Name=ip_name, Scope="REGIONAL", IPAddressVersion="IPV4", Addresses=[])
+
+
+def test_waf_list_resources_for_web_acl_filters_by_resource_type(direct_waf_scope):
+    web_acl_arn = _direct_web_acl_arn("direct-list-type-acl")
+    alb = "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/app/id"
+    pool = "arn:aws:cognito-idp:us-east-1:000000000000:userpool/us-east-1_abc"
+    for resource in (alb, pool):
+        status, _ = _waf_payload(waf_service._associate_web_acl({"WebACLArn": web_acl_arn, "ResourceArn": resource}))
+        assert status == 200
+    _, payload = _waf_payload(waf_service._list_resources_for_web_acl({"WebACLArn": web_acl_arn}))
+    assert payload["ResourceArns"] == [alb]
+    _, payload = _waf_payload(waf_service._list_resources_for_web_acl(
+        {"WebACLArn": web_acl_arn, "ResourceType": "COGNITO_USER_POOL"}))
+    assert payload["ResourceArns"] == [pool]

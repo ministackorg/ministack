@@ -60,6 +60,7 @@ def test_backup_describe_vault_not_found(backup):
     with pytest.raises(ClientError) as exc:
         backup.describe_backup_vault(BackupVaultName="no-such-vault-xyz")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_backup_create_vault_duplicate(backup):
@@ -68,6 +69,7 @@ def test_backup_create_vault_duplicate(backup):
     with pytest.raises(ClientError) as exc:
         backup.create_backup_vault(BackupVaultName=name)
     assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_backup_list_vaults(backup):
@@ -755,3 +757,24 @@ def test_backup_reset_clears_all_regions():
     finally:
         backup_service.reset()
         set_request_region(original_region)
+
+
+def test_backup_list_vaults_wire_members(backup):
+    import json
+
+    name = f"wire-vault-{_uid()}"
+    backup.create_backup_vault(BackupVaultName=name, BackupVaultTags={"k": "v"})
+    raw = {}
+
+    def grab(http_response, **_):
+        raw["body"] = json.loads(http_response.content)
+
+    backup.meta.events.register("after-call.backup.ListBackupVaults", grab)
+    try:
+        backup.list_backup_vaults()
+    finally:
+        backup.meta.events.unregister("after-call.backup.ListBackupVaults", grab)
+    vault = next(v for v in raw["body"]["BackupVaultList"] if v["BackupVaultName"] == name)
+    assert "BackupVaultTags" not in vault
+    assert vault.get("EncryptionKeyArn", None) != ""
+    assert vault["NumberOfRecoveryPoints"] == 0 and vault["Locked"] is False

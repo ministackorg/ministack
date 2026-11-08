@@ -1343,6 +1343,7 @@ def test_bedrock_create_guardrail_duplicate_name_conflict():
                                       blockedInputMessaging="x", blockedOutputsMessaging="y")
     except botocore.exceptions.ClientError as exc:
         assert exc.response["Error"]["Code"] == "ConflictException"
+        assert exc.response["ResponseMetadata"]["HTTPStatusCode"] == 400
     else:
         raise AssertionError("expected ConflictException")
 
@@ -2042,3 +2043,25 @@ def test_bedrock_converse_stream_without_tools_is_unchanged():
     kinds = [e.headers.get(":event-type") for e in buffer]
     assert "contentBlockStart" not in kinds
     assert kinds[0] == "messageStart" and kinds[-1] == "metadata"
+
+
+def test_bedrock_get_guardrail_returns_output_policy_shapes():
+    create = _bedrock().create_guardrail(
+        name="gr-shapes", blockedInputMessaging="x", blockedOutputsMessaging="y",
+        topicPolicyConfig={"topicsConfig": [{"name": "t", "definition": "d", "type": "DENY"}]},
+        contentPolicyConfig={"filtersConfig": [{"type": "HATE", "inputStrength": "HIGH", "outputStrength": "HIGH"}]},
+        wordPolicyConfig={"wordsConfig": [{"text": "w"}], "managedWordListsConfig": [{"type": "PROFANITY"}]},
+        sensitiveInformationPolicyConfig={
+            "piiEntitiesConfig": [{"type": "EMAIL", "action": "BLOCK"}],
+            "regexesConfig": [{"name": "r", "pattern": "a+", "action": "ANONYMIZE"}],
+        },
+        contextualGroundingPolicyConfig={"filtersConfig": [{"type": "GROUNDING", "threshold": 0.5}]},
+    )
+    g = _bedrock().get_guardrail(guardrailIdentifier=create["guardrailId"])
+    assert g["topicPolicy"]["topics"][0]["name"] == "t"
+    assert g["contentPolicy"]["filters"][0]["type"] == "HATE"
+    assert g["wordPolicy"]["words"] == [{"text": "w"}]
+    assert g["wordPolicy"]["managedWordLists"] == [{"type": "PROFANITY"}]
+    assert g["sensitiveInformationPolicy"]["piiEntities"][0]["type"] == "EMAIL"
+    assert g["sensitiveInformationPolicy"]["regexes"][0]["pattern"] == "a+"
+    assert g["contextualGroundingPolicy"]["filters"][0]["threshold"] == 0.5

@@ -14581,3 +14581,377 @@ def test_a_link_verification_pool_sends_a_code_for_a_changed_email(cognito_idp):
         assert "123456" in (message["BodyText"] or message["BodyHtml"])
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pid)
+# Hosted UI forgot password and MFA (pages and answers as AWS's classic hosted
+# UI gave them in eu-west-2, 2026-11-04)
+# ---------------------------------------------------------------------------
+
+def _hosted_oauth(client_id):
+    return {"client_id": client_id, "redirect_uri": "http://localhost:3000/callback", "scope": "openid",
+            "state": "st", "response_type": "code"}
+
+
+def _hidden(html, name):
+    import re
+    match = re.search(rf'name="{name}" value="([^"]*)"', html)
+    return match.group(1) if match else None
+
+
+def _hosted_sign_in(client_id, password="TestPass1!", username="testuser"):
+    return _post_form(f"{ENDPOINT}/login", {**_hosted_oauth(client_id), "username": username, "password": password},
+                      follow_redirects=False)
+
+
+def _hosted_mfa(mfa_token, client_id, **fields):
+    return _post_form(f"{ENDPOINT}/login", {**_hosted_oauth(client_id), "mfa_token": mfa_token, **fields},
+                      follow_redirects=False)
+
+
+def _hosted_email_pool(cognito_idp, prevent_user_existence_errors="LEGACY"):
+    pool_id = cognito_idp.create_user_pool(PoolName="HostedEmailPool", UsernameAttributes=["email"])["UserPool"]["Id"]
+    client_id = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="hosted", GenerateSecret=False, AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"], AllowedOAuthFlowsUserPoolClient=True,
+        CallbackURLs=["http://localhost:3000/callback"], ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+        PreventUserExistenceErrors=prevent_user_existence_errors)["UserPoolClient"]["ClientId"]
+    return pool_id, client_id
+
+
+def _hosted_user(cognito_idp, pool_id, username, attributes, permanent=True):
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username=username, MessageAction="SUPPRESS",
+                                  TemporaryPassword="TempPass1!", UserAttributes=attributes)
+    if permanent:
+        cognito_idp.admin_set_user_password(UserPoolId=pool_id, Username=username, Password="TestPass1!", Permanent=True)
+
+
+def _hosted_forgot(client_id, username):
+    return _post_form(f"{ENDPOINT}/login", {**_hosted_oauth(client_id), "step": "forgot_password", "username": username})
+
+
+def _hosted_confirm(client_id, username, code, password, confirm=None, destination="t****@e****", medium="EMAIL"):
+    return _post_form(f"{ENDPOINT}/login", {
+        **_hosted_oauth(client_id), "step": "confirm_forgot_password", "username": username, "code": code,
+        "destination": destination, "deliveryMedium": medium, "password": password,
+        "confirmPassword": password if confirm is None else confirm}, follow_redirects=False)
+
+
+def test_hosted_ui_forgot_password(cognito_idp):
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    cid = client["ClientId"]
+    oauth = _hosted_oauth(cid)
+    try:
+        status, _h, body = _get(f"{ENDPOINT}/oauth2/authorize?{_urlencode(oauth)}")
+        assert "/forgotPassword?" in body.decode() and "Forgot your password?" in body.decode()
+        status, _h, body = _get(f"{ENDPOINT}/forgotPassword?{_urlencode(oauth)}")
+        page = body.decode()
+        assert status == 200 and "Reset my password" in page
+        assert "Enter your Username below and we will send a message to reset your password" in page
+
+        status, _h, body = _hosted_forgot(cid, "nobody")
+        assert "Could not reset password for the account, please contact support or try again" in body.decode()
+
+        status, _h, body = _hosted_forgot(cid, "testuser")
+        page = body.decode()
+        destination = _hidden(page, "destination")
+        assert destination.startswith("t*") and "@e*" in destination and _hidden(page, "deliveryMedium") == "EMAIL"
+        assert f"We have sent a password reset code by email to {destination}. Enter it below to reset your password." in page
+        assert 'type="password" id="code" name="code"' in page
+
+        status, _h, body = _hosted_confirm(cid, "testuser", "654321", "NewPass1!", "Other1!aa", destination)
+        page = body.decode()
+        assert "Password does not match the confirm password." in page
+        assert f"We have sent a password reset code by {destination} to EMAIL." in page
+        assert (_hidden(page, "destination"), _hidden(page, "deliveryMedium")) == ("EMAIL", destination)
+        for password, reason in (("Ab1!", "Password not long enough"),
+                                 ("newpassw0rd!longenough", "Password must have uppercase characters")):
+            status, _h, body = _hosted_confirm(cid, "testuser", "654321", password, destination=destination)
+            page = body.decode()
+            assert f"Password does not conform to policy: {reason}" in page
+            assert f"We have sent a password reset code by email to {destination}." in page
+        status, headers, _body = _hosted_confirm(cid, "testuser", "654321", "NewPass1!", destination=destination)
+        assert status == 302 and headers["location"].startswith("/oauth2/authorize?client_id=")
+        status, headers, _body = _hosted_sign_in(cid, "NewPass1!")
+        assert status == 302 and "code=" in headers["location"]
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_forgot_password_refuses_users_it_cannot_reset(cognito_idp):
+    tag = _uuid_mod.uuid4().hex[:8]
+    pool_id, cid = _hosted_email_pool(cognito_idp)
+    username_pool_id, username_client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    refused = "Could not reset password for the account, please contact support or try again"
+    try:
+        disabled, force, unverified = (f"{tag}-{n}@example.com" for n in ("disabled", "force", "unverified"))
+        for email in (disabled, force):
+            _hosted_user(cognito_idp, pool_id, email, [{"Name": "email", "Value": email},
+                                                        {"Name": "email_verified", "Value": "true"}],
+                         permanent=email != force)
+        _hosted_user(cognito_idp, pool_id, unverified, [{"Name": "email", "Value": unverified}])
+        cognito_idp.admin_disable_user(UserPoolId=pool_id, Username=disabled)
+        for email in (disabled, force, unverified, f"{tag}-unknown@example.com"):
+            status, _h, body = _hosted_forgot(cid, email)
+            page = body.decode()
+            assert status == 200 and refused in page
+            assert "Enter your Email below and we will send a message to reset your password" in page
+            assert _messages_to(email, "CognitoVerificationMessage") == []
+
+        _hosted_user(cognito_idp, username_pool_id, "noemail", [])
+        status, _h, body = _hosted_forgot(username_client["ClientId"], "noemail")
+        assert refused in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+        cognito_idp.delete_user_pool(UserPoolId=username_pool_id)
+
+
+def test_hosted_ui_forgot_password_hides_unknown_users_where_the_client_asks(cognito_idp):
+    tag = _uuid_mod.uuid4().hex[:8]
+    pool_id, cid = _hosted_email_pool(cognito_idp, "ENABLED")
+    known, unknown = f"m{tag}-known@example.com", f"m{tag}-unknown@example.com"
+    try:
+        _hosted_user(cognito_idp, pool_id, known, [{"Name": "email", "Value": known},
+                                                   {"Name": "email_verified", "Value": "true"}])
+        for email in (unknown, known):
+            status, _h, body = _hosted_forgot(cid, email)
+            page = body.decode()
+            destination = _hidden(page, "destination")
+            assert destination.startswith("m*") and "@e*" in destination and _hidden(page, "deliveryMedium") == "EMAIL"
+            assert f"We have sent a password reset code by email to {destination}." in page
+        assert _messages_to(unknown, "CognitoVerificationMessage") == []
+        assert len(_messages_to(known, "CognitoVerificationMessage")) == 1
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+@pytest.mark.auth_contract
+def test_hosted_ui_forgot_password_checks_the_code_under_auth(auth_enabled, cognito_idp):
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    cid = client["ClientId"]
+    invalid = "Invalid verification code provided, please try again."
+    try:
+        _hosted_user(cognito_idp, pool_id, "never-asked", [{"Name": "email", "Value": "never@example.com"},
+                                                           {"Name": "email_verified", "Value": "true"}])
+        _hosted_forgot(cid, "testuser")
+        status, _h, body = _hosted_confirm(cid, "testuser", "000000", "NewPass1!", "Other1!aa")
+        assert "Password does not match the confirm password." in body.decode()
+        status, _h, body = _hosted_confirm(cid, "testuser", "000000", "short")
+        assert (invalid if auth_enabled else "Password does not conform to policy: Password not long enough") \
+            in body.decode()
+        status, headers, body = _hosted_confirm(cid, "testuser", "000000", "NewPass1!")
+        if auth_enabled:
+            assert status == 200 and invalid in body.decode()
+            assert "We have sent a password reset code by email to " in body.decode()
+            status, headers, _body = _hosted_confirm(cid, "testuser", "654321", "NewPass1!")
+        assert status == 302 and headers["location"].startswith("/oauth2/authorize?")
+        status, headers, body = _hosted_confirm(cid, "never-asked", "654321", "NewPass1!")
+        if auth_enabled:
+            assert status == 200 and invalid in body.decode()
+        else:
+            assert status == 302
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_forgot_password_page_refuses_a_bad_request(cognito_idp):
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False)
+    oauth = _hosted_oauth(client["ClientId"])
+    try:
+        for params, error in (({"redirect_uri": "https://evil.example.net/cb"}, "redirect_mismatch"),
+                              ({"response_type": "token"}, "unauthorized_client")):
+            status, headers, body = _get(f"{ENDPOINT}/forgotPassword?{_urlencode({**oauth, **params})}")
+            assert status == 400 and headers["content-type"].startswith("text/html")
+            assert "An error was encountered with the requested page." in body.decode() and error in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def _enrol_totp_by_api(cognito_idp, client_id, username="testuser"):
+    token = cognito_idp.initiate_auth(ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+        "USERNAME": username, "PASSWORD": "TestPass1!"})["AuthenticationResult"]["AccessToken"]
+    secret = cognito_idp.associate_software_token(AccessToken=token)["SecretCode"]
+    cognito_idp.verify_software_token(AccessToken=token, UserCode=_totp_code(secret))
+    cognito_idp.set_user_mfa_preference(AccessToken=token, SoftwareTokenMfaSettings={"Enabled": True, "PreferredMfa": True})
+    return secret
+
+
+def _totp_pool(cognito_idp, mfa="OPTIONAL"):
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False, mfa_configuration="OPTIONAL")
+    cognito_idp.set_user_pool_mfa_config(UserPoolId=pool_id, MfaConfiguration=mfa,
+                                         SoftwareTokenMfaConfiguration={"Enabled": True})
+    return pool_id, client["ClientId"]
+
+
+def test_hosted_ui_asks_an_enrolled_user_for_their_totp_code(cognito_idp):
+    pool_id, cid = _totp_pool(cognito_idp)
+    try:
+        secret = _enrol_totp_by_api(cognito_idp, cid)
+        status, _h, body = _hosted_sign_in(cid)
+        page = body.decode()
+        assert status == 200 and "Please enter the code from your passcode app." in page
+        mfa_token = _hidden(page, "mfa_token")
+        for fields in ({}, {"authentication_code": ""}):
+            status, _h, body = _hosted_mfa(mfa_token, cid, **fields)
+            assert "Missing required parameter SOFTWARE_TOKEN_MFA_CODE" in body.decode()
+        status, _h, body = _hosted_mfa(mfa_token, cid, authentication_code="000000")
+        assert "The code entered is invalid, please try again." in body.decode()
+        code = _totp_code(secret)
+        status, headers, _body = _hosted_mfa(mfa_token, cid, authentication_code=code)
+        assert status == 302 and "code=" in headers["location"]
+
+        status, _h, body = _hosted_sign_in(cid)
+        status, _h, body = _hosted_mfa(_hidden(body.decode(), "mfa_token"), cid, authentication_code=code)
+        assert status == 200 and "Your software token has already been used once." in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_locks_the_totp_challenge_after_five_wrong_codes(cognito_idp):
+    pool_id, cid = _totp_pool(cognito_idp)
+    try:
+        secret = _enrol_totp_by_api(cognito_idp, cid)
+        status, _h, body = _hosted_sign_in(cid)
+        mfa_token = _hidden(body.decode(), "mfa_token")
+        locked = "Too many invalid credentials attempts. User temporarily locked. Please try again after few seconds."
+        for attempt in range(6):
+            status, _h, body = _hosted_mfa(mfa_token, cid, authentication_code="000000")
+            assert (locked if attempt == 5 else "The code entered is invalid, please try again.") in body.decode()
+        status, _h, body = _hosted_mfa(mfa_token, cid, authentication_code=_totp_code(secret))
+        assert status == 200 and locked in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_refuses_a_user_disabled_during_the_totp_challenge(cognito_idp):
+    pool_id, cid = _totp_pool(cognito_idp)
+    try:
+        secret = _enrol_totp_by_api(cognito_idp, cid)
+        status, _h, body = _hosted_sign_in(cid)
+        mfa_token = _hidden(body.decode(), "mfa_token")
+        cognito_idp.admin_disable_user(UserPoolId=pool_id, Username="testuser")
+        status, _h, body = _hosted_mfa(mfa_token, cid, authentication_code=_totp_code(secret))
+        assert status == 200 and "User is disabled." in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_mfa_session_lasts_the_clients_auth_session_validity(monkeypatch):
+    from types import SimpleNamespace
+
+    mod, call = _idp_in_process(monkeypatch, auth=False)
+    monkeypatch.setattr(mod, "_pending_hosted_mfa", {})
+    pid = call("CreateUserPool", PoolName="HostedMfaSessionPool", MfaConfiguration="OPTIONAL")["UserPool"]["Id"]
+    call("SetUserPoolMfaConfig", UserPoolId=pid, MfaConfiguration="OPTIONAL",
+         SoftwareTokenMfaConfiguration={"Enabled": True})
+    cid = call("CreateUserPoolClient", UserPoolId=pid, ClientName="hosted", AllowedOAuthFlows=["code"],
+               AllowedOAuthScopes=["openid"], AllowedOAuthFlowsUserPoolClient=True, AuthSessionValidity=4,
+               CallbackURLs=["http://localhost:3000/callback"],
+               ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    call("AdminCreateUser", UserPoolId=pid, Username="tim", MessageAction="SUPPRESS")
+    call("AdminSetUserPassword", UserPoolId=pid, Username="tim", Password="TestPass1!", Permanent=True)
+    token = call("InitiateAuth", ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                 AuthParameters={"USERNAME": "tim", "PASSWORD": "TestPass1!"})["AuthenticationResult"]["AccessToken"]
+    secret = call("AssociateSoftwareToken", AccessToken=token)["SecretCode"]
+    call("VerifySoftwareToken", AccessToken=token, UserCode=mod._totp_code(secret))
+
+    oauth = _hosted_oauth(cid)
+
+    def submit(**form):
+        return mod.handle_login_submit("POST", "/login", {}, _urlencode({**oauth, **form}).encode(), {})
+
+    now = [time.time()]
+    monkeypatch.setattr(mod, "time", SimpleNamespace(time=lambda: now[0]))
+    _status, _h, body = submit(username="tim", password="TestPass1!")
+    mfa_token = _hidden(body.decode(), "mfa_token")
+    now[0] += 239
+    _status, _h, body = submit(mfa_token=mfa_token, authentication_code="000000")
+    assert "The code entered is invalid, please try again." in body.decode()
+    now[0] += 2
+    status, headers, _body = submit(mfa_token=mfa_token, authentication_code="000000")
+    assert status == 302 and headers["Location"] == f"/oauth2/authorize?{_urlencode(oauth)}"
+    status, headers, _body = submit(mfa_token="never-issued", authentication_code="000000")
+    assert status == 302 and headers["Location"] == f"/oauth2/authorize?{_urlencode(oauth)}"
+
+
+def test_hosted_ui_sends_sms_users_the_sms_code_page(cognito_idp):
+    sms = {"SmsConfiguration": {"SnsCallerArn": "arn:aws:iam::000000000000:role/sms", "ExternalId": "x"}}
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False, mfa_configuration="OPTIONAL")
+    cid = client["ClientId"]
+    try:
+        cognito_idp.set_user_pool_mfa_config(UserPoolId=pool_id, MfaConfiguration="ON", SmsMfaConfiguration=sms,
+                                             SoftwareTokenMfaConfiguration={"Enabled": False})
+        cognito_idp.admin_update_user_attributes(UserPoolId=pool_id, Username="testuser", UserAttributes=[
+            {"Name": "phone_number", "Value": "+447700900100"}])
+        status, _h, body = _hosted_sign_in(cid)
+        page = body.decode()
+        assert status == 200 and "Enter the code that was sent by sms to +********0100." in page
+        assert "Set up authenticator app MFA" not in page
+        status, headers, _body = _hosted_mfa(_hidden(page, "mfa_token"), cid, authentication_code="123456")
+        assert status == 302 and "code=" in headers["location"]
+
+        cognito_idp.set_user_pool_mfa_config(UserPoolId=pool_id, MfaConfiguration="ON", SmsMfaConfiguration=sms,
+                                             SoftwareTokenMfaConfiguration={"Enabled": True})
+        cognito_idp.admin_set_user_mfa_preference(UserPoolId=pool_id, Username="testuser",
+                                                  SMSMfaSettings={"Enabled": True, "PreferredMfa": True})
+        status, _h, body = _hosted_sign_in(cid)
+        assert "Enter the code that was sent by sms to +********0100." in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def _enrol_on_the_hosted_page(cid, username, device_name=""):
+    import re
+    status, _h, body = _hosted_sign_in(cid, username=username)
+    page = body.decode()
+    secret = re.search(r'id="secretKey"[^>]*>([^<]+)<', page).group(1)
+    status, headers, _body = _hosted_mfa(_hidden(page, "mfa_token"), cid, userCode=_totp_code(secret),
+                                         friendlyDeviceName=device_name)
+    assert status == 302 and "code=" in headers["location"]
+
+
+def test_hosted_ui_enrols_totp_where_the_pool_requires_mfa(cognito_idp):
+    import re
+    pool_id, cid = _totp_pool(cognito_idp, mfa="ON")
+    try:
+        status, _h, body = _hosted_sign_in(cid)
+        page = body.decode()
+        visible = [t.strip() for t in re.sub(r"<(script|style)[^>]*>.*?</\1>", "", page, flags=re.S).split("<")
+                   if ">" in t and t.split(">", 1)[1].strip()]
+        texts = [t.split(">", 1)[1].strip() for t in visible]
+        secret = re.search(r'id="secretKey"[^>]*>([^<]+)<', page).group(1)
+        assert texts[texts.index("1"):] == [
+            "1", "Install an authenticator app on your mobile device.", "2",
+            "Scan this QR code with your authenticator app. Alternatively, you can manually enter a secret key in your authenticator app.",
+            "Show secret key", "Hide secret key", "Secret key", secret, "3", "Enter a code from your authenticator app",
+            "Enter a friendly device name - optional", "Sign in", "Back", "Powered by ministack"]
+        assert re.fullmatch(r"[A-Z2-7]{52}", secret)
+        mfa_token = _hidden(page, "mfa_token")
+        status, _h, body = _hosted_mfa(mfa_token, cid, userCode="000000")
+        assert "Invalid or expired code entered. Try again." in body.decode()
+        status, headers, _body = _hosted_mfa(mfa_token, cid, userCode=_totp_code(secret), friendlyDeviceName="probe-device")
+        assert status == 302 and "code=" in headers["location"]
+        user = cognito_idp.admin_get_user(UserPoolId=pool_id, Username="testuser")
+        assert not user.get("UserMFASettingList") and not user.get("PreferredMfaSetting")
+        status, _h, body = _hosted_sign_in(cid)
+        assert "Please enter the code from probe-device." in body.decode()
+
+        _hosted_user(cognito_idp, pool_id, "nameless", [])
+        _enrol_on_the_hosted_page(cid, "nameless")
+        status, _h, body = _hosted_sign_in(cid, username="nameless")
+        assert "Please enter the code from your passcode app." in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_asks_for_a_new_password_before_totp_enrolment(cognito_idp):
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False, force_change_password=True,
+                                            mfa_configuration="OPTIONAL")
+    cid = client["ClientId"]
+    try:
+        cognito_idp.set_user_pool_mfa_config(UserPoolId=pool_id, MfaConfiguration="ON",
+                                             SoftwareTokenMfaConfiguration={"Enabled": True})
+        status, _h, body = _hosted_sign_in(cid, "TempPass1!")
+        np_token = _extract_np_token(body.decode())
+        status, _h, body = _post_form(f"{ENDPOINT}/login", {"np_token": np_token, "new_password": "NewPass1!",
+                                                            "confirm_password": "NewPass1!"})
+        assert status == 200 and "Set up authenticator app MFA" in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)

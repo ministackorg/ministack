@@ -61,6 +61,8 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
+    MISSING_BOOTSTRAP_MESSAGE,
+    LambdaServiceError,
     RuntimeExitError,
     acquire_worker,
     ensure_spawned,
@@ -261,7 +263,7 @@ LAMBDA_DOCKER_FLAGS = os.environ.get("LAMBDA_DOCKER_FLAGS", "")
 # LAMBDA_STRICT=1 → AWS-fidelity mode: every invocation must run in Docker via
 # the AWS RIE image (matching fzonneveld's "docker = docker, no fallbacks"
 # rule). When set, the warm-worker / local-subprocess fallbacks are disabled
-# and missing Docker is surfaced as a clean Runtime.DockerUnavailable error
+# and missing Docker is surfaced as a ServiceException (HTTP 500)
 # instead of silently degrading to an in-process execution that diverges from
 # real AWS semantics.
 LAMBDA_STRICT = os.environ.get("LAMBDA_STRICT", "0").lower() in ("1", "true", "yes")
@@ -319,6 +321,27 @@ def _is_docker_transport_error(exc: BaseException) -> bool:
 
 _cached_docker_client = None
 _is_in_container: bool | None = None
+
+
+_own_network: str | None = None
+
+
+def _lambda_network(client) -> str:
+    """The network Lambda containers join: the configured one, else (MiniStack in a container) a user-defined
+    network MiniStack's own container is on, as RDS finds its network; empty for the default bridge."""
+    global _own_network
+    if LAMBDA_DOCKER_NETWORK:
+        return LAMBDA_DOCKER_NETWORK
+    if _own_network is None:
+        _own_network = ""
+        if _running_in_container() and client is not None:
+            try:
+                me = client.containers.get(os.environ.get("HOSTNAME", ""))
+                names = list((me.attrs.get("NetworkSettings") or {}).get("Networks") or {})
+                _own_network = next((n for n in names if n not in ("bridge", "host", "none")), "")
+            except Exception:
+                _own_network = ""
+    return _own_network
 
 
 def _running_in_container() -> bool:
@@ -3296,7 +3319,7 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
     _emit_lambda_metrics(
         name,
         duration_ms=_duration_ms,
-        error=bool(result.get("error")),
+        error=bool(result.get("error")) and not result.get("service_error"),
         throttle=bool(result.get("throttle")),
     )
 
@@ -3367,6 +3390,10 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         if retry_after:
             throttle_headers["Retry-After"] = str(retry_after)
         return 429, throttle_headers, json.dumps(body).encode()
+
+    if result.get("service_error"):
+        return error_response_json("ServiceException", (result.get("body") or {}).get("message", ""), 500,
+                                   content_type="application/json")
 
     if result.get("error"):
         # AWS distinguishes Handled (user returned error-shaped payload) from
@@ -4055,6 +4082,16 @@ def _route_async_failure(target_arn: str, func_name: str, event: dict, result: d
         logger.error("Lambda %s DLQ/OnFailure dispatch failed: %s", func_name, exc)
 
 
+def _service_error_response(message: str) -> dict:
+    """MiniStack's own machinery failed: Invoke answers 500 ServiceException, not a function error."""
+    return {
+        "service_error": True,
+        "body": {"__type": "ServiceException", "message": message},
+        "error": True,
+        "log": "",
+    }
+
+
 def _throttle_response(reason_code: str, msg: str, retry_after: int = 1) -> dict:
     """Shape a throttle result for the Invoke handler to translate into HTTP 429.
 
@@ -4256,6 +4293,7 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
     if isinstance(event, dict) and event.get("ResponseURL"):
         event = {**event, "ResponseURL": _rewrite_host_for_container(event["ResponseURL"])}
     max_attempts = int(timeout * 10) + 20
+    dialed = None
     connect_deadline = time.time() + min(timeout + 2.0, _RIE_CONNECT_RETRY_SECONDS)
     for _attempt in range(max_attempts):
         if time.time() > connect_deadline:
@@ -4268,8 +4306,9 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             # Try Docker network first (container-to-container)
             container_ip = None
-            if LAMBDA_DOCKER_NETWORK:
-                container_ip = networks.get(LAMBDA_DOCKER_NETWORK, {}).get("IPAddress", "")
+            network = _lambda_network(_get_docker_client())
+            if network:
+                container_ip = networks.get(network, {}).get("IPAddress", "")
             if not container_ip and _running_in_container():
                 # DinD: host-mapped ports aren't reachable from inside this container.
                 # Use the Lambda container's IP on any available Docker network.
@@ -4280,6 +4319,7 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
                         break
             if container_ip:
                 rie_url = f"http://{container_ip}:8080/2015-03-31/functions/function/invocations"
+                dialed = (container_ip, next((n for n, i in networks.items() if i.get("IPAddress") == container_ip), ""))
             else:
                 ports = container.ports.get("8080/tcp") or []
                 if not ports:
@@ -4326,6 +4366,11 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
             continue
     # Never became reachable
     stdout = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+    if dialed and container.status == "running":
+        # The runtime is up but MiniStack cannot reach it: say where, not what the runtime last logged.
+        return _service_error_response(
+            f"Lambda container at {dialed[0]}:8080 (network {dialed[1] or 'unknown'}) is not reachable "
+            "from MiniStack; set DOCKER_NETWORK (or LAMBDA_DOCKER_NETWORK) to a network MiniStack is on")
     return {
         "body": {"errorMessage": f"Lambda RIE failed: {stdout[:500]}", "errorType": "Runtime.ExitError"},
         "error": True, "log": stdout,
@@ -4894,8 +4939,9 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
 
     if mounts:
         run_kwargs["mounts"] = mounts
-    if LAMBDA_DOCKER_NETWORK:
-        run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+    network = _lambda_network(client)
+    if network:
+        run_kwargs["network"] = network
     else:
         # The runtime is reached on its network address when there is one; otherwise on loopback only.
         run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
@@ -5085,8 +5131,8 @@ def _execute_function_docker(func: dict, event: dict, request_id: str) -> dict:
     # permissive mode falls back to the in-process executors.
     if not _docker_available:
         if package_type == "Image" or LAMBDA_STRICT:
-            return {"body": {"errorMessage": "Docker is required to invoke Lambda functions",
-                             "errorType": "Runtime.DockerUnavailable"}, "error": True}
+            return _service_error_response(
+                "MiniStack could not run the function: Docker is required and the docker SDK is not installed")
         if runtime.startswith(("python", "nodejs")):
             logger.warning("docker SDK unavailable - falling back to warm executor")
             return _execute_function_warm(func, event, request_id)
@@ -5095,8 +5141,8 @@ def _execute_function_docker(func: dict, event: dict, request_id: str) -> dict:
 
     if _get_docker_client() is None:
         if package_type == "Image" or LAMBDA_STRICT:
-            return {"body": {"errorMessage": "Cannot connect to Docker",
-                             "errorType": "Runtime.DockerError"}, "error": True}
+            return _service_error_response(
+                "MiniStack could not run the function: cannot connect to the Docker daemon")
         logger.warning("Docker daemon unreachable – falling back")
         if runtime.startswith(("python", "nodejs")):
             return _execute_function_warm(func, event, request_id)
@@ -5107,10 +5153,8 @@ def _execute_function_docker(func: dict, event: dict, request_id: str) -> dict:
     if package_type == "Zip" and not code_zip:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
-    # Early validation of runtime → image mapping to return a clean mock
     if package_type != "Image" and _docker_image_for_runtime(runtime) is None:
-        return {"body": {"statusCode": 200,
-                         "body": f"Mock response - {runtime} not supported for docker execution"}}
+        return _service_error_response(f"MiniStack has no container image for runtime {runtime}")
 
     fn_name = config["FunctionName"]
     timeout = int(config.get("Timeout", 30 if package_type == "Image" else 3))
@@ -5137,12 +5181,9 @@ def _execute_function_docker(func: dict, event: dict, request_id: str) -> dict:
         if reason == "spawn":
             try:
                 container, tmpdir = _spawn_lambda_container(config, code_zip)
-            except ValueError as exc:
-                return {"body": {"statusCode": 200, "body": f"Mock response - {exc}"}}
             except Exception as exc:
                 logger.error("Lambda %s spawn error: %s", fn_name, exc)
-                return {"body": {"errorMessage": str(exc),
-                                 "errorType": type(exc).__name__}, "error": True, "log": ""}
+                return _service_error_response(f"MiniStack could not start the function's container: {exc}")
             entry = _pool_register(key, container, tmpdir)
             logger.info("Lambda %s: cold-start container added to pool", fn_name)
             break
@@ -5183,15 +5224,13 @@ def _execute_function_docker(func: dict, event: dict, request_id: str) -> dict:
         return result
     except Exception as exc:
         msg = str(exc).lower()
-        if "timed out" in msg or "read timed out" in msg:
-            err_body = {"errorMessage": f"Task timed out after {timeout}.00 seconds",
-                        "errorType": "Sandbox.Timedout"}
-        else:
-            err_body = {"errorMessage": str(exc), "errorType": type(exc).__name__}
         logger.error("Lambda %s invocation error: %s", fn_name, exc)
         _pool_remove(entry)
         entry = None
-        return {"body": err_body, "error": True, "log": ""}
+        if "timed out" in msg or "read timed out" in msg:
+            return {"body": {"errorMessage": f"Task timed out after {timeout}.00 seconds",
+                             "errorType": "Sandbox.Timedout"}, "error": True, "log": ""}
+        return _service_error_response(f"MiniStack could not invoke the function's container: {exc}")
     finally:
         if entry is not None:
             _pool_release(entry)
@@ -5491,6 +5530,8 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
             result = _execute_function_docker(func, event, request_id)
 
     duration_ms = int((time.time() - started) * 1000)
+    if isinstance(result, dict) and result.get("service_error"):
+        return result  # the function never ran: no platform log lines
     _emit_lambda_logs(
         func, request_id,
         result.get("log", "") if isinstance(result, dict) else "",
@@ -5666,6 +5707,8 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
         )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
+        if result.get("service_error"):
+            return _service_error_response(f"MiniStack's worker for the function failed: {result.get('error')}")
         if isinstance(result.get("payload"), dict):
             # The runtime's own error document, as AWS's runtime client posts it.
             return {"body": result["payload"], "error": True,
@@ -5692,11 +5735,9 @@ def _execute_function_warm(func: dict, event: dict, request_id: str) -> dict:
                     "error": True, "log": e.log}
         if isinstance(getattr(e, "payload", None), dict):
             return {"body": e.payload, "error": True, "log": ""}
-        return {
-            "body": {"errorMessage": str(e), "errorType": getattr(e, "error_type", "") or type(e).__name__},
-            "error": True,
-            "log": "",
-        }
+        if getattr(e, "error_type", "") and not isinstance(e, LambdaServiceError):
+            return {"body": {"errorMessage": str(e), "errorType": e.error_type}, "error": True, "log": ""}
+        return _service_error_response(f"MiniStack's worker for the function failed: {e}")
     finally:
         release_worker(worker)
 
@@ -5784,10 +5825,12 @@ def _execute_function_provided_warm(func: dict, event: dict,
         account, region = _account_region_from_function_config(config)
         invalidate_worker(func_name, qualifier=qualifier, account=account, region=region)
         worker = None  # invalidation already removed and reaped the worker
-        # A Python class name is not an AWS error type: a bootstrap that is
-        # missing or cannot be executed is `Runtime.InvalidEntrypoint`, and the
-        # environment failures AWS names Runtime.* carry their own type.
-        error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
+        # A missing or unexecutable bootstrap is `Runtime.InvalidEntrypoint`;
+        # the runtime failures AWS names carry their own type. Anything
+        # untyped is MiniStack's own machinery failing.
+        error_type = getattr(e, "error_type", "")
+        if not error_type:
+            return _service_error_response(f"MiniStack could not run the function's bootstrap: {e}")
         # Do not transparently invoke again: the handler may already have
         # performed side effects before its environment failed.
         if isinstance(e, RuntimeExitError):
@@ -5817,7 +5860,8 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
         code_dir = _provided_runtime_code_dir(code_zip)
         bootstrap_path = os.path.join(code_dir, "bootstrap")
         if not os.path.exists(bootstrap_path):
-            return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
+            return {"body": {"errorMessage": MISSING_BOOTSTRAP_MESSAGE, "errorType": "Runtime.InvalidEntrypoint"},
+                    "error": True, "log": ""}
 
         # Shared state for the Runtime API
         result_holder = {"response": None, "error": None}
@@ -5927,13 +5971,17 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
             # write elsewhere, or the child inherits the open write fd and
             # execve fails with ETXTBSY (#1051).
             with _provided_code_lock:
-                proc = subprocess.Popen(
-                    [bootstrap_path],
-                    cwd=code_dir,
-                    env=proc_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
+                try:
+                    proc = subprocess.Popen(
+                        [bootstrap_path],
+                        cwd=code_dir,
+                        env=proc_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                except OSError as exc:
+                    return {"body": {"errorMessage": f"Couldn't execute the bootstrap binary: {exc}",
+                                     "errorType": "Runtime.InvalidEntrypoint"}, "error": True, "log": ""}
 
             deadline = time.monotonic() + timeout
             while not response_received.wait(min(0.05, max(0.0, deadline - time.monotonic()))):
@@ -5970,7 +6018,7 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
 
     except Exception as e:
         logger.error("provided runtime execution error: %s", e)
-        return {"body": {"errorMessage": str(e), "errorType": type(e).__name__}, "error": True}
+        return _service_error_response(f"MiniStack could not run the function's bootstrap: {e}")
 
 
 def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
@@ -5987,12 +6035,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
 
     is_node = runtime.startswith("nodejs")
     if not runtime.startswith("python") and not is_node:
-        return {
-            "body": {
-                "statusCode": 200,
-                "body": f"Mock response - {runtime} not supported for local execution",
-            },
-        }
+        return _service_error_response(f"MiniStack cannot run runtime {runtime} without Docker")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6157,11 +6200,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
         }
     except Exception as e:
         logger.error("Lambda execution error: %s", e)
-        return {
-            "body": {"errorMessage": str(e), "errorType": type(e).__name__},
-            "error": True,
-            "log": "",
-        }
+        return _service_error_response(f"MiniStack could not run the function: {e}")
 
 
 def _resolve_layer_zip(attachment: str | dict) -> bytes | None:

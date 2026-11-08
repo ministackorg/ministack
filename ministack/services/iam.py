@@ -1054,6 +1054,12 @@ def _list_entities_for_policy(p):
 
 # -------------------- Attached role policies --------------------
 
+def _unattachable_policy_error(policy_arn: str):
+    if _is_aws_managed_arn(policy_arn) or policy_arn in _policies:
+        return None
+    return _error(404, "NoSuchEntity", f"Policy {policy_arn} does not exist or is not attachable.", ns="iam")
+
+
 def attach_managed_policy(entity: dict, policy_arn: str) -> None:
     """Attach a managed policy to a role, user or group record.
 
@@ -1098,6 +1104,8 @@ def _attach_role_policy(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     attach_managed_policy(role, policy_arn)
     return _xml(200, "AttachRolePolicyResponse", "", ns="iam")
 
@@ -1229,6 +1237,8 @@ def _attach_user_policy(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     if policy_arn not in user["AttachedPolicies"]:
         user["AttachedPolicies"].append(policy_arn)
         if _is_aws_managed_arn(policy_arn):
@@ -1897,6 +1907,8 @@ def _attach_group_policy(p):
     if not group:
         return _error(404, "NoSuchEntity",
                       f"The group with name {group_name} cannot be found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     attached = group.setdefault("AttachedPolicies", [])
     if policy_arn not in attached:
         attached.append(policy_arn)

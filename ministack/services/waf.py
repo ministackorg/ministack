@@ -607,8 +607,28 @@ def _list_resources_for_web_acl(data):
     _, err = _resolve_local_web_acl(web_acl_arn)
     if err:
         return err
-    arns = [r for r, a in _associations.items() if a == web_acl_arn]
+    # "If you don't provide a resource type, the call uses ... APPLICATION_LOAD_BALANCER" (service-2.json).
+    resource_type = data.get("ResourceType") or "APPLICATION_LOAD_BALANCER"
+    arns = [r for r, a in _associations.items()
+            if a == web_acl_arn and _associated_resource_type(r) == resource_type]
     return json_response({"ResourceArns": arns})
+
+
+def _associated_resource_type(resource_arn):
+    parts = resource_arn.split(":", 5)
+    service, resource = (parts[2], parts[5]) if len(parts) == 6 else ("", "")
+    if service == "elasticloadbalancing":
+        return "APPLICATION_LOAD_BALANCER"
+    if service == "ec2" and resource.startswith("verified-access-instance/"):
+        return "VERIFIED_ACCESS_INSTANCE"
+    return {
+        "apigateway": "API_GATEWAY",
+        "appsync": "APPSYNC",
+        "cognito-idp": "COGNITO_USER_POOL",
+        "apprunner": "APP_RUNNER_SERVICE",
+        "amplify": "AMPLIFY",
+        "bedrock-agentcore": "AGENTCORE_GATEWAY",
+    }.get(service, "")
 
 
 # ---------------------------------------------------------------------------

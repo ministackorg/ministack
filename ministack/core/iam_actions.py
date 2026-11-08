@@ -436,18 +436,50 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
     return checks
 
 
-def s3_access_point_resources(resource_arn: str) -> list[tuple[str, dict]]:
-    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias."""
+# The context key marking the checks of a PutObject through another account's access point.
+S3_FOREIGN_STEP = "ministack:s3foreignstep"
+
+
+def s3_access_point_resources(resource_arn: str, action: str = "") -> list[tuple[str, dict]]:
+    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias.
+
+    A ``s3:PutObject`` through another account's access point is checked in the order recorded on AWS
+    (us-east-2): the caller's identity policy on the bucket object, then the owner's bucket policy, then the
+    caller's identity policy on the access point object, then the access point policy (with neither resource
+    policy allowing, the bucket answers; the identity policy must allow both objects). ``S3_FOREIGN_STEP``
+    names the step of each check.
+    """
+    from ministack.core.responses import get_account_id
     from ministack.services import s3 as s3_svc
 
     alias, sep, key = resource_arn.removeprefix("arn:aws:s3:::").partition("/")
-    access_point = s3_svc.access_point_for_alias(alias) if resource_arn.startswith("arn:aws:s3:::") else None
+    foreign = action == "s3:PutObject" and bool(sep)
+    access_point = s3_svc.access_point_for_alias(alias, foreign) if resource_arn.startswith("arn:aws:s3:::") else None
     if access_point is None:
         return [(resource_arn, {})]
     access_point_arn, bucket, keys = access_point
     if sep:
-        return [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+        checks = [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+        if keys["s3:DataAccessPointAccount"] != get_account_id():
+            checks = [(checks[1][0], {**keys, S3_FOREIGN_STEP: "identity"}),
+                      (checks[1][0], {**keys, S3_FOREIGN_STEP: "bucket"}),
+                      (checks[0][0], {**keys, S3_FOREIGN_STEP: "accesspoint-identity"}),
+                      (checks[0][0], {**keys, S3_FOREIGN_STEP: "accesspoint"})]
+        return checks
     return [(access_point_arn, keys), (f"arn:aws:s3:::{bucket}", keys)]
+
+
+def s3_foreign_denial_message(keys: dict, action: str, principal_arn: str, denied, resource: str) -> str:
+    """The message of a denial in a step of a PutObject through another account's access point, or "" for
+    any other check (and for an explicit Deny of a resource policy, which has its own wording)."""
+    step = keys.get(S3_FOREIGN_STEP)
+    explicit = denied.decision == "Deny"
+    if not step or (explicit and denied.resource_policy_arn):
+        return ""
+    if explicit or step in ("identity", "accesspoint-identity"):
+        return identity_denial_message(action, principal_arn, f'"{resource}"', explicit)
+    return (f'User: {principal_arn} is not authorized to perform: {action} on resource: "{resource}" '
+            f"because no resource-based policy allows the {action} action")
 
 
 # Lambda REST path → IAM action
@@ -2083,7 +2115,7 @@ def s3_service_context(iam_action: str, query_params: dict | None, path: str = "
 
 
 def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
-    """s3:x-amz-server-side-encryption, s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
+    """s3:x-amz-server-side-encryption(-aws-kms-key-id), s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
     from ministack.services import s3 as s3_svc
 
     bucket, _, key = path.lstrip("/").partition("/")
@@ -2093,9 +2125,13 @@ def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: 
     if iam_action == "s3:PutObject":
         # A part and the completion carry no headers: the upload's own request decides.
         upload_id = _query_param(query_params, "uploadId")
-        sse = s3_svc.upload_encryption_header(upload_id) if upload_id else headers.get("x-amz-server-side-encryption")
+        sse = (s3_svc.upload_encryption_header(upload_id, bucket) if upload_id
+               else headers.get("x-amz-server-side-encryption"))
         if sse:
             context["s3:x-amz-server-side-encryption"] = sse
+        kms_key = s3_svc.kms_key_for_condition(bucket, headers, upload_id)
+        if kms_key:
+            context["s3:x-amz-server-side-encryption-aws-kms-key-id"] = kms_key
         if not upload_id:
             for name in ("x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
                          "x-amz-grant-write-acp", "x-amz-grant-full-control"):

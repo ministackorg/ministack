@@ -595,6 +595,12 @@ _pending_user_auth = {}   # token -> {pool_id, client_id, username, redirect_uri
                           #           code_challenge_method, available_challenges, expires_at}
 _USER_AUTH_SESSION_TTL = 300  # 5 minutes
 
+# Hosted UI MFA sessions after a password: a TOTP or SMS challenge, or TOTP
+# enrolment where the pool requires MFA. Plain dict for the same reason as above.
+# They last the client's AuthSessionValidity, as AWS's `cognito` cookie does.
+_pending_hosted_mfa = {}  # token -> {oauth fields, pool_id, username, kind: "verify"|"sms"|"setup",
+                          #           secret, failures, expires_at}
+
 # ---------------------------------------------------------------------------
 # In-memory state — CUSTOM_AUTH Challenge Sessions
 # ---------------------------------------------------------------------------
@@ -7438,6 +7444,7 @@ def _apply_mfa_preference(user: dict, data: dict):
             user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
     elif "Enabled" in totp_settings and not totp_settings["Enabled"]:
         enabled_mfa[:] = [m for m in enabled_mfa if m != "SOFTWARE_TOKEN_MFA"]
+        user.pop("_totp_hosted", None)
         if user.get("_preferred_mfa") == "SOFTWARE_TOKEN_MFA":
             user["_preferred_mfa"] = ""
 
@@ -7495,8 +7502,11 @@ _totp_session_secrets: dict[str, str] = {}
 
 def _totp_code(secret_b32: str, step_offset: int = 0) -> str:
     """RFC 6238: HMAC-SHA1, 30-second step, 6 digits."""
+    return _totp_code_at(secret_b32, int(time.time() // 30) + step_offset)
+
+
+def _totp_code_at(secret_b32: str, counter: int) -> str:
     key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
-    counter = int(time.time() // 30) + step_offset
     mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
     offset = mac[-1] & 0x0F
     return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
@@ -7553,6 +7563,7 @@ def _verify_software_token(data):
     if user is not None:
         user["_totp_secret"] = secret
         user.pop("_totp_pending_secret", None)
+        user.pop("_totp_device_name", None)
         user.setdefault("_mfa_enabled", [])
         if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
             user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
@@ -7712,7 +7723,8 @@ def _login_page_html(client_id, redirect_uri, scope, state, response_type,
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button>
-</form>"""
+</form>
+{_forgot_password_link(client_id, redirect_uri, scope, state, response_type, code_challenge, code_challenge_method, nonce)}"""
     return _page_shell("Sign in", "Sign in", body)
 
 
@@ -7790,14 +7802,138 @@ def _password_page_html(ua_token, username, error_message=""):
     err_block = ""
     if error_message:
         err_block = f'<div class="error">{esc(error_message)}</div>'
+    session = _pending_user_auth.get(ua_token) or {}
+    link = _forgot_password_link(*(session.get(k, "") for k in _HOSTED_OAUTH_FIELDS)) if session else ""
     body = f"""{err_block}
 <form method="POST" action="/login">
 <input type="hidden" name="ua_token" value="{esc(ua_token)}">
 <label for="password">Password for {esc(username)}</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required autofocus>
 <button type="submit">Sign in</button>
+</form>
+{link}"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+_HOSTED_OAUTH_FIELDS = ("client_id", "redirect_uri", "scope", "state", "response_type",
+                        "code_challenge", "code_challenge_method", "nonce")
+
+
+def _forgot_password_link(*oauth_values):
+    query = urlencode(dict(zip(_HOSTED_OAUTH_FIELDS, oauth_values)))
+    return f'<p style="text-align:center;font-size:14px"><a href="/forgotPassword?{html_mod.escape(query)}">Forgot your password?</a></p>'
+
+
+def _oauth_hidden_fields(oauth):
+    esc = html_mod.escape
+    return "\n".join(f'<input type="hidden" name="{k}" value="{esc(oauth.get(k, ""))}">' for k in _HOSTED_OAUTH_FIELDS)
+
+
+def _sign_in_url(oauth):
+    """ministack's sign-in page for the same OAuth request, where AWS's hosted UI has /login."""
+    return "/oauth2/authorize?" + urlencode({k: oauth[k] for k in _HOSTED_OAUTH_FIELDS if oauth.get(k)})
+
+
+def _sign_in_again(oauth):
+    return 302, {"Location": _sign_in_url(oauth), "Cache-Control": "no-store"}, b""
+
+
+def _html_page(html_body, status=200):
+    return status, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+
+def _hosted_error_page(error):
+    body = f"""<p style="text-align:center;font-size:14px;margin-bottom:16px">An error was encountered with the requested page.</p>
+<div class="error">{html_mod.escape(error)}</div>"""
+    return _html_page(_page_shell("Sign in", "Sign in", body), 400)
+
+
+def _forgot_password_page_html(oauth, by_email, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    what = "Email" if by_email else "Username"
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="step" value="forgot_password">
+{_oauth_hidden_fields(oauth)}
+<label for="username">Enter your {what} below and we will send a message to reset your password</label>
+<input type="text" id="username" name="username" autocomplete="username" required autofocus>
+<button type="submit">Reset my password</button>
+</form>"""
+    return _page_shell("Forgot your password?", "Forgot your password?", body)
+
+
+def _confirm_forgot_password_page_html(oauth, username, destination, delivery_medium, error_message=""):
+    """The code-and-new-password page, whose sentence AWS builds from its hidden
+    destination and deliveryMedium fields; after a password mismatch AWS hands
+    those two back swapped, so the sentence reads "...by m***@e*** to EMAIL"."""
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    medium = "email" if delivery_medium == "EMAIL" else delivery_medium
+    sent = f"We have sent a password reset code by {medium} to {destination}. Enter it below to reset your password."
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="step" value="confirm_forgot_password">
+<input type="hidden" name="username" value="{esc(username)}">
+<input type="hidden" name="destination" value="{esc(destination)}">
+<input type="hidden" name="deliveryMedium" value="{esc(delivery_medium)}">
+{_oauth_hidden_fields(oauth)}
+<p style="font-size:14px;margin-bottom:16px">{esc(sent)}</p>
+<label for="code">Code</label>
+<input type="password" id="code" name="code" autocomplete="one-time-code" required autofocus>
+<label for="password">New Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+<label for="confirmPassword">Enter New Password Again</label>
+<input type="password" id="confirmPassword" name="confirmPassword" autocomplete="new-password" required>
+<button type="submit">Change Password</button>
+</form>"""
+    return _page_shell("Reset your password", "Reset your password", body)
+
+
+def _masked_phone(phone):
+    return "+" + "*" * max(len(phone) - 5, 0) + phone[-4:]
+
+
+def _mfa_page_html(mfa_token, session, prompt, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    body = f"""<form method="POST" action="/login">
+<input type="hidden" name="mfa_token" value="{esc(mfa_token)}">
+{_oauth_hidden_fields(session)}
+<label for="authentication_code">{esc(prompt)}</label>
+{err_block}
+<input type="text" id="authentication_code" name="authentication_code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<button type="submit">Sign in</button>
 </form>"""
     return _page_shell("Sign in", "Sign in", body)
+
+
+def _mfa_setup_page_html(mfa_token, session, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="mfa_token" value="{esc(mfa_token)}">
+{_oauth_hidden_fields(session)}
+<p style="font-size:14px;margin-bottom:4px">1</p>
+<p style="font-size:14px;margin-bottom:12px">Install an authenticator app on your mobile device.</p>
+<p style="font-size:14px;margin-bottom:4px">2</p>
+<p style="font-size:14px;margin-bottom:8px">Scan this QR code with your authenticator app. Alternatively, you can manually enter a secret key in your authenticator app.</p>
+<p style="font-size:14px;margin-bottom:12px"><a id="showSecretKey" href="#" onclick="document.getElementById('secretKeySection').hidden=false;this.hidden=true;document.getElementById('hideSecretKey').hidden=false;return false">Show secret key</a>
+<a id="hideSecretKey" href="#" hidden onclick="document.getElementById('secretKeySection').hidden=true;this.hidden=true;document.getElementById('showSecretKey').hidden=false;return false">Hide secret key</a></p>
+<div id="secretKeySection" hidden>
+<p style="font-size:14px;margin-bottom:4px">Secret key</p>
+<p id="secretKey" style="font-family:monospace;word-break:break-all;margin-bottom:16px">{esc(session["secret"])}</p>
+</div>
+<p style="font-size:14px;margin-bottom:4px">3</p>
+<label for="userCode">Enter a code from your authenticator app</label>
+<input type="text" id="userCode" name="userCode" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<label for="friendlyDeviceName">Enter a friendly device name - optional</label>
+<input type="text" id="friendlyDeviceName" name="friendlyDeviceName">
+<button type="submit">Sign in</button>
+</form>
+<p style="text-align:center;font-size:14px"><a href="{esc(_sign_in_url(session))}">Back</a></p>"""
+    return _page_shell("Set up authenticator app MFA", "Set up authenticator app MFA", body)
 
 
 def _email_otp_page_html(ua_token, error_message=""):
@@ -8364,6 +8500,207 @@ def _oauth2_idp_response(method, body, query_params):
 
 # -- /login (POST) ----------------------------------------------------------
 
+def _hosted_mfa_kind(pool, user):
+    """The page a hosted UI sign-in shows after the password: "verify" (TOTP),
+    "sms", "setup" (TOTP enrolment, only where the pool requires MFA and allows
+    TOTP), or None for the authorization code."""
+    mfa = pool.get("MfaConfiguration", "OFF")
+    if mfa == "OFF":
+        return None
+    enabled = user.get("_mfa_enabled") or []
+    totp = bool(user.get("_totp_secret")) and ("SOFTWARE_TOKEN_MFA" in enabled or user.get("_totp_hosted"))
+    sms = "SMS_MFA" in enabled
+    if totp and sms:
+        return "sms" if user.get("_preferred_mfa") == "SMS_MFA" else "verify"
+    if totp:
+        return "verify"
+    if sms:
+        return "sms"
+    if mfa != "ON":
+        return None
+    if (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
+        return "setup"
+    if _attr_list_to_dict(user.get("Attributes", [])).get("phone_number"):
+        return "sms"
+    return None
+
+
+def _hosted_mfa_prompt(session, user):
+    if session["kind"] == "sms":
+        phone = _attr_list_to_dict(user.get("Attributes", [])).get("phone_number", "")
+        return f"Enter the code that was sent by sms to {_masked_phone(phone)}."
+    return f"Please enter the code from {user.get('_totp_device_name') or 'your passcode app'}."
+
+
+def _finish_password_sign_in(pool, pool_id, user, oauth):
+    """After a hosted UI password: the MFA challenge or enrolment page, or the authorization code."""
+    kind = _hosted_mfa_kind(pool, user)
+    if kind:
+        now = time.time()
+        for stale in [t for t, s in _pending_hosted_mfa.items() if s["expires_at"] < now]:
+            _pending_hosted_mfa.pop(stale, None)
+        client = (pool.get("_clients") or {}).get(oauth.get("client_id"), {})
+        token = secrets.token_urlsafe(24)
+        session = _pending_hosted_mfa[token] = {
+            **{k: oauth.get(k, "") for k in _HOSTED_OAUTH_FIELDS}, "pool_id": pool_id,
+            "username": user["Username"], "kind": kind, "failures": 0,
+            "secret": base64.b32encode(secrets.token_bytes(32)).decode().rstrip("=") if kind == "setup" else None,
+            "expires_at": now + client.get("AuthSessionValidity", 3) * 60,
+        }
+        if kind == "setup":
+            return _html_page(_mfa_setup_page_html(token, session))
+        return _html_page(_mfa_page_html(token, session, _hosted_mfa_prompt(session, user)))
+    return _issue_auth_code_redirect(
+        oauth["client_id"], pool_id, oauth["redirect_uri"], oauth["scope"], user["Username"],
+        oauth.get("nonce", ""), oauth.get("code_challenge", ""), oauth.get("code_challenge_method", ""),
+        oauth.get("state", ""))
+
+
+def _totp_matching_step(secret_b32, user_code):
+    """The 30-second step whose code `user_code` is, within the drift `_totp_matches` allows, or None."""
+    if not secret_b32 or not isinstance(user_code, str):
+        return None
+    now_step = int(time.time() // 30)
+    try:
+        return next((step for step in (now_step - 1, now_step, now_step + 1)
+                     if hmac.compare_digest(_totp_code_at(secret_b32, step), user_code)), None)
+    except Exception:
+        return None
+
+
+_HOSTED_MFA_LOCKOUT_AFTER = 5
+
+
+def _handle_hosted_mfa_submit(mfa_token, form):
+    """The MFA challenge or enrolment page's submission. TOTP codes are checked
+    for real, as for the API; an SMS code is accepted as the API's SMS_MFA
+    challenge accepts it."""
+    session = _pending_hosted_mfa.get(mfa_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_hosted_mfa.pop(mfa_token, None)
+        oauth = session or _extract_oauth_form_params(form)
+        if oauth.get("client_id"):
+            return _sign_in_again(oauth)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+    pool = _get_pool_unscoped(session["pool_id"])
+    user = _resolve_user(pool, session["username"])[0] if pool else None
+    if not user:
+        _pending_hosted_mfa.pop(mfa_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+    kind = session["kind"]
+
+    def again(message):
+        if kind == "setup":
+            return _html_page(_mfa_setup_page_html(mfa_token, session, message))
+        return _html_page(_mfa_page_html(mfa_token, session, _hosted_mfa_prompt(session, user), message))
+
+    status_error = _hosted_ui_user_status_error(user)
+    if status_error:
+        return again(status_error)
+    if kind == "setup":
+        if not _totp_matches(session["secret"], form.get("userCode", "").strip()):
+            return again("Invalid or expired code entered. Try again.")
+        user["_totp_secret"] = session["secret"]
+        user["_totp_hosted"] = True
+        user.pop("_totp_pending_secret", None)
+        device_name = form.get("friendlyDeviceName", "").strip()
+        if device_name:
+            user["_totp_device_name"] = device_name
+        else:
+            user.pop("_totp_device_name", None)
+    elif kind == "verify":
+        code = form.get("authentication_code", "").strip()
+        if not code:
+            return again("Missing required parameter SOFTWARE_TOKEN_MFA_CODE")
+        if session["failures"] >= _HOSTED_MFA_LOCKOUT_AFTER:
+            return again("Too many invalid credentials attempts. User temporarily locked. "
+                         "Please try again after few seconds.")
+        step = _totp_matching_step(user.get("_totp_secret"), code)
+        if step is None:
+            session["failures"] += 1
+            return again("The code entered is invalid, please try again.")
+        if step == user.get("_totp_used_step"):
+            return again("Your software token has already been used once.")
+        user["_totp_used_step"] = step
+    del _pending_hosted_mfa[mfa_token]
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"], user["Username"],
+        session["nonce"], session["code_challenge"], session["code_challenge_method"], session["state"])
+
+
+def handle_forgot_password_page(method, path, headers, query_params):
+    """GET /forgotPassword — the page the sign-in page's "Forgot your password?"
+    link opens. AWS sends a bad request to /error with a 302; it is rendered here."""
+    oauth = {k: _qp(query_params, k) for k in _HOSTED_OAUTH_FIELDS}
+    _pool_id, pool, client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    if oauth["redirect_uri"] not in (client.get("CallbackURLs") or []):
+        return _hosted_error_page("redirect_mismatch")
+    if oauth["response_type"] != "code":
+        return _hosted_error_page("unauthorized_client")
+    return _html_page(_forgot_password_page_html(oauth, "email" in (pool.get("UsernameAttributes") or [])))
+
+
+def _hosted_reset_refused(user):
+    """Whether the hosted UI refuses to send this user a reset code, as it does an unknown one."""
+    if user is None or not user.get("Enabled", True) or user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        return True
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    return not attrs.get("email") or str(attrs.get("email_verified", "")).lower() != "true"
+
+
+def _handle_forgot_password_submit(form):
+    oauth = _extract_oauth_form_params(form)
+    _pool_id, pool, _client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    username = form.get("username", "")
+    if _hosted_reset_refused(_resolve_user(pool, username)[0]):
+        if not _hides_user_existence(pool, oauth["client_id"]):
+            return _html_page(_forgot_password_page_html(
+                oauth, "email" in (pool.get("UsernameAttributes") or []),
+                "Could not reset password for the account, please contact support or try again"))
+        destination = _masked_destination(username)
+    else:
+        _status, _, body = _forgot_password({"ClientId": oauth["client_id"], "Username": username})
+        destination = json.loads(body)["CodeDeliveryDetails"]["Destination"]
+    return _html_page(_confirm_forgot_password_page_html(oauth, username, destination, "EMAIL"))
+
+
+def _handle_confirm_forgot_password_submit(form):
+    """The confirm page's submission, refused in AWS's order: a password
+    mismatch, then the code (checked under AUTH=true only, as for the API),
+    then the password policy."""
+    oauth = _extract_oauth_form_params(form)
+    _pool_id, pool, _client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    username, password, code = form.get("username", ""), form.get("password", ""), form.get("code", "").strip()
+    destination, medium = form.get("destination", ""), form.get("deliveryMedium", "")
+
+    def again(message, destination=destination, medium=medium):
+        return _html_page(_confirm_forgot_password_page_html(oauth, username, destination, medium, message))
+
+    if password != form.get("confirmPassword", ""):
+        return again("Password does not match the confirm password.", destination=medium, medium=destination)
+    invalid_code = "Invalid verification code provided, please try again."
+    from ministack.app import AUTH
+    if AUTH:
+        user = _resolve_user(pool, username)[0]
+        if user is None or _code_error(user.get("_reset_code"), code):
+            return again(invalid_code)
+    policy = _password_policy_errors(pool, password)
+    if policy:
+        reason = "Password not long enough" if policy[0].startswith("Password must have length") else policy[0]
+        return again(f"Password does not conform to policy: {reason}")
+    status, _, _body = _confirm_forgot_password(
+        {"ClientId": oauth["client_id"], "Username": username, "ConfirmationCode": code, "Password": password})
+    if status >= 400:
+        return again(invalid_code)
+    return _sign_in_again(oauth)
+
+
 def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
                                code_challenge, code_challenge_method, state):
     """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
@@ -8477,6 +8814,13 @@ def handle_login_submit(method, path, headers, body, query_params):
     if np_token:
         return _handle_new_password_submit(np_token, form)
 
+    if form.get("mfa_token"):
+        return _handle_hosted_mfa_submit(form["mfa_token"], form)
+    if form.get("step") == "forgot_password":
+        return _handle_forgot_password_submit(form)
+    if form.get("step") == "confirm_forgot_password":
+        return _handle_confirm_forgot_password_submit(form)
+
     ua_token = form.get("ua_token", "")
     if ua_token:
         return _handle_user_auth_submit(ua_token, form)
@@ -8518,10 +8862,7 @@ def handle_login_submit(method, path, headers, body, query_params):
         html_body = _new_password_page_html(np_token)
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
-    return _issue_auth_code_redirect(
-        client_id, pool_id, redirect_uri, scope, user["Username"], nonce,
-        code_challenge, code_challenge_method, state,
-    )
+    return _finish_password_sign_in(pool, pool_id, user, oauth)
 
 
 _EMAIL_OTP_CODE = "123456"
@@ -8641,6 +8982,8 @@ def _handle_user_auth_submit(ua_token, form):
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
     _pending_user_auth.pop(ua_token, None)
+    if session.get("challenge") == "PASSWORD":
+        return _finish_password_sign_in(pool, session["pool_id"], user, session)
     return _issue_auth_code_redirect(
         session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
         user["Username"], session["nonce"], session["code_challenge"],
@@ -8688,11 +9031,7 @@ def _handle_new_password_submit(np_token, form):
 
     del _pending_new_password[np_token]
 
-    return _issue_auth_code_redirect(
-        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
-        user["Username"], session["nonce"], session["code_challenge"],
-        session["code_challenge_method"], session["state"],
-    )
+    return _finish_password_sign_in(pool, session["pool_id"], user, session)
 
 
 # -- /oauth2/token (POST) ---------------------------------------------------
@@ -9749,4 +10088,5 @@ def reset():
     _refresh_token_families.clear()
     _challenge_sessions.clear()
     _pending_new_password.clear()
+    _pending_hosted_mfa.clear()
     _pending_user_auth.clear()

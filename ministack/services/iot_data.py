@@ -234,7 +234,7 @@ async def _publish(topic: str, body: bytes, qp: dict, headers: dict, access_key:
         return error_response_json(
             "InternalFailureException",
             "IoT broker is not available",
-            503,
+            500,
         )
 
     try:
@@ -251,7 +251,7 @@ async def _publish(topic: str, body: bytes, qp: dict, headers: dict, access_key:
     except Exception as e:
         logger.exception("iot-data publish failed")
         return error_response_json(
-            "InternalFailureException", f"Publish failed: {e}", 503,
+            "InternalFailureException", f"Publish failed: {e}", 500,
         )
     # AWS returns 200 with empty body for Publish.
     return 200, {"Content-Type": "application/json"}, b""
