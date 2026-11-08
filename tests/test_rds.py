@@ -5292,6 +5292,66 @@ def test_rds_reboot_preserves_mysql_data_and_breaks_sessions(monkeypatch, reboot
         container.remove(force=True, v=True)
 
 
+@pytest.mark.data_plane
+def test_rds_reboot_on_default_bridge_ends_sessions_without_restart(monkeypatch, reboot_instance):
+    """A restart on the default bridge can move the endpoint; AWS keeps it, so sessions end in place."""
+    import docker
+    import pymysql
+
+    client = docker.from_env()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    container = client.containers.run(
+        "mysql:8.0", detach=True, ports={"3306/tcp": ("127.0.0.1", port)},
+        environment={"MYSQL_ROOT_PASSWORD": "test", "MYSQL_ROOT_HOST": "%"},
+    )
+    connection = None
+    try:
+        container.reload()
+        port = int(container.attrs["NetworkSettings"]["Ports"]["3306/tcp"][0]["HostPort"])
+        reboot_instance["_HostPort"] = port
+        reboot_instance["_docker_container_id"] = container.id
+
+        def connect():
+            return pymysql.connect(host="127.0.0.1", port=port, user="root", password="test", connect_timeout=2,
+                                   read_timeout=2, autocommit=True)
+
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            try:
+                connection = connect()
+                break
+            except pymysql.Error:
+                time.sleep(0.5)
+        assert connection is not None
+        with connection.cursor() as cursor:
+            cursor.execute("CREATE DATABASE reboot_test")
+            cursor.execute("CREATE TABLE reboot_test.evidence (value INT)")
+            cursor.execute("INSERT INTO reboot_test.evidence VALUES (42)")
+        monkeypatch.setattr(_imm_rds, "_get_docker", lambda: client)
+        monkeypatch.setattr(_imm_rds, "_get_ministack_network", lambda client: "bridge")
+        started = container.attrs["State"]["StartedAt"]
+        response = _imm_rds._reboot_db_instance({"DBInstanceIdentifier": "reboot-test"})
+        assert response["DBInstanceStatus"] == "rebooting"
+        deadline = time.monotonic() + 90
+        while reboot_instance["DBInstanceStatus"] == "rebooting" and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert reboot_instance["DBInstanceStatus"] == "available"
+        with pytest.raises(pymysql.Error):
+            connection.ping(reconnect=False)
+        with connect() as recovered:
+            with recovered.cursor() as cursor:
+                cursor.execute("SELECT value FROM reboot_test.evidence")
+                assert cursor.fetchone() == (42,)
+        container.reload()
+        assert container.attrs["State"]["StartedAt"] == started
+    finally:
+        if connection:
+            connection.close()
+        container.remove(force=True, v=True)
+
+
 def test_rds_reboot_failed_restart_does_not_report_available(monkeypatch, reboot_instance):
     def fail():
         raise RuntimeError("Docker unavailable")
@@ -5317,6 +5377,101 @@ def test_rds_reboot_does_not_resurrect_a_replaced_instance(monkeypatch, reboot_i
     _imm_rds._finish_instance_reboot(reboot_instance, None)
     assert _imm_rds._instances["reboot-test"] is replacement
     assert reboot_instance["DBInstanceStatus"] == "rebooting"
+
+
+def test_rds_reboot_authenticates_cluster_member_with_rotated_password(monkeypatch, reboot_instance):
+    """A member keeps its attach-time password copy; ModifyDBCluster rotates only the cluster's."""
+    cluster = {"DBClusterIdentifier": "reboot-cluster", "MasterUsername": "admin", "_MasterUserPassword": "rotated"}
+    reboot_instance.update({"_shared_cluster_id": "reboot-cluster", "_MasterUserPassword": "stale"})
+    seen = []
+
+    def ready(host, port, engine, user, password, db_name, alive):
+        seen.append((user, password))
+        return True
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None, reload=lambda: None, status="running")
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    monkeypatch.setattr(_imm_rds, "_end_mysql_global_instance_mutation", lambda cluster: None)
+    monkeypatch.setattr(_imm_rds, "_apply_deferred_global_writer_alias", lambda cluster: None)
+
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert seen == [("admin", "rotated")]
+    assert reboot_instance["DBInstanceStatus"] == "available"
+
+    # A rotation parked while compute was down has not reached the database yet.
+    cluster["_pending_master_password_rotation"] = {"old_password": "previous"}
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert seen[-1] == ("admin", "previous")
+
+
+def test_rds_reboot_keeps_cluster_status_when_another_cluster_loses_a_member(monkeypatch, reboot_instance):
+    """Deleting another cluster's instance mid-reboot must not leave this cluster ``creating``."""
+    cluster = {"DBClusterIdentifier": "reboot-cluster", "Status": "available", "MasterUsername": "admin",
+               "DBClusterMembers": [{"DBInstanceIdentifier": reboot_instance["DBInstanceIdentifier"]}]}
+    other = {"DBClusterIdentifier": "other-cluster", "Status": "available",
+             "DBClusterMembers": [{"DBInstanceIdentifier": "other-instance"}]}
+    monkeypatch.setitem(_imm_rds._clusters, "reboot-cluster", cluster)
+    monkeypatch.setitem(_imm_rds._clusters, "other-cluster", other)
+    reboot_instance["_shared_cluster_id"] = "reboot-cluster"
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None, reload=lambda: None, status="running")
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_end_mysql_global_instance_mutation", lambda cluster: None)
+    monkeypatch.setattr(_imm_rds, "_apply_deferred_global_writer_alias", lambda cluster: None)
+
+    def ready(host, port, engine, user, password, db_name, alive):
+        _imm_rds._unregister_instance_from_clusters("other-instance")
+        assert cluster["Status"] == "available"
+        cluster["Status"] = "creating"  # any other refresh while the member is rebooting
+        return True
+
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert reboot_instance["DBInstanceStatus"] == "available"
+    assert cluster["Status"] == "available"
+    assert other["DBClusterMembers"] == []
+
+
+def test_rds_reboot_follows_container_to_its_new_address(monkeypatch, reboot_instance):
+    """Docker may give a restarted container a new IP; readiness and endpoints must follow it."""
+    cluster = {"DBClusterIdentifier": "reboot-cluster", "MasterUsername": "admin", "_MasterUserPassword": "pw",
+               "_shared_internal_address": "10.0.0.7", "_shared_internal_port": 3306,
+               "_shared_endpoint": {"Address": "10.0.0.7", "Port": 3306}}
+    reboot_instance.update({"_shared_cluster_id": "reboot-cluster", "_internal_address": "10.0.0.7",
+                            "_internal_port": 3306, "Endpoint": {"Address": "10.0.0.7", "Port": 3306}})
+    sibling = {"DBInstanceIdentifier": "reboot-sibling", "_internal_address": "10.0.0.7",
+               "Endpoint": {"Address": "10.0.0.7", "Port": 3306}}
+    monkeypatch.setitem(_imm_rds._instances, "reboot-sibling", sibling)
+    monkeypatch.setattr(_imm_rds, "_ministack_network", "ms-net")
+    seen = []
+
+    def ready(host, port, engine, user, password, db_name, alive):
+        seen.append((host, port))
+        return True
+
+    container = types.SimpleNamespace(stop=lambda **kw: None, start=lambda: None, reload=lambda: None, status="running",
+                                      attrs={"NetworkSettings": {"Networks": {"ms-net": {"IPAddress": "10.0.0.4"}}}})
+    monkeypatch.setattr(_imm_rds, "_get_docker",
+                        lambda: types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda ident: container)))
+    monkeypatch.setattr(_imm_rds, "_wait_for_database_ready", ready)
+    monkeypatch.setattr(_imm_rds, "_end_mysql_global_instance_mutation", lambda cluster: None)
+    monkeypatch.setattr(_imm_rds, "_apply_deferred_global_writer_alias", lambda cluster: None)
+
+    reboot_instance["DBInstanceStatus"] = "rebooting"
+    _imm_rds._finish_instance_reboot(reboot_instance, cluster)
+    assert seen == [("10.0.0.4", 3306)]
+    assert reboot_instance["DBInstanceStatus"] == "available"
+    assert reboot_instance["Endpoint"]["Address"] == "10.0.0.4"
+    assert sibling["_internal_address"] == "10.0.0.4" and sibling["Endpoint"]["Address"] == "10.0.0.4"
+    assert cluster["_shared_internal_address"] == "10.0.0.4"
+    assert cluster["_shared_endpoint"]["Address"] == "10.0.0.4"
+    assert cluster["Endpoint"] == "10.0.0.4"
 
 
 @pytest.fixture
