@@ -1392,3 +1392,38 @@ def test_ses_v2_send_raw_email_relays_message_bytes_unchanged(ses_v2, monkeypatc
     assert recipients == ["to@example.com", "cc@example.com"]
     expected = raw.replace("Message-ID: <client@x>\r\n", "")
     assert relayed == f"Message-ID: <{body['MessageId']}>\r\n" + expected
+
+
+def test_put_email_identity_configuration_set_attributes_sets_and_clears_the_default(sesv2):
+    """Captured on AWS (us-west-2, 2026-11-08): a set name makes it the identity's default, a call
+    without one clears it, and GetEmailIdentity shows each; an unknown identity or set is a 404."""
+    suffix = uuid.uuid4().hex[:8]
+    identity, config_set = f"default-{suffix}.example.com", f"default-{suffix}"
+    sesv2.create_email_identity(EmailIdentity=identity)
+    sesv2.create_configuration_set(ConfigurationSetName=config_set)
+    try:
+        sesv2.put_email_identity_configuration_set_attributes(
+            EmailIdentity=identity, ConfigurationSetName=config_set)
+        assert sesv2.get_email_identity(EmailIdentity=identity)["ConfigurationSetName"] == config_set
+
+        sesv2.put_email_identity_configuration_set_attributes(EmailIdentity=identity)
+        assert "ConfigurationSetName" not in sesv2.get_email_identity(EmailIdentity=identity)
+
+        missing_set = f"missing-{suffix}"
+        with pytest.raises(ClientError) as exc:
+            sesv2.put_email_identity_configuration_set_attributes(
+                EmailIdentity=identity, ConfigurationSetName=missing_set)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+        assert exc.value.response["Error"]["Message"] == f"Configuration set <{missing_set}> does not exist."
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+        missing_identity = f"missing-{suffix}.example.com"
+        with pytest.raises(ClientError) as exc:
+            sesv2.put_email_identity_configuration_set_attributes(
+                EmailIdentity=missing_identity, ConfigurationSetName=config_set)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+        assert exc.value.response["Error"]["Message"] == f"Identity <{missing_identity}> does not exist."
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    finally:
+        sesv2.delete_email_identity(EmailIdentity=identity)
+        sesv2.delete_configuration_set(ConfigurationSetName=config_set)

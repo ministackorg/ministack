@@ -1177,6 +1177,22 @@ async def handle_request(method, path, headers, body, query_params):
             out["NextToken"] = next_token
         return json_response(out)
 
+    # PUT /v2/email/identities/{identity}/configuration-set  (PutEmailIdentityConfigurationSetAttributes)
+    m = re.match(r"^/identities/(.+)/configuration-set$", sub)
+    if m and method == "PUT":
+        identity = m.group(1)
+        rec = _identities.get(identity)
+        if rec is None:
+            return _json_err("NotFoundException", f"Identity <{identity}> does not exist.", 404)
+        name = data.get("ConfigurationSetName")
+        if not name:
+            rec.pop("ConfigurationSetName", None)
+        elif name not in _config_sets:
+            return _missing_config_set(name)
+        else:
+            rec["ConfigurationSetName"] = name
+        return json_response({})
+
     # GET /v2/email/identities/{identity}
     m = re.match(r"^/identities/(.+)$", sub)
     if m:
