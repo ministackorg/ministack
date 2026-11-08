@@ -10097,16 +10097,27 @@ def _mrap_describe(token_arn: str) -> tuple:
 
 
 def _mrap_list(query_params: dict) -> tuple:
-    records = sorted(_mraps.values(), key=lambda r: (r["CreatedAt"], r["Name"]))
-    start = int(_qp(query_params, "nextToken", "0") or "0")
+    # The token names the last access point returned, not a position, so a create or delete between pages skips
+    # nothing.
+    records = sorted(_mraps.values(), key=lambda r: (str(r["CreatedAt"]), r["Name"]))
+    token = _qp(query_params, "nextToken", "")
+    if token:
+        try:
+            after = tuple(json.loads(base64.urlsafe_b64decode(token.encode())))
+        except (ValueError, TypeError):
+            after = None
+        if after is not None:
+            records = [r for r in records if (str(r["CreatedAt"]), r["Name"]) > after]
     max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
-    page = records[start:start + max_results]
+    page = records[:max_results]
     out = Element("ListMultiRegionAccessPointsResult", xmlns=S3CONTROL_NS)
     aps = SubElement(out, "AccessPoints")
     for record in page:
         _mrap_report_xml(aps, record)
-    if start + max_results < len(records):
-        SubElement(out, "NextToken").text = str(start + max_results)
+    if page and len(records) > max_results:
+        last = page[-1]
+        SubElement(out, "NextToken").text = base64.urlsafe_b64encode(
+            json.dumps([str(last["CreatedAt"]), last["Name"]]).encode()).decode()
     return _s3control_response(out)
 
 

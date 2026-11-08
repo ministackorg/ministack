@@ -38,7 +38,6 @@ from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.query_protocol import query_value as _query_value
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -48,6 +47,7 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
+from ministack.core.responses import query_value as _query_value
 
 logger = logging.getLogger("alb")
 

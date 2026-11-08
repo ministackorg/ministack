@@ -26,16 +26,19 @@ import time
 from decimal import Decimal
 from xml.sax.saxutils import escape
 
-from ministack.core.query_protocol import DECIMAL, INTEGER, member_index, member_numbering_error
-from ministack.core.query_protocol import query_value as _query_value
 from ministack.core.responses import (
+    DECIMAL,
+    INTEGER,
     AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
     get_region,
+    member_index,
+    member_numbering_error,
     new_uuid,
     now_iso,
 )
+from ministack.core.responses import query_value as _query_value
 
 logger = logging.getLogger("autoscaling")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")

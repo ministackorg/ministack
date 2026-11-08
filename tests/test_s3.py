@@ -13705,3 +13705,29 @@ def test_s3_storage_class_and_request_tag_condition_contract(auth_enabled, iam_u
     _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
         Bucket=bucket, Key="dev", Body=b"x", Tagging="env=dev"))
 
+
+
+def test_s3_mrap_list_skips_nothing_when_one_is_deleted_between_pages(s3control_dns, mrap_members):
+    """The page token marks the last access point returned, so deleting one mid-listing skips no other."""
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    names = [_mrap_name() for _ in range(3)]
+    for name in names:
+        assert _mrap_create(ctl, name, [use1_bucket, euw1_bucket])["RequestStatus"] == "SUCCEEDED"
+    deleted = set()
+    try:
+        listed, token = [], None
+        while True:
+            page = ctl.list_multi_region_access_points(
+                AccountId=_ACCOUNT, MaxResults=1, **({"NextToken": token} if token else {}))
+            listed += [a["Name"] for a in page["AccessPoints"]]
+            if listed and listed[-1] in names and not deleted:
+                _mrap_delete(ctl, listed[-1])
+                deleted.add(listed[-1])
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(listed)
+    finally:
+        for name in set(names) - deleted:
+            _mrap_delete(ctl, name)
