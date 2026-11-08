@@ -2878,6 +2878,8 @@ def _run_idp_handler(handler, action: str, data: dict):
         return handler(data)
     except (_PreTokenRejected, _PreTokenUnavailable) as e:
         return _pretoken_error(e)
+    except _PostAuthenticationInvalid as e:
+        return error_response_json("InvalidLambdaResponseException", str(e), 400)
 
 
 def _run_identity_handler(handler, action: str, data: dict):
@@ -5342,12 +5344,19 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     if mfa_config == "OFF":
         return None
     enabled_mfa = user.get("_mfa_enabled", [])
+    # A TOTP enrolled on the hosted page signs in with a code too, though it sets no MFA preference.
+    has_totp = "SOFTWARE_TOKEN_MFA" in enabled_mfa or bool(user.get("_totp_hosted") and user.get("_totp_secret"))
     # OPTIONAL: only challenge if user has TOTP set up
-    if mfa_config == "OPTIONAL" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
+    if mfa_config == "OPTIONAL" and not has_totp:
         return None
-    # ON: challenge if TOTP is set up; if not set up yet, skip (let them enroll)
-    if mfa_config == "ON" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
-        return None
+    # ON without a factor yet: AWS answers MFA_SETUP where TOTP can be set up; other cases still sign in.
+    if mfa_config == "ON" and not has_totp:
+        if not (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
+            return None
+        session = base64.b64encode(secrets.token_bytes(32)).decode()
+        _mfa_setup_users[session] = (pid, user["Username"])
+        return {"ChallengeName": "MFA_SETUP", "Session": session,
+                "ChallengeParameters": {"MFAS_CAN_SETUP": '["SOFTWARE_TOKEN_MFA"]'}}
     session = base64.b64encode(secrets.token_bytes(32)).decode()
     return {
         "ChallengeName": "SOFTWARE_TOKEN_MFA",
@@ -5359,10 +5368,71 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
+class _PostAuthenticationInvalid(Exception):
+    """Raised when a PostAuthentication Lambda does not return the event."""
+
+
+def _apply_postauth_trigger(pool_id: str, client_id: str, user: dict, client_metadata: dict | None,
+                            new_device_used: bool = False):
+    """Invoke the pool's PostAuthentication Lambda after a sign-in, before tokens are issued."""
+    pool = _user_pools.get(pool_id)
+    arn = ((pool or {}).get("LambdaConfig") or {}).get("PostAuthentication")
+    if not arn:
+        return
+    attrs = {k: v for k, v in _attr_list_to_dict(user.get("Attributes", [])).items()
+             if isinstance(v, (str, int, float, bool))}
+    attrs["cognito:user_status"] = user.get("UserStatus", "CONFIRMED")
+    request = {"userAttributes": attrs, "newDeviceUsed": new_device_used}
+    # AWS leaves out InitiateAuth's ClientMetadata; only challenge responses pass it.
+    if client_metadata:
+        request["clientMetadata"] = client_metadata
+    event = {
+        "version": "1",
+        "triggerSource": "PostAuthentication_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": request,
+        "response": {},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _PreTokenUnavailable("PostAuthentication invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PostAuthentication Lambda invocation failed for pool %s: %s", pool_id, e)
+        if isinstance(e, _PreTokenUnavailable):
+            raise
+        raise _PreTokenUnavailable(
+            f"PostAuthentication invocation failed due to error {type(e).__name__}.") from e
+    if isinstance(result, dict) and result.get("error"):
+        raise _PreTokenRejected(f"PostAuthentication failed with error {_lambda_error_message(result.get('body'))}.")
+    payload = result.get("body") if isinstance(result, dict) else result
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+    if payload is None:
+        raise _PostAuthenticationInvalid("Invalid lambda function output : Invalid JSON")
+    if not isinstance(payload, dict):
+        raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+
+
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
                         client_metadata: dict | None = None, origin_jti: str = "",
                         scope: str | None = None, audience: str = "") -> dict:
+    if trigger_source in ("TokenGeneration_Authentication", "TokenGeneration_NewPasswordChallenge"):
+        _apply_postauth_trigger(pool_id, client_id, user, client_metadata,
+                                new_device_used=trigger_source == "TokenGeneration_NewPasswordChallenge")
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -5396,6 +5466,7 @@ def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: 
     _record_auth_event(pool, user, data or {}, "SignIn", "InProgress" if mfa_challenge else "Pass",
                        (("Password", "Success"),), (mfa_challenge or {}).get("Session"))
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        _apply_postauth_trigger(pid, cid, user, client_metadata)
         session = base64.b64encode(secrets.token_bytes(32)).decode()
         return json_response({
             "ChallengeName": "NEW_PASSWORD_REQUIRED",
@@ -5607,6 +5678,28 @@ def _admin_initiate_auth(data):
     return error_response_json("InvalidParameterException", f"Unsupported AuthFlow: {auth_flow}", 400)
 
 
+def _software_token_code_refused(user, responses):
+    """A SOFTWARE_TOKEN_MFA code that does not match; a user who never enrolled TOTP has no code that does."""
+    totp_secret = user.get("_totp_secret")
+    if not totp_secret:
+        return "SOFTWARE_TOKEN_MFA" not in (user.get("_mfa_enabled") or [])
+    return not _totp_matches(totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", ""))
+
+
+def _mfa_setup_response(pool, pid, cid, data, responses):
+    """MFA_SETUP answered with VerifySoftwareToken's session: AWS then asks for a SOFTWARE_TOKEN_MFA code. A user
+    who has not enrolled yet gets MFA_SETUP again."""
+    _mfa_setup_users.pop(responses.get("SESSION") or data.get("Session") or "", None)
+    user, _err = _resolve_user(pool, responses.get("USERNAME"))
+    if _err:
+        return _hidden_user_error(pool, cid, _err)
+    challenge = _mfa_challenge_for_user(pool, user, pid, user["Username"])
+    if challenge is None:
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=data.get("ClientMetadata", {}))})
+    return json_response(challenge)
+
+
 def _admin_respond_to_auth_challenge(data):
     pid = data.get("UserPoolId")
     cid = data.get("ClientId")
@@ -5724,9 +5817,7 @@ def _admin_respond_to_auth_challenge(data):
         # A user enrolled before secrets were stored has nothing to check
         # against; that legacy state keeps the old accept-any behaviour until
         # re-enrolment.
-        totp_secret = user.get("_totp_secret")
-        if totp_secret and not _totp_matches(
-                totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
+        if _software_token_code_refused(user, responses):
             _finish_auth_event(user, data.get("Session"), "Mfa", False)
             return error_response_json(
                 "CodeMismatchException", "Invalid code received for user", 400)
@@ -5735,14 +5826,7 @@ def _admin_respond_to_auth_challenge(data):
             pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "MFA_SETUP":
-        # Triggered when pool MFA=ON but user hasn't enrolled yet
-        username = responses.get("USERNAME")
-        client_metadata = data.get("ClientMetadata", {})
-        user, _err = _resolve_user(pool, username)
-        if _err:
-            return _hidden_user_error(pool, cid, _err)
-        return json_response({"AuthenticationResult": _build_auth_result(
-            pid, cid, user, client_metadata=client_metadata)})
+        return _mfa_setup_response(pool, pid, cid, data, responses)
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
@@ -6107,23 +6191,22 @@ def _respond_to_auth_challenge(data):
             pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
             client_metadata=client_metadata)})
 
-    if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
+    if challenge_name == "MFA_SETUP":
+        return _mfa_setup_response(pool, pid, cid, data, responses)
+
+    if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _hidden_user_error(pool, cid, _err)
-        # SOFTWARE_TOKEN_MFA checks the code against the enrolled secret
-        # (legacy pre-secret enrolments keep accept-any until re-enrolment).
-        # MFA_SETUP's verification already happened in VerifySoftwareToken.
-        if challenge_name == "SOFTWARE_TOKEN_MFA":
-            totp_secret = user.get("_totp_secret")
-            if totp_secret and not _totp_matches(
-                    totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
-                _finish_auth_event(user, data.get("Session"), "Mfa", False)
-                return error_response_json(
-                    "CodeMismatchException", "Invalid code received for user", 400)
-            _finish_auth_event(user, data.get("Session"), "Mfa", True)
+        # The code is checked against the enrolled secret (legacy pre-secret
+        # enrolments keep accept-any until re-enrolment).
+        if _software_token_code_refused(user, responses):
+            _finish_auth_event(user, data.get("Session"), "Mfa", False)
+            return error_response_json(
+                "CodeMismatchException", "Invalid code received for user", 400)
+        _finish_auth_event(user, data.get("Session"), "Mfa", True)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -7506,6 +7589,15 @@ def _set_user_pool_mfa_config(data):
 # unguessable random session — the same isolation argument as the OAuth code
 # stores above.
 _totp_session_secrets: dict[str, str] = {}
+# An MFA_SETUP challenge's session, and the AssociateSoftwareToken / VerifySoftwareToken sessions that carry it
+# on -> (pool id, username): the user enrolling before they have an access token.
+_mfa_setup_users: dict[str, tuple[str, str]] = {}
+
+
+def _mfa_setup_user(session):
+    owner = _mfa_setup_users.get(session or "")
+    pool = _get_pool_unscoped(owner[0]) if owner else None
+    return (_resolve_user(pool, owner[1])[0] if pool else None), owner
 
 
 def _totp_code(secret_b32: str, step_offset: int = 0) -> str:
@@ -7542,6 +7634,9 @@ def _associate_software_token(data):
     user = _user_for_access_token(data.get("AccessToken"))
     if user is not None:
         user["_totp_pending_secret"] = secret
+    owner = _mfa_setup_users.pop(data.get("Session") or "", None)
+    if owner:
+        _mfa_setup_users[session] = owner
     _totp_session_secrets[session] = secret
     return json_response({"SecretCode": secret, "Session": session})
 
@@ -7554,8 +7649,13 @@ def _verify_software_token(data):
     user_code = data.get("UserCode", "")
 
     user = _user_for_access_token(access_token)
+    owner = None
+    if user is None and session:
+        user, owner = _mfa_setup_user(session)
     secret = None
-    if user is not None:
+    if owner:
+        secret = _totp_session_secrets.get(session)
+    elif user is not None:
         secret = user.get("_totp_pending_secret") or user.get("_totp_secret")
     if not secret and session:
         secret = _totp_session_secrets.get(session)
@@ -7582,6 +7682,9 @@ def _verify_software_token(data):
     resp = {"Status": "SUCCESS"}
     if session:
         resp["Session"] = base64.b64encode(secrets.token_bytes(32)).decode()
+        if owner:
+            _mfa_setup_users.pop(session, None)
+            _mfa_setup_users[resp["Session"]] = owner
     return json_response(resp)
 
 
@@ -8547,9 +8650,11 @@ def _hosted_mfa_kind(pool, user):
         return None
     if (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
         return "setup"
-    if _attr_list_to_dict(user.get("Attributes", [])).get("phone_number"):
+    if (_attr_list_to_dict(user.get("Attributes", [])).get("phone_number")
+            and (pool.get("SmsMfaConfiguration") or pool.get("SmsConfiguration"))):
         return "sms"
-    return None
+    # MFA is required and the user has no factor they can use or set up: AWS refuses the sign-in.
+    return "unavailable"
 
 
 def _hosted_mfa_prompt(session, user):
@@ -8562,6 +8667,8 @@ def _hosted_mfa_prompt(session, user):
 def _finish_password_sign_in(pool, pool_id, user, oauth):
     """After a hosted UI password: the MFA challenge or enrolment page, or the authorization code."""
     kind = _hosted_mfa_kind(pool, user)
+    if kind == "unavailable":
+        return _hosted_error_page("MFA is required and no MFA method is available for this user.")
     if kind:
         now = time.time()
         for stale in [t for t, s in _pending_hosted_mfa.items() if s["expires_at"] < now]:
@@ -8570,7 +8677,7 @@ def _finish_password_sign_in(pool, pool_id, user, oauth):
         token = secrets.token_urlsafe(24)
         session = _pending_hosted_mfa[token] = {
             **{k: oauth.get(k, "") for k in _HOSTED_OAUTH_FIELDS}, "pool_id": pool_id,
-            "username": user["Username"], "kind": kind, "failures": 0,
+            "username": user["Username"], "kind": kind,
             "secret": base64.b32encode(secrets.token_bytes(32)).decode().rstrip("=") if kind == "setup" else None,
             "expires_at": now + client.get("AuthSessionValidity", 3) * 60,
         }
@@ -8595,7 +8702,30 @@ def _totp_matching_step(secret_b32, user_code):
         return None
 
 
-_HOSTED_MFA_LOCKOUT_AFTER = 5
+# AWS's lockout for failed sign-in attempts, which it applies to MFA codes: after five failures the user is locked
+# for 2^(n-5) seconds, up to about 15 minutes. Attempts while locked don't count; a success, or 15 quiet minutes
+# after a lockout, resets it.
+_MFA_LOCKOUT_AFTER = 5
+_MFA_LOCKOUT_MAX_SECONDS = 900
+
+
+def _mfa_locked(user, now):
+    if (user.get("_mfa_failures", 0) >= _MFA_LOCKOUT_AFTER
+            and now - user.get("_mfa_last_failure", 0) >= _MFA_LOCKOUT_MAX_SECONDS):
+        _mfa_reset(user)
+    return now < user.get("_mfa_locked_until", 0)
+
+
+def _mfa_failed(user, now):
+    failures = user["_mfa_failures"] = user.get("_mfa_failures", 0) + 1
+    user["_mfa_last_failure"] = now
+    if failures >= _MFA_LOCKOUT_AFTER:
+        user["_mfa_locked_until"] = now + min(2 ** min(failures - _MFA_LOCKOUT_AFTER, 10), _MFA_LOCKOUT_MAX_SECONDS)
+
+
+def _mfa_reset(user):
+    for key in ("_mfa_failures", "_mfa_last_failure", "_mfa_locked_until"):
+        user.pop(key, None)
 
 
 def _handle_hosted_mfa_submit(mfa_token, form):
@@ -8639,16 +8769,18 @@ def _handle_hosted_mfa_submit(mfa_token, form):
         code = form.get("authentication_code", "").strip()
         if not code:
             return again("Missing required parameter SOFTWARE_TOKEN_MFA_CODE")
-        if session["failures"] >= _HOSTED_MFA_LOCKOUT_AFTER:
+        now = time.time()
+        if _mfa_locked(user, now):
             return again("Too many invalid credentials attempts. User temporarily locked. "
                          "Please try again after few seconds.")
         step = _totp_matching_step(user.get("_totp_secret"), code)
         if step is None:
-            session["failures"] += 1
+            _mfa_failed(user, now)
             return again("The code entered is invalid, please try again.")
         if step == user.get("_totp_used_step"):
             return again("Your software token has already been used once.")
         user["_totp_used_step"] = step
+        _mfa_reset(user)
     del _pending_hosted_mfa[mfa_token]
     return _issue_auth_code_redirect(
         session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"], user["Username"],
@@ -10127,4 +10259,5 @@ def reset():
     _challenge_sessions.clear()
     _pending_new_password.clear()
     _pending_hosted_mfa.clear()
+    _mfa_setup_users.clear()
     _pending_user_auth.clear()

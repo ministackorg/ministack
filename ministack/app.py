@@ -2080,11 +2080,12 @@ def _resolve_cloudfront_alias_request(host: str):
 
 async def _serve_cloudfront_distribution(
     dist, path: str, raw_path: str, raw_query_string: str, method: str,
-    headers: dict, body: bytes, query_params: dict, client_ip: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
     try:
         return await _get_module("cloudfront").handle_viewer_request(
             dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
+            http_version=http_version,
         )
     except Exception as e:
         logger.exception("Error in CloudFront data-plane dispatch: %s", e)
@@ -2093,7 +2094,7 @@ async def _serve_cloudfront_distribution(
 
 async def _handle_cloudfront_dataplane_request(
     host: str, path: str, raw_path: str, raw_query_string: str, method: str,
-    headers: dict, body: bytes, query_params: dict, client_ip: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
     """Serve a CloudFront distribution's viewer traffic, matched by its ``<label>.cloudfront.net`` Host."""
     label = _parse_cloudfront_dataplane_host(host)
@@ -2101,12 +2102,12 @@ async def _handle_cloudfront_dataplane_request(
     if dist is None:
         return None
     return await _serve_cloudfront_distribution(
-        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip, http_version)
 
 
 async def _handle_cloudfront_alias_request(
     host: str, path: str, raw_path: str, raw_query_string: str, method: str,
-    headers: dict, body: bytes, query_params: dict, client_ip: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
     """Serve a request whose Host is a distribution's alternate domain name. Runs after every other Host-claiming
     handler: on AWS DNS sends those hosts to their own service, here the Host is the only signal."""
@@ -2118,7 +2119,7 @@ async def _handle_cloudfront_alias_request(
     if dist is None:
         return None
     return await _serve_cloudfront_distribution(
-        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip, http_version)
 
 
 def _invoke_as_api_owner(api_id: str) -> str | None:
@@ -2770,6 +2771,7 @@ async def _handle_special_data_plane_request(
     raw_path: str | None = None,
     raw_query_string: str = "",
     client_ip: str = "127.0.0.1",
+    http_version: str = "1.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
     # S3 Object Lambda's WriteGetObjectResponse, on any host: its modeled host
@@ -2818,7 +2820,7 @@ async def _handle_special_data_plane_request(
     host = headers.get("host", "")
     if response := await _handle_cloudfront_dataplane_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
-        headers, body, query_params, client_ip,
+        headers, body, query_params, client_ip, http_version,
     ):
         # A distribution adds its own headers (Via, X-Amz-Cf-Id, X-Amz-Cf-Pop, X-Cache), not an API's request ids.
         return response
@@ -2849,7 +2851,7 @@ async def _handle_special_data_plane_request(
     # A distribution's alternate domain name yields to every service that claims the Host.
     return await _handle_cloudfront_alias_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
-        headers, body, query_params, client_ip,
+        headers, body, query_params, client_ip, http_version,
     )
 
 
@@ -3143,6 +3145,7 @@ async def _dispatch_service_request(
             extract_resource_arn,
             iot_resource_arns,
             logs_service_context,
+            request_field_context,
             request_tag_context,
             s3_access_point_resources,
             s3_foreign_denial_message,
@@ -3193,6 +3196,7 @@ async def _dispatch_service_request(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
             service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **request_field_context(service, iam_action, body, routing_params, region),
                                **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
@@ -3577,6 +3581,7 @@ async def app(scope, receive, send):
         raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
         raw_query_string=query_string,
         client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+        http_version=scope.get("http_version", "1.1"),
     )
     if response is not None and head_path is not None:
         response = _get_module("s3").format_head_response(head_path, headers, response)

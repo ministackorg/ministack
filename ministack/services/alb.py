@@ -47,6 +47,7 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
+from ministack.core.responses import query_value as _query_value
 
 logger = logging.getLogger("alb")
 
@@ -278,37 +279,6 @@ def _shape(name):
     if "_MODEL" not in globals():
         _MODEL = botocore.session.get_session().get_service_model("elbv2")
     return _MODEL.shape_for(name)
-
-
-def _query_value(params, prefix, shape):
-    """A Query-protocol member under *prefix*, typed by its botocore shape, or None when absent."""
-    if shape.type_name == "structure":
-        out = {}
-        for member, member_shape in shape.members.items():
-            value = _query_value(params, f"{prefix}.{member}", member_shape)
-            if value is not None:
-                out[member] = value
-        return out or None
-    if shape.type_name == "list":
-        items, i = [], 1
-        while (value := _query_value(params, f"{prefix}.member.{i}", shape.member)) is not None:
-            items.append(value)
-            i += 1
-        return items or None
-    if shape.type_name == "map":
-        out, i = {}, 1
-        while f"{prefix}.entry.{i}.key" in params:
-            out[_p(params, f"{prefix}.entry.{i}.key")] = _query_value(params, f"{prefix}.entry.{i}.value", shape.value)
-            i += 1
-        return out or None
-    if prefix not in params:
-        return None
-    raw = _p(params, prefix)
-    if shape.type_name in ("integer", "long"):
-        return int(raw)
-    if shape.type_name == "boolean":
-        return raw.lower() == "true"
-    return raw
 
 
 def _shape_xml(value, shape):

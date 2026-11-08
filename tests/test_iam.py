@@ -3,6 +3,7 @@ import uuid as _uuid_mod
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import make_client
 
 
 def test_iam_role_user(iam):
@@ -1846,3 +1847,67 @@ def test_iam_attach_missing_customer_policy_is_no_such_entity(iam):
         assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("NoSuchEntity", 404)
         assert err["Error"]["Message"] == f"Policy {missing} does not exist or is not attachable."
     assert iam.list_attached_role_policies(RoleName=role)["AttachedPolicies"] == []
+
+
+def _deny_on(action, condition):
+    return {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "*", "Resource": "*"},
+        {"Effect": "Deny", "Action": action, "Resource": "*", "Condition": condition}]}
+
+
+def _refused(auth_enabled, call):
+    """With AUTH=true the call is refused by the identity policy; without IAM it goes through."""
+    if not auth_enabled:
+        call()
+        return
+    with pytest.raises(ClientError) as exc:
+        call()
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] in (400, 403)
+    assert "AccessDenied" in exc.value.response["Error"]["Code"] or "not authorized" in exc.value.response["Error"]["Message"]
+
+
+@pytest.mark.auth_contract
+def test_request_field_condition_keys_contract(auth_enabled, iam_user):
+    """Identity-policy denies on request-field keys AWS sets: kms:EncryptionContext, secretsmanager:SecretId,
+    sns:Protocol, ssm:Overwrite, ec2:Region and iam:PermissionsBoundary."""
+    import uuid as _uuid
+    tag = _uuid.uuid4().hex[:8]
+    admin_kms = make_client("kms")
+    key = admin_kms.create_key()["KeyMetadata"]["KeyId"]
+    kms = iam_user(policy=_deny_on("kms:Encrypt", {"StringEquals": {"kms:EncryptionContext:app": "blocked"}})).client("kms")
+    kms.encrypt(KeyId=key, Plaintext=b"x", EncryptionContext={"app": "ok"})
+    _refused(auth_enabled, lambda: kms.encrypt(KeyId=key, Plaintext=b"x", EncryptionContext={"app": "blocked"}))
+
+    sm = iam_user(policy=_deny_on("secretsmanager:GetSecretValue",
+                                  {"StringLike": {"secretsmanager:SecretId": "*blocked*"}})).client("secretsmanager")
+    admin_sm = make_client("secretsmanager")
+    for name in (f"ok-{tag}", f"blocked-{tag}"):
+        admin_sm.create_secret(Name=name, SecretString="v")
+    sm.get_secret_value(SecretId=f"ok-{tag}")
+    _refused(auth_enabled, lambda: sm.get_secret_value(SecretId=f"blocked-{tag}"))
+
+    topic = make_client("sns").create_topic(Name=f"proto-{tag}")["TopicArn"]
+    sns = iam_user(policy=_deny_on("sns:Subscribe", {"StringEquals": {"sns:Protocol": "http"}})).client("sns")
+    sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=f"arn:aws:sqs:us-east-1:000000000000:q-{tag}")
+    _refused(auth_enabled, lambda: sns.subscribe(TopicArn=topic, Protocol="http", Endpoint="http://example.com/h"))
+
+    ssm = iam_user(policy=_deny_on("ssm:PutParameter", {"Bool": {"ssm:Overwrite": "true"}})).client("ssm")
+    ssm.put_parameter(Name=f"/ow/{tag}", Value="a", Type="String")
+    _refused(auth_enabled, lambda: ssm.put_parameter(Name=f"/ow/{tag}", Value="b", Type="String", Overwrite=True))
+
+    ec2 = iam_user(policy=_deny_on("ec2:DescribeVpcs", {"StringEquals": {"ec2:Region": "eu-west-1"}}))
+    ec2.client("ec2", region="us-east-1").describe_vpcs()
+    _refused(auth_enabled, lambda: ec2.client("ec2", region="eu-west-1").describe_vpcs())
+
+    boundary = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    iam = iam_user(policy=_deny_on("iam:CreateRole", {"StringNotEquals": {"iam:PermissionsBoundary": boundary}})).client("iam")
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    iam.create_role(RoleName=f"bounded-{tag}", AssumeRolePolicyDocument=trust, PermissionsBoundary=boundary)
+    _refused(auth_enabled, lambda: iam.create_role(RoleName=f"unbounded-{tag}", AssumeRolePolicyDocument=trust))
+    admin_iam = make_client("iam")
+    for name in (f"bounded-{tag}", f"unbounded-{tag}"):
+        try:
+            admin_iam.delete_role(RoleName=name)
+        except ClientError:
+            pass
