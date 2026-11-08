@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import gzip
 import http.client
 import http.server
 import io
@@ -5650,7 +5651,7 @@ def test_forward_to_origin_timeout_raises_origin_timeout():
         "http_port": 1, "https_port": 443, "protocol_policy": "http-only", "read_timeout": 30,
     }
     with mock.patch("http.client.HTTPConnection") as mock_conn_cls:
-        mock_conn_cls.return_value.request.side_effect = TimeoutError("timed out")
+        mock_conn_cls.return_value.endheaders.side_effect = TimeoutError("timed out")
         with pytest.raises(cloudfront_svc.OriginTimeout):
             cloudfront_svc._forward_to_origin(
                 origin, "GET", "/anything", "", {}, b"", viewer_is_https=False,
@@ -6650,3 +6651,255 @@ def test_viewer_response_function_adds_cloudfront_server_when_the_origin_sends_n
     status, headers, _body = _get(dist_host, "/hello")
     assert status == 200
     assert {k.lower(): v for k, v in headers.items()}["server"] == "CloudFront"
+
+
+class _CompressOriginHandler(http.server.BaseHTTPRequestHandler):
+    """GET /<size>/<content-type with ~ for />/<status>[/<etag>|/encoded|/nolength] answers that object."""
+
+    def do_GET(self):
+        parts = self.path.strip("/").split("/")
+        size, ctype, status = int(parts[0]), parts[1].replace("~", "/"), int(parts[2])
+        extra = parts[3] if len(parts) > 3 else ""
+        body = b"a" * size
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("X-Seen-Accept-Encoding", self.headers.get("Accept-Encoding", "-"))
+        if extra == "encoded":
+            self.send_header("Content-Encoding", "identity")
+        elif extra.startswith("etag-"):
+            self.send_header("ETag", {"strong": '"abc"', "weak": 'W/"abc"', "invalid": "abc"}[extra[5:]])
+        if extra != "nolength":
+            self.send_header("Content-Length", str(size))
+        self.end_headers()
+        self.wfile.write(body)
+        if extra == "nolength":
+            self.close_connection = True
+
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.fixture(scope="module")
+def cf_compress_stack(cloudfront):
+    server = http.server.HTTPServer(("127.0.0.1", 0), _CompressOriginHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    suffix = _uuid_mod.uuid4().hex[:10]
+    policy_id = cloudfront.create_cache_policy(CachePolicyConfig={
+        "Name": f"cf-compress-{suffix}", "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
+        "ParametersInCacheKeyAndForwardedToOrigin": {
+            "EnableAcceptEncodingGzip": True, "EnableAcceptEncodingBrotli": True,
+            "HeadersConfig": {"HeaderBehavior": "none"}, "CookiesConfig": {"CookieBehavior": "none"},
+            "QueryStringsConfig": {"QueryStringBehavior": "none"},
+        },
+    })["CachePolicy"]["Id"]
+    hosts = {}
+    for name, behavior in (
+        ("policy", {"Compress": True, "CachePolicyId": policy_id}),
+        ("off", {"Compress": False, "CachePolicyId": policy_id}),
+        ("legacy", {"Compress": True, "MinTTL": 0, "ForwardedValues": {
+            "QueryString": False, "Cookies": {"Forward": "none"}}}),
+    ):
+        dist = cloudfront.create_distribution(DistributionConfig={
+            "CallerReference": f"cf-compress-{name}-{suffix}", "Comment": "", "Enabled": True,
+            "Origins": {"Quantity": 1, "Items": [{
+                "Id": "o", "DomainName": "127.0.0.1",
+                "CustomOriginConfig": {
+                    "HTTPPort": server.server_address[1], "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
+                    "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+                    "OriginReadTimeout": 30, "OriginKeepaliveTimeout": 5,
+                },
+            }]},
+            "DefaultCacheBehavior": {"TargetOriginId": "o", "ViewerProtocolPolicy": "allow-all", **behavior},
+        })["Distribution"]
+        hosts[name] = dist["DomainName"]
+    try:
+        yield hosts
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def _compress_get(dist_host: str, path: str, accept_encoding: str | None = "gzip"):
+    conn = http.client.HTTPConnection("127.0.0.1", int(GATEWAY_PORT), timeout=10)
+    try:
+        conn.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", f"{dist_host}:{GATEWAY_PORT}")
+        if accept_encoding is not None:
+            conn.putheader("Accept-Encoding", accept_encoding)
+        conn.endheaders()
+        resp = conn.getresponse()
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+    finally:
+        conn.close()
+
+
+def test_dataplane_compresses_with_gzip(cf_compress_stack):
+    """Compress: true gzips an eligible origin response and forwards only gzip/br to the origin."""
+    status, headers, body = _compress_get(cf_compress_stack["policy"], "/1000/application~json/200",
+                                          "deflate, gzip;q=1.0")
+    assert status == 200
+    assert headers["content-encoding"] == "gzip"
+    assert gzip.decompress(body) == b"a" * 1000
+    assert headers["x-seen-accept-encoding"] == "gzip"
+
+
+@pytest.mark.parametrize("dist,accept,seen", [
+    ("policy", "gzip, deflate, br", "br,gzip"),
+    ("policy", "deflate", "identity"),
+    ("policy", "gzip;q=0", "identity"),
+    ("policy", None, "-"),
+    ("off", "gzip, deflate, br", "br,gzip"),  # the cache policy normalizes it even without Compress
+    ("legacy", "gzip, br", "gzip"),
+])
+def test_dataplane_normalizes_accept_encoding_to_origin(cf_compress_stack, dist, accept, seen):
+    _, headers, _ = _compress_get(cf_compress_stack[dist], "/10/text~plain/200", accept)
+    assert headers["x-seen-accept-encoding"] == seen
+
+
+@pytest.mark.parametrize("path,accept", [
+    ("/999/application~json/200", "gzip"),                 # under 1,000 bytes
+    ("/1000/image~png/200", "gzip"),                       # not a listed Content-Type
+    ("/1000/application~json/500", "gzip"),                # status other than 200/403/404
+    ("/1000/application~json/200/encoded", "gzip"),        # origin already set Content-Encoding
+    ("/1000/application~json/200/nolength", "gzip"),       # no Content-Length
+    ("/1000/application~json/200", "deflate"),             # viewer takes neither gzip nor br
+    ("/1000/application~json/200", "gzip;q=0"),            # q=0 refuses gzip (observed on AWS)
+    ("/1000/application~json/200", None),
+])
+def test_dataplane_skips_compression(cf_compress_stack, path, accept):
+    _, headers, body = _compress_get(cf_compress_stack["policy"], path, accept)
+    assert headers.get("content-encoding") in (None, "identity")
+    assert len(body) == int(path.split("/")[1])
+
+
+def test_dataplane_compresses_403_and_404(cf_compress_stack):
+    for code in (403, 404):
+        status, headers, _ = _compress_get(cf_compress_stack["policy"], f"/1000/text~html/{code}")
+        assert status == code and headers["content-encoding"] == "gzip"
+
+
+def test_dataplane_no_compression_when_compress_false(cf_compress_stack):
+    _, headers, body = _compress_get(cf_compress_stack["off"], "/1000/application~json/200")
+    assert "content-encoding" not in headers and body == b"a" * 1000
+
+
+def test_dataplane_legacy_cache_settings_compress_gzip_only(cf_compress_stack):
+    _, headers, _ = _compress_get(cf_compress_stack["legacy"], "/1000/application~json/200", "br")
+    assert "content-encoding" not in headers
+    _, headers, _ = _compress_get(cf_compress_stack["legacy"], "/1000/application~json/200", "gzip, br")
+    assert headers["content-encoding"] == "gzip"
+
+
+@pytest.mark.parametrize("etag,expected", [("strong", 'W/"abc"'), ("weak", 'W/"abc"'), ("invalid", None)])
+def test_dataplane_compression_etag(cf_compress_stack, etag, expected):
+    _, headers, _ = _compress_get(cf_compress_stack["policy"], f"/1000/text~plain/200/etag-{etag}")
+    assert headers["content-encoding"] == "gzip"
+    assert headers.get("etag") == expected
+
+
+_KVS_FUNCTION = b"""import cf from 'cloudfront';
+const kvs = cf.kvs();
+async function handler(event) {
+  let missing = 'none';
+  try { await kvs.get('nope'); } catch (e) { missing = String(e); }
+  const meta = await kvs.meta();
+  const out = {
+    str: await kvs.get('route'),
+    json: (await kvs.get('cfg', { format: 'json' })).on,
+    bytes: (await kvs.get('route', { format: 'bytes' })).length,
+    has: await kvs.exists('route'),
+    hasNot: await kvs.exists('nope'),
+    missing: missing,
+    keyCount: meta.keyCount,
+    times: meta.creationDateTime instanceof Date && meta.lastUpdatedDateTime instanceof Date,
+  };
+  return { statusCode: 200, statusDescription: 'OK', headers: {}, body: JSON.stringify(out) };
+}
+"""
+
+
+def _kvs_function_distribution(cloudfront, cloudfront_kvs, runtime):
+    suffix = _uuid_mod.uuid4().hex[:10]
+    kvs_arn = cloudfront.create_key_value_store(Name=f"cfkvs-{suffix}")["KeyValueStore"]["ARN"]
+    etag = cloudfront_kvs.describe_key_value_store(KvsARN=kvs_arn)["ResponseMetadata"]["HTTPHeaders"]["etag"]
+    cloudfront_kvs.update_keys(KvsARN=kvs_arn, IfMatch=etag,
+                               Puts=[{"Key": "route", "Value": "/index.html"}, {"Key": "cfg", "Value": '{"on": true}'}])
+    name = f"cfkvs-fn-{suffix}"
+    created = cloudfront.create_function(
+        Name=name, FunctionCode=_KVS_FUNCTION,
+        FunctionConfig={"Comment": "", "Runtime": runtime,
+                        "KeyValueStoreAssociations": {"Quantity": 1, "Items": [{"KeyValueStoreARN": kvs_arn}]}})
+    fn_arn = cloudfront.publish_function(Name=name, IfMatch=created["ETag"])["FunctionSummary"][
+        "FunctionMetadata"]["FunctionARN"]
+    dist = cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cfkvs-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "o", "DomainName": "127.0.0.1",
+            "CustomOriginConfig": {"HTTPPort": 9, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"},
+        }]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
+            "FunctionAssociations": {"Quantity": 1, "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}]},
+        },
+    })["Distribution"]
+    return dist["DomainName"]
+
+
+def test_function_reads_its_key_value_store(cloudfront, cloudfront_kvs):
+    """cf.kvs() get/exists/meta read the associated key value store (runtime 2.0)."""
+    _skip_without_node()
+    status, _headers, body = _get(_kvs_function_distribution(cloudfront, cloudfront_kvs, "cloudfront-js-2.0"), "/")
+    assert status == 200
+    assert json.loads(body) == {"str": "/index.html", "json": True, "bytes": 11, "has": True, "hasNot": False,
+                                "missing": "Error: KeyNotFound", "keyCount": 2, "times": True}
+
+
+def test_function_without_key_value_store_cannot_open_one(cloudfront):
+    """Observed on AWS: cf.kvs() in a function with no associated store throws InternalError."""
+    _skip_without_node()
+    suffix = _uuid_mod.uuid4().hex[:10]
+    fn_arn = _create_function(cloudfront, f"cfnokvs-{suffix}", b"""import cf from 'cloudfront';
+async function handler(event) {
+  let out;
+  try { cf.kvs(); out = 'no error'; } catch (e) { out = String(e); }
+  return { statusCode: 200, statusDescription: 'OK', headers: {}, body: out };
+}
+""")
+    dist = cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cfnokvs-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "o", "DomainName": "127.0.0.1",
+            "CustomOriginConfig": {"HTTPPort": 9, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"},
+        }]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
+            "FunctionAssociations": {"Quantity": 1, "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}]},
+        },
+    })["Distribution"]
+    status, _headers, body = _get(dist["DomainName"], "/")
+    assert status == 200
+    assert body == b'InternalError: "cloudfront.kvs" module is not configured'
+
+
+def test_function_runtime_1_has_no_cloudfront_module(cloudfront, cloudfront_kvs):
+    _skip_without_node()
+    status, _headers, _body = _get(_kvs_function_distribution(cloudfront, cloudfront_kvs, "cloudfront-js-1.0"), "/")
+    assert status == 503
+
+
+def test_dataplane_http_1_0_drops_accept_encoding(cf_compress_stack):
+    """An HTTP/1.0 request loses its Accept-Encoding and is not compressed (Developer Guide, observed on AWS)."""
+    import socket
+    with socket.create_connection(("127.0.0.1", int(GATEWAY_PORT)), timeout=10) as sock:
+        sock.sendall((f"GET /1000/text~plain/200 HTTP/1.0\r\nHost: {cf_compress_stack['policy']}:{GATEWAY_PORT}\r\n"
+                      "Accept-Encoding: gzip\r\n\r\n").encode())
+        raw = b""
+        while chunk := sock.recv(65536):
+            raw += chunk
+    head, _, body = raw.partition(b"\r\n\r\n")
+    headers = {k.lower(): v for k, _, v in (line.decode().partition(": ") for line in head.split(b"\r\n")[1:])}
+    assert "content-encoding" not in headers
+    assert headers["x-seen-accept-encoding"] == "-"
+    assert body == b"a" * 1000

@@ -66,6 +66,7 @@ import asyncio
 import base64
 import copy
 import fnmatch
+import gzip
 import http.client
 import logging
 import os
@@ -83,6 +84,11 @@ from urllib.parse import parse_qs, quote, unquote, urlencode
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from defusedxml.ElementTree import fromstring
+
+try:
+    import brotli
+except ImportError:  # optional: without it, Brotli-only viewers get the uncompressed object
+    brotli = None
 
 from ministack.core import cloudfront_js
 from ministack.core.arn import ArnParseError, parse_arn
@@ -5449,6 +5455,7 @@ def _dataplane_behavior(behavior_el, path_pattern=None):
         "cache_policy_id": _opt_text(behavior_el, "CachePolicyId"),
         "origin_request_policy_id": _opt_text(behavior_el, "OriginRequestPolicyId"),
         "response_headers_policy_id": _opt_text(behavior_el, "ResponseHeadersPolicyId"),
+        "compress": (_opt_text(behavior_el, "Compress") or "").lower() == "true",
         "forwarded_values": _dataplane_forwarded_values(behavior_el),
         "functions": _dataplane_function_associations(behavior_el),
     }
@@ -5696,9 +5703,15 @@ async def _run_function(function_arn: str, event: dict) -> dict:
     code = live_function_code(function_arn)
     if code is None:
         raise CloudFrontFunctionError(f"{function_arn} has no published (LIVE) code")
+    from ministack.services import cloudfront_keyvaluestore
+
+    fn = _functions[function_arn.rsplit("/", 1)[-1]]
+    view = _function_view(fn, "LIVE")
+    kvs_arns = view.get("kvs_arns") or []
+    kvs = cloudfront_keyvaluestore.function_snapshot(kvs_arns[0]) if kvs_arns else None
     try:
-        # A function cannot call back into MiniStack, so this is run_offloop work.
-        return await run_offloop(cloudfront_js.evaluate, code, event)
+        # A function cannot call back into MiniStack, so the key value store goes in with the event.
+        return await run_offloop(cloudfront_js.evaluate, code, event, view.get("runtime", fn["runtime"]), kvs)
     except cloudfront_js.CloudFrontFunctionError as exc:
         raise CloudFrontFunctionError(str(exc)) from exc
 
@@ -6079,7 +6092,14 @@ def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
         if use_https else conn_cls(conn_host, conn_port, timeout=timeout)
     )
     try:
-        conn.request(method, target_path, body=body if body else None, headers=send_headers)
+        # conn.request() would add "Accept-Encoding: identity" to a request the viewer sent without one.
+        names = {k.lower() for k in send_headers}
+        conn.putrequest(method, target_path, skip_host="host" in names, skip_accept_encoding=True)
+        for name, value in send_headers.items():
+            conn.putheader(name, value)
+        if "content-length" not in names and (body or method in ("POST", "PUT", "PATCH")):
+            conn.putheader("Content-Length", str(len(body or b"")))
+        conn.endheaders(body if body else None)
         resp = conn.getresponse()
         data = resp.read()
         return resp.status, resp.reason, resp.getheaders(), data
@@ -6247,27 +6267,34 @@ async def _fetch_from_origin(origin: dict, method: str, uri: str, query_string: 
     if origin.get("s3_bucket"):
         status, header_pairs, data = await run_offloop(_serve_s3_origin, origin, method, uri, headers, dist_arn)
         pairs = header_pairs.items() if isinstance(header_pairs, dict) else header_pairs
-        return status, http.client.responses.get(status, ""), _multidict_from_pairs(pairs), data
+        return status, http.client.responses.get(status, ""), _with_content_length(_multidict_from_pairs(pairs), data), data
     lb = _registered_alb(origin)
     if lb is not None:
         status, reason, header_pairs, data = await _fetch_from_alb_origin(
             lb, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
             viewer_is_https, client_ip, viewer_xff,
         )
-        return status, reason, _multidict_from_pairs(header_pairs), data
+        return status, reason, _with_content_length(_multidict_from_pairs(header_pairs), data), data
     url_host = _registered_function_url(origin)
     if url_host is not None:
         status, reason, header_pairs, data = await _fetch_from_function_url_origin(
             url_host, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
             viewer_is_https, client_ip, viewer_xff,
         )
-        return status, reason, _multidict_from_pairs(header_pairs), data
+        return status, reason, _with_content_length(_multidict_from_pairs(header_pairs), data), data
     # The origin may be MiniStack's own gateway, so the call must be reentrant.
     status, reason, header_pairs, data = await run_reentrant(
         _forward_to_origin, origin, method, (origin.get("origin_path") or "") + uri, query_string, headers, body,
         viewer_is_https, client_ip, viewer_xff,
     )
     return status, reason, _multidict_from_pairs(header_pairs), data
+
+
+def _with_content_length(headers: dict, data: bytes) -> dict:
+    """An in-process origin's buffered body, framed with the Content-Length its wire response carries."""
+    if "content-length" not in headers and "transfer-encoding" not in headers:
+        headers["content-length"] = str(len(data or b""))
+    return headers
 
 
 def _multidict_from_pairs(pairs) -> dict:
@@ -6283,6 +6310,81 @@ def _multidict_from_pairs(pairs) -> dict:
         else:
             out[key] = value
     return out
+
+
+# Content-Type values CloudFront compresses (Developer Guide, "File types that CloudFront compresses").
+_COMPRESSIBLE_CONTENT_TYPES = frozenset((
+    "application/dash+xml", "application/eot", "application/font", "application/font-sfnt",
+    "application/javascript", "application/json", "application/opentype", "application/otf", "application/pdf",
+    "application/pkcs7-mime", "application/protobuf", "application/rss+xml", "application/truetype",
+    "application/ttf", "application/vnd.apple.mpegurl", "application/vnd.mapbox-vector-tile",
+    "application/vnd.ms-fontobject", "application/wasm", "application/xhtml+xml", "application/xml",
+    "application/x-font-opentype", "application/x-font-truetype", "application/x-font-ttf",
+    "application/x-httpd-cgi", "application/x-javascript", "application/x-mpegurl", "application/x-opentype",
+    "application/x-otf", "application/x-perl", "application/x-ttf", "font/eot", "font/opentype", "font/otf",
+    "font/ttf", "image/svg+xml", "text/css", "text/csv", "text/html", "text/javascript", "text/js", "text/plain",
+    "text/richtext", "text/tab-separated-values", "text/xml", "text/x-component", "text/x-java-source",
+    "text/x-script", "vnd.apple.mpegurl",
+))
+
+
+def _accept_encoding_formats(behavior: dict) -> tuple:
+    """The encodings whose Accept-Encoding CloudFront normalizes: the cache policy's, or Gzip for legacy compression."""
+    if behavior.get("cache_policy_id"):
+        params = cache_policy_params(behavior["cache_policy_id"]) or {}
+        return tuple(name for name, key in (("br", "EnableAcceptEncodingBrotli"), ("gzip", "EnableAcceptEncodingGzip"))
+                     if params.get(key))
+    return ("gzip",) if behavior.get("compress") else ()
+
+
+def _accepted_encodings(accept_encoding: str, formats: tuple) -> list:
+    """The viewer's encodings among ``formats``, as CloudFront normalizes them: br before gzip."""
+    tokens = set()
+    for part in (accept_encoding or "").split(","):
+        name, _, params = part.partition(";")
+        q = next((p.split("=", 1)[1].strip() for p in params.split(";") if p.strip().lower().startswith("q=")), "1")
+        try:
+            accepted = float(q) > 0
+        except ValueError:
+            accepted = True
+        if accepted:
+            tokens.add(name.strip().lower())
+    return [name for name in ("br", "gzip") if name in formats and name in tokens]
+
+
+def _viewer_compression(formats: tuple, accepted: list):
+    """Brotli when the viewer takes both (Developer Guide, "How CloudFront compression works")."""
+    if "br" in formats and "br" in accepted and brotli is not None:
+        return "br"
+    if "gzip" in formats and "gzip" in accepted:
+        return "gzip"
+    return None
+
+
+def _compress_response(status: int, headers: dict, body: bytes, encoding: str) -> tuple:
+    """Compress an origin response when CloudFront's conditions for compression hold."""
+    if status not in (200, 403, 404) or not body or "content-encoding" in headers:
+        return headers, body
+    try:
+        length = int(str(headers.get("content-length", "")).strip())
+    except ValueError:
+        return headers, body
+    if not 1000 <= length <= 10_000_000:
+        return headers, body
+    if str(headers.get("content-type", "")).split(";", 1)[0].strip().lower() not in _COMPRESSIBLE_CONTENT_TYPES:
+        return headers, body
+    compressed = brotli.compress(body) if encoding == "br" else gzip.compress(body)
+    headers = dict(headers)
+    headers["content-encoding"] = encoding
+    # Observed on AWS: a compressed response carries no Content-Length.
+    headers.pop("content-length", None)
+    etag = headers.get("etag")
+    if isinstance(etag, str):
+        if etag.startswith('"') and etag.endswith('"') and len(etag) > 1:
+            headers["etag"] = "W/" + etag
+        elif not etag.startswith("W/"):
+            headers.pop("etag")
+    return headers, compressed
 
 
 def _strip_hop_by_hop_response_headers(headers: dict) -> dict:
@@ -6352,16 +6454,18 @@ def _check_stacked_distribution(headers: dict):
 
 
 async def handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
-                          headers: dict, body: bytes, query_params: dict, client_ip: str = "127.0.0.1") -> tuple:
+                          headers: dict, body: bytes, query_params: dict, client_ip: str = "127.0.0.1",
+                          http_version: str = "1.1") -> tuple:
     """Serve one viewer request against ``dist`` (a cloudfront.py distribution record) in its owner's account."""
     owner = next((account for (account, _), d in _distributions.to_dict().items() if d is dist), get_account_id())
     with request_scope(owner, get_region()):
         return await _handle_viewer_request(dist, method, path, raw_uri, raw_query_string, headers, body,
-                                            query_params, client_ip)
+                                            query_params, client_ip, http_version)
 
 
 async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: str, raw_query_string: str,
-                                 headers: dict, body: bytes, query_params: dict, client_ip: str) -> tuple:
+                                 headers: dict, body: bytes, query_params: dict, client_ip: str,
+                                 http_version: str = "1.1") -> tuple:
     stacked_response = _check_stacked_distribution(headers)
     if stacked_response is not None:
         return stacked_response
@@ -6386,6 +6490,9 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
         return methods_response
 
     request_headers = dict(headers)
+    if http_version == "1.0":
+        # Developer Guide, "Serve compressed files": an HTTP 1.0 request loses its Accept-Encoding.
+        request_headers.pop("accept-encoding", None)
     request_uri = _apply_default_root_object(parsed.get("default_root_object", ""), raw_uri)
     request_query = dict(query_params or {})
     literal_query_string = None  # set when a function rearranges querystring into a literal string
@@ -6459,6 +6566,14 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
         fwd_headers["user-agent"] = "Amazon CloudFront"
     if forward_host:
         fwd_headers["host"] = request_headers.get("host", "")
+    encoding_formats = _accept_encoding_formats(behavior)
+    compression_formats = encoding_formats if behavior.get("compress") else ()
+    accepted_encodings = _accepted_encodings(request_headers.get("accept-encoding", ""), encoding_formats)
+    if encoding_formats:
+        # Developer Guide, "Compression support": a normalized Accept-Encoding, identity when nothing matches.
+        fwd_headers.pop("accept-encoding", None)
+        if "accept-encoding" in request_headers:
+            fwd_headers["accept-encoding"] = ",".join(accepted_encodings) or "identity"
     cookie_pairs = [f"{name}={field['value']}" for name, field in request_cookies.items() if cookie_allowed(name)]
     if cookie_pairs:
         fwd_headers["cookie"] = "; ".join(cookie_pairs)
@@ -6502,6 +6617,9 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
         return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
 
     origin_headers = _strip_hop_by_hop_response_headers(origin_headers)
+    encoding = _viewer_compression(compression_formats, accepted_encodings)
+    if encoding:
+        origin_headers, origin_body = _compress_response(status, origin_headers, origin_body, encoding)
     policy_cfg = response_headers_policy_config(behavior.get("response_headers_policy_id"))
     response_headers = _apply_response_headers_policy(
         origin_headers, policy_cfg, request_headers.get("origin", ""), method,
