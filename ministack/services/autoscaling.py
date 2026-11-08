@@ -77,6 +77,11 @@ def _restore_state(data):
     _clear_state()
     _asgs.update(data.get("asgs", {}))
     _launch_configs.update(data.get("launch_configs", {}))
+    # v1.5.38 saved DesiredCapacityType "units" on every group. A group without a MixedInstancesPolicy never
+    # has a type on AWS (captured, us-east-2, 2026-11-05), so restored state drops it there.
+    for asg in _asgs.all_values():
+        if not asg.get("MixedInstancesPolicy"):
+            asg["DesiredCapacityType"] = None
 
     asg_regions = {
         (account_id, asg_name): region
@@ -203,8 +208,10 @@ def _xml(status, root_tag, inner):
 def _error(code, message, status=400):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if status < 500 else "Receiver"
+    # An empty message has no <Message> element (AWS MalformedInput for a non-numeric value).
+    message_xml = f"<Message>{escape(message)}</Message>" if message else ""
     body = (f'<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">'
-            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{escape(message)}</Message></Error>'
+            f'<Error><Type>{fault_type}</Type><Code>{code}</Code>{message_xml}</Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
@@ -307,6 +314,9 @@ def _launch_template_spec(p):
 
 _SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
                  "MixedInstancesPolicy parameter.")
+# UpdateAutoScalingGroup words it without InstanceId (captured, us-east-2, 2026-11-05).
+_UPDATE_SOURCE_ERROR = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName or "
+                        "MixedInstancesPolicy parameter.")
 _INSTANCES_DISTRIBUTION_DEFAULTS = {
     "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
     "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price",
@@ -443,14 +453,13 @@ _GROUP_MEMBERS = (
     "AvailabilityZoneIds",
 )
 _GROUP_UPDATE_MEMBERS = tuple(m for m in _GROUP_MEMBERS if m not in ("LoadBalancerNames", "TargetGroupARNs",
-                                                                      "TrafficSources"))
+                                                                      "TrafficSources", "DesiredCapacityType"))
 
 
 def _group_defaults():
     return {
         "ServiceLinkedRoleARN": (f"arn:aws:iam::{get_account_id()}:role/aws-service-role/"
                                  "autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"),
-        "DesiredCapacityType": "units",
         "DeletionProtection": "none",
         "AvailabilityZoneDistribution": {"CapacityDistributionStrategy": "balanced-best-effort"},
     }
@@ -460,6 +469,81 @@ def _group_members_xml(asg):
     shape = _model_shape("AutoScalingGroup")
     return "".join(f"<{m}>{_shape_xml(asg[m], shape.members[m])}</{m}>"
                    for m in _GROUP_MEMBERS if asg.get(m) not in (None, ""))
+
+
+_DESIRED_CAPACITY_TYPES = ("vcpu", "memory-mib", "units")
+_REQUIREMENT_CAPACITY_TYPES = ("vcpu", "memory-mib")    # need InstanceRequirements
+
+
+def _length_constraint(p, member, wire_name):
+    value = _p(p, member)
+    if value == "":
+        return f"Value '' at '{wire_name}' failed to satisfy constraint: Member must have length greater than or equal to 1"
+    if len(value) > 255:
+        return (f"Value '{value}' at '{wire_name}' failed to satisfy constraint: "
+                "Member must have length less than or equal to 255")
+    return None
+
+
+def _constraint_error(p):
+    """AWS's request constraint errors for DesiredCapacityType and AutoScalingGroupName (missing name, empty,
+    longer than 255), reported together and before the launch source checks (captured, us-east-2, 2026-11-05)."""
+    errors = []
+    if _has_member(p, "DesiredCapacityType"):
+        errors.append(_length_constraint(p, "DesiredCapacityType", "desiredCapacityType"))
+    if not _has_member(p, "AutoScalingGroupName"):
+        errors.append("Value null at 'autoScalingGroupName' failed to satisfy constraint: Member must not be null")
+    else:
+        errors.append(_length_constraint(p, "AutoScalingGroupName", "autoScalingGroupName"))
+    errors = [e for e in errors if e]
+    if not errors:
+        return None
+    return f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: {'; '.join(errors)}"
+
+
+def _capacity_type_value_error(p):
+    value = _p(p, "DesiredCapacityType")
+    if value and value not in _DESIRED_CAPACITY_TYPES:
+        return (f"Invalid DesiredCapacityType value '{value}', it should be one of "
+                f"{', '.join(_DESIRED_CAPACITY_TYPES)}")
+    return None
+
+
+# DesiredCapacityType as AWS handles it (captured, us-east-2, 2026-11-05): only a group with a
+# MixedInstancesPolicy has one; "units" on an update takes effect only with a MixedInstancesPolicy; vcpu and
+# memory-mib need InstanceRequirements, in the policy's overrides or, without overrides, its launch template.
+def _template_has_requirements(spec):
+    from ministack.services import ec2
+
+    record = ec2._launch_templates.get(spec.get("LaunchTemplateId") or "")
+    if not record:
+        return False
+    version = spec.get("Version") or "$Default"
+    number = {"$Default": record.get("DefaultVersionNumber"), "$Latest": record.get("LatestVersionNumber")}.get(
+        version, version)
+    data = next((v.get("LaunchTemplateData") or {} for v in record.get("Versions", [])
+                 if str(v.get("VersionNumber")) == str(number)), {})
+    return bool(data.get("InstanceRequirements"))
+
+
+def _has_instance_requirements(mixed):
+    launch_template = (mixed or {}).get("LaunchTemplate") or {}
+    overrides = launch_template.get("Overrides") or []
+    if overrides:
+        return any(o.get("InstanceRequirements") for o in overrides)
+    return _template_has_requirements(launch_template.get("LaunchTemplateSpecification") or {})
+
+
+def _capacity_type_requirements_error(capacity_type, mixed, operation):
+    if capacity_type not in _REQUIREMENT_CAPACITY_TYPES or _has_instance_requirements(mixed):
+        return None
+    if operation == "create":
+        return (f"The DesiredCapacityType {capacity_type} is only allowed in mixed instances groups containing "
+                "InstanceRequirements. Please include a MixedInstancesPolicy with InstanceRequirements for your "
+                "group and try again.")
+    return (f"The DesiredCapacityType {capacity_type} is only allowed in mixed instances groups using instance "
+            "requirements. Please include instance requirements in the launch template or launch template "
+            "overrides and try again.")
 
 
 def _launch_template_xml(lt):
@@ -494,21 +578,207 @@ def _instances_xml(asg):
     return "<Instances>" + "".join(_instance_member_xml(i) for i in asg["Instances"]) + "</Instances>"
 
 
+_OVERRIDES_PREFIX = "MixedInstancesPolicy.LaunchTemplate.Overrides.member."
+_OVERRIDE_SHAPE_ERROR = "A launch template override must contain one of InstanceType or InstanceRequirements"
+_OVERRIDE_MIX_ERROR = ("You cannot mix single instance and instance requirements launch template override in the "
+                       "same mixed instance policy. Remove the launch template overrides that use single instance "
+                       "types, or the ones using instance requirements.")
+_OVERRIDE_BOTH_ERROR = ("The parameter InstanceType cannot be used in a launch template override using instance "
+                        "requirements.")
+_OVERRIDE_WEIGHT_ERROR = ("Not all instance types have a defined WeightedCapacity. Specify missing weights, or "
+                          "remove all weights, and try again.")
+_LTNC_ERROR = ("The launch template is not compatible with the configuration of the Auto Scaling group. This launch "
+               "template can only be used if MixedInstancesPolicy is set on the Auto Scaling group. Specify the "
+               "MixedInstancesPolicy parameter or use a launch template that contains the InstanceType parameter "
+               "instead of the InstanceRequirements parameter, and try again.")
+
+
+def _duplicate_type_error(types):
+    """AWS names every InstanceType sent more than once, in the order each is first detected as a repeat, that is
+    at its second occurrence (captured, us-east-2, 2026-11-06: edges3 d-c-abba, d-c-baab, d-c-abccb)."""
+    seen, duplicated = set(), []
+    for t in types:
+        if t in seen and t not in duplicated:
+            duplicated.append(t)
+        seen.add(t)
+    if not duplicated:
+        return None
+    return ("Cannot add same instance type override more than once. Remove these duplicates from the request "
+            f"and try again: [{', '.join(duplicated)}]")
+
+
+_REQUIREMENT_NUMBERS = ("VCpuCount.Min", "VCpuCount.Max", "MemoryMiB.Min", "MemoryMiB.Max")
+
+
+def _scan_overrides(p):
+    """The override entries sent, from the numbering alone: ({index: {member names}}, {index: InstanceType},
+    modelled). Nothing proportional to the highest index is allocated. *modelled* is False for input whose
+    AWS answer is a field-level or wire-format error that is not reproduced (a scalar where a structure belongs,
+    an empty InstanceType, InstanceRequirements without MemoryMiB or VCpuCount, non-numeric requirement values);
+    those requests get no override checks, as before the checks existed."""
+    members, types, requirement_parts, modelled, illegal = {}, {}, {}, True, None
+    for key, value in p.items():
+        if not key.startswith(_OVERRIDES_PREFIX):
+            continue
+        index, _, rest = key[len(_OVERRIDES_PREFIX):].partition(".")
+        if not index.isdigit():
+            continue
+        value = _p(p, key)      # a repeated key counts once, as _query_value reads it
+        significant = index.lstrip("0")
+        if len(significant) > _MAX_LISTED_DIGITS or significant == "9" * _MAX_LISTED_DIGITS:
+            # Compared as text, never through int(): the digit string is untrusted and can be thousands long.
+            illegal = illegal or index
+            continue
+        try:
+            number = int(index)
+        except ValueError:      # more digits than int() converts
+            continue
+        parts = rest.split(".")
+        name = parts[0]
+        members.setdefault(number, set()).add(name)
+        if (not rest and value) or (name in ("InstanceRequirements", "LaunchTemplateSpecification") and len(parts) == 1):
+            modelled = False
+        elif name == "" and not value:      # a blank member.N= is an entry with no member (edges3 e-u-wire-member1-blank)
+            pass
+        elif name == "WeightedCapacity" and not value:     # blank: a field-length error first (edges3 b-c-blank-wc-*)
+            modelled = False
+        elif name == "InstanceType":
+            types[number] = value
+            modelled = modelled and bool(value)
+        elif name == "InstanceRequirements":
+            requirement_parts.setdefault(number, set()).add(parts[1])
+            if ".".join(parts[1:]) in _REQUIREMENT_NUMBERS and not str(value).isdigit():
+                modelled = False
+    for number, present in requirement_parts.items():
+        if not {"VCpuCount", "MemoryMiB"} <= present:
+            modelled = False
+    return members, types, modelled, illegal
+
+
+# AWS reads a member index below 999,999,999 as a position (sparse-list error above a gap of 10) and refuses
+# 999,999,999 and above as "Index N is illegal" (captured, us-east-2, 2026-11-06: edges8 h8-*, edges7 h7-*). The range
+# between 99,999,999 and 999,999,999 is not captured, so the sparse error is kept there.
+_MAX_LISTED_DIGITS = 9
+
+
+_INTEGER_REQUIREMENTS = ("VCpuCount", "MemoryMiB", "NetworkInterfaceCount", "BaselineEbsBandwidthMbps",
+                         "AcceleratorCount", "AcceleratorTotalMemoryMiB")
+_DECIMAL_REQUIREMENTS = ("MemoryGiBPerVCpu", "TotalLocalStorageGB", "NetworkBandwidthGbps")
+_REQUIREMENT_KEY = re.compile(r"\.InstanceRequirements\.(\w+)\.(Min|Max)$")
+_INTEGER = re.compile(r"-?[0-9]+")
+_DECIMAL = re.compile(r"-?([0-9]+\.?[0-9]*|\.[0-9]+)")
+
+
+def _malformed_number_error(p):
+    """The message of the MalformedInput AWS answers for a non-numeric wire value, or None. It covers the group size
+    parameters and every numeric InstanceRequirements field, and comes right after the index errors, before every
+    other check (captured, us-east-2, 2026-11-06: edges7 b7-*, g7-*; the order against the index errors is not
+    captured). The message is empty, except for a blank VCpuCount.Min (b7-create-vcpumin-blank)."""
+    for key, value in p.items():
+        value = _p(p, key)
+        if key in ("MinSize", "MaxSize", "DesiredCapacity"):
+            if value != "" and not _INTEGER.fullmatch(value):
+                return ""
+        elif match := _REQUIREMENT_KEY.search(key):
+            if value == "" and key.endswith(".VCpuCount.Min"):
+                return "missing value for decimal type"
+            if match[1] in _INTEGER_REQUIREMENTS and value != "" and not _INTEGER.fullmatch(value):
+                return ""
+            if match[1] in _DECIMAL_REQUIREMENTS and value != "" and not _DECIMAL.fullmatch(value):
+                return ""
+    return None
+
+
+def _override_numbering_error(members, illegal=None):
+    """Index 0 is refused, and so is a gap that skips 11 or more list elements: with the present indexes sorted
+    ascending and the previous one starting at 1, an index i after p skips i - p (captured, us-east-2, 2026-11-06:
+    single index 12 gives 11, 21 gives 20, {1,60} gives 59, edges4 q-c-*; dense lists up to 40 are accepted, edges4
+    p-c-dense-*). The count carries thousands separators. The first offending gap in ascending index order is
+    reported, whatever the wire order (edges5 g-c-*, g-u-1-20-40, i-c-41-sparse-1-40-and-60). These errors come before every other check, the group-name
+    constraint and the source check included (edges4 r-*, s-u-*)."""
+    if 0 in members:
+        return "MalformedInput", "0 is not a valid index"
+    previous = 1
+    for index in sorted(members):
+        if index - previous >= 11:
+            return "MalformedInput", f"Excessively sparse input would skip {index - previous:,} list elements"
+        previous = index
+    if illegal:
+        return "MalformedInput", f"Index {illegal} is illegal"
+    return None
+
+
+_OVERRIDE_COUNT_ERROR = "The number of LaunchTemplateOverrides must be fewer than 40."
+_UPDATE_OVERRIDE_COUNT_ERROR = "The number of LaunchTemplateOverrides must be between 1 and 40."
+
+
+def _override_shape_error(p, scan, count_error=None):
+    """(code, message) for a bad override list (captured, us-east-2, 2026-11-05/06). Order: a duplicated InstanceType; partial WeightedCapacity; then the entries in index
+    order, the first wrong one decides (neither InstanceType nor InstanceRequirements, or both); then InstanceType
+    entries mixed with InstanceRequirements ones. A gap in the numbering is an empty override; the shared
+    _query_value parser is left alone."""
+    members, types, modelled = scan[:3]
+    if not members or not modelled:
+        return None
+    # More than 40 overrides: AWS counts the list size, the highest index, not the entries present (edges7 a7-*:
+    # {1,11,21,31,41} and 1..40 plus 50 are refused; 40 are accepted). On create (edges5 i-c-41-*, edges4 p-c-dense-41, edges6 c6-41-*) it
+    # comes after the source and DesiredCapacityType errors; on update (edges6 u6-41-*) after the index, name
+    # constraint and source errors and before the DesiredCapacityType enum. Either way before the duplicate,
+    # neither, mix and weight errors and before every lookup.
+    if count_error and max(members) > 40:
+        return "ValidationError", count_error
+    if duplicate_error := _duplicate_type_error([types[i] for i in sorted(types)]):
+        return "ValidationError", duplicate_error
+    entries = [members.get(index, set()) for index in range(1, max(members) + 1)]
+    weighted = sum("WeightedCapacity" in present for present in entries)
+    if 0 < weighted < len(entries):
+        return "ValidationError", _OVERRIDE_WEIGHT_ERROR
+    for present in entries:
+        has_type, has_requirements = "InstanceType" in present, "InstanceRequirements" in present
+        if not (has_type or has_requirements):
+            return "ValidationError", _OVERRIDE_SHAPE_ERROR
+        if has_type and has_requirements:
+            return "ValidationError", _OVERRIDE_BOTH_ERROR
+    if any("InstanceType" in present for present in entries) and any(
+            "InstanceRequirements" in present for present in entries):
+        return "ValidationError", _OVERRIDE_MIX_ERROR
+    return None
+
+
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
-    if not name:
-        return _error("ValidationError", "AutoScalingGroupName is required")
-    if name in _asgs:
-        return _error("AlreadyExists", f"AutoScalingGroup {name} already exists")
-    sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")]
-    if all(sources) or not (any(sources) or _p(p, "LaunchConfigurationName") or _p(p, "InstanceId")):
+    scan = _scan_overrides(p)
+    if numbering_error := _override_numbering_error(scan[0], scan[3]):
+        return _error(*numbering_error)
+    if (malformed := _malformed_number_error(p)) is not None:
+        return _error("MalformedInput", malformed)
+    if constraint_error := _constraint_error(p):
+        return _error("ValidationError", constraint_error)
+    sources = [_has_member(p, m) for m in ("LaunchTemplate", "MixedInstancesPolicy")] + [
+        bool(_p(p, "LaunchConfigurationName"))]
+    if sum(sources) > 1 or not (any(sources) or _p(p, "InstanceId")):
         return _error("ValidationError", _SOURCE_ERROR)
+    if value_error := _capacity_type_value_error(p):
+        return _error("ValidationError", value_error)
+    if shape_error := _override_shape_error(p, scan, _OVERRIDE_COUNT_ERROR):
+        return _error(*shape_error)
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
-    mixed, mixed_error = _mixed_instances_policy(p)
+    try:
+        mixed, mixed_error = _mixed_instances_policy(p)
+    except ValueError:      # a non-numeric requirement value (edges4 v-c-memory-max-abc)
+        return _error("MalformedInput", "")
     if mixed_error:
         return _error("ValidationError", mixed_error)
+    capacity_type = _p(p, "DesiredCapacityType") or None
+    if launch_template and not _p(p, "InstanceId") and _template_has_requirements(launch_template):
+        return _error("InvalidQueryParameter", _LTNC_ERROR)
+    if requirements_error := _capacity_type_requirements_error(capacity_type, mixed, "create"):
+        return _error("ValidationError", requirements_error)
+    if name in _asgs:
+        return _error("AlreadyExists", "AutoScalingGroup by this name already exists - A group with the name "
+                                       f"{name} already exists")
 
     arn = _asg_arn(name)
     _asgs[name] = {
@@ -530,6 +800,7 @@ def _create_asg(p):
         "NewInstancesProtectedFromScaleIn": _p(p, "NewInstancesProtectedFromScaleIn") == "true",
         **_group_defaults(),
         **_input_members(p, "CreateAutoScalingGroup", _GROUP_MEMBERS),
+        "DesiredCapacityType": capacity_type if mixed else None,
         "Tags": [],
         "Status": "",
     }
@@ -611,17 +882,53 @@ def _describe_asgs(p):
 
 def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
+    scan = _scan_overrides(p)
+    if numbering_error := _override_numbering_error(scan[0], scan[3]):
+        return _error(*numbering_error)
+    if (malformed := _malformed_number_error(p)) is not None:
+        return _error("MalformedInput", malformed)
+    if constraint_error := _constraint_error(p):
+        return _error("ValidationError", constraint_error)
+    # Any two of LaunchTemplate, MixedInstancesPolicy and LaunchConfigurationName (captured, us-east-2, 2026-11-06:
+    # edges3 u-mip-and-lc, u-lt-it-and-lc, u-all-three, u-lt-ir-and-lc-vcpu).
+    if sum([_has_member(p, "LaunchTemplate"), _has_member(p, "MixedInstancesPolicy"),
+            bool(_p(p, "LaunchConfigurationName"))]) > 1:
+        return _error("ValidationError", _UPDATE_SOURCE_ERROR)
+    # On update every override error, duplicate InstanceTypes included, comes before the DesiredCapacityType
+    # enum check (a-* captures; d-u-aa-* carry no enum value).
+    if shape_error := _override_shape_error(p, scan, _UPDATE_OVERRIDE_COUNT_ERROR):
+        return _error(*shape_error)
+    if value_error := _capacity_type_value_error(p):
+        return _error("ValidationError", value_error)
     asg = _asgs.get(name)
     if not asg:
-        return _error("ValidationError", f"AutoScalingGroup {name} not found")
-    if _has_member(p, "LaunchTemplate") and _has_member(p, "MixedInstancesPolicy"):
-        return _error("ValidationError", _SOURCE_ERROR)
+        # UpdateAutoScalingGroup's text for a missing group (captured, us-east-2, 2026-11-05).
+        return _error("ValidationError", "AutoScalingGroup name not found - null")
     launch_template, lt_error = _launch_template_spec(p)
     if lt_error:
         return _error("ValidationError", lt_error)
-    mixed, mixed_error = _mixed_instances_policy(p, asg.get("MixedInstancesPolicy"))
+    try:
+        mixed, mixed_error = _mixed_instances_policy(p, asg.get("MixedInstancesPolicy"))
+    except ValueError:      # a non-numeric requirement value (edges4 v-u-vcpu-min-abc)
+        return _error("MalformedInput", "")
     if mixed_error:
         return _error("ValidationError", mixed_error)
+    sent_type = _p(p, "DesiredCapacityType") or None
+    replaces_source = launch_template or _p(p, "LaunchConfigurationName")
+    final_mixed = mixed or (None if replaces_source else asg.get("MixedInstancesPolicy"))
+    # The stored type is checked again only when the launch source changes (captured, us-east-2, 2026-11-05).
+    source_changed = replaces_source or _has_member(p, "MixedInstancesPolicy.LaunchTemplate")
+    checked_type = sent_type or (asg.get("DesiredCapacityType") if source_changed else None)
+    if requirements_error := _capacity_type_requirements_error(checked_type, final_mixed, "update"):
+        return _error("ValidationError", requirements_error)
+    if launch_template and _template_has_requirements(launch_template):
+        return _error("InvalidQueryParameter", _LTNC_ERROR)
+    if not final_mixed:
+        capacity_type = None
+    elif sent_type and (sent_type != "units" or mixed):
+        capacity_type = sent_type
+    else:
+        capacity_type = asg.get("DesiredCapacityType")
     if mixed:
         asg["MixedInstancesPolicy"] = mixed
         asg["LaunchTemplate"] = {}
@@ -649,6 +956,7 @@ def _update_asg(p):
     if _p(p, "NewInstancesProtectedFromScaleIn"):
         asg["NewInstancesProtectedFromScaleIn"] = _p(p, "NewInstancesProtectedFromScaleIn") == "true"
     asg.update(_input_members(p, "UpdateAutoScalingGroup", _GROUP_UPDATE_MEMBERS))
+    asg["DesiredCapacityType"] = capacity_type
     if launch_template:
         asg["LaunchTemplate"] = launch_template
     _reconcile_instances(asg)
