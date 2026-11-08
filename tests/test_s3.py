@@ -13674,3 +13674,34 @@ def test_s3_kms_writes_to_another_accounts_bucket_contract(auth_enabled):
         for item in owner.list_objects_v2(Bucket=bucket).get("Contents", []):
             owner.delete_object(Bucket=bucket, Key=item["Key"])
         owner.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_signature_condition_keys_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """s3:signatureversion and s3:authType hold AWS's values for a SigV4 header-signed request."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    client = user.client("s3")
+    for condition, allowed in (({"StringNotEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}}, True),
+                               ({"StringNotEquals": {"s3:authType": "REST-HEADER"}}, True),
+                               ({"StringEquals": {"s3:authType": "REST-QUERY-STRING"}}, True),
+                               ({"NumericGreaterThan": {"s3:signatureAge": "600000"}}, True),
+                               ({"StringEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}}, False)):
+        bucket = auth_condition_bucket(user.arn, "s3:PutObject", condition)
+        _assert_s3_condition(auth_enabled, allowed, lambda: client.put_object(Bucket=bucket, Key="sig", Body=b"x"))
+
+
+@pytest.mark.auth_contract
+def test_s3_storage_class_and_request_tag_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    client = user.client("s3")
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {"s3:x-amz-storage-class": "STANDARD"}})
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+        Bucket=bucket, Key="standard", Body=b"x", StorageClass="STANDARD"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+        Bucket=bucket, Key="ia", Body=b"x", StorageClass="STANDARD_IA"))
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {"s3:RequestObjectTag/env": "prod"}})
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+        Bucket=bucket, Key="prod", Body=b"x", Tagging="env=prod&team=a"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+        Bucket=bucket, Key="dev", Body=b"x", Tagging="env=dev"))
+

@@ -3143,6 +3143,7 @@ async def _dispatch_service_request(
             extract_resource_arn,
             iot_resource_arns,
             logs_service_context,
+            request_field_context,
             request_tag_context,
             s3_access_point_resources,
             s3_foreign_denial_message,
@@ -3193,6 +3194,7 @@ async def _dispatch_service_request(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
             service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **request_field_context(service, iam_action, body, routing_params, region),
                                **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.

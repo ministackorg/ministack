@@ -2796,8 +2796,8 @@ def _totp_code(secret_b32: str) -> str:
 
 
 def test_cognito_totp_full_flow(cognito_idp):
-    """Full TOTP MFA flow: SetUserPoolMfaConfig ON → AssociateSoftwareToken →
-    VerifySoftwareToken → InitiateAuth returns SOFTWARE_TOKEN_MFA challenge →
+    """Full TOTP MFA flow: SetUserPoolMfaConfig ON → InitiateAuth returns MFA_SETUP →
+    AssociateSoftwareToken / VerifySoftwareToken on its session → SOFTWARE_TOKEN_MFA challenge →
     RespondToAuthChallenge with any code returns tokens."""
     pid = cognito_idp.create_user_pool(PoolName="qa-totp-full")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
@@ -2820,29 +2820,40 @@ def test_cognito_totp_full_flow(cognito_idp):
     cognito_idp.admin_create_user(UserPoolId=pid, Username="totp-user", TemporaryPassword="TmpPass1!")
     cognito_idp.admin_set_user_password(UserPoolId=pid, Username="totp-user", Password="PermPass1!", Permanent=True)
 
-    # Enroll TOTP: associate → get tokens first (MFA not yet enrolled, pool is ON but no enrollment)
-    # Pool ON with no enrollment → auth succeeds so user can enroll
+    # Pool ON with no enrolment: AWS answers MFA_SETUP, and enrolment runs on its session (no access token yet).
     auth = cognito_idp.admin_initiate_auth(
         UserPoolId=pid,
         ClientId=cid,
         AuthFlow="ADMIN_USER_PASSWORD_AUTH",
         AuthParameters={"USERNAME": "totp-user", "PASSWORD": "PermPass1!"},
     )
-    access_token = auth["AuthenticationResult"]["AccessToken"]
+    assert auth["ChallengeName"] == "MFA_SETUP" and "AuthenticationResult" not in auth
+    assert auth["ChallengeParameters"]["MFAS_CAN_SETUP"] == '["SOFTWARE_TOKEN_MFA"]'
 
-    # Associate software token
-    assoc = cognito_idp.associate_software_token(AccessToken=access_token)
+    # Answering MFA_SETUP before enrolling gives no tokens.
+    again = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pid, ClientId=cid, ChallengeName="MFA_SETUP", Session=auth["Session"],
+        ChallengeResponses={"USERNAME": "totp-user"})
+    assert again["ChallengeName"] == "MFA_SETUP" and "AuthenticationResult" not in again
+
+    assoc = cognito_idp.associate_software_token(Session=again["Session"])
     assert "SecretCode" in assoc
     assert len(assoc["SecretCode"]) > 0
 
     # A wrong code is refused — that refusal is what an MFA test exists for.
     with pytest.raises(ClientError) as exc:
-        cognito_idp.verify_software_token(AccessToken=access_token, UserCode="000000")
+        cognito_idp.verify_software_token(Session=assoc["Session"], UserCode="000000")
     assert exc.value.response["Error"]["Code"] == "EnableSoftwareTokenMFAException"
 
     verify = cognito_idp.verify_software_token(
-        AccessToken=access_token, UserCode=_totp_code(assoc["SecretCode"]))
+        Session=assoc["Session"], UserCode=_totp_code(assoc["SecretCode"]))
     assert verify["Status"] == "SUCCESS"
+
+    # MFA_SETUP answered with VerifySoftwareToken's session: AWS then asks for a code.
+    setup = cognito_idp.admin_respond_to_auth_challenge(
+        UserPoolId=pid, ClientId=cid, ChallengeName="MFA_SETUP", Session=verify["Session"],
+        ChallengeResponses={"USERNAME": "totp-user", "SESSION": verify["Session"]})
+    assert setup["ChallengeName"] == "SOFTWARE_TOKEN_MFA"
 
     # Now auth should return SOFTWARE_TOKEN_MFA challenge
     auth2 = cognito_idp.admin_initiate_auth(
@@ -14953,5 +14964,62 @@ def test_hosted_ui_asks_for_a_new_password_before_totp_enrolment(cognito_idp):
         status, _h, body = _post_form(f"{ENDPOINT}/login", {"np_token": np_token, "new_password": "NewPass1!",
                                                             "confirm_password": "NewPass1!"})
         assert status == 200 and "Set up authenticator app MFA" in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_mfa_lockout_is_per_user_not_per_session(cognito_idp):
+    """AWS locks the user, not the sign-in: a fresh sign-in after five wrong codes is still locked."""
+    pool_id, cid = _totp_pool(cognito_idp)
+    try:
+        secret = _enrol_totp_by_api(cognito_idp, cid)
+        status, _h, body = _hosted_sign_in(cid)
+        mfa_token = _hidden(body.decode(), "mfa_token")
+        for _ in range(5):
+            _hosted_mfa(mfa_token, cid, authentication_code="000000")
+        status, _h, body = _hosted_sign_in(cid)
+        status, _h, body = _hosted_mfa(_hidden(body.decode(), "mfa_token"), cid, authentication_code=_totp_code(secret))
+        assert status == 200 and "User temporarily locked." in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_hosted_ui_refuses_required_mfa_without_a_usable_factor(cognito_idp):
+    """MFA required, TOTP off and no SMS: AWS refuses the sign-in instead of letting the user in."""
+    pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=False, mfa_configuration="OPTIONAL")
+    cid = client["ClientId"]
+    try:
+        cognito_idp.set_user_pool_mfa_config(UserPoolId=pool_id, MfaConfiguration="ON",
+                                             SoftwareTokenMfaConfiguration={"Enabled": False})
+        for attributes in ([], [{"Name": "phone_number", "Value": "+447700900100"}]):
+            if attributes:
+                cognito_idp.admin_update_user_attributes(UserPoolId=pool_id, Username="testuser",
+                                                         UserAttributes=attributes)
+            status, headers, _body = _hosted_sign_in(cid)
+            assert status == 400 and "code=" not in headers.get("location", "")
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_totp_enrolled_on_the_hosted_page_is_asked_for_by_the_api(cognito_idp):
+    pool_id, cid = _totp_pool(cognito_idp, mfa="ON")
+    try:
+        _enrol_on_the_hosted_page(cid, "testuser")
+        resp = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                                         AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"})
+        assert resp.get("ChallengeName") == "SOFTWARE_TOKEN_MFA" and "AuthenticationResult" not in resp
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_software_token_mfa_answer_from_a_user_who_never_enrolled_is_refused(cognito_idp):
+    pool_id, cid = _totp_pool(cognito_idp, mfa="ON")
+    try:
+        assert cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+            "USERNAME": "testuser", "PASSWORD": "TestPass1!"})["ChallengeName"] == "MFA_SETUP"
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.respond_to_auth_challenge(ClientId=cid, ChallengeName="SOFTWARE_TOKEN_MFA", ChallengeResponses={
+                "USERNAME": "testuser", "SOFTWARE_TOKEN_MFA_CODE": "123456"})
+        assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pool_id)

@@ -26,6 +26,8 @@ import time
 from decimal import Decimal
 from xml.sax.saxutils import escape
 
+from ministack.core.query_protocol import DECIMAL, INTEGER, member_index, member_numbering_error
+from ministack.core.query_protocol import query_value as _query_value
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -332,36 +334,6 @@ def _model_shape(name):
     return _MODEL.shape_for(name)
 
 
-def _query_value(params, prefix, shape):
-    """A Query-protocol member under *prefix*, typed by its botocore shape, or None when absent."""
-    if shape.type_name == "structure":
-        out = {}
-        for member, member_shape in shape.members.items():
-            value = _query_value(params, f"{prefix}.{member}", member_shape)
-            if value is not None:
-                out[member] = value
-        return out or None
-    if shape.type_name == "list":
-        items, i = [], 1
-        while True:
-            value = _query_value(params, f"{prefix}.member.{i}", shape.member)
-            if value is None:
-                break
-            items.append(value)
-            i += 1
-        return items or None
-    if prefix not in params:
-        return None
-    raw = _p(params, prefix)
-    if shape.type_name == "integer":
-        return int(raw)
-    if shape.type_name in ("double", "float"):
-        return float(raw)
-    if shape.type_name == "boolean":
-        return raw.lower() == "true"
-    return raw
-
-
 def _shape_xml(value, shape):
     if shape.type_name == "structure":
         return "".join(f"<{k}>{_shape_xml(value[k], shape.members[k])}</{k}>" for k in shape.members if k in value)
@@ -624,14 +596,9 @@ def _scan_overrides(p):
         if not index.isdigit():
             continue
         value = _p(p, key)      # a repeated key counts once, as _query_value reads it
-        significant = index.lstrip("0")
-        if len(significant) > _MAX_LISTED_DIGITS or significant == "9" * _MAX_LISTED_DIGITS:
-            # Compared as text, never through int(): the digit string is untrusted and can be thousands long.
+        number = member_index(index)
+        if number is None:
             illegal = illegal or index
-            continue
-        try:
-            number = int(index)
-        except ValueError:      # more digits than int() converts
             continue
         parts = rest.split(".")
         name = parts[0]
@@ -655,18 +622,10 @@ def _scan_overrides(p):
     return members, types, modelled, illegal
 
 
-# AWS reads a member index below 999,999,999 as a position (sparse-list error above a gap of 10) and refuses
-# 999,999,999 and above as "Index N is illegal" (captured, us-east-2, 2026-11-06: edges8 h8-*, edges7 h7-*). The range
-# between 99,999,999 and 999,999,999 is not captured, so the sparse error is kept there.
-_MAX_LISTED_DIGITS = 9
-
-
 _INTEGER_REQUIREMENTS = ("VCpuCount", "MemoryMiB", "NetworkInterfaceCount", "BaselineEbsBandwidthMbps",
                          "AcceleratorCount", "AcceleratorTotalMemoryMiB")
 _DECIMAL_REQUIREMENTS = ("MemoryGiBPerVCpu", "TotalLocalStorageGB", "NetworkBandwidthGbps")
 _REQUIREMENT_KEY = re.compile(r"\.InstanceRequirements\.(\w+)\.(Min|Max)$")
-_INTEGER = re.compile(r"-?[0-9]+")
-_DECIMAL = re.compile(r"-?([0-9]+\.?[0-9]*|\.[0-9]+)")
 
 
 def _malformed_number_error(p):
@@ -677,34 +636,15 @@ def _malformed_number_error(p):
     for key, value in p.items():
         value = _p(p, key)
         if key in ("MinSize", "MaxSize", "DesiredCapacity"):
-            if value != "" and not _INTEGER.fullmatch(value):
+            if value != "" and not INTEGER.fullmatch(value):
                 return ""
         elif match := _REQUIREMENT_KEY.search(key):
             if value == "" and key.endswith(".VCpuCount.Min"):
                 return "missing value for decimal type"
-            if match[1] in _INTEGER_REQUIREMENTS and value != "" and not _INTEGER.fullmatch(value):
+            if match[1] in _INTEGER_REQUIREMENTS and value != "" and not INTEGER.fullmatch(value):
                 return ""
-            if match[1] in _DECIMAL_REQUIREMENTS and value != "" and not _DECIMAL.fullmatch(value):
+            if match[1] in _DECIMAL_REQUIREMENTS and value != "" and not DECIMAL.fullmatch(value):
                 return ""
-    return None
-
-
-def _override_numbering_error(members, illegal=None):
-    """Index 0 is refused, and so is a gap that skips 11 or more list elements: with the present indexes sorted
-    ascending and the previous one starting at 1, an index i after p skips i - p (captured, us-east-2, 2026-11-06:
-    single index 12 gives 11, 21 gives 20, {1,60} gives 59, edges4 q-c-*; dense lists up to 40 are accepted, edges4
-    p-c-dense-*). The count carries thousands separators. The first offending gap in ascending index order is
-    reported, whatever the wire order (edges5 g-c-*, g-u-1-20-40, i-c-41-sparse-1-40-and-60). These errors come before every other check, the group-name
-    constraint and the source check included (edges4 r-*, s-u-*)."""
-    if 0 in members:
-        return "MalformedInput", "0 is not a valid index"
-    previous = 1
-    for index in sorted(members):
-        if index - previous >= 11:
-            return "MalformedInput", f"Excessively sparse input would skip {index - previous:,} list elements"
-        previous = index
-    if illegal:
-        return "MalformedInput", f"Index {illegal} is illegal"
     return None
 
 
@@ -748,7 +688,7 @@ def _override_shape_error(p, scan, count_error=None):
 def _create_asg(p):
     name = _p(p, "AutoScalingGroupName")
     scan = _scan_overrides(p)
-    if numbering_error := _override_numbering_error(scan[0], scan[3]):
+    if numbering_error := member_numbering_error(scan[0], scan[3]):
         return _error(*numbering_error)
     if (malformed := _malformed_number_error(p)) is not None:
         return _error("MalformedInput", malformed)
@@ -883,7 +823,7 @@ def _describe_asgs(p):
 def _update_asg(p):
     name = _p(p, "AutoScalingGroupName")
     scan = _scan_overrides(p)
-    if numbering_error := _override_numbering_error(scan[0], scan[3]):
+    if numbering_error := member_numbering_error(scan[0], scan[3]):
         return _error(*numbering_error)
     if (malformed := _malformed_number_error(p)) is not None:
         return _error("MalformedInput", malformed)
