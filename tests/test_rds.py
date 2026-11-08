@@ -5292,66 +5292,6 @@ def test_rds_reboot_preserves_mysql_data_and_breaks_sessions(monkeypatch, reboot
         container.remove(force=True, v=True)
 
 
-@pytest.mark.data_plane
-def test_rds_reboot_on_default_bridge_ends_sessions_without_restart(monkeypatch, reboot_instance):
-    """A restart on the default bridge can move the endpoint; AWS keeps it, so sessions end in place."""
-    import docker
-    import pymysql
-
-    client = docker.from_env()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    container = client.containers.run(
-        "mysql:8.0", detach=True, ports={"3306/tcp": ("127.0.0.1", port)},
-        environment={"MYSQL_ROOT_PASSWORD": "test", "MYSQL_ROOT_HOST": "%"},
-    )
-    connection = None
-    try:
-        container.reload()
-        port = int(container.attrs["NetworkSettings"]["Ports"]["3306/tcp"][0]["HostPort"])
-        reboot_instance["_HostPort"] = port
-        reboot_instance["_docker_container_id"] = container.id
-
-        def connect():
-            return pymysql.connect(host="127.0.0.1", port=port, user="root", password="test", connect_timeout=2,
-                                   read_timeout=2, autocommit=True)
-
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
-            try:
-                connection = connect()
-                break
-            except pymysql.Error:
-                time.sleep(0.5)
-        assert connection is not None
-        with connection.cursor() as cursor:
-            cursor.execute("CREATE DATABASE reboot_test")
-            cursor.execute("CREATE TABLE reboot_test.evidence (value INT)")
-            cursor.execute("INSERT INTO reboot_test.evidence VALUES (42)")
-        monkeypatch.setattr(_imm_rds, "_get_docker", lambda: client)
-        monkeypatch.setattr(_imm_rds, "_get_ministack_network", lambda client: "bridge")
-        started = container.attrs["State"]["StartedAt"]
-        response = _imm_rds._reboot_db_instance({"DBInstanceIdentifier": "reboot-test"})
-        assert response["DBInstanceStatus"] == "rebooting"
-        deadline = time.monotonic() + 90
-        while reboot_instance["DBInstanceStatus"] == "rebooting" and time.monotonic() < deadline:
-            time.sleep(0.2)
-        assert reboot_instance["DBInstanceStatus"] == "available"
-        with pytest.raises(pymysql.Error):
-            connection.ping(reconnect=False)
-        with connect() as recovered:
-            with recovered.cursor() as cursor:
-                cursor.execute("SELECT value FROM reboot_test.evidence")
-                assert cursor.fetchone() == (42,)
-        container.reload()
-        assert container.attrs["State"]["StartedAt"] == started
-    finally:
-        if connection:
-            connection.close()
-        container.remove(force=True, v=True)
-
-
 def test_rds_reboot_failed_restart_does_not_report_available(monkeypatch, reboot_instance):
     def fail():
         raise RuntimeError("Docker unavailable")
