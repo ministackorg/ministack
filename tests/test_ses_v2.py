@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 from botocore.exceptions import ClientError
+from conftest import ses_events_to_log_group
 
 from ministack.core.responses import set_request_account_id, set_request_region
 
@@ -1427,3 +1428,51 @@ def test_put_email_identity_configuration_set_attributes_sets_and_clears_the_def
     finally:
         sesv2.delete_email_identity(EmailIdentity=identity)
         sesv2.delete_configuration_set(ConfigurationSetName=config_set)
+
+
+_SIMULATOR = "simulator.amazonses.com"
+
+
+def test_ses_v2_send_email_publishes_the_events_aws_published():
+    """Captured on AWS (us-west-2, 2026-11-08): a v2 SendEmail to complaint@ publishes Send, Delivery
+    and Complaint, with the headers SES writes for a plain-text message."""
+    chain = ses_events_to_log_group(default=False)
+    rcpt = f"complaint@{_SIMULATOR}"
+    msg_id = chain.sesv2.send_email(
+        FromEmailAddress=chain.sender, Destination={"ToAddresses": [rcpt]},
+        Content={"Simple": {"Subject": {"Data": "hello"}, "Body": {"Text": {"Data": "body"}}}},
+        ConfigurationSetName=chain.config_set)["MessageId"]
+
+    events = chain.published()
+    assert sorted(e["detail-type"] for e in events) == ["Email Complaint Received", "Email Delivered", "Email Sent"]
+    for event in events:
+        mail = event["detail"]["mail"]
+        assert mail["messageId"] == msg_id
+        assert mail["tags"]["ses:operation"] == ["SendEmail"]
+        assert mail["tags"]["ses:configuration-set"] == [chain.config_set]
+        assert mail["headers"] == [
+            {"name": "From", "value": chain.sender}, {"name": "To", "value": rcpt},
+            {"name": "Subject", "value": "hello"}, {"name": "MIME-Version", "value": "1.0"},
+            {"name": "Content-Type", "value": "text/plain; charset=UTF-8"},
+            {"name": "Content-Transfer-Encoding", "value": "7bit"}]
+    [delivery] = [e["detail"]["delivery"] for e in events if e["detail"]["eventType"] == "Delivery"]
+    assert delivery["smtpResponse"] == "250 Ok"
+
+
+def test_ses_v2_send_bulk_email_publishes_each_entry_with_its_own_message_id():
+    chain = ses_events_to_log_group()
+    template = f"events-{uuid.uuid4().hex[:8]}"
+    chain.sesv2.create_email_template(TemplateName=template, TemplateContent={
+        "Subject": "Hi {{name}}", "Text": "Hello {{name}}"})
+    results = chain.sesv2.send_bulk_email(
+        FromEmailAddress=chain.sender,
+        DefaultContent={"Template": {"TemplateName": template, "TemplateData": '{"name": "a"}'}},
+        BulkEmailEntries=[{"Destination": {"ToAddresses": [f"success@{_SIMULATOR}"]}},
+                          {"Destination": {"ToAddresses": [f"bounce@{_SIMULATOR}"]}}])["BulkEmailEntryResults"]
+    by_message = {}
+    for event in chain.published():
+        mail = event["detail"]["mail"]
+        assert mail["tags"]["ses:operation"] == ["SendBulkEmail"]
+        by_message.setdefault(mail["messageId"], []).append(event["detail"]["eventType"])
+    assert sorted(by_message[results[0]["MessageId"]]) == ["Delivery", "Send"]
+    assert sorted(by_message[results[1]["MessageId"]]) == ["Bounce", "Send"]

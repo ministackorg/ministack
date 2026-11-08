@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import uuid as _uuid_mod
 from datetime import datetime
@@ -16,6 +17,7 @@ from botocore.exceptions import ClientError
 from botocore.parsers import create_parser
 from botocore.serialize import create_serializer
 from botocore.session import Session
+from conftest import ses_events_to_log_group
 
 from ministack.core import persistence
 from ministack.core.responses import (
@@ -2000,3 +2002,198 @@ def test_ses_v2_target_header_route_is_authorized_contract(auth_enabled, iam_use
         sesv2.delete_email_template(TemplateName=name)
     else:
         assert status == 200
+
+
+# ---------------------------------------------------------------------------
+# Sending events published through a configuration set's EventBridge event
+# destination to a log group. Captured on AWS (us-west-2, 2026-11-08) with the
+# mailbox simulator; ses_events_to_log_group in conftest.py is the setup.
+# ---------------------------------------------------------------------------
+
+_SIMULATOR = "simulator.amazonses.com"
+
+
+def _outcomes(published):
+    """(eventType, recipients, bounce type/sub-type) of each published event, in a stable order."""
+    out = []
+    for event in published:
+        detail = event["detail"]
+        kind = detail["eventType"]
+        if kind == "Send":
+            out.append((kind, tuple(detail["mail"]["destination"]), None))
+        elif kind == "Delivery":
+            out.append((kind, tuple(detail["delivery"]["recipients"]), None))
+        elif kind == "Bounce":
+            bounce = detail["bounce"]
+            out.append((kind, tuple(r["emailAddress"] for r in bounce["bouncedRecipients"]),
+                        f"{bounce['bounceType']}/{bounce['bounceSubType']}"))
+        else:
+            out.append((kind, tuple(r["emailAddress"] for r in detail["complaint"]["complainedRecipients"]), None))
+    return sorted(out, key=str)
+
+
+def _send(chain, to, **kwargs):
+    return chain.ses.send_email(Source=chain.sender, Destination={"ToAddresses": to},
+                                Message={"Subject": {"Data": "hello"}, "Body": {"Text": {"Data": "body"}}},
+                                **kwargs)["MessageId"]
+
+
+def test_ses_send_raw_email_naming_no_set_publishes_through_the_identity_default():
+    """A v1 SendRawEmail naming no set leaves exactly "Email Sent" and "Email Delivered" in the log group,
+    each carrying the MessageId the send returned, in the shape captured on AWS."""
+    chain = ses_events_to_log_group()
+    rcpt = f"success@{_SIMULATOR}"
+    raw = f"From: {chain.sender}\r\nTo: {rcpt}\r\nSubject: hello\r\nContent-Type: text/plain\r\n\r\nbody\r\n"
+    msg_id = chain.ses.send_raw_email(RawMessage={"Data": raw.encode()})["MessageId"]
+
+    events = sorted(chain.published(), key=lambda e: e["detail"]["eventType"] != "Send")
+    assert [e["detail-type"] for e in events] == ["Email Sent", "Email Delivered"]
+    region, account = chain.region, chain.account
+    for event in events:
+        assert event["source"] == "aws.ses"
+        assert (event["account"], event["region"]) == (account, region)
+        assert event["resources"] == [f"arn:aws:ses:{region}:{account}:configuration-set/{chain.config_set}"]
+        mail = event["detail"]["mail"]
+        assert mail["timestamp"].endswith("Z")
+        assert {k: v for k, v in mail.items() if k != "timestamp"} == {
+            "source": chain.sender,
+            "sourceArn": f"arn:aws:ses:{region}:{account}:identity/{chain.domain}",
+            "sendingAccountId": account,
+            "messageId": msg_id,
+            "destination": [rcpt],
+            "headersTruncated": False,
+            "headers": [{"name": "From", "value": chain.sender}, {"name": "To", "value": rcpt},
+                        {"name": "Subject", "value": "hello"}, {"name": "Content-Type", "value": "text/plain"}],
+            "commonHeaders": {"from": [chain.sender], "to": [rcpt], "messageId": msg_id, "subject": "hello"},
+            "tags": {"ses:operation": ["SendRawEmail"], "ses:configuration-set": [chain.config_set],
+                     "ses:from-domain": [chain.domain], "ses:sender-identity": [chain.domain]},
+        }
+    assert events[0]["detail"]["send"] == {}
+    delivery = events[1]["detail"]["delivery"]
+    assert (delivery["recipients"], delivery["smtpResponse"]) == ([rcpt], "250 Ok")
+
+
+@pytest.mark.parametrize("local, outcomes", [
+    ("success", [("Delivery", None)]),
+    ("ooto", [("Delivery", None), ("Bounce", "Transient/General")]),
+    ("bounce", [("Bounce", "Permanent/General")]),
+    ("bounce+label", [("Bounce", "Permanent/General")]),
+    ("suppressionlist", [("Bounce", "Permanent/EmailValidationSuppressed")]),
+    ("complaint", [("Delivery", None), ("Complaint", None)]),
+])
+def test_ses_send_email_to_the_mailbox_simulator_publishes_what_aws_published(local, outcomes):
+    chain = ses_events_to_log_group()
+    rcpt = f"{local}@{_SIMULATOR}"
+    _send(chain, [rcpt])
+    expected = [("Send", (rcpt,), None)] + [(kind, (rcpt,), sub) for kind, sub in outcomes]
+    assert _outcomes(chain.published()) == sorted(expected, key=str)
+
+
+def test_ses_simulator_bounce_and_complaint_events_carry_what_aws_reported():
+    chain = ses_events_to_log_group()
+    for local in ("bounce", "suppressionlist", "ooto", "complaint"):
+        _send(chain, [f"{local}@{_SIMULATOR}"])
+    details = {(e["detail"]["eventType"], e["detail"]["mail"]["destination"][0].split("@")[0]): e["detail"]
+               for e in chain.published()}
+
+    bounce = details[("Bounce", "bounce")]["bounce"]
+    assert bounce["bouncedRecipients"] == [{
+        "emailAddress": f"bounce@{_SIMULATOR}", "action": "failed", "status": "5.1.1",
+        "diagnosticCode": f"smtp; 550 5.1.1 As requested: user unknown <bounce@{_SIMULATOR}>"}]
+    assert bounce["reportingMTA"].startswith("dns; ")
+    suppressed = details[("Bounce", "suppressionlist")]["bounce"]
+    assert suppressed["bouncedRecipients"][0]["diagnosticCode"].startswith(
+        "Amazon SES has suppressed sending to this address due to email validation.")
+    assert suppressed["reportingMTA"] == "dns; amazonses.com"
+    assert details[("Bounce", "ooto")]["bounce"]["bouncedRecipients"] == [{"emailAddress": f"ooto@{_SIMULATOR}"}]
+    complaint = details[("Complaint", "complaint")]["complaint"]
+    assert complaint["complainedRecipients"] == [{"emailAddress": f"complaint@{_SIMULATOR}"}]
+    assert (complaint["complaintFeedbackType"], complaint["userAgent"], complaint["complaintSubType"]) == (
+        "abuse", "Amazon SES Mailbox Simulator", None)
+    for detail in details.values():
+        body = detail.get("bounce") or detail.get("complaint")
+        if body:
+            assert re.fullmatch(r"[0-9a-f]{16}-[0-9a-f-]{36}-000000", body["feedbackId"])
+
+
+def test_ses_send_email_to_two_recipients_publishes_one_send_and_an_outcome_each():
+    chain = ses_events_to_log_group()
+    success, bounce = f"success@{_SIMULATOR}", f"bounce@{_SIMULATOR}"
+    _send(chain, [success, bounce])
+    assert _outcomes(chain.published()) == sorted([
+        ("Send", (success, bounce), None), ("Delivery", (success,), None),
+        ("Bounce", (bounce,), "Permanent/General")], key=str)
+
+
+def test_ses_recipient_outside_the_simulator_is_delivered():
+    """MiniStack has no mail server to refuse a recipient, so any other address is delivered."""
+    chain = ses_events_to_log_group()
+    _send(chain, ["someone@example.org"])
+    [delivery] = [e["detail"]["delivery"] for e in chain.published() if e["detail"]["eventType"] == "Delivery"]
+    assert (delivery["recipients"], delivery["smtpResponse"]) == (["someone@example.org"], "250 2.0.0 OK")
+
+
+def test_ses_send_email_naming_a_set_publishes_through_it_not_the_identity_default():
+    """The set named on the send wins over the identity default. It was created through SES v2, which
+    v1 SendEmail used to refuse with ConfigurationSetDoesNotExist."""
+    chain = ses_events_to_log_group()
+    named = chain.configuration_set(f"named-{_uuid_mod.uuid4().hex[:8]}")
+    _send(chain, [f"success@{_SIMULATOR}"], ConfigurationSetName=named)
+    published = chain.published()
+    assert len(published) == 2
+    assert {e["detail"]["mail"]["tags"]["ses:configuration-set"][0] for e in published} == {named}
+
+
+def test_ses_destination_publishes_only_its_matching_event_types_and_only_when_enabled():
+    chain = ses_events_to_log_group()
+    delivery_only = chain.configuration_set(f"delivery-{_uuid_mod.uuid4().hex[:8]}", matching=("DELIVERY",))
+    disabled = chain.configuration_set(f"disabled-{_uuid_mod.uuid4().hex[:8]}", enabled=False)
+    _send(chain, [f"success@{_SIMULATOR}"], ConfigurationSetName=delivery_only)
+    _send(chain, [f"success@{_SIMULATOR}"], ConfigurationSetName=disabled)
+    assert [(e["detail-type"], e["detail"]["mail"]["tags"]["ses:configuration-set"]) for e in chain.published()] == [
+        ("Email Delivered", [delivery_only])]
+
+
+def test_ses_send_from_an_identity_without_a_default_set_publishes_nothing():
+    chain = ses_events_to_log_group(default=False)
+    _send(chain, [f"success@{_SIMULATOR}"])
+    assert chain.published() == []
+
+
+def test_ses_the_most_specific_identity_and_its_default_apply():
+    """An address identity is used over its domain, with its own default, or none."""
+    chain = ses_events_to_log_group()
+    own = chain.configuration_set(f"own-{_uuid_mod.uuid4().hex[:8]}")
+    with_default, without = f"with-default@{chain.domain}", f"without@{chain.domain}"
+    chain.sesv2.create_email_identity(EmailIdentity=with_default, ConfigurationSetName=own)
+    chain.sesv2.create_email_identity(EmailIdentity=without)
+    for sender in (with_default, without):
+        chain.ses.send_email(Source=sender, Destination={"ToAddresses": [f"success@{_SIMULATOR}"]},
+                             Message={"Subject": {"Data": "hello"}, "Body": {"Text": {"Data": "body"}}})
+    mails = [e["detail"]["mail"] for e in chain.published()]
+    assert len(mails) == 2
+    for mail in mails:
+        assert mail["source"] == with_default
+        assert mail["tags"]["ses:configuration-set"] == [own]
+        assert mail["tags"]["ses:sender-identity"] == [with_default]
+        assert mail["sourceArn"].endswith(f":identity/{with_default}")
+
+
+def test_ses_templated_sends_publish_with_their_operation():
+    chain = ses_events_to_log_group()
+    template = f"events-{_uuid_mod.uuid4().hex[:8]}"
+    chain.ses.create_template(Template={"TemplateName": template, "SubjectPart": "Hi {{name}}",
+                                        "TextPart": "Hello {{name}}"})
+    one = chain.ses.send_templated_email(Source=chain.sender, Destination={"ToAddresses": [f"success@{_SIMULATOR}"]},
+                                         Template=template, TemplateData='{"name": "a"}')["MessageId"]
+    bulk = chain.ses.send_bulk_templated_email(
+        Source=chain.sender, Template=template, DefaultTemplateData='{"name": "b"}',
+        Destinations=[{"Destination": {"ToAddresses": [f"success@{_SIMULATOR}"]}},
+                      {"Destination": {"ToAddresses": [f"bounce@{_SIMULATOR}"]}}])["Status"]
+    sends = {e["detail"]["mail"]["messageId"]: e["detail"]["mail"] for e in chain.published()
+             if e["detail"]["eventType"] == "Send"}
+    assert sends[one]["tags"]["ses:operation"] == ["SendTemplatedEmail"]
+    assert sends[one]["commonHeaders"]["subject"] == "Hi a"
+    assert [sends[s["MessageId"]]["tags"]["ses:operation"] for s in bulk] == [["SendBulkTemplatedEmail"]] * 2
+    assert [sends[s["MessageId"]]["destination"] for s in bulk] == [[f"success@{_SIMULATOR}"],
+                                                                   [f"bounce@{_SIMULATOR}"]]

@@ -481,7 +481,7 @@ def _send_email(params):
     recipients = to_addrs + cc_addrs + bcc_addrs
     if any(_missing_domain(address) for address in [source, *recipients] if address):
         return _error("InvalidParameterValue", "Missing final '@domain'", 400)
-    if config_set and config_set not in _configuration_sets:
+    if config_set and not _configuration_set_exists(config_set):
         return _config_set_missing(config_set)
     rejected = _message_rejection(source, recipients)
     if rejected:
@@ -514,6 +514,13 @@ def _missing_domain(value: str) -> bool:
 def _config_set_missing(name):
     return _error("ConfigurationSetDoesNotExist", f"Configuration set {name} does not exist", 400,
                   "Sender", fields={"ConfigurationSetName": name})
+
+
+def _configuration_set_exists(name):
+    """A set created through either API; on AWS v1 and v2 share them."""
+    from ministack.services import ses_v2
+
+    return name in _configuration_sets or name in ses_v2._config_sets
 
 
 def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
@@ -552,6 +559,8 @@ def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
                                        subject, body_text, body_html, msg_id)
         _smtp_relay(source, all_addrs, mime_str)
     _send_notifications(msg_id, source, all_addrs)
+    _publish_send_events(msg_id, source, to_addrs, cc_addrs, bcc_addrs, subject,
+                         operation=type_name, config_set=config_set, body_html=body_html)
     return msg_id
 
 
@@ -576,6 +585,7 @@ def send_internal_email(source, to_addrs, subject, body_text="", body_html="",
 def _send_raw_email(params):
     raw_b64 = _p(params, "RawMessage.Data")
     source = _p(params, "Source")
+    config_set = _p(params, "ConfigurationSetName")
     msg_id = f"{new_uuid()}@email.amazonses.com"
 
     parsed = _parse_raw_mime(raw_b64)
@@ -614,6 +624,8 @@ def _send_raw_email(params):
         "Timestamp": time.time(),
         "Type": "SendRawEmail",
     }
+    if config_set:
+        record["ConfigurationSetName"] = config_set
     _sent_emails_list().append(record)
     logger.info("SES SendRawEmail: %s", msg_id)
     # Relay raw message via SMTP
@@ -636,6 +648,8 @@ def _send_raw_email(params):
         except Exception:
             logger.warning('SMTP relay failed for SendRawEmail: %s', msg_id, exc_info=True)
     _send_notifications(msg_id, actual_source, relay_addrs)
+    _publish_send_events(msg_id, actual_source, relay_addrs, operation="SendRawEmail",
+                         config_set=config_set, raw_headers=parsed.get("Headers", []))
     return _xml(200, "SendRawEmailResponse",
                 f"<SendRawEmailResult><MessageId>{msg_id}</MessageId></SendRawEmailResult>")
 
@@ -685,6 +699,9 @@ def _send_templated_email(params):
                                        rendered.get("Html", ""), msg_id)
         _smtp_relay(source, all_addrs, mime_str)
     _send_notifications(msg_id, source, all_addrs)
+    _publish_send_events(msg_id, source, to_addrs, cc_addrs, bcc_addrs, rendered.get("Subject", ""),
+                         operation="SendTemplatedEmail", config_set=config_set,
+                         body_html=rendered.get("Html", ""))
     return _xml(200, "SendTemplatedEmailResponse",
                 f"<SendTemplatedEmailResult><MessageId>{msg_id}</MessageId></SendTemplatedEmailResult>")
 
@@ -742,6 +759,9 @@ def _send_bulk_templated_email(params):
                                            rendered.get("Html", ""), msg_id)
             _smtp_relay(source, dest["To"], mime_str)
         _send_notifications(msg_id, source, dest["To"])
+        _publish_send_events(msg_id, source, dest["To"], subject=rendered.get("Subject", ""),
+                             operation="SendBulkTemplatedEmail", config_set=config_set,
+                             body_html=rendered.get("Html", ""))
         statuses.append(
             f"<member><Status>Success</Status>"
             f"<MessageId>{msg_id}</MessageId></member>")
@@ -1227,6 +1247,174 @@ def _send_notifications(msg_id, source, recipients):
             _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
 
 
+# ---------------------------------------------------------------------------
+# Sending events: configuration set event destinations -> EventBridge
+# ---------------------------------------------------------------------------
+
+# What SES publishes for a mailbox simulator recipient after the Send event, as
+# (eventType, bounceType, bounceSubType). Captured on AWS (us-west-2,
+# 2026-11-08). Any other recipient is delivered.
+_DELIVERED = (("Delivery", None, None),)
+_SIMULATOR_EVENTS = {
+    "bounce": (("Bounce", "Permanent", "General"),),
+    "suppressionlist": (("Bounce", "Permanent", "EmailValidationSuppressed"),),
+    "ooto": (("Delivery", None, None), ("Bounce", "Transient", "General")),
+    "complaint": (("Delivery", None, None), ("Complaint", None, None)),
+}
+_EVENT_DETAIL_TYPES = {
+    "Send": "Email Sent",
+    "Delivery": "Email Delivered",
+    "Bounce": "Email Bounced",
+    "Complaint": "Email Complaint Received",
+}
+_SEND_OPERATIONS = {"SendEmail", "SendRawEmail", "SendTemplatedEmail", "SendBulkTemplatedEmail", "SendBulkEmail"}
+_SUPPRESSED_DIAGNOSTIC = (
+    "Amazon SES has suppressed sending to this address due to email validation. The address quality "
+    "confidence level is below your configured threshold. For details on validation checks and threshold "
+    "configuration, see https://docs.aws.amazon.com/ses/latest/dg/email-validation.html")
+
+
+def _sending_identity(source: str) -> tuple[str, str] | None:
+    """The (name, default configuration set) of the identity a sender sends as:
+    its address identity, else its nearest parent domain identity, in v2 or v1.
+    The most specific identity wins even when it has no default."""
+    from ministack.services import ses_v2
+
+    addr = parseaddr(source or "")[1]
+    if not addr:
+        return None
+    if addr in ses_v2._identities:
+        return addr, ses_v2._identities[addr].get("ConfigurationSetName", "")
+    if addr in _identities:
+        return addr, ""
+    domains = {k.lower(): (k, "") for k in _identities if "@" not in k}
+    domains.update({k.lower(): (k, r.get("ConfigurationSetName", ""))
+                    for k, r in ses_v2._identities.items() if "@" not in k})
+    for d in _domain_and_parents(addr.rpartition("@")[2].lower()):
+        if d in domains:
+            return domains[d]
+    return None
+
+
+def _event_headers(source, to_addrs, cc_addrs, subject, body_html="", raw_headers=None):
+    """The ``mail.headers`` list: a raw message's own headers, else the ones SES writes."""
+    if raw_headers is not None:
+        return [{"name": k, "value": str(v)} for k, v in raw_headers if k.lower() != "message-id"]
+    headers = [{"name": "From", "value": source}]
+    if to_addrs:
+        headers.append({"name": "To", "value": ", ".join(to_addrs)})
+    if cc_addrs:
+        headers.append({"name": "Cc", "value": ", ".join(cc_addrs)})
+    content_type = "text/html" if body_html else "text/plain"
+    return headers + [{"name": "Subject", "value": subject or ""},
+                      {"name": "MIME-Version", "value": "1.0"},
+                      {"name": "Content-Type", "value": f"{content_type}; charset=UTF-8"},
+                      {"name": "Content-Transfer-Encoding", "value": "7bit"}]
+
+
+def _common_headers(headers, msg_id):
+    found = {h["name"].lower(): h["value"] for h in headers}
+    out = {key: [a.strip() for a in found[key].split(",") if a.strip()]
+           for key in ("from", "to", "cc") if key in found}
+    out["messageId"] = msg_id
+    if "subject" in found:
+        out["subject"] = found["subject"]
+    return out
+
+
+def _feedback_id():
+    return f"{new_uuid().replace('-', '')[:16]}-{new_uuid()}-000000"
+
+
+def _event_body(kind, rcpt, ts, bounce_type=None, bounce_subtype=None):
+    """The ``delivery`` / ``bounce`` / ``complaint`` member of an outcome event, as captured on AWS."""
+    simulator = rcpt.rpartition("@")[2].lower() == _SIMULATOR_DOMAIN
+    mta = f"a0-0.smtp-out.{get_region()}.amazonses.com"
+    if kind == "Delivery":
+        return {"delivery": {
+            "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
+            "smtpResponse": "250 Ok" if simulator else "250 2.0.0 OK", "reportingMTA": mta}}
+    if kind == "Complaint":
+        return {"complaint": {
+            "feedbackId": _feedback_id(), "complaintSubType": None,
+            "complainedRecipients": [{"emailAddress": rcpt}], "timestamp": ts,
+            "userAgent": "Amazon SES Mailbox Simulator", "complaintFeedbackType": "abuse",
+            "arrivalDate": ts}}
+    recipient = {"emailAddress": rcpt}
+    bounce = {"feedbackId": _feedback_id(), "bounceType": bounce_type, "bounceSubType": bounce_subtype,
+              "bouncedRecipients": [recipient], "timestamp": ts}
+    if bounce_subtype == "EmailValidationSuppressed":
+        recipient.update(action="failed", status="5.1.1", diagnosticCode=_SUPPRESSED_DIAGNOSTIC)
+        bounce["reportingMTA"] = "dns; amazonses.com"
+    elif bounce_type == "Permanent":
+        recipient.update(action="failed", status="5.1.1",
+                         diagnosticCode=f"smtp; 550 5.1.1 As requested: user unknown <{rcpt}>")
+        bounce["reportingMTA"] = f"dns; {mta}"
+    return {"bounce": bounce}
+
+
+def _publish_send_events(msg_id, source, to_addrs, cc_addrs=(), bcc_addrs=(), subject="", *,
+                         operation, config_set="", body_html="", raw_headers=None):
+    """Publish a send's events to the EventBridge event destinations of its
+    configuration set: the one named on the send, else the sending identity's
+    default. One Send event, then each recipient's outcome events, filtered by
+    each destination's MatchingEventTypes. Failures never fail the send."""
+    from ministack.services import eventbridge, ses_v2
+
+    try:
+        identity = _sending_identity(source)
+        if identity is None:
+            return
+        identity_name, default_set = identity
+        set_name = config_set or default_set
+        destinations = [d for d in ((ses_v2._config_sets.get(set_name) or {}).get("EventDestinations") or {}).values()
+                        if d.get("Enabled") and d.get("EventBridgeDestination")]
+        if not destinations:
+            return
+        recipients = [a for a in (parseaddr(r)[1] for r in [*to_addrs, *cc_addrs, *bcc_addrs]) if a]
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+        headers = _event_headers(source, list(to_addrs), list(cc_addrs), subject, body_html, raw_headers)
+        sender = parseaddr(source)[1]
+        mail = {
+            "timestamp": ts,
+            "source": sender,
+            "sourceArn": f"arn:aws:ses:{get_region()}:{get_account_id()}:identity/{identity_name}",
+            "sendingAccountId": get_account_id(),
+            "messageId": msg_id,
+            "destination": recipients,
+            "headersTruncated": False,
+            "headers": headers,
+            "commonHeaders": _common_headers(headers, msg_id),
+            "tags": {
+                "ses:operation": [operation if operation in _SEND_OPERATIONS else "SendEmail"],
+                "ses:configuration-set": [set_name],
+                "ses:from-domain": [sender.rpartition("@")[2]],
+                "ses:sender-identity": [identity_name],
+            },
+        }
+        events = [("Send", {"send": {}})]
+        for rcpt in recipients:
+            local, _, domain = rcpt.partition("@")
+            outcomes = _DELIVERED
+            if domain.lower() == _SIMULATOR_DOMAIN:
+                outcomes = _SIMULATOR_EVENTS.get(local.lower().split("+")[0], _DELIVERED)
+            events += [(kind, _event_body(kind, rcpt, ts, bounce_type, bounce_subtype))
+                       for kind, bounce_type, bounce_subtype in outcomes]
+        set_arn = f"arn:aws:ses:{get_region()}:{get_account_id()}:configuration-set/{set_name}"
+        for destination in destinations:
+            wanted = set(destination.get("MatchingEventTypes") or [])
+            bus = destination["EventBridgeDestination"].get("EventBusArn") or "default"
+            entries = [{"Source": "aws.ses", "DetailType": _EVENT_DETAIL_TYPES[kind],
+                        "Detail": json.dumps({"eventType": kind, "mail": mail, **body}),
+                        "Resources": [set_arn], "EventBusName": bus}
+                       for kind, body in events if kind.upper() in wanted]
+            for i in range(0, len(entries), 10):
+                eventbridge._put_events({"Entries": entries[i:i + 10]}, allow_aws_source=True)
+    except Exception:
+        logger.warning("SES event publishing for %s failed", msg_id, exc_info=True)
+
+
 def _make_identity(identity, identity_type):
     return {
         "VerificationStatus": "Success",
@@ -1372,6 +1560,7 @@ def _parse_raw_mime(raw_b64):
         parsed["To"] = mime_msg.get("To", "")
         parsed["Subject"] = mime_msg.get("Subject", "")
         parsed["ContentType"] = mime_msg.get_content_type()
+        parsed["Headers"] = [(name, str(value)) for name, value in mime_msg.items()]
 
         body_parts = []
         if mime_msg.is_multipart():
