@@ -2878,6 +2878,8 @@ def _run_idp_handler(handler, action: str, data: dict):
         return handler(data)
     except (_PreTokenRejected, _PreTokenUnavailable) as e:
         return _pretoken_error(e)
+    except _PostAuthenticationInvalid as e:
+        return error_response_json("InvalidLambdaResponseException", str(e), 400)
 
 
 def _run_identity_handler(handler, action: str, data: dict):
@@ -5366,10 +5368,71 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
+class _PostAuthenticationInvalid(Exception):
+    """Raised when a PostAuthentication Lambda does not return the event."""
+
+
+def _apply_postauth_trigger(pool_id: str, client_id: str, user: dict, client_metadata: dict | None,
+                            new_device_used: bool = False):
+    """Invoke the pool's PostAuthentication Lambda after a sign-in, before tokens are issued."""
+    pool = _user_pools.get(pool_id)
+    arn = ((pool or {}).get("LambdaConfig") or {}).get("PostAuthentication")
+    if not arn:
+        return
+    attrs = {k: v for k, v in _attr_list_to_dict(user.get("Attributes", [])).items()
+             if isinstance(v, (str, int, float, bool))}
+    attrs["cognito:user_status"] = user.get("UserStatus", "CONFIRMED")
+    request = {"userAttributes": attrs, "newDeviceUsed": new_device_used}
+    # AWS leaves out InitiateAuth's ClientMetadata; only challenge responses pass it.
+    if client_metadata:
+        request["clientMetadata"] = client_metadata
+    event = {
+        "version": "1",
+        "triggerSource": "PostAuthentication_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": request,
+        "response": {},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _PreTokenUnavailable("PostAuthentication invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PostAuthentication Lambda invocation failed for pool %s: %s", pool_id, e)
+        if isinstance(e, _PreTokenUnavailable):
+            raise
+        raise _PreTokenUnavailable(
+            f"PostAuthentication invocation failed due to error {type(e).__name__}.") from e
+    if isinstance(result, dict) and result.get("error"):
+        raise _PreTokenRejected(f"PostAuthentication failed with error {_lambda_error_message(result.get('body'))}.")
+    payload = result.get("body") if isinstance(result, dict) else result
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+    if payload is None:
+        raise _PostAuthenticationInvalid("Invalid lambda function output : Invalid JSON")
+    if not isinstance(payload, dict):
+        raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+
+
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
                         client_metadata: dict | None = None, origin_jti: str = "",
                         scope: str | None = None, audience: str = "") -> dict:
+    if trigger_source in ("TokenGeneration_Authentication", "TokenGeneration_NewPasswordChallenge"):
+        _apply_postauth_trigger(pool_id, client_id, user, client_metadata,
+                                new_device_used=trigger_source == "TokenGeneration_NewPasswordChallenge")
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -5403,6 +5466,7 @@ def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: 
     _record_auth_event(pool, user, data or {}, "SignIn", "InProgress" if mfa_challenge else "Pass",
                        (("Password", "Success"),), (mfa_challenge or {}).get("Session"))
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        _apply_postauth_trigger(pid, cid, user, client_metadata)
         session = base64.b64encode(secrets.token_bytes(32)).decode()
         return json_response({
             "ChallengeName": "NEW_PASSWORD_REQUIRED",
