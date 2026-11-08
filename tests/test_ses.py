@@ -2197,3 +2197,31 @@ def test_ses_templated_sends_publish_with_their_operation():
     assert [sends[s["MessageId"]]["tags"]["ses:operation"] for s in bulk] == [["SendBulkTemplatedEmail"]] * 2
     assert [sends[s["MessageId"]]["destination"] for s in bulk] == [[f"success@{_SIMULATOR}"],
                                                                    [f"bounce@{_SIMULATOR}"]]
+
+
+def test_ses_events_stay_in_the_account_and_region_that_sent():
+    """The same setup, under the same names, in another region and in another account sees nothing."""
+    chain = ses_events_to_log_group()
+    other_region = ses_events_to_log_group(account=chain.account, region="us-west-2", suffix=chain.suffix)
+    other_account = ses_events_to_log_group(suffix=chain.suffix)
+    _send(chain, [f"success@{_SIMULATOR}"])
+    assert len(chain.published()) == 2
+    assert other_region.published() == []
+    assert other_account.published() == []
+
+
+def test_ses_events_setup_is_cleared_by_a_reset():
+    import urllib.request
+
+    chain = ses_events_to_log_group()
+    _send(chain, [f"success@{_SIMULATOR}"])
+    assert len(chain.published()) == 2
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    urllib.request.urlopen(urllib.request.Request(f"{endpoint}/_ministack/reset", method="POST"))
+
+    assert chain.logs.describe_log_groups(logGroupNamePrefix=chain.group)["logGroups"] == []
+    for call, kwargs in ((chain.sesv2.get_configuration_set, {"ConfigurationSetName": chain.config_set}),
+                         (chain.sesv2.get_email_identity, {"EmailIdentity": chain.domain})):
+        with pytest.raises(ClientError) as exc:
+            call(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"

@@ -153,7 +153,7 @@ def ses_events_to_log_group(*, account=None, region=REGION, suffix=None, default
     def published():
         return [json.loads(e["message"]) for e in logs.filter_log_events(logGroupName=group)["events"]]
 
-    return SimpleNamespace(account=account, region=region, ses=client("ses"), sesv2=sesv2, logs=logs,
+    return SimpleNamespace(account=account, region=region, suffix=suffix, ses=client("ses"), sesv2=sesv2, logs=logs,
                            group=group, config_set=config_set, domain=domain, sender=f"sender@{domain}",
                            configuration_set=configuration_set, published=published)
 
@@ -324,6 +324,7 @@ _SERIAL_TESTS = {
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
+    "tests/test_ses.py::test_ses_events_setup_is_cleared_by_a_reset",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
