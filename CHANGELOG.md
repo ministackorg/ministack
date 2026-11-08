@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Cognito — attribute verification** — adds `GetUserAttributeVerificationCode` and `VerifyUserAttribute`. A changed email or phone number now becomes unverified and gets a code where the pool auto-verifies it, and `AttributesRequireVerificationBeforeUpdate` keeps the old value until the new one is verified. Contributed by @toby6578.
 - **Cognito — hosted UI forgot password and MFA** — the hosted sign-in pages now have a forgot-password flow, ask for a TOTP or SMS code after the password, and enrol TOTP where the pool requires MFA. Messages match AWS's classic hosted UI; the pages render straight from `POST /login`, and reset codes are checked only with `AUTH=true`. Contributed by @toby6578.
 - **KMS — the `aws/s3` AWS managed key** — an S3 write with `aws:kms` and no key ID (or `alias/aws/s3`) was refused. S3 now creates the account's `aws/s3` key on first use (KeyManager `AWS`, AWS's description and key policy, alias `alias/aws/s3`) and encrypts with it, as does a bucket default of `aws:kms` without `KMSMasterKeyID`. (#2605)
 - **S3 — PutObject through another account's access point** — it was refused. It now succeeds when the caller's identity policy, the access point policy and the owner's bucket policy all allow it, and lands in the owner's bucket under its default encryption; a missing grant answers AWS's AccessDenied for that step. (#2605)
