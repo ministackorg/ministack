@@ -7229,8 +7229,8 @@ def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=
     _reconcile_tag_list(secret.setdefault("Tags", []), old_props, new_props)
     if new_props.get("ReplicaRegions") and new_props["ReplicaRegions"] != old_props.get("ReplicaRegions"):
         # Regions added or re-keyed since the previous template are applied;
-        # a region dropped from the template keeps its replica, the service
-        # has no RemoveRegionsFromReplication to take it down with.
+        # a region dropped from the template keeps its replica: the update
+        # does not call RemoveRegionsFromReplication.
         _sm_secret_replicate(physical_id, new_props["ReplicaRegions"])
     return physical_id, {"Id": secret["ARN"], "Arn": secret["ARN"]}
 
