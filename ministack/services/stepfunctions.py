@@ -2313,6 +2313,10 @@ def _call_lambda(func_ref, event):
     exec_record = lambda_svc._execution_record_for_config(func, config)
     result = lambda_svc._execute_function_with_config_scope(exec_record, event)
 
+    if result.get("service_error"):
+        # Lambda itself failed (Invoke answered 500 ServiceException); Step Functions names it Lambda.<ErrorName>.
+        body = result.get("body") or {}
+        raise _ExecutionError("Lambda.ServiceException", body.get("message", "") if isinstance(body, dict) else str(body))
     if result.get("error"):
         body = result.get("body", {})
         if isinstance(body, dict):

@@ -40,8 +40,12 @@ def test_efs_create_and_describe_filesystem(efs):
 def test_efs_creation_token_idempotency(efs):
     token = "unique-token-abc123"
     r1 = efs.create_file_system(CreationToken=token)
-    r2 = efs.create_file_system(CreationToken=token)
-    assert r1["FileSystemId"] == r2["FileSystemId"]
+    with pytest.raises(ClientError) as exc:
+        efs.create_file_system(CreationToken=token)
+    err = exc.value.response
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert err["Error"]["Code"] == "FileSystemAlreadyExists"
+    assert err["FileSystemId"] == r1["FileSystemId"]
 
 
 def test_efs_resources_are_region_scoped():
@@ -1241,3 +1245,10 @@ def test_efs_mount_target_ip_address_type_must_match_the_subnet(efs):
     assert "Ipv6Address" not in mt
     efs.delete_mount_target(MountTargetId=mt["MountTargetId"])
     efs.delete_file_system(FileSystemId=fs_id)
+
+def test_efs_optional_members_omitted_when_unset(efs):
+    fs = efs.create_file_system(CreationToken=f"omit-{_uuid_mod.uuid4().hex}")
+    assert "KmsKeyId" not in fs and "Name" not in fs
+    named = efs.create_file_system(CreationToken=f"named-{_uuid_mod.uuid4().hex}",
+                                   Tags=[{"Key": "Name", "Value": "data"}])
+    assert named["Name"] == "data"

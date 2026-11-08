@@ -544,7 +544,7 @@ def _error(code, message, status=400):
 
 def _attrs_xml(attrs):
     return "".join(
-        f"<member><Key>{a['Key']}</Key><Value>{a['Value']}</Value></member>"
+        f"<member><Key>{_esc(str(a['Key']))}</Key><Value>{_esc(str(a['Value']))}</Value></member>"
         for a in attrs
     )
 
@@ -554,61 +554,61 @@ def _attrs_xml(attrs):
 
 def _lb_xml(lb):
     azs = "".join(
-        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{s}</SubnetId>"
+        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{_esc(str(s))}</SubnetId>"
         f"<LoadBalancerAddresses/></member>"
         for s in lb.get("Subnets", [])
     )
-    sgs = "".join(f"<member>{sg}</member>" for sg in lb.get("SecurityGroups", []))
+    sgs = "".join(f"<member>{_esc(str(sg))}</member>" for sg in lb.get("SecurityGroups", []))
     return (
         f"<member>"
-        f"<LoadBalancerArn>{lb['LoadBalancerArn']}</LoadBalancerArn>"
-        f"<LoadBalancerName>{lb['LoadBalancerName']}</LoadBalancerName>"
-        f"<DNSName>{lb['DNSName']}</DNSName>"
+        f"<LoadBalancerArn>{_esc(str(lb['LoadBalancerArn']))}</LoadBalancerArn>"
+        f"<LoadBalancerName>{_esc(str(lb['LoadBalancerName']))}</LoadBalancerName>"
+        f"<DNSName>{_esc(str(lb['DNSName']))}</DNSName>"
         f"<CanonicalHostedZoneId>Z35SXDOTRQ7X7K</CanonicalHostedZoneId>"
-        f"<CreatedTime>{lb['CreatedTime']}</CreatedTime>"
-        f"<Scheme>{lb['Scheme']}</Scheme>"
-        f"<VpcId>{lb.get('VpcId','')}</VpcId>"
-        f"<State><Code>{lb['State']}</Code></State>"
-        f"<Type>{lb['Type']}</Type>"
+        f"<CreatedTime>{_esc(str(lb['CreatedTime']))}</CreatedTime>"
+        f"<Scheme>{_esc(str(lb['Scheme']))}</Scheme>"
+        f"<VpcId>{_esc(str(lb.get('VpcId','')))}</VpcId>"
+        f"<State><Code>{_esc(str(lb['State']))}</Code></State>"
+        f"<Type>{_esc(str(lb['Type']))}</Type>"
         f"<AvailabilityZones>{azs}</AvailabilityZones>"
         f"<SecurityGroups>{sgs}</SecurityGroups>"
-        f"<IpAddressType>{lb.get('IpAddressType','ipv4')}</IpAddressType>"
+        f"<IpAddressType>{_esc(str(lb.get('IpAddressType','ipv4')))}</IpAddressType>"
         f"{_members_xml(lb, 'LoadBalancer', ('EnablePrefixForIpv6SourceNat', 'IpamPools'))}"
         f"</member>"
     )
 
 
 def _tg_xml(tg):
-    lb_arns = "".join(f"<member>{a}</member>" for a in tg.get("LoadBalancerArns", []))
+    lb_arns = "".join(f"<member>{_esc(str(a))}</member>" for a in tg.get("LoadBalancerArns", []))
     return (
         f"<member>"
-        f"<TargetGroupArn>{tg['TargetGroupArn']}</TargetGroupArn>"
-        f"<TargetGroupName>{tg['TargetGroupName']}</TargetGroupName>"
-        f"<Protocol>{tg.get('Protocol','HTTP')}</Protocol>"
-        f"<Port>{tg.get('Port',80)}</Port>"
-        f"<VpcId>{tg.get('VpcId','')}</VpcId>"
+        f"<TargetGroupArn>{_esc(str(tg['TargetGroupArn']))}</TargetGroupArn>"
+        f"<TargetGroupName>{_esc(str(tg['TargetGroupName']))}</TargetGroupName>"
+        f"<Protocol>{_esc(str(tg.get('Protocol','HTTP')))}</Protocol>"
+        f"<Port>{_esc(str(tg.get('Port',80)))}</Port>"
+        f"<VpcId>{_esc(str(tg.get('VpcId','')))}</VpcId>"
         f"{_members_xml(tg, 'TargetGroup', ('HealthCheckProtocol', 'HealthCheckPort', 'HealthCheckEnabled', 'HealthCheckIntervalSeconds', 'HealthCheckTimeoutSeconds', 'HealthyThresholdCount', 'UnhealthyThresholdCount', 'HealthCheckPath', 'Matcher'))}"
         f"<LoadBalancerArns>{lb_arns}</LoadBalancerArns>"
-        f"<TargetType>{tg.get('TargetType','instance')}</TargetType>"
+        f"<TargetType>{_esc(str(tg.get('TargetType','instance')))}</TargetType>"
         f"{_members_xml(tg, 'TargetGroup', ('ProtocolVersion', 'IpAddressType', 'TargetControlPort'))}"
         f"</member>"
     )
 
 
 def _action_xml(a):
-    inner = f"<Type>{a['Type']}</Type><Order>{a.get('Order',1)}</Order>"
+    inner = f"<Type>{_esc(str(a['Type']))}</Type><Order>{_esc(str(a.get('Order',1)))}</Order>"
     if "TargetGroupArn" in a:
-        inner += f"<TargetGroupArn>{a['TargetGroupArn']}</TargetGroupArn>"
+        inner += f"<TargetGroupArn>{_esc(str(a['TargetGroupArn']))}</TargetGroupArn>"
     if "RedirectConfig" in a:
         rc = a["RedirectConfig"]
         inner += (
             f"<RedirectConfig>"
-            f"<Protocol>{rc.get('Protocol','#{protocol}')}</Protocol>"
-            f"<Port>{rc.get('Port','#{port}')}</Port>"
-            f"<Host>{rc.get('Host','#{host}')}</Host>"
-            f"<Path>{rc.get('Path','/#{path}')}</Path>"
+            f"<Protocol>{_esc(str(rc.get('Protocol','#{protocol}')))}</Protocol>"
+            f"<Port>{_esc(str(rc.get('Port','#{port}')))}</Port>"
+            f"<Host>{_esc(str(rc.get('Host','#{host}')))}</Host>"
+            f"<Path>{_esc(str(rc.get('Path','/#{path}')))}</Path>"
             f"<Query>{_esc(rc.get('Query', '#{query}'))}</Query>"
-            f"<StatusCode>{rc.get('StatusCode','HTTP_301')}</StatusCode>"
+            f"<StatusCode>{_esc(str(rc.get('StatusCode','HTTP_301')))}</StatusCode>"
             f"</RedirectConfig>"
         )
     if "AuthenticateOidcConfig" in a:
@@ -616,24 +616,24 @@ def _action_xml(a):
         # ClientSecret is deliberately absent: AWS never echoes it back.
         inner += (
             f"<AuthenticateOidcConfig>"
-            f"<Issuer>{oc.get('Issuer','')}</Issuer>"
-            f"<AuthorizationEndpoint>{oc.get('AuthorizationEndpoint','')}</AuthorizationEndpoint>"
-            f"<TokenEndpoint>{oc.get('TokenEndpoint','')}</TokenEndpoint>"
-            f"<UserInfoEndpoint>{oc.get('UserInfoEndpoint','')}</UserInfoEndpoint>"
-            f"<ClientId>{oc.get('ClientId','')}</ClientId>"
-            f"<Scope>{oc.get('Scope','openid')}</Scope>"
-            f"<SessionCookieName>{oc.get('SessionCookieName', OIDC_DEFAULT_COOKIE_NAME)}</SessionCookieName>"
-            f"<SessionTimeout>{oc.get('SessionTimeout', OIDC_DEFAULT_SESSION_TIMEOUT)}</SessionTimeout>"
-            f"<OnUnauthenticatedRequest>{oc.get('OnUnauthenticatedRequest','authenticate')}</OnUnauthenticatedRequest>"
+            f"<Issuer>{_esc(str(oc.get('Issuer','')))}</Issuer>"
+            f"<AuthorizationEndpoint>{_esc(str(oc.get('AuthorizationEndpoint','')))}</AuthorizationEndpoint>"
+            f"<TokenEndpoint>{_esc(str(oc.get('TokenEndpoint','')))}</TokenEndpoint>"
+            f"<UserInfoEndpoint>{_esc(str(oc.get('UserInfoEndpoint','')))}</UserInfoEndpoint>"
+            f"<ClientId>{_esc(str(oc.get('ClientId','')))}</ClientId>"
+            f"<Scope>{_esc(str(oc.get('Scope','openid')))}</Scope>"
+            f"<SessionCookieName>{_esc(str(oc.get('SessionCookieName', OIDC_DEFAULT_COOKIE_NAME)))}</SessionCookieName>"
+            f"<SessionTimeout>{_esc(str(oc.get('SessionTimeout', OIDC_DEFAULT_SESSION_TIMEOUT)))}</SessionTimeout>"
+            f"<OnUnauthenticatedRequest>{_esc(str(oc.get('OnUnauthenticatedRequest','authenticate')))}</OnUnauthenticatedRequest>"
             f"</AuthenticateOidcConfig>"
         )
     if "FixedResponseConfig" in a:
         frc = a["FixedResponseConfig"]
         inner += (
             f"<FixedResponseConfig>"
-            f"<StatusCode>{frc.get('StatusCode','200')}</StatusCode>"
-            f"<ContentType>{frc.get('ContentType','text/plain')}</ContentType>"
-            f"<MessageBody>{frc.get('MessageBody','')}</MessageBody>"
+            f"<StatusCode>{_esc(str(frc.get('StatusCode','200')))}</StatusCode>"
+            f"<ContentType>{_esc(str(frc.get('ContentType','text/plain')))}</ContentType>"
+            f"<MessageBody>{_esc(str(frc.get('MessageBody','')))}</MessageBody>"
             f"</FixedResponseConfig>"
         )
     inner += _members_xml(a, "Action", ("ForwardConfig", "AuthenticateCognitoConfig"))
@@ -658,10 +658,10 @@ def _listener_xml(l):
     # Member order follows the botocore Listener shape.
     return (
         f"<member>"
-        f"<ListenerArn>{l['ListenerArn']}</ListenerArn>"
-        f"<LoadBalancerArn>{l['LoadBalancerArn']}</LoadBalancerArn>"
-        f"<Port>{l.get('Port',80)}</Port>"
-        f"<Protocol>{l.get('Protocol','HTTP')}</Protocol>"
+        f"<ListenerArn>{_esc(str(l['ListenerArn']))}</ListenerArn>"
+        f"<LoadBalancerArn>{_esc(str(l['LoadBalancerArn']))}</LoadBalancerArn>"
+        f"<Port>{_esc(str(l.get('Port',80)))}</Port>"
+        f"<Protocol>{_esc(str(l.get('Protocol','HTTP')))}</Protocol>"
         f"{certs_xml}{policy_xml}"
         f"<DefaultActions>{acts}</DefaultActions>"
         f"{_members_xml(l, 'Listener', ('AlpnPolicy', 'MutualAuthentication'))}"
@@ -712,8 +712,8 @@ def _condition_xml(c):
     change on every run to put the values back.
     """
     values = c.get("Values", [])
-    members = "".join(f"<member>{v}</member>" for v in values)
-    xml = f"<member><Field>{c['Field']}</Field><Values>{members}</Values>"
+    members = "".join(f"<member>{_esc(str(v))}</member>" for v in values)
+    xml = f"<member><Field>{_esc(str(c['Field']))}</Field><Values>{members}</Values>"
     config_key = _CONDITION_VALUE_KEYS.get(c.get("Field"))
     if config_key:
         xml += f"<{config_key}><Values>{members}</Values></{config_key}>"
@@ -932,8 +932,8 @@ def _rule_xml(r, with_transforms=True):
                   + "</Transforms>") if with_transforms else ""
     return (
         f"<member>"
-        f"<RuleArn>{r['RuleArn']}</RuleArn>"
-        f"<Priority>{r['Priority']}</Priority>"
+        f"<RuleArn>{_esc(str(r['RuleArn']))}</RuleArn>"
+        f"<Priority>{_esc(str(r['Priority']))}</Priority>"
         f"<Conditions>{conds}</Conditions>"
         f"<Actions>{acts}</Actions>"
         f"<IsDefault>{str(r.get('IsDefault',False)).lower()}</IsDefault>"
@@ -1584,7 +1584,7 @@ def _describe_target_health(params):
     default_port = _tgs[tg_arn].get("Port", 80)
     descs = "".join(
         f"<member>"
-        f"<Target><Id>{t['Id']}</Id><Port>{t.get('Port', default_port)}</Port></Target>"
+        f"<Target><Id>{_esc(str(t['Id']))}</Id><Port>{_esc(str(t.get('Port', default_port)))}</Port></Target>"
         f"<TargetHealth><State>healthy</State></TargetHealth>"
         f"</member>"
         for t in registered
@@ -1633,10 +1633,10 @@ def _describe_tags(params):
         if err:
             return err
         tags_xml = "".join(
-            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+            f"<member><Key>{_esc(str(t['Key']))}</Key><Value>{_esc(str(t['Value']))}</Value></member>"
             for t in _tags.get(arn, [])
         )
-        descs += f"<member><ResourceArn>{arn}</ResourceArn><Tags>{tags_xml}</Tags></member>"
+        descs += f"<member><ResourceArn>{_esc(str(arn))}</ResourceArn><Tags>{tags_xml}</Tags></member>"
     return _xml(200, "DescribeTags", f"<TagDescriptions>{descs}</TagDescriptions>")
 
 
@@ -1656,13 +1656,13 @@ def _set_subnets(params):
     if ip_type:
         lb["IpAddressType"] = ip_type
     azs = "".join(
-        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{s}</SubnetId>"
+        f"<member><ZoneName>{get_region()}a</ZoneName><SubnetId>{_esc(str(s))}</SubnetId>"
         f"<LoadBalancerAddresses/></member>"
         for s in lb.get("Subnets", [])
     )
     return _xml(200, "SetSubnets",
                 f"<AvailabilityZones>{azs}</AvailabilityZones>"
-                f"<IpAddressType>{lb.get('IpAddressType','ipv4')}</IpAddressType>")
+                f"<IpAddressType>{_esc(str(lb.get('IpAddressType','ipv4')))}</IpAddressType>")
 
 
 def _set_ip_address_type(params):
@@ -1676,7 +1676,7 @@ def _set_ip_address_type(params):
                       f"Invalid IpAddressType: {ip_type}", 400)
     lb["IpAddressType"] = ip_type
     return _xml(200, "SetIpAddressType",
-                f"<IpAddressType>{ip_type}</IpAddressType>")
+                f"<IpAddressType>{_esc(str(ip_type))}</IpAddressType>")
 
 
 def _set_security_groups(params):
@@ -1686,7 +1686,7 @@ def _set_security_groups(params):
         return _error("LoadBalancerNotFound", "Load balancer not found", 400)
     sgs = _parse_member_list(params, "SecurityGroups")
     lb["SecurityGroups"] = sgs
-    members = "".join(f"<member>{s}</member>" for s in sgs)
+    members = "".join(f"<member>{_esc(str(s))}</member>" for s in sgs)
     return _xml(200, "SetSecurityGroups",
                 f"<SecurityGroupIds>{members}</SecurityGroupIds>")
 
@@ -2115,6 +2115,44 @@ def _oidc_claims(id_token):
         return {}
 
 
+# The session cookie lives 7 days whatever the session timeout, which the session itself carries (AWS docs).
+OIDC_COOKIE_MAX_AGE = 604800
+# Internal key: cookies a refreshed session needs, added to the response by _execute_actions.
+_OIDC_REFRESHED_COOKIES = "__ministack_oidc_cookies"
+
+
+def _oidc_access_exp(tokens):
+    """When the access token expires (epoch seconds): ``expires_in``, else a JWT access token's ``exp``; 0 if unknown."""
+    try:
+        return int(time.time()) + int(tokens["expires_in"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        return int(_oidc_claims(tokens.get("access_token", "")).get("exp", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _oidc_session_from_tokens(cfg, tokens, session_exp, refresh_token=""):
+    """The session for a token response: claims from the user info endpoint, the refresh token AWS keeps."""
+    userinfo = cfg.get("UserInfoEndpoint", "")
+    claims = None
+    if userinfo:
+        claims = await run_reentrant(
+            lambda: _oidc_get_userinfo(userinfo, tokens.get("access_token", "")),
+            thread_name="ministack-alb-oidc-userinfo",
+        )
+    if not claims:
+        claims = _oidc_claims(tokens.get("id_token", ""))
+    return {
+        "claims": claims,
+        "access_token": tokens.get("access_token", ""),
+        "refresh_token": tokens.get("refresh_token") or refresh_token,
+        "access_exp": _oidc_access_exp(tokens),
+        "exp": session_exp,
+    }
+
+
 async def _authenticate_oidc(action, method, path, headers, body, query_params, listener_port,
                              lb_arn=""):
     """Run one authenticate-oidc action.
@@ -2169,29 +2207,37 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         # AWS; the ID token only serves as a fallback when the IdP has no
         # usable user info response. AWS never passes the ID token itself to
         # the backend, and neither does this.
-        userinfo = cfg.get("UserInfoEndpoint", "")
-        claims = None
-        if userinfo:
-            claims = await run_reentrant(
-                lambda: _oidc_get_userinfo(userinfo, tokens.get("access_token", "")),
-                thread_name="ministack-alb-oidc-userinfo",
-            )
-        if not claims:
-            claims = _oidc_claims(tokens.get("id_token", ""))
-        session = {
-            "claims": claims,
-            "access_token": tokens.get("access_token", ""),
-            "exp": int(time.time()) + session_timeout,
-        }
+        session = await _oidc_session_from_tokens(cfg, tokens, int(time.time()) + session_timeout)
         return (302, {
             "Location": pending["url"],
-            "Set-Cookie": _oidc_session_cookies(cookie_name, session, session_timeout, secure),
+            "Set-Cookie": _oidc_session_cookies(cookie_name, session, OIDC_COOKIE_MAX_AGE, secure),
             "Content-Type": "text/plain",
         }, b"")
 
     # --- an established session -------------------------------------------
     session = _oidc_read_session(jar, cookie_name)
-    if session and int(session.get("exp", 0)) > time.time():
+    live = bool(session) and int(session.get("exp", 0)) > time.time()
+    if live and session.get("access_exp") and int(session["access_exp"]) <= time.time():
+        # AWS refreshes the claims with the IdP's refresh token each time the access token expires, until the
+        # session times out or the refresh fails; without one, or on failure, the user signs in again.
+        live = False
+        if session.get("refresh_token"):
+            status, tokens = await run_reentrant(
+                lambda: _oidc_post_form(cfg.get("TokenEndpoint", ""), {
+                    "grant_type": "refresh_token",
+                    "refresh_token": session["refresh_token"],
+                    "client_id": cfg.get("ClientId", ""),
+                    "client_secret": cfg.get("ClientSecret", ""),
+                }),
+                thread_name="ministack-alb-oidc-refresh",
+            )
+            if status < 400 and "access_token" in tokens:
+                session = await _oidc_session_from_tokens(cfg, tokens, int(session["exp"]), session["refresh_token"])
+                headers[_OIDC_REFRESHED_COOKIES] = (
+                    _oidc_expiry_cookies(cookie_name, len(jar))
+                    + _oidc_session_cookies(cookie_name, session, OIDC_COOKIE_MAX_AGE, secure))
+                live = True
+    if live:
         claims = session.get("claims") or {}
         headers["x-amzn-oidc-identity"] = str(claims.get("sub", ""))
         headers["x-amzn-oidc-accesstoken"] = session.get("access_token", "")
@@ -2203,7 +2249,8 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
     on_unauth = (cfg.get("OnUnauthenticatedRequest") or "authenticate").lower()
     if on_unauth == "allow":
         return None
-    if on_unauth == "deny":
+    if on_unauth == "deny" and not session:
+        # deny answers 401 to a request with no authentication information; expired information is sent to the IdP.
         return (401, {"Content-Type": "text/plain"}, b"Unauthorized")
 
     host = headers.get("host") or f"localhost:{listener_port}"
@@ -2224,6 +2271,7 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         "created": time.time(),
     }
     location = cfg.get("AuthorizationEndpoint", "") + "?" + urlencode({
+        **(cfg.get("AuthenticationRequestExtraParams") or {}),
         "client_id": cfg.get("ClientId", ""),
         "response_type": "code",
         "scope": cfg.get("Scope") or "openid",
@@ -2268,6 +2316,16 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
                                                 lb_arn=lb_arn)
             if response is not None:
                 return response
+            refreshed = forwarded.pop(_OIDC_REFRESHED_COOKIES, None)
+            if refreshed:
+                status, out_headers, out_body = await _execute_actions(
+                    [a for a in ordered if int(a.get("Order", 1) or 1) > int(action.get("Order", 1) or 1)],
+                    method, path, forwarded, body, query_params, listener_port, lb_arn=lb_arn,
+                    target_host=target_host, raw_query_string=raw_query_string, raw_path=raw_path)
+                out_headers = dict(out_headers or {})
+                existing = out_headers.get("Set-Cookie")
+                out_headers["Set-Cookie"] = ([existing] if isinstance(existing, str) else list(existing or [])) + refreshed
+                return status, out_headers, out_body
             continue
         if atype == "authenticate-cognito":
             # Cognito authentication is the same protocol with the endpoints

@@ -1133,3 +1133,10 @@ def test_recording_disabled_no_new_events(ct, s3):
             f"{ENDPOINT}/_ministack/config",
             json={"cloudtrail._recording_enabled": "true"},
         )
+
+
+def test_trail_not_found_is_http_400(ct):
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=f"missing-{_uid()}")
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400

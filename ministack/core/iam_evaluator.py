@@ -1712,6 +1712,24 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         if principal.policies is None:
             return None
     if principal.policies is None:
+        step = context.get("ministack:s3foreignstep")
+        if step in ("accesspoint", "bucket"):
+            # A root caller's own account allows it everything (the identity step), but another account's
+            # access point and bucket must still grant it, and an explicit Deny there denies it.
+            from ministack.services.s3 import access_point_policy_for_arn, bucket_policy_for_owner
+
+            found = (access_point_policy_for_arn(resource_arn) if step == "accesspoint"
+                     else bucket_policy_for_owner(resource_arn, context["s3:dataaccesspointaccount"]))
+            root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
+                                   principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
+                                   region=region, service_context=context, principal_keys=principal.keys)
+            result = evaluate_resource_policy(found[0] if found else "", root_ctx)
+            if result.decision == "Allow":
+                return None
+            if result.decision == "Deny":
+                result.resource_policy_arn = resource_arn
+            result.principal_arn = principal.arn
+            return result
         if service != "s3" or "s3:dataaccesspointarn" in context:
             return None
         found = _resource_policy(service, resource_arn)
@@ -1743,10 +1761,21 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     )
 
     result = evaluate(ctx, principal.policies, *principal.limits)
+    if context.get("ministack:s3foreignstep") == "accesspoint-identity":
+        # The caller's identity policy on the access point object, alone: the access point policy is the next step.
+        if result.decision == "Allow":
+            return None
+        result.principal_arn = principal.arn
+        return result
     found = _resource_policy(service, resource_arn)
     if found is not None and service == "s3" and "MultiRegionAccessPoint" in iam_action:
         found = None  # The MRAP policy governs data requests, not S3 Control's MRAP calls.
-    if found is None and service == "s3" and "s3:dataaccesspointarn" in context:
+    if found is None and service == "s3" and context.get("ministack:s3foreignstep") == "bucket":
+        # The owner's bucket policy, for a PutObject through the owner's access point.
+        from ministack.services.s3 import bucket_policy_for_owner
+
+        found = bucket_policy_for_owner(resource_arn, context["s3:dataaccesspointaccount"])
+    elif found is None and service == "s3" and "s3:dataaccesspointarn" in context:
         if (iam_action in ("s3:PutBucketPolicy", "s3:DeleteBucketPolicy") and result.decision != "Deny"
                 and resource_arn == context["s3:dataaccesspointarn"]):
             # An access point refuses bucket policy writes as an explicit Deny of its own.

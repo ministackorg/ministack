@@ -3188,35 +3188,25 @@ def test_s3_sse_s3_round_trip(s3):
     assert got["Body"].read() == b"x"
 
 
-def test_s3_sse_kms_round_trip_and_key_required(s3):
-    """aws:kms echoes the key id everywhere; aws:kms without a key id is
-    refused — MiniStack has no implicit account aws/s3 key to fall back to."""
+def test_s3_sse_kms_round_trip_and_aws_managed_key(s3, kms_client):
+    """aws:kms echoes the key ARN everywhere, whatever the request named the key by; aws:kms without a key
+    id takes the account's aws/s3 key (recorded on AWS, us-east-2)."""
     import uuid as _u
     bucket = f"sse-kms-{_u.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bucket)
+    meta = kms_client.create_key()["KeyMetadata"]
     resp = s3.put_object(Bucket=bucket, Key="k", Body=b"x",
-                         ServerSideEncryption="aws:kms", SSEKMSKeyId="my-key-id")
+                         ServerSideEncryption="aws:kms", SSEKMSKeyId=meta["KeyId"])
     assert resp["ServerSideEncryption"] == "aws:kms"
-    assert resp["SSEKMSKeyId"] == "my-key-id"
+    assert resp["SSEKMSKeyId"] == meta["Arn"]
     head = s3.head_object(Bucket=bucket, Key="k")
     assert head["ServerSideEncryption"] == "aws:kms"
-    assert head["SSEKMSKeyId"] == "my-key-id"
+    assert head["SSEKMSKeyId"] == meta["Arn"]
 
-    with pytest.raises(ClientError) as exc:
-        s3.put_object(Bucket=bucket, Key="k2", Body=b"x",
-                      ServerSideEncryption="aws:kms")
-    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
-
-
-def test_s3_sse_kms_and_sse_c_conflict(s3):
-    """SSE-KMS and SSE-C on the same write are mutually exclusive (400)."""
-    import uuid as _u
-    bucket = f"sse-conflict-{_u.uuid4().hex[:8]}"
-    s3.create_bucket(Bucket=bucket)
-    with pytest.raises(ClientError) as exc:
-        s3.put_object(Bucket=bucket, Key="k", Body=b"x",
-                      ServerSideEncryption="aws:kms", SSEKMSKeyId="kid", **_SSE_C)
-    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
+    resp = s3.put_object(Bucket=bucket, Key="k2", Body=b"x", ServerSideEncryption="aws:kms")
+    aws_key = kms_client.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]
+    assert resp["SSEKMSKeyId"] == aws_key["Arn"]
+    assert s3.head_object(Bucket=bucket, Key="k2")["SSEKMSKeyId"] == aws_key["Arn"]
 
 
 def test_s3_sse_c_round_trip_and_read_gating(s3):
@@ -7068,7 +7058,7 @@ def test_s3_content_md5_invalid_vs_bad_digest(s3):
     s3.put_object(Bucket=bkt, Key="k", Body=b"hello", ContentMD5=good)
 
 
-def test_s3_put_object_echoes_bucket_default_sse(s3):
+def test_s3_put_object_echoes_bucket_default_sse(s3, kms_client):
     """After PutBucketEncryption, PutObject echoes the applied SSE algorithm on the
     reply (AES256, or aws:kms + key id). (#1322, smaller wire omission)"""
     bkt = f"sse-{_uuid_mod.uuid4().hex[:8]}"
@@ -7080,13 +7070,14 @@ def test_s3_put_object_echoes_bucket_default_sse(s3):
 
     bkt2 = f"sse-kms-{_uuid_mod.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bkt2)
+    key = kms_client.create_key()["KeyMetadata"]
     s3.put_bucket_encryption(Bucket=bkt2, ServerSideEncryptionConfiguration={
         "Rules": [{"ApplyServerSideEncryptionByDefault": {
             "SSEAlgorithm": "aws:kms",
-            "KMSMasterKeyID": "arn:aws:kms:us-east-1:000000000000:key/abc"}}]})
+            "KMSMasterKeyID": key["Arn"]}}]})
     r2 = s3.put_object(Bucket=bkt2, Key="k", Body=b"x")
     assert r2.get("ServerSideEncryption") == "aws:kms", r2
-    assert r2.get("SSEKMSKeyId", "").endswith("key/abc"), r2
+    assert r2.get("SSEKMSKeyId") == key["Arn"], r2
 
     # A bucket without explicit encryption does not stamp the header here.
     bkt3 = f"noenc-{_uuid_mod.uuid4().hex[:8]}"
@@ -8225,9 +8216,12 @@ def test_an_algorithm_ministack_cannot_compute_is_refused(s3):
 # ── Encryption ─────────────────────────────────────────────────────────
 
 
-def test_annotations_take_the_objects_encryption(s3):
+def test_annotations_take_the_objects_encryption(s3, kms_client):
     bucket = _bucket(s3)
-    s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId="alias/annot")
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    alias = f"alias/annot-{_uid()}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=key_id)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId=alias)
     out = s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
     assert out["ServerSideEncryption"] == "aws:kms"
     got = s3.get_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
@@ -10665,6 +10659,164 @@ def test_s3_multipart_encryption_condition_contract(auth_enabled, iam_user, s3, 
         Bucket=bucket, Key="plain", UploadId=plain, PartNumber=1, Body=b"x"))
 
 
+@pytest.fixture
+def kms_key_with_alias(kms_client):
+    """A KMS key and an alias for it: ``(key metadata, alias name)``; scheduled for deletion after."""
+    meta = kms_client.create_key()["KeyMetadata"]
+    alias = f"alias/s3-cond-{uuid.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+    yield meta, alias
+    kms_client.delete_alias(AliasName=alias)
+    kms_client.schedule_key_deletion(KeyId=meta["KeyId"], PendingWindowInDays=7)
+
+
+def _assert_mpu_condition(auth_enabled, allowed, client, bucket, key, **sse):
+    """A CreateMultipartUpload is refused or, when allowed, its part and completion go through too."""
+    if auth_enabled and not allowed:
+        _assert_s3_condition(auth_enabled, False, lambda: client.create_multipart_upload(Bucket=bucket, Key=key, **sse))
+        return
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key=key, **sse)["UploadId"]
+    etag = client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b"x")["ETag"]
+    client.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id,
+                                     MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]})
+
+
+_KMS_KEY_ID_CONDITION = "s3:x-amz-server-side-encryption-aws-kms-key-id"
+
+
+@pytest.mark.auth_contract
+def test_s3_kms_key_id_condition_contract(auth_enabled, iam_user, s3, kms_client, auth_condition_bucket,
+                                          kms_key_with_alias):
+    """s3:x-amz-server-side-encryption-aws-kms-key-id holds the key ARN however a write names the key.
+
+    Recorded on AWS (us-east-2), deny on StringNotEquals the key ARN: a PutObject or CopyObject naming the
+    key by ARN, ID, alias or alias ARN succeeds, as do a multipart upload's create, part, part copy and
+    completion; no SSE, AES256 or another key is refused.
+    """
+    meta, alias = kms_key_with_alias
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
+    s3.put_object(Bucket=bucket, Key="source", Body=b"x")
+    client = user.client("s3")
+    alias_arn = meta["Arn"].split(":key/")[0] + ":" + alias
+    other = kms_client.create_key()["KeyMetadata"]
+    source = {"Bucket": bucket, "Key": "source"}
+    try:
+        for name, key_id in (("arn", meta["Arn"]), ("id", meta["KeyId"]), ("alias", alias), ("alias-arn", alias_arn)):
+            _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+                Bucket=bucket, Key=f"key-{name}", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId=key_id))
+        _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+            Bucket=bucket, Key="other-key", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId=other["Arn"]))
+        _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+            Bucket=bucket, Key="aes256", Body=b"x", ServerSideEncryption="AES256"))
+        _assert_s3_condition(auth_enabled, False, lambda: client.put_object(Bucket=bucket, Key="no-sse", Body=b"x"))
+        _assert_s3_condition(auth_enabled, True, lambda: client.copy_object(
+            Bucket=bucket, Key="copy-alias", CopySource=source, ServerSideEncryption="aws:kms", SSEKMSKeyId=alias))
+        _assert_s3_condition(auth_enabled, False, lambda: client.copy_object(
+            Bucket=bucket, Key="copy-aes256", CopySource=source, ServerSideEncryption="AES256"))
+        _assert_s3_condition(auth_enabled, False, lambda: client.copy_object(
+            Bucket=bucket, Key="copy-no-sse", CopySource=source))
+        _assert_mpu_condition(auth_enabled, True, client, bucket, "mpu-id",
+                              ServerSideEncryption="aws:kms", SSEKMSKeyId=meta["KeyId"])
+        _assert_mpu_condition(auth_enabled, False, client, bucket, "mpu-no-sse")
+        upload_id = client.create_multipart_upload(Bucket=bucket, Key="mpu-part-copy", ServerSideEncryption="aws:kms",
+                                                   SSEKMSKeyId=alias)["UploadId"]
+        _assert_s3_condition(auth_enabled, True, lambda: client.upload_part_copy(
+            Bucket=bucket, Key="mpu-part-copy", UploadId=upload_id, PartNumber=1, CopySource=source))
+    finally:
+        kms_client.schedule_key_deletion(KeyId=other["KeyId"], PendingWindowInDays=7)
+
+
+@pytest.mark.auth_contract
+def test_s3_kms_key_id_condition_bucket_default_contract(auth_enabled, iam_user, s3, auth_condition_bucket,
+                                                        kms_key_with_alias):
+    """With no SSE header of its own a write carries the bucket default key, as an ARN; AES256 overrides it.
+
+    Recorded on AWS (us-east-2), default key named by key ID, deny on StringNotEquals the key ARN; an upload
+    keeps the key it started with after the default changes to AES256.
+    """
+    meta, _ = kms_key_with_alias
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
+    s3.put_object(Bucket=bucket, Key="source", Body=b"x")
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": meta["KeyId"]}}]})
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(Bucket=bucket, Key="no-header", Body=b"x"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+        Bucket=bucket, Key="aes256", Body=b"x", ServerSideEncryption="AES256"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.copy_object(
+        Bucket=bucket, Key="copy-no-header", CopySource={"Bucket": bucket, "Key": "source"}))
+    _assert_mpu_condition(auth_enabled, True, client, bucket, "mpu-no-header")
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key="mpu-default-changed")["UploadId"]
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]})
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(Bucket=bucket, Key="after", Body=b"x"))
+    etag = client.upload_part(Bucket=bucket, Key="mpu-default-changed", UploadId=upload_id, PartNumber=1,
+                              Body=b"x")["ETag"]
+    _assert_s3_condition(auth_enabled, True, lambda: client.complete_multipart_upload(
+        Bucket=bucket, Key="mpu-default-changed", UploadId=upload_id,
+        MultipartUpload={"Parts": [{"ETag": etag, "PartNumber": 1}]}))
+
+
+@pytest.mark.auth_contract
+def test_s3_kms_key_id_condition_other_account_key_contract(auth_enabled, iam_user, s3, kms_client,
+                                                           auth_condition_bucket):
+    """Another account's key, named by key ARN or alias ARN, header or bucket default: the condition holds its key ARN.
+
+    Recorded on AWS (us-east-2) with a key in a second account whose key policy lets the writer's account use it.
+    """
+    owner = boto3.client("kms", endpoint_url=ENDPOINT, region_name=kms_client.meta.region_name,
+                         aws_access_key_id="333333333333", aws_secret_access_key="root-secret")
+    meta = owner.create_key()["KeyMetadata"]
+    alias = f"alias/s3-cond-{uuid.uuid4().hex[:8]}"
+    owner.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+    alias_arn = meta["Arn"].split(":key/")[0] + ":" + alias
+    try:
+        user = iam_user(policy=_ALLOW_ALL_S3)
+        bucket = auth_condition_bucket(user.arn, "s3:PutObject",
+                                       {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
+        client = user.client("s3")
+        for name, key_id in (("arn", meta["Arn"]), ("alias-arn", alias_arn)):
+            _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+                Bucket=bucket, Key=f"key-{name}", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId=key_id))
+        s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": alias_arn}}]})
+        _assert_s3_condition(auth_enabled, True, lambda: client.put_object(Bucket=bucket, Key="no-header", Body=b"x"))
+    finally:
+        owner.delete_alias(AliasName=alias)
+        owner.schedule_key_deletion(KeyId=meta["KeyId"], PendingWindowInDays=7)
+
+
+@pytest.mark.auth_contract
+def test_s3_kms_key_id_condition_access_point_contract(auth_enabled, iam_user, s3, auth_condition_bucket,
+                                                      kms_key_with_alias):
+    """A write through an access point alias or ARN carries the bucket's default key; AES256 overrides it.
+
+    Recorded on AWS (us-east-2) with the deny in the caller's identity policy, and with it in the bucket
+    policy; MiniStack applies only the identity policy to an access point write, so the deny sits there.
+    """
+    meta, _ = kms_key_with_alias
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*",
+         "Condition": {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}}}]})
+    bucket = auth_condition_bucket(user.arn, "s3:GetObject", {"Bool": {"aws:SecureTransport": "true"}})
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": meta["KeyId"]}}]})
+    ctl = _client("s3control", "us-east-1")
+    name = f"ap-{_uid()}"
+    created = ctl.create_access_point(AccountId=ACCOUNT, Name=name, Bucket=bucket)
+    try:
+        client = user.client("s3")
+        for via in (created["Alias"], created["AccessPointArn"]):
+            _assert_s3_condition(auth_enabled, True, lambda: client.put_object(Bucket=via, Key="no-header", Body=b"x"))
+            _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+                Bucket=via, Key="aes256", Body=b"x", ServerSideEncryption="AES256"))
+    finally:
+        ctl.delete_access_point(AccountId=ACCOUNT, Name=name)
+
+
 @pytest.mark.auth_contract
 def test_s3_canned_acl_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
     """A bucket policy on s3:x-amz-acl sees the canned ACL of a PutObject."""
@@ -12843,3 +12995,682 @@ def test_s3_persisted_keys_a_path_cannot_hold_survive_a_restart(tmp_path, monkey
                                                  "last_modified": s3mod.now_iso()})
     assert open(tmp_path / "000000000000" / "keys-bucket" / "a" / "b", "rb").read() == b"moved"
     s3mod._buckets._data.pop(("000000000000", "keys-bucket"), None)
+
+
+def test_object_lock_retention_and_legal_hold_survive_a_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(_s3_mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(_s3_mod, "S3_PERSIST", True)
+    bucket = _locked_in_process(**{"x-amz-object-lock-mode": "COMPLIANCE",
+                                   "x-amz-object-lock-retain-until-date": _until()})
+    vid = _s3_mod._buckets[bucket]["objects"]["k"]["version_id"]
+    hold = b'<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>ON</Status></LegalHold>'
+    assert _lock_call("PUT", f"/{bucket}/k", {}, hold, {"legal-hold": [""], "versionId": [vid]})[0] == 200
+    with request_scope("000000000000", "us-east-1"):
+        state = _s3_mod.get_state()
+    for store in (_s3_mod._buckets, _s3_mod._object_versions, _s3_mod._object_retention, _s3_mod._object_legal_hold):
+        for k in [k for k in store._data if k[1] == bucket or (isinstance(k[1], tuple) and k[1][0] == bucket)]:
+            del store._data[k]
+    _s3_mod._load_persisted_data()
+    _s3_mod.load_persisted_state(state)
+    query = {"versionId": [vid]}
+    status, _, body = _lock_call("GET", f"/{bucket}/k", {}, b"", {"retention": [""], **query})
+    assert status == 200 and b"<Mode>COMPLIANCE</Mode>" in body
+    status, _, body = _lock_call("GET", f"/{bucket}/k", {}, b"", {"legal-hold": [""], **query})
+    assert status == 200 and b"<Status>ON</Status>" in body
+    status, _, body = _lock_call("DELETE", f"/{bucket}/k", {}, b"", query)
+    assert status == 403 and b"<Code>AccessDenied</Code>" in body
+
+
+def test_complete_multipart_upload_validates_the_parts_list(s3):
+    bkt = f"mpu-parts-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    upload_id = s3.create_multipart_upload(Bucket=bkt, Key="k")["UploadId"]
+    etags = [s3.upload_part(Bucket=bkt, Key="k", UploadId=upload_id, PartNumber=n,
+                            Body=b"x" * (5 * 1024 * 1024 if n == 1 else 10))["ETag"] for n in (1, 2)]
+
+    def complete(parts):
+        with pytest.raises(ClientError) as exc:
+            s3.complete_multipart_upload(Bucket=bkt, Key="k", UploadId=upload_id,
+                                         MultipartUpload={"Parts": parts})
+        return exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+
+    assert complete([{"PartNumber": 2, "ETag": etags[1]}, {"PartNumber": 1, "ETag": etags[0]}]) == (
+        "InvalidPartOrder", 400)
+    assert complete([]) == ("MalformedXML", 400)
+    assert complete([{"PartNumber": 1}, {"PartNumber": 2, "ETag": etags[1]}]) == ("InvalidPart", 400)
+    s3.complete_multipart_upload(Bucket=bkt, Key="k", UploadId=upload_id, MultipartUpload={
+        "Parts": [{"PartNumber": 1, "ETag": etags[0]}, {"PartNumber": 2, "ETag": etags[1]}]})
+    assert s3.head_object(Bucket=bkt, Key="k")["ContentLength"] == 5 * 1024 * 1024 + 10
+
+
+# ── aws/s3 managed key, KMS key resolution and pre-auth write checks ──────────
+#
+# Recorded on AWS (us-east-2), 2026-11-05.
+
+_SSE_ORPHAN_KEY_MESSAGE = ("Server Side Encryption with AWS KMS managed key requires HTTP header "
+                           "x-amz-server-side-encryption : aws:kms")
+_NO_SUCH_UPLOAD_TEXT = ("The specified upload does not exist. The upload ID may be invalid, or the upload may "
+                        "have been aborted or completed.")
+
+
+def _kms_ref_errors(region, account):
+    """``(key reference, code, message)`` for each reference S3 refuses, per KMS's own wording."""
+    missing_id = "11111111-2222-3333-4444-555555555555"
+    base = f"arn:aws:kms:{region}:{account}"
+    return [
+        ("alias/never-made", "KMS.NotFoundException", f"Alias {base}:alias/never-made is not found."),
+        ("alias/aws/notaservice", "KMS.NotFoundException", f"Alias {base}:alias/aws/notaservice is not found."),
+        ("alias/", "KMS.NotFoundException", f"Alias {base}:alias/ is not found."),
+        (f"{base}:alias/never-made", "KMS.NotFoundException", f"Alias {base}:alias/never-made is not found."),
+        (missing_id, "KMS.NotFoundException", f"Key '{base}:key/{missing_id}' does not exist"),
+        (f"{base}:key/{missing_id}", "KMS.NotFoundException", f"Key '{base}:key/{missing_id}' does not exist"),
+        ("my-key-id", "KMS.NotFoundException", "Invalid keyId 'my-key-id'"),
+        (f"{base}:key/abc", "KMS.NotFoundException", "Invalid keyId abc"),
+        ("arn:aws:s3:::somebucket", "KMS.NotFoundException", "Invalid arn s3"),
+        (f"arn:aws:kms:us-west-2:{account}:key/{missing_id}", "KMS.NotFoundException", "Invalid arn us-west-2"),
+        (f"arn:aws:kms:us-west-2:{account}:alias/x", "KMS.NotFoundException", "Invalid arn us-west-2"),
+        (f"{base}:foo/bar", "KMS.NotFoundException", f"Invalid arn {base}:foo/bar"),
+        # Incomplete ARNs (recorded on AWS, us-east-2).
+        ("arn:", "KMS.NotFoundException", "Invalid arn arn:"),
+        ("arn:aws", "KMS.NotFoundException", "Invalid arn arn:aws"),
+        ("arn:aws:kms", "KMS.NotFoundException", "Invalid arn arn:aws:kms"),
+        (f"arn:aws:kms:{region}", "KMS.NotFoundException", f"Invalid arn arn:aws:kms:{region}"),
+        (base, "KMS.NotFoundException", f"Invalid arn {base}"),
+        (f"{base}:", "KMS.NotFoundException", f"Invalid arn {base}:"),
+        (f"{base}:key/", "KMS.NotFoundException", "Invalid keyId "),
+        (f"arn:aws:kms::{account}:key/{missing_id}", "KMS.NotFoundException", "Invalid arn "),
+        (f"arn:aws:kms:{region}::key/{missing_id}", "KMS.NotFoundException",
+         f"Invalid arn arn:aws:kms:{region}::key/{missing_id}"),
+    ]
+
+
+def test_s3_kms_key_states_and_empty_key_header(s3, kms_client):
+    """Recorded on AWS (us-east-2): a disabled key, a key pending deletion and one pending import are refused
+    with KMS's error (header, bucket default, CopyObject, CreateMultipartUpload, another account's key too); an
+    empty key header with aws:kms is S3's 500 InternalError."""
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"x")
+    disabled = kms_client.create_key()["KeyMetadata"]
+    kms_client.disable_key(KeyId=disabled["KeyId"])
+    pending = kms_client.create_key()["KeyMetadata"]
+    kms_client.schedule_key_deletion(KeyId=pending["KeyId"], PendingWindowInDays=7)
+    external = kms_client.create_key(Origin="EXTERNAL")["KeyMetadata"]
+    owner = boto3.client("kms", endpoint_url=ENDPOINT, region_name=kms_client.meta.region_name,
+                         aws_access_key_id="333333333333", aws_secret_access_key="root-secret")
+    foreign = owner.create_key()["KeyMetadata"]
+    owner.disable_key(KeyId=foreign["KeyId"])
+    expected = [
+        (disabled["KeyId"], "KMS.DisabledException", f"{disabled['Arn']} is disabled."),
+        (pending["Arn"], "KMS.KMSInvalidStateException", f"{pending['Arn']} is pending deletion."),
+        (external["KeyId"], "KMS.KMSInvalidStateException", f"{external['Arn']} is pending import."),
+        (foreign["Arn"], "KMS.DisabledException", f"{foreign['Arn']} is disabled."),
+    ]
+    for ref, code, message in expected:
+        kms = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": ref}
+        for call in (lambda: s3.put_object(Bucket=bucket, Key="k", Body=b"x", **kms),
+                     lambda: s3.copy_object(Bucket=bucket, Key="k", CopySource={"Bucket": bucket, "Key": "src"}, **kms),
+                     lambda: s3.create_multipart_upload(Bucket=bucket, Key="k", **kms)):
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (code, message)
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": disabled["KeyId"]}}]})
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="dflt", Body=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMS.DisabledException"
+    s3.delete_bucket_encryption(Bucket=bucket)
+
+    def empty_key_header(request, **_):
+        request.headers["x-amz-server-side-encryption-aws-kms-key-id"] = ""
+
+    s3.meta.events.register("before-sign.s3.PutObject", empty_key_header)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="empty", Body=b"x", ServerSideEncryption="aws:kms")
+    finally:
+        s3.meta.events.unregister("before-sign.s3.PutObject", empty_key_header)
+    assert exc.value.response["Error"]["Code"] == "InternalError"
+    assert exc.value.response["Error"]["Message"] == "We encountered an internal error. Please try again."
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 500
+
+
+def test_s3_aws_managed_key_is_created_on_first_use(s3, kms_client):
+    """aws/s3 appears with S3's first aws:kms write, with the recorded metadata, policy and alias."""
+    bucket = _bucket(s3)
+    resp = s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms")
+    meta = kms_client.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]
+    assert resp["SSEKMSKeyId"] == meta["Arn"]
+    assert meta["KeyManager"] == "AWS"
+    assert meta["Origin"] == "AWS_KMS"
+    assert meta["KeySpec"] == "SYMMETRIC_DEFAULT"
+    assert meta["EncryptionAlgorithms"] == ["SYMMETRIC_DEFAULT"]
+    assert meta["Enabled"] and not meta["MultiRegion"]
+    assert meta["Description"] == "Default key that protects my S3 objects when no other key is defined"
+    assert not kms_client.list_resource_tags(KeyId=meta["KeyId"])["Tags"]
+    assert not kms_client.get_key_rotation_status(KeyId=meta["KeyId"])["KeyRotationEnabled"]
+    region = kms_client.meta.region_name
+    account = meta["AWSAccountId"]
+    text = kms_client.get_key_policy(KeyId=meta["KeyId"], PolicyName="default")["Policy"]
+    # AWS returns the policy pretty-printed with " : " separators (recorded text).
+    assert text.startswith('{\n  "Version" : "2012-10-17",\n  "Id" : "auto-s3-2",\n  "Statement" : [ {\n')
+    assert text.endswith('    "Action" : [ "kms:Describe*", "kms:Get*", "kms:List*" ],\n    "Resource" : "*"\n  } ]\n}')
+    policy = json.loads(text)
+    assert policy["Id"] == "auto-s3-2"
+    via_s3, direct = policy["Statement"]
+    assert via_s3["Condition"]["StringEquals"] == {
+        "kms:ViaService": f"s3.{region}.amazonaws.com", "kms:CallerAccount": account}
+    assert via_s3["Action"] == ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*",
+                                "kms:DescribeKey"]
+    assert direct["Principal"] == {"AWS": f"arn:aws:iam::{account}:root"}
+    assert direct["Action"] == ["kms:Describe*", "kms:Get*", "kms:List*"]
+    aliases = {a["AliasName"]: a["TargetKeyId"] for a in kms_client.list_aliases()["Aliases"]}
+    assert aliases["alias/aws/s3"] == meta["KeyId"]
+    # The same key answers the alias, the alias ARN and the bucket default.
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}]})
+    assert s3.put_object(Bucket=bucket, Key="default", Body=b"x")["SSEKMSKeyId"] == meta["Arn"]
+    for ref in ("alias/aws/s3", f"arn:aws:kms:{region}:{account}:alias/aws/s3"):
+        assert s3.put_object(Bucket=bucket, Key="ref", Body=b"x", ServerSideEncryption="aws:kms",
+                             SSEKMSKeyId=ref)["SSEKMSKeyId"] == meta["Arn"]
+
+
+def test_s3_kms_key_references_echo_the_key_arn(s3, kms_client):
+    bucket = _bucket(s3)
+    meta = kms_client.create_key()["KeyMetadata"]
+    alias = f"alias/s3-echo-{_uid()}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+    alias_arn = meta["Arn"].split(":key/")[0] + ":" + alias
+    for ref in (meta["KeyId"], meta["Arn"], alias, alias_arn):
+        put = s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId=ref)
+        assert put["SSEKMSKeyId"] == meta["Arn"]
+        upload = s3.create_multipart_upload(Bucket=bucket, Key="m", ServerSideEncryption="aws:kms",
+                                            SSEKMSKeyId=ref)
+        assert upload["SSEKMSKeyId"] == meta["Arn"]
+        part = s3.upload_part(Bucket=bucket, Key="m", UploadId=upload["UploadId"], PartNumber=1, Body=b"x")
+        assert part["SSEKMSKeyId"] == meta["Arn"]
+        done = s3.complete_multipart_upload(Bucket=bucket, Key="m", UploadId=upload["UploadId"],
+                                            MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]})
+        assert done["SSEKMSKeyId"] == meta["Arn"]
+        assert s3.head_object(Bucket=bucket, Key="m")["SSEKMSKeyId"] == meta["Arn"]
+    # The ID of an existing key in capitals is another, unknown ID.
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms",
+                      SSEKMSKeyId=meta["KeyId"].upper())
+    assert exc.value.response["Error"]["Code"] == "KMS.NotFoundException"
+
+
+def test_s3_kms_key_reference_errors(s3, kms_client):
+    bucket = _bucket(s3)
+    region = s3.meta.region_name
+    account = kms_client.create_key()["KeyMetadata"]["AWSAccountId"]
+    for ref, code, message in _kms_ref_errors(region, account):
+        calls = [
+            lambda: s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms",
+                                  SSEKMSKeyId=ref),
+            lambda: s3.create_multipart_upload(Bucket=bucket, Key="k", ServerSideEncryption="aws:kms",
+                                               SSEKMSKeyId=ref),
+        ]
+        for call in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == code, ref
+            assert exc.value.response["Error"]["Message"] == message, ref
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400, ref
+
+
+def test_s3_kms_key_of_another_account_must_exist(s3, kms_client):
+    bucket = _bucket(s3)
+    owner = boto3.client("kms", endpoint_url=ENDPOINT, region_name=kms_client.meta.region_name,
+                         aws_access_key_id="333333333333", aws_secret_access_key="root-secret")
+    meta = owner.create_key()["KeyMetadata"]
+    try:
+        assert s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms",
+                             SSEKMSKeyId=meta["Arn"])["SSEKMSKeyId"] == meta["Arn"]
+        missing = meta["Arn"].replace(meta["KeyId"], "11111111-2222-3333-4444-555555555555")
+        with pytest.raises(ClientError) as exc:
+            s3.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms", SSEKMSKeyId=missing)
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+        assert "is not authorized to perform: kms:GenerateDataKey on this resource because the resource does " \
+               "not exist in this Region" in exc.value.response["Error"]["Message"]
+    finally:
+        owner.schedule_key_deletion(KeyId=meta["KeyId"], PendingWindowInDays=7)
+
+
+def test_s3_kms_key_header_needs_aws_kms(s3, kms_client):
+    bucket = _bucket(s3)
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    for sse in ({}, {"ServerSideEncryption": "AES256"}):
+        for call in (
+            lambda: s3.put_object(Bucket=bucket, Key="k", Body=b"x", SSEKMSKeyId=key_id, **sse),
+            lambda: s3.create_multipart_upload(Bucket=bucket, Key="k", SSEKMSKeyId=key_id, **sse),
+            lambda: s3.copy_object(Bucket=bucket, Key="k", CopySource={"Bucket": bucket, "Key": "s"},
+                                   SSEKMSKeyId=key_id, **sse),
+        ):
+            s3.put_object(Bucket=bucket, Key="s", Body=b"x")
+            with pytest.raises(ClientError) as exc:
+                call()
+            error = exc.value.response["Error"]
+            assert error["Code"] == "InvalidArgument"
+            assert error["Message"] == _SSE_ORPHAN_KEY_MESSAGE
+            # Recorded body: ArgumentName, and ArgumentValue only when an SSE header was sent; no Resource.
+            assert error["ArgumentName"] == "x-amz-server-side-encryption"
+            assert error.get("ArgumentValue") == sse.get("ServerSideEncryption")
+            assert "Resource" not in error
+
+
+def test_s3_bucket_default_key_is_resolved_on_write(s3, kms_client):
+    """An unknown default key fails the write, not PutBucketEncryption; a key ID or alias default echoes the ARN."""
+    bucket = _bucket(s3)
+    meta = kms_client.create_key()["KeyMetadata"]
+    missing = "11111111-2222-3333-4444-555555555555"
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": missing}}]})
+    with pytest.raises(ClientError) as exc:
+        s3.put_object(Bucket=bucket, Key="k", Body=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMS.NotFoundException"
+    assert exc.value.response["Error"]["Message"] == (
+        f"Key 'arn:aws:kms:{s3.meta.region_name}:{meta['AWSAccountId']}:key/{missing}' does not exist")
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": meta["KeyId"]}}]})
+    assert s3.put_object(Bucket=bucket, Key="k", Body=b"x")["SSEKMSKeyId"] == meta["Arn"]
+    assert s3.create_multipart_upload(Bucket=bucket, Key="m")["SSEKMSKeyId"] == meta["Arn"]
+
+
+def test_s3_unknown_upload_id(s3):
+    """Every multipart operation answers an unknown upload id alike, as do UploadPart and Complete for an id
+    used under another key.
+
+    Recorded on AWS (us-east-2): the message below and ``<UploadId>``, no ``<Resource>``.
+    """
+    bucket = _bucket(s3)
+    s3.put_object(Bucket=bucket, Key="src", Body=b"x")
+    real = s3.create_multipart_upload(Bucket=bucket, Key="real")["UploadId"]
+    parts = {"Parts": [{"ETag": '"a"', "PartNumber": 1}]}
+    calls = {
+        "part": lambda u, k: s3.upload_part(Bucket=bucket, Key=k, UploadId=u, PartNumber=1, Body=b"x"),
+        "complete": lambda u, k: s3.complete_multipart_upload(Bucket=bucket, Key=k, UploadId=u, MultipartUpload=parts),
+        "abort": lambda u, k: s3.abort_multipart_upload(Bucket=bucket, Key=k, UploadId=u),
+        "list-parts": lambda u, k: s3.list_parts(Bucket=bucket, Key=k, UploadId=u),
+        "part-copy": lambda u, k: s3.upload_part_copy(Bucket=bucket, Key=k, UploadId=u, PartNumber=1,
+                                                      CopySource={"Bucket": bucket, "Key": "src"}),
+    }
+    cases = [("nope", "k", name) for name in calls] + [(real, "other", "part"), (real, "other", "complete")]
+    for upload_id, key, name in cases:
+        with pytest.raises(ClientError) as exc:
+            calls[name](upload_id, key)
+        error = exc.value.response["Error"]
+        assert error["Code"] == "NoSuchUpload", name
+        assert error["Message"] == _NO_SUCH_UPLOAD_TEXT
+        assert error["UploadId"] == upload_id
+        assert "Resource" not in error
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    s3.abort_multipart_upload(Bucket=bucket, Key="real", UploadId=real)
+
+
+@pytest.mark.auth_contract
+def test_s3_write_checks_answer_before_authorization_contract(auth_enabled, iam_user, s3, kms_client,
+                                                              auth_condition_bucket):
+    """The key, SSE-header and upload-id errors win over a bucket policy denying the write.
+
+    Recorded on AWS (us-east-2) under a bucket policy denying all PutObject, an identity policy without
+    an S3 allow and an explicit identity deny.
+    """
+    meta = kms_client.create_key()["KeyMetadata"]
+    disabled = kms_client.create_key()["KeyMetadata"]
+    kms_client.disable_key(KeyId=disabled["KeyId"])
+    pending = kms_client.create_key()["KeyMetadata"]
+    kms_client.schedule_key_deletion(KeyId=pending["KeyId"], PendingWindowInDays=7)
+    deny_all = {"StringLike": {"aws:userid": "*"}}
+    cases = {
+        "bucket-policy": (_ALLOW_ALL_S3, True),
+        "no-allow": ({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "kms:*", "Resource": "*"}]}, False),
+        "identity-deny": ({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "s3:*", "Resource": "*"}]}, False),
+    }
+    for name, (policy, bucket_denies) in cases.items():
+        user = iam_user(policy=policy)
+        bucket = auth_condition_bucket(user.arn, "s3:PutObject", deny_all)
+        if not bucket_denies:
+            s3.delete_bucket_policy(Bucket=bucket)
+        client = user.client("s3")
+        region = client.meta.region_name
+        missing = "11111111-2222-3333-4444-555555555555"
+        expected = [
+            (lambda: client.put_object(Bucket=bucket, Key="k", Body=b"x", SSEKMSKeyId=meta["KeyId"]),
+             "InvalidArgument", _SSE_ORPHAN_KEY_MESSAGE),
+            (lambda: client.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms",
+                                       SSEKMSKeyId=missing),
+             "KMS.NotFoundException",
+             f"Key 'arn:aws:kms:{region}:{meta['AWSAccountId']}:key/{missing}' does not exist"),
+            (lambda: client.create_multipart_upload(Bucket=bucket, Key="k", SSEKMSKeyId=meta["KeyId"]),
+             "InvalidArgument", _SSE_ORPHAN_KEY_MESSAGE),
+            (lambda: client.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms",
+                                       SSEKMSKeyId=disabled["KeyId"]),
+             "KMS.DisabledException", f"{disabled['Arn']} is disabled."),
+            (lambda: client.put_object(Bucket=bucket, Key="k", Body=b"x", ServerSideEncryption="aws:kms",
+                                       SSEKMSKeyId=pending["Arn"]),
+             "KMS.KMSInvalidStateException", f"{pending['Arn']} is pending deletion."),
+            (lambda: client.upload_part(Bucket=bucket, Key="k", UploadId="nope", PartNumber=1, Body=b"x"),
+             "NoSuchUpload", _NO_SUCH_UPLOAD_TEXT),
+            (lambda: client.complete_multipart_upload(
+                Bucket=bucket, Key="k", UploadId="nope",
+                MultipartUpload={"Parts": [{"ETag": '"a"', "PartNumber": 1}]}),
+             "NoSuchUpload", _NO_SUCH_UPLOAD_TEXT),
+        ]
+        for call, code, message in expected:
+            with pytest.raises(ClientError) as exc:
+                call()
+            assert exc.value.response["Error"]["Code"] == code, name
+            assert exc.value.response["Error"]["Message"] == message, name
+        # A request that passes the checks meets the authorization.
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                client.put_object(Bucket=bucket, Key="k", Body=b"x")
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+
+@pytest.mark.auth_contract
+def test_s3_kms_key_id_condition_aws_managed_key_contract(auth_enabled, iam_user, s3, kms_client,
+                                                          auth_condition_bucket):
+    """aws:kms without a key id, from the header or the bucket default, holds the aws/s3 key ARN."""
+    bucket = _bucket(s3)
+    aws_key = s3.put_object(Bucket=bucket, Key="probe", Body=b"x", ServerSideEncryption="aws:kms")["SSEKMSKeyId"]
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringEquals": {_KMS_KEY_ID_CONDITION: aws_key}})
+    client = user.client("s3")
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+        Bucket=bucket, Key="header", Body=b"x", ServerSideEncryption="aws:kms"))
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+        Bucket=bucket, Key="aes256", Body=b"x", ServerSideEncryption="AES256"))
+    s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+        {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}]})
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(Bucket=bucket, Key="default", Body=b"x"))
+
+
+# --- PutObject through another account's access point (recorded on AWS, us-east-2, AUTH=true) ---
+
+_OWNER = "333333333333"
+_FOREIGN_AP_REGION = "us-east-1"
+_FOREIGN_ALLOW_ALL = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+
+
+def _foreign_ap_owner(service):
+    return boto3.client(service, endpoint_url=ENDPOINT, region_name=_FOREIGN_AP_REGION,
+                        aws_access_key_id=_OWNER, aws_secret_access_key="root-secret",
+                        config=Config(retries={"total_max_attempts": 1}))
+
+
+@pytest.fixture
+def foreign_access_points(auth_enabled):
+    """The owner's bucket ``b1`` (its policy delegates to the owner's access points) with access points
+    ``full`` (policy allows the default account's PutObject) and ``nopol``, and ``b2`` (no bucket policy)
+    with ``nodel`` (policy allows it) and ``none`` (no policy)."""
+    owner, ctl = _foreign_ap_owner("s3"), _foreign_ap_owner("s3control")
+    suffix = uuid.uuid4().hex[:8]
+    b1, b2 = f"foreign-ap-b1-{suffix}", f"foreign-ap-b2-{suffix}"
+    for name in (b1, b2):
+        owner.create_bucket(Bucket=name)
+    owner.put_bucket_policy(Bucket=b1, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "*",
+        "Resource": [f"arn:aws:s3:::{b1}", f"arn:aws:s3:::{b1}/*"],
+        "Condition": {"StringEquals": {"s3:DataAccessPointAccount": _OWNER}}}]}))
+    points = {}
+    for label, bucket, policy in (("full", b1, True), ("nopol", b1, False), ("nodel", b2, True), ("none", b2, False)):
+        name = f"{label}-{suffix}"
+        created = ctl.create_access_point(AccountId=_OWNER, Name=name, Bucket=bucket)
+        if policy:
+            ctl.put_access_point_policy(AccountId=_OWNER, Name=name, Policy=json.dumps({
+                "Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                    "Action": "s3:PutObject",
+                    "Resource": f"arn:aws:s3:{_FOREIGN_AP_REGION}:{_OWNER}:accesspoint/{name}/object/*"}]}))
+        points[label] = {"name": name, "bucket": bucket, "alias": created["Alias"], "arn": created["AccessPointArn"]}
+    yield owner, points
+    for label, point in points.items():
+        ctl.delete_access_point(AccountId=_OWNER, Name=point["name"])
+    for name in (b1, b2):
+        for obj in owner.list_objects_v2(Bucket=name).get("Contents", []):
+            owner.delete_object(Bucket=name, Key=obj["Key"])
+        owner.delete_bucket(Bucket=name)
+    owner.close()
+    ctl.close()
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("target,addressing_style", [("alias", "path"), ("alias", "virtual"), ("arn", "virtual")])
+@pytest.mark.parametrize("label", ["full", "nopol", "nodel", "none"])
+@pytest.mark.parametrize("identity_allows", [True, False], ids=["identity-allow", "no-identity-allow"])
+def test_put_object_through_another_accounts_access_point(
+        foreign_access_points, auth_enabled, iam_user, target, addressing_style, label, identity_allows):
+    """All three grants are needed with AUTH=true: identity first, then the bucket, then the access point (with
+    neither resource policy allowing, the bucket answers; recorded on AWS, us-east-2). Without IAM the owner's
+    grants decide, as for a direct request to another account's bucket."""
+    owner, points = foreign_access_points
+    point = points[label]
+    user = iam_user(policy=_FOREIGN_ALLOW_ALL if identity_allows else {
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]})
+    client = user.client("s3", region=_FOREIGN_AP_REGION, config=Config(s3={"addressing_style": addressing_style}))
+    key = f"through-{label}-{uuid.uuid4().hex[:6]}"
+    call = lambda **extra: client.put_object(Bucket=point[target], Key=key, Body=b"via ap", **extra)  # noqa: E731
+    bucket_resource = f"arn:aws:s3:::{point['bucket']}/{key}"
+    point_resource = f"arn:aws:s3:{_FOREIGN_AP_REGION}:{_OWNER}:accesspoint/{point['name']}/object/{key}"
+    if auth_enabled and not identity_allows:
+        resource, reason = bucket_resource, "no identity-based policy allows the s3:PutObject action"
+    elif auth_enabled and label == "nopol":
+        resource, reason = point_resource, "no resource-based policy allows the s3:PutObject action"
+    elif label in ("nodel", "none") or (not auth_enabled and label == "nopol"):
+        resource, reason = bucket_resource, "no resource-based policy allows the s3:PutObject action"
+    else:
+        resource = reason = None
+    if resource is None:
+        assert call()["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert call(ServerSideEncryption="AES256")["ResponseMetadata"]["HTTPStatusCode"] == 200
+        assert owner.get_object(Bucket=point["bucket"], Key=key)["Body"].read() == b"via ap"
+        return
+    with pytest.raises(ClientError) as exc:
+        call()
+    response = exc.value.response
+    assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (403, "AccessDenied")
+    if auth_enabled:
+        assert response["Error"]["Message"] == (
+            f'User: {user.arn} is not authorized to perform: s3:PutObject on resource: "{resource}" because {reason}')
+    assert owner.list_objects_v2(Bucket=point["bucket"], Prefix=key)["KeyCount"] == 0
+
+
+@pytest.mark.auth_contract
+def test_unsigned_put_through_another_accounts_access_point_is_refused(foreign_access_points, auth_enabled):
+    """An unsigned PutObject through another account's access point is anonymous, never the default account: with
+    AUTH=true access points take signed requests only (400); without IAM it is refused (403). Nothing is written."""
+    owner, points = foreign_access_points
+    point = points["full"]
+    request = urllib.request.Request(f"{ENDPOINT}/{point['alias']}/unsigned", data=b"x", method="PUT")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request)
+    assert exc.value.code == (400 if auth_enabled else 403)
+    assert owner.list_objects_v2(Bucket=point["bucket"], Prefix="unsigned")["KeyCount"] == 0
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("scope", ["bucket", "access-point", "both"])
+def test_put_object_through_another_accounts_access_point_identity_scope(foreign_access_points, auth_enabled, iam_user,
+                                                                       scope):
+    """The caller's identity policy must allow PutObject on the bucket object and on the access point object; a
+    gap names the object it misses, "no identity-based policy" (recorded on AWS, us-east-2, with IAM roles)."""
+    owner, points = foreign_access_points
+    point = points["full"]
+    bucket_objects = f"arn:aws:s3:::{point['bucket']}/*"
+    point_objects = f"{point['arn']}/object/*"
+    resources = {"bucket": [bucket_objects], "access-point": [point_objects], "both": [bucket_objects, point_objects]}
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": resources[scope]}]})
+    client = user.client("s3", region=_FOREIGN_AP_REGION, config=Config(s3={"addressing_style": "virtual"}))
+    for target in ("alias", "arn"):
+        key = f"scope-{scope}-{target}"
+        if scope == "both" or not auth_enabled:
+            assert client.put_object(Bucket=point[target], Key=key, Body=b"x")["ResponseMetadata"]["HTTPStatusCode"] == 200
+            continue
+        with pytest.raises(ClientError) as exc:
+            client.put_object(Bucket=point[target], Key=key, Body=b"x")
+        missed = (f"arn:aws:s3:{_FOREIGN_AP_REGION}:{_OWNER}:accesspoint/{point['name']}/object/{key}" if scope == "bucket"
+                  else f"arn:aws:s3:::{point['bucket']}/{key}")
+        assert exc.value.response["Error"]["Message"] == (
+            f'User: {user.arn} is not authorized to perform: s3:PutObject on resource: "{missed}" '
+            "because no identity-based policy allows the s3:PutObject action")
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("label", ["full", "nopol", "nodel", "none"])
+def test_put_object_through_another_accounts_access_point_as_root(foreign_access_points, auth_enabled, label):
+    """A root caller's own account allows it everything, but the owner's access point and bucket must still
+    grant it: only ``full`` lets the write through, in either mode."""
+    owner, points = foreign_access_points
+    point = points[label]
+    root = boto3.client("s3", endpoint_url=ENDPOINT, region_name=_FOREIGN_AP_REGION, aws_access_key_id=ACCOUNT,
+                        aws_secret_access_key="test", config=Config(s3={"addressing_style": "virtual"}))
+    try:
+        for target in ("alias", "arn"):
+            key = f"root-{label}-{target}"
+            if label == "full":
+                assert root.put_object(Bucket=point[target], Key=key, Body=b"x")["ResponseMetadata"]["HTTPStatusCode"] == 200
+                continue
+            with pytest.raises(ClientError) as exc:
+                root.put_object(Bucket=point[target], Key=key, Body=b"x")
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+            assert owner.list_objects_v2(Bucket=point["bucket"], Prefix=key)["KeyCount"] == 0
+    finally:
+        root.close()
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("where", ["access-point-policy", "bucket-policy", "access-point-policy-no-bucket-grant"])
+def test_put_object_through_another_accounts_access_point_explicit_deny(foreign_access_points, auth_enabled, iam_user,
+                                                                      where):
+    """An explicit Deny in the owner's access point policy or bucket policy refuses the write despite the allows.
+    With no bucket grant, an access point Deny answers as the bucket's missing allow (the bucket is checked first;
+    recorded on AWS, us-east-2)."""
+    owner, points = foreign_access_points
+    point = points["nodel" if where == "access-point-policy-no-bucket-grant" else "full"]
+    user = iam_user(policy=_FOREIGN_ALLOW_ALL)
+    deny = {"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::000000000000:root"}, "Action": "s3:PutObject"}
+    if where.startswith("access-point-policy"):
+        ctl = _foreign_ap_owner("s3control")
+        policy = json.loads(ctl.get_access_point_policy(AccountId=_OWNER, Name=point["name"])["Policy"])
+        policy["Statement"].append({**deny, "Resource": f"{point['arn']}/object/*"})
+        ctl.put_access_point_policy(AccountId=_OWNER, Name=point["name"], Policy=json.dumps(policy))
+        ctl.close()
+    else:
+        policy = json.loads(owner.get_bucket_policy(Bucket=point["bucket"])["Policy"])
+        policy["Statement"].append({**deny, "Resource": f"arn:aws:s3:::{point['bucket']}/*"})
+        owner.put_bucket_policy(Bucket=point["bucket"], Policy=json.dumps(policy))
+    client = user.client("s3", region=_FOREIGN_AP_REGION, config=Config(s3={"addressing_style": "virtual"}))
+    for target in ("alias", "arn"):
+        key = f"denied-{target}"
+        with pytest.raises(ClientError) as exc:
+            client.put_object(Bucket=point[target], Key=key, Body=b"x")
+        assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], exc.value.response["Error"]["Code"]) == (
+            403, "AccessDenied")
+        if auth_enabled:
+            # Recorded on AWS (us-east-2): the message names the resource of the policy that denies.
+            resource = (f"arn:aws:s3:{_FOREIGN_AP_REGION}:{_OWNER}:accesspoint/{point['name']}/object/{key}"
+                        if where == "access-point-policy" else f"arn:aws:s3:::{point['bucket']}/{key}")
+            reason = ("because no resource-based policy allows the s3:PutObject action"
+                      if where == "access-point-policy-no-bucket-grant" else "with an explicit deny in a resource-based policy")
+            assert exc.value.response["Error"]["Message"] == (
+                f'User: {user.arn} is not authorized to perform: s3:PutObject on resource: "{resource}" {reason}')
+        assert owner.list_objects_v2(Bucket=point["bucket"], Prefix=key)["KeyCount"] == 0
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("target", ["alias", "arn"])
+def test_put_object_through_another_accounts_access_point_applies_owners_default_encryption(
+        foreign_access_points, auth_enabled, iam_user, target):
+    owner, points = foreign_access_points
+    point = points["full"]
+    kms = _foreign_ap_owner("kms")
+    try:
+        key = kms.create_key()["KeyMetadata"]
+        user = iam_user(policy=_FOREIGN_ALLOW_ALL)
+        client = user.client("s3", region=_FOREIGN_AP_REGION, config=Config(s3={"addressing_style": "virtual"}))
+        # The owner's key ARN is held by s3:x-amz-server-side-encryption-aws-kms-key-id.
+        policy = json.loads(owner.get_bucket_policy(Bucket=point["bucket"])["Policy"])
+        policy["Statement"].append({
+            "Effect": "Deny", "Principal": {"AWS": "*"}, "Action": "s3:PutObject",
+            "Resource": f"arn:aws:s3:::{point['bucket']}/*",
+            "Condition": {"StringNotEquals": {_KMS_KEY_ID_CONDITION: key["Arn"]}}})
+        owner.put_bucket_policy(Bucket=point["bucket"], Policy=json.dumps(policy))
+        owner.put_bucket_encryption(Bucket=point["bucket"], ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": key["Arn"]}}]})
+        written = client.put_object(Bucket=point[target], Key="encrypted", Body=b"x")
+        assert written["ServerSideEncryption"] == "aws:kms"
+        assert written["SSEKMSKeyId"] == key["Arn"]
+        assert owner.head_object(Bucket=point["bucket"], Key="encrypted")["SSEKMSKeyId"] == key["Arn"]
+        # A bare key ID default is resolved in the caller's account, which has no such key.
+        owner.put_bucket_encryption(Bucket=point["bucket"], ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": key["KeyId"]}}]})
+        with pytest.raises(ClientError) as exc:
+            client.put_object(Bucket=point[target], Key="bare", Body=b"x")
+        response = exc.value.response
+        assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (
+            400, "KMS.NotFoundException")
+        assert response["Error"]["Message"] == (
+            f"Key 'arn:aws:kms:{_FOREIGN_AP_REGION}:000000000000:key/{key['KeyId']}' does not exist")
+        assert owner.list_objects_v2(Bucket=point["bucket"], Prefix="bare")["KeyCount"] == 0
+    finally:
+        kms.close()
+
+
+@pytest.mark.auth_contract
+def test_s3_kms_writes_to_another_accounts_bucket_contract(auth_enabled):
+    """A write straight to another account's bucket (its policy grants the caller's account), recorded on AWS
+    (us-east-2): multipart parts and completion find the upload; a key ID, ``aws:kms`` without a key and an
+    ``aws:kms`` default without a key resolve in the caller's account (the caller's ``aws/s3``), the same for the
+    policy check and the stored object; the owner's default key ARN applies; the owner's bare key ID does not
+    exist in the caller's account."""
+    owner, owner_kms = _foreign_ap_owner("s3"), _foreign_ap_owner("kms")
+    caller = boto3.client("s3", endpoint_url=ENDPOINT, region_name=_FOREIGN_AP_REGION, aws_access_key_id=ACCOUNT,
+                          aws_secret_access_key="test", config=Config(retries={"total_max_attempts": 1}))
+    caller_kms = boto3.client("kms", endpoint_url=ENDPOINT, region_name=_FOREIGN_AP_REGION, aws_access_key_id=ACCOUNT,
+                              aws_secret_access_key="test")
+    bucket = f"xacct-kms-{uuid.uuid4().hex[:8]}"
+    owner.create_bucket(Bucket=bucket)
+    try:
+        own = caller_kms.create_key()["KeyMetadata"]
+        owner.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"}, "Action": "s3:*",
+             "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"]}]}))
+        upload_id = caller.create_multipart_upload(Bucket=bucket, Key="mpu", ServerSideEncryption="aws:kms",
+                                                   SSEKMSKeyId=own["KeyId"])["UploadId"]
+        part = caller.upload_part(Bucket=bucket, Key="mpu", UploadId=upload_id, PartNumber=1, Body=b"x")
+        assert part["SSEKMSKeyId"] == own["Arn"]
+        done = caller.complete_multipart_upload(Bucket=bucket, Key="mpu", UploadId=upload_id,
+                                                MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]})
+        assert done["SSEKMSKeyId"] == own["Arn"]
+        assert caller.put_object(Bucket=bucket, Key="kid", Body=b"x", ServerSideEncryption="aws:kms",
+                                 SSEKMSKeyId=own["KeyId"])["SSEKMSKeyId"] == own["Arn"]
+        managed = caller.put_object(Bucket=bucket, Key="managed", Body=b"x", ServerSideEncryption="aws:kms")
+        assert managed["SSEKMSKeyId"] == caller_kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]["Arn"]
+        assert not [a for a in owner_kms.list_aliases()["Aliases"]
+                    if a["AliasName"] == "alias/aws/s3" and a.get("TargetKeyId")]
+        default = owner_kms.create_key()["KeyMetadata"]
+        owner.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": default["Arn"]}}]})
+        assert caller.put_object(Bucket=bucket, Key="dflt", Body=b"x")["SSEKMSKeyId"] == default["Arn"]
+        owner.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}]})
+        assert caller.put_object(Bucket=bucket, Key="dflt-managed", Body=b"x")["SSEKMSKeyId"] == managed["SSEKMSKeyId"]
+        owner.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
+            {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": default["KeyId"]}}]})
+        with pytest.raises(ClientError) as exc:
+            caller.put_object(Bucket=bucket, Key="dflt-bare", Body=b"x")
+        assert exc.value.response["Error"]["Message"] == (
+            f"Key 'arn:aws:kms:{_FOREIGN_AP_REGION}:{ACCOUNT}:key/{default['KeyId']}' does not exist")
+    finally:
+        for upload in owner.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
+            owner.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+        for item in owner.list_objects_v2(Bucket=bucket).get("Contents", []):
+            owner.delete_object(Bucket=bucket, Key=item["Key"])
+        owner.delete_bucket(Bucket=bucket)

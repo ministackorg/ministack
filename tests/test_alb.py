@@ -3495,3 +3495,40 @@ def test_elbv2_dataplane_name_in_two_tenants_resolves_in_the_default_tenant_firs
         assert _dataplane_get(f"/_alb/{name}/x") == (200, b"other")
     finally:
         other_teardown()
+
+
+def test_elbv2_xml_special_characters_are_escaped(elbv2):
+    lb_arn = elbv2.create_load_balancer(Name=f"qa-alb-esc-{_uuid_mod.uuid4().hex[:6]}")["LoadBalancers"][0][
+        "LoadBalancerArn"]
+    body = "<h1>R&D</h1>"
+    l_arn = elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Protocol="HTTP", Port=8081,
+        DefaultActions=[{"Type": "fixed-response",
+                         "FixedResponseConfig": {"StatusCode": "200", "ContentType": "text/html",
+                                                 "MessageBody": body}}],
+    )["Listeners"][0]["ListenerArn"]
+    try:
+        listener = elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]
+        assert listener["DefaultActions"][0]["FixedResponseConfig"]["MessageBody"] == body
+        rule = elbv2.create_rule(
+            ListenerArn=l_arn, Priority=5,
+            Conditions=[{"Field": "path-pattern", "Values": ["/r&d/<x>"]}],
+            Actions=[{"Type": "authenticate-oidc", "Order": 1,
+                      "AuthenticateOidcConfig": {"Issuer": "https://idp.example.com",
+                                                 "AuthorizationEndpoint": "https://idp.example.com/auth?a=1&b=2",
+                                                 "TokenEndpoint": "https://idp.example.com/token?a=1&b=2",
+                                                 "UserInfoEndpoint": "https://idp.example.com/me?a=1&b=2",
+                                                 "ClientId": "client", "ClientSecret": "secret"}},
+                     {"Type": "fixed-response", "Order": 2,
+                      "FixedResponseConfig": {"StatusCode": "200", "MessageBody": body}}],
+        )["Rules"][0]
+        assert rule["Conditions"][0]["Values"] == ["/r&d/<x>"]
+        oidc = rule["Actions"][0]["AuthenticateOidcConfig"]
+        assert oidc["AuthorizationEndpoint"] == "https://idp.example.com/auth?a=1&b=2"
+        assert oidc["UserInfoEndpoint"] == "https://idp.example.com/me?a=1&b=2"
+        elbv2.add_tags(ResourceArns=[lb_arn], Tags=[{"Key": "team", "Value": "R&D <ops>"}])
+        tags = elbv2.describe_tags(ResourceArns=[lb_arn])["TagDescriptions"][0]["Tags"]
+        assert {"Key": "team", "Value": "R&D <ops>"} in tags
+    finally:
+        elbv2.delete_listener(ListenerArn=l_arn)
+        elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
