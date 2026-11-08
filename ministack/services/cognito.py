@@ -535,7 +535,7 @@ _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 # In-memory state — OAuth2 Authorization Codes & Refresh Tokens
 # ---------------------------------------------------------------------------
 
-_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
+_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method, resource}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
 _revoked_tokens: set = set()                 # refresh tokens and origin_jti values revoked
 _signed_out_tokens: set = set()              # the origin_jti values of those a global sign-out ended
@@ -924,13 +924,15 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                  nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication",
                  client_metadata: dict | None = None, origin_jti: str = "",
-                 scope: str | None = None, expires_at: int | None = None) -> str:
+                 scope: str | None = None, expires_at: int | None = None, audience: str = "") -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
     Refresh tokens are opaque in AWS and skip the trigger. ``scope`` is the
-    grant's scopes; None for API sign-ins.
+    grant's scopes; None for API sign-ins. ``audience`` is the resource the
+    sign-in was bound to (RFC 8707): the access token's ``aud``, kept in the
+    refresh token for the tokens it mints.
     """
     granted = _API_TOKEN_SCOPE if scope is None else scope
     now = int(time.time())
@@ -986,6 +988,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["client_id"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
+        if audience:
+            claims["aud"] = audience
         claims["scope"] = " ".join(_aws_scope_order(granted.split()))
         if username:
             claims["username"] = username
@@ -997,6 +1001,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["origin_jti"] = origin_jti
         if scope is not None:
             claims["scope"] = scope
+        if audience:
+            claims["aud"] = audience
 
     if token_type in ("access", "id"):
         claims = _apply_pretoken_trigger(
@@ -5363,7 +5369,7 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
                         client_metadata: dict | None = None, origin_jti: str = "",
-                        scope: str | None = None) -> dict:
+                        scope: str | None = None, audience: str = "") -> dict:
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -5375,12 +5381,14 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
                                     trigger_source=trigger_source,
-                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
+                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope,
+                                    audience=audience),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
                                trigger_source=trigger_source,
                                client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
-        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope),
+        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope,
+                                    audience=audience),
         "TokenType": "Bearer",
         "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
@@ -5785,7 +5793,7 @@ def _next_refresh_token(pid, cid, grace, refresh_token, claims):
     origin = claims.get("origin_jti") or refresh_token
     minted = _fake_token(claims.get("sub", ""), pid, cid, "refresh",
                          origin_jti=claims.get("origin_jti", ""), scope=claims.get("scope"),
-                         expires_at=claims.get("exp"))
+                         expires_at=claims.get("exp"), audience=claims.get("aud", ""))
     with _refresh_token_families_lock:
         family = _refresh_token_families.setdefault(
             origin, {"latest": refresh_token, "rotated": None, "rotated_at": 0})
@@ -5864,7 +5872,7 @@ def _refresh_auth_result(pool, pid, cid, refresh_token, reused=_refresh_token_re
     claims = _token_claims(refresh_token)
     result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
                                 origin_jti=claims.get("origin_jti", ""),
-                                scope=claims.get("scope"))
+                                scope=claims.get("scope"), audience=claims.get("aud", ""))
     grace = _rotation_grace(pool, cid)
     rotated = None
     if grace is not None:
@@ -7741,7 +7749,7 @@ button:hover{{background:#005a94}}
 
 
 def _login_page_html(client_id, redirect_uri, scope, state, response_type,
-                     code_challenge="", code_challenge_method="", nonce="",
+                     code_challenge="", code_challenge_method="", nonce="", resource="",
                      error_message=""):
     esc = html_mod.escape
     err_block = ""
@@ -7757,13 +7765,14 @@ def _login_page_html(client_id, redirect_uri, scope, state, response_type,
 <input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
 <input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
 <input type="hidden" name="nonce" value="{esc(nonce)}">
+<input type="hidden" name="resource" value="{esc(resource)}">
 <label for="username">Username</label>
 <input type="text" id="username" name="username" autocomplete="username" required autofocus>
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button>
 </form>
-{_forgot_password_link(client_id, redirect_uri, scope, state, response_type, code_challenge, code_challenge_method, nonce)}"""
+{_forgot_password_link(client_id, redirect_uri, scope, state, response_type, code_challenge, code_challenge_method, nonce, resource)}"""
     return _page_shell("Sign in", "Sign in", body)
 
 
@@ -7785,7 +7794,7 @@ def _new_password_page_html(np_token, error_message=""):
 
 
 def _username_page_html(client_id, redirect_uri, scope, state, response_type,
-                        code_challenge="", code_challenge_method="", nonce="",
+                        code_challenge="", code_challenge_method="", nonce="", resource="",
                         error_message=""):
     """Step 1 of choice-based sign-in (ALLOW_USER_AUTH): username only."""
     esc = html_mod.escape
@@ -7803,6 +7812,7 @@ def _username_page_html(client_id, redirect_uri, scope, state, response_type,
 <input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
 <input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
 <input type="hidden" name="nonce" value="{esc(nonce)}">
+<input type="hidden" name="resource" value="{esc(resource)}">
 <label for="username">Username</label>
 <input type="text" id="username" name="username" autocomplete="username" required autofocus>
 <button type="submit">Next</button>
@@ -7855,7 +7865,7 @@ def _password_page_html(ua_token, username, error_message=""):
 
 
 _HOSTED_OAUTH_FIELDS = ("client_id", "redirect_uri", "scope", "state", "response_type",
-                        "code_challenge", "code_challenge_method", "nonce")
+                        "code_challenge", "code_challenge_method", "nonce", "resource")
 
 
 def _forgot_password_link(*oauth_values):
@@ -8084,6 +8094,22 @@ def _oauth2_authorize_federation(query_params):
     return 302, {"Location": redirect_url, "Content-Type": "text/html"}, b""
 
 
+def _binds_resource(pool, headers):
+    """Managed login (version 2) binds an RFC 8707 resource to the sign-in; the classic hosted UI ignores it.
+
+    MiniStack serves every domain on one host, so the domain is the request's host when it names one of
+    the pool's (a custom domain exactly, a prefix domain as its first label), else any of them.
+    """
+    versions = {d.lower(): v for d, v in (pool.get("_managed_login_versions") or {}).items()}
+    host = next((v for k, v in (headers or {}).items() if k.lower() == "host"), "").split(":")[0].lower()
+    if host in versions:
+        return versions[host] == 2
+    label = host.split(".", 1)[0]
+    if label in versions:
+        return versions[label] == 2
+    return 2 in versions.values()
+
+
 def handle_oauth2_authorize(method, path, headers, query_params):
     """GET /oauth2/authorize — if identity_provider is given, redirect to external IdP;
     otherwise show managed login form."""
@@ -8130,15 +8156,16 @@ def handle_oauth2_authorize(method, path, headers, query_params):
     if pkce_error:
         return pkce_error
 
+    resource = _qp(query_params, "resource") if _binds_resource(pool, headers) else ""
     if _use_choice_based_ui(client):
         html_body = _username_page_html(
             client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
+            code_challenge, code_challenge_method, nonce, resource=resource,
         )
     else:
         html_body = _login_page_html(
             client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
+            code_challenge, code_challenge_method, nonce, resource=resource,
         )
     return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
@@ -8596,7 +8623,7 @@ def _finish_password_sign_in(pool, pool_id, user, oauth):
     return _issue_auth_code_redirect(
         oauth["client_id"], pool_id, oauth["redirect_uri"], oauth["scope"], user["Username"],
         oauth.get("nonce", ""), oauth.get("code_challenge", ""), oauth.get("code_challenge_method", ""),
-        oauth.get("state", ""))
+        oauth.get("state", ""), resource=oauth.get("resource", ""))
 
 
 def _totp_matching_step(secret_b32, user_code):
@@ -8693,7 +8720,8 @@ def _handle_hosted_mfa_submit(mfa_token, form):
     del _pending_hosted_mfa[mfa_token]
     return _issue_auth_code_redirect(
         session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"], user["Username"],
-        session["nonce"], session["code_challenge"], session["code_challenge_method"], session["state"])
+        session["nonce"], session["code_challenge"], session["code_challenge_method"], session["state"],
+        resource=session.get("resource", ""))
 
 
 def handle_forgot_password_page(method, path, headers, query_params):
@@ -8770,7 +8798,7 @@ def _handle_confirm_forgot_password_submit(form):
 
 
 def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
-                               code_challenge, code_challenge_method, state):
+                               code_challenge, code_challenge_method, state, resource=""):
     """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
     client = _find_pool_by_client_id(client_id)[2] or {}
     if redirect_uri not in client.get("CallbackURLs", []):
@@ -8788,6 +8816,7 @@ def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username,
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "resource": resource,
         "expires_at": time.time() + 300,
     }
 
@@ -8844,11 +8873,12 @@ def _extract_oauth_form_params(form: dict) -> dict:
         "code_challenge": form.get("code_challenge", ""),
         "code_challenge_method": form.get("code_challenge_method", ""),
         "nonce": form.get("nonce", ""),
+        "resource": form.get("resource", ""),
     }
 
 
 def _start_new_password_session(pool_id, client_id, username, redirect_uri, scope, state,
-                                response_type, nonce, code_challenge, code_challenge_method) -> str:
+                                response_type, nonce, code_challenge, code_challenge_method, resource="") -> str:
     """Create a `_pending_new_password` session for a FORCE_CHANGE_PASSWORD user reached
     via either Hosted UI login path (single-page or choice-based), returning its token."""
     np_token = secrets.token_urlsafe(24)
@@ -8863,6 +8893,7 @@ def _start_new_password_session(pool_id, client_id, username, redirect_uri, scop
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "resource": resource,
         "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
     }
     return np_token
@@ -8881,6 +8912,8 @@ def handle_login_submit(method, path, headers, body, query_params):
     np_token = form.get("np_token", "")
     if np_token:
         return _handle_new_password_submit(np_token, form)
+    if form.get("resource") and not _binds_resource(_find_pool_by_client_id(form.get("client_id", ""))[1] or {}, headers):
+        form["resource"] = ""
 
     if form.get("mfa_token"):
         return _handle_hosted_mfa_submit(form["mfa_token"], form)
@@ -8907,6 +8940,7 @@ def handle_login_submit(method, path, headers, body, query_params):
     code_challenge = oauth["code_challenge"]
     code_challenge_method = oauth["code_challenge_method"]
     nonce = oauth["nonce"]
+    resource = oauth["resource"]
 
     pool_id, pool, client = _find_pool_by_client_id(client_id)
     if not pool:
@@ -8917,7 +8951,7 @@ def handle_login_submit(method, path, headers, body, query_params):
     if error_msg:
         html_body = _login_page_html(
             client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
+            code_challenge, code_challenge_method, nonce, resource=resource,
             error_message=error_msg,
         )
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
@@ -8925,7 +8959,7 @@ def handle_login_submit(method, path, headers, body, query_params):
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
         np_token = _start_new_password_session(
             pool_id, client_id, user["Username"], redirect_uri, scope, state,
-            response_type, nonce, code_challenge, code_challenge_method,
+            response_type, nonce, code_challenge, code_challenge_method, resource=resource,
         )
         html_body = _new_password_page_html(np_token)
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
@@ -9043,7 +9077,7 @@ def _handle_user_auth_submit(ua_token, form):
             session["pool_id"], session["client_id"], user["Username"],
             session["redirect_uri"], session["scope"], session["state"],
             session["response_type"], session["nonce"],
-            session["code_challenge"], session["code_challenge_method"],
+            session["code_challenge"], session["code_challenge_method"], resource=session.get("resource", ""),
         )
         _pending_user_auth.pop(ua_token, None)
         html_body = _new_password_page_html(np_token)
@@ -9055,7 +9089,7 @@ def _handle_user_auth_submit(ua_token, form):
     return _issue_auth_code_redirect(
         session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
         user["Username"], session["nonce"], session["code_challenge"],
-        session["code_challenge_method"], session["state"],
+        session["code_challenge_method"], session["state"], resource=session.get("resource", ""),
     )
 
 
@@ -9220,9 +9254,13 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 # A code issued before AdminDisableUser no longer signs the user in.
                 return _oauth2_error("invalid_grant", "User is disabled.")
 
+            resource = entry.get("resource", "")
+            if resource and resource not in _pool_resource_servers(pool):
+                # An unregistered resource fails the exchange, not the sign-in, and AWS gives no description.
+                return 400, {"Content-Type": "application/json"}, json.dumps({"error": "invalid_grant"}).encode()
             scope = _granted_scopes(client, entry.get("scope"))
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
-                                         trigger_source="TokenGeneration_HostedAuth", scope=scope)
+                                         trigger_source="TokenGeneration_HostedAuth", scope=scope, audience=resource)
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -9335,7 +9373,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         resp = {
             "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
                                          trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
-                                         scope=scope),
+                                         scope=scope, audience=refresh_claims.get("aud", "")),
             "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
                                      trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
                                      scope=scope),
