@@ -289,6 +289,41 @@ def _log_group_name_from_identifier_arn(identifier: str) -> str | None:
     return name or None
 
 
+def log_group_policy_allows(group: str, stream: str, service: str, source_arn: str) -> bool:
+    """Whether the resource policies let an AWS service write to a log group.
+
+    EventBridge writes to a log group target as ``events.amazonaws.com``: it
+    needs ``logs:CreateLogStream`` and ``logs:PutLogEvents`` allowed by one of
+    the account's resource policies or the group's own. Captured on AWS
+    (us-west-2, 2026-11-08): a group no policy allowed received nothing. Only
+    under AUTH=true; with auth disabled every delivery passes, as for SQS and
+    SNS. A Deny in any of the policies wins.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    documents = [p["policyDocument"] for p in _resource_policies.values()]
+    if group in _log_group_policies:
+        documents.append(_log_group_policies[group]["policyDocument"])
+    for action in ("logs:CreateLogStream", "logs:PutLogEvents"):
+        # The caller is the service itself, so only a Service principal (or "*") matches.
+        ctx = EvalContext(
+            principal_arn="*",
+            principal_type="Service",
+            principal_account="",
+            action=action,
+            resource_arn=f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{group}:log-stream:{stream}",
+            region=get_region(),
+            service_context={"aws:sourcearn": source_arn, "aws:sourceaccount": get_account_id()},
+        )
+        decisions = {evaluate_resource_policy(doc, ctx, service=service).decision for doc in documents}
+        if "Deny" in decisions or "Allow" not in decisions:
+            return False
+    return True
+
+
 def _decode_token(token):
     """Decode a pagination token to an integer offset."""
     if not token:

@@ -2553,6 +2553,8 @@ def _invoke_target(target, event, rule, view=None, from_rule=True):
                                arn, target.get("RoleArn"))
         elif spec.service == "sns":
             _dispatch_to_sns(arn, event_payload)
+        elif spec.service == "logs":
+            _dispatch_to_log_group(spec, event_payload, event, rule)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
@@ -2916,6 +2918,28 @@ def _dispatch_to_sns(arn, payload):
         logger.warning("EventBridge → SNS: topic %s not found", arn)
         return
     logger.info("EventBridge → SNS %s", arn)
+
+
+def _dispatch_to_log_group(spec, payload, event, rule):
+    """Write one matched event as one line in a new log stream, as EventBridge does for a log group target."""
+    from ministack.services import cloudwatch_logs as _logs
+
+    group = _logs._log_group_name_from_identifier_arn(str(spec))
+    if group is None or group not in _logs._log_groups:
+        logger.warning("EventBridge → Logs: log group %s not found", spec)
+        return
+    stream = new_uuid()
+    if not _logs.log_group_policy_allows(group, stream, "events.amazonaws.com", rule.get("Arn", "")):
+        logger.warning("EventBridge → Logs %s not delivered: no resource policy allows events.amazonaws.com", group)
+        return
+    # Captured on AWS: the line's timestamp is the event's time, to the second.
+    seconds = event.get("Time")
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        seconds = time.time()
+    _logs._create_log_stream({"logGroupName": group, "logStreamName": stream})
+    _logs._put_log_events({"logGroupName": group, "logStreamName": stream,
+                           "logEvents": [{"timestamp": int(seconds) * 1000, "message": payload}]})
+    logger.info("EventBridge → Logs %s", group)
 
 
 def _dispatch_to_stepfunctions(arn, payload):
