@@ -5385,9 +5385,14 @@ def test_rds_reboot_follows_container_to_its_new_address(monkeypatch, reboot_ins
                "_shared_endpoint": {"Address": "10.0.0.7", "Port": 3306}}
     reboot_instance.update({"_shared_cluster_id": "reboot-cluster", "_internal_address": "10.0.0.7",
                             "_internal_port": 3306, "Endpoint": {"Address": "10.0.0.7", "Port": 3306}})
-    sibling = {"DBInstanceIdentifier": "reboot-sibling", "_internal_address": "10.0.0.7",
-               "Endpoint": {"Address": "10.0.0.7", "Port": 3306}}
+    sibling = {"DBInstanceIdentifier": "reboot-sibling", "_docker_container_id": "owned",
+               "_internal_address": "10.0.0.7", "Endpoint": {"Address": "10.0.0.7", "Port": 3306}}
     monkeypatch.setitem(_imm_rds._instances, "reboot-sibling", sibling)
+    # Another cluster's container that restarted at the same time and took the
+    # old address keeps it.
+    neighbour = {"DBInstanceIdentifier": "reboot-neighbour", "_docker_container_id": "other",
+                 "_internal_address": "10.0.0.7", "Endpoint": {"Address": "10.0.0.7", "Port": 3306}}
+    monkeypatch.setitem(_imm_rds._instances, "reboot-neighbour", neighbour)
     monkeypatch.setattr(_imm_rds, "_ministack_network", "ms-net")
     seen = []
 
@@ -5409,6 +5414,7 @@ def test_rds_reboot_follows_container_to_its_new_address(monkeypatch, reboot_ins
     assert reboot_instance["DBInstanceStatus"] == "available"
     assert reboot_instance["Endpoint"]["Address"] == "10.0.0.4"
     assert sibling["_internal_address"] == "10.0.0.4" and sibling["Endpoint"]["Address"] == "10.0.0.4"
+    assert neighbour["_internal_address"] == "10.0.0.7" and neighbour["Endpoint"]["Address"] == "10.0.0.7"
     assert cluster["_shared_internal_address"] == "10.0.0.4"
     assert cluster["_shared_endpoint"]["Address"] == "10.0.0.4"
     assert cluster["Endpoint"] == "10.0.0.4"
