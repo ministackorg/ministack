@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ECS — `ListServiceDeployments` and `DescribeServiceDeployments`** — both answered an empty list for every service, so the AWS provider's wait on a new `aws_ecs_service` never finished once it took the service-deployment path (it does when the deployment's `createdAt` is after the time the client noted before `CreateService`). Each deployment of a service is now listed, newest first, with AWS's ARNs, `createdAt` and `status` filters and `status` moving from `IN_PROGRESS` to `SUCCESSFUL`, and described with its source and target revisions. Contributed by @kharabasz.
+
 ## [1.5.39] — 2026-11-08
 
 ### Added
