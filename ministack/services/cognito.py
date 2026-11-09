@@ -535,7 +535,7 @@ _pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 # In-memory state — OAuth2 Authorization Codes & Refresh Tokens
 # ---------------------------------------------------------------------------
 
-_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
+_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method, resource}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
 _revoked_tokens: set = set()                 # refresh tokens and origin_jti values revoked
 _signed_out_tokens: set = set()              # the origin_jti values of those a global sign-out ended
@@ -594,6 +594,12 @@ _pending_user_auth = {}   # token -> {pool_id, client_id, username, redirect_uri
                           #           state, response_type, nonce, code_challenge,
                           #           code_challenge_method, available_challenges, expires_at}
 _USER_AUTH_SESSION_TTL = 300  # 5 minutes
+
+# Hosted UI MFA sessions after a password: a TOTP or SMS challenge, or TOTP
+# enrolment where the pool requires MFA. Plain dict for the same reason as above.
+# They last the client's AuthSessionValidity, as AWS's `cognito` cookie does.
+_pending_hosted_mfa = {}  # token -> {oauth fields, pool_id, username, kind: "verify"|"sms"|"setup",
+                          #           secret, failures, expires_at}
 
 # ---------------------------------------------------------------------------
 # In-memory state — CUSTOM_AUTH Challenge Sessions
@@ -918,13 +924,15 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
                  nonce: str = "",
                  trigger_source: str = "TokenGeneration_Authentication",
                  client_metadata: dict | None = None, origin_jti: str = "",
-                 scope: str | None = None, expires_at: int | None = None) -> str:
+                 scope: str | None = None, expires_at: int | None = None, audience: str = "") -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
     Refresh tokens are opaque in AWS and skip the trigger. ``scope`` is the
-    grant's scopes; None for API sign-ins.
+    grant's scopes; None for API sign-ins. ``audience`` is the resource the
+    sign-in was bound to (RFC 8707): the access token's ``aud``, kept in the
+    refresh token for the tokens it mints.
     """
     granted = _API_TOKEN_SCOPE if scope is None else scope
     now = int(time.time())
@@ -980,6 +988,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["client_id"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
+        if audience:
+            claims["aud"] = audience
         claims["scope"] = " ".join(_aws_scope_order(granted.split()))
         if username:
             claims["username"] = username
@@ -991,6 +1001,8 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["origin_jti"] = origin_jti
         if scope is not None:
             claims["scope"] = scope
+        if audience:
+            claims["aud"] = audience
 
     if token_type in ("access", "id"):
         claims = _apply_pretoken_trigger(
@@ -2657,6 +2669,7 @@ _UNSIGNED_IDP_ACTIONS = {
     "ForgotPassword",
     "GetTokensFromRefreshToken",
     "GetUser",
+    "GetUserAttributeVerificationCode",
     "GlobalSignOut",
     "InitiateAuth",
     "ResendConfirmationCode",
@@ -2667,6 +2680,7 @@ _UNSIGNED_IDP_ACTIONS = {
     "UpdateAuthEventFeedback",
     "UpdateUserAttributes",
     "VerifySoftwareToken",
+    "VerifyUserAttribute",
 }
 
 _UNSIGNED_IDENTITY_ACTIONS = {
@@ -2864,6 +2878,8 @@ def _run_idp_handler(handler, action: str, data: dict):
         return handler(data)
     except (_PreTokenRejected, _PreTokenUnavailable) as e:
         return _pretoken_error(e)
+    except _PostAuthenticationInvalid as e:
+        return error_response_json("InvalidLambdaResponseException", str(e), 400)
 
 
 def _run_identity_handler(handler, action: str, data: dict):
@@ -2937,6 +2953,8 @@ async def _dispatch_idp(action: str, data: dict):
         "ChangePassword": _change_password,
         "GetUser": _get_user,
         "UpdateUserAttributes": _update_user_attributes,
+        "GetUserAttributeVerificationCode": _get_user_attribute_verification_code,
+        "VerifyUserAttribute": _verify_user_attribute,
         "DeleteUser": _delete_user,
         # Groups
         "CreateGroup": _create_group,
@@ -3093,12 +3111,21 @@ def _sms_configuration_error(auto_verified, sms_configuration):
     return None
 
 
+def _update_settings_error(auto_verified, update_settings):
+    kept = (update_settings or {}).get("AttributesRequireVerificationBeforeUpdate") or []
+    if not set(kept) <= set(auto_verified or []):
+        return error_response_json("InvalidParameterException",
+                                   "All attributes in AttributesRequireVerificationBeforeUpdate must exist in AutoVerifiedAttributes", 400)
+    return None
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
-    err = _custom_sender_key_error(data.get("LambdaConfig")) or _sms_configuration_error(
-        data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+    err = (_custom_sender_key_error(data.get("LambdaConfig"))
+           or _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+           or _update_settings_error(data.get("AutoVerifiedAttributes"), data.get("UserAttributeUpdateSettings")))
     if err:
         return err
 
@@ -3227,7 +3254,10 @@ def _update_user_pool(data):
         err = _custom_sender_key_error(data["LambdaConfig"])
         if err:
             return err
-    err = _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+    err = _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration")) or _update_settings_error(
+        # Measured: an omitted AutoVerifiedAttributes counts as none, an omitted setting as the stored one.
+        data.get("AutoVerifiedAttributes", []),
+        data.get("UserAttributeUpdateSettings", pool.get("UserAttributeUpdateSettings")))
     if err:
         return err
     # An omitted tier keeps the pool's plan; omitted add-ons stay out of the check, AWS resets them.
@@ -4455,7 +4485,7 @@ def _deliver_invitation_email(pool, username, attr_dict, subject, body, sender=N
     )
 
 
-def _send_verification_email(pool, username, attr_dict, code, attribute_name="email", sender=None):
+def _send_verification_email(pool, username, attr_dict, code, attribute_name="email", sender=None, by_link=None):
     email = (attr_dict or {}).get("email")
     if not email:
         return None
@@ -4463,9 +4493,10 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
         return None
     # CONFIRM_WITH_LINK means body uses {##...##} link placeholder; we still
     # interpolate {####} as the verification code for compatibility.
-    by_link = (pool.get("VerificationMessageTemplate") or {}).get(
-        "DefaultEmailOption"
-    ) == "CONFIRM_WITH_LINK"
+    if by_link is None:
+        by_link = (pool.get("VerificationMessageTemplate") or {}).get(
+            "DefaultEmailOption"
+        ) == "CONFIRM_WITH_LINK"
     subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
     display = _template_username(pool, username, attr_dict)
     subject = _expand_template(subject_tpl, display, code)
@@ -4930,10 +4961,9 @@ def _admin_update_user_attributes(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["Attributes"] = _merge_attributes(
-        user.get("Attributes", []),
-        data.get("UserAttributes", []),
-    )
+    _sent, err = _apply_attribute_update(pool, user, data.get("UserAttributes", []), None, data.get("ClientMetadata"))
+    if err:
+        return err
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
 
@@ -5314,12 +5344,19 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     if mfa_config == "OFF":
         return None
     enabled_mfa = user.get("_mfa_enabled", [])
+    # A TOTP enrolled on the hosted page signs in with a code too, though it sets no MFA preference.
+    has_totp = "SOFTWARE_TOKEN_MFA" in enabled_mfa or bool(user.get("_totp_hosted") and user.get("_totp_secret"))
     # OPTIONAL: only challenge if user has TOTP set up
-    if mfa_config == "OPTIONAL" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
+    if mfa_config == "OPTIONAL" and not has_totp:
         return None
-    # ON: challenge if TOTP is set up; if not set up yet, skip (let them enroll)
-    if mfa_config == "ON" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
-        return None
+    # ON without a factor yet: AWS answers MFA_SETUP where TOTP can be set up; other cases still sign in.
+    if mfa_config == "ON" and not has_totp:
+        if not (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
+            return None
+        session = base64.b64encode(secrets.token_bytes(32)).decode()
+        _mfa_setup_users[session] = (pid, user["Username"])
+        return {"ChallengeName": "MFA_SETUP", "Session": session,
+                "ChallengeParameters": {"MFAS_CAN_SETUP": '["SOFTWARE_TOKEN_MFA"]'}}
     session = base64.b64encode(secrets.token_bytes(32)).decode()
     return {
         "ChallengeName": "SOFTWARE_TOKEN_MFA",
@@ -5331,10 +5368,71 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
+class _PostAuthenticationInvalid(Exception):
+    """Raised when a PostAuthentication Lambda does not return the event."""
+
+
+def _apply_postauth_trigger(pool_id: str, client_id: str, user: dict, client_metadata: dict | None,
+                            new_device_used: bool = False):
+    """Invoke the pool's PostAuthentication Lambda after a sign-in, before tokens are issued."""
+    pool = _user_pools.get(pool_id)
+    arn = ((pool or {}).get("LambdaConfig") or {}).get("PostAuthentication")
+    if not arn:
+        return
+    attrs = {k: v for k, v in _attr_list_to_dict(user.get("Attributes", [])).items()
+             if isinstance(v, (str, int, float, bool))}
+    attrs["cognito:user_status"] = user.get("UserStatus", "CONFIRMED")
+    request = {"userAttributes": attrs, "newDeviceUsed": new_device_used}
+    # AWS leaves out InitiateAuth's ClientMetadata; only challenge responses pass it.
+    if client_metadata:
+        request["clientMetadata"] = client_metadata
+    event = {
+        "version": "1",
+        "triggerSource": "PostAuthentication_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": request,
+        "response": {},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _PreTokenUnavailable("PostAuthentication invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PostAuthentication Lambda invocation failed for pool %s: %s", pool_id, e)
+        if isinstance(e, _PreTokenUnavailable):
+            raise
+        raise _PreTokenUnavailable(
+            f"PostAuthentication invocation failed due to error {type(e).__name__}.") from e
+    if isinstance(result, dict) and result.get("error"):
+        raise _PreTokenRejected(f"PostAuthentication failed with error {_lambda_error_message(result.get('body'))}.")
+    payload = result.get("body") if isinstance(result, dict) else result
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+    if payload is None:
+        raise _PostAuthenticationInvalid("Invalid lambda function output : Invalid JSON")
+    if not isinstance(payload, dict):
+        raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+
+
 def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
                         trigger_source: str = "TokenGeneration_Authentication",
                         client_metadata: dict | None = None, origin_jti: str = "",
-                        scope: str | None = None) -> dict:
+                        scope: str | None = None, audience: str = "") -> dict:
+    if trigger_source in ("TokenGeneration_Authentication", "TokenGeneration_NewPasswordChallenge"):
+        _apply_postauth_trigger(pool_id, client_id, user, client_metadata,
+                                new_device_used=trigger_source == "TokenGeneration_NewPasswordChallenge")
     if not origin_jti:
         origin_jti = new_uuid()
         user.setdefault("_origin_jtis", []).append(origin_jti)
@@ -5346,12 +5444,14 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
                                     user_attrs=attrs, groups=groups,
                                     trigger_source=trigger_source,
-                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
+                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope,
+                                    audience=audience),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
                                user_attrs=attrs, groups=groups, nonce=nonce,
                                trigger_source=trigger_source,
                                client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
-        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope),
+        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope,
+                                    audience=audience),
         "TokenType": "Bearer",
         "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
@@ -5366,6 +5466,7 @@ def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: 
     _record_auth_event(pool, user, data or {}, "SignIn", "InProgress" if mfa_challenge else "Pass",
                        (("Password", "Success"),), (mfa_challenge or {}).get("Session"))
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        _apply_postauth_trigger(pid, cid, user, client_metadata)
         session = base64.b64encode(secrets.token_bytes(32)).decode()
         return json_response({
             "ChallengeName": "NEW_PASSWORD_REQUIRED",
@@ -5577,6 +5678,28 @@ def _admin_initiate_auth(data):
     return error_response_json("InvalidParameterException", f"Unsupported AuthFlow: {auth_flow}", 400)
 
 
+def _software_token_code_refused(user, responses):
+    """A SOFTWARE_TOKEN_MFA code that does not match; a user who never enrolled TOTP has no code that does."""
+    totp_secret = user.get("_totp_secret")
+    if not totp_secret:
+        return "SOFTWARE_TOKEN_MFA" not in (user.get("_mfa_enabled") or [])
+    return not _totp_matches(totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", ""))
+
+
+def _mfa_setup_response(pool, pid, cid, data, responses):
+    """MFA_SETUP answered with VerifySoftwareToken's session: AWS then asks for a SOFTWARE_TOKEN_MFA code. A user
+    who has not enrolled yet gets MFA_SETUP again."""
+    _mfa_setup_users.pop(responses.get("SESSION") or data.get("Session") or "", None)
+    user, _err = _resolve_user(pool, responses.get("USERNAME"))
+    if _err:
+        return _hidden_user_error(pool, cid, _err)
+    challenge = _mfa_challenge_for_user(pool, user, pid, user["Username"])
+    if challenge is None:
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=data.get("ClientMetadata", {}))})
+    return json_response(challenge)
+
+
 def _admin_respond_to_auth_challenge(data):
     pid = data.get("UserPoolId")
     cid = data.get("ClientId")
@@ -5694,9 +5817,7 @@ def _admin_respond_to_auth_challenge(data):
         # A user enrolled before secrets were stored has nothing to check
         # against; that legacy state keeps the old accept-any behaviour until
         # re-enrolment.
-        totp_secret = user.get("_totp_secret")
-        if totp_secret and not _totp_matches(
-                totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
+        if _software_token_code_refused(user, responses):
             _finish_auth_event(user, data.get("Session"), "Mfa", False)
             return error_response_json(
                 "CodeMismatchException", "Invalid code received for user", 400)
@@ -5705,14 +5826,7 @@ def _admin_respond_to_auth_challenge(data):
             pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "MFA_SETUP":
-        # Triggered when pool MFA=ON but user hasn't enrolled yet
-        username = responses.get("USERNAME")
-        client_metadata = data.get("ClientMetadata", {})
-        user, _err = _resolve_user(pool, username)
-        if _err:
-            return _hidden_user_error(pool, cid, _err)
-        return json_response({"AuthenticationResult": _build_auth_result(
-            pid, cid, user, client_metadata=client_metadata)})
+        return _mfa_setup_response(pool, pid, cid, data, responses)
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
@@ -5743,7 +5857,7 @@ def _next_refresh_token(pid, cid, grace, refresh_token, claims):
     origin = claims.get("origin_jti") or refresh_token
     minted = _fake_token(claims.get("sub", ""), pid, cid, "refresh",
                          origin_jti=claims.get("origin_jti", ""), scope=claims.get("scope"),
-                         expires_at=claims.get("exp"))
+                         expires_at=claims.get("exp"), audience=claims.get("aud", ""))
     with _refresh_token_families_lock:
         family = _refresh_token_families.setdefault(
             origin, {"latest": refresh_token, "rotated": None, "rotated_at": 0})
@@ -5822,7 +5936,7 @@ def _refresh_auth_result(pool, pid, cid, refresh_token, reused=_refresh_token_re
     claims = _token_claims(refresh_token)
     result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
                                 origin_jti=claims.get("origin_jti", ""),
-                                scope=claims.get("scope"))
+                                scope=claims.get("scope"), audience=claims.get("aud", ""))
     grace = _rotation_grace(pool, cid)
     rotated = None
     if grace is not None:
@@ -6077,23 +6191,22 @@ def _respond_to_auth_challenge(data):
             pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
             client_metadata=client_metadata)})
 
-    if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
+    if challenge_name == "MFA_SETUP":
+        return _mfa_setup_response(pool, pid, cid, data, responses)
+
+    if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _hidden_user_error(pool, cid, _err)
-        # SOFTWARE_TOKEN_MFA checks the code against the enrolled secret
-        # (legacy pre-secret enrolments keep accept-any until re-enrolment).
-        # MFA_SETUP's verification already happened in VerifySoftwareToken.
-        if challenge_name == "SOFTWARE_TOKEN_MFA":
-            totp_secret = user.get("_totp_secret")
-            if totp_secret and not _totp_matches(
-                    totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", "")):
-                _finish_auth_event(user, data.get("Session"), "Mfa", False)
-                return error_response_json(
-                    "CodeMismatchException", "Invalid code received for user", 400)
-            _finish_auth_event(user, data.get("Session"), "Mfa", True)
+        # The code is checked against the enrolled secret (legacy pre-secret
+        # enrolments keep accept-any until re-enrolment).
+        if _software_token_code_refused(user, responses):
+            _finish_auth_event(user, data.get("Session"), "Mfa", False)
+            return error_response_json(
+                "CodeMismatchException", "Invalid code received for user", 400)
+        _finish_auth_event(user, data.get("Session"), "Mfa", True)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -6272,7 +6385,15 @@ def _code_error(issued, code):
 
 
 def _confirmation_code_error(action: str, data: dict):
-    """The error for a ConfirmSignUp or ConfirmForgotPassword the issued code does not allow, or None."""
+    """The error for a ConfirmSignUp, ConfirmForgotPassword or VerifyUserAttribute the issued code does not allow, or None."""
+    if action == "VerifyUserAttribute":
+        user, _pool = _user_pool_for_access_token(data.get("AccessToken", ""))
+        attr = data.get("AttributeName")
+        if (not user or attr not in _VERIFIABLE_ATTRIBUTES
+                or not (_attr_list_to_dict(user.get("Attributes", [])).get(attr)
+                        or (user.get("_pending_attributes") or {}).get(attr))):
+            return None
+        return _code_error((user.get("_attribute_codes") or {}).get(attr), data.get("Code"))
     if action not in ("ConfirmSignUp", "ConfirmForgotPassword"):
         return None
     pool, _pid = _pool_for_client(data.get("ClientId"))
@@ -6444,15 +6565,168 @@ def _update_user_attributes(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    user, _pool = _user_pool_for_access_token(access_token)
+    user, pool = _user_pool_for_access_token(access_token)
     if not user:
         return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
-    user["Attributes"] = _merge_attributes(
-        user.get("Attributes", []),
-        data.get("UserAttributes", []),
-    )
+    updates = data.get("UserAttributes", [])
+    verified = next((u["Name"] for u in updates if u.get("Name") in ("email_verified", "phone_number_verified")), None)
+    if verified:
+        return error_response_json("InvalidParameterException", f"Cannot modify the non-mutable attribute {verified}", 400)
+    sent, err = _apply_attribute_update(pool, user, updates,
+                                        _token_claims(access_token).get("client_id"), data.get("ClientMetadata"))
+    if err:
+        return err
     user["UserLastModifiedDate"] = _now_epoch()
-    return json_response({"CodeDeliveryDetailsList": []})
+    if not sent:
+        return json_response({})
+    return json_response({"CodeDeliveryDetailsList": [_code_delivery(attribute, value) for attribute, value in sent]})
+
+
+_VERIFIABLE_ATTRIBUTES = ("email", "phone_number")
+_ATTRIBUTE_VERIFICATION_CODE = "123456"
+
+
+def _alias_key(pool, value):
+    if (pool.get("UsernameConfiguration") or {}).get("CaseSensitive") is False:
+        return value.lower()
+    return value
+
+
+def _alias_taken(pool, user, attribute, value):
+    """Another user in a pool that signs in by this attribute already holds the value, verified or not."""
+    if attribute not in (pool.get("UsernameAttributes") or []):
+        return False
+    wanted = _alias_key(pool, value)
+    return any(other is not user and _alias_key(pool, _attr_list_to_dict(other.get("Attributes", [])).get(attribute) or "") == wanted
+               for other in pool["_users"].values())
+
+
+def _alias_exists(attribute):
+    return error_response_json("AliasExistsException", f"An account with the given {attribute} already exists.", 400)
+
+
+def _is_true(value):
+    return str(value or "").lower() == "true"
+
+
+def _take_email_alias(pool, user, email):
+    """In a pool with an email alias, the address a user has just verified stops being verified for anyone else."""
+    if "email" not in (pool.get("AliasAttributes") or []):
+        return
+    for other in pool["_users"].values():
+        attrs = _attr_list_to_dict(other.get("Attributes", []))
+        if other is not user and attrs.get("email") == email and _is_true(attrs.get("email_verified")):
+            other["Attributes"] = _merge_attributes(other["Attributes"], [{"Name": "email_verified", "Value": "false"}])
+
+
+def _apply_attribute_update(pool, user, updates, client_id, client_metadata):
+    """Merge an attribute update. Returns ((attribute, value) for each code sent; an error).
+
+    A changed email or phone number is unverified until verified, unless an
+    admin's update sets it verified, and a pool that auto-verifies it sends the
+    new value a code, which replaces any earlier one. An attribute in
+    AttributesRequireVerificationBeforeUpdate keeps its old value, which still
+    signs in, until the new one is verified. The pending value and its code
+    outlive a later change back and an admin's verified update; a later change
+    replaces them. The other attributes apply at once.
+    """
+    current = _attr_list_to_dict(user.get("Attributes", []))
+    given = _attr_list_to_dict(updates)
+    kept = set((pool.get("UserAttributeUpdateSettings") or {}).get("AttributesRequireVerificationBeforeUpdate") or [])
+    marked = {a for a in _VERIFIABLE_ATTRIBUTES if _is_true(given.get(f"{a}_verified"))}
+    changed = [a for a in _VERIFIABLE_ATTRIBUTES if given.get(a) and given[a] != current.get(a)]
+    held = {a for a in changed if a in kept and a not in marked}
+    taken = next((a for a in changed if a not in held and _alias_taken(pool, user, a, given[a])), None)
+    if taken:
+        return None, _alias_exists(taken)
+    merged = [u for u in updates if u.get("Name") not in held]
+    merged += [{"Name": f"{a}_verified", "Value": "false"} for a in changed if a not in held and a not in marked]
+    user["Attributes"] = _merge_attributes(user.get("Attributes", []), merged)
+    if "email" in marked:
+        _take_email_alias(pool, user, _attr_list_to_dict(user["Attributes"]).get("email"))
+    pending = user.setdefault("_pending_attributes", {})
+    codes = user.setdefault("_attribute_codes", {})
+    code_for = user.setdefault("_attribute_code_for", {})
+    sent = []
+    for attribute in changed:
+        if attribute in held:
+            pending[attribute] = given[attribute]
+        elif attribute in kept:
+            continue
+        codes.pop(attribute, None)
+        if attribute in marked or attribute not in (pool.get("AutoVerifiedAttributes") or []):
+            continue
+        codes[attribute] = _ATTRIBUTE_VERIFICATION_CODE
+        code_for[attribute] = given[attribute]
+        sent.append((attribute, given[attribute]))
+        if attribute == "email":
+            # The code goes to the new address; a pending one leaves email_verified as it was.
+            attrs = {**_attr_list_to_dict(user["Attributes"]), "email": given["email"]}
+            _send_verification_email(pool, user["Username"], attrs, _ATTRIBUTE_VERIFICATION_CODE, by_link=False, sender={
+                "trigger": "UpdateUserAttribute", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+                "client_id": client_id, "client_metadata": client_metadata})
+    return sent, None
+
+
+def _get_user_attribute_verification_code(data):
+    access_token = data.get("AccessToken", "")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    attr = data.get("AttributeName")
+    if attr not in _VERIFIABLE_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException", "Invalid attribute name. Only phone_number and email can be verified.", 400)
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    if not attrs.get(attr):
+        message = ("User does not have a valid registered phone number" if attr == "phone_number"
+                   else "User does not have a valid registered email")
+        return error_response_json("InvalidParameterException", message, 400)
+    if attr == "phone_number" and not pool.get("SmsConfiguration"):
+        return error_response_json("InvalidParameterException", (
+            "Invalid phone number provided/Unable to send the message. User pool does not have SMS configuration "
+            "to send messages."), 400)
+    # A code requested while a change is pending is for the current value, and replaces the pending one's.
+    user.setdefault("_attribute_codes", {})[attr] = _ATTRIBUTE_VERIFICATION_CODE
+    user.setdefault("_attribute_code_for", {})[attr] = attrs[attr]
+    if attr == "email":
+        _send_verification_email(pool, user["Username"], attrs, _ATTRIBUTE_VERIFICATION_CODE, by_link=False, sender={
+            "trigger": "VerifyUserAttribute", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": _token_claims(access_token).get("client_id"), "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attr, attrs[attr])})
+
+
+def _verify_user_attribute(data):
+    """Mark the attribute verified, and move a pending value to the one its code went to.
+    The code itself is checked only with AUTH=true, as for ConfirmSignUp."""
+    access_token = data.get("AccessToken", "")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    attr = data.get("AttributeName")
+    if attr not in _VERIFIABLE_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException", "Invalid attribute name. Only phone_number and email can be verified.", 400)
+    pending = (user.get("_pending_attributes") or {}).get(attr)
+    if not (_attr_list_to_dict(user.get("Attributes", [])).get(attr) or pending):
+        return error_response_json(
+            "InvalidParameterException", f"Unable to verify attribute: {attr} no value set to verify", 400)
+    moving = pending and (user.get("_attribute_code_for") or {}).get(attr) == pending
+    if moving and _alias_taken(pool, user, attr, pending):
+        return _alias_exists(attr)
+    (user.get("_attribute_codes") or {}).pop(attr, None)
+    updates = [{"Name": f"{attr}_verified", "Value": "true"}]
+    if moving:
+        updates.append({"Name": attr, "Value": user["_pending_attributes"].pop(attr)})
+    user["Attributes"] = _merge_attributes(user.get("Attributes", []), updates)
+    if attr == "email":
+        _take_email_alias(pool, user, _attr_list_to_dict(user["Attributes"]).get("email"))
+    user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({})
 
 
 def _delete_user(data):
@@ -7261,6 +7535,7 @@ def _apply_mfa_preference(user: dict, data: dict):
             user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
     elif "Enabled" in totp_settings and not totp_settings["Enabled"]:
         enabled_mfa[:] = [m for m in enabled_mfa if m != "SOFTWARE_TOKEN_MFA"]
+        user.pop("_totp_hosted", None)
         if user.get("_preferred_mfa") == "SOFTWARE_TOKEN_MFA":
             user["_preferred_mfa"] = ""
 
@@ -7314,12 +7589,24 @@ def _set_user_pool_mfa_config(data):
 # unguessable random session — the same isolation argument as the OAuth code
 # stores above.
 _totp_session_secrets: dict[str, str] = {}
+# An MFA_SETUP challenge's session, and the AssociateSoftwareToken / VerifySoftwareToken sessions that carry it
+# on -> (pool id, username): the user enrolling before they have an access token.
+_mfa_setup_users: dict[str, tuple[str, str]] = {}
+
+
+def _mfa_setup_user(session):
+    owner = _mfa_setup_users.get(session or "")
+    pool = _get_pool_unscoped(owner[0]) if owner else None
+    return (_resolve_user(pool, owner[1])[0] if pool else None), owner
 
 
 def _totp_code(secret_b32: str, step_offset: int = 0) -> str:
     """RFC 6238: HMAC-SHA1, 30-second step, 6 digits."""
+    return _totp_code_at(secret_b32, int(time.time() // 30) + step_offset)
+
+
+def _totp_code_at(secret_b32: str, counter: int) -> str:
     key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
-    counter = int(time.time() // 30) + step_offset
     mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
     offset = mac[-1] & 0x0F
     return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
@@ -7347,6 +7634,9 @@ def _associate_software_token(data):
     user = _user_for_access_token(data.get("AccessToken"))
     if user is not None:
         user["_totp_pending_secret"] = secret
+    owner = _mfa_setup_users.pop(data.get("Session") or "", None)
+    if owner:
+        _mfa_setup_users[session] = owner
     _totp_session_secrets[session] = secret
     return json_response({"SecretCode": secret, "Session": session})
 
@@ -7359,8 +7649,13 @@ def _verify_software_token(data):
     user_code = data.get("UserCode", "")
 
     user = _user_for_access_token(access_token)
+    owner = None
+    if user is None and session:
+        user, owner = _mfa_setup_user(session)
     secret = None
-    if user is not None:
+    if owner:
+        secret = _totp_session_secrets.get(session)
+    elif user is not None:
         secret = user.get("_totp_pending_secret") or user.get("_totp_secret")
     if not secret and session:
         secret = _totp_session_secrets.get(session)
@@ -7376,6 +7671,7 @@ def _verify_software_token(data):
     if user is not None:
         user["_totp_secret"] = secret
         user.pop("_totp_pending_secret", None)
+        user.pop("_totp_device_name", None)
         user.setdefault("_mfa_enabled", [])
         if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
             user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
@@ -7386,6 +7682,9 @@ def _verify_software_token(data):
     resp = {"Status": "SUCCESS"}
     if session:
         resp["Session"] = base64.b64encode(secrets.token_bytes(32)).decode()
+        if owner:
+            _mfa_setup_users.pop(session, None)
+            _mfa_setup_users[resp["Session"]] = owner
     return json_response(resp)
 
 
@@ -7514,7 +7813,7 @@ button:hover{{background:#005a94}}
 
 
 def _login_page_html(client_id, redirect_uri, scope, state, response_type,
-                     code_challenge="", code_challenge_method="", nonce="",
+                     code_challenge="", code_challenge_method="", nonce="", resource="",
                      error_message=""):
     esc = html_mod.escape
     err_block = ""
@@ -7530,12 +7829,14 @@ def _login_page_html(client_id, redirect_uri, scope, state, response_type,
 <input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
 <input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
 <input type="hidden" name="nonce" value="{esc(nonce)}">
+<input type="hidden" name="resource" value="{esc(resource)}">
 <label for="username">Username</label>
 <input type="text" id="username" name="username" autocomplete="username" required autofocus>
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button>
-</form>"""
+</form>
+{_forgot_password_link(client_id, redirect_uri, scope, state, response_type, code_challenge, code_challenge_method, nonce, resource)}"""
     return _page_shell("Sign in", "Sign in", body)
 
 
@@ -7557,7 +7858,7 @@ def _new_password_page_html(np_token, error_message=""):
 
 
 def _username_page_html(client_id, redirect_uri, scope, state, response_type,
-                        code_challenge="", code_challenge_method="", nonce="",
+                        code_challenge="", code_challenge_method="", nonce="", resource="",
                         error_message=""):
     """Step 1 of choice-based sign-in (ALLOW_USER_AUTH): username only."""
     esc = html_mod.escape
@@ -7575,6 +7876,7 @@ def _username_page_html(client_id, redirect_uri, scope, state, response_type,
 <input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
 <input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
 <input type="hidden" name="nonce" value="{esc(nonce)}">
+<input type="hidden" name="resource" value="{esc(resource)}">
 <label for="username">Username</label>
 <input type="text" id="username" name="username" autocomplete="username" required autofocus>
 <button type="submit">Next</button>
@@ -7613,14 +7915,138 @@ def _password_page_html(ua_token, username, error_message=""):
     err_block = ""
     if error_message:
         err_block = f'<div class="error">{esc(error_message)}</div>'
+    session = _pending_user_auth.get(ua_token) or {}
+    link = _forgot_password_link(*(session.get(k, "") for k in _HOSTED_OAUTH_FIELDS)) if session else ""
     body = f"""{err_block}
 <form method="POST" action="/login">
 <input type="hidden" name="ua_token" value="{esc(ua_token)}">
 <label for="password">Password for {esc(username)}</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required autofocus>
 <button type="submit">Sign in</button>
+</form>
+{link}"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+_HOSTED_OAUTH_FIELDS = ("client_id", "redirect_uri", "scope", "state", "response_type",
+                        "code_challenge", "code_challenge_method", "nonce", "resource")
+
+
+def _forgot_password_link(*oauth_values):
+    query = urlencode(dict(zip(_HOSTED_OAUTH_FIELDS, oauth_values)))
+    return f'<p style="text-align:center;font-size:14px"><a href="/forgotPassword?{html_mod.escape(query)}">Forgot your password?</a></p>'
+
+
+def _oauth_hidden_fields(oauth):
+    esc = html_mod.escape
+    return "\n".join(f'<input type="hidden" name="{k}" value="{esc(oauth.get(k, ""))}">' for k in _HOSTED_OAUTH_FIELDS)
+
+
+def _sign_in_url(oauth):
+    """ministack's sign-in page for the same OAuth request, where AWS's hosted UI has /login."""
+    return "/oauth2/authorize?" + urlencode({k: oauth[k] for k in _HOSTED_OAUTH_FIELDS if oauth.get(k)})
+
+
+def _sign_in_again(oauth):
+    return 302, {"Location": _sign_in_url(oauth), "Cache-Control": "no-store"}, b""
+
+
+def _html_page(html_body, status=200):
+    return status, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+
+def _hosted_error_page(error):
+    body = f"""<p style="text-align:center;font-size:14px;margin-bottom:16px">An error was encountered with the requested page.</p>
+<div class="error">{html_mod.escape(error)}</div>"""
+    return _html_page(_page_shell("Sign in", "Sign in", body), 400)
+
+
+def _forgot_password_page_html(oauth, by_email, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    what = "Email" if by_email else "Username"
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="step" value="forgot_password">
+{_oauth_hidden_fields(oauth)}
+<label for="username">Enter your {what} below and we will send a message to reset your password</label>
+<input type="text" id="username" name="username" autocomplete="username" required autofocus>
+<button type="submit">Reset my password</button>
+</form>"""
+    return _page_shell("Forgot your password?", "Forgot your password?", body)
+
+
+def _confirm_forgot_password_page_html(oauth, username, destination, delivery_medium, error_message=""):
+    """The code-and-new-password page, whose sentence AWS builds from its hidden
+    destination and deliveryMedium fields; after a password mismatch AWS hands
+    those two back swapped, so the sentence reads "...by m***@e*** to EMAIL"."""
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    medium = "email" if delivery_medium == "EMAIL" else delivery_medium
+    sent = f"We have sent a password reset code by {medium} to {destination}. Enter it below to reset your password."
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="step" value="confirm_forgot_password">
+<input type="hidden" name="username" value="{esc(username)}">
+<input type="hidden" name="destination" value="{esc(destination)}">
+<input type="hidden" name="deliveryMedium" value="{esc(delivery_medium)}">
+{_oauth_hidden_fields(oauth)}
+<p style="font-size:14px;margin-bottom:16px">{esc(sent)}</p>
+<label for="code">Code</label>
+<input type="password" id="code" name="code" autocomplete="one-time-code" required autofocus>
+<label for="password">New Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+<label for="confirmPassword">Enter New Password Again</label>
+<input type="password" id="confirmPassword" name="confirmPassword" autocomplete="new-password" required>
+<button type="submit">Change Password</button>
+</form>"""
+    return _page_shell("Reset your password", "Reset your password", body)
+
+
+def _masked_phone(phone):
+    return "+" + "*" * max(len(phone) - 5, 0) + phone[-4:]
+
+
+def _mfa_page_html(mfa_token, session, prompt, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    body = f"""<form method="POST" action="/login">
+<input type="hidden" name="mfa_token" value="{esc(mfa_token)}">
+{_oauth_hidden_fields(session)}
+<label for="authentication_code">{esc(prompt)}</label>
+{err_block}
+<input type="text" id="authentication_code" name="authentication_code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<button type="submit">Sign in</button>
 </form>"""
     return _page_shell("Sign in", "Sign in", body)
+
+
+def _mfa_setup_page_html(mfa_token, session, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="mfa_token" value="{esc(mfa_token)}">
+{_oauth_hidden_fields(session)}
+<p style="font-size:14px;margin-bottom:4px">1</p>
+<p style="font-size:14px;margin-bottom:12px">Install an authenticator app on your mobile device.</p>
+<p style="font-size:14px;margin-bottom:4px">2</p>
+<p style="font-size:14px;margin-bottom:8px">Scan this QR code with your authenticator app. Alternatively, you can manually enter a secret key in your authenticator app.</p>
+<p style="font-size:14px;margin-bottom:12px"><a id="showSecretKey" href="#" onclick="document.getElementById('secretKeySection').hidden=false;this.hidden=true;document.getElementById('hideSecretKey').hidden=false;return false">Show secret key</a>
+<a id="hideSecretKey" href="#" hidden onclick="document.getElementById('secretKeySection').hidden=true;this.hidden=true;document.getElementById('showSecretKey').hidden=false;return false">Hide secret key</a></p>
+<div id="secretKeySection" hidden>
+<p style="font-size:14px;margin-bottom:4px">Secret key</p>
+<p id="secretKey" style="font-family:monospace;word-break:break-all;margin-bottom:16px">{esc(session["secret"])}</p>
+</div>
+<p style="font-size:14px;margin-bottom:4px">3</p>
+<label for="userCode">Enter a code from your authenticator app</label>
+<input type="text" id="userCode" name="userCode" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<label for="friendlyDeviceName">Enter a friendly device name - optional</label>
+<input type="text" id="friendlyDeviceName" name="friendlyDeviceName">
+<button type="submit">Sign in</button>
+</form>
+<p style="text-align:center;font-size:14px"><a href="{esc(_sign_in_url(session))}">Back</a></p>"""
+    return _page_shell("Set up authenticator app MFA", "Set up authenticator app MFA", body)
 
 
 def _email_otp_page_html(ua_token, error_message=""):
@@ -7732,6 +8158,22 @@ def _oauth2_authorize_federation(query_params):
     return 302, {"Location": redirect_url, "Content-Type": "text/html"}, b""
 
 
+def _binds_resource(pool, headers):
+    """Managed login (version 2) binds an RFC 8707 resource to the sign-in; the classic hosted UI ignores it.
+
+    MiniStack serves every domain on one host, so the domain is the request's host when it names one of
+    the pool's (a custom domain exactly, a prefix domain as its first label), else any of them.
+    """
+    versions = {d.lower(): v for d, v in (pool.get("_managed_login_versions") or {}).items()}
+    host = next((v for k, v in (headers or {}).items() if k.lower() == "host"), "").split(":")[0].lower()
+    if host in versions:
+        return versions[host] == 2
+    label = host.split(".", 1)[0]
+    if label in versions:
+        return versions[label] == 2
+    return 2 in versions.values()
+
+
 def handle_oauth2_authorize(method, path, headers, query_params):
     """GET /oauth2/authorize — if identity_provider is given, redirect to external IdP;
     otherwise show managed login form."""
@@ -7778,15 +8220,16 @@ def handle_oauth2_authorize(method, path, headers, query_params):
     if pkce_error:
         return pkce_error
 
+    resource = _qp(query_params, "resource") if _binds_resource(pool, headers) else ""
     if _use_choice_based_ui(client):
         html_body = _username_page_html(
             client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
+            code_challenge, code_challenge_method, nonce, resource=resource,
         )
     else:
         html_body = _login_page_html(
             client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
+            code_challenge, code_challenge_method, nonce, resource=resource,
         )
     return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
@@ -8187,8 +8630,239 @@ def _oauth2_idp_response(method, body, query_params):
 
 # -- /login (POST) ----------------------------------------------------------
 
+def _hosted_mfa_kind(pool, user):
+    """The page a hosted UI sign-in shows after the password: "verify" (TOTP),
+    "sms", "setup" (TOTP enrolment, only where the pool requires MFA and allows
+    TOTP), or None for the authorization code."""
+    mfa = pool.get("MfaConfiguration", "OFF")
+    if mfa == "OFF":
+        return None
+    enabled = user.get("_mfa_enabled") or []
+    totp = bool(user.get("_totp_secret")) and ("SOFTWARE_TOKEN_MFA" in enabled or user.get("_totp_hosted"))
+    sms = "SMS_MFA" in enabled
+    if totp and sms:
+        return "sms" if user.get("_preferred_mfa") == "SMS_MFA" else "verify"
+    if totp:
+        return "verify"
+    if sms:
+        return "sms"
+    if mfa != "ON":
+        return None
+    if (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
+        return "setup"
+    if (_attr_list_to_dict(user.get("Attributes", [])).get("phone_number")
+            and (pool.get("SmsMfaConfiguration") or pool.get("SmsConfiguration"))):
+        return "sms"
+    # MFA is required and the user has no factor they can use or set up: AWS refuses the sign-in.
+    return "unavailable"
+
+
+def _hosted_mfa_prompt(session, user):
+    if session["kind"] == "sms":
+        phone = _attr_list_to_dict(user.get("Attributes", [])).get("phone_number", "")
+        return f"Enter the code that was sent by sms to {_masked_phone(phone)}."
+    return f"Please enter the code from {user.get('_totp_device_name') or 'your passcode app'}."
+
+
+def _finish_password_sign_in(pool, pool_id, user, oauth):
+    """After a hosted UI password: the MFA challenge or enrolment page, or the authorization code."""
+    kind = _hosted_mfa_kind(pool, user)
+    if kind == "unavailable":
+        return _hosted_error_page("MFA is required and no MFA method is available for this user.")
+    if kind:
+        now = time.time()
+        for stale in [t for t, s in _pending_hosted_mfa.items() if s["expires_at"] < now]:
+            _pending_hosted_mfa.pop(stale, None)
+        client = (pool.get("_clients") or {}).get(oauth.get("client_id"), {})
+        token = secrets.token_urlsafe(24)
+        session = _pending_hosted_mfa[token] = {
+            **{k: oauth.get(k, "") for k in _HOSTED_OAUTH_FIELDS}, "pool_id": pool_id,
+            "username": user["Username"], "kind": kind,
+            "secret": base64.b32encode(secrets.token_bytes(32)).decode().rstrip("=") if kind == "setup" else None,
+            "expires_at": now + client.get("AuthSessionValidity", 3) * 60,
+        }
+        if kind == "setup":
+            return _html_page(_mfa_setup_page_html(token, session))
+        return _html_page(_mfa_page_html(token, session, _hosted_mfa_prompt(session, user)))
+    return _issue_auth_code_redirect(
+        oauth["client_id"], pool_id, oauth["redirect_uri"], oauth["scope"], user["Username"],
+        oauth.get("nonce", ""), oauth.get("code_challenge", ""), oauth.get("code_challenge_method", ""),
+        oauth.get("state", ""), resource=oauth.get("resource", ""))
+
+
+def _totp_matching_step(secret_b32, user_code):
+    """The 30-second step whose code `user_code` is, within the drift `_totp_matches` allows, or None."""
+    if not secret_b32 or not isinstance(user_code, str):
+        return None
+    now_step = int(time.time() // 30)
+    try:
+        return next((step for step in (now_step - 1, now_step, now_step + 1)
+                     if hmac.compare_digest(_totp_code_at(secret_b32, step), user_code)), None)
+    except Exception:
+        return None
+
+
+# AWS's lockout for failed sign-in attempts, which it applies to MFA codes: after five failures the user is locked
+# for 2^(n-5) seconds, up to about 15 minutes. Attempts while locked don't count; a success, or 15 quiet minutes
+# after a lockout, resets it.
+_MFA_LOCKOUT_AFTER = 5
+_MFA_LOCKOUT_MAX_SECONDS = 900
+
+
+def _mfa_locked(user, now):
+    if (user.get("_mfa_failures", 0) >= _MFA_LOCKOUT_AFTER
+            and now - user.get("_mfa_last_failure", 0) >= _MFA_LOCKOUT_MAX_SECONDS):
+        _mfa_reset(user)
+    return now < user.get("_mfa_locked_until", 0)
+
+
+def _mfa_failed(user, now):
+    failures = user["_mfa_failures"] = user.get("_mfa_failures", 0) + 1
+    user["_mfa_last_failure"] = now
+    if failures >= _MFA_LOCKOUT_AFTER:
+        user["_mfa_locked_until"] = now + min(2 ** min(failures - _MFA_LOCKOUT_AFTER, 10), _MFA_LOCKOUT_MAX_SECONDS)
+
+
+def _mfa_reset(user):
+    for key in ("_mfa_failures", "_mfa_last_failure", "_mfa_locked_until"):
+        user.pop(key, None)
+
+
+def _handle_hosted_mfa_submit(mfa_token, form):
+    """The MFA challenge or enrolment page's submission. TOTP codes are checked
+    for real, as for the API; an SMS code is accepted as the API's SMS_MFA
+    challenge accepts it."""
+    session = _pending_hosted_mfa.get(mfa_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_hosted_mfa.pop(mfa_token, None)
+        oauth = session or _extract_oauth_form_params(form)
+        if oauth.get("client_id"):
+            return _sign_in_again(oauth)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+    pool = _get_pool_unscoped(session["pool_id"])
+    user = _resolve_user(pool, session["username"])[0] if pool else None
+    if not user:
+        _pending_hosted_mfa.pop(mfa_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+    kind = session["kind"]
+
+    def again(message):
+        if kind == "setup":
+            return _html_page(_mfa_setup_page_html(mfa_token, session, message))
+        return _html_page(_mfa_page_html(mfa_token, session, _hosted_mfa_prompt(session, user), message))
+
+    status_error = _hosted_ui_user_status_error(user)
+    if status_error:
+        return again(status_error)
+    if kind == "setup":
+        if not _totp_matches(session["secret"], form.get("userCode", "").strip()):
+            return again("Invalid or expired code entered. Try again.")
+        user["_totp_secret"] = session["secret"]
+        user["_totp_hosted"] = True
+        user.pop("_totp_pending_secret", None)
+        device_name = form.get("friendlyDeviceName", "").strip()
+        if device_name:
+            user["_totp_device_name"] = device_name
+        else:
+            user.pop("_totp_device_name", None)
+    elif kind == "verify":
+        code = form.get("authentication_code", "").strip()
+        if not code:
+            return again("Missing required parameter SOFTWARE_TOKEN_MFA_CODE")
+        now = time.time()
+        if _mfa_locked(user, now):
+            return again("Too many invalid credentials attempts. User temporarily locked. "
+                         "Please try again after few seconds.")
+        step = _totp_matching_step(user.get("_totp_secret"), code)
+        if step is None:
+            _mfa_failed(user, now)
+            return again("The code entered is invalid, please try again.")
+        if step == user.get("_totp_used_step"):
+            return again("Your software token has already been used once.")
+        user["_totp_used_step"] = step
+        _mfa_reset(user)
+    del _pending_hosted_mfa[mfa_token]
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"], user["Username"],
+        session["nonce"], session["code_challenge"], session["code_challenge_method"], session["state"],
+        resource=session.get("resource", ""))
+
+
+def handle_forgot_password_page(method, path, headers, query_params):
+    """GET /forgotPassword — the page the sign-in page's "Forgot your password?"
+    link opens. AWS sends a bad request to /error with a 302; it is rendered here."""
+    oauth = {k: _qp(query_params, k) for k in _HOSTED_OAUTH_FIELDS}
+    _pool_id, pool, client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    if oauth["redirect_uri"] not in (client.get("CallbackURLs") or []):
+        return _hosted_error_page("redirect_mismatch")
+    if oauth["response_type"] != "code":
+        return _hosted_error_page("unauthorized_client")
+    return _html_page(_forgot_password_page_html(oauth, "email" in (pool.get("UsernameAttributes") or [])))
+
+
+def _hosted_reset_refused(user):
+    """Whether the hosted UI refuses to send this user a reset code, as it does an unknown one."""
+    if user is None or not user.get("Enabled", True) or user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        return True
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    return not attrs.get("email") or str(attrs.get("email_verified", "")).lower() != "true"
+
+
+def _handle_forgot_password_submit(form):
+    oauth = _extract_oauth_form_params(form)
+    _pool_id, pool, _client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    username = form.get("username", "")
+    if _hosted_reset_refused(_resolve_user(pool, username)[0]):
+        if not _hides_user_existence(pool, oauth["client_id"]):
+            return _html_page(_forgot_password_page_html(
+                oauth, "email" in (pool.get("UsernameAttributes") or []),
+                "Could not reset password for the account, please contact support or try again"))
+        destination = _masked_destination(username)
+    else:
+        _status, _, body = _forgot_password({"ClientId": oauth["client_id"], "Username": username})
+        destination = json.loads(body)["CodeDeliveryDetails"]["Destination"]
+    return _html_page(_confirm_forgot_password_page_html(oauth, username, destination, "EMAIL"))
+
+
+def _handle_confirm_forgot_password_submit(form):
+    """The confirm page's submission, refused in AWS's order: a password
+    mismatch, then the code (checked under AUTH=true only, as for the API),
+    then the password policy."""
+    oauth = _extract_oauth_form_params(form)
+    _pool_id, pool, _client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    username, password, code = form.get("username", ""), form.get("password", ""), form.get("code", "").strip()
+    destination, medium = form.get("destination", ""), form.get("deliveryMedium", "")
+
+    def again(message, destination=destination, medium=medium):
+        return _html_page(_confirm_forgot_password_page_html(oauth, username, destination, medium, message))
+
+    if password != form.get("confirmPassword", ""):
+        return again("Password does not match the confirm password.", destination=medium, medium=destination)
+    invalid_code = "Invalid verification code provided, please try again."
+    from ministack.app import AUTH
+    if AUTH:
+        user = _resolve_user(pool, username)[0]
+        if user is None or _code_error(user.get("_reset_code"), code):
+            return again(invalid_code)
+    policy = _password_policy_errors(pool, password)
+    if policy:
+        reason = "Password not long enough" if policy[0].startswith("Password must have length") else policy[0]
+        return again(f"Password does not conform to policy: {reason}")
+    status, _, _body = _confirm_forgot_password(
+        {"ClientId": oauth["client_id"], "Username": username, "ConfirmationCode": code, "Password": password})
+    if status >= 400:
+        return again(invalid_code)
+    return _sign_in_again(oauth)
+
+
 def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
-                               code_challenge, code_challenge_method, state):
+                               code_challenge, code_challenge_method, state, resource=""):
     """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
     client = _find_pool_by_client_id(client_id)[2] or {}
     if redirect_uri not in client.get("CallbackURLs", []):
@@ -8206,6 +8880,7 @@ def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username,
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "resource": resource,
         "expires_at": time.time() + 300,
     }
 
@@ -8262,11 +8937,12 @@ def _extract_oauth_form_params(form: dict) -> dict:
         "code_challenge": form.get("code_challenge", ""),
         "code_challenge_method": form.get("code_challenge_method", ""),
         "nonce": form.get("nonce", ""),
+        "resource": form.get("resource", ""),
     }
 
 
 def _start_new_password_session(pool_id, client_id, username, redirect_uri, scope, state,
-                                response_type, nonce, code_challenge, code_challenge_method) -> str:
+                                response_type, nonce, code_challenge, code_challenge_method, resource="") -> str:
     """Create a `_pending_new_password` session for a FORCE_CHANGE_PASSWORD user reached
     via either Hosted UI login path (single-page or choice-based), returning its token."""
     np_token = secrets.token_urlsafe(24)
@@ -8281,6 +8957,7 @@ def _start_new_password_session(pool_id, client_id, username, redirect_uri, scop
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "resource": resource,
         "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
     }
     return np_token
@@ -8299,6 +8976,15 @@ def handle_login_submit(method, path, headers, body, query_params):
     np_token = form.get("np_token", "")
     if np_token:
         return _handle_new_password_submit(np_token, form)
+    if form.get("resource") and not _binds_resource(_find_pool_by_client_id(form.get("client_id", ""))[1] or {}, headers):
+        form["resource"] = ""
+
+    if form.get("mfa_token"):
+        return _handle_hosted_mfa_submit(form["mfa_token"], form)
+    if form.get("step") == "forgot_password":
+        return _handle_forgot_password_submit(form)
+    if form.get("step") == "confirm_forgot_password":
+        return _handle_confirm_forgot_password_submit(form)
 
     ua_token = form.get("ua_token", "")
     if ua_token:
@@ -8318,6 +9004,7 @@ def handle_login_submit(method, path, headers, body, query_params):
     code_challenge = oauth["code_challenge"]
     code_challenge_method = oauth["code_challenge_method"]
     nonce = oauth["nonce"]
+    resource = oauth["resource"]
 
     pool_id, pool, client = _find_pool_by_client_id(client_id)
     if not pool:
@@ -8328,7 +9015,7 @@ def handle_login_submit(method, path, headers, body, query_params):
     if error_msg:
         html_body = _login_page_html(
             client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
+            code_challenge, code_challenge_method, nonce, resource=resource,
             error_message=error_msg,
         )
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
@@ -8336,15 +9023,12 @@ def handle_login_submit(method, path, headers, body, query_params):
     if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
         np_token = _start_new_password_session(
             pool_id, client_id, user["Username"], redirect_uri, scope, state,
-            response_type, nonce, code_challenge, code_challenge_method,
+            response_type, nonce, code_challenge, code_challenge_method, resource=resource,
         )
         html_body = _new_password_page_html(np_token)
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
-    return _issue_auth_code_redirect(
-        client_id, pool_id, redirect_uri, scope, user["Username"], nonce,
-        code_challenge, code_challenge_method, state,
-    )
+    return _finish_password_sign_in(pool, pool_id, user, oauth)
 
 
 _EMAIL_OTP_CODE = "123456"
@@ -8457,17 +9141,19 @@ def _handle_user_auth_submit(ua_token, form):
             session["pool_id"], session["client_id"], user["Username"],
             session["redirect_uri"], session["scope"], session["state"],
             session["response_type"], session["nonce"],
-            session["code_challenge"], session["code_challenge_method"],
+            session["code_challenge"], session["code_challenge_method"], resource=session.get("resource", ""),
         )
         _pending_user_auth.pop(ua_token, None)
         html_body = _new_password_page_html(np_token)
         return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
     _pending_user_auth.pop(ua_token, None)
+    if session.get("challenge") == "PASSWORD":
+        return _finish_password_sign_in(pool, session["pool_id"], user, session)
     return _issue_auth_code_redirect(
         session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
         user["Username"], session["nonce"], session["code_challenge"],
-        session["code_challenge_method"], session["state"],
+        session["code_challenge_method"], session["state"], resource=session.get("resource", ""),
     )
 
 
@@ -8511,11 +9197,7 @@ def _handle_new_password_submit(np_token, form):
 
     del _pending_new_password[np_token]
 
-    return _issue_auth_code_redirect(
-        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
-        user["Username"], session["nonce"], session["code_challenge"],
-        session["code_challenge_method"], session["state"],
-    )
+    return _finish_password_sign_in(pool, session["pool_id"], user, session)
 
 
 # -- /oauth2/token (POST) ---------------------------------------------------
@@ -8636,9 +9318,13 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 # A code issued before AdminDisableUser no longer signs the user in.
                 return _oauth2_error("invalid_grant", "User is disabled.")
 
+            resource = entry.get("resource", "")
+            if resource and resource not in _pool_resource_servers(pool):
+                # An unregistered resource fails the exchange, not the sign-in, and AWS gives no description.
+                return 400, {"Content-Type": "application/json"}, json.dumps({"error": "invalid_grant"}).encode()
             scope = _granted_scopes(client, entry.get("scope"))
             result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
-                                         trigger_source="TokenGeneration_HostedAuth", scope=scope)
+                                         trigger_source="TokenGeneration_HostedAuth", scope=scope, audience=resource)
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -8751,7 +9437,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         resp = {
             "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
                                          trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
-                                         scope=scope),
+                                         scope=scope, audience=refresh_claims.get("aud", "")),
             "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
                                      trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
                                      scope=scope),
@@ -9572,4 +10258,6 @@ def reset():
     _refresh_token_families.clear()
     _challenge_sessions.clear()
     _pending_new_password.clear()
+    _pending_hosted_mfa.clear()
+    _mfa_setup_users.clear()
     _pending_user_auth.clear()

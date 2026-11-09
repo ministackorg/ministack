@@ -229,6 +229,331 @@ def test_secretsmanager_replicated_secret_versions_stay_in_sync(sm):
     assert replica_stages[token] == ["AWSCURRENT"]
 
 
+def _unvalidated_sm(region_name="us-east-1"):
+    """A client that lets malformed members reach the server, as the raw-wire captures did."""
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    return boto3.client(
+        "secretsmanager",
+        endpoint_url=endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, parameter_validation=False),
+    )
+
+
+def _code(exc):
+    return exc.value.response["Error"]["Code"]
+
+
+def test_secretsmanager_remove_regions_from_replication(sm):
+    # Shapes and errors captured against real AWS (us-east-2 primary, us-west-2 and us-east-1 replicas).
+    name = f"sm-region-replica-remove-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(
+        SecretId=name,
+        AddReplicaRegions=[{"Region": "us-west-2"}, {"Region": "eu-west-1"}],
+    )
+
+    # A valid region that was never a replica is a no-op that returns the remaining statuses.
+    resp = sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-1"])
+    assert sorted(s["Region"] for s in resp["ReplicationStatus"]) == ["eu-west-1", "us-west-2"]
+
+    resp = sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])
+    assert [s["Region"] for s in resp["ReplicationStatus"]] == ["eu-west-1"]
+    with pytest.raises(ClientError) as exc:
+        west.get_secret_value(SecretId=name)
+    assert _code(exc) == "ResourceNotFoundException"
+
+    resp = sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["eu-west-1", "eu-west-1"])
+    assert resp["ReplicationStatus"] == []
+    assert "ReplicationStatus" not in sm.describe_secret(SecretId=name)
+    # Repeating the call is not an error, and the primary can now be deleted.
+    assert sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])["ReplicationStatus"] == []
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_secretsmanager_remove_regions_from_replication_errors(sm):
+    name = f"sm-region-replica-remove-err-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+
+    with pytest.raises(ClientError) as exc:
+        sm.remove_regions_from_replication(SecretId=f"{name}-nope", RemoveReplicaRegions=["us-west-2"])
+    assert _code(exc) == "ResourceNotFoundException"
+    # An unknown secret is reported before an invalid region.
+    with pytest.raises(ClientError) as exc:
+        sm.remove_regions_from_replication(SecretId=f"{name}-nope", RemoveReplicaRegions=["us-east-1"])
+    assert _code(exc) == "ResourceNotFoundException"
+
+    # The primary's own region, or a name that is not a region, fails the whole request.
+    for bad in ("us-east-1", "xx-nowhere-9", "us-gov-west-1", "us-east-3"):
+        with pytest.raises(ClientError) as exc:
+            sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2", bad])
+        assert _code(exc) == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == "Invalid replica region."
+        assert west.get_secret_value(SecretId=name)["SecretString"] == "primary"
+
+    # Called in the replica's region.
+    with pytest.raises(ClientError) as exc:
+        west.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-east-1"])
+    assert _code(exc) == "InvalidParameterException"
+    assert "replica secret" in exc.value.response["Error"]["Message"]
+
+
+def test_secretsmanager_replication_actions_validate_the_request(sm):
+    raw = _unvalidated_sm()
+    pattern = (
+        "Member must satisfy constraint: [Member must have length less than or equal to 128, "
+        "Member must have length greater than or equal to 1, "
+        "Member must satisfy regular expression pattern: ^([a-z]+-)+\\d+$]"
+    )
+
+    def message(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            raw.remove_regions_from_replication(**kwargs)
+        assert _code(exc) == "ValidationException"
+        return exc.value.response["Error"]["Message"]
+
+    null = "Member must not be null"
+    assert message() == (
+        "2 validation errors detected: "
+        f"Value null at 'removeReplicaRegions' failed to satisfy constraint: {null}; "
+        f"Value null at 'secretId' failed to satisfy constraint: {null}"
+    )
+    assert message(SecretId="s", RemoveReplicaRegions=[]) == (
+        "1 validation error detected: Value '[]' at 'removeReplicaRegions' failed to satisfy constraint: "
+        "Member must have length greater than or equal to 1"
+    )
+    assert message(RemoveReplicaRegions=["US-WEST-2", "us-west-2"]) == (
+        "2 validation errors detected: Value '[US-WEST-2, us-west-2]' at 'removeReplicaRegions' failed to "
+        f"satisfy constraint: {pattern}; Value null at 'secretId' failed to satisfy constraint: {null}"
+    )
+    assert "us-west-2\n" in message(SecretId="s", RemoveReplicaRegions=["us-west-2\n"])
+    assert "[us-west-\uff12]" in message(SecretId="s", RemoveReplicaRegions=["us-west-\uff12"])
+    long_region = "a-" * 70 + "1"
+    assert f"Value '[{long_region[:63]} ...'" in message(SecretId="s", RemoveReplicaRegions=[long_region])
+
+    # A SecretId that is not a name or ARN wins over the member errors.
+    invalid_name = (
+        "Invalid name. Must be a valid name containing alphanumeric characters, or any of the following: -/_+=.@!"
+    )
+    for secret_id in ("", "a b", "bad#name", "a:b", "x" * 513, "arn:aws:secretsmanager:us-east-2:"):
+        assert message(SecretId=secret_id, RemoveReplicaRegions=[]) == invalid_name
+        with pytest.raises(ClientError) as exc:
+            raw.stop_replication_to_replica(SecretId=secret_id)
+        assert exc.value.response["Error"]["Message"] == invalid_name
+    for secret_id in ("a!b", "x" * 512):
+        with pytest.raises(ClientError) as exc:
+            raw.stop_replication_to_replica(SecretId=secret_id)
+        assert _code(exc) == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        raw.remove_regions_from_replication(SecretId="x" * 1025, RemoveReplicaRegions=["us-west-2"])
+    assert _code(exc) == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "SecretId exceeds size limit."
+
+    with pytest.raises(ClientError) as exc:
+        raw.stop_replication_to_replica()
+    assert exc.value.response["Error"]["Message"] == (
+        f"1 validation error detected: Value null at 'secretId' failed to satisfy constraint: {null}"
+    )
+
+
+def test_secretsmanager_replication_actions_refuse_wrong_wire_types_and_foreign_arns(sm):
+    raw = _unvalidated_sm()
+    for value, message in (
+        (5, "NUMBER_VALUE can not be converted to a String"),
+        (1.5, "NUMBER_VALUE can not be converted to a String"),
+        (True, "TRUE_VALUE can not be converted to a String"),
+        (False, "FALSE_VALUE can not be converted to a String"),
+        (["a"], "Start of list found where not expected"),
+        ({"a": 1}, "Start of structure or map found where not expected."),
+    ):
+        # With AUTH=true the IAM resource lookup runs first and fails on a non-string SecretId for every
+        # Secrets Manager action (existing behavior), so the scalar case is checked only without it.
+        if os.environ.get("AUTH", "false").lower() != "true":
+            with pytest.raises(ClientError) as exc:
+                raw.stop_replication_to_replica(SecretId=value)
+            assert _code(exc) == "SerializationException"
+            assert exc.value.response["Error"]["Message"] == message
+        # It is reported before any other check, as the first bad member.
+        with pytest.raises(ClientError) as exc:
+            raw.remove_regions_from_replication(SecretId="bad#", RemoveReplicaRegions=["BAD", value])
+        assert exc.value.response["Error"]["Message"] == message
+
+    # The region list is read before SecretId.
+    if os.environ.get("AUTH", "false").lower() != "true":
+        with pytest.raises(ClientError) as exc:
+            raw.remove_regions_from_replication(SecretId=["a"], RemoveReplicaRegions=[5])
+        assert exc.value.response["Error"]["Message"] == "NUMBER_VALUE can not be converted to a String"
+
+    # Only a Secrets Manager secret ARN is an ARN; any partition is well-formed and simply not found.
+    invalid = "Invalid name."
+    for arn in (
+        "arn:aws:s3:::x",
+        "arn:aws:secretsmanager:us-east-2:000000000000:secret:",
+        "arn:aws:secretsmanager:us-east-2:000000000000:other:x",
+        "arn:", "arn:aws", "ARN:aws:secretsmanager:us-east-2:000000000000:secret:x",
+    ):
+        with pytest.raises(ClientError) as exc:
+            raw.stop_replication_to_replica(SecretId=arn)
+        assert _code(exc) == "ValidationException"
+        assert exc.value.response["Error"]["Message"].startswith(invalid)
+    for arn in (
+        "arn:aws-cn:secretsmanager:cn-north-1:000000000000:secret:x",
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:x-AbCdEf",
+    ):
+        with pytest.raises(ClientError) as exc:
+            raw.stop_replication_to_replica(SecretId=arn)
+        assert _code(exc) == "ResourceNotFoundException"
+
+    # A long list value is cut at 64 characters, a value of exactly 64 is shown whole.
+    with pytest.raises(ClientError) as exc:
+        raw.remove_regions_from_replication(SecretId="s", RemoveReplicaRegions=["A" * 62])
+    assert f"Value '[{'A' * 62}]' at" in exc.value.response["Error"]["Message"]
+    with pytest.raises(ClientError) as exc:
+        raw.remove_regions_from_replication(SecretId="s", RemoveReplicaRegions=["A" * 63])
+    assert f"Value '[{'A' * 63} ...' at" in exc.value.response["Error"]["Message"]
+
+
+def test_secretsmanager_refuses_a_request_that_is_not_one_json_object():
+    # Captured on every action tried (ListSecrets, DescribeSecret, DeleteSecret, ...): the same refusal.
+    from ministack.services import secretsmanager as _sm
+
+    async def call(body):
+        headers = {"x-amz-target": "secretsmanager.ListSecrets"}
+        return await _sm.handle_request("POST", "/", headers, body, {})
+
+    import asyncio
+
+    for body in (b"", b"  ", b"not json", b'"x"', b"null", b"5", b"true", b"{} x", b'{"SecretId":',
+                 "\ufeff{}".encode("utf-8"), b"\xff\xfe{}", b'{"a":NaN}', b"{'a':1}", b'{"a":1,}'):
+        status, headers, payload = asyncio.run(call(body))
+        assert status == 400, body
+        assert json.loads(payload) == {"__type": "SerializationException"}, body
+        assert headers["Content-Type"] == "application/x-amz-json-1.1"
+        assert "x-amzn-errortype" not in headers
+    for body in (b"[]", b"[{}]"):
+        status, _, payload = asyncio.run(call(body))
+        assert status == 400
+        assert json.loads(payload) == {
+            "__type": "SerializationException", "Message": "Start of list found where not expected",
+        }
+    assert asyncio.run(call(b"{}"))[0] == 200
+    # Surrounding whitespace is fine, and a stray invalid byte inside a string is not a parse error.
+    assert asyncio.run(call(b" {}\n"))[0] == 200
+    assert asyncio.run(call(b'{"MaxResults":1,"Filters":[{"Key":"name","Values":["\xe9"]}]}'))[0] == 200
+
+
+def test_secretsmanager_remove_regions_leaves_a_stopped_replica_alone_and_touches_the_primary(sm):
+    # Captured: a stopped replica is a secret of its own, so removing its region from the primary keeps it.
+    name = f"sm-region-replica-stopped-remove-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+    primary_changed = sm.describe_secret(SecretId=name)["LastChangedDate"]
+    replica_changed = west.describe_secret(SecretId=name)["LastChangedDate"]
+
+    time.sleep(1.1)
+    west.stop_replication_to_replica(SecretId=name)
+    assert west.describe_secret(SecretId=name)["LastChangedDate"] > replica_changed
+    assert sm.describe_secret(SecretId=name)["LastChangedDate"] == primary_changed
+
+    time.sleep(1.1)
+    assert sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"]) \
+        ["ReplicationStatus"] == []
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "primary"
+    west.put_secret_value(SecretId=name, SecretString="still-here")
+    after_remove = sm.describe_secret(SecretId=name)["LastChangedDate"]
+    assert after_remove > primary_changed
+
+    # Even a call that removes nothing moves it.
+    time.sleep(1.1)
+    sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])
+    assert sm.describe_secret(SecretId=name)["LastChangedDate"] > after_remove
+
+    west.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_secretsmanager_remove_regions_from_replication_allows_a_deleted_primary_and_partial_arn(sm):
+    name = f"sm-region-replica-remove-id-{_uuid_mod.uuid4().hex[:8]}"
+    arn = sm.create_secret(Name=name, SecretString="primary")["ARN"]
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+    partial_arn = arn.rsplit("-", 1)[0]
+    assert sm.remove_regions_from_replication(
+        SecretId=partial_arn, RemoveReplicaRegions=["us-west-2"],
+    )["ReplicationStatus"] == []
+    # A secret scheduled for deletion still answers.
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    assert sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])["ARN"] == arn
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_secretsmanager_stop_replication_to_replica(sm):
+    name = f"sm-region-replica-stop-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+
+    # On the primary, which still replicates.
+    with pytest.raises(ClientError) as exc:
+        sm.stop_replication_to_replica(SecretId=name)
+    assert _code(exc) == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == (
+        "Operation not permitted on a primary secret. Call must be made in replica secret's region."
+    )
+
+    replica_arn = west.describe_secret(SecretId=name)["ARN"]
+    assert west.stop_replication_to_replica(SecretId=name)["ARN"] == replica_arn
+
+    # The replica is a standalone secret: no PrimaryRegion, writable, and no longer synced.
+    assert "PrimaryRegion" not in west.describe_secret(SecretId=name)
+    west.put_secret_value(SecretId=name, SecretString="west-v2")
+    sm.put_secret_value(SecretId=name, SecretString="east-v2")
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "west-v2"
+    assert "ReplicationStatus" not in sm.describe_secret(SecretId=name)
+
+    with pytest.raises(ClientError) as exc:
+        west.stop_replication_to_replica(SecretId=name)
+    assert exc.value.response["Error"]["Message"] == "Operation not permitted on a primary/standalone secret."
+
+    west.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_secretsmanager_stopped_replica_keeps_its_policy_and_stops_following_the_primary(sm):
+    name = f"sm-region-replica-stop-policy-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    sm.create_secret(Name=name, SecretString="primary")
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+
+    def policy(action):
+        return json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                "Action": f"secretsmanager:{action}",
+                "Resource": "*",
+            }],
+        })
+
+    sm.put_resource_policy(SecretId=name, ResourcePolicy=policy("GetSecretValue"))
+    assert "GetSecretValue" in west.get_resource_policy(SecretId=name)["ResourcePolicy"]
+
+    west.stop_replication_to_replica(SecretId=name)
+    assert "GetSecretValue" in west.get_resource_policy(SecretId=name)["ResourcePolicy"]
+    sm.put_resource_policy(SecretId=name, ResourcePolicy=policy("DescribeSecret"))
+    assert "GetSecretValue" in west.get_resource_policy(SecretId=name)["ResourcePolicy"]
+
+    west.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
 def test_secretsmanager_replica_rejects_direct_mutation(sm):
     name = f"sm-region-replica-readonly-{_uuid_mod.uuid4().hex[:8]}"
     west = _regional_sm("us-west-2")
@@ -244,41 +569,115 @@ def test_secretsmanager_replica_rejects_direct_mutation(sm):
     assert west.get_secret_value(SecretId=name)["SecretString"] == "primary"
 
 
-def test_secretsmanager_primary_force_delete_removes_replicas(sm):
+def test_secretsmanager_primary_with_replicas_cannot_be_deleted(sm):
+    # Captured against real AWS: every delete form is refused until the replicas are removed.
     name = f"sm-region-replica-delete-{_uuid_mod.uuid4().hex[:8]}"
     west = _regional_sm("us-west-2")
-    sm.create_secret(Name=name, SecretString="primary")
+    arn = sm.create_secret(Name=name, SecretString="primary")["ARN"]
     sm.replicate_secret_to_regions(
         SecretId=name,
-        AddReplicaRegions=[{"Region": "us-west-2"}],
+        AddReplicaRegions=[{"Region": "us-west-2"}, {"Region": "eu-west-1"}, {"Region": "ap-south-1"}],
     )
+    # Listed alphabetically, whatever the order they were added in.
+    expected = (
+        f"You can't delete secret {arn} that still has replica regions [ap-south-1, eu-west-1, us-west-2]."
+    )
+    for kwargs in (
+        {}, {"RecoveryWindowInDays": 7}, {"RecoveryWindowInDays": 30},
+        {"ForceDeleteWithoutRecovery": True}, {"ForceDeleteWithoutRecovery": False},
+    ):
+        with pytest.raises(ClientError) as exc:
+            sm.delete_secret(SecretId=name, **kwargs)
+        assert _code(exc) == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == expected
+    with pytest.raises(ClientError) as exc:
+        sm.delete_secret(SecretId=arn.rsplit("-", 1)[0], ForceDeleteWithoutRecovery=True)
+    assert exc.value.response["Error"]["Message"] == expected
+    assert west.get_secret_value(SecretId=name)["SecretString"] == "primary"
 
+    # The request's own checks come first.
+    with pytest.raises(ClientError) as exc:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True, RecoveryWindowInDays=7)
+    assert "in conjunction with RecoveryWindowInDays" in exc.value.response["Error"]["Message"]
+    with pytest.raises(ClientError) as exc:
+        sm.delete_secret(SecretId=name, RecoveryWindowInDays=1)
+    assert "between 7 and 30 days" in exc.value.response["Error"]["Message"]
+
+    sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["eu-west-1", "ap-south-1"])
+    with pytest.raises(ClientError) as exc:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    assert exc.value.response["Error"]["Message"].endswith("replica regions [us-west-2].")
+
+    sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    assert sm.describe_secret(SecretId=name)["DeletedDate"]
     sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
 
-    with pytest.raises(ClientError) as exc:
-        west.get_secret_value(SecretId=name)
-    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
-
-def test_secretsmanager_primary_force_delete_removes_replica_policy(sm):
+def test_secretsmanager_own_region_status_does_not_block_delete():
+    # In process: a status entry naming the secret's own region (never a replica) is not a replica to remove.
     from ministack.services import secretsmanager as _sm
 
+    name = f"sm-region-replica-own-status-{_uuid_mod.uuid4().hex[:8]}"
+    _sm._create_secret({"Name": name, "SecretString": "primary"})
+    try:
+        secret = _sm._secrets.get(name)
+        region = secret["ARN"].split(":")[3]
+        secret["ReplicationStatus"] = [{"Region": region, "Status": "InSync"}]
+        status, _, _ = _sm._delete_secret({"SecretId": name, "ForceDeleteWithoutRecovery": True})
+        assert status == 200
+        assert _sm._secrets.get(name) is None
+    finally:
+        _sm._secrets.pop(name, None)
+
+
+def test_secretsmanager_replica_cannot_be_deleted_and_stopped_replica_can(sm):
+    name = f"sm-region-replica-delete-replica-{_uuid_mod.uuid4().hex[:8]}"
+    west = _regional_sm("us-west-2")
+    arn = sm.create_secret(Name=name, SecretString="primary")["ARN"]
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+    refused = "Operation not permitted on a replica secret. Call must be made in primary secret's region."
+
+    west_arn = arn.replace("us-east-1", "us-west-2")
+    for secret_id, kwargs in (
+        (name, {}), (name, {"RecoveryWindowInDays": 7}),
+        (name, {"ForceDeleteWithoutRecovery": True}), (west_arn, {"ForceDeleteWithoutRecovery": True}),
+    ):
+        with pytest.raises(ClientError) as exc:
+            west.delete_secret(SecretId=secret_id, **kwargs)
+        assert _code(exc) == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == refused
+    # The request's own checks come first on a replica too.
+    with pytest.raises(ClientError) as exc:
+        west.delete_secret(SecretId=name, RecoveryWindowInDays=1)
+    assert "between 7 and 30 days" in exc.value.response["Error"]["Message"]
+
+    west.stop_replication_to_replica(SecretId=name)
+    west.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    assert west.describe_secret(SecretId=name)["DeletedDate"]
+    # With no replicas left, the primary deletes on its own.
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    west.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_secretsmanager_removed_replica_leaves_no_resource_policy_behind(sm):
+    # A replica's ARN is the primary's with another region, so a policy left behind by the removal would
+    # show up on the next replica made in that region.
     name = f"sm-region-replica-policy-delete-{_uuid_mod.uuid4().hex[:8]}"
     west = _regional_sm("us-west-2")
     sm.create_secret(Name=name, SecretString="primary")
-    sm.replicate_secret_to_regions(
-        SecretId=name,
-        AddReplicaRegions=[{"Region": "us-west-2"}],
-    )
-    west_arn = west.describe_secret(SecretId=name)["ARN"]
-    west.put_resource_policy(
-        SecretId=name,
-        ResourcePolicy=json.dumps({"Version": "2012-10-17", "Statement": []}),
-    )
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+    policy = json.dumps({"Version": "2012-10-17", "Statement": []})
+    west.put_resource_policy(SecretId=name, ResourcePolicy=policy)
+    assert "ResourcePolicy" in west.get_resource_policy(SecretId=name)
 
+    sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])
+    sm.replicate_secret_to_regions(SecretId=name, AddReplicaRegions=[{"Region": "us-west-2"}])
+
+    assert "ResourcePolicy" not in west.get_resource_policy(SecretId=name)
+    sm.remove_regions_from_replication(SecretId=name, RemoveReplicaRegions=["us-west-2"])
     sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
-
-    assert _sm._resource_policies.get_scoped("000000000000", "us-west-2", west_arn) is None
 
 
 def test_secretsmanager_replica_cannot_be_replicated(sm):

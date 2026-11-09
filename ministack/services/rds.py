@@ -5036,7 +5036,12 @@ def _unregister_instance_from_clusters(db_id):
     """Remove instance from any cluster member list."""
     for cl in _clusters.values():
         mem = cl.get("DBClusterMembers") or []
-        cl["DBClusterMembers"] = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        kept = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        if len(kept) == len(mem):
+            # Another cluster's status must not change; a member of it may be
+            # mid-reboot, and nothing would restore its status afterward.
+            continue
+        cl["DBClusterMembers"] = kept
         _sync_cluster_endpoints(cl)
         _refresh_cluster_status(cl.get("DBClusterIdentifier"))
 
@@ -6299,6 +6304,57 @@ def _describe_events(p):
     return _xml(200, "DescribeEventsResponse", f"<DescribeEventsResult><Events>{members}</Events>{next_marker}</DescribeEventsResult>")
 
 
+def _reboot_credentials(instance, cluster):
+    """Credentials the restarted database accepts.
+
+    A cluster member copies the master password when it attaches, but
+    ModifyDBCluster updates only the cluster. Reading the member's copy after a
+    rotation never authenticates, so the reboot never completes. A rotation
+    still pending has not reached the database, which keeps the old password.
+    """
+    user = instance.get("MasterUsername", "root")
+    password = instance.get("_MasterUserPassword", "password")
+    if cluster:
+        user = cluster.get("MasterUsername", user)
+        pending = cluster.get("_pending_master_password_rotation")
+        password = pending["old_password"] if pending else cluster.get("_MasterUserPassword", password)
+    return user, password
+
+
+def _refresh_restarted_container_address(client, container, instance, cluster):
+    """Record the address Docker gave a restarted container.
+
+    Docker can assign a new IP on restart, so every record that carried the
+    old one (the instance, a shared cluster container and its other members)
+    moves to the new address.
+    """
+    ms_network = _get_ministack_network(client)
+    if not ms_network:
+        return
+    container.reload()
+    networks = (getattr(container, "attrs", None) or {}).get("NetworkSettings", {}).get("Networks", {})
+    new_ip = networks.get(ms_network, {}).get("IPAddress", "")
+    old_ip = instance.get("_internal_address")
+    if not new_ip or not old_ip or new_ip == old_ip:
+        return
+    records = [i for i in _instances.values() if i.get("_internal_address") == old_ip]
+    if instance not in records:
+        records.append(instance)
+    for record in records:
+        record["_internal_address"] = new_ip
+        endpoint = record.get("Endpoint")
+        if isinstance(endpoint, dict) and endpoint.get("Address") == old_ip:
+            endpoint["Address"] = new_ip
+    if cluster and cluster.get("_shared_internal_address") == old_ip:
+        cluster["_shared_internal_address"] = new_ip
+        endpoint = cluster.get("_shared_endpoint")
+        if isinstance(endpoint, dict) and endpoint.get("Address") == old_ip:
+            endpoint["Address"] = new_ip
+        # Outside alias mode the published cluster endpoints are addresses too.
+        _sync_cluster_endpoints(cluster)
+    logger.info("RDS: %s restarted at %s (was %s)", instance.get("DBInstanceIdentifier"), new_ip, old_ip)
+
+
 def _finish_instance_reboot(instance, cluster):
     db_id = instance["DBInstanceIdentifier"]
 
@@ -6310,10 +6366,12 @@ def _finish_instance_reboot(instance, cluster):
         container_id = instance.get("_docker_container_id")
         if client and container_id:
             container = client.containers.get(container_id)
+            user, password = _reboot_credentials(instance, cluster)
             container.stop(timeout=5)
             if not current():
                 return
             container.start()
+            _refresh_restarted_container_address(client, container, instance, cluster)
 
             def alive():
                 if not current():
@@ -6326,8 +6384,7 @@ def _finish_instance_reboot(instance, cluster):
             port = instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port")
             if not _wait_for_database_ready(
                 host, port, instance.get("Engine", "mysql"),
-                instance.get("MasterUsername", "root"),
-                instance.get("_MasterUserPassword", "password"),
+                user, password,
                 instance.get("DBName"), alive,
             ):
                 raise RuntimeError("database stopped before reboot readiness")
@@ -6342,6 +6399,7 @@ def _finish_instance_reboot(instance, cluster):
         if cluster:
             _end_mysql_global_instance_mutation(cluster)
             _apply_deferred_global_writer_alias(cluster)
+            _refresh_cluster_status(cluster.get("DBClusterIdentifier"))
 
 
 # ---------------------------------------------------------------------------

@@ -13674,3 +13674,60 @@ def test_s3_kms_writes_to_another_accounts_bucket_contract(auth_enabled):
         for item in owner.list_objects_v2(Bucket=bucket).get("Contents", []):
             owner.delete_object(Bucket=bucket, Key=item["Key"])
         owner.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.auth_contract
+def test_s3_signature_condition_keys_contract(auth_enabled, iam_user, auth_condition_bucket):
+    """s3:signatureversion and s3:authType hold AWS's values for a SigV4 header-signed request."""
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    client = user.client("s3")
+    for condition, allowed in (({"StringNotEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}}, True),
+                               ({"StringNotEquals": {"s3:authType": "REST-HEADER"}}, True),
+                               ({"StringEquals": {"s3:authType": "REST-QUERY-STRING"}}, True),
+                               ({"NumericGreaterThan": {"s3:signatureAge": "600000"}}, True),
+                               ({"StringEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}}, False)):
+        bucket = auth_condition_bucket(user.arn, "s3:PutObject", condition)
+        _assert_s3_condition(auth_enabled, allowed, lambda: client.put_object(Bucket=bucket, Key="sig", Body=b"x"))
+
+
+@pytest.mark.auth_contract
+def test_s3_storage_class_and_request_tag_condition_contract(auth_enabled, iam_user, auth_condition_bucket):
+    user = iam_user(policy=_ALLOW_ALL_S3)
+    client = user.client("s3")
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {"s3:x-amz-storage-class": "STANDARD"}})
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+        Bucket=bucket, Key="standard", Body=b"x", StorageClass="STANDARD"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+        Bucket=bucket, Key="ia", Body=b"x", StorageClass="STANDARD_IA"))
+    bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {"s3:RequestObjectTag/env": "prod"}})
+    _assert_s3_condition(auth_enabled, True, lambda: client.put_object(
+        Bucket=bucket, Key="prod", Body=b"x", Tagging="env=prod&team=a"))
+    _assert_s3_condition(auth_enabled, False, lambda: client.put_object(
+        Bucket=bucket, Key="dev", Body=b"x", Tagging="env=dev"))
+
+
+
+def test_s3_mrap_list_skips_nothing_when_one_is_deleted_between_pages(s3control_dns, mrap_members):
+    """The page token marks the last access point returned, so deleting one mid-listing skips no other."""
+    _, use1_bucket, _, euw1_bucket = mrap_members
+    ctl = _regional_client("s3control", "us-west-2")
+    names = [_mrap_name() for _ in range(3)]
+    for name in names:
+        assert _mrap_create(ctl, name, [use1_bucket, euw1_bucket])["RequestStatus"] == "SUCCEEDED"
+    deleted = set()
+    try:
+        listed, token = [], None
+        while True:
+            page = ctl.list_multi_region_access_points(
+                AccountId=_ACCOUNT, MaxResults=1, **({"NextToken": token} if token else {}))
+            listed += [a["Name"] for a in page["AccessPoints"]]
+            if listed and listed[-1] in names and not deleted:
+                _mrap_delete(ctl, listed[-1])
+                deleted.add(listed[-1])
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(listed)
+    finally:
+        for name in set(names) - deleted:
+            _mrap_delete(ctl, name)

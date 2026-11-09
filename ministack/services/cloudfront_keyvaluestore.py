@@ -15,7 +15,7 @@ import copy
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -112,6 +112,21 @@ def _get_store(arn: str):
         store = {"etag": new_uuid(), "items": {}}
         _stores[arn] = store
     return store, None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def function_snapshot(arn: str):
+    """What cf.kvs() reads in a function: the store's items and its meta() times, or None if it is gone."""
+    store, err = _get_store(arn)
+    if err:
+        return None
+    from ministack.services.cloudfront import _kvstores
+
+    created = next((v.get("LastModifiedTime") for v in _kvstores.values() if v["ARN"] == arn), None)
+    return {"items": dict(store["items"]), "created": created, "updated": store.get("updated") or created}
 
 
 def _compute_size(items: dict) -> int:
@@ -283,6 +298,7 @@ def _put_key(arn: str, key: str, headers, body):
 
     store["items"][key] = value
     store["etag"] = new_uuid()
+    store["updated"] = _now_iso()
 
     resp = {
         "ItemCount": len(store["items"]),
@@ -308,6 +324,7 @@ def _delete_key(arn: str, key: str, headers):
 
     del store["items"][key]
     store["etag"] = new_uuid()
+    store["updated"] = _now_iso()
 
     resp = {
         "ItemCount": len(store["items"]),
@@ -365,6 +382,7 @@ def _update_keys(arn: str, headers, body):
     for k in validated_deletes:
         store["items"].pop(k, None)
     store["etag"] = new_uuid()
+    store["updated"] = _now_iso()
 
     resp = {
         "ItemCount": len(store["items"]),
