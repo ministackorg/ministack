@@ -6801,3 +6801,84 @@ def test_schedule_publishing_to_a_bus_is_not_a_rules_forward(fwd, auth_enabled):
             scheduler.delete_schedule(Name=name)
         except ClientError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# CloudWatch Logs log group targets. Captured on AWS (us-west-2, 2026-11-08):
+# each matched event is written whole, as one line in a new log stream, once a
+# resource policy lets events.amazonaws.com write to the group. Each test runs
+# in its own account, so its account resource policy has the account to itself.
+# ---------------------------------------------------------------------------
+
+def _logs_target_account():
+    account = f"{_uuid_mod.uuid4().int % 10**12:012d}"
+    return _xa_client("events", account), _xa_client("logs", account)
+
+
+def _logs_target(eb, logs, suffix):
+    """A log group and a rule on ``eb.logs.test`` events of this run that targets it; returns the group's name and ARN."""
+    group = f"/aws/events/eb-logs-{suffix}"
+    logs.create_log_group(logGroupName=group)
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    eb.put_rule(Name=f"eb-logs-{suffix}",
+                EventPattern=json.dumps({"source": ["eb.logs.test"], "detail": {"run": [suffix]}}))
+    eb.put_targets(Rule=f"eb-logs-{suffix}", Targets=[{"Id": "logs", "Arn": arn.removesuffix(":*")}])
+    return group, arn
+
+
+def _allow_events_to_write(logs, name, arn):
+    logs.put_resource_policy(policyName=name, policyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow",
+                       "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+                       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"], "Resource": arn}]}))
+
+
+def test_rule_writes_each_event_whole_to_a_log_group_target():
+    """Captured on AWS: a plain PutEvents leaves one line holding the whole event, in a new log stream,
+    timestamped with the event's time."""
+    from datetime import datetime, timezone
+
+    eb, logs = _logs_target_account()
+    suffix = _uuid_mod.uuid4().hex[:8]
+    group, arn = _logs_target(eb, logs, suffix)
+    _allow_events_to_write(logs, f"eb-logs-{suffix}", arn)
+
+    for n in (1, 2):
+        resp = eb.put_events(Entries=[{"Source": "eb.logs.test", "DetailType": "Capture Check",
+                                       "Detail": json.dumps({"run": suffix, "n": n})}])
+        assert resp["FailedEntryCount"] == 0
+
+    streams = logs.describe_log_streams(logGroupName=group)["logStreams"]
+    assert len(streams) == 2
+    lines = [line for s in streams
+             for line in logs.get_log_events(logGroupName=group, logStreamName=s["logStreamName"])["events"]]
+    assert len(lines) == 2
+    events = sorted((json.loads(line["message"]) for line in lines), key=lambda e: e["detail"]["n"])
+    assert [e["detail"] for e in events] == [{"run": suffix, "n": 1}, {"run": suffix, "n": 2}]
+    assert set(events[0]) == {"version", "id", "detail-type", "source", "account", "time", "region",
+                              "resources", "detail"}
+    assert events[0]["detail-type"] == "Capture Check"
+    for line in lines:
+        event = json.loads(line["message"])
+        sent = datetime.strptime(event["time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        assert line["timestamp"] == int(sent.timestamp()) * 1000
+
+
+@pytest.mark.auth_contract
+def test_rule_to_log_group_target_needs_a_resource_policy(auth_enabled):
+    """Captured on AWS: with no resource policy letting events.amazonaws.com write, the group receives nothing.
+    MiniStack checks the policy only under AUTH=true, as it does for SQS and SNS."""
+    eb, logs = _logs_target_account()
+    suffix = _uuid_mod.uuid4().hex[:8]
+    group, arn = _logs_target(eb, logs, suffix)
+
+    def put(n):
+        eb.put_events(Entries=[{"Source": "eb.logs.test", "DetailType": "Capture Check",
+                                "Detail": json.dumps({"run": suffix, "n": n})}])
+        return sorted(json.loads(e["message"])["detail"]["n"]
+                      for e in logs.filter_log_events(logGroupName=group)["events"])
+
+    assert put(1) == ([] if auth_enabled else [1])
+    _allow_events_to_write(logs, f"eb-logs-{suffix}", arn)
+    assert put(2) == ([2] if auth_enabled else [1, 2])

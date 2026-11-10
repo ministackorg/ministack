@@ -107,6 +107,57 @@ def sqs_policy_allow_sns(queue_arn, topic_arn):
             "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}}}]}
 
 
+def ses_events_to_log_group(*, account=None, region=REGION, suffix=None, default=True):
+    """The AWS setup that sends SES sending events to a CloudWatch Logs log group.
+
+    In an account of its own unless one is given: a log group with a resource
+    policy letting EventBridge write, a rule sending every ``aws.ses`` event to
+    it, a configuration set with an enabled EventBridge event destination for
+    Send, Delivery, Bounce and Complaint, and a domain identity whose default
+    set it is (unless ``default`` is False). ``published()`` reads back the
+    events in the log group, one per line; ``configuration_set()`` adds a set.
+    """
+    account = account or f"{uuid.uuid4().int % 10**12:012d}"
+    suffix = suffix or uuid.uuid4().hex[:8]
+
+    def client(service):
+        return boto3.client(service, endpoint_url=ENDPOINT, aws_access_key_id=account,
+                            aws_secret_access_key="test", region_name=region,
+                            config=Config(region_name=region, retries={"mode": "standard"}))
+
+    sesv2, logs, events = client("sesv2"), client("logs"), client("events")
+
+    def configuration_set(name, matching=("SEND", "DELIVERY", "BOUNCE", "COMPLAINT"), enabled=True):
+        sesv2.create_configuration_set(ConfigurationSetName=name)
+        sesv2.create_configuration_set_event_destination(
+            ConfigurationSetName=name, EventDestinationName="eventbridge",
+            EventDestination={"Enabled": enabled, "MatchingEventTypes": list(matching), "EventBridgeDestination": {
+                "EventBusArn": f"arn:aws:events:{region}:{account}:event-bus/default"}})
+        return name
+
+    group, domain = f"/aws/events/ses-{suffix}", f"ses-{suffix}.example.com"
+    logs.create_log_group(logGroupName=group)
+    group_arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    logs.put_resource_policy(policyName=f"ses-events-{suffix}", policyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow",
+                       "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+                       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"], "Resource": group_arn}]}))
+    events.put_rule(Name=f"ses-events-{suffix}", EventPattern=json.dumps({"source": ["aws.ses"]}))
+    events.put_targets(Rule=f"ses-events-{suffix}", Targets=[{"Id": "logs", "Arn": group_arn.removesuffix(":*")}])
+    config_set = configuration_set(f"ses-events-{suffix}")
+    sesv2.create_email_identity(EmailIdentity=domain)
+    if default:
+        sesv2.put_email_identity_configuration_set_attributes(EmailIdentity=domain, ConfigurationSetName=config_set)
+
+    def published():
+        return [json.loads(e["message"]) for e in logs.filter_log_events(logGroupName=group)["events"]]
+
+    return SimpleNamespace(account=account, region=region, suffix=suffix, ses=client("ses"), sesv2=sesv2, logs=logs,
+                           group=group, config_set=config_set, domain=domain, sender=f"sender@{domain}",
+                           configuration_set=configuration_set, published=published)
+
+
 def iot_test_ca(registration_code, common_name="ministack-test-ca"):
     """A fresh CA as ``(ca_pem, ca_key_pem, verification_pem)``, the verification certificate carrying ``registration_code`` as its CN."""
     from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
@@ -273,6 +324,7 @@ _SERIAL_TESTS = {
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
+    "tests/test_ses.py::test_ses_events_setup_is_cleared_by_a_reset",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
