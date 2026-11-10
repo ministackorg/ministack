@@ -1985,25 +1985,124 @@ def test_a_custom_session_cookie_name_is_honoured(elbv2, lam):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
 
 
-def test_authenticate_cognito_is_reported_as_unimplemented(elbv2, lam):
-    """Better a loud 501 than forwarding a request nobody authenticated."""
+def _cognito_pool_with_client(cognito_idp, name):
+    pool = cognito_idp.create_user_pool(PoolName=f"{name}-pool")["UserPool"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool["Id"],
+        ClientName=f"{name}-client",
+        GenerateSecret=True,
+        CallbackURLs=[f"http://{name}.alb.localhost:{_EXECUTE_PORT}/oauth2/idpresponse"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        AllowedOAuthFlowsUserPoolClient=True,
+        SupportedIdentityProviders=["COGNITO"],
+    )["UserPoolClient"]
+    return pool, client
+
+
+def _cognito_action(pool, client, order=1, **overrides):
+    cfg = {
+        "UserPoolArn": pool["Arn"],
+        "UserPoolClientId": client["ClientId"],
+        "UserPoolDomain": "unused-locally",
+    }
+    cfg.update(overrides)
+    return {"Type": "authenticate-cognito", "Order": order, "AuthenticateCognitoConfig": cfg}
+
+
+def test_authenticate_cognito_redirects_to_the_user_pool(elbv2, lam, cognito_idp):
+    """authenticate-cognito is authenticate-oidc against the user pool's endpoints."""
     name = "oidc-dp-cognito"
-    fn_code = ("def handler(event, context):\n"
-               "    return {'statusCode': 200, 'body': 'reached'}\n")
+    pool, client = _cognito_pool_with_client(cognito_idp, name)
+    lb_arn, tg_arn, l_arn = _alb_with_oidc(elbv2, lam, name)
+    try:
+        elbv2.modify_listener(
+            ListenerArn=l_arn,
+            DefaultActions=[
+                _cognito_action(pool, client, Scope="openid email",
+                                AuthenticationRequestExtraParams={"identity_provider": "Entra"}),
+                {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
+            ],
+        )
+        status, headers, _ = _oidc_get("/private", name)
+        assert status == 302
+
+        location = urlparse(headers["Location"])
+        assert location.path == "/oauth2/authorize"
+
+        q = parse_qs(location.query)
+        assert q["client_id"] == [client["ClientId"]]
+        assert q["response_type"] == ["code"]
+        assert q["scope"] == ["openid email"]
+        assert q["identity_provider"] == ["Entra"]
+        assert q["redirect_uri"] == [f"http://{name}.alb.localhost:{_EXECUTE_PORT}/oauth2/idpresponse"]
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
+
+
+def test_authenticate_cognito_oidc_data_is_issued_for_the_user_pool(elbv2, lam, cognito_idp):
+    """The x-amzn-oidc-data header names the user pool as issuer and its app client."""
+    import base64
+
+    name = "oidc-dp-cognito-jwt"
+    pool, client = _cognito_pool_with_client(cognito_idp, name)
+    fn_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    h = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+        "    return {'statusCode': 200, 'headers': {'Content-Type': 'application/json'},\n"
+        "            'body': json.dumps({'data': h.get('x-amzn-oidc-data')})}\n"
+    )
     lb_arn, tg_arn, l_arn, _ = _alb_setup(elbv2, lam, name, f"{name}-fn", fn_code)
     try:
         elbv2.modify_listener(
             ListenerArn=l_arn,
             DefaultActions=[
-                {"Type": "authenticate-cognito", "Order": 1},
+                _cognito_action(pool, client),
+                {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
+            ],
+        )
+        from ministack.services import alb
+
+        session = {"claims": {"sub": "user-1", "custom:roles": "[FOO_BAR,BAZ_QUX]"},
+                   "access_token": "at", "exp": int(time.time()) + 600}
+        cookies = alb._oidc_session_cookies("AWSELBAuthSessionCookie", session, 600, False)
+        jar = "; ".join(c.split(";", 1)[0] for c in cookies)
+
+        status, _, body = _oidc_get("/private", name, {"Cookie": jar})
+        assert status == 200
+        head, payload, _sig = json.loads(body)["data"].split(".")
+        header = json.loads(base64.urlsafe_b64decode(head))
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        assert header["signer"] == lb_arn
+        assert header["client"] == client["ClientId"]
+        assert header["iss"] == f"https://cognito-idp.{pool['Id'].split('_', 1)[0]}.amazonaws.com/{pool['Id']}"
+        assert claims["custom:roles"] == "[FOO_BAR,BAZ_QUX]"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
+
+
+def test_authenticate_cognito_with_an_unknown_app_client_never_forwards(elbv2, lam, cognito_idp):
+    """Better a refusal than forwarding a request nobody authenticated."""
+    name = "oidc-dp-cognito-unknown"
+    pool, client = _cognito_pool_with_client(cognito_idp, name)
+    lb_arn, tg_arn, l_arn = _alb_with_oidc(elbv2, lam, name)
+    try:
+        elbv2.modify_listener(
+            ListenerArn=l_arn,
+            DefaultActions=[
+                _cognito_action(pool, client, UserPoolClientId="unknownclient"),
                 {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
             ],
         )
         status, _, body = _oidc_get("/private", name)
-        assert status == 501
-        assert b"not implemented" in body
+        assert status == 500
+        assert b"identity" not in body
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
 
 
 def test_modify_listener_updates_the_serving_default_rule(elbv2, lam):

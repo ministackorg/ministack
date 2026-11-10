@@ -2266,6 +2266,41 @@ def _oidc_first(value):
 # Data-plane: action execution
 # ---------------------------------------------------------------------------
 
+def _cognito_as_oidc_action(action):
+    """The authenticate-oidc equivalent of an authenticate-cognito action, or an error response.
+
+    AWS takes the endpoints from the user pool and the client secret from its app client.
+    The browser follows the authorize redirect to the gateway, the token and user info
+    requests stay inside MiniStack. The configured UserPoolDomain is not needed for that.
+    """
+    from ministack.services import cognito
+
+    cfg = action.get("AuthenticateCognitoConfig") or {}
+    pool_id = (cfg.get("UserPoolArn") or "").rsplit("/", 1)[-1]
+    found_pool_id, _pool, client = cognito._find_pool_by_client_id(cfg.get("UserPoolClientId") or "")
+    if client is None or found_pool_id != pool_id:
+        # Never forward a request the load balancer could not authenticate
+        logger.warning("ALB authenticate-cognito: app client %s not found in user pool %s",
+                       cfg.get("UserPoolClientId"), pool_id)
+        return action, (500, {"Content-Type": "text/plain"},
+                        b"Authentication failed: user pool app client not found")
+
+    public_base = f"http://{cognito._MINISTACK_HOST}:{cognito._MINISTACK_PORT}"
+    internal_base = f"http://127.0.0.1:{cognito._MINISTACK_PORT}"
+    oidc = {
+        "Issuer": f"https://cognito-idp.{cognito._pool_region(pool_id)}.amazonaws.com/{pool_id}",
+        "AuthorizationEndpoint": f"{public_base}/oauth2/authorize",
+        "TokenEndpoint": f"{internal_base}/oauth2/token",
+        "UserInfoEndpoint": f"{internal_base}/oauth2/userInfo",
+        "ClientId": client["ClientId"],
+        "ClientSecret": client.get("ClientSecret") or "",
+        **{k: cfg[k] for k in ("Scope", "SessionCookieName", "SessionTimeout",
+                               "OnUnauthenticatedRequest", "AuthenticationRequestExtraParams")
+           if k in cfg},
+    }
+    return {**action, "Type": "authenticate-oidc", "AuthenticateOidcConfig": oidc}, None
+
+
 async def _execute_actions(actions, method, path, headers, body, query_params, listener_port=80,
                            lb_arn="", target_host=None, raw_query_string=None, raw_path=None):
     """Run a rule's actions in Order until one produces a response.
@@ -2280,6 +2315,13 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
 
     for action in ordered:
         atype = (action.get("Type") or "").lower()
+        if atype == "authenticate-cognito":
+            # Cognito authentication is the same protocol with the endpoints
+            # and the client secret taken from the user pool.
+            action, error = _cognito_as_oidc_action(action)
+            if error is not None:
+                return error
+            atype = "authenticate-oidc"
         if atype == "authenticate-oidc":
             response = await _authenticate_oidc(action, method, path, forwarded,
                                                 body, query_params, listener_port,
@@ -2297,13 +2339,6 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
                 out_headers["Set-Cookie"] = ([existing] if isinstance(existing, str) else list(existing or [])) + refreshed
                 return status, out_headers, out_body
             continue
-        if atype == "authenticate-cognito":
-            # Cognito authentication is the same protocol with the endpoints
-            # derived from a user pool rather than given explicitly. Not
-            # implemented; failing loudly beats forwarding an unauthenticated
-            # request to a target that assumes the load balancer checked.
-            return (501, {"Content-Type": "application/json"},
-                    json.dumps({"message": "authenticate-cognito is not implemented"}).encode())
         if atype == "forward":
             action = {**action, "TargetGroupArn": _forward_target_group(action)}
         tg = _tgs.get(action.get("TargetGroupArn", "")) if atype == "forward" else None
