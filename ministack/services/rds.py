@@ -5050,103 +5050,6 @@ def _unregister_instance_from_clusters(db_id):
 # DB Instances
 # ---------------------------------------------------------------------------
 
-class _MemberCreateLockScope:
-    """This thread's hold on _shared_container_lock during one CreateDBInstance.
-
-    ``_create_db_instance_impl`` takes the lock part-way through and gives it
-    back once the member is registered; ``_member_create_lock_scope`` releases
-    it on every other way out.
-    """
-
-    def __init__(self):
-        self.held = False
-
-    def hold(self):
-        if not self.held:
-            _shared_container_lock.acquire()
-            self.held = True
-
-    def release(self):
-        if self.held:
-            self.held = False
-            _shared_container_lock.release()
-
-
-_member_create_lock_scopes = threading.local()
-
-
-@contextlib.contextmanager
-def _member_create_lock_scope():
-    scope = _MemberCreateLockScope()
-    outer = getattr(_member_create_lock_scopes, "current", None)
-    _member_create_lock_scopes.current = scope
-    try:
-        yield scope
-    finally:
-        _member_create_lock_scopes.current = outer
-        scope.release()
-
-
-def _current_member_create_lock_scope():
-    scope = getattr(_member_create_lock_scopes, "current", None)
-    if scope is None:
-        # A caller that bypassed _create_db_instance would otherwise leave
-        # the lock held on an early return.
-        raise RuntimeError("_create_db_instance_impl runs only via _create_db_instance")
-    return scope
-
-
-def _pull_cluster_image_before_lock(docker_client, cluster):
-    """Pull the cluster's engine image if it is not local yet.
-
-    A create into a cluster starts the shared or reader container while it
-    holds the process-wide _shared_container_lock. A cold pull there would
-    stall every other RDS lifecycle operation for minutes, so it happens
-    here, before the lock; only this request waits for it, as on a
-    standalone create. A failed pull is left for the container start to
-    report.
-    """
-    if not docker_client or not hasattr(docker_client, "images"):
-        return
-    engine = cluster.get("Engine", "aurora-postgresql")
-    image, _env, _port, _data_path = _docker_image_for_engine(
-        engine,
-        cluster.get("EngineVersion") or _default_engine_version(engine),
-        cluster.get("MasterUsername", "admin"),
-        cluster.get("_MasterUserPassword", "password"),
-        cluster.get("DatabaseName") or "mydb",
-    )
-    if not image or _image_is_local(docker_client, image):
-        return
-    try:
-        docker_client.images.pull(image)
-    except Exception as e:
-        logger.warning("RDS: failed to pull %s for a cluster member: %s", image, e)
-
-
-def _member_create_cluster_state_error(cluster):
-    """The error CreateDBInstance gives for a cluster that is stopping or stopped.
-
-    Messages captured on AWS (us-east-2, 2026-11-10, #2626). AWS keeps giving
-    the stopped answer while a stopped cluster is being deleted.
-    """
-    cluster_id = cluster["DBClusterIdentifier"]
-    status = cluster.get("Status")
-    if status == "stopping":
-        return _error(
-            "InvalidDBClusterStateFault",
-            f"DbCluster {cluster_id} is being stopped.",
-            400,
-        )
-    if status == "stopped":
-        return _error(
-            "InvalidDBClusterStateFault",
-            f"Db cluster {cluster_id} is in stopped state, cannot create instance in it",
-            400,
-        )
-    return None
-
-
 def _create_db_instance(p):
     cluster = None
     cluster_id = _p(p, "DBClusterIdentifier")
@@ -5154,7 +5057,15 @@ def _create_db_instance(p):
     if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
         return switch_error
     try:
-        with _member_create_lock_scope():
+        # Handlers run on worker threads, so two creates into one cluster
+        # (Terraform's count = 2) can interleave and both start its shared
+        # container. Serialise creates per cluster so the second sees the
+        # first as a member, as when the calls arrive apart.
+        lock = resource_lock(
+            "rds-cluster-create",
+            f"{get_account_id()}/{get_region()}/{cluster['DBClusterIdentifier']}",
+        ) if cluster else contextlib.nullcontext()
+        with lock:
             return _create_db_instance_impl(p)
     finally:
         if cluster:
@@ -5198,13 +5109,17 @@ def _create_db_instance_impl(p):
                 "migration is blocked.",
                 400,
             )
-        # Real AWS rejects instance additions to a stopping or stopped
-        # cluster; the cluster must be started first. Without this guard the
-        # new member would land as ``creating`` with no readiness worker to
-        # ever complete it.
-        state_error = _member_create_cluster_state_error(parent)
-        if state_error:
-            return state_error
+        if parent.get("Status") == "stopped":
+            # Real AWS rejects instance additions to a stopped cluster; the
+            # cluster must be started first. Without this guard the new
+            # member would land as ``creating`` with no readiness worker to
+            # ever complete it.
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
+                "state but expected it to be one of available.",
+                400,
+            )
         cluster_id_param = parent["DBClusterIdentifier"]
         engine = parent.get("Engine", engine)
         engine_version = parent.get("EngineVersion", engine_version)
@@ -5262,27 +5177,6 @@ def _create_db_instance_impl(p):
     deferred_container_start = False
     docker_client = _get_docker()
     reader_launch = None
-    if parent:
-        # Handlers run on worker threads, so two creates into one cluster
-        # (Terraform's count = 2) can interleave. Hold _shared_container_lock
-        # from reading the cluster's members and container through
-        # registering this member, as the restore path holds it from its start
-        # through attaching members, so the next create sees this one as a
-        # member and finds its container.
-        _pull_cluster_image_before_lock(docker_client, parent)
-        _current_member_create_lock_scope().hold()
-        # The checks above ran before the lock; a concurrent DeleteDBCluster
-        # or StopDBCluster may have finished since.
-        if _resolve_cluster_in_request_region(cluster_id_param) is not parent:
-            return _error(
-                "DBClusterNotFoundFault",
-                "The source cluster could not be found or cannot be accessed: "
-                f"{cluster_id_param}",
-                404,
-            )
-        state_error = _member_create_cluster_state_error(parent)
-        if state_error:
-            return state_error
     if (
         parent
         and parent.get("DBClusterMembers")
@@ -5310,7 +5204,7 @@ def _create_db_instance_impl(p):
         pending_rotation = parent.get("_pending_master_password_rotation")
         if pending_rotation:
             readiness_master_pass = pending_rotation["old_password"]
-        # Runs under _shared_container_lock (taken above), so this check and
+        # _create_db_instance serialises creates per cluster, so this check and
         # the shared metadata update cannot interleave with another create.
         resume_control_plane_only = (
             not docker_client
@@ -5597,8 +5491,6 @@ def _create_db_instance_impl(p):
         _attach_instance_to_shared_cluster(instance, parent)
     _instances[db_id] = instance
     _register_instance_in_cluster(instance)
-    if parent:
-        _current_member_create_lock_scope().release()
 
     if deferred_container_start:
         # Cold image cache. Pull and start on a background thread — the same
