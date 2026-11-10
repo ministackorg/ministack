@@ -6324,9 +6324,10 @@ def _reboot_credentials(instance, cluster):
 def _refresh_restarted_container_address(client, container, instance, cluster):
     """Record the address Docker gave a restarted container.
 
-    Docker can assign a new IP on restart, so every record that carried the
-    old one (the instance, a shared cluster container and its other members)
-    moves to the new address.
+    Docker can assign a new IP on restart, so every record backed by this
+    container (the instance, a shared cluster container and its other members)
+    moves to the new address. Records are matched by container, not by the old
+    IP: containers restarting together can trade addresses.
     """
     ms_network = _get_ministack_network(client)
     if not ms_network:
@@ -6337,7 +6338,9 @@ def _refresh_restarted_container_address(client, container, instance, cluster):
     old_ip = instance.get("_internal_address")
     if not new_ip or not old_ip or new_ip == old_ip:
         return
-    records = [i for i in _instances.values() if i.get("_internal_address") == old_ip]
+    container_id = instance.get("_docker_container_id")
+    records = [i for i in _instances.values()
+               if container_id and i.get("_docker_container_id") == container_id and i.get("_internal_address") == old_ip]
     if instance not in records:
         records.append(instance)
     for record in records:

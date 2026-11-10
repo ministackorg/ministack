@@ -54,6 +54,7 @@ from ministack.services.ses import (
     _dkim_tokens,
     _message_rejection,
     _parse_raw_mime,
+    _publish_send_events,
     _render_template,
     _restore_regional_store,
     _sent_emails_list,
@@ -962,6 +963,7 @@ async def handle_request(method, path, headers, body, query_params):
     if sub == "/outbound-emails" and method == "POST":
         msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
+        config_set = data.get("ConfigurationSetName", "")
         reply_to = list(data.get("ReplyToAddresses") or [])
         dest = data.get("Destination") or {}
         to_addrs = dest.get("ToAddresses", [])
@@ -977,6 +979,7 @@ async def handle_request(method, path, headers, body, query_params):
         template_name = ""
         raw_bytes = None
         raw_from = ""
+        event_headers = None
         extras = simple or tpl
         headers = list(extras.get("Headers") or [])
         attachments = list(extras.get("Attachments") or [])
@@ -987,6 +990,7 @@ async def handle_request(method, path, headers, body, query_params):
         elif raw:
             raw_bytes = _decode_raw(raw.get("Data", ""))
             parsed = _parse_raw_mime(raw.get("Data", ""))
+            event_headers = parsed.get("Headers", [])
             raw_headers = message_from_bytes(raw_bytes)
             raw_from = raw_headers.get("From", "") or ""
             subj = parsed.get("Subject", "") or ""
@@ -1054,10 +1058,14 @@ async def handle_request(method, path, headers, body, query_params):
             record["TemplateData"] = tpl.get("TemplateData", "")
             if template_name:
                 record["Template"] = template_name
+        if config_set:
+            record["ConfigurationSetName"] = config_set
         _sent_emails_list().append(record)
 
         logger.info("SESv2 SendEmail: MessageId=%s | %s -> %s%s", msg_id, source, to_addrs,
                     f" | template={template_name}" if template_name else "")
+        _publish_send_events(msg_id, sender, to_addrs, cc_addrs, bcc_addrs, subj, operation="SendEmail",
+                             config_set=config_set, body_html=body_html, raw_headers=event_headers)
         return json_response({"MessageId": msg_id})
 
     # POST /v2/email/outbound-bulk-emails  (SendBulkEmail)
@@ -1123,6 +1131,8 @@ async def handle_request(method, path, headers, body, query_params):
             if config_set:
                 record["ConfigurationSetName"] = config_set
             _sent_emails_list().append(record)
+            _publish_send_events(msg_id, source, to_addrs, cc_addrs, bcc_addrs, subj, operation="SendBulkEmail",
+                                 config_set=config_set, body_html=body_html)
             results.append({"Status": "SUCCESS", "MessageId": msg_id})
 
         logger.info("SESv2 SendBulkEmail: %s | template=%s | %s entries",
@@ -1176,6 +1186,22 @@ async def handle_request(method, path, headers, body, query_params):
         if next_token:
             out["NextToken"] = next_token
         return json_response(out)
+
+    # PUT /v2/email/identities/{identity}/configuration-set  (PutEmailIdentityConfigurationSetAttributes)
+    m = re.match(r"^/identities/(.+)/configuration-set$", sub)
+    if m and method == "PUT":
+        identity = m.group(1)
+        rec = _identities.get(identity)
+        if rec is None:
+            return _json_err("NotFoundException", f"Identity <{identity}> does not exist.", 404)
+        name = data.get("ConfigurationSetName")
+        if not name:
+            rec.pop("ConfigurationSetName", None)
+        elif name not in _config_sets:
+            return _missing_config_set(name)
+        else:
+            rec["ConfigurationSetName"] = name
+        return json_response({})
 
     # GET /v2/email/identities/{identity}
     m = re.match(r"^/identities/(.+)$", sub)
