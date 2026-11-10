@@ -3158,6 +3158,148 @@ def test_rds_create_rechecks_cluster_under_shared_container_lock(
         m._clusters.clear()
 
 
+def _member_lock_fake_docker(events, local_images=True, pull=None):
+    class FakeContainer:
+        id = "member-lock-shared-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+        status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            events.append("start")
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **_kwargs):
+            events.append("run")
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeImages:
+        def get(self, image):
+            if local_images:
+                return object()
+            raise Exception("not local")
+
+        def pull(self, image):
+            events.append("pull")
+            if pull:
+                pull()
+
+    class FakeDocker:
+        containers = FakeContainers()
+        images = FakeImages()
+
+    return FakeDocker()
+
+
+def _member_lock_cluster(monkeypatch, m, docker):
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16050)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_a, **_k: True)
+    m._instances.clear()
+    m._clusters.clear()
+    m._create_db_cluster({
+        "DBClusterIdentifier": "member-lock-cluster",
+        "Engine": "aurora-postgresql",
+        "MasterUsername": "postgres",
+        "MasterUserPassword": "password123",
+    })
+
+
+def _member_lock_request(db_id, **extra):
+    return {
+        "DBInstanceIdentifier": db_id,
+        "DBClusterIdentifier": "member-lock-cluster",
+        "DBInstanceClass": "db.r6g.large",
+        "Engine": "aurora-postgresql",
+        **extra,
+    }
+
+
+def _shared_container_lock_is_free(m):
+    free = []
+
+    def _probe():
+        if m._shared_container_lock.acquire(blocking=False):
+            m._shared_container_lock.release()
+            free.append(True)
+
+    probe = threading.Thread(target=_probe)
+    probe.start()
+    probe.join(timeout=1)
+    return bool(free)
+
+
+def test_rds_cluster_member_create_releases_lock_when_it_raises(monkeypatch):
+    """A create into a cluster that raises after starting the shared container
+    gives _shared_container_lock back, and the next create brings the cluster
+    up instead of waiting on a container nothing is readying."""
+    from ministack.services import rds as m
+
+    events = []
+    _member_lock_cluster(monkeypatch, m, _member_lock_fake_docker(events))
+    try:
+        with pytest.raises(ValueError):
+            m._create_db_instance(_member_lock_request("member-lock-0", Iops="not-a-number"))
+        assert events == ["run"]
+        assert _shared_container_lock_is_free(m)
+
+        m._create_db_instance(_member_lock_request("member-lock-1"))
+        deadline = time.monotonic() + 5
+        while (
+            m._instances["member-lock-1"]["DBInstanceStatus"] != "available"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert m._instances["member-lock-1"]["DBInstanceStatus"] == "available"
+        assert "member-lock-0" not in m._instances
+        assert _shared_container_lock_is_free(m)
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_cluster_member_create_pulls_image_before_taking_lock(monkeypatch):
+    """A cold engine image is pulled before the create takes the process-wide
+    _shared_container_lock, so other RDS lifecycle work is not stalled behind
+    the pull."""
+    from ministack.services import rds as m
+
+    events = []
+    lock_free_during_pull = []
+    docker = _member_lock_fake_docker(
+        events,
+        local_images=False,
+        pull=lambda: lock_free_during_pull.append(_shared_container_lock_is_free(m)),
+    )
+    _member_lock_cluster(monkeypatch, m, docker)
+    try:
+        m._create_db_instance(_member_lock_request("member-lock-pull"))
+        assert events[:2] == ["pull", "run"]
+        assert lock_free_during_pull == [True]
+        assert _shared_container_lock_is_free(m)
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_create_db_instance_impl_refuses_to_run_outside_its_lock_scope():
+    from ministack.services import rds as m
+
+    with pytest.raises(RuntimeError):
+        m._current_member_create_lock_scope()
+
+
 def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
     """StopDBCluster stops the shared container; StartDBCluster restarts it."""
     from ministack.services import rds as m

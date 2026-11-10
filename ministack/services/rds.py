@@ -5050,20 +5050,78 @@ def _unregister_instance_from_clusters(db_id):
 # DB Instances
 # ---------------------------------------------------------------------------
 
-# How many times this thread's CreateDBInstance holds _shared_container_lock.
-_create_member_lock_depth = threading.local()
+class _MemberCreateLockScope:
+    """This thread's hold on _shared_container_lock during one CreateDBInstance.
+
+    ``_create_db_instance_impl`` takes the lock part-way through and gives it
+    back once the member is registered; ``_member_create_lock_scope`` releases
+    it on every other way out.
+    """
+
+    def __init__(self):
+        self.held = False
+
+    def hold(self):
+        if not self.held:
+            _shared_container_lock.acquire()
+            self.held = True
+
+    def release(self):
+        if self.held:
+            self.held = False
+            _shared_container_lock.release()
 
 
-def _hold_shared_container_lock_for_member_create():
-    _shared_container_lock.acquire()
-    _create_member_lock_depth.n = getattr(_create_member_lock_depth, "n", 0) + 1
+_member_create_lock_scopes = threading.local()
 
 
-def _release_shared_container_lock_for_member_create():
-    held = getattr(_create_member_lock_depth, "n", 0)
-    if held:
-        _create_member_lock_depth.n = held - 1
-        _shared_container_lock.release()
+@contextlib.contextmanager
+def _member_create_lock_scope():
+    scope = _MemberCreateLockScope()
+    outer = getattr(_member_create_lock_scopes, "current", None)
+    _member_create_lock_scopes.current = scope
+    try:
+        yield scope
+    finally:
+        _member_create_lock_scopes.current = outer
+        scope.release()
+
+
+def _current_member_create_lock_scope():
+    scope = getattr(_member_create_lock_scopes, "current", None)
+    if scope is None:
+        # A caller that bypassed _create_db_instance would otherwise leave
+        # the lock held on an early return.
+        raise RuntimeError("_create_db_instance_impl runs only via _create_db_instance")
+    return scope
+
+
+def _pull_cluster_image_before_lock(docker_client, cluster):
+    """Pull the cluster's engine image if it is not local yet.
+
+    A create into a cluster starts the shared or reader container while it
+    holds the process-wide _shared_container_lock. A cold pull there would
+    stall every other RDS lifecycle operation for minutes, so it happens
+    here, before the lock; only this request waits for it, as on a
+    standalone create. A failed pull is left for the container start to
+    report.
+    """
+    if not docker_client or not hasattr(docker_client, "images"):
+        return
+    engine = cluster.get("Engine", "aurora-postgresql")
+    image, _env, _port, _data_path = _docker_image_for_engine(
+        engine,
+        cluster.get("EngineVersion") or _default_engine_version(engine),
+        cluster.get("MasterUsername", "admin"),
+        cluster.get("_MasterUserPassword", "password"),
+        cluster.get("DatabaseName") or "mydb",
+    )
+    if not image or _image_is_local(docker_client, image):
+        return
+    try:
+        docker_client.images.pull(image)
+    except Exception as e:
+        logger.warning("RDS: failed to pull %s for a cluster member: %s", image, e)
 
 
 def _member_create_cluster_state_error(cluster):
@@ -5096,11 +5154,9 @@ def _create_db_instance(p):
     if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
         return switch_error
     try:
-        return _create_db_instance_impl(p)
+        with _member_create_lock_scope():
+            return _create_db_instance_impl(p)
     finally:
-        # The impl releases the lock once the member is registered; this
-        # covers its early returns and exceptions.
-        _release_shared_container_lock_for_member_create()
         if cluster:
             _end_mysql_global_instance_mutation(cluster)
 
@@ -5213,7 +5269,8 @@ def _create_db_instance_impl(p):
         # registering this member, as the restore path holds it from its start
         # through attaching members, so the next create sees this one as a
         # member and finds its container.
-        _hold_shared_container_lock_for_member_create()
+        _pull_cluster_image_before_lock(docker_client, parent)
+        _current_member_create_lock_scope().hold()
         # The checks above ran before the lock; a concurrent DeleteDBCluster
         # or StopDBCluster may have finished since.
         if _resolve_cluster_in_request_region(cluster_id_param) is not parent:
@@ -5540,7 +5597,8 @@ def _create_db_instance_impl(p):
         _attach_instance_to_shared_cluster(instance, parent)
     _instances[db_id] = instance
     _register_instance_in_cluster(instance)
-    _release_shared_container_lock_for_member_create()
+    if parent:
+        _current_member_create_lock_scope().release()
 
     if deferred_container_start:
         # Cold image cache. Pull and start on a background thread — the same
