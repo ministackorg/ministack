@@ -5066,6 +5066,29 @@ def _release_shared_container_lock_for_member_create():
         _shared_container_lock.release()
 
 
+def _member_create_cluster_state_error(cluster):
+    """The error CreateDBInstance gives for a cluster that is stopping or stopped.
+
+    Messages captured on AWS (us-east-2, 2026-11-10, #2626). AWS keeps giving
+    the stopped answer while a stopped cluster is being deleted.
+    """
+    cluster_id = cluster["DBClusterIdentifier"]
+    status = cluster.get("Status")
+    if status == "stopping":
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"DbCluster {cluster_id} is being stopped.",
+            400,
+        )
+    if status == "stopped":
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"Db cluster {cluster_id} is in stopped state, cannot create instance in it",
+            400,
+        )
+    return None
+
+
 def _create_db_instance(p):
     cluster = None
     cluster_id = _p(p, "DBClusterIdentifier")
@@ -5119,17 +5142,13 @@ def _create_db_instance_impl(p):
                 "migration is blocked.",
                 400,
             )
-        if parent.get("Status") == "stopped":
-            # Real AWS rejects instance additions to a stopped cluster; the
-            # cluster must be started first. Without this guard the new
-            # member would land as ``creating`` with no readiness worker to
-            # ever complete it.
-            return _error(
-                "InvalidDBClusterStateFault",
-                f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
-                "state but expected it to be one of available.",
-                400,
-            )
+        # Real AWS rejects instance additions to a stopping or stopped
+        # cluster; the cluster must be started first. Without this guard the
+        # new member would land as ``creating`` with no readiness worker to
+        # ever complete it.
+        state_error = _member_create_cluster_state_error(parent)
+        if state_error:
+            return state_error
         cluster_id_param = parent["DBClusterIdentifier"]
         engine = parent.get("Engine", engine)
         engine_version = parent.get("EngineVersion", engine_version)
@@ -5200,16 +5219,13 @@ def _create_db_instance_impl(p):
         if _resolve_cluster_in_request_region(cluster_id_param) is not parent:
             return _error(
                 "DBClusterNotFoundFault",
-                f"DBCluster {cluster_id_param} not found.",
+                "The source cluster could not be found or cannot be accessed: "
+                f"{cluster_id_param}",
                 404,
             )
-        if parent.get("Status") == "stopped":
-            return _error(
-                "InvalidDBClusterStateFault",
-                f"DbCluster {cluster_id_param} is in stopped "
-                "state but expected it to be one of available.",
-                400,
-            )
+        state_error = _member_create_cluster_state_error(parent)
+        if state_error:
+            return state_error
     if (
         parent
         and parent.get("DBClusterMembers")

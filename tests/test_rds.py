@@ -3075,6 +3075,89 @@ def test_rds_concurrent_cluster_instance_creates_start_one_shared_container(monk
         m._clusters.clear()
 
 
+@pytest.mark.parametrize(
+    ("change", "status", "code", "message"),
+    [
+        (
+            "delete",
+            404,
+            "DBClusterNotFoundFault",
+            "The source cluster could not be found or cannot be accessed: recheck-cluster",
+        ),
+        (
+            "stopping",
+            400,
+            "InvalidDBClusterStateFault",
+            "DbCluster recheck-cluster is being stopped.",
+        ),
+        (
+            "stopped",
+            400,
+            "InvalidDBClusterStateFault",
+            "Db cluster recheck-cluster is in stopped state, cannot create instance in it",
+        ),
+    ],
+)
+def test_rds_create_rechecks_cluster_under_shared_container_lock(
+    monkeypatch, change, status, code, message,
+):
+    """A CreateDBInstance that waits for _shared_container_lock while its cluster
+    is deleted or stopped answers as AWS does for that cluster state, and starts
+    no compute. Messages captured on AWS (us-east-2, 2026-11-10)."""
+    import threading
+
+    from ministack.services import rds as m
+
+    started = []
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    monkeypatch.setattr(
+        m, "_start_cluster_shared_container",
+        lambda *a, **k: started.append(a) or {"started": False, "failed": False},
+    )
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "recheck-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "postgres",
+            "MasterUserPassword": "password123",
+        })
+        result = {}
+
+        def _create():
+            result["r"] = m._create_db_instance({
+                "DBInstanceIdentifier": "recheck-instance",
+                "DBClusterIdentifier": "recheck-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+            })
+
+        with m._shared_container_lock:
+            creator = threading.Thread(target=_create)
+            creator.start()
+            creator.join(timeout=0.3)
+            assert creator.is_alive()  # waiting for the lock
+            if change == "delete":
+                del m._clusters["recheck-cluster"]
+            else:
+                m._clusters["recheck-cluster"]["Status"] = change
+        creator.join(timeout=5)
+
+        resp_status, _headers, body = result["r"]
+        body = body.decode() if isinstance(body, bytes) else body
+        assert resp_status == status
+        assert f"<Code>{code}</Code>" in body
+        assert f"<Message>{message}</Message>" in body
+        assert "recheck-instance" not in m._instances
+        assert started == []
+        assert m._shared_container_lock.acquire(blocking=False)
+        m._shared_container_lock.release()
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
     """StopDBCluster stops the shared container; StartDBCluster restarts it."""
     from ministack.services import rds as m
