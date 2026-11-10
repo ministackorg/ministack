@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SES — sending events through EventBridge** — configuration set event destinations were stored but never fired. Each send now publishes `aws.ses` events to the set's EventBridge destination, with the outcomes AWS gives the mailbox simulator. Adds `PutEmailIdentityConfigurationSetAttributes`; EventBridge now delivers to CloudWatch Logs log group targets.
+
 ## [1.5.39] — 2026-11-08
 
 ### Added

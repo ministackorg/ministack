@@ -11765,7 +11765,7 @@ def _ses_configuration_set_event_destination_create(logical_id, props, stack_nam
     destination = props.get("EventDestination", {}) or {}
     dest_name = destination.get("Name") or _physical_name(
         stack_name, logical_id, max_len=64)
-    # Recorded through the SES v2 API; the emulator does not deliver SES events.
+    # Recorded through the SES v2 API, so sends publish to an EventBridge destination like one made there.
     _ses_event_destination_put(config_set, dest_name, props, create=True)
     # The physical id encodes both names so delete can locate the destination.
     return f"{config_set}|{dest_name}", {"Id": dest_name}
