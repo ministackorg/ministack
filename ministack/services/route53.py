@@ -485,7 +485,7 @@ def _parse_health_check_config(el) -> dict:
             cfg[bool_field] = _text(el, bool_field).lower() == "true"
     chc_el = _find(el, "ChildHealthChecks")
     if chc_el is not None:
-        cfg["ChildHealthChecks"] = [_text(c, "ChildHealthCheck") for c in _findall(chc_el, "ChildHealthCheck")]
+        cfg["ChildHealthChecks"] = [(c.text or "").strip() for c in _findall(chc_el, "ChildHealthCheck")]
     reg_el = _find(el, "Regions")
     if reg_el is not None:
         cfg["Regions"] = [_text(r, "Region") for r in _findall(reg_el, "Region")]
@@ -934,6 +934,100 @@ def _list_hosted_zones_by_vpc(query_params: dict):
 
 # ─── health checks ────────────────────────────────────────────────────────────
 
+def _find_metric_alarm(alarm_identifier: dict):
+    from ministack.services import cloudwatch as _cloudwatch
+
+    name = alarm_identifier.get("Name") or ""
+    region = alarm_identifier.get("Region") or ""
+    return _cloudwatch._alarms.get_scoped(get_account_id(), region, name)
+
+
+# Fields a health check type must not carry, in the order AWS reports them.
+# UpdateHealthCheck has no RequestInterval or MeasureLatency member, so those
+# two are only checked on create.
+_METRIC_FORBIDDEN = (
+    ("IPAddress", "an IP address"), ("Port", "a port"), ("ResourcePath", "a resource path"),
+    ("SearchString", "a search string"), ("RequestInterval", "a period"), ("FailureThreshold", "a failure threshold"),
+    ("Regions", "regions"), ("MeasureLatency", "a latency measurement"), ("FullyQualifiedDomainName", "a FQDN"),
+    ("HealthThreshold", "a health threshold"), ("ChildHealthChecks", "child health checks"), ("EnableSNI", "enable SNI"),
+)
+_CALCULATED_FORBIDDEN = (
+    ("IPAddress", "an IP address"), ("Port", "a port"), ("ResourcePath", "a resource path"),
+    ("SearchString", "a search string"), ("RequestInterval", "a period"), ("FailureThreshold", "a failure threshold"),
+    ("Regions", "regions"), ("MeasureLatency", "a latency measurement"), ("FullyQualifiedDomainName", "a FQDN"),
+    ("EnableSNI", "enable SNI"), ("AlarmIdentifier", "an metric region"),
+    ("InsufficientDataHealthStatus", "an insufficient data health status"),
+)
+_CREATE_ONLY_FIELDS = ("RequestInterval", "MeasureLatency")
+
+
+def _health_check_config_error(hc_type, cfg: dict, creating: bool):
+    """AWS's InvalidInput checks for metric-based, calculated and recovery-control
+    health checks, in the order AWS applies them. A recovery-control check cannot
+    be updated at all and AWS words its errors as "Calculated health checks ...".
+    A metric check's alarm is checked first (null on create, missing, then its
+    kind), then the fields the type must not carry, then, for a calculated check,
+    a missing health threshold (create) and unknown child health checks."""
+    if hc_type == "RECOVERY_CONTROL" and not creating:
+        return _error_response("InvalidInput", "Invalid parameter : Update is not supported for this health check type.")
+    if hc_type == "CLOUDWATCH_METRIC":
+        kind, forbidden = "Metric-based", _METRIC_FORBIDDEN
+        ident = cfg.get("AlarmIdentifier")
+        if ident is None and creating:
+            return _error_response("InvalidInput", "Alarm identifier must not be null.")
+        if ident is not None:
+            alarm = _find_metric_alarm(ident)
+            if alarm is None:
+                return _error_response(
+                    "InvalidInput",
+                    f"The specified CloudWatch alarm doesn't exist. Name: {ident.get('Name', '')}, "
+                    f"region: {ident.get('Region', '')}",
+                )
+            if alarm.get("ExtendedStatistic") or alarm.get("Metrics"):
+                return _error_response("InvalidInput", "Route 53 does not support extended CloudWatch metric statistics")
+            if int(alarm.get("Period") or 60) < 60:
+                return _error_response("InvalidInput", "Route 53 does not support high-resolution CloudWatch alarms")
+    elif hc_type in ("CALCULATED", "RECOVERY_CONTROL"):
+        kind, forbidden = "Calculated", _CALCULATED_FORBIDDEN
+        if hc_type == "RECOVERY_CONTROL" and "RoutingControlArn" not in cfg:
+            return _error_response("InvalidInput", "Routing control ARN must not be null")
+    else:
+        return None
+    for field, label in forbidden:
+        if not creating and field in _CREATE_ONLY_FIELDS:
+            continue
+        # An empty ChildHealthChecks list counts as not specified.
+        present = bool(cfg.get(field)) if field == "ChildHealthChecks" else field in cfg
+        if present:
+            return _error_response("InvalidInput", f"Invalid parameter : {kind} health checks must not have {label} specified.")
+    if hc_type == "CALCULATED":
+        if creating and "HealthThreshold" not in cfg:
+            return _error_response(
+                "InvalidInput", "Invalid parameter : Calculated health checks must have a health threshold specified."
+            )
+        unknown = [c for c in cfg.get("ChildHealthChecks") or [] if c not in _health_checks]
+        if unknown:
+            return _error_response(
+                "InvalidInput",
+                "Invalid parameter : Child health check IDs do not exist or are deleted: " + ", ".join(unknown),
+            )
+    return None
+
+
+def _normalise_health_check_children(hc_type, cfg: dict, creating: bool) -> None:
+    """Store what AWS returns: a calculated check always lists its children (empty
+    when none were sent); a recovery-control check keeps neither ChildHealthChecks
+    nor HealthThreshold; a metric check drops an empty ChildHealthChecks."""
+    if hc_type == "CALCULATED":
+        if creating:
+            cfg.setdefault("ChildHealthChecks", [])
+    elif hc_type == "RECOVERY_CONTROL":
+        cfg.pop("ChildHealthChecks", None)
+        cfg.pop("HealthThreshold", None)
+    elif hc_type == "CLOUDWATCH_METRIC" and cfg.get("ChildHealthChecks") == []:
+        del cfg["ChildHealthChecks"]
+
+
 def _create_health_check(body: bytes):
     root = _parse_body(body)
     if root is None:
@@ -945,11 +1039,22 @@ def _create_health_check(body: bytes):
 
     cfg_el = _find(root, "HealthCheckConfig")
     cfg = _parse_health_check_config(cfg_el) if cfg_el is not None else {}
-    if cfg.get("Type") != "RECOVERY_CONTROL":
+    hc_type = cfg.get("Type")
+    # AWS defaults these for endpoint checks (HTTP, HTTPS, HTTP_STR_MATCH,
+    # HTTPS_STR_MATCH, TCP); CLOUDWATCH_METRIC, CALCULATED and RECOVERY_CONTROL
+    # checks come back without either field.
+    if hc_type not in ("CLOUDWATCH_METRIC", "CALCULATED", "RECOVERY_CONTROL"):
         cfg.setdefault("RequestInterval", 30)
         cfg.setdefault("FailureThreshold", 3)
+    elif hc_type == "CLOUDWATCH_METRIC":
+        cfg.setdefault("InsufficientDataHealthStatus", "LastKnownStatus")
 
     with _lock:
+        # Under the lock: the child-health-check check reads _health_checks.
+        err = _health_check_config_error(hc_type, cfg, creating=True)
+        if err:
+            return err
+        _normalise_health_check_children(hc_type, cfg, creating=True)
         if caller_ref in _hc_caller_refs:
             hc = _health_checks[_hc_caller_refs[caller_ref]]
             def build(root):
@@ -1021,14 +1126,21 @@ def _list_health_checks(query_params: dict):
 
 
 def _update_health_check(hc_id: str, body: bytes):
-    root = _parse_body(body)
-    if root is None:
-        return _error_response("InvalidInput", "Missing or invalid request body.")
+    # An UpdateHealthCheck with no members has an empty body; AWS accepts it, keeps
+    # the config and still bumps HealthCheckVersion. Any other body that is not XML
+    # (whitespace included) is MalformedInput, checked before the health check ID.
+    root = _parse_body(body) if body else None
+    if body and root is None:
+        return _error_response("MalformedInput", "Could not parse XML")
     with _lock:
         hc = _health_checks.get(hc_id)
         if not hc:
             return _error_response("NoSuchHealthCheck", f"No health check exists with the specified ID {hc_id}.", 404)
-        updates = _parse_health_check_config(root)
+        updates = _parse_health_check_config(root) if root is not None else {}
+        err = _health_check_config_error(hc["config"].get("Type"), updates, creating=False)
+        if err:
+            return err
+        _normalise_health_check_children(hc["config"].get("Type"), updates, creating=False)
         hc["config"] = {**hc["config"], **updates}
         hc["version"] = hc.get("version", 1) + 1
 
