@@ -2957,6 +2957,118 @@ def test_rds_last_member_delete_wins_after_readiness_epoch_check(monkeypatch):
         m._clusters.clear()
 
 
+def test_rds_concurrent_cluster_instance_creates_start_one_shared_container(monkeypatch):
+    """Two CreateDBInstance calls into one new Aurora cluster, sent at once (as
+    Terraform does for `count = 2`), start the cluster's container once and
+    neither instance reports `failed`. MiniStack contract: before the fix both
+    calls started the container under the same name, and the one that lost
+    Docker's name conflict was `failed` until the other's container was ready."""
+    import threading
+
+    from ministack.services import rds as m
+
+    second_run = threading.Event()
+    cluster_runs = []
+    restarts = []
+
+    class FakeContainer:
+        id = "concurrent-create-shared-container"
+        attrs = {"NetworkSettings": {"Networks": {}}}
+        status = "running"
+
+        def reload(self):
+            pass
+
+        def start(self):
+            restarts.append(self.id)
+
+    container = FakeContainer()
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            if kwargs.get("name") != m._rds_cluster_docker_name("concurrent-create-cluster"):
+                return container
+            cluster_runs.append(kwargs["name"])
+            if len(cluster_runs) > 1:
+                second_run.set()
+                raise Exception(
+                    '409 Client Error: Conflict ("The container name "/%s" is already in use")'
+                    % kwargs["name"],
+                )
+            # Hold the first start long enough for an unserialised second
+            # create to reach Docker too.
+            second_run.wait(timeout=0.5)
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeDocker:
+        def __init__(self):
+            self.containers = FakeContainers()
+
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16030)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args, **_kwargs: True)
+
+    register = m._register_instance_in_cluster
+
+    def _slow_register(instance):
+        # Widen the gap between the container start and member registration,
+        # where a second create would see a started container with no members
+        # and restart it as if an empty cluster were growing.
+        time.sleep(0.2)
+        register(instance)
+
+    monkeypatch.setattr(m, "_register_instance_in_cluster", _slow_register)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "concurrent-create-cluster",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "postgres",
+            "MasterUserPassword": "password123",
+        })
+        ids = ["concurrent-create-0", "concurrent-create-1"]
+        barrier = threading.Barrier(len(ids))
+        statuses = {}
+
+        def _create(db_id):
+            barrier.wait()
+            m._create_db_instance({
+                "DBInstanceIdentifier": db_id,
+                "DBClusterIdentifier": "concurrent-create-cluster",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+            })
+            statuses[db_id] = m._instances[db_id]["DBInstanceStatus"]
+
+        threads = [threading.Thread(target=_create, args=(i,)) for i in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(cluster_runs) == 1
+        assert restarts == []
+        assert sorted(statuses) == ids
+        assert "failed" not in statuses.values(), statuses
+        members = {
+            mbr["DBInstanceIdentifier"]
+            for mbr in m._clusters["concurrent-create-cluster"]["DBClusterMembers"]
+        }
+        assert members == set(ids)
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_stop_start_cluster_compute_lifecycle(monkeypatch):
     """StopDBCluster stops the shared container; StartDBCluster restarts it."""
     from ministack.services import rds as m

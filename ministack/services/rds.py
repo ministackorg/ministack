@@ -2266,8 +2266,13 @@ def _remove_cluster_shared_resources(
         )
 
 
-def _restart_cluster_shared_container(cluster_id, cluster):
-    """Restart the preserved shared container when an empty cluster grows."""
+def _restart_cluster_shared_container(cluster_id, cluster, skip_if_running=False):
+    """Restart the preserved shared container when an empty cluster grows.
+
+    With ``skip_if_running`` a container that is already running is left as
+    it is: it is not a preserved one but one whose readiness wait is still in
+    flight, and restarting it would bump the epoch and discard that result.
+    """
     docker_client = _get_docker()
     container_id = cluster.get("_shared_container_id")
     if not docker_client or not container_id:
@@ -2280,6 +2285,13 @@ def _restart_cluster_shared_container(cluster_id, cluster):
 
     try:
         container = docker_client.containers.get(container_id)
+        if skip_if_running and getattr(container, "status", None) == "running":
+            return {
+                "started": False,
+                "failed": False,
+                "readiness_host": None,
+                "readiness_port": None,
+            }
         container.start()
         container.reload()
     except Exception as e:
@@ -5195,60 +5207,66 @@ def _create_db_instance_impl(p):
         pending_rotation = parent.get("_pending_master_password_rotation")
         if pending_rotation:
             readiness_master_pass = pending_rotation["old_password"]
-        # RDS action dispatch is synchronous and await-free, so this check and
-        # the shared metadata update cannot interleave with another create.
-        resume_control_plane_only = (
-            not docker_client
-            and not parent.get("DBClusterMembers")
-            and not parent.get("_shared_container_ready", True)
-        )
-        has_failed_shared_member = any(
-            (_instances.get(member.get("DBInstanceIdentifier")) or {}).get(
-                "DBInstanceStatus",
-            ) == "failed"
-            for member in parent.get("DBClusterMembers", [])
-            if member.get("DBInstanceIdentifier")
-        )
-        restart_unhealthy_container = (
-            docker_client
-            and parent.get("_shared_container_id")
-            and not parent.get("_shared_container_ready", True)
-            and (
-                not parent.get("DBClusterMembers")
-                or has_failed_shared_member
+        # Handlers run on worker threads, so two creates into one new cluster
+        # (Terraform's count = 2) can interleave. Hold _shared_container_lock
+        # across the check and the start, as the restore path does, so the
+        # second create finds the container the first one started.
+        with _shared_container_lock:
+            resume_control_plane_only = (
+                not docker_client
+                and not parent.get("DBClusterMembers")
+                and not parent.get("_shared_container_ready", True)
             )
-        )
-        if resume_control_plane_only:
-            parent["_shared_container_ready"] = True
-            start_result = {"started": False, "failed": False}
-        elif restart_unhealthy_container:
-            start_result = _restart_cluster_shared_container(
-                cluster_id_param,
-                parent,
+            has_failed_shared_member = any(
+                (_instances.get(member.get("DBInstanceIdentifier")) or {}).get(
+                    "DBInstanceStatus",
+                ) == "failed"
+                for member in parent.get("DBClusterMembers", [])
+                if member.get("DBInstanceIdentifier")
             )
-            if start_result.get("failed"):
-                # A preserved container can become unrestartable (for example,
-                # its old host port may have been claimed). Recreate only the
-                # compute layer; the cluster-owned named volume retains data.
-                start_result = _start_cluster_shared_container(
+            restart_unhealthy_container = (
+                docker_client
+                and parent.get("_shared_container_id")
+                and not parent.get("_shared_container_ready", True)
+                and (
+                    not parent.get("DBClusterMembers")
+                    or has_failed_shared_member
+                )
+            )
+            if resume_control_plane_only:
+                parent["_shared_container_ready"] = True
+                start_result = {"started": False, "failed": False}
+            elif restart_unhealthy_container:
+                start_result = _restart_cluster_shared_container(
                     cluster_id_param,
                     parent,
-                    remove_stale=True,
+                    # With no members, a running container was just started
+                    # by a concurrent create that has not registered yet.
+                    skip_if_running=not has_failed_shared_member,
                 )
-        else:
-            needs_shared_start = (
-                not parent.get("_shared_endpoint")
-                or (docker_client and not parent.get("_shared_container_id"))
-            )
-            start_result = (
-                _start_cluster_shared_container(
-                    cluster_id_param,
-                    parent,
-                    remove_stale=bool(parent.get("_shared_endpoint")),
+                if start_result.get("failed"):
+                    # A preserved container can become unrestartable (for example,
+                    # its old host port may have been claimed). Recreate only the
+                    # compute layer; the cluster-owned named volume retains data.
+                    start_result = _start_cluster_shared_container(
+                        cluster_id_param,
+                        parent,
+                        remove_stale=True,
+                    )
+            else:
+                needs_shared_start = (
+                    not parent.get("_shared_endpoint")
+                    or (docker_client and not parent.get("_shared_container_id"))
                 )
-                if needs_shared_start
-                else {"started": False, "failed": False}
-            )
+                start_result = (
+                    _start_cluster_shared_container(
+                        cluster_id_param,
+                        parent,
+                        remove_stale=bool(parent.get("_shared_endpoint")),
+                    )
+                    if needs_shared_start
+                    else {"started": False, "failed": False}
+                )
         shared_endpoint = parent.get("_shared_endpoint") or {}
         endpoint_host = shared_endpoint.get("Address", endpoint_host)
         endpoint_port = int(shared_endpoint.get("Port", endpoint_port))
