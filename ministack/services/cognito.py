@@ -1368,6 +1368,26 @@ def _federation_attribute_value(value):
     return None
 
 
+def _mapped_federation_attributes(idp_attrs: dict, attr_mapping: dict, from_trigger: bool = False) -> dict:
+    """The user attributes that the provider's AttributeMapping assigns from the IdP's attributes.
+
+    "Your user pool writes all claims that match mapping rules to user attributes on the
+    user pool user profile. Your user pool ignores attributes that match a mapping rule
+    but aren't required and aren't found in the provider's claims."
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-flow.html)
+    Claims without a mapping rule are not written.
+
+    The userAttributesToMap of an InboundFederation Lambda keep their unmapped entries
+    under their own name, as before.
+    """
+    mapped = {cognito_attr: idp_attrs[idp_claim]
+              for cognito_attr, idp_claim in attr_mapping.items() if idp_claim in idp_attrs}
+    if not from_trigger:
+        return mapped
+    mapped_claims = set(attr_mapping.values())
+    return {**{k: v for k, v in idp_attrs.items() if k not in mapped_claims}, **mapped}
+
+
 def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
     """Registered token claims from InboundFederation output count only when mapped."""
     mapped = set(attr_mapping.values())
@@ -8318,7 +8338,6 @@ def _saml2_idp_response(body: bytes, query_params):
 
     # Apply attribute mapping: IdP claim name → Cognito attribute name
     attr_mapping = provider.get("AttributeMapping", {})
-    reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
     try:
         to_map = _apply_inbound_federation_trigger(
             pool_id, client_id, name_id, provider_name, "SAML",
@@ -8329,10 +8348,7 @@ def _saml2_idp_response(body: bytes, query_params):
         logger.info("Cognito: InboundFederation Lambda rejected SAML sign-in for %s: %s",
                     name_id, e)
         return error_response_json("UserLambdaValidationException", str(e), 400)
-    user_attrs = {}
-    for idp_claim, value in idp_attrs.items():
-        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
-        user_attrs[cognito_attr] = value
+    user_attrs = _mapped_federation_attributes(idp_attrs, attr_mapping, from_trigger=bool(to_map))
 
     # Create or update federated user. A profile linked ahead of this first
     # sign-in wins over minting a new `{Provider}_id` one (#1499).
@@ -8552,7 +8568,6 @@ def _oauth2_idp_response(method, body, query_params):
     # Apply attribute mapping (IdP claim → Cognito attribute), same shape
     # as the SAML branch.
     attr_mapping = provider.get("AttributeMapping", {})
-    reverse_mapping = {v: k for k, v in attr_mapping.items()}
     try:
         to_map = _apply_inbound_federation_trigger(
             pool_id, client_id, claims.get('sub') or claims.get('email') or '',
@@ -8565,9 +8580,7 @@ def _oauth2_idp_response(method, body, query_params):
                   else {k: flat for k, v in claims.items()
                         if k not in _FEDERATION_RESERVED_CLAIMS
                         and (flat := _federation_attribute_value(v)) is not None})
-    user_attrs = {}
-    for idp_claim, value in idp_claims.items():
-        user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value
+    user_attrs = _mapped_federation_attributes(idp_claims, attr_mapping, from_trigger=bool(to_map))
 
     # Stable identifier: prefer `sub` from id_token, fall back to `email` or
     # a generated UUID so users can be re-found on subsequent logins.
