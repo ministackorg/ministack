@@ -357,6 +357,7 @@ _ECS_TIMESTAMP_FIELDS = {
     "createdAt", "startedAt", "stoppedAt", "stoppingAt", "registeredAt",
     "deregisteredAt", "updatedAt", "lastModified", "runningAt",
     "connectivityAt", "pullStartedAt", "pullStoppedAt", "executionStoppedAt",
+    "finishedAt",
 }
 
 
@@ -965,6 +966,7 @@ def _refresh_service_state(cluster_name, group):
         # draining its old tasks.  Collapse old deployments here as well as in
         # the completion path so the final response cannot retain a drained
         # ACTIVE deployment merely because that nested refresh won the race.
+        _sync_service_deployments(svc)
         svc["deployments"] = [
             dep for dep in svc.get("deployments", [])
             if dep.get("status") == "PRIMARY"
@@ -1069,6 +1071,7 @@ def _complete_service_deployment(cluster_name, svc_key, expected_deployment_id=N
         # a FAILED deployment, however: callers need its failure diagnostics.
         svc = _services.get(svc_key)
         if svc:
+            _sync_service_deployments(svc)
             svc["deployments"] = [
                 dep for dep in svc.get("deployments", [])
                 if dep.get("status") == "PRIMARY"
@@ -1473,6 +1476,7 @@ def _create_service(data):
         if data.get(field) is not None:
             svc[f"_{field}"] = data[field]
     _services[svc_key] = svc
+    _sync_service_deployments(svc)
 
     if svc["tags"]:
         _tags[arn] = list(svc["tags"])
@@ -1621,6 +1625,7 @@ def _update_service(data):
         new_dep["rolloutState"] = "IN_PROGRESS"
         new_dep["rolloutStateReason"] = ""
         svc["deployments"].insert(0, new_dep)
+        _sync_service_deployments(svc)
         svc["taskDefinition"] = td_arn
         changed = True
 
@@ -3515,15 +3520,168 @@ def _update_capacity_provider(data):
 
 
 # ---------------------------------------------------------------------------
-# ServiceDeployments (stubs)
+# ServiceDeployments
 # ---------------------------------------------------------------------------
 
-def _describe_service_deployments(data):
-    return json_response({"serviceDeployments": []})
+# Status values ListServiceDeployments accepts, in the order AWS lists them in its
+# validation message (real AWS capture, us-east-1).
+_SERVICE_DEPLOYMENT_STATUSES = (
+    "IN_PROGRESS", "CREATED", "ROLLBACK_IN_PROGRESS", "STOPPED", "STOP_REQUESTED",
+    "ROLLBACK_REQUESTED", "ROLLBACK_SUCCESSFUL", "PENDING", "ROLLBACK_FAILED",
+    "SUCCESSFUL",
+)
+
+
+def _revision_id(deployment_id):
+    return deployment_id.split("/", 1)[-1]
+
+
+def _sync_service_deployments(svc):
+    """Keep one service-deployment record per ECS deployment of a service.
+
+    A service deployment outlives the deployment entry in DescribeServices, which
+    is dropped once the old tasks drain, so the records are stored on the service
+    (``_serviceDeployments``, oldest first) and brought up to date whenever a
+    deployment is added or about to be dropped, and before they are read.
+    """
+    records = svc.setdefault("_serviceDeployments", [])
+    by_deployment = {rec["deploymentId"]: rec for rec in records}
+    service_arn = svc["serviceArn"]
+    # Oldest first, so each new record can name the revision it replaces.
+    for dep in reversed(svc.get("deployments", [])):
+        rec = by_deployment.get(dep["id"])
+        if rec is None:
+            rec = {
+                "deploymentId": dep["id"],
+                "serviceDeploymentArn": service_arn.replace(":service/", ":service-deployment/", 1)
+                + "/" + secrets.token_urlsafe(16)[:21],
+                "createdAt": dep["createdAt"],
+                "startedAt": dep["createdAt"],
+                "status": "IN_PROGRESS",
+                "sourceDeploymentId": records[-1]["deploymentId"] if records else None,
+            }
+            records.append(rec)
+            by_deployment[dep["id"]] = rec
+        rec["desiredCount"] = dep.get("desiredCount", 0)
+        rec["runningCount"] = dep.get("runningCount", 0)
+        rec["pendingCount"] = dep.get("pendingCount", 0)
+        if dep.get("rolloutState") == "COMPLETED" and rec["status"] != "SUCCESSFUL":
+            rec["status"] = "SUCCESSFUL"
+            rec["finishedAt"] = dep.get("updatedAt") or _iso()
+            rec["updatedAt"] = rec["finishedAt"]
+        elif rec["status"] == "IN_PROGRESS":
+            rec["updatedAt"] = dep.get("updatedAt") or rec["createdAt"]
+    return records
+
+
+def _revision_arn(svc, deployment_id):
+    return (svc["serviceArn"].replace(":service/", ":service-revision/", 1)
+            + "/" + _revision_id(deployment_id))
+
+
+def _service_deployment_brief(svc, rec):
+    brief = {
+        "serviceDeploymentArn": rec["serviceDeploymentArn"],
+        "serviceArn": svc["serviceArn"],
+        "clusterArn": svc["clusterArn"],
+        "createdAt": rec["createdAt"],
+        "startedAt": rec["startedAt"],
+        "finishedAt": rec.get("finishedAt"),
+        "status": rec["status"],
+        "targetServiceRevisionArn": _revision_arn(svc, rec["deploymentId"]),
+    }
+    return brief
+
+
+def _service_revision_summary(svc, deployment_id, rec):
+    return {
+        "arn": _revision_arn(svc, deployment_id),
+        "requestedTaskCount": rec["desiredCount"],
+        "runningTaskCount": rec["runningCount"],
+        "pendingTaskCount": rec["pendingCount"],
+    }
+
+
+def _service_deployment_detail(svc, rec, records):
+    detail = _service_deployment_brief(svc, rec)
+    del detail["targetServiceRevisionArn"]
+    detail["updatedAt"] = rec["updatedAt"]
+    detail["targetServiceRevision"] = _service_revision_summary(svc, rec["deploymentId"], rec)
+    source = next((r for r in records if r["deploymentId"] == rec.get("sourceDeploymentId")), None)
+    if source is not None:
+        detail["sourceServiceRevisions"] = [
+            _service_revision_summary(svc, source["deploymentId"], source)]
+    return detail
+
+
+def _epoch(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
 def _list_service_deployments(data):
-    return json_response({"serviceDeployments": []})
+    cluster_name = _resolve_cluster_name(data.get("cluster", "default"))
+    if cluster_name is None or cluster_name not in _clusters:
+        return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
+    svc_ref = _resolve_service_ref(data.get("service", ""))
+    if svc_ref is None or not svc_ref[0] or svc_ref[1] not in (None, cluster_name):
+        return error_response_json("ServiceNotFoundException", "Service not found.", 400)
+    svc = _services.get(f"{cluster_name}/{svc_ref[0]}")
+    if not svc:
+        return error_response_json("ServiceNotFoundException", "Service not found.", 400)
+
+    statuses = data.get("status") or []
+    invalid = [st for st in statuses if st not in _SERVICE_DEPLOYMENT_STATUSES]
+    if invalid:
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '[{', '.join(invalid)}]' at 'statusFilter' "
+            "failed to satisfy constraint: Member must satisfy constraint: "
+            f"[Member must satisfy enum value set: [{', '.join(_SERVICE_DEPLOYMENT_STATUSES)}]]",
+            400)
+    created = data.get("createdAt") or {}
+    after, before = created.get("after"), created.get("before")
+
+    with resource_lock("ecs-service", f"{cluster_name}/{svc['serviceName']}"):
+        records = _sync_service_deployments(svc)
+        briefs = []
+        for rec in reversed(records):  # newest first
+            created_at = _epoch(rec["createdAt"])
+            if statuses and rec["status"] not in statuses:
+                continue
+            if after is not None and created_at < after:
+                continue
+            if before is not None and created_at > before:
+                continue
+            briefs.append(_service_deployment_brief(svc, rec))
+    return json_response({"serviceDeployments": _sanitize(briefs)})
+
+
+def _describe_service_deployments(data):
+    arns = data.get("serviceDeploymentArns") or []
+    if not arns:
+        return error_response_json(
+            "InvalidParameterException", "The Service ARN provided is invalid.", 400)
+    found = []
+    for arn in arns:
+        tail = _ecs_resource_tail(arn, "service-deployment") if isinstance(arn, str) else None
+        parts = tail.split("/") if tail else []
+        if len(parts) != 3 or not all(parts):
+            return error_response_json(
+                "InvalidParameterException", "The Service ARN provided is invalid.", 400)
+        cluster_name, service_name, _dep_id = parts
+        svc = _services.get(f"{cluster_name}/{service_name}")
+        rec = None
+        if svc:
+            rec = next((r for r in _sync_service_deployments(svc)
+                        if r["serviceDeploymentArn"] == arn), None)
+        if rec is None:
+            return error_response_json(
+                "InvalidParameterException", "The ServiceDeployment ARN is invalid.", 400)
+        found.append((svc, rec))
+    deployments = [
+        _service_deployment_detail(svc, rec, svc["_serviceDeployments"]) for svc, rec in found]
+    return json_response({"serviceDeployments": _sanitize(deployments), "failures": []})
 
 
 def _describe_service_revisions(data):

@@ -3,6 +3,7 @@ import json
 import os
 import time
 import uuid as _uuid_mod
+from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -4591,3 +4592,157 @@ def test_ecr_held_image_from_another_account_needs_its_repository_policy(auth_en
         with request_scope("222233334444", "us-east-1"):
             ecr._repositories.pop("shared", None)
             ecr._repo_policies.pop("shared", None)
+
+
+# ---------------------------------------------------------------------------
+# ListServiceDeployments / DescribeServiceDeployments
+#
+# Shapes, filters and error messages follow a real AWS capture (us-east-1,
+# 2026-11-09): ministackorg/ministack#2629.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def deployment_service(ecs):
+    name = f"sd-{_uuid_mod.uuid4().hex[:8]}"
+    ecs.create_cluster(clusterName=name)
+    td = ecs.register_task_definition(
+        family=name, networkMode="bridge", requiresCompatibilities=["EC2"], cpu="128", memory="64",
+        containerDefinitions=[{"name": "a", "image": "busybox", "essential": True, "memory": 64}],
+    )["taskDefinition"]["taskDefinitionArn"]
+    service = ecs.create_service(cluster=name, serviceName=name, taskDefinition=td, desiredCount=0,
+                                 launchType="EC2")["service"]
+    try:
+        yield name, service
+    finally:
+        ecs.delete_service(cluster=name, service=name, force=True)
+        ecs.deregister_task_definition(taskDefinition=td)
+        ecs.delete_cluster(cluster=name)
+
+
+def test_ecs_list_service_deployments_lists_the_primary_deployment(ecs, deployment_service):
+    name, service = deployment_service
+    briefs = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"]
+    assert len(briefs) == 1
+    brief = briefs[0]
+    assert brief["serviceArn"] == service["serviceArn"]
+    assert brief["clusterArn"] == service["clusterArn"]
+    assert brief["serviceDeploymentArn"].split(":", 5)[5].startswith(f"service-deployment/{name}/{name}/")
+    # The provider matches the PRIMARY deployment's id inside targetServiceRevisionArn.
+    deployment_id = service["deployments"][0]["id"]
+    assert deployment_id.startswith("ecs-svc/")
+    assert brief["targetServiceRevisionArn"].endswith(
+        f":service-revision/{name}/{name}/{deployment_id.split('/', 1)[1]}")
+    assert brief["status"] == "SUCCESSFUL"
+    assert brief["createdAt"] and brief["startedAt"] and brief["finishedAt"]
+
+
+def test_ecs_list_service_deployments_by_arn(ecs, deployment_service):
+    name, service = deployment_service
+    by_arn = ecs.list_service_deployments(cluster=service["clusterArn"], service=service["serviceArn"])
+    assert len(by_arn["serviceDeployments"]) == 1
+
+
+def test_ecs_list_service_deployments_created_at_filter(ecs, deployment_service):
+    name, _ = deployment_service
+    created = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]["createdAt"]
+
+    def listed(**created_at):
+        return len(ecs.list_service_deployments(
+            cluster=name, service=name, createdAt=created_at)["serviceDeployments"])
+
+    one_second = timedelta(seconds=1)
+    assert listed(after=created - one_second) == 1
+    assert listed(after=created + one_second) == 0
+    assert listed(before=created + one_second) == 1
+    assert listed(before=created - one_second) == 0
+    assert listed(after=created - one_second, before=created + one_second) == 1
+
+
+def test_ecs_list_service_deployments_status_filter(ecs, deployment_service):
+    name, _ = deployment_service
+
+    def listed(*status):
+        return len(ecs.list_service_deployments(
+            cluster=name, service=name, status=list(status))["serviceDeployments"])
+
+    assert listed("SUCCESSFUL") == 1
+    assert listed("SUCCESSFUL", "STOPPED") == 1
+    assert listed("IN_PROGRESS") == 0
+    assert listed("STOPPED") == 0
+
+
+def test_ecs_list_service_deployments_invalid_status(ecs, deployment_service):
+    name, _ = deployment_service
+    # The message is the one AWS returned for a bad value.
+    with pytest.raises(ClientError) as exc:
+        ecs.list_service_deployments(cluster=name, service=name, status=["BOGUS"])
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == (
+        "1 validation error detected: Value '[BOGUS]' at 'statusFilter' failed to satisfy constraint: "
+        "Member must satisfy constraint: [Member must satisfy enum value set: [IN_PROGRESS, CREATED, "
+        "ROLLBACK_IN_PROGRESS, STOPPED, STOP_REQUESTED, ROLLBACK_REQUESTED, ROLLBACK_SUCCESSFUL, "
+        "PENDING, ROLLBACK_FAILED, SUCCESSFUL]]")
+
+
+def test_ecs_list_service_deployments_errors(ecs, deployment_service):
+    name, _ = deployment_service
+    for kwargs, code, message in (
+        ({"cluster": name, "service": "nope"}, "ServiceNotFoundException", "Service not found."),
+        ({"cluster": "nope-cluster", "service": name}, "ClusterNotFoundException", "Cluster not found."),
+        ({"service": name}, "ClusterNotFoundException", "Cluster not found."),  # no "default" cluster
+    ):
+        with pytest.raises(ClientError) as exc:
+            ecs.list_service_deployments(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+
+
+def test_ecs_describe_service_deployments(ecs, deployment_service):
+    name, service = deployment_service
+    brief = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]
+    resp = ecs.describe_service_deployments(serviceDeploymentArns=[brief["serviceDeploymentArn"]])
+    assert resp["failures"] == []
+    [detail] = resp["serviceDeployments"]
+    assert detail["serviceDeploymentArn"] == brief["serviceDeploymentArn"]
+    assert detail["serviceArn"] == service["serviceArn"]
+    assert detail["clusterArn"] == service["clusterArn"]
+    assert detail["status"] == "SUCCESSFUL"
+    assert detail["createdAt"] and detail["startedAt"] and detail["finishedAt"] and detail["updatedAt"]
+    assert detail["targetServiceRevision"] == {
+        "arn": brief["targetServiceRevisionArn"],
+        "requestedTaskCount": 0, "runningTaskCount": 0, "pendingTaskCount": 0}
+    assert "sourceServiceRevisions" not in detail
+
+
+def test_ecs_describe_service_deployments_errors(ecs, deployment_service):
+    name, _ = deployment_service
+    arn = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]["serviceDeploymentArn"]
+    unknown = arn.rsplit("/", 1)[0] + "/doesnotexist"
+    for arns, message in (
+        ([unknown], "The ServiceDeployment ARN is invalid."),
+        ([arn, unknown], "The ServiceDeployment ARN is invalid."),  # one unknown fails the whole call
+        (["not-an-arn"], "The Service ARN provided is invalid."),
+        ([], "The Service ARN provided is invalid."),
+    ):
+        with pytest.raises(ClientError) as exc:
+            ecs.describe_service_deployments(serviceDeploymentArns=arns)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == message
+
+
+def test_ecs_service_deployments_after_a_second_deployment(ecs, deployment_service):
+    name, service = deployment_service
+    first = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"][0]
+    ecs.update_service(cluster=name, service=name, forceNewDeployment=True)
+    briefs = ecs.list_service_deployments(cluster=name, service=name)["serviceDeployments"]
+    assert len(briefs) == 2
+    # Newest first; the replaced deployment stays listed and finished.
+    assert briefs[1] == first
+    newest = briefs[0]
+    assert newest["serviceDeploymentArn"] != first["serviceDeploymentArn"]
+    assert newest["targetServiceRevisionArn"] != first["targetServiceRevisionArn"]
+    details = ecs.describe_service_deployments(
+        serviceDeploymentArns=[b["serviceDeploymentArn"] for b in briefs])["serviceDeployments"]
+    assert [d["serviceDeploymentArn"] for d in details] == [b["serviceDeploymentArn"] for b in briefs]
+    assert details[0]["sourceServiceRevisions"][0]["arn"] == first["targetServiceRevisionArn"]
+    assert "sourceServiceRevisions" not in details[1]
