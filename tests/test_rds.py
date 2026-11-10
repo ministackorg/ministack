@@ -3064,6 +3064,12 @@ def test_rds_concurrent_cluster_instance_creates_start_one_shared_container(monk
             for mbr in m._clusters["concurrent-create-cluster"]["DBClusterMembers"]
         }
         assert members == set(ids)
+        writers = [
+            mbr["DBInstanceIdentifier"]
+            for mbr in m._clusters["concurrent-create-cluster"]["DBClusterMembers"]
+            if mbr["IsClusterWriter"]
+        ]
+        assert len(writers) == 1, writers
     finally:
         m._instances.clear()
         m._clusters.clear()
