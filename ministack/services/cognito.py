@@ -78,7 +78,7 @@ import threading
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, unquote, urlencode
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlencode
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
@@ -1347,6 +1347,25 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
 # attribute when AttributeMapping maps it explicitly.
 _FEDERATION_RESERVED_CLAIMS = frozenset(
     ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"))
+
+
+def _federation_attribute_value(value):
+    """An IdP claim as user attribute value, None when it can't be one.
+
+    "When IdP attributes contain multiple values, Amazon Cognito flattens all values into a
+    single comma-delimited string enclosed in the square-bracket characters [ and ]. Amazon
+    Cognito URL form-encodes the values containing non-alphanumeric characters except for
+    ., -, *, and _."
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-specifying-attribute-mapping.html)
+    """
+    if isinstance(value, list):
+        # quote_plus always keeps "~", which AWS encodes
+        return "[" + ", ".join(
+            quote_plus(str(v), safe=".-*_").replace("~", "%7E")
+            for v in value if isinstance(v, (str, int, float, bool))) + "]"
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return None
 
 
 def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
@@ -8543,8 +8562,9 @@ def _oauth2_idp_response(method, body, query_params):
                     claims.get("sub"), e)
         return error_response_json("UserLambdaValidationException", str(e), 400)
     idp_claims = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
-                  else {k: str(v) for k, v in claims.items()
-                        if k not in _FEDERATION_RESERVED_CLAIMS and isinstance(v, (str, int, float, bool))})
+                  else {k: flat for k, v in claims.items()
+                        if k not in _FEDERATION_RESERVED_CLAIMS
+                        and (flat := _federation_attribute_value(v)) is not None})
     user_attrs = {}
     for idp_claim, value in idp_claims.items():
         user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value

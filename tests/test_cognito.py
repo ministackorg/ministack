@@ -12806,6 +12806,22 @@ def _oidc_idpresponse(cid):
         return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
 
 
+def test_cognito_oidc_federation_flattens_multi_valued_claims(cognito_idp):
+    """A multi-valued IdP claim becomes "[a, b]", values URL form-encoded except for . - * _."""
+    token_url, _recorded, stop = _start_fake_oidc_idp(
+        {"sub": "oidc-roles", "roles": ["FOO_BAR", "Document.Read", "a b/c~"]})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url,
+                                    attribute_mapping={"custom:roles": "roles"})
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-roles")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert attrs["custom:roles"] == "[FOO_BAR, Document.Read, a+b%2Fc%7E]"
+    finally:
+        stop()
+
+
 def test_cognito_inbound_federation_trigger_failure_fails_oidc_sign_in(cognito_idp, lam):
     handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
     fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reject", handler)
