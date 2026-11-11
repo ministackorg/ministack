@@ -2263,6 +2263,18 @@ def test_ec2_aws_managed_prefix_list_filter_by_owner(ec2):
     assert len(result["PrefixLists"]) > 0
 
 
+def test_ec2_tag_filters_exclude_aws_managed_prefix_lists(ec2):
+    pl = ec2.create_managed_prefix_list(
+        PrefixListName="tagged-pl", MaxEntries=1, AddressFamily="IPv4",
+        TagSpecifications=[{"ResourceType": "prefix-list", "Tags": [{"Key": "team", "Value": "net"}]}],
+    )["PrefixList"]
+    try:
+        for f in ([{"Name": "tag:team", "Values": ["net"]}], [{"Name": "tag-key", "Values": ["team"]}]):
+            found = ec2.describe_managed_prefix_lists(Filters=f)["PrefixLists"]
+            assert [p["PrefixListId"] for p in found] == [pl["PrefixListId"]]
+    finally:
+        ec2.delete_managed_prefix_list(PrefixListId=pl["PrefixListId"])
+
 def test_ec2_aws_managed_prefix_list_get_entries(ec2):
     """GetManagedPrefixListEntries works for AWS-managed prefix lists."""
     # Get an AWS-managed prefix list ID
