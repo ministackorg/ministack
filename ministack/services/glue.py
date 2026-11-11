@@ -1437,14 +1437,73 @@ def _parse_partition_value(raw, col_type):
         # java.sql.Date is lenient: 2024-02-31 rolls over into March.
         return datetime.date(int(m[1]), int(m[2]), 1) + datetime.timedelta(days=int(m[3]) - 1)
     if col_type == "timestamp":
-        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{1,2}):(\d{1,2})(?:\.(\d{1,9}))?", raw)
-        if not m or not 1 <= int(m[2]) <= 12 or not 1 <= int(m[3]) <= 31:
+        try:
+            return _java_timestamp(raw)
+        except _JavaNumberFormatError as e:
+            raise _PartitionFilterError(f"{prefix}{e} {raw} is not a timestamp.")
+        except (ValueError, OverflowError):
             raise _PartitionFilterError(
                 f"{prefix}Timestamp format must be yyyy-mm-dd hh:mm:ss[.fffffffff] {raw} is not a timestamp.")
-        start = datetime.datetime(int(m[1]), int(m[2]), 1)
-        offset = datetime.timedelta(days=int(m[3]) - 1, hours=int(m[4]), minutes=int(m[5]), seconds=int(m[6]))
-        return start + offset, int((m[7] or "").ljust(9, "0"))
     return raw
+
+
+class _JavaNumberFormatError(Exception):
+    pass
+
+
+def _java_parse_int(s, begin, end):
+    """Integer.parseInt(s, begin, end, 10), raising its NumberFormatException message."""
+    def fail(i):
+        return _JavaNumberFormatError(f'Error at index {i - begin} in: "{s[begin:end]}"')
+    if begin == end:
+        raise _JavaNumberFormatError("")
+    i, negative = begin, False
+    if s[i] < "0":
+        if s[i] not in "+-":
+            raise fail(i)
+        negative = s[i] == "-"
+        i += 1
+        if i == end:
+            raise fail(i)
+    limit, result = 2**31 if negative else 2**31 - 1, 0
+    while i < end:
+        if not "0" <= s[i] <= "9":
+            raise fail(i)
+        result = result * 10 + int(s[i])
+        if result > limit:
+            raise fail(i)
+        i += 1
+    return -result if negative else result
+
+
+def _java_timestamp(raw):
+    """java.sql.Timestamp.valueOf, which Glue applies to timestamp keys; ValueError means its format error."""
+    s = raw.strip("".join(map(chr, range(33))))
+    space = s.find(" ")
+    dash1 = s.find("-")
+    dash2 = s.find("-", dash1 + 1)
+    colon1 = s.find(":", space + 1)
+    colon2 = s.find(":", colon1 + 1)
+    period = s.find(".", colon2 + 1)
+    if space < 0 or not (dash1 == 4 and 1 < dash2 - dash1 <= 3 and 1 < space - dash2 <= 3):
+        raise ValueError
+    year, month, day = _java_parse_int(s, 0, dash1), _java_parse_int(s, dash1 + 1, dash2), _java_parse_int(s, dash2 + 1, space)
+    if not (1 <= month <= 12 and 1 <= day <= 31) or not (colon1 > 0 and colon2 > 0 and colon2 < len(s) - 1):
+        raise ValueError
+    hour, minute, nanos = _java_parse_int(s, space + 1, colon1), _java_parse_int(s, colon1 + 1, colon2), 0
+    if 0 < period < len(s) - 1:
+        second = _java_parse_int(s, colon2 + 1, period)
+        digits = len(s) - period - 1
+        if digits > 9 or not "0" <= s[period + 1] <= "9":
+            raise ValueError
+        nanos = _java_parse_int(s, period + 1, len(s)) * 10 ** (9 - digits)
+    elif period > 0:
+        raise ValueError
+    else:
+        second = _java_parse_int(s, colon2 + 1, len(s))
+    # Lenient like java.sql.Timestamp: 2024-01-14 25:02:03 rolls over into the 15th.
+    start = datetime.datetime(year, month, 1)
+    return start + datetime.timedelta(days=day - 1, hours=hour, minutes=minute, seconds=second), nanos
 
 
 def _tokenize_partition_filter(expr):
@@ -1643,6 +1702,8 @@ def _get_partitions(data):
             "Member must have value less than or equal to 1000",
             400,
         )
+    if max_results is not None and max_results <= 0:
+        return error_response_json("InvalidInputException", "MaxItems has to be a positive number", 400)
     segment = data.get("Segment") or {}
     number, total = segment.get("SegmentNumber", 0), segment.get("TotalSegments", 1)
     if total > 10:
@@ -1652,6 +1713,8 @@ def _get_partitions(data):
             "Member must have value less than or equal to 10",
             400,
         )
+    if number < 0:
+        return error_response_json("InvalidInputException", "Segment number should be a non-negative integer.", 400)
     if number >= total:
         return error_response_json("InvalidInputException", "Segment number should be less than total segments.", 400)
     err = _partition_table_error(db_name, table_name)
@@ -1659,18 +1722,18 @@ def _get_partitions(data):
         return err
 
     expression = data.get("Expression")
+    parts = _partitions.get(key, [])
+    parts = parts[number * len(parts) // total:(number + 1) * len(parts) // total]
     try:
         matches = _compile_partition_filter(expression, _tables[key].get("PartitionKeys") or []) if expression else None
         start = _partition_token_offset(data.get("NextToken"), key)
+        # MaxResults bounds the partitions scanned, not the matches: filtered pages can be short or empty.
+        window = parts[start:start + (max_results or _DEFAULT_PARTITION_PAGE_SIZE)]
+        page = [p for p in window if matches is None or matches(p.get("Values") or [])]
     except _PartitionFilterError as e:
         return error_response_json("InvalidInputException", str(e), 400)
-
-    parts = _partitions.get(key, [])
-    parts = parts[number * len(parts) // total:(number + 1) * len(parts) // total]
-    # MaxResults bounds the partitions scanned, not the matches: filtered pages can be short or empty.
-    # ponytail: offset token; partitions deleted between pages shift later pages.
-    window = parts[start:start + (max_results or _DEFAULT_PARTITION_PAGE_SIZE)]
-    page = [p for p in window if matches is None or matches(p.get("Values") or [])]
+    except RecursionError:
+        return error_response_json("OperationTimeoutException", "Operation timed out", 400)
     if data.get("ExcludeColumnSchema"):
         page = [{**p, "StorageDescriptor": {**p["StorageDescriptor"], "Columns": []}} if "StorageDescriptor" in p else p
                 for p in page]
@@ -1880,7 +1943,7 @@ def _get_column_statistics_for_table(data):
     errors = []
     for col in data.get("ColumnNames", []):
         if col in bucket:
-            stats_list.append(bucket[col])
+            stats_list.append(_column_statistics_out(bucket[col]))
         else:
             errors.append(
                 {
@@ -1892,6 +1955,12 @@ def _get_column_statistics_for_table(data):
                 }
             )
     return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _column_statistics_out(cs):
+    if isinstance(cs.get("AnalyzedTime"), float):
+        return {**cs, "AnalyzedTime": int(cs["AnalyzedTime"])}
+    return cs
 
 
 def _delete_column_statistics_for_table(data):
@@ -1948,14 +2017,14 @@ def _get_column_statistics_for_partition(data):
     errors = []
     for col in data.get("ColumnNames", []):
         if col in bucket:
-            stats_list.append(bucket[col])
+            stats_list.append(_column_statistics_out(bucket[col]))
         else:
             errors.append(
                 {
                     "ColumnName": col,
                     "Error": {
                         "ErrorCode": "EntityNotFoundException",
-                        "ErrorMessage": f"Column statistics for {col} not found",
+                        "ErrorMessage": "Statistics do not exist for this column",
                     },
                 }
             )

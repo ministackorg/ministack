@@ -12806,6 +12806,42 @@ def _oidc_idpresponse(cid):
         return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
 
 
+def test_cognito_oidc_federation_mapped_claim_values(cognito_idp):
+    """Mapped claim values as captured from Cognito: compact JSON, or "[a, b]" with escapes when an element needs them."""
+    expected = {
+        "roles": (["FOO_BAR", "Document.Read", "a b", "c~d", "e/f", "g+h", "x,y", "[z]", "ü", "a*b", "1-2", "%"],
+                  "[FOO_BAR, Document.Read, a b, c%7Ed, e%2Ff, g%2Bh, x%2Cy, %5Bz%5D, %C3%BC, a*b, 1-2, %25]"),
+        "mixed": (["a", 1, None, {"k": "v"}, ["n"]], "[a, 1, null, %7B%22k%22%3A%22v%22%7D, %5B%22n%22%5D]"),
+        "nested": ([["x", "y"], "a"], "[%5B%22x%22%2C%22y%22%5D, a]"),
+        "objone": ([{"k": "v"}], "[%7B%22k%22%3A%22v%22%7D]"),
+        "plain": (["a", 1, 2.5, True, False], '["a",1,2.5,true,false]'),
+        "nums": ([1.0, 2], "[1.0,2]"),
+        "spaced": (["a", " b "], '["a"," b "]'),
+        "withnull": ([None, "a"], '[null,"a"]'),
+        "one": (["solo"], '["solo"]'),
+        "blank": ([""], '[""]'),
+        "empty": ([], "[]"),
+        "single": ("a b/c~d", "a b/c~d"),
+        "flag": (True, "true"),
+        "count": (42, "42"),
+        "ratio": (2.5, "2.5"),
+        "obj": ({"k": "v"}, '{"k":"v"}'),
+    }
+    claims = {"sub": "oidc-flat", "gone": None, "amr": ["pwd", "mfa"], **{k: v for k, (v, _) in expected.items()}}
+    token_url, _recorded, stop = _start_fake_oidc_idp(claims)
+    try:
+        mapping = {f"custom:{k}": k for k in [*expected, "gone"]}
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, attribute_mapping=mapping)
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-flat")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert {k[7:]: v for k, v in attrs.items() if k.startswith("custom:")} == {k: s for k, (_, s) in expected.items()}
+        assert "amr" not in attrs
+    finally:
+        stop()
+
+
 def test_cognito_inbound_federation_trigger_failure_fails_oidc_sign_in(cognito_idp, lam):
     handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
     fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reject", handler)

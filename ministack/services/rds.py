@@ -5057,10 +5057,7 @@ def _create_db_instance(p):
     if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
         return switch_error
     try:
-        # Handlers run on worker threads, so two creates into one cluster
-        # (Terraform's count = 2) can interleave and both start its shared
-        # container. Serialise creates per cluster so the second sees the
-        # first as a member, as when the calls arrive apart.
+        # Handlers run on worker threads; serialise creates per cluster.
         lock = resource_lock(
             "rds-cluster-create",
             f"{get_account_id()}/{get_region()}/{cluster['DBClusterIdentifier']}",

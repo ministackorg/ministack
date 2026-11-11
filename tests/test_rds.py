@@ -2958,11 +2958,7 @@ def test_rds_last_member_delete_wins_after_readiness_epoch_check(monkeypatch):
 
 
 def test_rds_concurrent_cluster_instance_creates_start_one_shared_container(monkeypatch):
-    """Two CreateDBInstance calls into one new Aurora cluster, sent at once (as
-    Terraform does for `count = 2`), start the cluster's container once and
-    neither instance reports `failed`. MiniStack contract: before the fix both
-    calls started the container under the same name, and the one that lost
-    Docker's name conflict was `failed` until the other's container was ready."""
+    """Two concurrent CreateDBInstance calls into one new cluster start its container once; neither is `failed`."""
     import threading
 
     from ministack.services import rds as m
@@ -2995,8 +2991,7 @@ def test_rds_concurrent_cluster_instance_creates_start_one_shared_container(monk
                     '409 Client Error: Conflict ("The container name "/%s" is already in use")'
                     % kwargs["name"],
                 )
-            # Hold the first start long enough for an unserialised second
-            # create to reach Docker too.
+            # Let an unserialised second create reach Docker too.
             second_run.wait(timeout=0.5)
             return container
 
@@ -3018,9 +3013,7 @@ def test_rds_concurrent_cluster_instance_creates_start_one_shared_container(monk
     register = m._register_instance_in_cluster
 
     def _slow_register(instance):
-        # Widen the gap between the container start and member registration,
-        # where a second create would see a started container with no members
-        # and restart it as if an empty cluster were growing.
+        # Widen the start-to-registration gap a second create could restart in.
         time.sleep(0.2)
         register(instance)
 

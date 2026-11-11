@@ -3234,6 +3234,17 @@ def test_glue_table_optimizer_role_needs_table_and_s3_access(auth_enabled, glue,
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def partition_db(glue):
+    """A fresh database per test, dropped (with its tables) even when the test fails."""
+    name = f"qa-part-{os.urandom(4).hex()}"
+    yield name
+    try:
+        glue.delete_database(Name=name)
+    except ClientError:
+        pass
+
+
 def _partitioned_table(glue, db, tbl, keys):
     try:
         glue.create_database(DatabaseInput={"Name": db})
@@ -3259,8 +3270,8 @@ def _add_partitions(glue, db, tbl, value_lists):
         assert resp["Errors"] == []
 
 
-def test_glue_batch_delete_partition(glue):
-    db, tbl = "qa-bdp-db", "qa-bdp-tbl"
+def test_glue_batch_delete_partition(glue, partition_db):
+    db, tbl = partition_db, "qa-bdp-tbl"
     _partitioned_table(glue, db, tbl, [("dt", "string")])
     _add_partitions(glue, db, tbl, [["a"], ["b"], ["c"]])
     glue.update_column_statistics_for_partition(
@@ -3318,12 +3329,10 @@ def test_glue_batch_delete_partition(glue):
         glue.batch_delete_partition(DatabaseName="no-such-db", TableName=tbl, PartitionsToDelete=[{"Values": ["c"]}])
     assert exc.value.response["Error"]["Message"] == "Database no-such-db not found."
 
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_expression(glue):
-    db, tbl = "qa-gpe-db", "qa-gpe-tbl"
+def test_glue_get_partitions_expression(glue, partition_db):
+    db, tbl = partition_db, "qa-gpe-tbl"
     _partitioned_table(glue, db, tbl, [("tenant", "string"), ("region", "string"), ("dt", "string"),
                                        ("kind", "string"), ("shard", "string")])
     rows = [
@@ -3372,12 +3381,10 @@ def test_glue_get_partitions_expression(glue):
     assert matching("((region = 'us') OR (region = '__HIVE_DEFAULT_PARTITION__'))") == [0, 1, 3]
     assert matching("(kind <> '__HIVE_DEFAULT_PARTITION__')") == [0, 1, 2, 3, 4, 5]
 
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_expression_numeric_keys(glue):
-    db, tbl = "qa-gpn-db", "qa-gpn-tbl"
+def test_glue_get_partitions_expression_numeric_keys(glue, partition_db):
+    db, tbl = partition_db, "qa-gpn-tbl"
     _partitioned_table(glue, db, tbl, [("year", "int"), ("id", "bigint")])
     _add_partitions(glue, db, tbl, [["9", "100"], ["10", "20"], ["2024", "3"]])
 
@@ -3405,12 +3412,10 @@ def test_glue_get_partitions_expression_numeric_keys(glue):
         glue.get_partitions(DatabaseName=db, TableName=tbl, Expression="year LIKE '20%'")
     assert exc.value.response["Error"]["Message"] == "Invalid partition expression!"
 
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_bad_expression(glue):
-    db, tbl = "qa-gpb-db", "qa-gpb-tbl"
+def test_glue_get_partitions_bad_expression(glue, partition_db):
+    db, tbl = partition_db, "qa-gpb-tbl"
     _partitioned_table(glue, db, tbl, [("tenant", "string")])
     for expr in ["tenant = ", "tenant = 't1' AND", "(tenant = 't1'", "nosuchcol = 'x'", "tenant === 't1'",
                  "tenant IN ()", "garbage", "tenant", "'t1' = tenant", "\"tenant\" = 't1'", "tenant = \"t1\"",
@@ -3423,12 +3428,10 @@ def test_glue_get_partitions_bad_expression(glue):
     with pytest.raises(ClientError) as exc:
         glue.get_partitions(DatabaseName=db, TableName="no-such-tbl", Expression="tenant = 't1'")
     assert exc.value.response["Error"] == {"Code": "EntityNotFoundException", "Message": "Table no-such-tbl not found."}
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_paging_and_segments(glue):
-    db, tbl = "qa-gpp-db", "qa-gpp-tbl"
+def test_glue_get_partitions_paging_and_segments(glue, partition_db):
+    db, tbl = partition_db, "qa-gpp-tbl"
     _partitioned_table(glue, db, tbl, [("n", "string")])
     _add_partitions(glue, db, tbl, [[f"{i:03d}"] for i in range(250)])
 
@@ -3470,12 +3473,10 @@ def test_glue_get_partitions_paging_and_segments(glue):
         "constraint: Member must have value less than or equal to 1000")
     assert error(NextToken="garbage") == ("InvalidInputException", "Invalid token value")
 
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_expression_parsing_quirks(glue):
-    db, tbl = "qa-gpq-db", "qa-gpq-tbl"
+def test_glue_get_partitions_expression_parsing_quirks(glue, partition_db):
+    db, tbl = partition_db, "qa-gpq-tbl"
     _partitioned_table(glue, db, tbl, [("tenant", "string"), ("shard", "string")])
     rows = [["t1", "0"], ["T1", "1"], ["t2", "2"], ["a.b", "10"], ["a%b", "9"], ["t1x", "20"], ["a\\b", "10.0"]]
     _add_partitions(glue, db, tbl, rows)
@@ -3518,12 +3519,10 @@ def test_glue_get_partitions_expression_parsing_quirks(glue):
             "Code": "InvalidInputException", "Message": "Invalid partition expression!"
         }, expr
 
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_expression_key_types(glue):
-    db = "qa-gpt-db"
+def test_glue_get_partitions_expression_key_types(glue, partition_db):
+    db = partition_db
     prefix = "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: "
     cases = {
         "int": (["9", "10", "2024"], {
@@ -3579,12 +3578,10 @@ def test_glue_get_partitions_expression_key_types(glue):
     with pytest.raises(ClientError) as exc:
         glue.get_partitions(DatabaseName=db, TableName="mixed", Expression="a = 'x'")
     assert exc.value.response["Error"]["Message"] == "Invalid partition expression!"
-    glue.delete_table(DatabaseName=db, Name="mixed")
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_scan_window_and_tokens(glue):
-    db, tbl, other = "qa-gpw-db", "qa-gpw-tbl", "qa-gpw-other"
+def test_glue_get_partitions_scan_window_and_tokens(glue, partition_db):
+    db, tbl, other = partition_db, "qa-gpw-tbl", "qa-gpw-other"
     _partitioned_table(glue, db, tbl, [("n", "string")])
     _partitioned_table(glue, db, other, [("n", "string")])
     _add_partitions(glue, db, tbl, [[f"{i:03d}"] for i in range(600)])
@@ -3629,13 +3626,10 @@ def test_glue_get_partitions_scan_window_and_tokens(glue):
         glue.get_partitions(DatabaseName=db, TableName=tbl, Expression="garbage", NextToken="x")
     assert exc.value.response["Error"]["Message"] == "Invalid partition expression!"
 
-    for name in (tbl, other):
-        glue.delete_table(DatabaseName=db, Name=name)
-    glue.delete_database(Name=db)
 
 
-def test_glue_get_partitions_exclude_column_schema(glue):
-    db, tbl = "qa-gpx-db", "qa-gpx-tbl"
+def test_glue_get_partitions_exclude_column_schema(glue, partition_db):
+    db, tbl = partition_db, "qa-gpx-tbl"
     _partitioned_table(glue, db, tbl, [("n", "string")])
     glue.create_partition(DatabaseName=db, TableName=tbl, PartitionInput={
         "Values": ["a"], "StorageDescriptor": {"Columns": [{"Name": "c", "Type": "string"}], "Location": "s3://b/a"}})
@@ -3643,12 +3637,10 @@ def test_glue_get_partitions_exclude_column_schema(glue):
     assert full["StorageDescriptor"]["Columns"] == [{"Name": "c", "Type": "string"}]
     lean = glue.get_partitions(DatabaseName=db, TableName=tbl, ExcludeColumnSchema=True)["Partitions"][0]
     assert lean["StorageDescriptor"] == {**full["StorageDescriptor"], "Columns": []}
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
 
 
-def test_glue_delete_partition_errors(glue):
-    db, tbl = "qa-dpe-db", "qa-dpe-tbl"
+def test_glue_delete_partition_errors(glue, partition_db):
+    db, tbl = partition_db, "qa-dpe-tbl"
     _partitioned_table(glue, db, tbl, [("n", "string")])
     _add_partitions(glue, db, tbl, [["a"]])
 
@@ -3663,5 +3655,59 @@ def test_glue_delete_partition_errors(glue):
         "Code": "EntityNotFoundException", "Message": "Database qa-dpe-nope not found."}
     glue.delete_partition(DatabaseName=db, TableName=tbl, PartitionValues=["a"])
     assert error() == {"Code": "EntityNotFoundException", "Message": "Partition not found"}
-    glue.delete_table(DatabaseName=db, Name=tbl)
-    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_java_timestamp_and_limits(glue, partition_db):
+    db, tbl = partition_db, "qa-gpj-tbl"
+    prefix = "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: "
+    _partitioned_table(glue, db, tbl, [("k", "timestamp")])
+    _add_partitions(glue, db, tbl, [["2024-01-15 01:02:03"]])
+
+    unchecked = boto3.client("glue", endpoint_url=glue.meta.endpoint_url, region_name="us-east-1",
+                             aws_access_key_id="test", aws_secret_access_key="test",
+                             config=Config(parameter_validation=False))
+
+    def call(**kwargs):
+        try:
+            return [p["Values"][0] for p in unchecked.get_partitions(DatabaseName=db, TableName=tbl, **kwargs)["Partitions"]]
+        except ClientError as e:
+            return e.response["Error"]
+
+    hit = ["2024-01-15 01:02:03"]
+    assert call(Expression="k = ' 2024-01-15 01:02:03 '") == hit
+    assert call(Expression="k = '2024-01-15 1:2:3'") == hit
+    assert call(Expression="k = '2024-01-15 001:002:003'") == hit
+    assert call(Expression="k = '2024-01-14 25:02:03'") == hit
+    assert call(Expression="k = '2024-01-15 01:02:03.5'") == []
+    assert call(Expression="k = '2024-01-15 aa:02:03'") == {"Code": "InvalidInputException", "Message":
+        prefix + 'Error at index 0 in: "aa" 2024-01-15 aa:02:03 is not a timestamp.'}
+    assert call(Expression="k = '2024-01-15 01:02:03.1234567891'") == {"Code": "InvalidInputException", "Message":
+        prefix + "Timestamp format must be yyyy-mm-dd hh:mm:ss[.fffffffff] 2024-01-15 01:02:03.1234567891 is not a timestamp."}
+
+    assert call(Expression="(" * 500 + "k = '2024-01-15 01:02:03'" + ")" * 500) == {
+        "Code": "OperationTimeoutException", "Message": "Operation timed out"}
+    assert call(MaxResults=0) == {"Code": "InvalidInputException", "Message": "MaxItems has to be a positive number"}
+    assert call(Segment={"SegmentNumber": -1, "TotalSegments": 2}) == {
+        "Code": "InvalidInputException", "Message": "Segment number should be a non-negative integer."}
+
+
+def test_glue_column_statistics_for_partition_missing_and_int_time(glue, partition_db):
+    db, tbl = partition_db, "qa-csi-tbl"
+    _partitioned_table(glue, db, tbl, [("dt", "string")])
+    _add_partitions(glue, db, tbl, [["a"]])
+    glue.update_column_statistics_for_partition(
+        DatabaseName=db, TableName=tbl, PartitionValues=["a"],
+        ColumnStatisticsList=[{
+            "ColumnName": "x", "ColumnType": "bigint", "AnalyzedTime": 1700000000.75,
+            "StatisticsData": {"Type": "LONG", "LongColumnStatisticsData": {"NumberOfNulls": 0, "NumberOfDistinctValues": 1}},
+        }],
+    )
+    raw = boto3.client("glue", endpoint_url=glue.meta.endpoint_url, region_name="us-east-1",
+                       aws_access_key_id="test", aws_secret_access_key="test")
+    raw.meta.events.register("after-call.glue.GetColumnStatisticsForPartition",
+                             lambda http_response, parsed, **_: parsed.update(body=json.loads(http_response.content)))
+    resp = raw.get_column_statistics_for_partition(DatabaseName=db, TableName=tbl, PartitionValues=["a"],
+                                                   ColumnNames=["x", "y"])
+    assert resp["body"]["ColumnStatisticsList"][0]["AnalyzedTime"] == 1700000000
+    assert resp["body"]["Errors"] == [{"ColumnName": "y", "Error": {
+        "ErrorCode": "EntityNotFoundException", "ErrorMessage": "Statistics do not exist for this column"}}]
