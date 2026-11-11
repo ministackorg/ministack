@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Persistence — state lost to a kill that skips shutdown** — with `PERSIST_STATE=1`, state was written only in the shutdown handler, so `docker kill`, the out-of-memory killer, a Kubernetes eviction past its grace period or a host losing power took every queue, table, role and key with it (S3 objects, written as they arrive with `S3_PERSIST=1`, were kept). State is now also saved every `PERSIST_INTERVAL` seconds (default 20) while the server runs; `0` keeps the shutdown save only. Contributed by @bryanhelmig.
+
 ## [1.5.40] — 2026-11-11
 
 ### Added
