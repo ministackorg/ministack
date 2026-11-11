@@ -2,8 +2,9 @@
 # Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 State persistence for MiniStack services.
-When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown
-and reloaded on startup.
+When PERSIST_STATE=1, service state is saved to STATE_DIR every
+PERSIST_INTERVAL seconds while the server runs and again on shutdown, and
+reloaded on startup.
 """
 
 import ast
@@ -17,6 +18,10 @@ logger = logging.getLogger("persistence")
 
 PERSIST_STATE = os.environ.get("PERSIST_STATE", "0") == "1"
 STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
+# The shutdown save alone loses everything to a kill that skips shutdown (SIGKILL,
+# the OOM killer, an eviction past its grace period, power loss), so state is also
+# written on this timer. 0 turns the timer off and keeps only the shutdown save.
+PERSIST_INTERVAL = float(os.environ.get("PERSIST_INTERVAL", "20"))
 
 # On-disk state format versions. Files are wrapped as
 #   {"__ministack_format__": N, "payload": <service state>}

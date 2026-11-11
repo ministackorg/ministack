@@ -230,7 +230,7 @@ from ministack.core.iam_evaluator import (
     pin_signed_body,
     pin_signed_request,
 )
-from ministack.core.persistence import PERSIST_STATE, load_state, save_all
+from ministack.core.persistence import PERSIST_INTERVAL, PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
     _request_account_id,
@@ -3768,6 +3768,8 @@ async def _handle_lifespan(scope, receive, send):
             for svc in SERVICE_HANDLERS:
                 logger.debug("%s init completed.", svc.capitalize())
             asyncio.create_task(_run_ready_scripts())
+            if PERSIST_STATE and PERSIST_INTERVAL > 0:
+                asyncio.create_task(_save_state_periodically())
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
@@ -3841,6 +3843,24 @@ def _stop_docker_containers(include_unlabelled: bool = False):
     for service, flag in (("rds", "RDS_PERSIST"), ("mwaa", "MWAA_PERSIST"), ("dsql", "DSQL_PERSIST")):
         if os.environ.get(flag, "0").lower() not in ("1", "true", "yes"):
             container_reaper.reap_volumes(client, service)
+
+
+async def _save_state_periodically():
+    """Write all service state to STATE_DIR every PERSIST_INTERVAL seconds.
+
+    The shutdown save covers a clean stop only. A kill that skips shutdown runs
+    no handler, so without this every resource that lives only in memory is lost.
+    It runs on the event loop, like the shutdown save, so handlers on the loop are
+    never seen half applied. A service whose state a worker thread changes during
+    the write is skipped for that round (save_state logs it) and written on the
+    next one; each file is written whole and renamed into place.
+    """
+    while True:
+        await asyncio.sleep(PERSIST_INTERVAL)
+        try:
+            save_all(_build_persistence_save_dict())
+        except Exception as e:
+            logger.error("Persistence: periodic save failed: %s", e)
 
 
 def _build_persistence_save_dict():

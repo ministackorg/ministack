@@ -932,6 +932,7 @@ When Docker is available, `StartApplication` for a `FLINK-1_19` or `FLINK-1_20` 
 | `MINISTACK_OPENSEARCH_ENDPOINT` | _(unset)_ | If set (e.g. `localhost:9200`), every domain returns this endpoint instead of spawning a per-domain container — useful when you bring your own cluster |
 | `PERSIST_STATE` | `0` | Set `1` to persist service state across restarts |
 | `STATE_DIR` | `/tmp/ministack-state` | Directory for persisted state files |
+| `PERSIST_INTERVAL` | `20` | With `PERSIST_STATE=1`, seconds between saves while the server runs, so a kill that skips shutdown loses at most this much; `0` saves on shutdown only |
 | `LAMBDA_EXECUTOR` | `local` | Lambda execution mode: `local` (subprocess, including `provided.*`) or `docker` (container). `PackageType: Image` always uses Docker |
 | `LAMBDA_STRICT` | `0` | Set `1` for AWS-fidelity mode: every Lambda invocation runs in a Docker container via the AWS RIE image; in-process fallbacks are disabled. Missing Docker surfaces as `Runtime.DockerUnavailable` instead of degrading to a subprocess. Opt-in because the default install doesn't require Docker |
 | `LAMBDA_DOCKER_NETWORK` | _(unset)_ | Legacy alias for `DOCKER_NETWORK` (Lambda only). Prefer `DOCKER_NETWORK` which covers all services |
@@ -1046,7 +1047,7 @@ Install DuckDB for full Athena SQL compatibility: `pip install ministack[full]`.
 
 ### State Persistence
 
-When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` on shutdown and reloads it on startup. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
+When `PERSIST_STATE=1`, MiniStack saves service state to `STATE_DIR` every `PERSIST_INTERVAL` seconds (default 20) and on shutdown, and reloads it on startup. The timed save is what survives a kill that skips shutdown, such as `docker kill`, the out-of-memory killer, or a Kubernetes eviction past its grace period. Writes are atomic (write-to-tmp then rename) to prevent corruption on crash.
 
 Services currently supporting persistence: **All services** — API Gateway v1/v2, ALB, ACM, AppConfig, AppSync, Athena, Aurora DSQL, Bedrock, Cloud Map, CloudFront, CloudWatch, CloudWatch Logs, CodeBuild, Cognito, DynamoDB, EC2, ECR, ECS, EFS, EKS, ElastiCache, EMR, EventBridge, EventBridge Scheduler, Firehose, Glue, IAM/STS, Kinesis, KMS, Lambda, MSK, RDS, Route 53, S3, Secrets Manager, SES, SES v2, SNS, SQS, SSM, Step Functions, Transfer Family, WAF v2
 
