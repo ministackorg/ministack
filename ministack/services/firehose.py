@@ -10,9 +10,11 @@ Supports:
   TagDeliveryStream, UntagDeliveryStream, ListTagsForDeliveryStream,
   StartDeliveryStreamEncryption, StopDeliveryStreamEncryption.
 
-Destinations supported: ExtendedS3, S3 (deprecated alias), HttpEndpoint.
+Destinations supported: ExtendedS3, S3 (deprecated alias), HttpEndpoint, Iceberg.
 Records put to an S3 destination are written synchronously to the local S3
-emulator (bucket must already exist).  All other destinations buffer records
+emulator (bucket must already exist).  Iceberg destinations on the Glue Data
+Catalog are buffered and committed by ``firehose_iceberg``; S3 Tables ones are
+written per record through DuckDB.  All other destinations buffer records
 in-memory (accessible for testing via PutRecord/PutRecordBatch round-trip).
 """
 
@@ -36,7 +38,10 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_epoch,
+    set_request_account_id,
+    set_request_region,
 )
+from ministack.services import firehose_iceberg
 
 logger = logging.getLogger("firehose")
 
@@ -57,6 +62,8 @@ def reset():
     with _lock:
         _streams.clear()
         _dest_counter = 0
+    with _iceberg_buffers_lock:
+        _iceberg_buffers.clear()
 
 
 def get_state() -> dict:
@@ -211,7 +218,8 @@ def _dest_description(dest: dict) -> dict:
         out["HttpEndpointDestinationDescription"] = desc
     elif dtype == "Iceberg":
         cfg = dest["config"]
-        desc = {k: v for k, v in cfg.items() if k != "S3Configuration"}
+        desc = {"AppendOnly": False, "RetryOptions": {"DurationInSeconds": 300},
+                **{k: v for k, v in cfg.items() if k != "S3Configuration"}}
         if "S3Configuration" in cfg:
             desc["S3DestinationDescription"] = _s3_dest_description(cfg["S3Configuration"])
         out["IcebergDestinationDescription"] = desc
@@ -1003,6 +1011,164 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
         _deliver_iceberg_groups()
 
 
+# ─── Iceberg on the Glue Data Catalog: buffered delivery ──────────────────────
+# Records wait in a per-destination buffer until BufferingHints.IntervalInSeconds has passed since the oldest
+# one arrived, or SizeInMBs is reached; IntervalInSeconds 0 delivers before PutRecord/PutRecordBatch returns.
+# The whole buffer is one commit and leaves the buffer only once committed, so a failed commit is retried and
+# no later record can be committed before it. Buffers live in memory only.
+
+_iceberg_buffers = {}  # (account, region, stream name, destination id) -> buffer
+_iceberg_buffers_lock = threading.Lock()
+_iceberg_flusher_started = False
+_ICEBERG_TICK_SECONDS = 0.2
+_ICEBERG_RETRY_SECONDS = 5
+
+
+def _is_glue_iceberg(dest: dict) -> bool:
+    arn = ((dest.get("config") or {}).get("CatalogConfiguration") or {}).get("CatalogARN", "")
+    return dest.get("type") == "Iceberg" and arn.startswith("arn:aws:glue:") and arn.endswith(":catalog")
+
+
+def _buffer_for_iceberg(stream: dict, dest: dict, record_id: str, raw: bytes):
+    """Append one record to the destination's buffer; returns the buffer key if it is due right away."""
+    global _iceberg_flusher_started
+    key = (get_account_id(), get_region(), stream["name"], dest["id"])
+    with _iceberg_buffers_lock:
+        buf = _iceberg_buffers.setdefault(key, {"records": [], "bytes": 0, "retry_at": 0,
+                                                "deliver": threading.Lock()})
+        buf["records"].append((record_id, raw, int(time.time() * 1000)))
+        buf["bytes"] += len(raw)
+        start = not _iceberg_flusher_started
+        _iceberg_flusher_started = True
+    if start:
+        try:
+            spawn_background(_iceberg_flusher, thread_name="ministack-firehose-iceberg-flusher")
+        except RuntimeError:
+            with _iceberg_buffers_lock:
+                _iceberg_flusher_started = False
+            raise
+    hints = dest["config"].get("BufferingHints") or {}
+    return key if hints.get("IntervalInSeconds", 300) == 0 else None
+
+
+def _iceberg_flusher():
+    while True:
+        time.sleep(_ICEBERG_TICK_SECONDS)
+        with _iceberg_buffers_lock:
+            keys = list(_iceberg_buffers)
+        for key in keys:
+            try:
+                _deliver_iceberg_buffer(key, wait=False)
+            except Exception:
+                logger.exception("Firehose Iceberg flusher failed for %s", key[2])
+
+
+def _deliver_iceberg_buffer(key, wait: bool):
+    account, region, name, dest_id = key
+    with _iceberg_buffers_lock:
+        buf = _iceberg_buffers.get(key)
+    if buf is None or not buf["deliver"].acquire(blocking=wait):
+        return
+    try:
+        set_request_account_id(account)
+        set_request_region(region)
+        stream = _streams.get_scoped(account, region, name)
+        dest = next((d for d in (stream or {}).get("destinations", []) if d["id"] == dest_id), None)
+        if dest is None or not _is_glue_iceberg(dest):
+            with _iceberg_buffers_lock:
+                _iceberg_buffers.pop(key, None)
+            return
+        now_ms = int(time.time() * 1000)
+        with _iceberg_buffers_lock:
+            batch = list(buf["records"])
+        hints = dest["config"].get("BufferingHints") or {}
+        due = batch and (now_ms - batch[0][2] >= hints.get("IntervalInSeconds", 300) * 1000
+                         or buf["bytes"] >= hints.get("SizeInMBs", 5) * 1024 * 1024)
+        if not due or (not wait and now_ms < buf["retry_at"]):
+            return
+        try:
+            outcome = _commit_glue_iceberg(stream, dest, batch)
+        except Exception as exc:
+            buf["retry_at"] = now_ms + _ICEBERG_RETRY_SECONDS * 1000
+            logger.warning("Firehose %s: Iceberg delivery failed, will retry: %s", name, exc)
+            return
+        with _iceberg_buffers_lock:
+            del buf["records"][:len(batch)]
+            buf["bytes"] -= sum(len(raw) for _, raw, _ in batch)
+            buf["retry_at"] = 0
+        try:
+            _after_glue_iceberg_commit(stream, dest, batch, *outcome)
+        except Exception:
+            logger.exception("Firehose %s: reporting a committed Iceberg delivery failed", name)
+    finally:
+        buf["deliver"].release()
+
+
+def _commit_glue_iceberg(stream: dict, dest: dict, batch: list):
+    """Commit ``batch`` [(recordId, raw, arrival ms)] to the destination table; raises if it must be retried.
+
+    Returns (database, table, committed row count, error-output documents)."""
+    cfg = dest["config"]
+    table_cfg = (cfg.get("DestinationTableConfigurationList") or [{}])[0]
+    database, table = table_cfg.get("DestinationDatabaseName"), table_cfg.get("DestinationTableName")
+    arrival = {rid: ms for rid, _, ms in batch}
+    processed = _apply_lambda_processors(stream, dest, [(rid, raw) for rid, raw, _ in batch])
+    metadata = json.loads(firehose_iceberg.s3_get(firehose_iceberg.glue_table(database, table)))
+    rows, failed = firehose_iceberg.prepare_rows(
+        metadata, [(raw, arrival.get(rid, batch[0][2])) for rid, raw in processed])
+    if rows:
+        checkpoint = dest.get("iceberg_checkpoint", 0) + 1
+        firehose_iceberg.append(database, table, rows, {
+            "FIREHOSE-DELIVERY-STREAM-ID": f"{get_account_id()}:{stream['name']}:{int(stream['created_at'] * 1000)}",
+            "FIREHOSE-INTERNAL-CHECKPOINT": f"{checkpoint:018d},,,{0:018d}",
+        })
+        with _lock:
+            dest["iceberg_checkpoint"] = checkpoint
+    return database, table, len(rows), failed
+
+
+def _after_glue_iceberg_commit(stream: dict, dest: dict, batch: list, database, table, row_count, failed):
+    if failed:
+        _write_iceberg_errors(stream, dest["config"], failed)
+    freshness = (time.time() * 1000 - batch[0][2]) / 1000
+    for dims in ({"DeliveryStreamName": stream["name"]},
+                 {"DeliveryStreamName": stream["name"], "IcebergTableName": f"{database}.{table}"}):
+        _record_firehose_metric("DeliveryToIceberg.DataFreshness", freshness, "Seconds", dims)
+        _record_firehose_metric("DeliveryToIceberg.SuccessfulRowCount", row_count, "Count", dims)
+        _record_firehose_metric("DeliveryToIceberg.FailedRowCount", len(failed), "Count", dims)
+
+
+def _record_firehose_metric(name, value, unit, dims):
+    from ministack.services import cloudwatch
+
+    cloudwatch.record_metric("AWS/Firehose", name, value, unit, dims)
+
+
+def _write_iceberg_errors(stream: dict, cfg: dict, documents: list):
+    s3_cfg = cfg.get("S3Configuration") or {}
+    try:
+        bucket = _s3_bucket_from_arn(s3_cfg.get("BucketARN", ""))
+        t = time.gmtime()
+        prefix = s3_cfg.get("ErrorOutputPrefix", "")
+        if "!{" in prefix:
+            prefix = _evaluate_prefix(prefix, t, error_type="iceberg-failed")
+        else:
+            prefix = f"{prefix}iceberg-failed/{_java_time('yyyy/MM/dd/HH/', t)}"
+        key = (f"{prefix}{stream['name']}-{stream.get('version', 1)}-"
+               f"{_java_time('yyyy-MM-dd-HH-mm-ss', t)}-{new_uuid()}")
+        body = "".join(json.dumps(d) + "\n" for d in documents).encode()
+        firehose_iceberg.s3_put(f"s3://{bucket}/{key}", body)
+    except Exception as exc:
+        logger.warning("Firehose %s: writing %d failed records to the error output failed: %s",
+                       stream["name"], len(documents), exc)
+
+
+def _drop_iceberg_buffers(name: str):
+    with _iceberg_buffers_lock:
+        for key in [k for k in _iceberg_buffers if k[:3] == (get_account_id(), get_region(), name)]:
+            del _iceberg_buffers[key]
+
+
 def _record_id() -> str:
     """Generate a Firehose-style RecordId (long numeric string)."""
     ts = int(time.time() * 1000)
@@ -1090,7 +1256,8 @@ def _create_delivery_stream(data: dict):
         # A stream with no destination is valid (destination added later via UpdateDestination)
         destinations = []
         if dtype and cfg is not None:
-            validation_error = _validate_s3_destination_config(dtype, cfg)
+            validation_error = (_validate_s3_destination_config(dtype, cfg)
+                                or _validate_iceberg_config(dtype, cfg, "icebergDestinationConfiguration"))
             if validation_error:
                 return validation_error
             destinations.append(
@@ -1161,6 +1328,7 @@ def _delete_delivery_stream(data: dict):
         if stream["status"] == "CREATING":
             return _in_use(name)
         del _streams[name]
+    _drop_iceberg_buffers(name)
     return json_response({})
 
 
@@ -1201,10 +1369,46 @@ def _list_delivery_streams(data: dict):
     )
 
 
+_MAX_RECORD_BYTES = 1024 * 1000
+_MAX_BATCH_BYTES = 4 * 1024 * 1024
+
+
+def _validation_error(path: str, constraint: str):
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value at '{path}' failed to satisfy constraint: Member must {constraint}",
+        400,
+    )
+
+
+def _accept_record(stream: dict, record_id: str, raw_data: str, decoded: bytes) -> list:
+    """Hand one record to every destination; returns the Iceberg buffers due for delivery right away."""
+    due = []
+    for dest in stream["destinations"]:
+        if _is_glue_iceberg(dest):
+            key = _buffer_for_iceberg(stream, dest, record_id, decoded)
+            if key and key not in due:
+                due.append(key)
+            continue
+        dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
+        if dest["type"] in ("ExtendedS3", "S3"):
+            _deliver_records_to_s3(stream, dest, [(record_id, decoded)])
+        elif dest["type"] == "Iceberg":
+            _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
+    return due
+
+
 def _put_record(data: dict):
     name = data.get("DeliveryStreamName", "")
     record = data.get("Record", {})
     raw_data = record.get("Data", "")
+
+    try:
+        decoded = base64.b64decode(raw_data)
+    except Exception:
+        return _invalid("Record.Data must be valid base64.")
+    if len(decoded) > _MAX_RECORD_BYTES:
+        return _validation_error("record.data", f"have length less than or equal to {_MAX_RECORD_BYTES}")
 
     with _lock:
         stream = _streams.get(name)
@@ -1212,23 +1416,11 @@ def _put_record(data: dict):
             return _not_found(name)
         if stream["status"] != "ACTIVE":
             return error_response_json("ServiceUnavailableException", "Service unavailable.", 500)
-
-        try:
-            decoded = base64.b64decode(raw_data)
-        except Exception:
-            return _invalid("Record.Data must be valid base64.")
-
-        if len(decoded) > 1024 * 1000:
-            return _invalid("Record size exceeds 1,000 KiB limit.")
-
         record_id = _record_id()
-        for dest in stream["destinations"]:
-            dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
-            if dest["type"] in ("ExtendedS3", "S3"):
-                _deliver_records_to_s3(stream, dest, [(record_id, decoded)])
-            elif dest["type"] == "Iceberg":
-                _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
+        due = _accept_record(stream, record_id, raw_data, decoded)
 
+    for key in due:
+        _deliver_iceberg_buffer(key, wait=True)
     return json_response({"RecordId": record_id, "Encrypted": False})
 
 
@@ -1239,8 +1431,21 @@ def _put_record_batch(data: dict):
     if not records:
         return _invalid("Records must not be empty.")
     if len(records) > 500:
-        return _invalid("A maximum of 500 records can be sent per batch.")
+        return _validation_error("records", "have length less than or equal to 500")
+    decoded_records = []
+    for index, rec in enumerate(records, start=1):
+        try:
+            decoded = base64.b64decode(rec.get("Data", ""))
+        except Exception:
+            decoded = None
+        if decoded is not None and len(decoded) > _MAX_RECORD_BYTES:
+            return _validation_error(f"records.{index}.member.data",
+                                     f"have length less than or equal to {_MAX_RECORD_BYTES}")
+        decoded_records.append(decoded)
+    if sum(len(d) for d in decoded_records if d) > _MAX_BATCH_BYTES:
+        return _invalid("Records size exceeds 4 MB limit")
 
+    due = []
     with _lock:
         stream = _streams.get(name)
         if not stream:
@@ -1250,19 +1455,12 @@ def _put_record_batch(data: dict):
 
         responses = []
         failed = 0
-        for rec in records:
-            raw_data = rec.get("Data", "")
+        for rec, decoded in zip(records, decoded_records):
             try:
-                decoded = base64.b64decode(raw_data)
-                if len(decoded) > 1024 * 1000:
-                    raise ValueError("Record too large")
+                if decoded is None:
+                    raise ValueError("Record.Data must be valid base64.")
                 record_id = _record_id()
-                for dest in stream["destinations"]:
-                    dest["records"].append({"id": record_id, "data": raw_data, "ts": now_epoch()})
-                    if dest["type"] in ("ExtendedS3", "S3"):
-                        _deliver_records_to_s3(stream, dest, [(record_id, decoded)])
-                    elif dest["type"] == "Iceberg":
-                        _deliver_to_iceberg(stream, dest, [(record_id, decoded)])
+                due += [k for k in _accept_record(stream, record_id, rec.get("Data", ""), decoded) if k not in due]
                 responses.append({"RecordId": record_id})
             except Exception as e:
                 failed += 1
@@ -1273,6 +1471,8 @@ def _put_record_batch(data: dict):
                     }
                 )
 
+    for key in due:
+        _deliver_iceberg_buffer(key, wait=True)
     return json_response(
         {
             "FailedPutCount": failed,
@@ -1280,6 +1480,20 @@ def _put_record_batch(data: dict):
             "RequestResponses": responses,
         }
     )
+
+
+def _validate_iceberg_config(dtype: str, cfg: dict, path: str):
+    if dtype != "Iceberg":
+        return None
+    hints = cfg.get("BufferingHints") or {}
+    for key, member, low, high in (("IntervalInSeconds", "intervalInSeconds", 0, 900),
+                                   ("SizeInMBs", "sizeInMBs", 1, 128)):
+        value = hints.get(key)
+        if value is not None and value > high:
+            return _validation_error(f"{path}.bufferingHints.{member}", f"have value less than or equal to {high}")
+        if value is not None and value < low:
+            return _validation_error(f"{path}.bufferingHints.{member}", f"have value greater than or equal to {low}")
+    return None
 
 
 def _update_destination(data: dict):
@@ -1307,9 +1521,13 @@ def _update_destination(data: dict):
 
         dtype, cfg = _resolve_dest_update_config(data)
         if dtype and cfg is not None:
-            validation_error = _validate_s3_destination_config(dtype, cfg)
+            validation_error = (_validate_s3_destination_config(dtype, cfg)
+                                or _validate_iceberg_config(dtype, cfg, "icebergDestinationUpdate"))
             if validation_error:
                 return validation_error
+            if (dtype == dest["type"] == "Iceberg" and dest["config"].get("AppendOnly")
+                    and cfg.get("AppendOnly") is False):
+                return _invalid("AppendOnly field cannot be disabled once set to true")
             if dtype == dest["type"]:
                 # Same destination type — merge fields (AWS behaviour)
                 dest["config"] = {**dest["config"], **cfg}

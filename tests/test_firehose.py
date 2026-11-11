@@ -1099,3 +1099,323 @@ def test_firehose_region_delivery_into_regional_bucket():
         for obj in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
             s3.delete_object(Bucket=bucket, Key=obj["Key"])
         s3.delete_bucket(Bucket=bucket)
+
+
+# ─── Iceberg destination on the Glue Data Catalog ─────────────────────────────
+
+_ICE_COLUMNS = [
+    {"id": 1, "name": "tenant_id", "required": False, "type": "string"},
+    {"id": 2, "name": "integration_id", "required": False, "type": "string"},
+    {"id": 3, "name": "sub_integration_id", "required": False, "type": "string"},
+    {"id": 4, "name": "raw", "required": False, "type": "string"},
+    {"id": 5, "name": "extracted_at", "required": False, "type": "timestamp"},
+]
+_GLUE_CATALOG = "arn:aws:glue:us-east-1:000000000000:catalog"
+
+
+def _glue_iceberg_table(s3, glue, suffix):
+    """A format-version 2 table partitioned by three varchar columns, laid out as Trino creates one."""
+    bucket, database, table = f"fh-glue-ice-{suffix}", f"fh_glue_ice_{suffix}", "itm_events"
+    s3.create_bucket(Bucket=bucket)
+    glue.create_database(DatabaseInput={"Name": database})
+    location = f"s3://{bucket}/{database}/{table}"
+    metadata = {
+        "format-version": 2, "table-uuid": str(_uuid_mod.uuid4()), "location": location,
+        "last-sequence-number": 0, "last-updated-ms": int(time.time() * 1000), "last-column-id": 5,
+        "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": _ICE_COLUMNS}],
+        "default-spec-id": 0, "last-partition-id": 1002, "partition-specs": [{"spec-id": 0, "fields": [
+            {"name": n, "transform": "identity", "source-id": i, "field-id": 999 + i}
+            for i, n in ((1, "tenant_id"), (2, "integration_id"), (3, "sub_integration_id"))]}],
+        "default-sort-order-id": 0, "sort-orders": [{"order-id": 0, "fields": []}],
+        "properties": {"write.format.default": "PARQUET"}, "current-snapshot-id": -1, "refs": {},
+        "snapshots": [], "snapshot-log": [], "metadata-log": [],
+    }
+    key = f"{database}/{table}/metadata/00000-{_uuid_mod.uuid4()}.metadata.json"
+    s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(metadata).encode())
+    glue.create_table(DatabaseName=database, TableInput={
+        "Name": table, "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"table_type": "ICEBERG", "metadata_location": f"s3://{bucket}/{key}"}})
+    return bucket, database, table
+
+
+def _glue_iceberg_stream(fh, bucket, database, table, name, interval=0, **extra):
+    fh.create_delivery_stream(DeliveryStreamName=name, DeliveryStreamType="DirectPut", IcebergDestinationConfiguration={
+        "RoleARN": "arn:aws:iam::000000000000:role/firehose", "AppendOnly": True,
+        "CatalogConfiguration": {"CatalogARN": _GLUE_CATALOG},
+        "DestinationTableConfigurationList": [{"DestinationDatabaseName": database, "DestinationTableName": table}],
+        "BufferingHints": {"IntervalInSeconds": interval, "SizeInMBs": 128},
+        "RetryOptions": {"DurationInSeconds": 7200},
+        "S3Configuration": {"RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                            "BucketARN": f"arn:aws:s3:::{bucket}", "ErrorOutputPrefix": f"{name}-errors/"},
+        "CloudWatchLoggingOptions": {"Enabled": True, "LogGroupName": "/firehose", "LogStreamName": "delivery"},
+        **extra})
+
+
+def _s3_body(s3, uri):
+    bucket, key = uri.split("://", 1)[1].split("/", 1)
+    return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def _iceberg_state(s3, glue, database, table, tmp_path):
+    """(metadata.json, rows) of the table's current snapshot, read from its manifests and Parquet files."""
+    import duckdb
+
+    from ministack.services.firehose_iceberg import avro_read
+
+    location = glue.get_table(DatabaseName=database, Name=table)["Table"]["Parameters"]["metadata_location"]
+    metadata = json.loads(_s3_body(s3, location))
+    snapshot = next((s for s in metadata["snapshots"] if s["snapshot-id"] == metadata["current-snapshot-id"]), None)
+    rows = []
+    if snapshot:
+        con = duckdb.connect()
+        for manifest in avro_read(_s3_body(s3, snapshot["manifest-list"])):
+            for entry in avro_read(_s3_body(s3, manifest["manifest_path"])):
+                data_file = entry["data_file"]
+                path = tmp_path / f"{_uuid_mod.uuid4()}.parquet"
+                path.write_bytes(_s3_body(s3, data_file["file_path"]))
+                found = con.execute(f"SELECT * FROM '{path}'").fetchall()
+                assert len(found) == data_file["record_count"]
+                for row in found:
+                    assert tuple(data_file["partition"].values()) == row[:3]
+                rows += found
+    return metadata, sorted(rows, key=lambda r: (r[4] is None, r[4] or 0, r[3] or ""))
+
+
+def _ice_record(sub, n, extracted_at=None, **extra):
+    return json.dumps({"tenant_id": "t1", "integration_id": "i1", "sub_integration_id": sub, "raw": f"r{n}",
+                       "extracted_at": extracted_at or f"2026-11-11T14:46:53.{377500 + n:06d}", **extra}).encode()
+
+
+@pytest.fixture
+def glue_iceberg(fh, glue, s3):
+    pytest.importorskip("duckdb")
+    return _glue_iceberg_table(s3, glue, _uuid_mod.uuid4().hex[:8])
+
+
+def test_firehose_put_record_batch_limits(fh, glue_iceberg):
+    bucket, database, table = glue_iceberg
+    name = f"fh-limits-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    with pytest.raises(ClientError) as exc:
+        fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": b"{}"}] * 501)
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"] == ("1 validation error detected: Value at 'records' failed to "
+                                                      "satisfy constraint: Member must have length less than or "
+                                                      "equal to 500")
+    with pytest.raises(ClientError) as exc:
+        fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": b"{}"}, {"Data": b"x" * (1024 * 1000 + 1)}])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "Value at 'records.2.member.data'" in exc.value.response["Error"]["Message"]
+    with pytest.raises(ClientError) as exc:
+        fh.put_record(DeliveryStreamName=name, Record={"Data": b"x" * (1024 * 1000 + 1)})
+    assert "Value at 'record.data'" in exc.value.response["Error"]["Message"]
+    with pytest.raises(ClientError) as exc:
+        fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": b"x" * (1024 * 1000)}] * 4
+                            + [{"Data": b"x" * (4 * 1024 * 1024 - 4 * 1024 * 1000 + 1)}])
+    assert exc.value.response["Error"] == {"Code": "InvalidArgumentException",
+                                           "Message": "Records size exceeds 4 MB limit"}
+    ok = fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": _ice_record("s1", n)} for n in range(3)])
+    assert ok["FailedPutCount"] == 0
+    assert len(ok["RequestResponses"]) == 3 and all(r["RecordId"] for r in ok["RequestResponses"])
+
+
+def test_firehose_iceberg_destination_config(fh, glue_iceberg):
+    bucket, database, table = glue_iceberg
+    name = f"fh-cfg-{bucket[-8:]}"
+    with pytest.raises(ClientError) as exc:
+        _glue_iceberg_stream(fh, bucket, database, table, name, interval=901)
+    assert exc.value.response["Error"]["Message"] == (
+        "1 validation error detected: Value at 'icebergDestinationConfiguration.bufferingHints.intervalInSeconds' "
+        "failed to satisfy constraint: Member must have value less than or equal to 900")
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    stream = fh.describe_delivery_stream(DeliveryStreamName=name)["DeliveryStreamDescription"]
+    dest = stream["Destinations"][0]["IcebergDestinationDescription"]
+    assert dest["AppendOnly"] is True
+    assert dest["CatalogConfiguration"] == {"CatalogARN": _GLUE_CATALOG}
+    assert dest["RetryOptions"] == {"DurationInSeconds": 7200}
+    assert dest["BufferingHints"] == {"IntervalInSeconds": 0, "SizeInMBs": 128}
+    assert dest["S3DestinationDescription"]["ErrorOutputPrefix"] == f"{name}-errors/"
+    assert dest["CloudWatchLoggingOptions"]["LogGroupName"] == "/firehose"
+    with pytest.raises(ClientError) as exc:
+        fh.update_destination(DeliveryStreamName=name, CurrentDeliveryStreamVersionId=stream["VersionId"],
+                              DestinationId=stream["Destinations"][0]["DestinationId"],
+                              IcebergDestinationUpdate={"AppendOnly": False})
+    assert exc.value.response["Error"] == {"Code": "InvalidArgumentException",
+                                           "Message": "AppendOnly field cannot be disabled once set to true"}
+
+    other = f"fh-cfg-defaults-{bucket[-8:]}"
+    fh.create_delivery_stream(DeliveryStreamName=other, IcebergDestinationConfiguration={
+        "RoleARN": "arn:aws:iam::000000000000:role/firehose", "CatalogConfiguration": {"CatalogARN": _GLUE_CATALOG},
+        "DestinationTableConfigurationList": [{"DestinationDatabaseName": database, "DestinationTableName": table}],
+        "S3Configuration": {"RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                            "BucketARN": f"arn:aws:s3:::{bucket}"}})
+    dest = fh.describe_delivery_stream(DeliveryStreamName=other)["DeliveryStreamDescription"]["Destinations"][0]
+    assert dest["IcebergDestinationDescription"]["AppendOnly"] is False
+    assert dest["IcebergDestinationDescription"]["RetryOptions"] == {"DurationInSeconds": 300}
+
+
+def test_firehose_iceberg_delivers_one_partitioned_commit(fh, glue, s3, glue_iceberg, tmp_path):
+    bucket, database, table = glue_iceberg
+    name = f"fh-commit-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    before = glue.get_table(DatabaseName=database, Name=table)["Table"]["Parameters"]["metadata_location"]
+    records = [_ice_record(f"s{n % 2}", n, ignored="extra key") for n in range(4)]
+    fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": r} for r in records])
+
+    params = glue.get_table(DatabaseName=database, Name=table)["Table"]["Parameters"]
+    assert params["metadata_location"] != before
+    assert params["previous_metadata_location"] == before
+    metadata, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+    assert len(metadata["snapshots"]) == 1
+    assert [r[:4] for r in rows] == [("t1", "i1", f"s{n % 2}", f"r{n}") for n in range(4)]
+    summary = metadata["snapshots"][0]["summary"]
+    assert summary["added-records"] == "4" and summary["added-data-files"] == "2"
+    assert summary["changed-partition-count"] == "2"
+    paths = [o["Key"] for o in s3.list_objects_v2(Bucket=bucket, Prefix=f"{database}/{table}/data/")["Contents"]]
+    assert sorted(p.rsplit("/", 1)[0] for p in paths) == [
+        f"{database}/{table}/data/tenant_id=t1/integration_id=i1/sub_integration_id=s0",
+        f"{database}/{table}/data/tenant_id=t1/integration_id=i1/sub_integration_id=s1"]
+
+
+def test_firehose_iceberg_timestamps_and_failed_records(fh, glue, s3, glue_iceberg, tmp_path):
+    import datetime
+
+    bucket, database, table = glue_iceberg
+    name = f"fh-types-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    malformed = _ice_record("s1", 2, extracted_at="2026-11-11 14:46:53.377548")
+    fh.put_record_batch(DeliveryStreamName=name, Records=[
+        {"Data": _ice_record("s1", 1, extracted_at="2026-11-11T14:46:53.377548")},
+        {"Data": malformed}, {"Data": b"not json"}])
+
+    _, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+    assert rows == [("t1", "i1", "s1", "r1", datetime.datetime(2026, 11, 11, 14, 46, 53, 377548))]
+    errors = s3.list_objects_v2(Bucket=bucket, Prefix=f"{name}-errors/")["Contents"]
+    assert len(errors) == 1
+    assert re.fullmatch(rf"{name}-errors/iceberg-failed/\d{{4}}/\d{{2}}/\d{{2}}/\d{{2}}/{name}-1-"
+                        r"\d{4}(-\d{2}){5}-[0-9a-f-]{36}", errors[0]["Key"]), errors[0]["Key"]
+    lines = [json.loads(line) for line in _s3_body(s3, f"s3://{bucket}/{errors[0]['Key']}").splitlines()]
+    assert [list(line) for line in lines] == [["attemptsMade", "arrivalTimestamp", "errorCode", "errorMessage",
+                                               "attemptEndingTimestamp", "rawData"]] * 2
+    assert lines[0]["errorCode"] == "Iceberg.MalformedFieldWithinRecord" and lines[0]["attemptsMade"] == 1
+    assert lines[0]["errorMessage"] == ("Firehose is unable to convert column data in your record to the column "
+                                        "type specified within the schema.")
+    assert base64.b64decode(lines[0]["rawData"]) == malformed
+    assert lines[1]["errorCode"] == "Iceberg.InvalidPayload" and lines[1]["attemptsMade"] == 0
+
+
+def test_firehose_iceberg_snapshot_summary(fh, glue, s3, glue_iceberg, tmp_path):
+    bucket, database, table = glue_iceberg
+    name = f"fh-summary-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    created = fh.describe_delivery_stream(DeliveryStreamName=name)["DeliveryStreamDescription"]["CreateTimestamp"]
+    for n in range(2):
+        fh.put_record(DeliveryStreamName=name, Record={"Data": _ice_record("s1", n)})
+    metadata, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+    first, second = (s["summary"] for s in metadata["snapshots"])
+    account, stream, created_ms = first["FIREHOSE-DELIVERY-STREAM-ID"].split(":")
+    assert (account, stream) == ("000000000000", name)
+    assert abs(int(created_ms) - created.timestamp() * 1000) < 1000
+    assert int(second["FIREHOSE-INTERNAL-CHECKPOINT"].split(",")[0]) == (
+        int(first["FIREHOSE-INTERNAL-CHECKPOINT"].split(",")[0]) + 1)
+    assert second["total-records"] == "2" and second["added-records"] == "1"
+    assert metadata["snapshots"][1]["parent-snapshot-id"] == metadata["snapshots"][0]["snapshot-id"]
+    assert len(rows) == 2
+
+
+def test_firehose_iceberg_failed_commit_keeps_arrival_order(fh, glue, s3, glue_iceberg, tmp_path):
+    bucket, database, table = glue_iceberg
+    name = f"fh-order-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    entry = glue.get_table(DatabaseName=database, Name=table)["Table"]
+    good = entry["Parameters"]["metadata_location"]
+    table_input = {"Name": table, "TableType": "EXTERNAL_TABLE", "Parameters": dict(entry["Parameters"])}
+    glue.update_table(DatabaseName=database, TableInput={
+        **table_input, "Parameters": {**table_input["Parameters"], "metadata_location": good + ".missing"}})
+    fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": _ice_record("s1", n)} for n in range(3)])
+    glue.update_table(DatabaseName=database, TableInput=table_input)
+    assert glue.get_table(DatabaseName=database, Name=table)["Table"]["Parameters"]["metadata_location"] == good
+
+    fh.put_record_batch(DeliveryStreamName=name, Records=[{"Data": _ice_record("s1", n)} for n in range(3, 5)])
+    metadata, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+    assert [r[3] for r in rows] == [f"r{n}" for n in range(5)]
+    assert all(int(s["summary"]["total-records"]) >= 3 for s in metadata["snapshots"])
+
+
+def test_firehose_iceberg_concurrent_streams_retry_catalog_conflicts(fh, glue, s3, glue_iceberg, tmp_path):
+    import concurrent.futures
+
+    bucket, database, table = glue_iceberg
+    names = [f"fh-race{i}-{bucket[-8:]}" for i in range(2)]
+    for name in names:
+        _glue_iceberg_stream(fh, bucket, database, table, name)
+
+    def send(i):
+        for n in range(5):
+            fh.put_record(DeliveryStreamName=names[i], Record={"Data": _ice_record(f"s{i}", i * 10 + n)})
+
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        list(pool.map(send, range(2)))
+    metadata, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+    assert sorted(r[3] for r in rows) == sorted(f"r{i * 10 + n}" for i in range(2) for n in range(5))
+    assert len(metadata["snapshots"]) == 10
+    for i in range(2):
+        own = [r[3] for r in rows if r[2] == f"s{i}"]
+        assert own == [f"r{i * 10 + n}" for n in range(5)]
+
+
+def test_firehose_iceberg_delivery_metrics(fh, cw, glue_iceberg):
+    import datetime
+
+    bucket, database, table = glue_iceberg
+    name = f"fh-metrics-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=2)
+    fh.put_record_batch(DeliveryStreamName=name, Records=[
+        {"Data": _ice_record("s1", 1)}, {"Data": _ice_record("s1", 2)},
+        {"Data": _ice_record("s1", 3, extracted_at="2026-11-11 14:46:53")}])
+    queries = []
+    for metric, stat in (("DataFreshness", "Maximum"), ("SuccessfulRowCount", "Sum"), ("FailedRowCount", "Sum")):
+        for dims in ([{"Name": "DeliveryStreamName", "Value": name}],
+                     [{"Name": "DeliveryStreamName", "Value": name},
+                      {"Name": "IcebergTableName", "Value": f"{database}.{table}"}]):
+            queries.append({"Id": f"m{len(queries)}", "MetricStat": {"Metric": {
+                "Namespace": "AWS/Firehose", "MetricName": f"DeliveryToIceberg.{metric}", "Dimensions": dims},
+                "Period": 60, "Stat": stat}})
+    result = cw.get_metric_data(MetricDataQueries=queries, StartTime=start,
+                                EndTime=start + datetime.timedelta(minutes=4))["MetricDataResults"]
+    values = [sum(r["Values"]) for r in result]
+    assert all(len(r["Values"]) == 1 for r in result), result
+    assert 0 <= values[0] < 60 and values[0] == values[1]
+    assert values[2:] == [2, 2, 1, 1]
+
+
+def test_firehose_iceberg_buffers_until_the_interval(fh, glue, s3, glue_iceberg, tmp_path):
+    bucket, database, table = glue_iceberg
+    name = f"fh-buffer-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name, interval=2)
+    fh.put_record(DeliveryStreamName=name, Record={"Data": _ice_record("s1", 1)})
+    fh.put_record(DeliveryStreamName=name, Record={"Data": _ice_record("s1", 2)})
+    assert _iceberg_state(s3, glue, database, table, tmp_path)[1] == []
+    for _ in range(50):
+        metadata, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+        if rows:
+            break
+        time.sleep(0.2)
+    assert [r[3] for r in rows] == ["r1", "r2"]
+    assert len(metadata["snapshots"]) == 1
+
+
+def test_firehose_iceberg_unconvertible_values_do_not_block_the_stream(fh, glue, s3, glue_iceberg, tmp_path):
+    bucket, database, table = glue_iceberg
+    name = f"fh-stuck-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, table, name)
+    fh.put_record_batch(DeliveryStreamName=name, Records=[
+        {"Data": _ice_record("s1", 1)},
+        {"Data": json.dumps({"tenant_id": "t1", "extracted_at": 10 ** 20}).encode()},
+        {"Data": b'{"tenant_id": "t1", "raw": "\\ud800"}'}])
+    _, rows = _iceberg_state(s3, glue, database, table, tmp_path)
+    assert [r[3] for r in rows] == ["r1"]
+    errors = s3.list_objects_v2(Bucket=bucket, Prefix=f"{name}-errors/")["Contents"]
+    lines = _s3_body(s3, f"s3://{bucket}/{errors[0]['Key']}").splitlines()
+    assert [json.loads(line)["errorCode"] for line in lines] == ["Iceberg.MalformedFieldWithinRecord"] * 2
