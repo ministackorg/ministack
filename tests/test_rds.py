@@ -18569,3 +18569,32 @@ def test_host_port_probe_sees_ports_the_daemon_publishes(monkeypatch):
     monkeypatch.setattr(m, "_published_cache", [0.0, frozenset()])
     assert not m._is_host_port_free(16381)
     assert m._is_host_port_free(16382)
+
+
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="needs a live PostgreSQL container")
+@pytest.mark.data_plane
+def test_rds_aurora_postgresql_has_builtin_roles(rds):
+    """The master user is a member of rds_superuser, and rds_iam exists to grant."""
+    cluster_id = f"pgroles-{uuid.uuid4().hex[:8]}"
+    rds.create_db_cluster(DBClusterIdentifier=cluster_id, Engine="aurora-postgresql",
+                          MasterUsername="admin", MasterUserPassword=PASSWORD, DatabaseName=DATABASE)
+    rds.create_db_instance(DBInstanceIdentifier=f"{cluster_id}-1", DBClusterIdentifier=cluster_id,
+                           DBInstanceClass="db.r6g.large", Engine="aurora-postgresql")
+    try:
+        writer = _wait_for_instance(rds, f"{cluster_id}-1", timeout=180)
+        conn = _pg_connect(writer["Endpoint"])
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT pg_has_role('admin', 'rds_superuser', 'member')")
+            assert cur.fetchone() == (True,)
+            cur.execute("SELECT r.rolname, a.admin_option FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid "
+                        "JOIN pg_roles m ON m.oid = a.member WHERE m.rolname = 'rds_superuser' ORDER BY 1")
+            assert cur.fetchall() == [("rds_password", True), ("rds_replication", True)]
+            cur.execute("CREATE USER app_user; GRANT rds_iam TO app_user")
+            cur.execute("SELECT pg_has_role('app_user', 'rds_iam', 'member')")
+            assert cur.fetchone() == (True,)
+        finally:
+            conn.close()
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=f"{cluster_id}-1", SkipFinalSnapshot=True)
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
