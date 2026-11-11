@@ -963,6 +963,10 @@ def closed_stream(stream_arn: str) -> dict | None:
     return closed
 
 
+def _stream_enabled(table_or_request):
+    return bool((table_or_request.get("StreamSpecification") or {}).get("StreamEnabled"))
+
+
 def drop_stream_records(table_name: str, table: dict | None = None) -> None:
     """Detach the table's current stream; an enabled one stays readable as closed."""
     records = _stream_records.pop(table_name, None) or []
@@ -1698,7 +1702,8 @@ def _create_table(data):
             if billing_mode == "PAY_PER_REQUEST"
             else data.get("ProvisionedThroughput", {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}),
         "BillingModeSummary": {"BillingMode": billing_mode},
-        "StreamSpecification": data.get("StreamSpecification"),
+        # Captured: a disabled stream at creation leaves no StreamSpecification, label or ARN.
+        "StreamSpecification": data.get("StreamSpecification") if _stream_enabled(data) else None,
         "SSEDescription": _sse_description_from_spec(data.get("SSESpecification")),
         "DeletionProtectionEnabled": data.get("DeletionProtectionEnabled", False),
     }
@@ -1720,7 +1725,7 @@ def _create_table(data):
         }
     if data.get("WarmThroughput"):
         _tables[name]["WarmThroughput"] = _warm_throughput_description(data["WarmThroughput"])
-    if data.get("StreamSpecification"):
+    if _stream_enabled(data):
         stream_label = _stream_label()
         _tables[name]["LatestStreamLabel"] = stream_label
         _tables[name]["LatestStreamArn"] = f"{_tables[name]['TableArn']}/stream/{stream_label}"
@@ -1912,6 +1917,9 @@ def _update_table(data):
             "GlobalSecondaryIndexUpdates, SSESpecification, ReplicaUpdates or TableClass "
             "is required", 400)
 
+    if "StreamSpecification" in data and not _stream_enabled(data) and not _stream_enabled(table):
+        return error_response_json("ValidationException", f"Table has no stream to disable: TableName: {name}", 400)
+
     current_billing = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
     new_billing = data.get("BillingMode")
     err = _apply_vector_index_updates(name, table, data, new_billing or current_billing)
@@ -1958,11 +1966,12 @@ def _update_table(data):
             existing_ad.setdefault(ad["AttributeName"], ad)
         table["AttributeDefinitions"] = list(existing_ad.values())
     if "StreamSpecification" in data:
-        stream_spec = data["StreamSpecification"]
-        stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
+        stream_spec = data["StreamSpecification"] or {}
+        stream_was_enabled = _stream_enabled(table)
         if stream_was_enabled and not stream_spec.get("StreamEnabled"):
             drop_stream_records(name, table)
-        table["StreamSpecification"] = stream_spec
+        # Captured: disabling drops StreamSpecification; the last label and ARN stay.
+        table["StreamSpecification"] = stream_spec if stream_spec.get("StreamEnabled") else None
         if stream_spec.get("StreamEnabled") and not stream_was_enabled:
             stream_label = _stream_label()
             table["LatestStreamLabel"] = stream_label
@@ -2088,10 +2097,11 @@ def _table_description(name):
         desc["VectorIndexes"] = [_vector_index_description(v) for v in t["VectorIndexes"]]
         if desc["TableStatus"] == "ACTIVE" and any(_vector_phase(v) == "allocating" for v in t["VectorIndexes"]):
             desc["TableStatus"] = "UPDATING"
-    if t.get("StreamSpecification"):
+    if _stream_enabled(t):
         desc["StreamSpecification"] = t["StreamSpecification"]
+    if t.get("LatestStreamArn"):
         desc["LatestStreamLabel"] = t.get("LatestStreamLabel", "")
-        desc["LatestStreamArn"] = t.get("LatestStreamArn", "")
+        desc["LatestStreamArn"] = t["LatestStreamArn"]
     if t.get("SSEDescription"):
         desc["SSEDescription"] = t["SSEDescription"]
     if t.get("TableClassSummary"):

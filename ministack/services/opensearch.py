@@ -926,6 +926,7 @@ def create_domain_record(payload, compatibility_properties=None):
             _tags[rec["ARN"]] = tags
         else:
             _tags.pop(rec["ARN"], None)
+        _record_change(name, rec, [])
         # Only now — the finisher looks the record up by name and reclaims what
         # it started if it is not there, so it must not run before this.
         deferred_start = rec.pop("_deferred_start", None)
@@ -1085,7 +1086,6 @@ def _create_domain(payload):
         rec = create_domain_record(payload)
     except OpenSearchServiceError as exc:
         return _error(exc.status, exc.code, exc.message)
-    _record_change(rec["DomainName"], rec, [])
     return _json(200, {"DomainStatus": _public(rec)})
 
 

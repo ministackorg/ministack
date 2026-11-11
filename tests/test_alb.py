@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import urllib.request as _req
 import uuid as _uuid_mod
 import zipfile
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
 import pytest
 from botocore.exceptions import ClientError
@@ -1985,25 +1986,190 @@ def test_a_custom_session_cookie_name_is_honoured(elbv2, lam):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
 
 
-def test_authenticate_cognito_is_reported_as_unimplemented(elbv2, lam):
-    """Better a loud 501 than forwarding a request nobody authenticated."""
-    name = "oidc-dp-cognito"
-    fn_code = ("def handler(event, context):\n"
-               "    return {'statusCode': 200, 'body': 'reached'}\n")
+def _oidc_get_url(url, host):
+    req = _req.Request(url, method="GET")
+    req.add_header("Host", host)
+    try:
+        resp = _oidc_opener.open(req)
+        return resp.status, dict(resp.headers), resp.read()
+    except HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def _cognito_pool_for_alb(idp, name, callback):
+    pool = idp.create_user_pool(PoolName=name)["UserPool"]
+    domain = f"{name}-{_uuid_mod.uuid4().hex[:8]}"
+    idp.create_user_pool_domain(Domain=domain, UserPoolId=pool["Id"])
+    client = idp.create_user_pool_client(
+        UserPoolId=pool["Id"], ClientName=name, GenerateSecret=True,
+        AllowedOAuthFlows=["code"], AllowedOAuthFlowsUserPoolClient=True,
+        AllowedOAuthScopes=["openid", "email"], CallbackURLs=[callback],
+        SupportedIdentityProviders=["COGNITO"],
+    )["UserPoolClient"]
+    return pool, domain, client
+
+
+def _cognito_action(pool, client, domain, order=1, **extra):
+    return {"Type": "authenticate-cognito", "Order": order, "AuthenticateCognitoConfig": {
+        "UserPoolArn": pool["Arn"], "UserPoolClientId": client["ClientId"], "UserPoolDomain": domain, **extra}}
+
+
+def test_authenticate_cognito_control_plane_errors(elbv2, cognito_idp):
+    """Captured from AWS: HTTPS only, and the client and domain must belong to the pool."""
+    pool, domain, client = _cognito_pool_for_alb(cognito_idp, "albcog-cp", "https://example.com/cb")
+    lb = elbv2.create_load_balancer(Name="albcog-cp")["LoadBalancers"][0]
+    tg = elbv2.create_target_group(Name="albcog-cp-tg", TargetType="lambda")["TargetGroups"][0]
+    forward = {"Type": "forward", "Order": 2, "TargetGroupArn": tg["TargetGroupArn"]}
+    try:
+        with pytest.raises(ClientError) as exc:
+            elbv2.create_listener(LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+                                  DefaultActions=[_cognito_action(pool, client, domain), forward])
+        assert exc.value.response["Error"]["Code"] == "InvalidLoadBalancerAction"
+        assert exc.value.response["Error"]["Message"] == (
+            "Actions of type 'authenticate-cognito' are supported only on HTTPS listeners")
+        assert elbv2.describe_listeners(LoadBalancerArn=lb["LoadBalancerArn"])["Listeners"] == []
+
+        l_arn = elbv2.create_listener(LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTPS", Port=443,
+                                      DefaultActions=[_cognito_action(pool, client, domain), forward],
+                                      )["Listeners"][0]["ListenerArn"]
+        cond = [{"Field": "path-pattern", "Values": ["/x"]}]
+        bad_client = {**client, "ClientId": "1example23456789example2345"}
+        bad_pool = {**pool, "Arn": pool["Arn"].rsplit("/", 1)[0] + "/us-east-1_NoSuchPool"}
+        cases = [
+            (_cognito_action(pool, bad_client, domain),
+             "The user pool client '1example23456789example2345' does not exist in the provided user pool"),
+            (_cognito_action(bad_pool, client, domain),
+             f"The user pool client '{client['ClientId']}' does not exist in the provided user pool"),
+            (_cognito_action(pool, client, "albcog-no-such-domain"),
+             "The user pool domain 'albcog-no-such-domain' is not associated with the provided user pool"),
+        ]
+        for priority, (action, message) in enumerate(cases, start=1):
+            with pytest.raises(ClientError) as exc:
+                elbv2.create_rule(ListenerArn=l_arn, Priority=priority, Conditions=cond, Actions=[action, forward])
+            assert exc.value.response["Error"]["Code"] == "InvalidLoadBalancerAction"
+            assert exc.value.response["Error"]["Message"] == message
+        full_host = f"{domain}.auth.us-east-1.amazoncognito.com"
+        rule = elbv2.create_rule(ListenerArn=l_arn, Priority=10, Conditions=cond,
+                                 Actions=[_cognito_action(pool, client, full_host), forward])["Rules"][0]
+        assert rule["Actions"][0]["AuthenticateCognitoConfig"]["UserPoolDomain"] == full_host
+
+        with pytest.raises(ClientError) as exc:
+            elbv2.modify_listener(ListenerArn=l_arn, Protocol="HTTP", Port=80)
+        assert exc.value.response["Error"]["Code"] == "InvalidLoadBalancerAction"
+        assert elbv2.describe_listeners(ListenerArns=[l_arn])["Listeners"][0]["Protocol"] == "HTTPS"
+    finally:
+        elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+        elbv2.delete_target_group(TargetGroupArn=tg["TargetGroupArn"])
+        cognito_idp.delete_user_pool_domain(Domain=domain, UserPoolId=pool["Id"])
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
+
+
+def _b64json(segment):
+    return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+
+
+def test_authenticate_cognito_signs_in_through_the_user_pool(elbv2, lam, cognito_idp):
+    """The flow and headers captured from AWS: redirect to the pool domain, sign in, claims to the target."""
+    name = "albcog-dp"
+    host = f"{name}.alb.localhost"
+    callback = f"https://{host}/oauth2/idpresponse"
+    pool, domain, client = _cognito_pool_for_alb(cognito_idp, name, callback)
+    cognito_idp.admin_create_user(UserPoolId=pool["Id"], Username="albuser", MessageAction="SUPPRESS",
+                                  UserAttributes=[{"Name": "email", "Value": "albuser@example.com"},
+                                                  {"Name": "email_verified", "Value": "true"}])
+    cognito_idp.admin_set_user_password(UserPoolId=pool["Id"], Username="albuser",
+                                        Password="Passw0rd!Passw0rd", Permanent=True)
+    fn_code = ("import json\n"
+               "def handler(event, context):\n"
+               "    h = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+               "    return {'statusCode': 200, 'body': json.dumps({k: v for k, v in h.items()\n"
+               "                                                    if k.startswith('x-amzn-oidc')})}\n")
     lb_arn, tg_arn, l_arn, _ = _alb_setup(elbv2, lam, name, f"{name}-fn", fn_code)
     try:
-        elbv2.modify_listener(
-            ListenerArn=l_arn,
-            DefaultActions=[
-                {"Type": "authenticate-cognito", "Order": 1},
-                {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn},
-            ],
-        )
-        status, _, body = _oidc_get("/private", name)
-        assert status == 501
-        assert b"not implemented" in body
+        elbv2.delete_listener(ListenerArn=l_arn)
+        l_arn = elbv2.create_listener(
+            LoadBalancerArn=lb_arn, Protocol="HTTPS", Port=443,
+            DefaultActions=[_cognito_action(pool, client, domain),
+                            {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn}])["Listeners"][0]["ListenerArn"]
+        rule_cond = [{"Field": "path-pattern", "Values": ["/deny"]}]
+        elbv2.create_rule(ListenerArn=l_arn, Priority=1, Conditions=rule_cond, Actions=[
+            _cognito_action(pool, client, domain, OnUnauthenticatedRequest="deny"),
+            {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn}])
+        elbv2.create_rule(ListenerArn=l_arn, Priority=2, Conditions=[{"Field": "path-pattern", "Values": ["/extra"]}],
+                          Actions=[_cognito_action(pool, client, domain, Scope="openid email",
+                                                   AuthenticationRequestExtraParams={"prompt": "login"}),
+                                   {"Type": "forward", "Order": 2, "TargetGroupArn": tg_arn}])
+
+        status, headers, body = _oidc_get("/deny", name)
+        assert status == 401
+        assert body == (b"<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n"
+                        b"<center><h1>401 Authorization Required</h1></center>\r\n</body>\r\n</html>\r\n")
+
+        status, headers, _ = _oidc_get("/extra", name)
+        query = urlparse(headers["Location"]).query
+        assert [k for k, _ in parse_qsl(query)] == [
+            "client_id", "redirect_uri", "response_type", "scope", "state", "prompt"]
+        assert parse_qs(query)["scope"] == ["openid email"]
+
+        status, headers, _ = _oidc_get("/hello?x=1", name)
+        assert status == 302
+        location = urlparse(headers["Location"])
+        assert f"{location.scheme}://{location.netloc}{location.path}" == (
+            f"https://{domain}.auth.us-east-1.amazoncognito.com/oauth2/authorize")
+        query = parse_qs(location.query)
+        assert query["client_id"] == [client["ClientId"]]
+        assert query["redirect_uri"] == [callback]
+        assert query["response_type"] == ["code"] and query["scope"] == ["openid"]
+
+        form = urlencode({"client_id": client["ClientId"], "redirect_uri": callback, "response_type": "code",
+                          "scope": "openid", "state": query["state"][0],
+                          "username": "albuser", "password": "Passw0rd!Passw0rd"}).encode()
+        # With the pool domain routed to MiniStack, as for iss: the gateway serves its authorize endpoint.
+        status, _, page = _oidc_get_url(f"{_endpoint}/oauth2/authorize?{location.query}", location.netloc)
+        assert status == 200 and b"<form" in page
+        try:
+            _oidc_opener.open(_req.Request(f"{_endpoint}/login", data=form, method="POST"))
+            raise AssertionError("login did not redirect")
+        except HTTPError as e:
+            assert e.code == 302
+            back = urlparse(e.headers["Location"])
+        assert f"{back.scheme}://{back.netloc}{back.path}" == callback
+
+        req = _req.Request(f"{_endpoint}/oauth2/idpresponse?{back.query}", method="GET")
+        req.add_header("Host", f"{host}:{_EXECUTE_PORT}")
+        try:
+            _oidc_opener.open(req)
+            raise AssertionError("idpresponse did not redirect")
+        except HTTPError as e:
+            assert e.code == 302
+            assert e.headers["Location"] == f"https://{host}:{_EXECUTE_PORT}/hello?x=1"
+            jar = "; ".join(c.split(";", 1)[0] for c in e.headers.get_all("Set-Cookie"))
+        assert jar.startswith("AWSELBAuthSessionCookie-0=")
+
+        before = int(time.time())
+        status, _, body = _oidc_get("/hello?x=1", name, {"Cookie": jar})
+        assert status == 200
+        seen = json.loads(body)
+        user = cognito_idp.admin_get_user(UserPoolId=pool["Id"], Username="albuser")
+        sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
+        issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool['Id']}"
+        assert seen["x-amzn-oidc-identity"] == sub
+        access = _b64json(seen["x-amzn-oidc-accesstoken"].split(".")[1])
+        assert access["token_use"] == "access" and access["client_id"] == client["ClientId"]
+        header_seg, payload_seg, _ = seen["x-amzn-oidc-data"].split(".")
+        assert header_seg.endswith("=") or len(header_seg) % 4 == 0
+        header, payload = _b64json(header_seg), _b64json(payload_seg)
+        assert list(header) == ["typ", "kid", "alg", "iss", "client", "signer", "exp"]
+        assert (header["alg"], header["iss"], header["client"], header["signer"]) == (
+            "ES256", issuer, client["ClientId"], lb_arn)
+        assert before + 120 <= header["exp"] <= int(time.time()) + 120
+        assert list(payload)[-2:] == ["exp", "iss"]
+        assert (payload["sub"], payload["email"], payload["exp"], payload["iss"]) == (
+            sub, "albuser@example.com", header["exp"], issuer)
     finally:
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, f"{name}-fn")
+        cognito_idp.delete_user_pool_domain(Domain=domain, UserPoolId=pool["Id"])
+        cognito_idp.delete_user_pool(UserPoolId=pool["Id"])
 
 
 def test_modify_listener_updates_the_serving_default_rule(elbv2, lam):
