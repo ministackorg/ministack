@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SSM — Secrets Manager references** — `GetParameter` and `GetParameters` refused `/aws/reference/secretsmanager/<secret-id>` as a reserved name, so serverless `${ssm:/aws/reference/secretsmanager/...}` variables could not resolve. They now return the secret's `AWSCURRENT` value as a `SecureString` with `Version` 0, the secret's ARN and a `SourceResult`, as on AWS. `WithDecryption` must be true: `GetParameter` answers `ValidationException` without it, and `GetParameters` lists the name in `InvalidParameters`. A missing secret answers `ParameterNotFound` with AWS's message.
+
 ## [1.5.40] — 2026-11-11
 
 ### Added
