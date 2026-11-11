@@ -2677,6 +2677,41 @@ def test_partiql_select_where_number(ddb):
     assert resp["Items"][0]["pk"]["S"] == "n2"
 
 
+def test_dynamodb_disabled_stream_shapes(ddb):
+    """Captured from AWS: a disabled stream has no StreamSpecification; disabling keeps the last label and ARN."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    base = dict(KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}], BillingMode="PAY_PER_REQUEST")
+    keys = ("StreamSpecification", "LatestStreamLabel", "LatestStreamArn")
+    names = {k: f"strm-{k}-{suffix}" for k in ("nospec", "disabled", "enabled")}
+    try:
+        ddb.create_table(TableName=names["nospec"], **base)
+        created = ddb.create_table(TableName=names["disabled"], StreamSpecification={"StreamEnabled": False},
+                                   **base)["TableDescription"]
+        assert not any(k in created for k in keys)
+        ddb.create_table(TableName=names["enabled"],
+                         StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"}, **base)
+        for key in ("nospec", "disabled"):
+            assert not any(k in ddb.describe_table(TableName=names[key])["Table"] for k in keys)
+            with pytest.raises(ClientError) as e:
+                ddb.update_table(TableName=names[key], StreamSpecification={"StreamEnabled": False})
+            assert e.value.response["Error"]["Code"] == "ValidationException"
+            assert e.value.response["Error"]["Message"] == f"Table has no stream to disable: TableName: {names[key]}"
+
+        before = ddb.describe_table(TableName=names["enabled"])["Table"]
+        updated = ddb.update_table(TableName=names["enabled"],
+                                   StreamSpecification={"StreamEnabled": False})["TableDescription"]
+        after = ddb.describe_table(TableName=names["enabled"])["Table"]
+        for desc in (updated, after):
+            assert "StreamSpecification" not in desc
+            assert (desc["LatestStreamLabel"], desc["LatestStreamArn"]) == (
+                before["LatestStreamLabel"], before["LatestStreamArn"])
+    finally:
+        for name in names.values():
+            with contextlib.suppress(ClientError):
+                ddb.delete_table(TableName=name)
+
+
 def test_dynamodb_stream_arn_stable(ddb):
     """LatestStreamArn should be stable across DescribeTable calls."""
     tname = f"stream-stable-{_uuid_mod.uuid4().hex[:8]}"
