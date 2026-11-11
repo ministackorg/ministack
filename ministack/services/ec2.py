@@ -6249,6 +6249,9 @@ def _describe_managed_prefix_lists(p):
             continue
         if filters.get("owner-id") and "AWS" not in filters["owner-id"]:
             continue
+        # AWS-managed lists carry no tags, so any tag filter excludes them.
+        if not _resource_matches_tag_filters(pl_id, filters):
+            continue
         items.append(f"""<item>
         <prefixListId>{_esc(str(pl_id))}</prefixListId>
         <prefixListName>{_esc(str(name))}</prefixListName>
