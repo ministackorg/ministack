@@ -12806,6 +12806,55 @@ def _oidc_idpresponse(cid):
         return e.code, (e.headers.get("Location", "") if e.code == 302 else e.read())
 
 
+def test_cognito_oidc_federation_flattens_multi_valued_claims(cognito_idp):
+    """A multi-valued IdP claim becomes "[a, b]", values URL form-encoded except for . - * _."""
+    token_url, _recorded, stop = _start_fake_oidc_idp(
+        {"sub": "oidc-roles", "roles": ["FOO_BAR", "Document.Read", "a b/c~"]})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url,
+                                    attribute_mapping={"custom:roles": "roles"})
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-roles")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert attrs["custom:roles"] == "[FOO_BAR, Document.Read, a+b%2Fc%7E]"
+    finally:
+        stop()
+
+
+def test_cognito_oidc_federation_writes_mapped_claims_only(cognito_idp):
+    """Claims without a mapping rule never become user attributes."""
+    token_url, _recorded, stop = _start_fake_oidc_idp(
+        {"sub": "oidc-mapped", "email": "m@example.com", "name": "Mapped",
+         "oid": "object-id", "amr": ["pwd", "mfa"]})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url,
+                                    attribute_mapping={"email": "email", "nickname": "name"})
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_oidc-mapped")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert attrs["email"] == "m@example.com"
+        assert attrs["nickname"] == "Mapped"
+        assert "name" not in attrs
+        assert "oid" not in attrs
+        assert "amr" not in attrs
+    finally:
+        stop()
+
+
+def test_cognito_saml_federation_writes_mapped_attributes_only(cognito_idp):
+    pid, cid = _setup_saml_pool(cognito_idp)
+    status, _ = _saml_idpresponse(cid, _build_mock_saml_response(
+        name_id="mapped-name-id",
+        attributes={_INBOUND_EMAIL_CLAIM: "raw@example.com", "department": "Unmapped"}))
+    assert status == 302
+    attrs = {a["Name"]: a["Value"] for a in
+             cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_mapped-name-id")["UserAttributes"]}
+    assert attrs["email"] == "raw@example.com"
+    assert "department" not in attrs
+
+
 def test_cognito_inbound_federation_trigger_failure_fails_oidc_sign_in(cognito_idp, lam):
     handler = "def handler(event, ctx):\n    raise Exception('bad claims')\n"
     fn_arn = _create_inbound_federation_lambda(lam, "ministack-inbound-fed-oidc-reject", handler)
@@ -12861,7 +12910,8 @@ def test_cognito_inbound_federation_trigger_empty_map_keeps_idp_attributes(cogni
     attrs = {a["Name"]: a["Value"] for a in
              cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_noop-name-id")["UserAttributes"]}
     assert attrs["email"] == "raw@example.com"
-    assert attrs["family_name"] == "Kept"
+    # No mapping rule for family_name
+    assert "family_name" not in attrs
 
 
 def test_cognito_inbound_federation_trigger_unconfigured_pool_keeps_idp_attributes(cognito_idp):
