@@ -1349,6 +1349,27 @@ _FEDERATION_RESERVED_CLAIMS = frozenset(
     ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"))
 
 
+_FEDERATION_FLAT_SAFE = frozenset(string.ascii_letters + string.digits + ".-*_ ")
+
+
+def _federation_claim_value(value):
+    """A mapped OIDC claim as Cognito stores it (captured from AWS), None for a null claim."""
+    def text(v):
+        return v if isinstance(v, str) else json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return text(value)
+    parts = [text(v) for v in value]
+    if all(_FEDERATION_FLAT_SAFE.issuperset(p) for p in parts):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return "[" + ", ".join(
+        "".join(c if c in _FEDERATION_FLAT_SAFE else "".join(f"%{b:02X}" for b in c.encode("utf-8", "surrogatepass"))
+                for c in p)
+        for p in parts) + "]"
+
+
 def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
     """Registered token claims from InboundFederation output count only when mapped."""
     mapped = set(attr_mapping.values())
@@ -8542,9 +8563,19 @@ def _oauth2_idp_response(method, body, query_params):
         logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
                     claims.get("sub"), e)
         return error_response_json("UserLambdaValidationException", str(e), 400)
-    idp_claims = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
-                  else {k: str(v) for k, v in claims.items()
-                        if k not in _FEDERATION_RESERVED_CLAIMS and isinstance(v, (str, int, float, bool))})
+    if to_map:
+        idp_claims = _drop_unmapped_reserved_claims(to_map, attr_mapping)
+    else:
+        idp_claims = {}
+        for k, v in claims.items():
+            if k in _FEDERATION_RESERVED_CLAIMS:
+                continue
+            if k in reverse_mapping:
+                value = _federation_claim_value(v)
+            else:
+                value = str(v) if isinstance(v, (str, int, float, bool)) else None
+            if value is not None:
+                idp_claims[k] = value
     user_attrs = {}
     for idp_claim, value in idp_claims.items():
         user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value

@@ -19763,6 +19763,9 @@ def test_cfn_opensearch_domain_create_update_replace_and_idempotent_delete(
     assert status["OffPeakWindowOptions"]["Enabled"] is True
     assert status["SoftwareUpdateOptions"]["AutoSoftwareUpdateEnabled"] is True
     assert sentinel not in json.dumps(status, default=str)
+    created_change = status["ChangeProgressDetails"]["ChangeId"]
+    assert opensearch.describe_domain_change_progress(DomainName=domain_name)[
+        "ChangeProgressStatus"]["ChangeId"] == created_change
     tags = opensearch.list_tags(ARN=expected_arn)["TagList"]
     assert _template_tags({t["Key"]: t["Value"] for t in tags}) == {
         "Environment": "test", "Changing": "old"
