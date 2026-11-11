@@ -1160,7 +1160,7 @@ def _iceberg_state(s3, glue, database, table, tmp_path):
     """(metadata.json, rows) of the table's current snapshot, read from its manifests and Parquet files."""
     import duckdb
 
-    from ministack.services.firehose_iceberg import avro_read
+    from ministack.services.firehose import _iceberg_avro_read as avro_read
 
     location = glue.get_table(DatabaseName=database, Name=table)["Table"]["Parameters"]["metadata_location"]
     metadata = json.loads(_s3_body(s3, location))
@@ -1419,3 +1419,24 @@ def test_firehose_iceberg_unconvertible_values_do_not_block_the_stream(fh, glue,
     errors = s3.list_objects_v2(Bucket=bucket, Prefix=f"{name}-errors/")["Contents"]
     lines = _s3_body(s3, f"s3://{bucket}/{errors[0]['Key']}").splitlines()
     assert [json.loads(line)["errorCode"] for line in lines] == ["Iceberg.MalformedFieldWithinRecord"] * 2
+
+
+def test_firehose_iceberg_buffers_survive_persistence():
+    from ministack.services import firehose as _fh
+
+    key = ("000000000000", "us-east-1", "fh-persist", "destinationId-000000000001")
+    with _fh._iceberg_buffers_lock:
+        saved = dict(_fh._iceberg_buffers)
+        _fh._iceberg_buffers.clear()
+        _fh._iceberg_buffers[key] = {**_fh._new_iceberg_buffer(), "records": [("rid-1", b'{"a":1}', 1)], "bytes": 7}
+    try:
+        state = _fh.get_state()
+        with _fh._iceberg_buffers_lock:
+            _fh._iceberg_buffers.clear()
+        _fh.load_persisted_state({"_iceberg_buffers": state["_iceberg_buffers"]})
+        assert _fh._iceberg_buffers[key]["records"] == [("rid-1", b'{"a":1}', 1)]
+        assert _fh._iceberg_buffers[key]["bytes"] == 7
+    finally:
+        with _fh._iceberg_buffers_lock:
+            _fh._iceberg_buffers.clear()
+            _fh._iceberg_buffers.update(saved)

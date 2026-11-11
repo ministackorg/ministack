@@ -13,7 +13,7 @@ Supports:
 Destinations supported: ExtendedS3, S3 (deprecated alias), HttpEndpoint, Iceberg.
 Records put to an S3 destination are written synchronously to the local S3
 emulator (bucket must already exist).  Iceberg destinations on the Glue Data
-Catalog are buffered and committed by ``firehose_iceberg``; S3 Tables ones are
+Catalog are buffered and committed as Iceberg snapshots; S3 Tables ones are
 written per record through DuckDB.  All other destinations buffer records
 in-memory (accessible for testing via PutRecord/PutRecordBatch round-trip).
 """
@@ -21,12 +21,16 @@ in-memory (accessible for testing via PutRecord/PutRecordBatch round-trip).
 import asyncio
 import base64
 import copy
+import datetime
 import json
 import logging
 import os
+import random
 import re
+import struct
 import threading
 import time
+import zlib
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant, spawn_background
@@ -41,7 +45,6 @@ from ministack.core.responses import (
     set_request_account_id,
     set_request_region,
 )
-from ministack.services import firehose_iceberg
 
 logger = logging.getLogger("firehose")
 
@@ -67,7 +70,9 @@ def reset():
 
 
 def get_state() -> dict:
-    return copy.deepcopy({"_streams": _streams, "_dest_counter": _dest_counter})
+    with _lock, _iceberg_buffers_lock:
+        buffers = [[*key, list(buf["records"])] for key, buf in _iceberg_buffers.items() if buf["records"]]
+        return copy.deepcopy({"_streams": _streams, "_dest_counter": _dest_counter, "_iceberg_buffers": buffers})
 
 
 def load_persisted_state(data):
@@ -78,6 +83,12 @@ def _restore_state(data: dict):
     global _dest_counter
     _streams.update(data.get("_streams", {}))
     _dest_counter = data.get("_dest_counter", _dest_counter)
+    for *key, records in data.get("_iceberg_buffers", []):
+        with _iceberg_buffers_lock:
+            buf = _iceberg_buffers.setdefault(tuple(key), _new_iceberg_buffer())
+            buf["records"].extend(tuple(r) for r in records)
+            buf["bytes"] += sum(len(r[1]) for r in records)
+        _start_iceberg_flusher()
 
 
 
@@ -1011,6 +1022,562 @@ def _deliver_to_iceberg(stream: dict, dest: dict, records: list):
         _deliver_iceberg_groups()
 
 
+# ─── Iceberg on the Glue Data Catalog: the commit ─────────────────────────────
+# One buffer of JSON records is appended to a format-version 2 table as one Iceberg commit: Parquet data files
+# per identity partition (DuckDB), a manifest, a manifest list that keeps the parent snapshot's manifests, a new
+# metadata.json, and a compare-and-swap of the Glue table's metadata_location. Table files live in MiniStack's S3.
+# Only string and timestamp columns are written: those are the types whose conversion was observed on AWS.
+
+_ICEBERG_MALFORMED = ("Iceberg.MalformedFieldWithinRecord",
+                      "Firehose is unable to convert column data in your record to the column type specified "
+                      "within the schema.")
+_ICEBERG_INVALID_JSON = ("Iceberg.InvalidPayload", "Delivery failed due to invalid input format. Make sure that "
+                         "the payload provided is in JSON Format.")
+_ICEBERG_NOT_A_ROW = ("Iceberg.InvalidPayload", "Cannot de-serialize proper row from event data.")
+# Held from the check that the table hasn't moved through writing the next metadata.json and swapping it in, so
+# two Firehose commits never write the same metadata file name (``vN`` tables have no unique part).
+_ICEBERG_COMMIT_LOCK = threading.Lock()
+# Firehose keeps the local date-time of an ISO string and ignores a trailing Z or offset; seconds and the fraction
+# are optional and digits past microseconds are dropped. A space instead of "T" is malformed.
+_ICEBERG_TS_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2})?")
+_ICEBERG_TYPES = {  # Iceberg type -> (Avro type, DuckDB type)
+    "string": ("string", "VARCHAR"),
+    "timestamp": ({"type": "long", "logicalType": "timestamp-micros", "adjust-to-utc": False}, "TIMESTAMP"),
+}
+_EPOCH = datetime.datetime(1970, 1, 1)
+# Iceberg's default write.metadata.metrics.default is truncate(16).
+_ICEBERG_TRUNCATE = 16
+
+
+class _IcebergMalformed(Exception):
+    pass
+
+
+def _iceberg_split_uri(uri):
+    for scheme in ("s3://", "s3a://", "s3n://"):
+        if uri.startswith(scheme):
+            bucket, _, key = uri[len(scheme):].partition("/")
+            return bucket, key
+    raise ValueError(f"not an S3 location: {uri}")
+
+
+def _iceberg_s3_get(uri):
+    from ministack.services import s3 as s3_svc
+
+    data = s3_svc._get_object_data(*_iceberg_split_uri(uri))
+    if data is None:
+        raise FileNotFoundError(uri)
+    return data
+
+
+def _iceberg_s3_put(uri, body):
+    from ministack.services import s3 as s3_svc
+
+    bucket, key = _iceberg_split_uri(uri)
+    headers = {"content-type": "application/octet-stream", "content-length": str(len(body)), "host": "s3.localhost"}
+    status, _, response = asyncio.run(
+        s3_svc.handle_request("PUT", f"/{bucket}/{key}", headers, body, {}, internal=True))
+    if status >= 300:
+        raise OSError(f"S3 PUT {uri} failed with {status}: {response[:200]!r}")
+
+
+# Avro object container files: the subset Iceberg manifests use.
+
+def _avro_zigzag(n):
+    out = bytearray()
+    n = (n << 1) ^ (n >> 63)
+    while n & ~0x7F:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _avro_encode(schema, value, out):
+    if isinstance(schema, list):
+        branch = 0 if value is None and "null" in schema else next(i for i, s in enumerate(schema) if s != "null")
+        out += _avro_zigzag(branch)
+        _avro_encode(schema[branch], value, out)
+        return
+    kind = schema["type"] if isinstance(schema, dict) else schema
+    if isinstance(kind, (dict, list)):
+        _avro_encode(kind, value, out)
+    elif kind == "null":
+        pass
+    elif kind == "boolean":
+        out.append(1 if value else 0)
+    elif kind in ("int", "long"):
+        out += _avro_zigzag(int(value))
+    elif kind in ("bytes", "string"):
+        raw = value.encode() if isinstance(value, str) else bytes(value)
+        out += _avro_zigzag(len(raw)) + raw
+    elif kind == "record":
+        for field in schema["fields"]:
+            _avro_encode(field["type"], (value or {}).get(field["name"]), out)
+    elif kind == "array":
+        if value:
+            out += _avro_zigzag(len(value))
+            for item in value:
+                _avro_encode(schema["items"], item, out)
+        out += _avro_zigzag(0)
+    else:
+        raise ValueError(f"unsupported Avro type {kind}")
+
+
+class _AvroReader:
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def long(self):
+        shift = result = 0
+        while True:
+            b = self.data[self.pos]
+            self.pos += 1
+            result |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return (result >> 1) ^ -(result & 1)
+            shift += 7
+
+    def take(self, n):
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+
+def _avro_decode(schema, r, named):
+    if isinstance(schema, list):
+        return _avro_decode(schema[r.long()], r, named)
+    if isinstance(schema, str) and schema in named:
+        return _avro_decode(named[schema], r, named)
+    kind = schema["type"] if isinstance(schema, dict) else schema
+    if isinstance(kind, (dict, list)):
+        return _avro_decode(kind, r, named)
+    if kind == "null":
+        return None
+    if kind == "boolean":
+        return r.take(1) == b"\x01"
+    if kind in ("int", "long"):
+        return r.long()
+    if kind == "float":
+        return struct.unpack("<f", r.take(4))[0]
+    if kind == "double":
+        return struct.unpack("<d", r.take(8))[0]
+    if kind == "bytes":
+        return r.take(r.long())
+    if kind == "string":
+        return r.take(r.long()).decode()
+    if kind == "fixed":
+        named.setdefault(schema["name"], schema)
+        return r.take(schema["size"])
+    if kind == "enum":
+        named.setdefault(schema["name"], schema)
+        return schema["symbols"][r.long()]
+    if kind == "record":
+        named.setdefault(schema["name"], schema)
+        return {f["name"]: _avro_decode(f["type"], r, named) for f in schema["fields"]}
+    if kind in ("array", "map"):
+        items = [] if kind == "array" else {}
+        while (count := r.long()) != 0:
+            if count < 0:
+                count = -count
+                r.long()
+            for _ in range(count):
+                if kind == "array":
+                    items.append(_avro_decode(schema["items"], r, named))
+                else:
+                    key = r.take(r.long()).decode()
+                    items[key] = _avro_decode(schema["values"], r, named)
+        return items
+    raise ValueError(f"unsupported Avro type {kind}")
+
+
+def _iceberg_avro_read(data):
+    """Records of an Avro object container file (null or deflate codec)."""
+    r = _AvroReader(data)
+    if r.take(4) != b"Obj\x01":
+        raise ValueError("not an Avro file")
+    meta = _avro_decode({"type": "map", "values": "bytes"}, r, {})
+    schema = json.loads(meta["avro.schema"])
+    codec = meta.get("avro.codec", b"null").decode()
+    if codec not in ("null", "deflate"):
+        raise ValueError(f"unsupported Avro codec {codec}")
+    sync = r.take(16)
+    records = []
+    while r.pos < len(data):
+        count = r.long()
+        block = r.take(r.long())
+        if codec == "deflate":
+            block = zlib.decompress(block, -15)
+        br = _AvroReader(block)
+        records.extend(_avro_decode(schema, br, {}) for _ in range(count))
+        if r.take(16) != sync:
+            raise ValueError("Avro sync marker mismatch")
+    return records
+
+
+def _iceberg_avro_write(schema, records, metadata):
+    out = bytearray(b"Obj\x01")
+    meta = {**metadata, "avro.schema": json.dumps(schema), "avro.codec": "null"}
+    _avro_encode({"type": "array", "items": {"type": "record", "name": "kv", "fields": [
+        {"name": "k", "type": "string"}, {"name": "v", "type": "bytes"}]}},
+        [{"k": k, "v": v.encode() if isinstance(v, str) else v} for k, v in meta.items()], out)
+    sync = os.urandom(16)
+    out += sync
+    block = bytearray()
+    for record in records:
+        _avro_encode(schema, record, block)
+    out += _avro_zigzag(len(records)) + _avro_zigzag(len(block)) + block + sync
+    return bytes(out)
+
+
+# A map is written as an array of {key, value} pairs: the bytes are the same as an Avro map's.
+def _avro_map(field_id, name, key_id, value_id, value_type):
+    return {"name": name, "field-id": field_id, "default": None, "type": ["null", {
+        "type": "array", "logicalType": "map", "items": {
+            "type": "record", "name": f"k{key_id}_v{value_id}", "fields": [
+                {"name": "key", "type": "int", "field-id": key_id},
+                {"name": "value", "type": value_type, "field-id": value_id}]}}]}
+
+
+def _iceberg_manifest_entry_schema(partition_fields):
+    return {"type": "record", "name": "manifest_entry", "fields": [
+        {"name": "status", "type": "int", "field-id": 0},
+        {"name": "snapshot_id", "type": ["null", "long"], "default": None, "field-id": 1},
+        {"name": "sequence_number", "type": ["null", "long"], "default": None, "field-id": 3},
+        {"name": "file_sequence_number", "type": ["null", "long"], "default": None, "field-id": 4},
+        {"name": "data_file", "field-id": 2, "type": {"type": "record", "name": "r2", "fields": [
+            {"name": "content", "type": "int", "field-id": 134},
+            {"name": "file_path", "type": "string", "field-id": 100},
+            {"name": "file_format", "type": "string", "field-id": 101},
+            {"name": "partition", "field-id": 102,
+             "type": {"type": "record", "name": "r102", "fields": partition_fields}},
+            {"name": "record_count", "type": "long", "field-id": 103},
+            {"name": "file_size_in_bytes", "type": "long", "field-id": 104},
+            _avro_map(108, "column_sizes", 117, 118, "long"),
+            _avro_map(109, "value_counts", 119, 120, "long"),
+            _avro_map(110, "null_value_counts", 121, 122, "long"),
+            _avro_map(137, "nan_value_counts", 138, 139, "long"),
+            _avro_map(125, "lower_bounds", 126, 127, "bytes"),
+            _avro_map(128, "upper_bounds", 129, 130, "bytes"),
+            {"name": "key_metadata", "type": ["null", "bytes"], "default": None, "field-id": 131},
+            {"name": "split_offsets", "default": None, "field-id": 132,
+             "type": ["null", {"type": "array", "items": "long", "element-id": 133}]},
+            {"name": "equality_ids", "default": None, "field-id": 135,
+             "type": ["null", {"type": "array", "items": "int", "element-id": 136}]},
+            {"name": "sort_order_id", "type": ["null", "int"], "default": None, "field-id": 140},
+        ]}},
+    ]}
+
+
+_ICEBERG_MANIFEST_FILE_SCHEMA = {"type": "record", "name": "manifest_file", "fields": [
+    {"name": "manifest_path", "type": "string", "field-id": 500},
+    {"name": "manifest_length", "type": "long", "field-id": 501},
+    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+    {"name": "content", "type": "int", "field-id": 517},
+    {"name": "sequence_number", "type": "long", "field-id": 515},
+    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "partitions", "default": None, "field-id": 507, "type": ["null", {
+        "type": "array", "element-id": 508, "items": {"type": "record", "name": "r508", "fields": [
+            {"name": "contains_null", "type": "boolean", "field-id": 509},
+            {"name": "contains_nan", "type": ["null", "boolean"], "default": None, "field-id": 518},
+            {"name": "lower_bound", "type": ["null", "bytes"], "default": None, "field-id": 510},
+            {"name": "upper_bound", "type": ["null", "bytes"], "default": None, "field-id": 511}]}}]},
+    {"name": "key_metadata", "type": ["null", "bytes"], "default": None, "field-id": 519},
+]}
+
+
+def _iceberg_micros(value):
+    delta = value - _EPOCH
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _iceberg_convert(iceberg_type, value):
+    """A JSON value as the Python value DuckDB writes for this column type; _IcebergMalformed if it can't be."""
+    if value is None:
+        return None
+    if iceberg_type == "string":
+        text = value if isinstance(value, str) else json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        text.encode()  # a lone surrogate from a JSON "\ud800" escape can't be written as UTF-8
+        return text
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _EPOCH + datetime.timedelta(microseconds=value)
+    m = _ICEBERG_TS_RE.fullmatch(value) if isinstance(value, str) else None
+    if not m:
+        raise _IcebergMalformed(value)
+    year, month, day, hour, minute, second = (int(g or 0) for g in m.groups()[:6])
+    return datetime.datetime(year, month, day, hour, minute, second, int((m.group(7) or "").ljust(6, "0")[:6]))
+
+
+def _iceberg_single_value(iceberg_type, value):
+    """Iceberg's binary single-value serialization, used for bounds."""
+    return value.encode() if iceberg_type == "string" else struct.pack("<q", _iceberg_micros(value))
+
+
+def _iceberg_bounds(iceberg_type, values):
+    present = [v for v in values if v is not None]
+    if not present:
+        return None, None
+    low, high = min(present), max(present)
+    if iceberg_type != "string":
+        return _iceberg_single_value(iceberg_type, low), _iceberg_single_value(iceberg_type, high)
+    low = low[:_ICEBERG_TRUNCATE]
+    if len(high) > _ICEBERG_TRUNCATE:
+        chars = list(high[:_ICEBERG_TRUNCATE])
+        while chars:
+            code = ord(chars[-1]) + 1
+            if code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF:
+                chars[-1] = chr(code)
+                break
+            chars.pop()
+        if not chars:
+            return low.encode(), None
+        high = "".join(chars)
+    return low.encode(), high.encode()
+
+
+def _iceberg_schema(metadata):
+    schema_id = metadata.get("current-schema-id", 0)
+    return next(s for s in metadata["schemas"] if s.get("schema-id", 0) == schema_id)
+
+
+def _iceberg_spec(metadata):
+    spec_id = metadata.get("default-spec-id", 0)
+    return next(s for s in metadata["partition-specs"] if s.get("spec-id", 0) == spec_id)
+
+
+def _iceberg_next_metadata_name(location):
+    base = location.rsplit("/", 1)[-1]
+    m = re.match(r"(\d+)-", base)
+    if m:
+        return f"{int(m.group(1)) + 1:05d}-{new_uuid()}.metadata.json"
+    m = re.match(r"v(\d+)\.", base)
+    if m:
+        return f"v{int(m.group(1)) + 1}.metadata.json"
+    return f"00001-{new_uuid()}.metadata.json"
+
+
+def _iceberg_metadata_location(database, table):
+    from ministack.services import glue as glue_svc
+
+    entry = glue_svc._tables.get(f"{database}/{table}")
+    location = ((entry or {}).get("Parameters") or {}).get("metadata_location")
+    if not location:
+        raise LookupError(f"Iceberg table {database}.{table} not found in the Glue Data Catalog")
+    return location
+
+
+def _iceberg_load_table(database, table):
+    """The table's current metadata.json, checked for what this writer supports."""
+    metadata = json.loads(_iceberg_s3_get(_iceberg_metadata_location(database, table)))
+    if metadata.get("format-version") != 2:
+        raise ValueError(f"{database}.{table} is Iceberg format-version {metadata.get('format-version')}; "
+                         "MiniStack's Firehose writes format-version 2 tables")
+    for column in _iceberg_schema(metadata)["fields"]:
+        if column["type"] not in _ICEBERG_TYPES or column.get("required"):
+            raise ValueError(f"column {column['name']} ({'required ' if column.get('required') else ''}"
+                             f"{column['type']}) can't be written by MiniStack's Firehose, which writes optional "
+                             "string and timestamp columns")
+    for field in _iceberg_spec(metadata)["fields"]:
+        if field["transform"] != "identity":
+            raise ValueError(f"partition transform {field['transform']} is not supported by MiniStack's Firehose")
+    return metadata
+
+
+def _iceberg_error_document(raw, arrival_ms, code, message, attempted=False):
+    # A payload that isn't a JSON object is rejected before any attempt: AWS reports 0 attempts and a 0 end time.
+    return {"attemptsMade": 1 if attempted else 0, "arrivalTimestamp": arrival_ms, "errorCode": code,
+            "errorMessage": message, "attemptEndingTimestamp": int(time.time() * 1000) if attempted else 0,
+            "rawData": base64.b64encode(raw).decode()}
+
+
+def _iceberg_prepare_rows(metadata, records):
+    """Split ``records`` [(raw bytes, arrival ms)] into rows in the table's schema and error-output documents."""
+    columns = _iceberg_schema(metadata)["fields"]
+    rows, failed = [], []
+    for raw, arrival_ms in records:
+        try:
+            text = raw.decode("utf-8")
+            # Firehose reads the first JSON value and ignores anything after it.
+            document = json.JSONDecoder().raw_decode(text, len(text) - len(text.lstrip()))[0]
+        except (ValueError, UnicodeDecodeError):
+            failed.append(_iceberg_error_document(raw, arrival_ms, *_ICEBERG_INVALID_JSON))
+            continue
+        if not isinstance(document, dict):
+            failed.append(_iceberg_error_document(raw, arrival_ms, *_ICEBERG_NOT_A_ROW))
+            continue
+        try:
+            rows.append({c["name"]: _iceberg_convert(c["type"], document.get(c["name"])) for c in columns})
+        except (_IcebergMalformed, OverflowError, ValueError, UnicodeError):
+            failed.append(_iceberg_error_document(raw, arrival_ms, *_ICEBERG_MALFORMED, attempted=True))
+    return rows, failed
+
+
+def _iceberg_write_data_files(metadata, rows, sequence):
+    """One Parquet file per partition; returns the manifest's data_file records."""
+    try:
+        import duckdb
+    except ImportError as exc:
+        raise RuntimeError("Firehose delivery to Iceberg needs DuckDB (the full image)") from exc
+    import tempfile
+    import urllib.parse
+
+    columns = _iceberg_schema(metadata)["fields"]
+    by_id = {c["id"]: c for c in columns}
+    spec_fields = _iceberg_spec(metadata)["fields"]
+    groups = {}
+    for row in rows:
+        groups.setdefault(tuple(row[by_id[f["source-id"]]["name"]] for f in spec_fields), []).append(row)
+
+    def ident(name):
+        return '"' + name.replace('"', '""') + '"'
+
+    select = ", ".join(f"unnest(${i + 1}::{_ICEBERG_TYPES[c['type']][1]}[]) AS {ident(c['name'])}"
+                       for i, c in enumerate(columns))
+    field_ids = ", ".join(f"{ident(c['name'])}: {c['id']}" for c in columns)
+    data_path = metadata.get("properties", {}).get("write.data.path") or f"{metadata['location'].rstrip('/')}/data"
+    query_id = new_uuid()
+    files = []
+    with tempfile.TemporaryDirectory() as tmp:
+        con = duckdb.connect()
+        try:
+            for n, (key, group) in enumerate(groups.items(), start=1):
+                local = os.path.join(tmp, f"{n}.parquet")
+                values = [[row[c["name"]] for row in group] for c in columns]
+                con.execute(f"COPY (SELECT {select}) TO '{local}' (FORMAT parquet, COMPRESSION zstd, "
+                            f"FIELD_IDS {{{field_ids}}})", values)
+                with open(local, "rb") as fh:
+                    body = fh.read()
+                partition_dir = "/".join(
+                    f"{f['name']}=" + ("null" if v is None else urllib.parse.quote(
+                        v if isinstance(v, str) else v.isoformat(), safe=""))
+                    for f, v in zip(spec_fields, key))
+                name = f"{sequence:05d}-{n}-{query_id}-{n:05d}.parquet"
+                path = f"{data_path}/{partition_dir}/{name}" if partition_dir else f"{data_path}/{name}"
+                _iceberg_s3_put(path, body)
+                bounds = [(c["id"], *_iceberg_bounds(c["type"], vals)) for c, vals in zip(columns, values)]
+                files.append({
+                    "content": 0, "file_path": path, "file_format": "PARQUET",
+                    "partition": {f["name"]: None if v is None else v if isinstance(v, str) else _iceberg_micros(v)
+                                  for f, v in zip(spec_fields, key)},
+                    "record_count": len(group), "file_size_in_bytes": len(body),
+                    "value_counts": [{"key": c["id"], "value": len(group)} for c in columns],
+                    "null_value_counts": [{"key": c["id"], "value": sum(v is None for v in vals)}
+                                          for c, vals in zip(columns, values)],
+                    "lower_bounds": [{"key": i, "value": low} for i, low, _ in bounds if low is not None],
+                    "upper_bounds": [{"key": i, "value": high} for i, _, high in bounds if high is not None],
+                    "_key": key,
+                })
+        finally:
+            con.close()
+    return files
+
+
+def _iceberg_partition_summaries(metadata, files):
+    columns = {c["id"]: c for c in _iceberg_schema(metadata)["fields"]}
+    summaries = []
+    for i, field in enumerate(_iceberg_spec(metadata)["fields"]):
+        iceberg_type = columns[field["source-id"]]["type"]
+        values = [f["_key"][i] for f in files]
+        present = [v for v in values if v is not None]
+        summaries.append({"contains_null": len(present) < len(values), "contains_nan": False,
+                          "lower_bound": _iceberg_single_value(iceberg_type, min(present)) if present else None,
+                          "upper_bound": _iceberg_single_value(iceberg_type, max(present)) if present else None})
+    return summaries
+
+
+def _iceberg_append(database, table, metadata, rows, summary_extra):
+    """Append ``rows`` to the table as one snapshot; retries Glue conflicts."""
+    from ministack.services import glue as glue_svc
+
+    location = _iceberg_metadata_location(database, table)
+    base = metadata["location"].rstrip("/")
+    files = _iceberg_write_data_files(metadata, rows, metadata.get("last-sequence-number", 0) + 1)
+    snapshot_id = random.getrandbits(63) or 1
+    schema, spec = _iceberg_schema(metadata), _iceberg_spec(metadata)
+    columns = {c["id"]: c for c in schema["fields"]}
+    partition_fields = [{"name": f["name"], "field-id": f["field-id"], "default": None,
+                         "type": ["null", _ICEBERG_TYPES[columns[f["source-id"]]["type"]][0]]}
+                        for f in spec["fields"]]
+    manifest = _iceberg_avro_write(_iceberg_manifest_entry_schema(partition_fields), [
+        {"status": 1, "snapshot_id": snapshot_id, "data_file": {k: v for k, v in f.items() if k != "_key"}}
+        for f in files], {
+        "schema": json.dumps(schema), "schema-id": str(schema.get("schema-id", 0)),
+        "partition-spec": json.dumps(spec["fields"]), "partition-spec-id": str(spec.get("spec-id", 0)),
+        "format-version": "2", "content": "data"})
+    manifest_path = f"{base}/metadata/{new_uuid()}-m0.avro"
+    _iceberg_s3_put(manifest_path, manifest)
+    added_records = sum(f["record_count"] for f in files)
+    added_size = sum(f["file_size_in_bytes"] for f in files)
+
+    retries = int(metadata.get("properties", {}).get("commit.retry.num-retries", 4))
+    for attempt in range(retries + 1):
+        if attempt:
+            location = _iceberg_metadata_location(database, table)
+            metadata = json.loads(_iceberg_s3_get(location))
+            if _iceberg_schema(metadata) != schema or _iceberg_spec(metadata) != spec:
+                raise ValueError(f"{database}.{table}: schema or partition spec changed during the commit")
+        sequence = metadata.get("last-sequence-number", 0) + 1
+        parent_id = metadata.get("current-snapshot-id")
+        parent = next((s for s in metadata.get("snapshots", []) if s["snapshot-id"] == parent_id), None)
+        if parent is None and parent_id not in (None, -1):
+            raise ValueError(f"{database}.{table}: current snapshot {parent_id} is not in its metadata")
+        existing = _iceberg_avro_read(_iceberg_s3_get(parent["manifest-list"])) if parent else []
+        manifest_entry = {
+            "manifest_path": manifest_path, "manifest_length": len(manifest),
+            "partition_spec_id": spec.get("spec-id", 0), "content": 0, "sequence_number": sequence,
+            "min_sequence_number": sequence, "added_snapshot_id": snapshot_id, "added_files_count": len(files),
+            "existing_files_count": 0, "deleted_files_count": 0, "added_rows_count": added_records,
+            "existing_rows_count": 0, "deleted_rows_count": 0,
+            "partitions": _iceberg_partition_summaries(metadata, files)}
+        manifest_list_path = f"{base}/metadata/snap-{snapshot_id}-1-{new_uuid()}.avro"
+        _iceberg_s3_put(manifest_list_path, _iceberg_avro_write(
+            _ICEBERG_MANIFEST_FILE_SCHEMA, [manifest_entry, *existing], {
+                "snapshot-id": str(snapshot_id), "parent-snapshot-id": str(parent_id if parent else "null"),
+                "sequence-number": str(sequence), "format-version": "2"}))
+
+        totals = (parent or {}).get("summary", {})
+        now_ms = int(time.time() * 1000)
+        summary = {"operation": "append", **summary_extra,
+                   "added-data-files": str(len(files)), "added-records": str(added_records),
+                   "added-files-size": str(added_size), "changed-partition-count": str(len(files)),
+                   "total-records": str(int(totals.get("total-records", 0)) + added_records),
+                   "total-files-size": str(int(totals.get("total-files-size", 0)) + added_size),
+                   "total-data-files": str(int(totals.get("total-data-files", 0)) + len(files)),
+                   "total-delete-files": totals.get("total-delete-files", "0"),
+                   "total-position-deletes": totals.get("total-position-deletes", "0"),
+                   "total-equality-deletes": totals.get("total-equality-deletes", "0")}
+        snapshot = {"sequence-number": sequence, "snapshot-id": snapshot_id, "timestamp-ms": now_ms,
+                    "summary": summary, "manifest-list": manifest_list_path, "schema-id": schema.get("schema-id", 0)}
+        if parent:
+            snapshot["parent-snapshot-id"] = parent_id
+        keep = int(metadata.get("properties", {}).get("write.metadata.previous-versions-max", 100))
+        new = {**metadata, "last-sequence-number": sequence, "last-updated-ms": now_ms,
+               "current-snapshot-id": snapshot_id,
+               "snapshots": [*metadata.get("snapshots", []), snapshot],
+               "snapshot-log": [*metadata.get("snapshot-log", []), {"timestamp-ms": now_ms, "snapshot-id": snapshot_id}],
+               "refs": {**metadata.get("refs", {}), "main": {"snapshot-id": snapshot_id, "type": "branch"}},
+               "metadata-log": [*metadata.get("metadata-log", []),
+                                {"timestamp-ms": metadata.get("last-updated-ms", now_ms), "metadata-file": location}
+                                ][-keep:]}
+        new_location = f"{base}/metadata/{_iceberg_next_metadata_name(location)}"
+        with _ICEBERG_COMMIT_LOCK:
+            if _iceberg_metadata_location(database, table) == location:
+                _iceberg_s3_put(new_location, json.dumps(new).encode())
+                if glue_svc.swap_iceberg_metadata_location(database, table, location, new_location):
+                    return
+        if attempt == retries:
+            raise RuntimeError(f"{database}.{table} kept changing; gave up after {retries + 1} attempts")
+        time.sleep(min(0.1 * 2 ** attempt, 2))
+
+
 # ─── Iceberg on the Glue Data Catalog: buffered delivery ──────────────────────
 # Records wait in a per-destination buffer until BufferingHints.IntervalInSeconds has passed since the oldest
 # one arrived, or SizeInMBs is reached; IntervalInSeconds 0 delivers before PutRecord/PutRecordBatch returns.
@@ -1031,24 +1598,32 @@ def _is_glue_iceberg(dest: dict) -> bool:
 
 def _buffer_for_iceberg(stream: dict, dest: dict, record_id: str, raw: bytes):
     """Append one record to the destination's buffer; returns the buffer key if it is due right away."""
-    global _iceberg_flusher_started
     key = (get_account_id(), get_region(), stream["name"], dest["id"])
     with _iceberg_buffers_lock:
-        buf = _iceberg_buffers.setdefault(key, {"records": [], "bytes": 0, "retry_at": 0,
-                                                "deliver": threading.Lock()})
+        buf = _iceberg_buffers.setdefault(key, _new_iceberg_buffer())
         buf["records"].append((record_id, raw, int(time.time() * 1000)))
         buf["bytes"] += len(raw)
-        start = not _iceberg_flusher_started
-        _iceberg_flusher_started = True
-    if start:
-        try:
-            spawn_background(_iceberg_flusher, thread_name="ministack-firehose-iceberg-flusher")
-        except RuntimeError:
-            with _iceberg_buffers_lock:
-                _iceberg_flusher_started = False
-            raise
+    _start_iceberg_flusher()
     hints = dest["config"].get("BufferingHints") or {}
     return key if hints.get("IntervalInSeconds", 300) == 0 else None
+
+
+def _new_iceberg_buffer():
+    return {"records": [], "bytes": 0, "retry_at": 0, "deliver": threading.Lock()}
+
+
+def _start_iceberg_flusher():
+    global _iceberg_flusher_started
+    with _iceberg_buffers_lock:
+        if _iceberg_flusher_started:
+            return
+        _iceberg_flusher_started = True
+    try:
+        spawn_background(_iceberg_flusher, thread_name="ministack-firehose-iceberg-flusher")
+    except RuntimeError:
+        with _iceberg_buffers_lock:
+            _iceberg_flusher_started = False
+        raise
 
 
 def _iceberg_flusher():
@@ -1113,12 +1688,12 @@ def _commit_glue_iceberg(stream: dict, dest: dict, batch: list):
     database, table = table_cfg.get("DestinationDatabaseName"), table_cfg.get("DestinationTableName")
     arrival = {rid: ms for rid, _, ms in batch}
     processed = _apply_lambda_processors(stream, dest, [(rid, raw) for rid, raw, _ in batch])
-    metadata = json.loads(firehose_iceberg.s3_get(firehose_iceberg.glue_table(database, table)))
-    rows, failed = firehose_iceberg.prepare_rows(
+    metadata = _iceberg_load_table(database, table)
+    rows, failed = _iceberg_prepare_rows(
         metadata, [(raw, arrival.get(rid, batch[0][2])) for rid, raw in processed])
     if rows:
         checkpoint = dest.get("iceberg_checkpoint", 0) + 1
-        firehose_iceberg.append(database, table, rows, {
+        _iceberg_append(database, table, metadata, rows, {
             "FIREHOSE-DELIVERY-STREAM-ID": f"{get_account_id()}:{stream['name']}:{int(stream['created_at'] * 1000)}",
             "FIREHOSE-INTERNAL-CHECKPOINT": f"{checkpoint:018d},,,{0:018d}",
         })
@@ -1149,15 +1724,11 @@ def _write_iceberg_errors(stream: dict, cfg: dict, documents: list):
     try:
         bucket = _s3_bucket_from_arn(s3_cfg.get("BucketARN", ""))
         t = time.gmtime()
-        prefix = s3_cfg.get("ErrorOutputPrefix", "")
-        if "!{" in prefix:
-            prefix = _evaluate_prefix(prefix, t, error_type="iceberg-failed")
-        else:
-            prefix = f"{prefix}iceberg-failed/{_java_time('yyyy/MM/dd/HH/', t)}"
+        prefix = f"{s3_cfg.get('ErrorOutputPrefix', '')}iceberg-failed/{_java_time('yyyy/MM/dd/HH/', t)}"
         key = (f"{prefix}{stream['name']}-{stream.get('version', 1)}-"
                f"{_java_time('yyyy-MM-dd-HH-mm-ss', t)}-{new_uuid()}")
         body = "".join(json.dumps(d) + "\n" for d in documents).encode()
-        firehose_iceberg.s3_put(f"s3://{bucket}/{key}", body)
+        _iceberg_s3_put(f"s3://{bucket}/{key}", body)
     except Exception as exc:
         logger.warning("Firehose %s: writing %d failed records to the error output failed: %s",
                        stream["name"], len(documents), exc)
@@ -1485,14 +2056,9 @@ def _put_record_batch(data: dict):
 def _validate_iceberg_config(dtype: str, cfg: dict, path: str):
     if dtype != "Iceberg":
         return None
-    hints = cfg.get("BufferingHints") or {}
-    for key, member, low, high in (("IntervalInSeconds", "intervalInSeconds", 0, 900),
-                                   ("SizeInMBs", "sizeInMBs", 1, 128)):
-        value = hints.get(key)
-        if value is not None and value > high:
-            return _validation_error(f"{path}.bufferingHints.{member}", f"have value less than or equal to {high}")
-        if value is not None and value < low:
-            return _validation_error(f"{path}.bufferingHints.{member}", f"have value greater than or equal to {low}")
+    interval = (cfg.get("BufferingHints") or {}).get("IntervalInSeconds")
+    if interval is not None and interval > 900:
+        return _validation_error(f"{path}.bufferingHints.intervalInSeconds", "have value less than or equal to 900")
     return None
 
 
