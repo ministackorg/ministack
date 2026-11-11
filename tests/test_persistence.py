@@ -5936,3 +5936,84 @@ def test_ec2_verified_access_reset_clears_stores():
         assert got["group"] not in mod._va_groups
         assert got["ep"] not in mod._va_endpoints
         assert mod._tags.get(got["inst"]) is None
+
+
+@pytest.mark.serial
+def test_state_survives_a_kill_that_skips_shutdown(tmp_path):
+    """State written while running survives a process that is killed outright.
+
+    The shutdown save runs only when the server gets to shut down. SIGKILL (the
+    kernel's out-of-memory killer, `docker kill`, a Kubernetes eviction past its
+    grace period, a host that loses power) runs no handler at all, so state that
+    exists only in memory is gone on the next boot. A save that runs while the
+    server is up is the only one that survives that.
+    """
+    import json
+    import os
+    import socket
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    import uuid
+
+    import boto3
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    def free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def spawn(port):
+        env = {
+            **os.environ,
+            "LOG_LEVEL": "WARNING",
+            "GATEWAY_PORT": str(port),
+            "PERSIST_STATE": "1",
+            "STATE_DIR": str(tmp_path),
+            "PERSIST_INTERVAL": "1",
+        }
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "hypercorn", "ministack.app:app", "--bind", f"127.0.0.1:{port}"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, cwd=repo_root,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/_ministack/health", timeout=1)
+                return proc
+            except OSError:
+                time.sleep(0.2)
+        proc.kill()
+        raise AssertionError("MiniStack did not become healthy")
+
+    def sqs(port):
+        return boto3.client(
+            "sqs", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+            aws_access_key_id="test", aws_secret_access_key="test",
+        )
+
+    name = f"kept-{uuid.uuid4().hex[:8]}"
+    port = free_port()
+    proc = spawn(port)
+    try:
+        sqs(port).create_queue(QueueName=name)
+        saved = tmp_path / "sqs.json"
+        deadline = time.time() + 10
+        while time.time() < deadline and not (saved.exists() and name in saved.read_text()):
+            time.sleep(0.2)
+        assert saved.exists() and name in saved.read_text(), "the queue never reached disk while the server ran"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+    port = free_port()
+    proc = spawn(port)
+    try:
+        urls = sqs(port).list_queues().get("QueueUrls", [])
+        assert any(u.endswith(f"/{name}") for u in urls), json.dumps(urls)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
