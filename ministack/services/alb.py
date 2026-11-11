@@ -1190,6 +1190,9 @@ def _create_listener(params):
     l_arn = (f"arn:aws:elasticloadbalancing:{get_region()}:{get_account_id()}"
              f":listener/{_lb_type_segment(lb_arn)}/{lb_name}/{lb_id}/{lid}")
     actions = _parse_actions(params, "DefaultActions")
+    err = _cognito_action_error(actions, _p(params, "Protocol", "HTTP"))
+    if err:
+        return err
     for action in actions:
         for tg_arn in _action_target_groups(action):
             if tg_arn in _tgs and lb_arn not in _tgs[tg_arn]["LoadBalancerArns"]:
@@ -1253,15 +1256,21 @@ def _modify_listener(params):
     certs, err = _default_certificate(params)
     if err:
         return err
+    actions = _parse_actions(params, "DefaultActions")
+    protocol = _p(params, "Protocol")
+    err = _cognito_action_error(actions, protocol or listener.get("Protocol"))
+    if (err is None and protocol and not actions and protocol.upper() != "HTTPS"
+            and any((a.get("Type") or "").lower() == "authenticate-cognito" for a in listener.get("DefaultActions", []))):
+        err = _cognito_action_error([{"Type": "authenticate-cognito"}], protocol)
+    if err:
+        return err
     port = _p(params, "Port")
     if port:
         listener["Port"] = int(port)
-    protocol = _p(params, "Protocol")
     if protocol:
         listener["Protocol"] = protocol
     _apply_tls_settings(listener, certs, _p(params, "SslPolicy"))
     listener.update(_listener_members(params))
-    actions = _parse_actions(params, "DefaultActions")
     if actions:
         listener["DefaultActions"] = actions
         for action in actions:
@@ -1402,6 +1411,10 @@ def _create_rule(params):
     if l_arn not in _listeners:
         return _error("ListenerNotFound", f"Listener '{l_arn}' not found.")
     listener = _listeners[l_arn]
+    actions = _parse_actions(params, "Actions")
+    err = _cognito_action_error(actions, listener.get("Protocol"))
+    if err:
+        return err
     lb_arn = listener["LoadBalancerArn"]
     lb_name = _lbs[lb_arn]["LoadBalancerName"]
     lb_id = _load_balancer_id_from_arn(lb_arn)
@@ -1413,7 +1426,7 @@ def _create_rule(params):
         "RuleArn": rule_arn, "ListenerArn": l_arn,
         "Priority": _p(params, "Priority", "1"),
         "Conditions": _parse_conditions(params),
-        "Actions": _parse_actions(params, "Actions"),
+        "Actions": actions,
         "IsDefault": False,
         "Transforms": transforms,
     }
@@ -1458,6 +1471,9 @@ def _modify_rule(params):
         return _error("RuleNotFound", f"Rule '{arn}' not found.")
     if rule.get("IsDefault"):
         return _error("OperationNotPermitted", f"Default rule '{arn}' cannot be modified")
+    err = _cognito_action_error(acts, _listeners.get(rule.get("ListenerArn"), {}).get("Protocol"))
+    if err:
+        return err
     if conds:
         rule["Conditions"] = conds
     if acts:
@@ -2036,22 +2052,100 @@ def _oidc_b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode()
 
 
+def _cognito_pool(cfg):
+    """(pool, client) an authenticate-cognito config names, looked up in the pool ARN's own scope."""
+    from ministack.services import cognito
+    try:
+        owner = parse_arn(cfg.get("UserPoolArn") or "")
+    except ArnParseError:
+        return None, None
+    with request_scope(owner.account_id, owner.region):
+        pool = cognito._user_pools.get(owner.resource.split("/", 1)[-1])
+    client = (pool or {}).get("_clients", {}).get(cfg.get("UserPoolClientId") or "")
+    return (pool, client) if client is not None else (None, None)
+
+
+def _cognito_action_error(actions, protocol):
+    """The InvalidLoadBalancerAction AWS answers for an authenticate-cognito action (captured), or None."""
+    for action in actions:
+        if (action.get("Type") or "").lower() != "authenticate-cognito":
+            continue
+        if (protocol or "HTTP").upper() != "HTTPS":
+            return _error("InvalidLoadBalancerAction",
+                          "Actions of type 'authenticate-cognito' are supported only on HTTPS listeners")
+        cfg = action.get("AuthenticateCognitoConfig") or {}
+        pool, _ = _cognito_pool(cfg)
+        if pool is None:
+            return _error("InvalidLoadBalancerAction",
+                          f"The user pool client '{cfg.get('UserPoolClientId', '')}' does not exist in the provided user pool")
+        domain = cfg.get("UserPoolDomain") or ""
+        prefix = pool.get("Domain")
+        region = parse_arn(cfg["UserPoolArn"]).region
+        if not domain or domain not in {prefix, f"{prefix}.auth.{region}.amazoncognito.com" if prefix else None,
+                                        pool.get("CustomDomain")}:
+            return _error("InvalidLoadBalancerAction",
+                          f"The user pool domain '{domain}' is not associated with the provided user pool")
+    return None
+
+
+def _cognito_as_oidc(action):
+    """An authenticate-cognito action as the OIDC config its user pool implies, or None if the pool is gone.
+
+    The browser goes to the pool's domain, as on AWS; the token and user info calls go to the local gateway.
+    """
+    from ministack.services import cognito
+    cfg = action.get("AuthenticateCognitoConfig") or {}
+    pool, client = _cognito_pool(cfg)
+    if pool is None:
+        return None
+    region = parse_arn(cfg["UserPoolArn"]).region
+    gateway = f"http://127.0.0.1:{cognito._MINISTACK_PORT}"
+    return {**action, "AuthenticateOidcConfig": {
+        **{k: v for k, v in cfg.items() if k not in ("UserPoolArn", "UserPoolClientId", "UserPoolDomain")},
+        "Issuer": f"https://cognito-idp.{region}.amazonaws.com/{pool['Id']}",
+        "AuthorizationEndpoint": cognito._pool_domain_base_url(pool) + "/oauth2/authorize",
+        "TokenEndpoint": f"{gateway}/oauth2/token",
+        "UserInfoEndpoint": f"{gateway}/oauth2/userInfo",
+        "ClientId": client["ClientId"],
+        "ClientSecret": client.get("ClientSecret") or "",
+    }}
+
+
+# Captured from authenticate-cognito: x-amzn-oidc-data expires two minutes after it is issued.
+_COGNITO_DATA_TTL = 120
+# Captured from authenticate-cognito with OnUnauthenticatedRequest=deny.
+_ALB_401_BODY = (b"<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n"
+                 b"<center><h1>401 Authorization Required</h1></center>\r\n</body>\r\n</html>\r\n")
+
+
+def _cognito_data_jwt(claims, cfg, lb_arn):
+    """x-amzn-oidc-data as authenticate-cognito sends it (captured): the user info claims plus exp and iss."""
+    exp = int(time.time()) + _COGNITO_DATA_TTL
+    header = {"typ": "JWT", "kid": _oidc_signing_material()[1], "alg": "ES256", "iss": cfg.get("Issuer", ""),
+              "client": cfg.get("ClientId", ""), "signer": lb_arn, "exp": exp}
+    return _signed_data_jwt(header, {**claims, "exp": exp, "iss": cfg.get("Issuer", "")})
+
+
 def _oidc_data_jwt(claims, cfg, lb_arn, exp):
     """Build x-amzn-oidc-data the way AWS documents it: the user claims as an
     ES256 JWT whose header carries ``kid``, ``signer`` (the load balancer ARN),
     ``iss``, ``client`` and ``exp``. The payload is the claims from the user
     info endpoint — never the provider's ID token, which AWS does not pass to
     the backend."""
-    key, kid = _oidc_signing_material()
     header = {
         "typ": "JWT",
         "alg": "ES256",
-        "kid": kid,
+        "kid": _oidc_signing_material()[1],
         "signer": lb_arn,
         "iss": cfg.get("Issuer", ""),
         "client": cfg.get("ClientId", ""),
         "exp": exp,
     }
+    return _signed_data_jwt(header, claims)
+
+
+def _signed_data_jwt(header, claims):
+    key, _ = _oidc_signing_material()
     signing_input = (
         _oidc_b64url(json.dumps(header, separators=(",", ":")).encode())
         + "."
@@ -2124,7 +2218,7 @@ async def _oidc_session_from_tokens(cfg, tokens, session_exp, refresh_token=""):
 
 
 async def _authenticate_oidc(action, method, path, headers, body, query_params, listener_port,
-                             lb_arn=""):
+                             lb_arn="", cognito=False):
     """Run one authenticate-oidc action.
 
     Returns None when the caller is authenticated and the request should carry
@@ -2211,8 +2305,8 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         claims = session.get("claims") or {}
         headers["x-amzn-oidc-identity"] = str(claims.get("sub", ""))
         headers["x-amzn-oidc-accesstoken"] = session.get("access_token", "")
-        headers["x-amzn-oidc-data"] = _oidc_data_jwt(
-            claims, cfg, lb_arn, int(session.get("exp", 0)))
+        headers["x-amzn-oidc-data"] = (_cognito_data_jwt(claims, cfg, lb_arn) if cognito else
+                                       _oidc_data_jwt(claims, cfg, lb_arn, int(session.get("exp", 0))))
         return None
 
     # --- no usable session -------------------------------------------------
@@ -2221,6 +2315,8 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         return None
     if on_unauth == "deny" and not session:
         # deny answers 401 to a request with no authentication information; expired information is sent to the IdP.
+        if cognito:
+            return (401, {"Content-Type": "text/html"}, _ALB_401_BODY)
         return (401, {"Content-Type": "text/plain"}, b"Unauthorized")
 
     host = headers.get("host") or f"localhost:{listener_port}"
@@ -2240,14 +2336,20 @@ async def _authenticate_oidc(action, method, path, headers, body, query_params, 
         "redirect_uri": redirect_uri,
         "created": time.time(),
     }
-    location = cfg.get("AuthorizationEndpoint", "") + "?" + urlencode({
-        **(cfg.get("AuthenticationRequestExtraParams") or {}),
+    params = {
         "client_id": cfg.get("ClientId", ""),
         "response_type": "code",
         "scope": cfg.get("Scope") or "openid",
         "redirect_uri": redirect_uri,
         "state": state,
-    })
+    }
+    if cognito:
+        # Captured order: client_id, redirect_uri, response_type, scope, state, then the extra params.
+        params = {k: params[k] for k in ("client_id", "redirect_uri", "response_type", "scope", "state")}
+        params.update({k: v for k, v in (cfg.get("AuthenticationRequestExtraParams") or {}).items() if k not in params})
+    else:
+        params = {**(cfg.get("AuthenticationRequestExtraParams") or {}), **params}
+    location = cfg.get("AuthorizationEndpoint", "") + "?" + urlencode(params)
     expired = _oidc_expiry_cookies(cookie_name, len(jar)) if session else []
     out_headers = {"Location": location, "Content-Type": "text/plain"}
     if expired:
@@ -2280,10 +2382,15 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
 
     for action in ordered:
         atype = (action.get("Type") or "").lower()
-        if atype == "authenticate-oidc":
-            response = await _authenticate_oidc(action, method, path, forwarded,
+        if atype in ("authenticate-oidc", "authenticate-cognito"):
+            cognito = atype == "authenticate-cognito"
+            oidc_action = _cognito_as_oidc(action) if cognito else action
+            if oidc_action is None:
+                return (561, {"Content-Type": "text/plain"},
+                        b"Authentication failed: the user pool or app client no longer exists")
+            response = await _authenticate_oidc(oidc_action, method, path, forwarded,
                                                 body, query_params, listener_port,
-                                                lb_arn=lb_arn)
+                                                lb_arn=lb_arn, cognito=cognito)
             if response is not None:
                 return response
             refreshed = forwarded.pop(_OIDC_REFRESHED_COOKIES, None)
@@ -2297,13 +2404,6 @@ async def _execute_actions(actions, method, path, headers, body, query_params, l
                 out_headers["Set-Cookie"] = ([existing] if isinstance(existing, str) else list(existing or [])) + refreshed
                 return status, out_headers, out_body
             continue
-        if atype == "authenticate-cognito":
-            # Cognito authentication is the same protocol with the endpoints
-            # derived from a user pool rather than given explicitly. Not
-            # implemented; failing loudly beats forwarding an unauthenticated
-            # request to a target that assumes the load balancer checked.
-            return (501, {"Content-Type": "application/json"},
-                    json.dumps({"message": "authenticate-cognito is not implemented"}).encode())
         if atype == "forward":
             action = {**action, "TargetGroupArn": _forward_target_group(action)}
         tg = _tgs.get(action.get("TargetGroupArn", "")) if atype == "forward" else None

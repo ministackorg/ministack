@@ -3684,8 +3684,12 @@ def test_glue_get_partitions_java_timestamp_and_limits(glue, partition_db):
     assert call(Expression="k = '2024-01-15 01:02:03.1234567891'") == {"Code": "InvalidInputException", "Message":
         prefix + "Timestamp format must be yyyy-mm-dd hh:mm:ss[.fffffffff] 2024-01-15 01:02:03.1234567891 is not a timestamp."}
 
-    assert call(Expression="(" * 500 + "k = '2024-01-15 01:02:03'" + ")" * 500) == {
-        "Code": "OperationTimeoutException", "Message": "Operation timed out"}
+    # Captured: 148 nested parentheses parse, 149 time out; NOT ( nesting and flat groups don't count.
+    nested = lambda d, opener="(": opener * d + "k = '2024-01-15 01:02:03'" + ")" * d  # noqa: E731
+    assert call(Expression=nested(148)) == hit
+    assert call(Expression=nested(149)) == {"Code": "OperationTimeoutException", "Message": "Operation timed out"}
+    assert call(Expression=nested(300, "NOT (")) == hit
+    assert call(Expression=" OR ".join(["(k = '2024-01-15 01:02:03')"] * 60)) == hit
     assert call(MaxResults=0) == {"Code": "InvalidInputException", "Message": "MaxItems has to be a positive number"}
     assert call(Segment={"SegmentNumber": -1, "TotalSegments": 2}) == {
         "Code": "InvalidInputException", "Message": "Segment number should be a non-negative integer."}

@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1665,6 +1666,26 @@ def _compile_partition_filter(expr, partition_keys):
     return disjunction()
 
 
+def _paren_run(expr):
+    """The longest run of "(" separated only by whitespace, outside quoted text."""
+    longest = run = i = 0
+    while i < len(expr):
+        c = expr[i]
+        if c in "'`":
+            j = i + 1
+            while j < len(expr) and not (expr[j] == c and not (c == "'" and expr[j + 1:j + 2] == "'")):
+                j += 2 if c == "'" and expr[j:j + 2] == "''" else 1
+            i, run = j + 1, 0
+            continue
+        if c == "(":
+            run += 1
+            longest = max(longest, run)
+        elif not c.isspace():
+            run = 0
+        i += 1
+    return longest
+
+
 def _partition_table_error(db_name, table_name):
     if db_name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
@@ -1722,6 +1743,12 @@ def _get_partitions(data):
         return err
 
     expression = data.get("Expression")
+    # Glue's parser times out past 148 directly nested parentheses; NOT ( nesting and flat groups don't count.
+    if expression and _paren_run(expression) > 148:
+        return error_response_json("OperationTimeoutException", "Operation timed out", 400)
+    # The recursive-descent parser needs ~2,100 frames for a 2,048-character expression.
+    if sys.getrecursionlimit() < 10000:
+        sys.setrecursionlimit(10000)
     parts = _partitions.get(key, [])
     parts = parts[number * len(parts) // total:(number + 1) * len(parts) // total]
     try:
