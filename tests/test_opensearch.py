@@ -309,6 +309,27 @@ def test_opensearch_describe_domain_change_progress(os_client):
         os_client.delete_domain(DomainName=name)
 
 
+def test_opensearch_domain_change_progress_details_name_the_current_change(os_client):
+    name = f"prog-id-{_uid()}"
+    created = os_client.create_domain(DomainName=name)["DomainStatus"]
+    try:
+        change_id = created["ChangeProgressDetails"]["ChangeId"]
+        assert change_id
+        progress = os_client.describe_domain_change_progress(DomainName=name)["ChangeProgressStatus"]
+        assert progress["ChangeId"] == change_id
+
+        os_client.update_domain_config(DomainName=name, AccessPolicies="{}")
+        details = os_client.describe_domain(DomainName=name)["DomainStatus"]["ChangeProgressDetails"]
+        progress = os_client.describe_domain_change_progress(DomainName=name)["ChangeProgressStatus"]
+        assert details["ChangeId"] == progress["ChangeId"] != change_id
+        assert progress["InitiatedBy"] == "CUSTOMER" and progress["LastUpdatedTime"]
+        # The creation stays readable by its ChangeId (real AWS, us-west-2).
+        first = os_client.describe_domain_change_progress(DomainName=name, ChangeId=change_id)["ChangeProgressStatus"]
+        assert (first["ChangeId"], first["Status"]) == (change_id, "COMPLETED")
+    finally:
+        os_client.delete_domain(DomainName=name)
+
+
 # ---------------------------------------------------------------------------
 # Versions
 # ---------------------------------------------------------------------------
