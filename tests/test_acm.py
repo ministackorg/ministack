@@ -1064,3 +1064,64 @@ def test_acm_certificate_options_validation_method(acm_client, acm_service_modul
     assert acm_client.describe_certificate(CertificateArn=iarn)["Certificate"]["Options"] == {
         _CT: "DISABLED", _EX: "DISABLED"}
     acm_client.delete_certificate(CertificateArn=iarn)
+
+
+def _self_signed_pem(common_name, dns_names):
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    builder = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(0x1234ABCD)
+        .not_valid_before(datetime.datetime(2026, 11, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2027, 2, 1, tzinfo=datetime.timezone.utc))
+    )
+    if dns_names:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(n) for n in dns_names]), critical=False)
+    cert = builder.sign(key, hashes.SHA256())
+    return (
+        cert.public_bytes(serialization.Encoding.PEM),
+        key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                          serialization.NoEncryption()),
+    )
+
+
+def test_imported_certificate_reports_the_names_and_dates_it_carries(acm_client):
+    """ImportCertificate reads DomainName, SubjectAlternativeNames and validity from the certificate.
+
+    Observed on AWS (us-east-1, 2026-11-12) for a self-signed certificate with CN
+    sans-differ.example.com and one DNS SAN other.example.net, valid 2026-11-01 to
+    2027-02-01: DomainName is the CN; SubjectAlternativeNames is the CN followed by the
+    SANs, without repeating the CN; DomainValidationOptions holds one {DomainName} per
+    name; NotBefore and NotAfter are the certificate's own. Re-importing a certificate
+    for renamed.example.com into the same ARN reports the new name.
+    """
+    import datetime
+
+    acm = acm_client
+    utc = datetime.timezone.utc
+    cert, key = _self_signed_pem("sans-differ.example.com", ["other.example.net"])
+    arn = acm.import_certificate(Certificate=cert, PrivateKey=key)["CertificateArn"]
+
+    desc = acm.describe_certificate(CertificateArn=arn)["Certificate"]
+    assert desc["DomainName"] == "sans-differ.example.com"
+    assert desc["SubjectAlternativeNames"] == ["sans-differ.example.com", "other.example.net"]
+    assert desc["DomainValidationOptions"] == [
+        {"DomainName": "sans-differ.example.com"}, {"DomainName": "other.example.net"}]
+    assert desc["NotBefore"] == datetime.datetime(2026, 11, 1, tzinfo=utc)
+    assert desc["NotAfter"] == datetime.datetime(2027, 2, 1, tzinfo=utc)
+    listed = [c for c in acm.list_certificates()["CertificateSummaryList"] if c["CertificateArn"] == arn]
+    assert listed[0]["DomainName"] == "sans-differ.example.com"
+
+    cert, key = _self_signed_pem("renamed.example.com", ["renamed.example.com"])
+    acm.import_certificate(CertificateArn=arn, Certificate=cert, PrivateKey=key)
+    desc = acm.describe_certificate(CertificateArn=arn)["Certificate"]
+    assert desc["DomainName"] == "renamed.example.com"
+    assert desc["SubjectAlternativeNames"] == ["renamed.example.com"]
