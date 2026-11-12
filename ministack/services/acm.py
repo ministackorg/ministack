@@ -17,6 +17,7 @@ import logging
 import os
 import time
 
+from ministack.core import x509_utils
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -463,6 +464,26 @@ def _get_certificate(data):
     })
 
 
+def _imported_certificate_facts(cert_pem):
+    """``(DomainName, SubjectAlternativeNames, NotBefore, NotAfter)`` read from an imported
+    certificate the way ACM reports them, or None when the body cannot be read.
+
+    Observed on AWS: DomainName is the subject CN, and SubjectAlternativeNames is the CN
+    followed by the certificate's DNS SANs, without repeating the CN. A certificate with
+    no CN is left to the synthetic fallback.
+    """
+    if not x509_utils.HAS_CRYPTO or not cert_pem:
+        return None
+    try:
+        cn, dns_names, not_before, not_after = x509_utils.certificate_names_and_validity(cert_pem)
+    except ValueError:
+        return None
+    if not cn:
+        return None
+    iso = "%Y-%m-%dT%H:%M:%SZ"
+    return cn, list(dict.fromkeys([cn, *dns_names])), not_before.strftime(iso), not_after.strftime(iso)
+
+
 def _import_certificate(data):
     if not data.get("PrivateKey"):
         constraint = ("Member must not be null" if data.get("PrivateKey") is None
@@ -477,24 +498,30 @@ def _import_certificate(data):
     cert_body = _decode_pem_field(data.get("Certificate"))
     cert_chain = _decode_pem_field(data.get("CertificateChain"))
     private_key = _decode_pem_field(data.get("PrivateKey"))
-    # Synthetic DomainName: real AWS parses CN/SAN from the cert; we
-    # don't ship X.509 parsing, so we emit a clearly-synthetic value
-    # that doesn't claim coverage of any specific domain. Re-import
-    # preserves the existing DomainName so downstream resources stay
-    # stable.
     existing = _certificates.get(arn) or {}
-    domain = existing.get("DomainName") or f"imported-cert-{arn.rsplit('/', 1)[-1][:8]}.invalid"
+    facts = _imported_certificate_facts(cert_body)
+    if facts:
+        domain, names, not_before, not_after = facts
+        validation_options = [{"DomainName": n} for n in names]
+    else:
+        # A body that does not parse as a certificate (or no `cryptography`): a
+        # synthetic name that claims no domain. Re-import keeps it so downstream
+        # resources stay stable.
+        domain = existing.get("DomainName") or f"imported-cert-{arn.rsplit('/', 1)[-1][:8]}.invalid"
+        names = existing.get("SubjectAlternativeNames", [domain])
+        not_before, not_after = now, _future_iso(365 * 24 * 3600)
+        validation_options = existing.get("DomainValidationOptions", [])
     _certificates[arn] = {
         "CertificateArn": arn,
         "DomainName": domain,
-        "SubjectAlternativeNames": existing.get("SubjectAlternativeNames", [domain]),
+        "SubjectAlternativeNames": names,
         "Status": "ISSUED",
         "Type": "IMPORTED",
         "CreatedAt": existing.get("CreatedAt", now),
         "IssuedAt": now,
-        "NotBefore": now,
-        "NotAfter": _future_iso(365 * 24 * 3600),
-        "DomainValidationOptions": [],
+        "NotBefore": not_before,
+        "NotAfter": not_after,
+        "DomainValidationOptions": validation_options,
         "Tags": data.get("Tags", existing.get("Tags", [])),
         "Options": {"CertificateTransparencyLoggingPreference": "DISABLED", "Export": "DISABLED"},
         "_pem_body": cert_body,

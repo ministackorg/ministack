@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ACM — names and dates of an imported certificate** — `ImportCertificate` reported a synthetic `imported-cert-<id>.invalid` name, no `DomainValidationOptions`, and validity from the time of import to a year later, so a lookup by domain (Terraform's `aws_acm_certificate` data source) found nothing. When the body parses as a certificate, `DomainName` is now its CN, `SubjectAlternativeNames` the CN followed by its DNS SANs without repeating the CN, `DomainValidationOptions` one `DomainName` per name, `NotBefore` and `NotAfter` the certificate's own, and a re-import takes the new certificate's names, as observed on AWS. A body that does not parse keeps the synthetic name. Contributed by @bryanhelmig.
+
 ## [1.5.40] — 2026-11-11
 
 ### Added
