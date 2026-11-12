@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **SNS — the `Sns` record a Lambda receives** — Lambda got the SQS/HTTP envelope: no `Subject` or `MessageAttributes` when the message had none, `SigningCertURL` and `UnsubscribeURL`, a placeholder subscription in the unsubscribe link, attribute types copied from `DataType`, and an empty value for binary attributes. Handlers that read `record['Sns']['Subject']` (Chalice's `on_sns_message`, for one) raised `KeyError`. As observed on AWS, `Subject` is now `null` and `MessageAttributes` `{}` when absent, the members are `SigningCertUrl` and `UnsubscribeUrl`, the unsubscribe link names the subscription, and each attribute is `Binary` with its base64 value or `String` (for String, Number and String.Array). SQS and HTTP envelopes are unchanged. Contributed by @bryanhelmig.
+
 ## [1.5.40] — 2026-11-11
 
 ### Added
