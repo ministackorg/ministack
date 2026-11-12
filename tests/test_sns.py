@@ -2385,3 +2385,56 @@ def test_sns_filter_wildcard_and_cidr(sns, sqs):
         for v in (match, other):
             sns.publish(TopicArn=topic, Message=v, MessageAttributes={"f": {"DataType": "String", "StringValue": v}})
         assert _bodies(sqs, url) == [match]
+
+
+def test_sns_to_lambda_event_sns_record_matches_aws(lam, sns, logs):
+    """The `Sns` record a Lambda receives has AWS's members, not the SQS/HTTP envelope's.
+
+    Observed on AWS (us-east-1, 2026-11-12, python3.12 function printing its event):
+    the record carries Type, MessageId, TopicArn, Subject, Message, Timestamp,
+    SignatureVersion, Signature, SigningCertUrl, UnsubscribeUrl and MessageAttributes.
+    Subject is null and MessageAttributes {} when the message has none. UnsubscribeUrl
+    names the subscription. Each attribute is {Type, Value}: Binary with the value in
+    base64, and String for String, Number and String.Array.
+    """
+    fn = f"sns-record-{_uuid_mod.uuid4().hex[:8]}"
+    code = "import json\ndef handler(event, context):\n    print('EVENT ' + json.dumps(event))\n"
+    fn_arn = lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                                 Handler="index.handler", Code={"ZipFile": _make_zip(code)})["FunctionArn"]
+    topic_arn = sns.create_topic(Name=f"sns-record-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    sub_arn = sns.subscribe(TopicArn=topic_arn, Protocol="lambda", Endpoint=fn_arn)["SubscriptionArn"]
+
+    sns.publish(TopicArn=topic_arn, Message="plain")
+    sns.publish(TopicArn=topic_arn, Message="full", Subject="Hello", MessageAttributes={
+        "color": {"DataType": "String", "StringValue": "blue"},
+        "count": {"DataType": "Number", "StringValue": "3"},
+        "blob": {"DataType": "Binary", "BinaryValue": b"\x00\x01\xff"},
+        "tags": {"DataType": "String.Array", "StringValue": '["a","b"]'},
+    })
+
+    records, deadline = {}, time.time() + 30
+    while time.time() < deadline and len(records) < 2:
+        time.sleep(0.5)
+        try:
+            events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}", filterPattern='"EVENT "')["events"]
+        except logs.exceptions.ResourceNotFoundException:
+            continue
+        for e in events:
+            record = json.loads(e["message"].split("EVENT ", 1)[1])["Records"][0]["Sns"]
+            records[record["Message"]] = record
+    assert set(records) == {"plain", "full"}
+
+    expected_members = {"Type", "MessageId", "TopicArn", "Subject", "Message", "Timestamp", "SignatureVersion",
+                        "Signature", "SigningCertUrl", "UnsubscribeUrl", "MessageAttributes"}
+    for record in records.values():
+        assert set(record) == expected_members
+        assert record["UnsubscribeUrl"].endswith(f"SubscriptionArn={sub_arn}")
+    assert records["plain"]["Subject"] is None
+    assert records["plain"]["MessageAttributes"] == {}
+    assert records["full"]["Subject"] == "Hello"
+    assert records["full"]["MessageAttributes"] == {
+        "color": {"Type": "String", "Value": "blue"},
+        "count": {"Type": "String", "Value": "3"},
+        "blob": {"Type": "Binary", "Value": "AAH/"},
+        "tags": {"Type": "String", "Value": '["a","b"]'},
+    }
