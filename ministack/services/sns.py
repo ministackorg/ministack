@@ -20,6 +20,7 @@ FIFO topics: .fifo naming validation, MessageGroupId/MessageDeduplicationId enfo
 """
 
 import asyncio
+import base64
 import contextvars
 import copy
 import hashlib
@@ -1284,6 +1285,40 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
     logger.info("SNS fanout → SQS %s", queue_name)
 
 
+def _lambda_sns_record(envelope: str, sub_arn: str, message_attributes: dict) -> dict:
+    """The `Sns` member of the event a Lambda receives, which is not the SQS/HTTP envelope.
+
+    Observed on AWS (us-east-1): Subject is null and MessageAttributes {} when the message
+    has none; the URLs are spelled SigningCertUrl and UnsubscribeUrl, and UnsubscribeUrl
+    names the subscription; each attribute is {Type, Value}, Binary with the value in
+    base64 and String for String, Number and String.Array. Custom-suffixed types
+    (`Binary.jpeg`, `Number.float`) follow their base type.
+    """
+    env = json.loads(envelope)
+    attributes = {}
+    for name, attr in (message_attributes or {}).items():
+        if (attr.get("DataType") or "").split(".", 1)[0] == "Binary":
+            value = attr.get("BinaryValue") or ""
+            if isinstance(value, (bytes, bytearray)):
+                value = base64.b64encode(value).decode("ascii")
+            attributes[name] = {"Type": "Binary", "Value": value}
+        else:
+            attributes[name] = {"Type": "String", "Value": attr.get("StringValue", "")}
+    return {
+        "Type": env.get("Type"),
+        "MessageId": env.get("MessageId"),
+        "TopicArn": env.get("TopicArn"),
+        "Subject": env.get("Subject"),
+        "Message": env.get("Message"),
+        "Timestamp": env.get("Timestamp"),
+        "SignatureVersion": env.get("SignatureVersion"),
+        "Signature": env.get("Signature"),
+        "SigningCertUrl": env.get("SigningCertURL"),
+        "UnsubscribeUrl": f"http://{_HOST}:{_PORT}/?Action=Unsubscribe&SubscriptionArn={sub_arn}",
+        "MessageAttributes": attributes,
+    }
+
+
 def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: str,
                        msg_id: str, raw_message: str, message_attributes: dict):
     """Invoke a Lambda function with the SNS Records envelope (AWS format)."""
@@ -1298,7 +1333,7 @@ def _deliver_to_lambda(endpoint: str, envelope: str, topic_arn: str, sub_arn: st
                 "EventVersion": "1.0",
                 "EventSubscriptionArn": sub_arn,
                 "EventSource": "aws:sns",
-                "Sns": json.loads(envelope),
+                "Sns": _lambda_sns_record(envelope, sub_arn, message_attributes),
             }
         ]
     }
