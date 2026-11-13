@@ -1253,6 +1253,22 @@ def test_rds_default_cluster_parameter_groups_exist_for_aurora_families(rds):
         rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.not-a-family")
     assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
 
+def test_rds_default_aurora_db_parameter_group_parameters_readable(rds):
+    """As captured on AWS (us-east-1): DescribeDBParameters on the default DB
+    parameter group of an Aurora family, here default.aurora-mysql8.0, with
+    Source=user answers an empty list. Nobody can modify a default group."""
+    response = rds.describe_db_parameters(
+        DBParameterGroupName="default.aurora-mysql8.0", Source="user", MaxRecords=100,
+    )
+    assert response["Parameters"] == []
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_parameters(DBParameterGroupName="default.not-a-family")
+    assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
+    # The group is answered, not stored: listings stay as before.
+    names = {g["DBParameterGroupName"] for g in rds.describe_db_parameter_groups()["DBParameterGroups"]}
+    assert "default.aurora-mysql8.0" not in names
+
+
 def _settled_cluster(client, cid):
     """Describe a cluster until its major upgrade has finished (it takes two describes)."""
     for _ in range(3):
