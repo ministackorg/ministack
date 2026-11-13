@@ -2735,9 +2735,9 @@ async def _execute_in_scope(
     if int_type in ("AWS_PROXY", "AWS"):
         # AWS_PROXY hands the function a response envelope to interpret; the
         # non-proxy `AWS` integration dispatches on the target service in the
-        # URI: `sqs:path/...` targets reach the SQS data plane, everything else
-        # takes the Lambda path (custom/"lambda" integrations return the
-        # handler's output as the body verbatim).
+        # URI: `sqs:path/...` and `sns:path/...` / `sns:action/...` targets reach
+        # those data planes, everything else takes the Lambda path
+        # (custom/"lambda" integrations return the handler's output verbatim).
         caller_identity = None
         if (method_obj.get("authorizationType") or "").upper() == "AWS_IAM":
             caller_identity = _iam_caller_identity(headers, query_params)
@@ -2747,6 +2747,8 @@ async def _execute_in_scope(
             spec = _parse_service_integration_uri(integration.get("uri", ""))
             if spec and spec[1] == "sqs" and spec[2] == "path":
                 invoke = _invoke_sqs_v1
+            elif spec and spec[1] == "sns" and spec[2] in ("path", "action"):
+                invoke = _invoke_sns_v1
             else:
                 invoke = _invoke_lambda_custom_v1
         return await invoke(
@@ -3545,6 +3547,117 @@ async def _invoke_sqs_v1(
     return _service_integration_response(
         integration, backend_status, backend_text, accept, params_map,
             vtl_context)
+
+
+def _integration_querystring_v1(integration, headers, query_params, path_params):
+    """The ``integration.request.querystring.*`` values of ``requestParameters``."""
+    out = {}
+    for dest, src in (integration.get("requestParameters") or {}).items():
+        if not dest.startswith("integration.request.querystring.") or not isinstance(src, str):
+            continue
+        name = dest[len("integration.request.querystring."):]
+        if len(src) >= 2 and src[0] == src[-1] == "'":
+            out[name] = src[1:-1]
+        elif src.startswith("method.request.querystring."):
+            v = (query_params or {}).get(src[len("method.request.querystring."):])
+            if v is not None:
+                out[name] = v[0] if isinstance(v, (list, tuple)) else v
+        elif src.startswith("method.request.path."):
+            v = (path_params or {}).get(src[len("method.request.path."):])
+            if v is not None:
+                out[name] = v
+        elif src.startswith("method.request.header."):
+            v = _header_ci(headers, src[len("method.request.header."):])
+            if v is not None:
+                out[name] = v
+    return out
+
+
+async def _invoke_sns_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Dispatch a non-proxy ``AWS`` integration whose URI targets SNS.
+
+    ``sns:path//`` sends the rendered request template as a form-encoded SNS
+    Query call; ``sns:action/{Action}`` takes the action from the URI. Mapped
+    ``integration.request.querystring.*`` parameters join the call. The call
+    runs in the topic's account and Region; a Publish reply reaches the
+    integration responses as JSON, as API Gateway receives it.
+    """
+    from ministack.services import sns as _sns_svc
+
+    spec = _parse_service_integration_uri(integration.get("uri", ""))
+    body_str = body.decode("utf-8", errors="replace") if body else ""
+    params_map = {}
+    for k, v in (headers or {}).items():
+        if isinstance(v, str):
+            params_map[k] = v
+    for k, v in (query_params or {}).items():
+        params_map[k] = v[0] if isinstance(v, (list, tuple)) else v
+    params_map.update(path_params or {})
+
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    template = None
+    for key, value in (integration.get("requestTemplates") or {}).items():
+        if key.split(";", 1)[0].strip().lower() == content_type:
+            template = value
+            break
+    vtl_context = {"authorizer": authorizer_context} if authorizer_context else {}
+    rendered = (_render_request_template_v1(template, body_str, params_map, vtl_context)
+                if template is not None else body_str)
+    form = _integration_querystring_v1(integration, headers, query_params, path_params)
+    form.update(urllib.parse.parse_qsl(rendered, keep_blank_values=True))
+    if spec and spec[2] == "action" and spec[3].strip("/"):
+        form["Action"] = spec[3].strip("/").split("/", 1)[0]
+
+    accept = (_header_ci(headers, "accept") or "application/json")
+    accept = accept.split(",", 1)[0].split(";", 1)[0].strip().lower()
+
+    account = owner_account_id or get_account_id()
+    region = (spec[0] if spec else "") or owner_region or get_region()
+    arn_parts = (form.get("TopicArn") or form.get("TargetArn") or "").split(":")
+    if len(arn_parts) >= 6 and arn_parts[0] == "arn" and arn_parts[2] == "sns":
+        region, account = arn_parts[3] or region, arn_parts[4] or account
+
+    try:
+        with request_scope(account, region):
+            backend_status, _h, xbody = await _sns_svc.handle_request(
+                "POST", "/", {"content-type": "application/x-www-form-urlencoded"},
+                urllib.parse.urlencode(form).encode(), {})
+    except Exception:
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    backend_text = xbody.decode("utf-8", errors="replace")
+    if form.get("Action") == "Publish" and backend_status == 200:
+        message_id = re.search(r"<MessageId>([^<]*)</MessageId>", backend_text)
+        request_id = re.search(r"<RequestId>([^<]*)</RequestId>", backend_text)
+        sequence = re.search(r"<SequenceNumber>([^<]*)</SequenceNumber>", backend_text)
+        result = {"MessageId": message_id.group(1) if message_id else None}
+        if sequence:
+            result["SequenceNumber"] = sequence.group(1)
+        backend_text = json.dumps({"PublishResponse": {
+            "PublishResult": result,
+            "ResponseMetadata": {"RequestId": request_id.group(1) if request_id else new_uuid()},
+        }})
+    return _service_integration_response(
+        integration, backend_status, backend_text, accept, params_map, vtl_context)
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
