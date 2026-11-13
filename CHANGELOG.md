@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — `CreateDBInstance` with an unknown `DBClusterIdentifier`** — a cluster ARN joined the cluster, and a plain id that names no cluster created an instance anyway. As on AWS, both now answer `404 DBClusterNotFoundFault` ("The source cluster could not be found or cannot be accessed: …") and nothing is created. Fixes #2633. Contributed by @kharabasz.
+
 ## [1.5.40] — 2026-11-11
 
 ### Added
