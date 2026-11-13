@@ -1633,7 +1633,19 @@ def test_rds_data_negative_rowcount_is_clamped(monkeypatch, engine):
 
 
 @pytest.mark.parametrize("engine", _MYSQL_ENGINES)
-def test_rds_data_mysql_row_counts_are_unchanged(monkeypatch, engine):
-    """pymysql has no statusmessage, so the MySQL path is untouched."""
-    assert _execute_with_cursor(
-        monkeypatch, engine, 2, "SELECT 2", [(1,), (2,)])["numberOfRecordsUpdated"] == 2
+@pytest.mark.parametrize("rows", ([], [(1,)], [(1,), (2,)]), ids=("none", "one", "two"))
+def test_rds_data_mysql_select_reports_no_updated_records(monkeypatch, engine, rows):
+    """As captured on AWS (Aurora MySQL): SELECT 1 answers numberOfRecordsUpdated 0
+    and no generatedFields, whatever PyMySQL puts in rowcount."""
+    result = _execute_with_cursor(monkeypatch, engine, len(rows), rows=rows, sql="SELECT 1")
+    assert result["numberOfRecordsUpdated"] == 0
+    assert "generatedFields" not in result
+    assert result["records"] == [[{"longValue": row[0]}] for row in rows]
+
+
+@pytest.mark.parametrize("engine", _MYSQL_ENGINES)
+def test_rds_data_mysql_dml_keeps_its_count(monkeypatch, engine):
+    """Without a result set the MySQL path is unchanged."""
+    result = _execute_with_cursor(monkeypatch, engine, 2, sql="UPDATE t SET name = 'b'")
+    assert result["numberOfRecordsUpdated"] == 2
+    assert result["generatedFields"] == []

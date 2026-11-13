@@ -687,11 +687,18 @@ def _execute_statement(data):
             # also returns rows. This is not an audit of side effects in CTEs.
             if command == ["SELECT"]:
                 updated = 0
+        mysql_result_set = engine not in ("postgres", "aurora-postgresql") and cursor.description
+        if mysql_result_set:
+            # PyMySQL counts returned rows. As captured on AWS (Aurora MySQL),
+            # SELECT 1 answers numberOfRecordsUpdated 0 and no generatedFields.
+            updated = 0
 
         response = {
             "numberOfRecordsUpdated": updated,
             "generatedFields": _generated_fields(cursor, engine),
         }
+        if mysql_result_set and not response["generatedFields"]:
+            del response["generatedFields"]
 
         if cursor.description:
             rows = cursor.fetchall()

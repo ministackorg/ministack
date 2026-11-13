@@ -716,6 +716,96 @@ def test_rds_create_subnet_group_rejects_invalid_subnets(rds, ec2, failure):
     )
 
 
+_AURORA_MEMBER_ABSENT_LISTS = (
+    "EnabledCloudwatchLogsExports",
+    "ProcessorFeatures",
+    "ReadReplicaDBClusterIdentifiers",
+    "StatusInfos",
+)
+
+
+def test_rds_aurora_member_lifecycle_response_shapes(rds, ec2):
+    """As captured on AWS (us-east-1, Aurora MySQL): the cluster carries
+    ReadReplicaIdentifiers and DomainMemberships as empty lists; a member instance
+    reports the cluster's DB subnet group and VPC security groups, leaves out four
+    empty lists, CreateDBInstance has no Endpoint yet, and DeleteDBInstance (deleting) carries no CertificateDetails."""
+    suffix = uuid.uuid4().hex[:8]
+    vpc_id = ec2.create_vpc(CidrBlock="10.75.0.0/16")["Vpc"]["VpcId"]
+    subnets = [
+        ec2.create_subnet(VpcId=vpc_id, CidrBlock=f"10.75.{i}.0/24",
+                          AvailabilityZone=f"us-east-1{az}")["Subnet"]["SubnetId"]
+        for i, az in ((1, "a"), (2, "c"))
+    ]
+    sg_id = ec2.create_security_group(GroupName=f"shape-{suffix}", Description="shape",
+                                      VpcId=vpc_id)["GroupId"]
+    subnet_group = f"shape-sng-{suffix}"
+    rds.create_db_subnet_group(DBSubnetGroupName=subnet_group, DBSubnetGroupDescription="shape",
+                               SubnetIds=subnets)
+    cluster_id, instance_id = f"shape-cl-{suffix}", f"shape-in-{suffix}"
+    try:
+        responses = [rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id, Engine="aurora-mysql", MasterUsername="admin",
+            MasterUserPassword="password123", DBSubnetGroupName=subnet_group,
+            VpcSecurityGroupIds=[sg_id],
+        )["DBCluster"]]
+        responses.append(rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0])
+        responses.append(rds.modify_db_cluster(DBClusterIdentifier=cluster_id, BackupRetentionPeriod=2,
+                                               ApplyImmediately=True)["DBCluster"])
+        for cluster in responses:
+            assert cluster["ReadReplicaIdentifiers"] == []
+            assert cluster["DomainMemberships"] == []
+
+        instances = [rds.create_db_instance(
+            DBInstanceIdentifier=instance_id, DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql", DBInstanceClass="db.r6g.large",
+        )["DBInstance"]]
+        assert "Endpoint" not in instances[0]
+        instances.append(rds.describe_db_instances(DBInstanceIdentifier=instance_id)["DBInstances"][0])
+        instances.append(rds.modify_db_instance(DBInstanceIdentifier=instance_id,
+                                                AutoMinorVersionUpgrade=False)["DBInstance"])
+        deleted = rds.delete_db_instance(DBInstanceIdentifier=instance_id, SkipFinalSnapshot=True)["DBInstance"]
+        instances.append(deleted)
+        for inst in instances:
+            for field in _AURORA_MEMBER_ABSENT_LISTS:
+                assert field not in inst, field
+            group = inst["DBSubnetGroup"]
+            assert group["DBSubnetGroupName"] == subnet_group
+            assert group["VpcId"] == vpc_id
+            assert sorted(sn["SubnetIdentifier"] for sn in group["Subnets"]) == sorted(subnets)
+            assert all(sn["SubnetStatus"] == "Active" and sn["SubnetAvailabilityZone"]["Name"]
+                       for sn in group["Subnets"])
+            assert inst["VpcSecurityGroups"] == [{"VpcSecurityGroupId": sg_id, "Status": "active"}]
+        assert deleted["DBInstanceStatus"] == "deleting"
+        assert "CertificateDetails" not in deleted
+    finally:
+        _delete_instance(rds, instance_id)
+        _delete_cluster(rds, cluster_id)
+
+
+def test_rds_instance_xml_aurora_member_create_response_has_no_endpoint():
+    """As captured on AWS: the CreateDBInstance response for an Aurora member (creating)
+    has no Endpoint yet. This holds when MiniStack already reports the member available
+    (no Docker). Describe calls and standalone instances keep their rendering."""
+    from ministack.services import rds as rds_service
+
+    base = {
+        "DBInstanceIdentifier": "unit", "DBInstanceClass": "db.r6g.large", "EngineVersion": "8.0",
+        "MasterUsername": "admin", "AllocatedStorage": 1, "DBInstanceArn": "arn",
+        "Endpoint": {"Address": "unit.example", "Port": 3306},
+    }
+    creating_member = {**base, "Engine": "aurora-mysql", "DBClusterIdentifier": "c",
+                       "DBInstanceStatus": "creating"}
+    assert "<Endpoint>" not in rds_service._instance_xml(creating_member, create_response=True)
+    assert "<Endpoint>" in rds_service._instance_xml(creating_member)
+    assert "<Endpoint>" not in rds_service._instance_xml(
+        {**creating_member, "DBInstanceStatus": "available"}, create_response=True)
+    standalone = {**base, "Engine": "mysql", "DBInstanceStatus": "creating"}
+    xml = rds_service._instance_xml(standalone, create_response=True)
+    assert "<Endpoint>" in xml
+    assert "<StatusInfos/>" in xml
+    assert "<ProcessorFeatures></ProcessorFeatures>" in xml
+
+
 def test_rds_modify_subnet_group(rds, ec2):
     vpc_id = ec2.create_vpc(CidrBlock="10.73.0.0/16")["Vpc"]["VpcId"]
     subnets = [
