@@ -10536,7 +10536,10 @@ def _instance_xml(i, create_response=False):
     )
     processor_xml = _member_list_xml(f"<ProcessorFeatures>{features}</ProcessorFeatures>", features)
 
-    endpoint_xml = "" if aurora_member and create_response and status == "creating" else f"""<Endpoint>
+    # As captured on AWS: the CreateDBInstance response of an Aurora member has no
+    # Endpoint. AWS always answers "creating" there; MiniStack can already be
+    # "available" (no Docker), so the omission does not depend on the status.
+    endpoint_xml = "" if aurora_member and create_response else f"""<Endpoint>
             <Address>{ep.get('Address','localhost')}</Address>
             <Port>{ep.get('Port',5432)}</Port>
             <HostedZoneId>{ep.get('HostedZoneId','Z2R2ITUGPM61AM')}</HostedZoneId>

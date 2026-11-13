@@ -782,9 +782,10 @@ def test_rds_aurora_member_lifecycle_response_shapes(rds, ec2):
         _delete_cluster(rds, cluster_id)
 
 
-def test_rds_instance_xml_aurora_member_creating_has_no_endpoint():
+def test_rds_instance_xml_aurora_member_create_response_has_no_endpoint():
     """As captured on AWS: the CreateDBInstance response for an Aurora member (creating)
-    has no Endpoint yet. Describe calls and standalone instances keep their rendering."""
+    has no Endpoint yet. This holds when MiniStack already reports the member available
+    (no Docker). Describe calls and standalone instances keep their rendering."""
     from ministack.services import rds as rds_service
 
     base = {
@@ -796,7 +797,7 @@ def test_rds_instance_xml_aurora_member_creating_has_no_endpoint():
                        "DBInstanceStatus": "creating"}
     assert "<Endpoint>" not in rds_service._instance_xml(creating_member, create_response=True)
     assert "<Endpoint>" in rds_service._instance_xml(creating_member)
-    assert "<Endpoint>" in rds_service._instance_xml(
+    assert "<Endpoint>" not in rds_service._instance_xml(
         {**creating_member, "DBInstanceStatus": "available"}, create_response=True)
     standalone = {**base, "Engine": "mysql", "DBInstanceStatus": "creating"}
     xml = rds_service._instance_xml(standalone, create_response=True)
