@@ -7608,6 +7608,16 @@ def _describe_param_groups(p):
 def _describe_db_parameters(p):
     name = _p(p, "DBParameterGroupName")
     pg = _param_groups.get(name)
+    if not pg and _is_default_cluster_param_group(name):
+        # Every account has a default DB parameter group per Aurora family, the
+        # same names as the default cluster groups. As captured on AWS (us-east-1),
+        # DescribeDBParameters on default.aurora-mysql8.0 with Source=user answers
+        # an empty list. The group is not stored, so listings are unchanged.
+        pg = {
+            "DBParameterGroupName": name,
+            "DBParameterGroupFamily": name[len("default."):],
+            "Parameters": {},
+        }
     if not pg:
         return _error("DBParameterGroupNotFound", f"Parameter group {name} not found.", 404)
 
