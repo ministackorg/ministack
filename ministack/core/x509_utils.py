@@ -380,3 +380,25 @@ def certificate_common_name(cert_pem: str) -> str | None:
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
     names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
     return str(names[0].value) if names else None
+
+
+def certificate_names_and_validity(cert_pem: str):
+    """Return ``(common_name, dns_names, not_before, not_after)`` for ``cert_pem``.
+
+    ``common_name`` is None when the subject has none; ``dns_names`` are the DNS entries
+    of the subject alternative name extension, in order, or ``[]`` without one; the
+    dates are timezone-aware UTC. Raises ``ValueError`` when ``cert_pem`` is not a PEM
+    certificate.
+    """
+    _require_crypto()
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        dns_names = san.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        dns_names = []
+    # `not_valid_*_utc` arrived in cryptography 42; the declared floor is 41.
+    not_before = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before.replace(tzinfo=_dt.timezone.utc)
+    not_after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=_dt.timezone.utc)
+    return (str(names[0].value) if names else None, dns_names, not_before, not_after)
