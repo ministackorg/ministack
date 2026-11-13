@@ -5116,7 +5116,19 @@ def _create_db_instance_impl(p):
 
     # Inherit credentials from cluster when instance is a cluster member.
     cluster_id_param = _p(p, "DBClusterIdentifier")
-    parent = _resolve_cluster_in_request_region(cluster_id_param) if cluster_id_param else None
+    parent = None
+    if cluster_id_param:
+        # AWS joins a cluster only by its plain id. A cluster ARN, even of an
+        # existing cluster, and an id that names no cluster are not found.
+        if not _parse_rds_arn(cluster_id_param):
+            parent = _resolve_cluster_in_request_region(cluster_id_param)
+        if parent is None:
+            return _error(
+                "DBClusterNotFoundFault",
+                "The source cluster could not be found or cannot be accessed: "
+                f"{_esc(cluster_id_param)}",
+                404,
+            )
     if parent:
         if parent.get("_shared_legacy_migration_in_progress"):
             return _error(
@@ -5153,11 +5165,6 @@ def _create_db_instance_impl(p):
         master_user = parent.get("MasterUsername", master_user)
         master_pass = parent.get("_MasterUserPassword", master_pass)
         db_name = parent.get("DatabaseName") or "mydb"
-    elif _parse_rds_arn(cluster_id_param):
-        wrong_region = _invalid_cluster_identifier_error(cluster_id_param)
-        if wrong_region:
-            return wrong_region
-        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id_param} not found.", 404)
     if not db_name:
         db_name = "mydb"
     allocated_storage = int(_p(p, "AllocatedStorage") or "20")
