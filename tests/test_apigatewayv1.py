@@ -6753,3 +6753,116 @@ def test_apigwv1_domain_name_access_association_lifecycle(apigw_v1, ec2):
         except ClientError:
             pass
         ec2.delete_vpc_endpoints(VpcEndpointIds=[vpce, vpce2])
+
+
+def _sns_api(apigw_v1, uri, *, request_templates=None, request_parameters=None,
+             integration_responses=None):
+    """REST API with POST /ingest backed by a non-proxy AWS integration to SNS."""
+    api_id, root = _gw_api(apigw_v1, f"gwsns-{_uuid_mod.uuid4().hex[:8]}")
+    resource = apigw_v1.create_resource(restApiId=api_id, parentId=root, pathPart="ingest")["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource, httpMethod="POST",
+                        authorizationType="NONE")
+    apigw_v1.put_method_response(restApiId=api_id, resourceId=resource,
+                                 httpMethod="POST", statusCode="200")
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource, httpMethod="POST", type="AWS",
+        integrationHttpMethod="POST", uri=uri,
+        credentials="arn:aws:iam::000000000000:role/sns-publish-role",
+        requestParameters=request_parameters or {
+            "integration.request.header.Content-Type": "'application/x-www-form-urlencoded'"},
+        requestTemplates=request_templates or {})
+    for status_code, extra in (integration_responses or {}).items():
+        apigw_v1.put_integration_response(restApiId=api_id, resourceId=resource,
+                                          httpMethod="POST", statusCode=status_code, **extra)
+    apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+    return api_id
+
+
+def _sns_topic_with_queue(sns, sqs):
+    topic_arn = sns.create_topic(Name=f"apigw-t-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
+    qurl = sqs.create_queue(QueueName=f"apigw-tq-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    qarn = sqs.get_queue_attributes(QueueUrl=qurl, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+    sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=qarn,
+                  Attributes={"RawMessageDelivery": "true"})
+    return topic_arn, qurl
+
+
+def test_apigwv1_execute_sns_path_integration_publishes(apigw_v1, sns, sqs):
+    """sns:path// sends the rendered template as a Publish call (localstack-samples apigateway-sns-deploy)."""
+    topic_arn, qurl = _sns_topic_with_queue(sns, sqs)
+    api_id = _sns_api(
+        apigw_v1, "arn:aws:apigateway:us-east-1:sns:path//",
+        request_templates={"application/json":
+            f"Action=Publish&TopicArn=$util.urlEncode('{topic_arn}')&Message=$util.urlEncode($input.body)"},
+        integration_responses={"200": {"selectionPattern": "", "responseTemplates": {
+            "application/json": '{"status": "message published"}'}}})
+    try:
+        status, text = _stage_call(api_id, "/ingest", method="POST", body='{"order":1}',
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 200
+        assert json.loads(text) == {"status": "message published"}
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=2).get("Messages", [])
+        assert [m["Body"] for m in msgs] == ['{"order":1}']
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sns_publish_reply_is_json(apigw_v1, sns, sqs):
+    """The Publish reply reaches the response template as SNS's JSON envelope."""
+    topic_arn, qurl = _sns_topic_with_queue(sns, sqs)
+    api_id = _sns_api(
+        apigw_v1, "arn:aws:apigateway:us-east-1:sns:path//",
+        request_templates={"application/json":
+            f"Action=Publish&TopicArn=$util.urlEncode('{topic_arn}')&Message=$util.urlEncode($input.body)"},
+        integration_responses={"200": {"responseTemplates": {
+            "application/json": "$input.path('$.PublishResponse.PublishResult.MessageId')"}}})
+    try:
+        status, text = _stage_call(api_id, "/ingest", method="POST", body='{"a":1}',
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=2,
+                                   MessageAttributeNames=["All"])["Messages"]
+        assert len(msgs) == 1 and text and text != "None"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sns_action_integration_with_querystring(apigw_v1, sns, sqs):
+    """sns:action/Publish takes TopicArn and Message from mapped query string parameters."""
+    topic_arn, qurl = _sns_topic_with_queue(sns, sqs)
+    api_id = _sns_api(
+        apigw_v1, "arn:aws:apigateway:us-east-1:sns:action/Publish",
+        request_parameters={
+            "integration.request.querystring.TopicArn": f"'{topic_arn}'",
+            "integration.request.querystring.Message": "method.request.querystring.message"},
+        integration_responses={"200": {"responseTemplates": {"application/json": '{"ok":true}'}}})
+    try:
+        status, text = _stage_call(api_id, "/ingest?message=hello", method="POST", body="")
+        assert status == 200 and json.loads(text) == {"ok": True}
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=2).get("Messages", [])
+        assert [m["Body"] for m in msgs] == ["hello"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sns.delete_topic(TopicArn=topic_arn)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sns_backend_error_maps_through_responses(apigw_v1, sns):
+    """An SNS error flows to the integration responses; with only a 200 default it answers 200."""
+    api_id = _sns_api(
+        apigw_v1, "arn:aws:apigateway:us-east-1:sns:path//",
+        request_templates={"application/json":
+            "Action=Publish&TopicArn=arn:aws:sns:us-east-1:000000000000:missing&Message=x"},
+        integration_responses={"200": {"responseTemplates": {"application/json": "$input.body"}},
+                               "404": {"selectionPattern": "404"}})
+    try:
+        status, text = _stage_call(api_id, "/ingest", method="POST", body="{}",
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 404
+        assert "<Code>NotFound</Code>" in text
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
