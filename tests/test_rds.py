@@ -716,6 +716,57 @@ def test_rds_create_subnet_group_rejects_invalid_subnets(rds, ec2, failure):
     )
 
 
+def test_rds_create_db_cluster_rejects_missing_subnet_group(rds):
+    """As captured on AWS (us-east-1): CreateDBCluster with a DB subnet group that
+    does not exist answers 404 DBSubnetGroupNotFoundFault and creates nothing."""
+    cluster_id = f"missing-sng-{uuid.uuid4().hex[:8]}"
+    subnet_group = f"missing-sng-{uuid.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            DBSubnetGroupName=subnet_group,
+        )
+    assert exc.value.response["Error"]["Code"] == "DBSubnetGroupNotFoundFault"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Message"] == (
+        f"DB subnet group '{subnet_group}' does not exist."
+    )
+    with pytest.raises(ClientError) as described:
+        rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+    assert described.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+
+def test_rds_create_db_cluster_accepts_existing_subnet_group(rds, ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.74.0.0/16")["Vpc"]["VpcId"]
+    subnets = [
+        ec2.create_subnet(VpcId=vpc_id, CidrBlock=f"10.74.{i}.0/24",
+                          AvailabilityZone=f"us-east-1{az}")["Subnet"]["SubnetId"]
+        for i, az in ((1, "a"), (2, "b"))
+    ]
+    subnet_group = f"present-sng-{uuid.uuid4().hex[:8]}"
+    rds.create_db_subnet_group(
+        DBSubnetGroupName=subnet_group,
+        DBSubnetGroupDescription="present",
+        SubnetIds=subnets,
+    )
+    cluster_id = f"present-sng-{uuid.uuid4().hex[:8]}"
+    try:
+        cluster = rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            DBSubnetGroupName=subnet_group,
+        )["DBCluster"]
+        assert cluster["DBSubnetGroup"] == subnet_group
+    finally:
+        _delete_cluster(rds, cluster_id)
+        rds.delete_db_subnet_group(DBSubnetGroupName=subnet_group)
+
+
 def test_rds_modify_subnet_group(rds, ec2):
     vpc_id = ec2.create_vpc(CidrBlock="10.73.0.0/16")["Vpc"]["VpcId"]
     subnets = [
@@ -8435,6 +8486,42 @@ def test_failover_global_cluster_missing_global_validated_before_parameter_combo
             TargetDbClusterIdentifier="arn:aws:rds:us-east-1:000000000000:cluster:missing-secondary",
             AllowDataLoss=True,
             Switchover=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
+
+
+@pytest.mark.parametrize("global_exists", [False, True], ids=["missing-global", "existing-global"])
+def test_remove_from_global_cluster_rejects_overlong_member_identifier(global_exists):
+    """As captured on AWS (us-east-1): a member ARN whose cluster identifier is
+    longer than 63 characters answers 400 InvalidParameterValue, checked before
+    the global cluster is looked up."""
+    east = _regional_rds("us-east-1")
+    global_id = f"remove-long-{uuid.uuid4().hex[:8]}"
+    if global_exists:
+        east.create_global_cluster(GlobalClusterIdentifier=global_id, Engine="aurora-mysql")
+    member_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{'m' * 64}"
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=member_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Message"] == (
+            f"Invalid database cluster identifier:  {member_arn}"
+        )
+    finally:
+        if global_exists:
+            _delete_global_cluster(east, global_id)
+
+
+def test_remove_from_global_cluster_63_character_member_identifier_reaches_lookup():
+    east = _regional_rds("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        east.remove_from_global_cluster(
+            GlobalClusterIdentifier=f"remove-long-{uuid.uuid4().hex[:8]}",
+            DbClusterIdentifier=f"arn:aws:rds:us-east-1:000000000000:cluster:{'m' * 63}",
         )
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
