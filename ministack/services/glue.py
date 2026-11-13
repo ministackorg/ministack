@@ -1051,7 +1051,33 @@ def _get_tables(data):
     return json_response({"TableList": tables})
 
 
+# Serializes table updates so an Iceberg writer's compare-and-swap of metadata_location (Firehose, on its own
+# thread) can't interleave with UpdateTable.
+_table_update_lock = threading.Lock()
+
+
+def swap_iceberg_metadata_location(db_name, table_name, expected, new):
+    """Point an Iceberg table at ``new`` if it still points at ``expected``; returns whether it did."""
+    with _table_update_lock:
+        table = _tables.get(f"{db_name}/{table_name}")
+        params = (table or {}).get("Parameters") or {}
+        if params.get("metadata_location") != expected:
+            return False
+        table["Parameters"] = {**params, "metadata_location": new, "previous_metadata_location": expected}
+        table["UpdateTime"] = int(time.time())
+        try:
+            table["VersionId"] = str(int(table.get("VersionId", "1")) + 1)
+        except (TypeError, ValueError):
+            table["VersionId"] = "1"
+        return True
+
+
 def _update_table(data):
+    with _table_update_lock:
+        return _update_table_unlocked(data)
+
+
+def _update_table_unlocked(data):
     db_name = data.get("DatabaseName")
     table_input = data.get("TableInput", {})
     name = table_input.get("Name")

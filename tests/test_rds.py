@@ -7937,7 +7937,7 @@ def test_rds_regional_cluster_apis_reject_foreign_region_arns():
                 DBInstanceClass="db.t3.micro",
                 Engine="aurora-mysql",
             )
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
 
         with pytest.raises(ClientError) as exc:
             east.create_global_cluster(
@@ -8615,7 +8615,26 @@ def test_rds_db_snapshot_filter_by_instance_arn_survives_source_deletion():
         _delete_instance(east, instance_id)
 
 
-def test_rds_create_instance_with_cluster_arn_stores_canonical_cluster_id():
+def _assert_create_instance_cluster_not_found(client, instance_id, cluster_value):
+    # AWS answer captured in us-east-2 (ministackorg/ministack#2633).
+    with pytest.raises(ClientError) as exc:
+        client.create_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBClusterIdentifier=cluster_value,
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-mysql",
+        )
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    assert exc.value.response["Error"]["Message"] == (
+        f"The source cluster could not be found or cannot be accessed: {cluster_value}"
+    )
+    with pytest.raises(ClientError) as exc:
+        client.describe_db_instances(DBInstanceIdentifier=instance_id)
+    assert exc.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+
+def test_rds_create_instance_with_cluster_arn_is_rejected():
     east = _regional_rds("us-east-1")
     suffix = uuid.uuid4().hex[:8]
     cluster_id = f"rds-inst-cluster-arn-{suffix}"
@@ -8628,22 +8647,28 @@ def test_rds_create_instance_with_cluster_arn_stores_canonical_cluster_id():
             MasterUsername="admin",
             MasterUserPassword="password123",
         )["DBCluster"]
-        east.create_db_instance(
-            DBInstanceIdentifier=instance_id,
-            DBClusterIdentifier=cluster["DBClusterArn"],
-            DBInstanceClass="db.t3.micro",
-            Engine="aurora-mysql",
+        _assert_create_instance_cluster_not_found(east, instance_id, cluster["DBClusterArn"])
+        _assert_create_instance_cluster_not_found(
+            east, instance_id, cluster["DBClusterArn"].replace(cluster_id, f"{cluster_id}-never")
         )
 
-        instance = east.describe_db_instances(DBInstanceIdentifier=instance_id)["DBInstances"][0]
-        assert instance["DBClusterIdentifier"] == cluster_id
-
         cluster = east.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
-        members = cluster["DBClusterMembers"]
-        assert any(member["DBInstanceIdentifier"] == instance_id for member in members)
+        assert cluster["DBClusterMembers"] == []
     finally:
         _delete_instance(east, instance_id)
         _delete_cluster(east, cluster_id)
+
+
+def test_rds_create_instance_with_unknown_cluster_id_is_rejected():
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    instance_id = f"rds-inst-missing-cluster-{suffix}"
+    try:
+        _assert_create_instance_cluster_not_found(
+            east, instance_id, f"rds-missing-cluster-{suffix}"
+        )
+    finally:
+        _delete_instance(east, instance_id)
 
 
 def test_rds_protected_cluster_member_delete_preserves_membership():
@@ -8661,7 +8686,7 @@ def test_rds_protected_cluster_member_delete_preserves_membership():
         )["DBCluster"]
         instance = east.create_db_instance(
             DBInstanceIdentifier=instance_id,
-            DBClusterIdentifier=cluster["DBClusterArn"],
+            DBClusterIdentifier=cluster_id,
             DBInstanceClass="db.t3.micro",
             Engine="aurora-mysql",
             DeletionProtection=True,
