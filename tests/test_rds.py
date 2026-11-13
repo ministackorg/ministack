@@ -8411,7 +8411,11 @@ def test_failover_global_cluster_allows_data_loss_promotes_target():
                 AllowDataLoss=True,
                 Switchover=True,
             )
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            "Parameter combination isn't valid. For a global switchover, specify "
+            "Switchover. For a global failover, specify AllowDataLoss."
+        )
 
         with pytest.raises(ClientError) as exc:
             east.failover_global_cluster(
@@ -8420,7 +8424,7 @@ def test_failover_global_cluster_allows_data_loss_promotes_target():
                 AllowDataLoss=False,
                 Switchover=True,
             )
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
     finally:
         _cleanup_two_member_global(east, global_id, primary_arn, secondary_arn)
         _delete_cluster(west, secondary_id)
@@ -8437,6 +8441,58 @@ def test_failover_global_cluster_missing_global_validated_before_parameter_combo
             Switchover=True,
         )
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
+
+
+def test_failover_global_cluster_parameter_combo_checked_before_target():
+    """As captured on AWS (us-east-1): an existing, empty global cluster and a
+    target that does not exist answer InvalidParameterValue for the parameter
+    combination, not a not-found fault for the target."""
+    east = _regional_rds("us-east-1")
+    global_id = f"failover-combo-{uuid.uuid4().hex[:8]}"
+    east.create_global_cluster(GlobalClusterIdentifier=global_id, Engine="aurora-mysql")
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.failover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=(
+                    f"arn:aws:rds:us-east-1:000000000000:cluster:{global_id}-missing-cluster"
+                ),
+                AllowDataLoss=True,
+                Switchover=True,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Message"] == (
+            "Parameter combination isn't valid. For a global switchover, specify "
+            "Switchover. For a global failover, specify AllowDataLoss."
+        )
+    finally:
+        _delete_global_cluster(east, global_id)
+
+
+def test_remove_from_global_cluster_missing_member_arn_is_invalid_parameter():
+    """As captured on AWS (us-east-1): RemoveFromGlobalCluster with a well-formed
+    ARN of a cluster that does not exist, against an existing global cluster,
+    answers 400 InvalidParameterValue. The global cluster is unchanged."""
+    east = _regional_rds("us-east-1")
+    global_id = f"remove-missing-{uuid.uuid4().hex[:8]}"
+    east.create_global_cluster(GlobalClusterIdentifier=global_id, Engine="aurora-mysql")
+    missing_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{global_id}-missing-cluster"
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=missing_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Message"] == (
+            f"Cluster {missing_arn} is not found in global cluster {global_id}"
+        )
+        described = east.describe_global_clusters(GlobalClusterIdentifier=global_id)
+        assert described["GlobalClusters"][0]["GlobalClusterMembers"] == []
+    finally:
+        _delete_global_cluster(east, global_id)
 
 
 def test_failover_db_cluster_promotes_reader_over_the_wire():

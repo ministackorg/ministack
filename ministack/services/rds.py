@@ -9130,6 +9130,12 @@ def _remove_from_global_cluster(p):
             None,
         )
         if not member:
+            if not cluster and _parse_rds_arn(db_cluster_id):
+                # As captured on AWS (us-east-1): a well-formed ARN of a cluster that
+                # does not exist, against an existing global cluster.
+                return _error("InvalidParameterValue",
+                    f"Cluster {db_cluster_arn} is not found in global cluster "
+                    f"{gc['GlobalClusterIdentifier']}", 400)
             return _error("DBClusterNotFoundFault",
                 f"DBCluster {db_cluster_id} is not a member of global cluster {gc_id}.", 404)
         if member.get("IsWriter") and len(members) > 1:
@@ -10224,9 +10230,11 @@ def _failover_global_cluster(p):
     both_failover_modes_specified = "AllowDataLoss" in p and "Switchover" in p
     allow_data_loss = str(_p(p, "AllowDataLoss")).lower() == "true"
     if both_failover_modes_specified:
+        # As captured on AWS (us-east-1): checked before the target cluster.
         return _error(
-            "InvalidParameterCombination",
-            "AllowDataLoss and Switchover cannot both be specified.",
+            "InvalidParameterValue",
+            "Parameter combination isn't valid. For a global switchover, specify "
+            "Switchover. For a global failover, specify AllowDataLoss.",
             400,
         )
     if allow_data_loss:
