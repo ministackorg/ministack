@@ -10227,10 +10227,11 @@ def _failover_global_cluster(p):
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
-    both_failover_modes_specified = "AllowDataLoss" in p and "Switchover" in p
     allow_data_loss = str(_p(p, "AllowDataLoss")).lower() == "true"
-    if both_failover_modes_specified:
-        # As captured on AWS (us-east-1): checked before the target cluster.
+    switchover = str(_p(p, "Switchover")).lower() == "true"
+    if allow_data_loss and switchover:
+        # As captured on AWS (us-east-1): checked before the target cluster. A flag
+        # set to false counts as absent.
         return _error(
             "InvalidParameterValue",
             "Parameter combination isn't valid. For a global switchover, specify "

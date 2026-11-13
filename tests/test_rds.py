@@ -8417,6 +8417,8 @@ def test_failover_global_cluster_allows_data_loss_promotes_target():
             "Switchover. For a global failover, specify AllowDataLoss."
         )
 
+        # As captured on AWS (us-east-1): a flag set to false counts as absent, so
+        # this is a plain switchover and not the parameter-combination error.
         with pytest.raises(ClientError) as exc:
             east.failover_global_cluster(
                 GlobalClusterIdentifier=global_id,
@@ -8424,7 +8426,7 @@ def test_failover_global_cluster_allows_data_loss_promotes_target():
                 AllowDataLoss=False,
                 Switchover=True,
             )
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Code"] != "InvalidParameterValue"
     finally:
         _cleanup_two_member_global(east, global_id, primary_arn, secondary_arn)
         _delete_cluster(west, secondary_id)
@@ -8466,6 +8468,29 @@ def test_failover_global_cluster_parameter_combo_checked_before_target():
             "Parameter combination isn't valid. For a global switchover, specify "
             "Switchover. For a global failover, specify AllowDataLoss."
         )
+    finally:
+        _delete_global_cluster(east, global_id)
+
+
+@pytest.mark.parametrize("allow_data_loss, switchover", [(False, True), (True, False)],
+                         ids=["switchover", "failover"])
+def test_failover_global_cluster_flag_set_false_counts_as_absent(allow_data_loss, switchover):
+    """As captured on AWS (us-east-1): with one flag true and the other explicitly
+    false, the call is a plain switchover or failover, so a target that does not
+    exist answers 404 DBClusterNotFoundFault, not the parameter-combination error."""
+    east = _regional_rds("us-east-1")
+    global_id = f"failover-flag-{uuid.uuid4().hex[:8]}"
+    east.create_global_cluster(GlobalClusterIdentifier=global_id, Engine="aurora-mysql")
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.failover_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                TargetDbClusterIdentifier=f"arn:aws:rds:us-east-1:000000000000:cluster:{global_id}-missing",
+                AllowDataLoss=allow_data_loss,
+                Switchover=switchover,
+            )
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     finally:
         _delete_global_cluster(east, global_id)
 

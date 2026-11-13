@@ -328,14 +328,21 @@ def _cluster_resolution_error(resource_arn, engine):
     )
 
 
+def _missing_target_error(resource_arn, engine, cluster):
+    if cluster is None and (absent_error := _absent_cluster_endpoint_error(resource_arn)):
+        return absent_error
+    return _cluster_resolution_error(resource_arn, engine)
+
+
 def _absent_cluster_endpoint_error(resource_arn):
-    """ExecuteStatement on a well-formed cluster ARN that names no cluster.
+    """A Data API call on a well-formed cluster ARN that names no cluster.
 
     As captured on AWS (us-east-1), a cluster ARN in the caller's account and
     Region that names no cluster (never created, or deleted) answers 400
-    HttpEndpointNotEnabledException "HttpEndpoint is not enabled for resource
-    <arn>." AWS does not reveal whether the cluster exists. Other ARN shapes keep
-    their current answers.
+    HttpEndpointNotEnabledException for ExecuteStatement ("HttpEndpoint is not
+    enabled for resource <arn>."), BatchExecuteStatement, BeginTransaction,
+    CommitTransaction and RollbackTransaction. AWS does not reveal whether the
+    cluster exists. Other ARN shapes keep their current answers.
     """
     from ministack.services import rds
 
@@ -675,9 +682,7 @@ def _execute_statement(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        if cluster is None and (absent_error := _absent_cluster_endpoint_error(resource_arn)):
-            return absent_error
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -774,7 +779,7 @@ def _begin_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
 
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
@@ -820,7 +825,7 @@ def _commit_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -859,7 +864,7 @@ def _rollback_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -902,7 +907,7 @@ def _batch_execute_statement(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
 
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:

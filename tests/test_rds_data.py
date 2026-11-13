@@ -168,6 +168,20 @@ def test_execute_deleted_cluster_reports_endpoint_not_enabled(rds):
     assert body["__type"] == "HttpEndpointNotEnabledException"
 
 
+@pytest.mark.parametrize("path, body", [
+    ("/CommitTransaction", {"transactionId": "AQ" + "A" * 182}),
+    ("/RollbackTransaction", {"transactionId": "AQ" + "A" * 182}),
+], ids=["commit", "rollback"])
+def test_transaction_calls_on_nonexistent_cluster_report_endpoint_not_enabled(path, body):
+    """As captured on AWS (us-east-1): CommitTransaction and RollbackTransaction
+    answer a well-formed ARN of a cluster that does not exist the same way as
+    ExecuteStatement, before they look up the transaction."""
+    status, response = _raw_post(path, {"resourceArn": FAKE_CLUSTER_ARN, "secretArn": FAKE_SECRET_ARN, **body})
+    assert status == 400
+    assert response["__type"] == "HttpEndpointNotEnabledException"
+    assert response["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
+
+
 @pytest.mark.auth_contract
 @pytest.mark.parametrize("operation,action,params,cluster,reason", [
     ("execute_statement", "ExecuteStatement", {"sql": "select 1"}, "other", None),
@@ -190,20 +204,15 @@ def test_rds_data_authorization_contract(auth_enabled, iam_user, operation, acti
     rds = user.client("rds-data")
     allowed = {"resourceArn": f"{clusters}-allowed", "secretArn": FAKE_SECRET_ARN}
     # An authorized call reaches the handler, which answers for the absent cluster.
-    for call, code in (
-        (lambda: rds.execute_statement(**allowed, sql="select 1"), "HttpEndpointNotEnabledException"),
-        (lambda: rds.begin_transaction(**allowed), "BadRequestException"),
-    ):
+    for call in (lambda: rds.execute_statement(**allowed, sql="select 1"), lambda: rds.begin_transaction(**allowed)):
         with pytest.raises(ClientError) as served:
             call()
-        assert served.value.response["Error"]["Code"] == code
+        assert served.value.response["Error"]["Code"] == "HttpEndpointNotEnabledException"
     with pytest.raises(ClientError) as exc:
         getattr(rds, operation)(resourceArn=f"{clusters}-{cluster}", secretArn=FAKE_SECRET_ARN, **params)
     response = exc.value.response
     if not auth_enabled:
-        assert response["Error"]["Code"] == (
-            "HttpEndpointNotEnabledException" if operation == "execute_statement" else "BadRequestException"
-        )
+        assert response["Error"]["Code"] == "HttpEndpointNotEnabledException"
         return
     reason = reason or f"because no identity-based policy allows the rds-data:{action} action"
     assert (response["ResponseMetadata"]["HTTPStatusCode"], response["Error"]["Code"]) == (
@@ -414,23 +423,26 @@ def test_rds_data_db_arn_lookup_rejects_foreign_account():
 
 
 def test_begin_transaction_nonexistent_cluster():
-    """BeginTransaction with a non-existent cluster ARN returns an error."""
+    """As captured on AWS (us-east-1): answered like ExecuteStatement."""
     status, body = _raw_post("/BeginTransaction", {
         "resourceArn": FAKE_CLUSTER_ARN,
         "secretArn": FAKE_SECRET_ARN,
     })
     assert status == 400
-    assert "not found" in body.get("message", body.get("Message", "")).lower()
+    assert body["__type"] == "HttpEndpointNotEnabledException"
+    assert body["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
 
 
 def test_batch_execute_nonexistent_cluster():
+    """As captured on AWS (us-east-1): answered like ExecuteStatement."""
     status, body = _raw_post("/BatchExecute", {
         "resourceArn": FAKE_CLUSTER_ARN,
         "secretArn": FAKE_SECRET_ARN,
         "sql": "INSERT INTO t VALUES (1)",
     })
     assert status == 400
-    assert "not found" in body.get("message", body.get("Message", "")).lower()
+    assert body["__type"] == "HttpEndpointNotEnabledException"
+    assert body["message"] == f"HttpEndpoint is not enabled for resource {FAKE_CLUSTER_ARN}."
 
 
 # ── Transaction lifecycle (error paths) ────────────────────
