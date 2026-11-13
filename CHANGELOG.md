@@ -8,13 +8,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-<<<<<<< Updated upstream
+- **SSM — Secrets Manager references** — `GetParameter` and `GetParameters` refused `/aws/reference/secretsmanager/<secret-id>` as a reserved name, so serverless `${ssm:/aws/reference/secretsmanager/...}` variables could not resolve. They now return the secret's `AWSCURRENT` value as a `SecureString` with `Version` 0, the secret's ARN and a `SourceResult`, as on AWS. `WithDecryption` must be true: `GetParameter` answers `ValidationException` without it, and `GetParameters` lists the name in `InvalidParameters`. A missing secret answers `ParameterNotFound` with AWS's message.
 - **Firehose — delivery to Iceberg tables on the Glue Data Catalog** — an Iceberg destination accepted `IcebergDestinationConfiguration` with a Glue catalog but never wrote to the table. Records now wait out `BufferingHints` and are appended as one commit per buffer: Parquet files per identity partition, a snapshot whose summary carries `FIREHOSE-DELIVERY-STREAM-ID` and `FIREHOSE-INTERNAL-CHECKPOINT`, and the Glue `metadata_location` updated, with failed commits retried in arrival order. Top-level JSON keys map to columns by exact name; a value that can't be converted goes to `<ErrorOutputPrefix>iceberg-failed/…` as `Iceberg.MalformedFieldWithinRecord`, and a payload that isn't a JSON object as `Iceberg.InvalidPayload`. `DeliveryToIceberg.DataFreshness`, `SuccessfulRowCount` and `FailedRowCount` are published to CloudWatch. `UpdateDestination` refuses to turn `AppendOnly` off, and `PutRecord` / `PutRecordBatch` answer AWS's `ValidationException` / `InvalidArgumentException` for more than 500 records, a record over 1,000 KiB or a batch over 4 MiB. Tables are format-version 2 in MiniStack's S3 with `string` and `timestamp` columns (full image, for DuckDB).
 ### Fixed
 - **RDS — `CreateDBInstance` with an unknown `DBClusterIdentifier`** — a cluster ARN joined the cluster, and a plain id that names no cluster created an instance anyway. As on AWS, both now answer `404 DBClusterNotFoundFault` ("The source cluster could not be found or cannot be accessed: …") and nothing is created. Fixes #2633. Contributed by @kharabasz.
-=======
 - **API Gateway — `AWS` integrations targeting SNS** — a non-proxy integration with an `sns:path//` or `sns:action/{Action}` URI answered `500` "Internal server error", because only SQS targets were dispatched. It now sends the rendered request template, plus any mapped `integration.request.querystring.*` parameters, as the SNS call in the topic's account and Region, and maps the reply through `integrationResponses`; a `Publish` reply reaches the response template as JSON (`PublishResponse.PublishResult.MessageId`). Reported by @OkButterscotch2891 on Reddit.
->>>>>>> Stashed changes
 
 ## [1.5.40] — 2026-11-11
 
