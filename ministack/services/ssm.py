@@ -502,6 +502,41 @@ def _public_parameter(name):
             "ARN": f"arn:aws:ssm:{get_region()}::parameter{name}"}
 
 
+_SECRET_REFERENCE_PREFIX = "/aws/reference/secretsmanager/"
+
+
+def _secret_reference(name):
+    """The Parameter AWS returns for a Secrets Manager reference: the secret's AWSCURRENT version, or None."""
+    from ministack.services import secretsmanager
+
+    secret = secretsmanager.find_secret(name[len(_SECRET_REFERENCE_PREFIX):])
+    if not secret or secret.get("DeletedDate"):
+        return None
+    version_id, version = next(
+        ((vid, ver) for vid, ver in secret["Versions"].items() if "AWSCURRENT" in ver["Stages"]), (None, None)
+    )
+    if not version or version.get("SecretString") is None:
+        return None
+    created = datetime.fromtimestamp(version["CreatedDate"], tz=timezone.utc)
+    source = {
+        "ARN": secret["ARN"],
+        "name": secret["Name"],
+        "versionId": version_id,
+        "secretString": version["SecretString"],
+        "versionStages": list(version["Stages"]),
+        "createdDate": f"{created:%b} {created.day}, {created.year}, {created.hour % 12 or 12}:{created:%M:%S %p}",
+    }
+    return {
+        "Name": name,
+        "Type": "SecureString",
+        "Value": version["SecretString"],
+        "Version": 0,
+        "SourceResult": json.dumps(source, separators=(",", ":")),
+        "LastModifiedDate": version["CreatedDate"],
+        "ARN": secret["ARN"],
+    }
+
+
 def _select_parameter(name_or_arn):
     """(param, error) for GetParameter / GetParameters, honouring name:version and name:label."""
     base, selector = _split_selector(name_or_arn)
@@ -524,6 +559,20 @@ def _select_parameter(name_or_arn):
 
 def _get_parameter(data):
     name = data.get("Name")
+    with_decryption = data.get("WithDecryption", False)
+    if name and name.startswith(_SECRET_REFERENCE_PREFIX):
+        if not with_decryption:
+            return error_response_json(
+                "ValidationException", "WithDecryption flag must be True for retrieving a Secret Manager secret.", 400
+            )
+        reference = _secret_reference(name)
+        if not reference:
+            message = (
+                f"An error occurred (ParameterNotFound) when referencing Secrets Manager: Secret {name[1:]} not found. "
+                "Secrets Manager can't find the specified secret."
+            )
+            return error_response_json("ParameterNotFound", message, 400)
+        return json_response({"Parameter": reference})
     param, error = _select_parameter(name)
     if error == "ParameterVersionNotFound":
         return error_response_json(
@@ -533,7 +582,6 @@ def _get_parameter(data):
         )
     if not param:
         return error_response_json("ParameterNotFound", f"Parameter {name} not found", 400)
-    with_decryption = data.get("WithDecryption", False)
     return json_response({"Parameter": _param_out(param, with_decryption)})
 
 
@@ -543,6 +591,13 @@ def _get_parameters(data):
     params = []
     invalid = []
     for name in names:
+        if name.startswith(_SECRET_REFERENCE_PREFIX):
+            reference = _secret_reference(name) if with_decryption else None
+            if reference:
+                params.append(reference)
+            else:
+                invalid.append(name)
+            continue
         p, _ = _select_parameter(name)
         if p:
             params.append(_param_out(p, with_decryption))
