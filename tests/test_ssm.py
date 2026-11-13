@@ -794,6 +794,72 @@ def test_ssm_public_latest_ami_parameter_names_a_stub_image(ssm, ec2):
     assert ec2.describe_images(ImageIds=[param["Value"]])["Images"][0]["Name"].startswith("al2023-ami-")
 
 
+def test_ssm_secretsmanager_reference_returns_current_secret(ssm, sm):
+    secret_name = f"ssm-ref-{_uuid_mod.uuid4().hex[:8]}"
+    secret = sm.create_secret(Name=secret_name, SecretString="first")
+    updated = sm.put_secret_value(SecretId=secret_name, SecretString="second")
+    name = f"/aws/reference/secretsmanager/{secret_name}"
+
+    param = ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]
+
+    assert param["Name"] == name
+    assert param["Type"] == "SecureString"
+    assert param["Value"] == "second"
+    assert param["Version"] == 0
+    assert param["ARN"] == secret["ARN"]
+    assert "DataType" not in param
+    source = json.loads(param["SourceResult"])
+    assert source["ARN"] == secret["ARN"]
+    assert source["name"] == secret_name
+    assert source["versionId"] == updated["VersionId"]
+    assert source["secretString"] == "second"
+    assert source["versionStages"] == ["AWSCURRENT"]
+
+
+def test_ssm_secretsmanager_reference_requires_with_decryption(ssm, sm):
+    secret_name = f"ssm-ref-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=secret_name, SecretString="value")
+    name = f"/aws/reference/secretsmanager/{secret_name}"
+
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name)
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == "WithDecryption flag must be True for retrieving a Secret Manager secret."
+
+    resp = ssm.get_parameters(Names=[name])
+    assert resp["Parameters"] == []
+    assert resp["InvalidParameters"] == [name]
+
+
+def test_ssm_secretsmanager_reference_to_missing_secret(ssm):
+    secret_name = f"ssm-ref-missing-{_uuid_mod.uuid4().hex[:8]}"
+    name = f"/aws/reference/secretsmanager/{secret_name}"
+
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name, WithDecryption=True)
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ParameterNotFound"
+    assert err["Message"] == (
+        "An error occurred (ParameterNotFound) when referencing Secrets Manager: "
+        f"Secret aws/reference/secretsmanager/{secret_name} not found. "
+        "Secrets Manager can't find the specified secret."
+    )
+
+
+def test_ssm_get_parameters_mixes_secretsmanager_references(ssm, sm):
+    secret_name = f"ssm-ref-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=secret_name, SecretString="value")
+    found = f"/aws/reference/secretsmanager/{secret_name}"
+    missing = f"/aws/reference/secretsmanager/{secret_name}-missing"
+
+    resp = ssm.get_parameters(Names=[found, missing], WithDecryption=True)
+
+    assert [p["Name"] for p in resp["Parameters"]] == [found]
+    assert resp["Parameters"][0]["Value"] == "value"
+    assert resp["InvalidParameters"] == [missing]
+
+
 def test_ssm_put_parameter_rejects_tags_with_overwrite(ssm):
     tags = [{"Key": "k", "Value": "v"}]
     new_name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"
