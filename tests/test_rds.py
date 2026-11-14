@@ -8616,21 +8616,6 @@ def test_failover_global_cluster_parameter_combo_checked_before_target():
                 ),
                 AllowDataLoss=True,
                 Switchover=True,
-@pytest.mark.parametrize("global_exists", [False, True], ids=["missing-global", "existing-global"])
-def test_remove_from_global_cluster_rejects_overlong_member_identifier(global_exists):
-    """As captured on AWS (us-east-1): a member ARN whose cluster identifier is
-    longer than 63 characters answers 400 InvalidParameterValue, checked before
-    the global cluster is looked up."""
-    east = _regional_rds("us-east-1")
-    global_id = f"remove-long-{uuid.uuid4().hex[:8]}"
-    if global_exists:
-        east.create_global_cluster(GlobalClusterIdentifier=global_id, Engine="aurora-mysql")
-    member_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{'m' * 64}"
-    try:
-        with pytest.raises(ClientError) as exc:
-            east.remove_from_global_cluster(
-                GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=member_arn,
             )
         assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
         assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
@@ -8688,6 +8673,27 @@ def test_remove_from_global_cluster_missing_member_arn_is_invalid_parameter():
         assert described["GlobalClusters"][0]["GlobalClusterMembers"] == []
     finally:
         _delete_global_cluster(east, global_id)
+
+
+@pytest.mark.parametrize("global_exists", [False, True], ids=["missing-global", "existing-global"])
+def test_remove_from_global_cluster_rejects_overlong_member_identifier(global_exists):
+    """As captured on AWS (us-east-1): a member ARN whose cluster identifier is
+    longer than 63 characters answers 400 InvalidParameterValue, checked before
+    the global cluster is looked up."""
+    east = _regional_rds("us-east-1")
+    global_id = f"remove-long-{uuid.uuid4().hex[:8]}"
+    if global_exists:
+        east.create_global_cluster(GlobalClusterIdentifier=global_id, Engine="aurora-mysql")
+    member_arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{'m' * 64}"
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=member_arn,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Message"] == (
             f"Invalid database cluster identifier:  {member_arn}"
         )
     finally:

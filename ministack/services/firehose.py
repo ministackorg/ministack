@@ -1375,8 +1375,9 @@ def _iceberg_metadata_location(database, table):
 
 
 def _iceberg_load_table(database, table):
-    """The table's current metadata.json, checked for what this writer supports."""
-    metadata = json.loads(_iceberg_s3_get(_iceberg_metadata_location(database, table)))
+    """(metadata_location, its metadata.json), checked for what this writer supports."""
+    location = _iceberg_metadata_location(database, table)
+    metadata = json.loads(_iceberg_s3_get(location))
     if metadata.get("format-version") != 2:
         raise ValueError(f"{database}.{table} is Iceberg format-version {metadata.get('format-version')}; "
                          "MiniStack's Firehose writes format-version 2 tables")
@@ -1388,13 +1389,15 @@ def _iceberg_load_table(database, table):
     for field in _iceberg_spec(metadata)["fields"]:
         if field["transform"] != "identity":
             raise ValueError(f"partition transform {field['transform']} is not supported by MiniStack's Firehose")
-    return metadata
+    return location, metadata
 
 
-def _iceberg_error_document(raw, arrival_ms, code, message, attempted=False):
+def _iceberg_error_document(raw, arrival_ms, code, message, attempted=False, ended=None):
     # A payload that isn't a JSON object is rejected before any attempt: AWS reports 0 attempts and a 0 end time.
+    if ended is None:
+        ended = int(time.time() * 1000) if attempted else 0
     return {"attemptsMade": 1 if attempted else 0, "arrivalTimestamp": arrival_ms, "errorCode": code,
-            "errorMessage": message, "attemptEndingTimestamp": int(time.time() * 1000) if attempted else 0,
+            "errorMessage": message, "attemptEndingTimestamp": ended,
             "rawData": base64.b64encode(raw).decode()}
 
 
@@ -1493,11 +1496,10 @@ def _iceberg_partition_summaries(metadata, files):
     return summaries
 
 
-def _iceberg_append(database, table, metadata, rows, summary_extra):
+def _iceberg_append(database, table, location, metadata, rows, summary_extra):
     """Append ``rows`` to the table as one snapshot; retries Glue conflicts."""
     from ministack.services import glue as glue_svc
 
-    location = _iceberg_metadata_location(database, table)
     base = metadata["location"].rstrip("/")
     files = _iceberg_write_data_files(metadata, rows, metadata.get("last-sequence-number", 0) + 1)
     snapshot_id = random.getrandbits(63) or 1
@@ -1688,12 +1690,19 @@ def _commit_glue_iceberg(stream: dict, dest: dict, batch: list):
     database, table = table_cfg.get("DestinationDatabaseName"), table_cfg.get("DestinationTableName")
     arrival = {rid: ms for rid, _, ms in batch}
     processed = _apply_lambda_processors(stream, dest, [(rid, raw) for rid, raw, _ in batch])
-    metadata = _iceberg_load_table(database, table)
+    try:
+        location, metadata = _iceberg_load_table(database, table)
+    except LookupError:
+        ended = int(time.time() * 1000)
+        return database, table, 0, [_iceberg_error_document(
+            raw, arrival.get(rid, batch[0][2]), "Iceberg.NoSuchIcebergTable",
+            f"Input Glue table is not an iceberg table. Table: {database}.{table}", ended=ended)
+            for rid, raw in processed]
     rows, failed = _iceberg_prepare_rows(
         metadata, [(raw, arrival.get(rid, batch[0][2])) for rid, raw in processed])
     if rows:
         checkpoint = dest.get("iceberg_checkpoint", 0) + 1
-        _iceberg_append(database, table, metadata, rows, {
+        _iceberg_append(database, table, location, metadata, rows, {
             "FIREHOSE-DELIVERY-STREAM-ID": f"{get_account_id()}:{stream['name']}:{int(stream['created_at'] * 1000)}",
             "FIREHOSE-INTERNAL-CHECKPOINT": f"{checkpoint:018d},,,{0:018d}",
         })

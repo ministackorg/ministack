@@ -1440,3 +1440,51 @@ def test_firehose_iceberg_buffers_survive_persistence():
         with _fh._iceberg_buffers_lock:
             _fh._iceberg_buffers.clear()
             _fh._iceberg_buffers.update(saved)
+
+
+def test_firehose_iceberg_commit_keeps_a_commit_made_after_the_load(monkeypatch):
+    pytest.importorskip("duckdb")
+    from ministack.services import firehose as _fh
+    from ministack.services import glue as _glue
+
+    store, base = {}, "s3://race-bucket/t"
+    monkeypatch.setattr(_fh, "_iceberg_s3_get", lambda uri: store[uri])
+    monkeypatch.setattr(_fh, "_iceberg_s3_put", lambda uri, body: store.__setitem__(uri, body))
+    md0 = {"format-version": 2, "location": base, "last-sequence-number": 0, "current-snapshot-id": -1,
+           "schemas": [{"schema-id": 0, "type": "struct",
+                        "fields": [{"id": 1, "name": "a", "required": False, "type": "string"}]}],
+           "current-schema-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}], "default-spec-id": 0,
+           "snapshots": [], "properties": {}}
+    md1 = {**md0, "last-sequence-number": 1, "current-snapshot-id": 7,
+           "snapshots": [{"snapshot-id": 7, "sequence-number": 1, "manifest-list": f"{base}/metadata/snap-7.avro",
+                          "summary": {}}]}
+    store[f"{base}/metadata/00000-a.metadata.json"] = json.dumps(md0).encode()
+    store[f"{base}/metadata/00001-b.metadata.json"] = json.dumps(md1).encode()
+    store[f"{base}/metadata/snap-7.avro"] = _fh._iceberg_avro_write(_fh._ICEBERG_MANIFEST_FILE_SCHEMA, [], {})
+    table = {"Name": "t", "Parameters": {"metadata_location": f"{base}/metadata/00000-a.metadata.json"}}
+    monkeypatch.setitem(_glue._tables, "racedb/t", table)
+
+    location, metadata = _fh._iceberg_load_table("racedb", "t")
+    table["Parameters"]["metadata_location"] = f"{base}/metadata/00001-b.metadata.json"  # another engine commits
+    _fh._iceberg_append("racedb", "t", location, metadata, [{"a": "x"}], {})
+
+    final = json.loads(store[table["Parameters"]["metadata_location"]])
+    assert [s["snapshot-id"] for s in final["snapshots"]][0] == 7
+    assert final["snapshots"][-1]["parent-snapshot-id"] == 7
+
+
+def test_firehose_iceberg_table_not_in_glue_goes_to_error_output(fh, s3, glue_iceberg):
+    bucket, database, _ = glue_iceberg
+    name = f"fh-notable-{bucket[-8:]}"
+    _glue_iceberg_stream(fh, bucket, database, "no_such_table", name)
+    record = _ice_record("s1", 1)
+    fh.put_record(DeliveryStreamName=name, Record={"Data": record})
+
+    errors = s3.list_objects_v2(Bucket=bucket, Prefix=f"{name}-errors/iceberg-failed/")["Contents"]
+    (line,) = [json.loads(x) for x in _s3_body(s3, f"s3://{bucket}/{errors[0]['Key']}").splitlines()]
+    assert list(line) == ["attemptsMade", "arrivalTimestamp", "errorCode", "errorMessage",
+                          "attemptEndingTimestamp", "rawData"]
+    assert line["errorCode"] == "Iceberg.NoSuchIcebergTable" and line["attemptsMade"] == 0
+    assert line["errorMessage"] == f"Input Glue table is not an iceberg table. Table: {database}.no_such_table"
+    assert line["attemptEndingTimestamp"] >= line["arrivalTimestamp"] > 0
+    assert base64.b64decode(line["rawData"]) == record
