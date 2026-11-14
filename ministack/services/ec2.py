@@ -9196,8 +9196,8 @@ def _va_certificate_error(cert_arn, domain):
         return _va_invalid("The CertificateArn is invalid")
     if cert.get("Status") != "ISSUED":
         return _va_invalid("The DomainCertificateArn provided in the request is not in ISSUED state.")
-    # MiniStack's ACM does not read the names in an imported certificate.
-    if cert.get("Type") == "IMPORTED":
+    # An imported body ACM could not parse carries a synthetic name.
+    if cert.get("Type") == "IMPORTED" and cert.get("DomainName", "").endswith(".invalid"):
         return None
     names = cert.get("SubjectAlternativeNames") or [cert.get("DomainName", "")]
     # A wildcard name covers one label: *.example.com covers web.example.com,
