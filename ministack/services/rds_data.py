@@ -13,7 +13,13 @@ import threading
 import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, json_response
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+)
 
 logger = logging.getLogger("rds-data")
 
@@ -319,6 +325,41 @@ def _cluster_resolution_error(resource_arn, engine):
     return _error(
         "BadRequestException",
         f"Database cluster not found for ARN: {resource_arn}",
+    )
+
+
+def _missing_target_error(resource_arn, engine, cluster):
+    if cluster is None and (absent_error := _absent_cluster_endpoint_error(resource_arn)):
+        return absent_error
+    return _cluster_resolution_error(resource_arn, engine)
+
+
+def _absent_cluster_endpoint_error(resource_arn):
+    """A Data API call on a well-formed cluster ARN that names no cluster.
+
+    As captured on AWS (us-east-1), a cluster ARN in the caller's account and
+    Region that names no cluster (never created, or deleted) answers 400
+    HttpEndpointNotEnabledException for ExecuteStatement ("HttpEndpoint is not
+    enabled for resource <arn>."), BatchExecuteStatement, BeginTransaction,
+    CommitTransaction and RollbackTransaction. AWS does not reveal whether the
+    cluster exists. Other ARN shapes keep their current answers.
+    """
+    from ministack.services import rds
+
+    parsed = rds._parse_rds_arn(resource_arn)
+    if not parsed:
+        return None
+    spec, resource_type, _resource_id = parsed
+    if (
+        resource_type != "cluster"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+        or rds._resolve_cluster(resource_arn)
+    ):
+        return None
+    return _error(
+        "HttpEndpointNotEnabledException",
+        f"HttpEndpoint is not enabled for resource {resource_arn}.",
     )
 
 
@@ -641,7 +682,7 @@ def _execute_statement(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -687,11 +728,18 @@ def _execute_statement(data):
             # also returns rows. This is not an audit of side effects in CTEs.
             if command == ["SELECT"]:
                 updated = 0
+        mysql_result_set = engine not in ("postgres", "aurora-postgresql") and cursor.description
+        if mysql_result_set:
+            # PyMySQL counts returned rows. As captured on AWS (Aurora MySQL),
+            # SELECT 1 answers numberOfRecordsUpdated 0 and no generatedFields.
+            updated = 0
 
         response = {
             "numberOfRecordsUpdated": updated,
             "generatedFields": _generated_fields(cursor, engine),
         }
+        if mysql_result_set and not response["generatedFields"]:
+            del response["generatedFields"]
 
         if cursor.description:
             rows = cursor.fetchall()
@@ -738,7 +786,7 @@ def _begin_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
 
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
@@ -784,7 +832,7 @@ def _commit_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -823,7 +871,7 @@ def _rollback_transaction(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
     _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
         return secret_error
@@ -866,7 +914,7 @@ def _batch_execute_statement(data):
     if endpoint_error:
         return endpoint_error
     if not instance:
-        return _cluster_resolution_error(resource_arn, engine)
+        return _missing_target_error(resource_arn, engine, cluster)
 
     secret_user, password, secret_error = _require_secret_credentials(secret_arn)
     if secret_error:
