@@ -313,6 +313,12 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
+    if action in ("GetParameter", "GetParameters"):
+        from ministack.app import AUTH
+        from ministack.core.router import extract_access_key_id
+
+        access_key = (extract_access_key_id(headers, query_params) or "") if AUTH else None
+        return handler(data, access_key)
     return handler(data)
 
 
@@ -537,6 +543,16 @@ def _secret_reference(name):
     }
 
 
+def _secret_reference_denial(reference, access_key):
+    """Under AUTH=true, Parameter Store honours the caller's access to the secret."""
+    if access_key is None:
+        return None
+    from ministack.core.iam_evaluator import enforce
+
+    return enforce(access_key, "secretsmanager:GetSecretValue", "secretsmanager", get_region(),
+                   resource_arn=reference["ARN"])
+
+
 def _select_parameter(name_or_arn):
     """(param, error) for GetParameter / GetParameters, honouring name:version and name:label."""
     base, selector = _split_selector(name_or_arn)
@@ -557,7 +573,7 @@ def _select_parameter(name_or_arn):
     return {**entry, "Name": param["Name"], "ARN": param["ARN"], "Selector": f":{selector}"}, None
 
 
-def _get_parameter(data):
+def _get_parameter(data, access_key=None):
     name = data.get("Name")
     with_decryption = data.get("WithDecryption", False)
     if name and name.startswith(_SECRET_REFERENCE_PREFIX):
@@ -572,6 +588,14 @@ def _get_parameter(data):
                 "Secrets Manager can't find the specified secret."
             )
             return error_response_json("ParameterNotFound", message, 400)
+        denied = _secret_reference_denial(reference, access_key)
+        if denied:
+            from ministack.core.iam_actions import access_denied_response
+
+            return access_denied_response("ssm", "secretsmanager:GetSecretValue",
+                                          getattr(denied, "principal_arn", ""), new_uuid(),
+                                          resource_arn=reference["ARN"],
+                                          explicit_deny=getattr(denied, "decision", "") == "Deny")
         return json_response({"Parameter": reference})
     param, error = _select_parameter(name)
     if error == "ParameterVersionNotFound":
@@ -585,7 +609,7 @@ def _get_parameter(data):
     return json_response({"Parameter": _param_out(param, with_decryption)})
 
 
-def _get_parameters(data):
+def _get_parameters(data, access_key=None):
     names = data.get("Names", [])
     with_decryption = data.get("WithDecryption", False)
     params = []
@@ -593,7 +617,7 @@ def _get_parameters(data):
     for name in names:
         if name.startswith(_SECRET_REFERENCE_PREFIX):
             reference = _secret_reference(name) if with_decryption else None
-            if reference:
+            if reference and not _secret_reference_denial(reference, access_key):
                 params.append(reference)
             else:
                 invalid.append(name)
