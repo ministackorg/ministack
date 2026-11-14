@@ -6682,7 +6682,6 @@ def _create_db_cluster_impl(p):
     explicit_subnet_group = _p(p, "DBSubnetGroupName")
     if (explicit_subnet_group and explicit_subnet_group != "default"
             and explicit_subnet_group not in _subnet_groups):
-        # As captured on AWS (us-east-1): nothing is created.
         return _error("DBSubnetGroupNotFoundFault",
                       f"DB subnet group '{explicit_subnet_group}' does not exist.", 404)
 
@@ -9123,8 +9122,6 @@ def _remove_from_global_cluster(p):
         return invalid_id
     parsed_member = _parse_rds_arn(db_cluster_id or "")
     if parsed_member and parsed_member[1] == "cluster" and len(parsed_member[2]) > 63:
-        # As captured on AWS (us-east-1): a member ARN whose cluster identifier is
-        # longer than 63 characters is rejected before the global cluster is looked up.
         return _error("InvalidParameterValue",
             f"Invalid database cluster identifier:  {db_cluster_id}", 400)
     gc = _resolve_global_cluster(gc_id)
@@ -9143,9 +9140,9 @@ def _remove_from_global_cluster(p):
             None,
         )
         if not member:
-            if not cluster and _parse_rds_arn(db_cluster_id):
-                # As captured on AWS (us-east-1): a well-formed ARN of a cluster that
-                # does not exist, against an existing global cluster.
+            if (not cluster and parsed_member and parsed_member[1] == "cluster"
+                    and parsed_member[0].account_id == get_account_id()
+                    and parsed_member[0].region == get_region()):
                 return _error("InvalidParameterValue",
                     f"Cluster {db_cluster_arn} is not found in global cluster "
                     f"{gc['GlobalClusterIdentifier']}", 400)
@@ -10243,8 +10240,6 @@ def _failover_global_cluster(p):
     allow_data_loss = str(_p(p, "AllowDataLoss")).lower() == "true"
     switchover = str(_p(p, "Switchover")).lower() == "true"
     if allow_data_loss and switchover:
-        # As captured on AWS (us-east-1): checked before the target cluster. A flag
-        # set to false counts as absent.
         return _error(
             "InvalidParameterValue",
             "Parameter combination isn't valid. For a global switchover, specify "

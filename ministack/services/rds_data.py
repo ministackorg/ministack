@@ -329,44 +329,20 @@ def _cluster_resolution_error(resource_arn, engine):
 
 
 def _missing_target_error(resource_arn, engine, cluster):
-    if cluster is None and (absent_error := _absent_cluster_endpoint_error(resource_arn)):
-        return absent_error
-    return _cluster_resolution_error(resource_arn, engine)
-
-
-def _absent_cluster_endpoint_error(resource_arn):
-    """A Data API call on a well-formed cluster ARN that names no cluster.
-
-    As captured on AWS (us-east-1), a cluster ARN in the caller's account and
-    Region that names no cluster (never created, or deleted) answers 400
-    HttpEndpointNotEnabledException for ExecuteStatement ("HttpEndpoint is not
-    enabled for resource <arn>."), BatchExecuteStatement, BeginTransaction,
-    CommitTransaction and RollbackTransaction. AWS does not reveal whether the
-    cluster exists. Other ARN shapes keep their current answers.
-    """
     from ministack.services import rds
 
-    parsed = rds._parse_rds_arn(resource_arn)
-    if not parsed:
-        return None
-    spec, resource_type, _resource_id = parsed
-    if (
-        resource_type != "cluster"
-        or spec.account_id != get_account_id()
-        or spec.region != get_region()
-        or rds._resolve_cluster(resource_arn)
-    ):
-        return None
-    return _error(
-        "HttpEndpointNotEnabledException",
-        f"HttpEndpoint is not enabled for resource {resource_arn}.",
-    )
+    # A same-account, same-Region cluster ARN that names no cluster.
+    parsed = rds._parse_rds_arn(resource_arn) if cluster is None else None
+    if (parsed and parsed[1] == "cluster" and parsed[0].account_id == get_account_id()
+            and parsed[0].region == get_region()):
+        return _http_endpoint_not_enabled_error(resource_arn)
+    return _cluster_resolution_error(resource_arn, engine)
 
 
 def _http_endpoint_not_enabled_error(resource_arn):
     return _error(
         "HttpEndpointNotEnabledException",
-        f"HTTP endpoint is not enabled for cluster ARN: {resource_arn}",
+        f"HttpEndpoint is not enabled for resource {resource_arn}.",
     )
 
 
