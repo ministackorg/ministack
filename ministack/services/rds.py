@@ -6679,6 +6679,13 @@ def _create_db_cluster_impl(p):
         return _error("DBClusterParameterGroupNotFound",
                       f"DBClusterParameterGroup {explicit_cpg} not found.", 404)
 
+    explicit_subnet_group = _p(p, "DBSubnetGroupName")
+    if (explicit_subnet_group and explicit_subnet_group != "default"
+            and explicit_subnet_group not in _subnet_groups):
+        # As captured on AWS (us-east-1): nothing is created.
+        return _error("DBSubnetGroupNotFoundFault",
+                      f"DB subnet group '{explicit_subnet_group}' does not exist.", 404)
+
     engine = _p(p, "Engine") or "aurora-postgresql"
     if global_cluster:
         expected_engine = global_cluster.get("Engine")
@@ -9114,6 +9121,12 @@ def _remove_from_global_cluster(p):
     invalid_id = _invalid_global_cluster_identifier_error(gc_id)
     if invalid_id:
         return invalid_id
+    parsed_member = _parse_rds_arn(db_cluster_id or "")
+    if parsed_member and parsed_member[1] == "cluster" and len(parsed_member[2]) > 63:
+        # As captured on AWS (us-east-1): a member ARN whose cluster identifier is
+        # longer than 63 characters is rejected before the global cluster is looked up.
+        return _error("InvalidParameterValue",
+            f"Invalid database cluster identifier:  {db_cluster_id}", 400)
     gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
@@ -9130,6 +9143,12 @@ def _remove_from_global_cluster(p):
             None,
         )
         if not member:
+            if not cluster and _parse_rds_arn(db_cluster_id):
+                # As captured on AWS (us-east-1): a well-formed ARN of a cluster that
+                # does not exist, against an existing global cluster.
+                return _error("InvalidParameterValue",
+                    f"Cluster {db_cluster_arn} is not found in global cluster "
+                    f"{gc['GlobalClusterIdentifier']}", 400)
             return _error("DBClusterNotFoundFault",
                 f"DBCluster {db_cluster_id} is not a member of global cluster {gc_id}.", 404)
         if member.get("IsWriter") and len(members) > 1:
@@ -10221,12 +10240,15 @@ def _failover_global_cluster(p):
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
-    both_failover_modes_specified = "AllowDataLoss" in p and "Switchover" in p
     allow_data_loss = str(_p(p, "AllowDataLoss")).lower() == "true"
-    if both_failover_modes_specified:
+    switchover = str(_p(p, "Switchover")).lower() == "true"
+    if allow_data_loss and switchover:
+        # As captured on AWS (us-east-1): checked before the target cluster. A flag
+        # set to false counts as absent.
         return _error(
-            "InvalidParameterCombination",
-            "AllowDataLoss and Switchover cannot both be specified.",
+            "InvalidParameterValue",
+            "Parameter combination isn't valid. For a global switchover, specify "
+            "Switchover. For a global failover, specify AllowDataLoss.",
             400,
         )
     if allow_data_loss:
