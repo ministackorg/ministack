@@ -706,8 +706,7 @@ def _execute_statement(data):
                 updated = 0
         mysql_result_set = engine not in ("postgres", "aurora-postgresql") and cursor.description
         if mysql_result_set:
-            # PyMySQL counts returned rows. As captured on AWS (Aurora MySQL),
-            # SELECT 1 answers numberOfRecordsUpdated 0 and no generatedFields.
+            # PyMySQL counts returned rows; AWS reports 0 for a SELECT.
             updated = 0
 
         response = {

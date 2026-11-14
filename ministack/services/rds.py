@@ -5169,7 +5169,6 @@ def _create_db_instance_impl(p):
         db_name = "mydb"
     allocated_storage = int(_p(p, "AllocatedStorage") or "20")
     storage_type = _p(p, "StorageType") or "gp2"
-    # An Aurora member is placed in its cluster's DB subnet group (AWS capture).
     subnet_group_name = (_p(p, "DBSubnetGroupName")
                          or (parent.get("DBSubnetGroup") if parent else None)
                          or "default")
@@ -5393,7 +5392,6 @@ def _create_db_instance_impl(p):
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
     vpc_sg_list = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs] if vpc_sgs else []
     if not vpc_sg_list and parent:
-        # An Aurora member reports its cluster's VPC security groups (AWS capture).
         vpc_sg_list = [
             {"VpcSecurityGroupId": sg["VpcSecurityGroupId"], "Status": sg.get("Status", "active")}
             for sg in parent.get("VpcSecurityGroups") or []
@@ -7626,10 +7624,6 @@ def _describe_db_parameters(p):
     name = _p(p, "DBParameterGroupName")
     pg = _param_groups.get(name)
     if not pg and _is_default_cluster_param_group(name):
-        # Every account has a default DB parameter group per Aurora family, the
-        # same names as the default cluster groups. As captured on AWS (us-east-1),
-        # DescribeDBParameters on default.aurora-mysql8.0 with Source=user answers
-        # an empty list. The group is not stored, so listings are unchanged.
         pg = {
             "DBParameterGroupName": name,
             "DBParameterGroupFamily": name[len("default."):],
@@ -10548,10 +10542,7 @@ def _instance_xml(i, create_response=False):
     if i.get("Iops") is not None:
         iops_xml = f"<Iops>{i['Iops']}</Iops>"
 
-    # Captured on AWS for an Aurora MySQL member: the CreateDBInstance response has no
-    # Endpoint yet, DeleteDBInstance (deleting) has no CertificateDetails, and the
-    # empty lists below are absent from every response, not empty.
-    aurora_member = bool(i.get("DBClusterIdentifier")) and str(i.get("Engine", "")).startswith("aurora")
+    aurora_member = bool(i.get("DBClusterIdentifier")) and i.get("Engine") == "aurora-mysql"
     status = i.get("DBInstanceStatus")
 
     def _member_list_xml(xml, values):
@@ -10563,9 +10554,6 @@ def _instance_xml(i, create_response=False):
     )
     processor_xml = _member_list_xml(f"<ProcessorFeatures>{features}</ProcessorFeatures>", features)
 
-    # As captured on AWS: the CreateDBInstance response of an Aurora member has no
-    # Endpoint. AWS always answers "creating" there; MiniStack can already be
-    # "available" (no Docker), so the omission does not depend on the status.
     endpoint_xml = "" if aurora_member and create_response else f"""<Endpoint>
             <Address>{ep.get('Address','localhost')}</Address>
             <Port>{ep.get('Port',5432)}</Port>
@@ -10688,9 +10676,7 @@ def _performance_insights_details_xml(resource):
 
 
 def _aurora_cluster_empty_lists_xml(c):
-    """Captured on AWS for an Aurora MySQL cluster: create, describe, modify and
-    delete carry ReadReplicaIdentifiers and DomainMemberships as empty lists."""
-    if not str(c.get("Engine", "")).startswith("aurora"):
+    if c.get("Engine") != "aurora-mysql":
         return ""
     replicas = "".join(
         f"<ReadReplicaIdentifier>{_esc(r)}</ReadReplicaIdentifier>"
