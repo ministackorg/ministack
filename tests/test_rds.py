@@ -18888,3 +18888,100 @@ def test_rds_aurora_postgresql_has_builtin_roles(rds):
     finally:
         rds.delete_db_instance(DBInstanceIdentifier=f"{cluster_id}-1", SkipFinalSnapshot=True)
         rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_create_db_cluster_reads_maintenance_window_back_in_lower_case(rds):
+    """CreateDBCluster stores the maintenance window day names in lower case, as AWS reads them back."""
+    cluster_id = f"window-case-{_uuid_mod.uuid4().hex[:8]}"
+    created = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id, Engine="aurora-postgresql", MasterUsername="admin",
+        MasterUserPassword="password123", BackupRetentionPeriod=1,
+        PreferredBackupWindow="07:00-07:30", PreferredMaintenanceWindow="Mon:00:00-Mon:03:00",
+    )["DBCluster"]
+    try:
+        assert created["PreferredMaintenanceWindow"] == "mon:00:00-mon:03:00"
+        described = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+        assert described["PreferredMaintenanceWindow"] == "mon:00:00-mon:03:00"
+        assert described["PreferredBackupWindow"] == "07:00-07:30"
+        assert described["BackupRetentionPeriod"] == 1
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.parametrize("retention", [36, 40])
+def test_rds_create_db_cluster_rejects_backup_retention_out_of_range(rds, retention):
+    """CreateDBCluster refuses a BackupRetentionPeriod outside 1-35 and creates nothing."""
+    cluster_id = f"bad-retention-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        rds.create_db_cluster(
+            DBClusterIdentifier=cluster_id, Engine="aurora-postgresql", MasterUsername="admin",
+            MasterUserPassword="password123", BackupRetentionPeriod=retention,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == (
+        f"Invalid backup retention period: {retention}. Retention period must be between 1 and 35."
+    )
+    with pytest.raises(ClientError) as missing:
+        rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+    assert missing.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+
+
+def test_rds_modify_db_cluster_rejects_inverted_serverless_v2_range(rds):
+    """ModifyDBCluster refuses a Serverless v2 minimum above the maximum and keeps the old range."""
+    cluster_id = f"inverted-acu-{_uuid_mod.uuid4().hex[:8]}"
+    initial = {"MinCapacity": 0.5, "MaxCapacity": 1.0}
+    created = rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id, Engine="aurora-postgresql", MasterUsername="admin",
+        MasterUserPassword="password123", ServerlessV2ScalingConfiguration=initial,
+    )["DBCluster"]
+    try:
+        assert created["ServerlessV2ScalingConfiguration"] == initial
+        for change in ({"MinCapacity": 2.0, "MaxCapacity": 1.0}, {"MinCapacity": 2.0}):
+            with pytest.raises(ClientError) as exc:
+                rds.modify_db_cluster(
+                    DBClusterIdentifier=cluster_id, ApplyImmediately=True,
+                    ServerlessV2ScalingConfiguration=change,
+                )
+            assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+            assert exc.value.response["Error"]["Message"] == (
+                "Serverless v2 minimum capacity must be less than or equal to maximum capacity"
+            )
+            still = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+            assert still["ServerlessV2ScalingConfiguration"] == initial
+
+        raised = {"MinCapacity": 1.0, "MaxCapacity": 2.0}
+        rds.modify_db_cluster(
+            DBClusterIdentifier=cluster_id, ApplyImmediately=True,
+            ServerlessV2ScalingConfiguration=raised,
+        )
+        cluster = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+        assert cluster["ServerlessV2ScalingConfiguration"] == raised
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_add_tags_rejects_reserved_aws_prefix(rds):
+    """AddTagsToResource refuses a key with the reserved aws: prefix and adds no tag."""
+    db_id = f"reserved-tag-{_uuid_mod.uuid4().hex[:8]}"
+    arn = rds.create_db_instance(
+        DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", Engine="postgres",
+        MasterUsername="admin", MasterUserPassword="password123", AllocatedStorage=20,
+    )["DBInstance"]["DBInstanceArn"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.add_tags_to_resource(
+                ResourceName=arn,
+                Tags=[{"Key": "ok-first", "Value": "1"}, {"Key": "aws:sim2real-reserved", "Value": "x"}],
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            'Tag keys cannot start with the reserved prefix "aws:".'
+        )
+        assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == []
+
+        rds.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "sim2real-ok-tag", "Value": "yes"}])
+        assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == [
+            {"Key": "sim2real-ok-tag", "Value": "yes"}
+        ]
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)

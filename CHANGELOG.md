@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — invalid cluster and tag input** — `CreateDBCluster` accepted a `BackupRetentionPeriod` outside 1–35 and read the maintenance window back as sent; it now answers `400 InvalidParameterValue` "Invalid backup retention period: <n>. Retention period must be between 1 and 35." and reads the day names back in lower case (`mon:00:00-mon:03:00`). `ModifyDBCluster` applied a Serverless v2 minimum above the maximum; it now answers `400 InvalidParameterValue` "Serverless v2 minimum capacity must be less than or equal to maximum capacity" and keeps the old range. `AddTagsToResource` refuses a key that starts with `aws:` ("Tag keys cannot start with the reserved prefix "aws:"."); CloudFormation still sets its `aws:cloudformation:*` tags. Contributed by @Areson.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added
