@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — invalid instance input** — `CreateDBInstance` and `ModifyDBInstance` accepted values that AWS refuses and stored them. `CreateDBInstance` now refuses an unknown engine ("Invalid DB engine"), a malformed instance class, a security group that does not exist, an unknown storage type (`StorageTypeNotSupported`), gp3 storage under 20 GiB, a `MaxAllocatedStorage` less than 10 percent above `AllocatedStorage`, a PostgreSQL master user name over 63 characters, the reserved name `rdsadmin`, a password under 8 characters and a Performance Insights retention period that AWS does not offer. `ModifyDBInstance` refuses a storage decrease, an engine change and a password under 8 characters. Nothing is created or changed. Contributed by @Areson.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added

@@ -5095,6 +5095,103 @@ def _create_db_instance(p):
             _end_mysql_global_instance_mutation(cluster)
 
 
+# Engine names that CreateDBInstance accepts: the botocore list plus docdb and
+# neptune, which share this API. AWS answers any other name "Invalid DB engine".
+_CREATE_DB_INSTANCE_ENGINES = {
+    "aurora", "aurora-mysql", "aurora-postgresql",
+    "custom-oracle-ee", "custom-oracle-ee-cdb", "custom-oracle-se2",
+    "custom-oracle-se2-cdb", "custom-sqlserver-dev", "custom-sqlserver-ee",
+    "custom-sqlserver-se", "custom-sqlserver-web", "db2-ae", "db2-se", "docdb",
+    "mariadb", "mysql", "neptune", "oracle-ee", "oracle-ee-cdb", "oracle-se2",
+    "oracle-se2-cdb", "postgres", "sqlserver-dev-ee", "sqlserver-ee",
+    "sqlserver-ex", "sqlserver-se", "sqlserver-web",
+}
+# db.serverless, or db.<family>.<size> for the RDS instance families.
+_DB_INSTANCE_CLASS_RE = re.compile(r"^db\.(serverless|[cmrtxz][0-9][a-z0-9-]*\.[a-z0-9]+)$")
+_DB_STORAGE_TYPES = {"standard", "gp2", "gp3", "io1", "io2", "aurora", "aurora-iopt1"}
+_PERFORMANCE_INSIGHTS_RETENTION_PERIODS = (7, *range(31, 31 * 24, 31), 731)
+_POSTGRES_MASTER_USERNAME_MAX = 63
+_MASTER_PASSWORD_MIN = 8
+
+
+def _master_password_error(password):
+    if len(password) < _MASTER_PASSWORD_MIN:
+        return _invalid_parameter_value(
+            "The parameter MasterUserPassword is not a valid password because it is "
+            f"shorter than {_MASTER_PASSWORD_MIN} characters."
+        )
+    return None
+
+
+def _storage_size_error(engine, storage_type, size):
+    return _invalid_parameter_combination(
+        f"Invalid storage size for engine name {_esc(engine)} and storage type "
+        f"{_esc(storage_type)}: {size}"
+    )
+
+
+def _create_db_instance_input_error(p, engine, parent):
+    """The AWS error for an invalid CreateDBInstance field, else None."""
+    db_class = _p(p, "DBInstanceClass")
+    if db_class and not _DB_INSTANCE_CLASS_RE.match(db_class.lower()):
+        return _invalid_parameter_value(f"Invalid DB Instance class: {_esc(db_class)}")
+
+    storage_type = _p(p, "StorageType")
+    if storage_type and storage_type.lower() not in _DB_STORAGE_TYPES:
+        return _error("StorageTypeNotSupported", f"Invalid storage type: {_esc(storage_type)}", 400)
+
+    for sg_id in _parse_member_list(p, "VpcSecurityGroupIds"):
+        if not _security_group_exists(sg_id):
+            return _invalid_parameter_value(
+                f"Invalid security group , groupId= {_esc(sg_id)}, groupName=."
+            )
+
+    retention = _p(p, "PerformanceInsightsRetentionPeriod")
+    if retention and (
+        not retention.isdigit()
+        or int(retention) not in _PERFORMANCE_INSIGHTS_RETENTION_PERIODS
+    ):
+        valid = ", ".join(str(v) for v in _PERFORMANCE_INSIGHTS_RETENTION_PERIODS)
+        return _invalid_parameter_value(
+            f"Invalid Performance Insights retention period. Valid values are: [{valid}]"
+        )
+
+    # Aurora members take storage and credentials from the DB cluster.
+    if parent or engine.lower().startswith("aurora"):
+        return None
+
+    allocated = int(_p(p, "AllocatedStorage") or "20")
+    if (storage_type or "").lower() == "gp3" and allocated < 20:
+        return _storage_size_error(engine, storage_type, allocated)
+    max_allocated = _p(p, "MaxAllocatedStorage")
+    if max_allocated and int(max_allocated) != allocated and int(max_allocated) * 10 < allocated * 11:
+        return _invalid_parameter_combination(
+            "The maximum allocated storage must be increased by at least 10 percent."
+        )
+
+    master_user = _p(p, "MasterUsername")
+    if master_user:
+        if master_user.lower() == "rdsadmin":
+            return _invalid_parameter_value(
+                f"MasterUsername {_esc(master_user)} cannot be used as it is a reserved "
+                "word used by the engine"
+            )
+        if engine.lower() == "postgres" and len(master_user) > _POSTGRES_MASTER_USERNAME_MAX:
+            return _invalid_parameter_value("Invalid master user name")
+
+    password = _p(p, "MasterUserPassword")
+    if password:
+        return _master_password_error(password)
+    return None
+
+
+def _security_group_exists(sg_id):
+    from ministack.services import ec2
+
+    ec2._ensure_defaults_initialized()
+    return sg_id in ec2._security_groups
+
+
 def _create_db_instance_impl(p):
     db_id = _p(p, "DBInstanceIdentifier")
     if not db_id:
@@ -5103,6 +5200,8 @@ def _create_db_instance_impl(p):
         return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
 
     engine = _p(p, "Engine") or "postgres"
+    if engine.lower() not in _CREATE_DB_INSTANCE_ENGINES:
+        return _invalid_parameter_value("Invalid DB engine")
     explicit_engine_version = _p(p, "EngineVersion")
     engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
@@ -5172,6 +5271,9 @@ def _create_db_instance_impl(p):
     subnet_group_name = (_p(p, "DBSubnetGroupName")
                          or (parent.get("DBSubnetGroup") if parent else None)
                          or "default")
+    input_error = _create_db_instance_input_error(p, engine, parent)
+    if input_error:
+        return input_error
     explicit_pg = _p(p, "DBParameterGroupName")
     # Validate every request field before shared compute can start or restart.
     # Otherwise an invalid member request can make an empty cluster reachable
@@ -6079,6 +6181,30 @@ def _modify_db_instance(p):
             "MasterUserPassword cannot be modified on a DB instance that is "
             "a member of a DB cluster. Use ModifyDBCluster instead.",
             400,
+        )
+    if new_pass:
+        password_error = _master_password_error(new_pass)
+        if password_error:
+            return password_error
+
+    new_engine = _p(p, "Engine")
+    current_engine = instance.get("Engine") or ""
+    if new_engine and new_engine.lower() != current_engine.lower():
+        return _invalid_parameter_combination(
+            f"Modification of database from engine {_esc(current_engine)} to engine "
+            f"{_esc(new_engine)} is not supported."
+        )
+
+    new_storage = _p(p, "AllocatedStorage")
+    if (
+        new_storage
+        and not current_engine.lower().startswith("aurora")
+        and int(new_storage) < int(instance.get("AllocatedStorage") or 0)
+    ):
+        return _storage_size_error(
+            current_engine,
+            _p(p, "StorageType") or instance.get("StorageType") or "gp2",
+            int(new_storage),
         )
 
     engine_version = _p(p, "EngineVersion")
