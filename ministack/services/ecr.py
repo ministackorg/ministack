@@ -5,6 +5,7 @@ ECR (Elastic Container Registry) Emulator.
 JSON-based API via X-Amz-Target (prefix: AmazonEC2ContainerRegistry_V20150921).
 """
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -18,15 +19,15 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
-    error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
     request_scope,
     set_request_account_id,
     set_request_region,
 )
+from ministack.services import ecr_pull_through
+from ministack.services.ecr_registry_policy import error_response_json, json_response
 
 logger = logging.getLogger("ecr")
 
@@ -55,6 +56,7 @@ def get_state():
         "repo_policies": copy.deepcopy(_repo_policies),
         "layer_blobs": copy.deepcopy(_layer_blobs),
         "manifest_blobs": copy.deepcopy(_manifest_blobs),
+        **ecr_pull_through.get_state(),
         # _uploads is intentionally NOT persisted — in-flight upload sessions
         # do not survive a restart, matching real registry behaviour where
         # the client retries the upload from scratch after a 404 on PATCH.
@@ -69,6 +71,7 @@ def _restore_state(data):
     if not data:
         return
 
+    ecr_pull_through.load_persisted_state(data)
     restored_repositories = data.get("repositories", {})
     legacy_repo_regions = {}
     if isinstance(restored_repositories, AccountScopedDict):
@@ -132,6 +135,25 @@ def _registry_id():
     return get_account_id()
 
 
+def _cache_scoped(name):
+    """Whether repository *name* is a pull-through cache repository or lies on a path a rule covers. The answers
+    captured for those paths (r07, r15) apply only there; every other repository keeps its v1.5.39 answer."""
+    return isinstance(name, str) and (ecr_pull_through.is_cache_repository(name) or _on_rule_path(name))
+
+
+def _on_rule_path(name):
+    """Whether a rule's prefix covers *name* (a trailing '/' or a '//' upstream path included)."""
+    return any(prefix == "ROOT" or name.startswith(prefix + "/") for prefix in ecr_pull_through._rules)
+
+
+def _repo_not_found_message(name, captured_everywhere=False):
+    """The registry-id wording is captured for BatchGetImage and DescribeRepositories on a path no rule covers
+    (r07-pull-no-rule, r15-get-no-rule--repo: *captured_everywhere*) and, for the other operations, on rule paths."""
+    if captured_everywhere or _cache_scoped(name):
+        return f"The repository with name '{name}' does not exist in the registry with id '{_registry_id()}'"
+    return f"The repository with name '{name}' does not exist"
+
+
 def _repo_uri(name):
     return f"{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/{name}"
 
@@ -144,6 +166,10 @@ def _image_digest(manifest):
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
+
+    if action in ecr_pull_through.ACTIONS:
+        # Pull-through cache actions read the raw body: AWS refuses malformed JSON and member types its own way.
+        return await asyncio.to_thread(ecr_pull_through.handle_action, action, body)
 
     try:
         data = json.loads(body) if body else {}
@@ -183,7 +209,76 @@ async def handle_request(method, path, headers, body, query_params):
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
 
+    if action in _CROSS_ACCOUNT_ACTIONS:
+        owner = data.get("registryId")
+        if (isinstance(owner, str) and owner != get_account_id() and re.fullmatch(r"[0-9]{12}", owner)
+                and _owner_serves_cache(owner, data.get("repositoryName"))):
+            return await _other_registry(action, owner, data, handler)
+    if action in ("BatchGetImage", "GetDownloadUrlForLayer"):
+        # Only a request on a cache repository can fetch from an upstream registry: it leaves the event loop.
+        return await ecr_pull_through.run_fetching(
+            data.get("repositoryName"), lambda: _action_fetches(action, data), handler, data)
     return handler(data)
+
+
+def _action_fetches(action, data):
+    """Whether *action* would contact an upstream registry: an image or layer it asks for is not held."""
+    name = data.get("repositoryName")
+    if action == "BatchGetImage":
+        return ecr_pull_through.images_need_fetch(name, data.get("imageIds"))
+    digest = data.get("layerDigest")
+    return ecr_pull_through.layers_need_fetch(name, [digest])
+
+
+_CROSS_ACCOUNT_ACTIONS = frozenset({"BatchGetImage", "DescribeImages"})
+
+
+def _owner_serves_cache(owner, name):
+    """Whether *name* is a cache repository, or on a rule path, in registry *owner*. Only those are captured as
+    refused without a repository policy (r11-a2-pull-no-grant, r11-a2-describe-images-a1); any other registryId
+    is ignored as on v1.5.39."""
+    with request_scope(owner, get_region()):
+        return _cache_scoped(name)
+
+
+async def _other_registry(action, owner, data, handler):
+    """Run *handler* in the registry of account *owner* when the repository policy there grants the caller
+    the action; otherwise refuse as AWS does (a registry policy alone grants nothing)."""
+    from ministack.core.iam_evaluator import EvalContext, caller_arn, resource_policy_allows
+
+    name = data.get("repositoryName", "")
+    region = get_region()
+    resource = f"arn:aws:ecr:{region}:{owner}:repository/{name}"
+    caller = caller_arn()
+    ctx = EvalContext(principal_arn=caller, principal_account=get_account_id(),
+                      principal_type="Root" if caller.endswith(":root") else
+                      "AssumedRole" if ":assumed-role/" in caller else "User",
+                      action=f"ecr:{action}", resource_arn=resource, region=region)
+    policy = _repo_policies.get_scoped(owner, region, name)
+    if not policy or not resource_policy_allows(policy, ctx, same_account=False):
+        message = (f"User: {caller} is not authorized to perform: ecr:{action} on resource: {resource} "
+                   f"because no resource-based policy allows the ecr:{action} action")
+        return error_response_json("AccessDeniedException", message, 400, message_key="Message")
+
+    def run():
+        with request_scope(owner, region):
+            return handler(data)
+
+    if action in ("BatchGetImage", "GetDownloadUrlForLayer"):
+        # These can fill from an upstream registry: keep the blocking fetch off the event loop.
+        with request_scope(owner, region):
+            fetches = _action_fetches(action, data)
+        if fetches:
+            return await ecr_pull_through.run_in_fill_pool(run)
+    return run()
+
+
+def _policy_not_found(kind, name):
+    """The wording of r07-cache-repo-policy and r07-cache-lifecycle on a cache repository, else v1.5.39's."""
+    if _cache_scoped(name):
+        return (f"{kind} policy does not exist for the repository with name '{name}' "
+                f"in the registry with id '{_registry_id()}'")
+    return f"{kind} policy does not exist for '{name}'"
 
 
 def _create_repository(data):
@@ -191,15 +286,20 @@ def _create_repository(data):
     if not name:
         return error_response_json("InvalidParameterException", "repositoryName is required", 400)
     if name in _repositories:
+        # r07-post-create-repo-again (a rule path); any other repository keeps the v1.5.39 text.
+        suffix = f" in the registry with id '{_registry_id()}'" if _cache_scoped(name) else ""
         return error_response_json("RepositoryAlreadyExistsException",
-                                   f"The repository with name '{name}' already exists", 400)
+                                   f"The repository with name '{name}' already exists{suffix}", 400)
 
     repo = {
         "repositoryArn": _repo_arn(name),
         "registryId": _registry_id(),
         "repositoryName": name,
         "repositoryUri": _repo_uri(name),
-        "createdAt": int(time.time()),
+        # Fractional seconds on rule paths (r07-post-create-repo-under-prefix).
+        # Fractional seconds for every repository: r07-pre-pull-into-existing--repo, r18-root-pull-into-plain--repo
+        # (repositories CreateRepository made before any rule covered them).
+        "createdAt": round(time.time(), 3),
         "imageTagMutability": data.get("imageTagMutability", "MUTABLE"),
         "imageScanningConfiguration": data.get("imageScanningConfiguration", {"scanOnPush": False}),
         "encryptionConfiguration": data.get("encryptionConfiguration", {"encryptionType": "AES256"}),
@@ -232,7 +332,7 @@ def _describe_repositories(data):
         for n in names:
             if n not in _repositories:
                 return error_response_json("RepositoryNotFoundException",
-                                           f"The repository with name '{n}' does not exist", 400)
+                                           _repo_not_found_message(n, captured_everywhere=True), 400)
             repos.append(_repositories[n])
         return json_response({"repositories": [_repo_shape(r) for r in repos]})
     return _paged(data, "repositories", [_repo_shape(r) for r in _repositories.values()])
@@ -244,16 +344,23 @@ def _delete_repository(data):
 
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
 
     if not force and _images.get(name):
-        return error_response_json("RepositoryNotEmptyException",
-                                   f"The repository with name '{name}' is not empty", 400)
+        if _cache_scoped(name):  # r07-cache-delete-repo-no-force
+            message = (f"The repository with name '{name}' in registry with id '{_registry_id()}' "
+                       "cannot be deleted because it still contains images")
+        else:
+            message = f"The repository with name '{name}' is not empty"
+        return error_response_json("RepositoryNotEmptyException", message, 400)
 
     repo = _repositories.pop(name)
     _images.pop(name, None)
     _lifecycle_policies.pop(name, None)
     _repo_policies.pop(name, None)
+    ecr_pull_through.forget_repository(name)
+    _layer_blobs.pop(name, None)
+    _manifest_blobs.pop(name, None)
     return json_response({"repository": _repo_shape(repo)})
 
 
@@ -261,7 +368,7 @@ def _put_image(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
 
     manifest = data.get("imageManifest", "")
     manifest_type = data.get("imageManifestMediaType",
@@ -269,7 +376,20 @@ def _put_image(data):
     tag = data.get("imageTag")
     digest = data.get("imageDigest") or _image_digest(manifest)
 
+    missing_layers = ecr_pull_through.cache_only_layers(name, manifest)
+    if missing_layers:
+        return error_response_json(
+            "LayersNotFoundException",
+            f"Layers with digests '[{','.join(missing_layers)}]' required for pushing image into repository with "
+            f"name '{name}' in the registry with id '{_registry_id()}' do not exist", 400)
+
     repo = _repositories[name]
+    if tag and _cache_scoped(name) and any(  # r07-cache-put-image-upstream-tag
+            img["imageDigest"] == digest and tag in img.get("imageTags", []) for img in _images[name]):
+        return error_response_json(
+            "ImageAlreadyExistsException",
+            f"Image with digest '{digest}' and tag '{tag}' already exists in the repository with name "
+            f"'{name}' in registry with id '{_registry_id()}'", 400)
     if tag and repo.get("imageTagMutability") == "IMMUTABLE":
         for img in _images[name]:
             if tag in img.get("imageTags", []):
@@ -315,33 +435,85 @@ def _put_image(data):
     }})
 
 
+_REPO_NAME_PATTERN = r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*"
+_REPO_NAME_RE = re.compile(_REPO_NAME_PATTERN)
+
+
+def _image_ids_wire_error(image_ids):
+    """The SerializationException AWS gives a JSON type that is not the member's shape (same answers as
+    ecr_pull_through's member checks); None when *image_ids* is a list of objects (or absent)."""
+    serialization_error = ecr_pull_through._serialization_error
+    if image_ids is None:
+        return None
+    if isinstance(image_ids, dict):
+        return serialization_error("Start of structure or map found where not expected")
+    if not isinstance(image_ids, list):
+        return serialization_error("Unexpected field type")
+    for item in image_ids:
+        if isinstance(item, list):
+            return serialization_error()
+        if not isinstance(item, dict):
+            return serialization_error("Unexpected field type")
+    return None
+
+
 def _batch_get_image(data):
     name = data.get("repositoryName", "")
-    if name not in _repositories:
+    if not isinstance(name, str):
+        # v1.5.39 answer for a name that cannot be a repository (null, a number, a list, an object).
         return error_response_json("RepositoryNotFoundException",
                                    f"The repository with name '{name}' does not exist", 400)
-
     image_ids = data.get("imageIds", [])
+    wire_error = _image_ids_wire_error(image_ids)
+    if wire_error is not None:
+        return wire_error
+    image_ids = image_ids or []
+    if _cache_scoped(name):
+        # r07-pull-prefix-bad-name, r07-pull-prefix-no-image-ids: captured on rule paths only; any other
+        # repository is not validated, as on v1.5.39.
+        if not _REPO_NAME_RE.fullmatch(name):
+            return error_response_json(
+                "InvalidParameterException",
+                f"Invalid parameter at 'repositoryName' failed to satisfy constraint: "
+                f"'must satisfy regular expression '{_REPO_NAME_PATTERN}''", 400)
+        if not image_ids:
+            return error_response_json(
+                "InvalidParameterException",
+                "Invalid parameter at 'imageIds' failed to satisfy constraint: "
+                "'Member must have length greater than or equal to 1'", 400)
+
+    # A pull-through cache rule fills what is not held (the repository too) from its upstream registry.
+    fills = None
+    if name not in _repositories or any(_find_image(name, iid) is None for iid in image_ids):
+        fills = ecr_pull_through.fill(name, image_ids)
+    if name not in _repositories:
+        if fills is None:
+            return error_response_json(
+                "RepositoryNotFoundException",
+                _repo_not_found_message(name, captured_everywhere=True), 400)  # r07-pull-no-rule
+        return json_response({"images": [], "failures": [
+            {"imageId": iid, "failureCode": fail[0], "failureReason": fail[1]}
+            for iid, fail in zip(image_ids, fills)]})
+
     found = []
     failures = []
-
-    for iid in image_ids:
+    for index, iid in enumerate(image_ids):
         match = _find_image(name, iid)
         if match:
             found.append({
                 "registryId": _registry_id(),
                 "repositoryName": name,
-                "imageId": match["imageId"],
+                # r07-pull-by-digest: a cache repository answers a digest request with the digest alone.
+                "imageId": {"imageDigest": match["imageDigest"]}
+                           if iid.get("imageDigest") and not iid.get("imageTag") and ecr_pull_through.is_cache_repository(name)
+                           else match["imageId"],
                 "imageManifest": match.get("imageManifest", "{}"),
                 "imageManifestMediaType": match.get("imageManifestMediaType",
                     "application/vnd.docker.distribution.manifest.v2+json"),
             })
         else:
-            failures.append({
-                "imageId": iid,
-                "failureCode": "ImageNotFound",
-                "failureReason": "Requested image not found",
-            })
+            code, reason = (fills[index] if fills else None) or ("ImageNotFound", "Requested image not found")
+            failures.append({"imageId": iid, "failureCode": code, "failureReason": reason})
 
     return json_response({"images": found, "failures": failures})
 
@@ -350,7 +522,7 @@ def _batch_delete_image(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
 
     image_ids = data.get("imageIds", [])
     deleted = []
@@ -375,11 +547,13 @@ def _list_images(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
 
     tag_status = data.get("filter", {}).get("tagStatus")
     result = []
     for img in _images.get(name, []):
+        if img.get("cacheOnly"):
+            continue
         tags = img.get("imageTags", [])
         if tag_status == "TAGGED" and not tags:
             continue
@@ -393,16 +567,24 @@ def _list_images(data):
 def _describe_images(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
+        # r16-pull-e2-app--images: the registry-id wording on a path no rule covers (the rule create was refused).
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name, captured_everywhere=True), 400)
 
     image_ids = data.get("imageIds")
-    images = _images.get(name, [])
+    # Images an ECR-upstream fill copied are served to pulls but never listed.
+    images = [img for img in _images.get(name, []) if not img.get("cacheOnly")]
 
     if image_ids:
         filtered = []
         for iid in image_ids:
             match = _find_image(name, iid)
+            if match and match.get("cacheOnly"):
+                return error_response_json(
+                    "ImageNotFoundException",
+                    f"The image with imageId {{imageDigest:'{iid.get('imageDigest') or 'null'}', "
+                    f"imageTag:'{iid.get('imageTag') or 'null'}'}} does not exist within the repository "
+                    f"with name '{name}' in the registry with id '{_registry_id()}'", 400)
             if match:
                 filtered.append(match)
         images = filtered
@@ -410,7 +592,7 @@ def _describe_images(data):
     details = []
     for img in images:
         manifest = img.get("imageManifest", "{}")
-        details.append({
+        detail = {
             "registryId": _registry_id(),
             "repositoryName": name,
             "imageDigest": img["imageDigest"],
@@ -421,7 +603,16 @@ def _describe_images(data):
                 "application/vnd.docker.distribution.manifest.v2+json"),
             "artifactMediaType": img.get("imageManifestMediaType",
                 "application/vnd.docker.distribution.manifest.v2+json"),
-        })
+        }
+        # Rows filled from an upstream registry carry their own size, status and artifact type.
+        if "detailOverrides" in img and not detail["imageTags"]:
+            del detail["imageTags"]
+        for key, value in img.get("detailOverrides", {}).items():
+            if value is None:
+                detail.pop(key, None)
+            else:
+                detail[key] = value
+        details.append(detail)
 
     if image_ids:
         return json_response({"imageDetails": details})
@@ -451,10 +642,9 @@ def _get_repository_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     if name not in _repo_policies:
-        return error_response_json("RepositoryPolicyNotFoundException",
-                                   f"Repository policy does not exist for '{name}'", 400)
+        return error_response_json("RepositoryPolicyNotFoundException", _policy_not_found("Repository", name), 400)
     return json_response({
         "registryId": _registry_id(),
         "repositoryName": name,
@@ -466,7 +656,7 @@ def _set_repository_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     policy = data.get("policyText", "")
     _repo_policies[name] = policy
     return json_response({
@@ -480,10 +670,9 @@ def _delete_repository_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     if name not in _repo_policies:
-        return error_response_json("RepositoryPolicyNotFoundException",
-                                   f"Repository policy does not exist for '{name}'", 400)
+        return error_response_json("RepositoryPolicyNotFoundException", _policy_not_found("Repository", name), 400)
     policy = _repo_policies.pop(name)
     return json_response({
         "registryId": _registry_id(),
@@ -496,7 +685,7 @@ def _put_lifecycle_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     policy = data.get("lifecyclePolicyText", "")
     _lifecycle_policies[name] = policy
     return json_response({
@@ -510,10 +699,9 @@ def _get_lifecycle_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     if name not in _lifecycle_policies:
-        return error_response_json("LifecyclePolicyNotFoundException",
-                                   f"Lifecycle policy does not exist for '{name}'", 400)
+        return error_response_json("LifecyclePolicyNotFoundException", _policy_not_found("Lifecycle", name), 400)
     return json_response({
         "registryId": _registry_id(),
         "repositoryName": name,
@@ -526,10 +714,9 @@ def _delete_lifecycle_policy(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     if name not in _lifecycle_policies:
-        return error_response_json("LifecyclePolicyNotFoundException",
-                                   f"Lifecycle policy does not exist for '{name}'", 400)
+        return error_response_json("LifecyclePolicyNotFoundException", _policy_not_found("Lifecycle", name), 400)
     policy = _lifecycle_policies.pop(name)
     return json_response({
         "registryId": _registry_id(),
@@ -574,7 +761,7 @@ def _put_image_tag_mutability(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     mutability = data.get("imageTagMutability", "MUTABLE")
     _repositories[name]["imageTagMutability"] = mutability
     filters = data.get("imageTagMutabilityExclusionFilters")
@@ -596,7 +783,7 @@ def _put_image_scanning_configuration(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     config = data.get("imageScanningConfiguration", {"scanOnPush": False})
     _repositories[name]["imageScanningConfiguration"] = config
     return json_response({
@@ -613,12 +800,26 @@ def _describe_registry(data):
     })
 
 
+def _unexpected_field_type():
+    """The SerializationException of a member whose JSON type is not its shape's, as _image_ids_wire_error."""
+    return ecr_pull_through._serialization_error("Unexpected field type")
+
+
 def _get_download_url_for_layer(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     layer_digest = data.get("layerDigest", "")
+    if _cache_scoped(name) and layer_digest is not None and not isinstance(layer_digest, str):
+        return _unexpected_field_type()
+    ecr_pull_through.ensure_layer(name, layer_digest)
+    if ecr_pull_through.layer_fetch_blocked(name, layer_digest):
+        # v20 line 196: the on-demand layer fetch failed.
+        return error_response_json(
+            "LayersNotFoundException",
+            "The specified layers could not be found, or the specified layer is not valid for this repository.",
+            400)
     return json_response({
         "downloadUrl": f"https://{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/v2/{name}/blobs/{layer_digest}",
         "layerDigest": layer_digest,
@@ -629,9 +830,14 @@ def _batch_check_layer_availability(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     digests = data.get("layerDigests", [])
-    layers = [{"layerDigest": d, "layerAvailability": "UNAVAILABLE", "layerSize": 0} for d in digests]
+    cache = _cache_scoped(name)
+    if cache and digests is not None and (
+            not isinstance(digests, list) or not all(isinstance(d, str) for d in digests)):
+        return _unexpected_field_type()
+    layers = [{"layerDigest": d, "layerAvailability": "UNAVAILABLE", **({} if cache else {"layerSize": 0})}
+              for d in digests or []]  # r07-layer-availability: AWS omits layerSize for an UNAVAILABLE layer
     return json_response({"layers": layers, "failures": []})
 
 
@@ -639,7 +845,7 @@ def _initiate_layer_upload(data):
     name = data.get("repositoryName", "")
     if name not in _repositories:
         return error_response_json("RepositoryNotFoundException",
-                                   f"The repository with name '{name}' does not exist", 400)
+                                   _repo_not_found_message(name), 400)
     return json_response({
         "registryId": _registry_id(),
         "repositoryName": name,
@@ -670,6 +876,8 @@ def _complete_layer_upload(data):
 
 
 def _find_image(repo_name, image_id):
+    if not isinstance(image_id, dict):
+        return None
     digest = image_id.get("imageDigest")
     tag = image_id.get("imageTag")
     for img in _images.get(repo_name, []):
@@ -732,6 +940,7 @@ def reset():
     _layer_blobs.clear()
     _manifest_blobs.clear()
     _uploads.clear()
+    ecr_pull_through.reset()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1088,6 +1297,7 @@ def _v2_head_blob(name, digest):
     err = _ensure_repo_exists(name)
     if err is not None:
         return err
+    ecr_pull_through.ensure_layer(name, digest)  # HEAD runs the same on-demand fetch as GET
     blob = _layer_blobs.get(name, {}).get(digest)
     if blob is None:
         return _registry_error(
@@ -1111,6 +1321,7 @@ def _v2_get_blob(name, digest):
     err = _ensure_repo_exists(name)
     if err is not None:
         return err
+    ecr_pull_through.ensure_layer(name, digest)
     blob = _layer_blobs.get(name, {}).get(digest)
     if blob is None:
         return _registry_error(
@@ -1382,50 +1593,123 @@ def _v2_put_manifest(name, ref, headers, body):
     )
 
 
-def _v2_get_manifest(name, ref):
-    err = _ensure_repo_exists(name)
-    if err is not None:
-        return err
-    digest, blob, media_type = _resolve_manifest(name, ref)
-    if blob is None:
-        return _registry_error(
-            404,
-            "MANIFEST_UNKNOWN",
-            "manifest unknown to registry",
-            {"name": name, "reference": ref},
-        )
-    return _registry_ok(
-        200,
+def _v2_fill_manifest(name, ref):
+    """A V2 manifest GET or HEAD fills from the pull-through cache rule the same way BatchGetImage does.
+
+    Returns the fill failure (code, reason) when the upstream refused the rule's credentials, else None."""
+    if name in _repositories and _resolve_manifest(name, ref)[1] is not None:
+        return None
+    image_id = {"imageDigest": ref} if ref.startswith("sha256:") else {"imageTag": ref}
+    results = ecr_pull_through.fill(name, [image_id])
+    if results and results[0] is not None and results[0][0] == "UpstreamAccessDenied":
+        return results[0]
+    return None
+
+
+def _v2_manifest_error(status, code, message, head):
+    """A manifest-path error: ``{"errors":[{"code","message"}]}`` with no detail member (empty for HEAD)."""
+    body = json.dumps({"errors": [{"code": code, "message": message}]}, separators=(",", ":")).encode() + b"\n"
+    return (
+        status,
         {
-            "Content-Length": str(len(blob)),
-            "Content-Type": media_type,
-            "Docker-Content-Digest": digest,
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": str(len(body)),
+            _REGISTRY_API_VERSION_HEADER[0]: _REGISTRY_API_VERSION_HEADER[1],
         },
-        blob,
+        b"" if head else body,
     )
 
 
-def _v2_head_manifest(name, ref):
-    err = _ensure_repo_exists(name)
-    if err is not None:
-        return err
+_V2_AUTH_SCHEMES = frozenset({"basic", "bearer", "aws4-hmac-sha256"})
+
+
+def _v2_request_signed(headers):
+    """Whether a registry request carries credentials of a scheme MiniStack issues or verifies: Basic (the
+    GetAuthorizationToken token), Bearer, or a SigV4 signature, each followed by a non-empty credential."""
+    scheme, _, credential = (headers.get("authorization") or "").strip().partition(" ")
+    return scheme.lower() in _V2_AUTH_SCHEMES and bool(credential.strip())
+
+
+def _v2_unsigned_fill_refusal(name, ref, head):
+    """Under AUTH=true an unsigned manifest request that would start a fill is answered 401 (r15-noauth)."""
+    from ministack.app import AUTH
+
+    if not AUTH or ecr_pull_through.match_rule(name) is None or not ecr_pull_through.fillable(name):
+        return None
+    if name in _repositories and _resolve_manifest(name, ref)[1] is not None:
+        return None
+    body = b"Not Authorized\n"
+    realm = f"https://{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com/"
+    return (
+        401,
+        {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": str(len(body)),
+            _REGISTRY_API_VERSION_HEADER[0]: _REGISTRY_API_VERSION_HEADER[1],
+            "Www-Authenticate": f'Basic realm="{realm}",service="ecr.amazonaws.com"',
+        },
+        b"" if head else body,
+    )
+
+
+def _v2_bad_name_answer(head):
+    """The router-level 404 AWS gives a manifest request whose repository name breaks the name pattern."""
+    body = b"404 page not found\n"
+    return (
+        404,
+        {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": str(len(body)),
+            _REGISTRY_API_VERSION_HEADER[0]: _REGISTRY_API_VERSION_HEADER[1],
+            "X-Content-Type-Options": "nosniff",
+        },
+        b"" if head else body,
+    )
+
+
+def _v2_manifest(name, ref, head, unsigned=False):
+    if name not in _repositories and not _REPO_NAME_RE.fullmatch(name):
+        # r15-get-bad-name-no-rule: a name that is no repository and breaks the pattern is a router 404. A
+        # repository CreateRepository made keeps answering as on v1.5.39 (MiniStack does not validate names there).
+        return _v2_bad_name_answer(head)
+    if unsigned:
+        refused = _v2_unsigned_fill_refusal(name, ref, head)
+        if refused is not None:
+            return refused
+    denied = _v2_fill_manifest(name, ref)
+    if denied is not None:
+        return _v2_manifest_error(403, "DENIED", denied[1], head)
+    if name not in _repositories and ecr_pull_through.fillable(name):
+        # A rule covers the name but the fill brought nothing (missing tag or upstream repository).
+        return _v2_manifest_error(404, "MANIFEST_UNKNOWN", "Requested image not found", head)
+    if name not in _repositories:
+        return _v2_manifest_error(
+            404,
+            "NAME_UNKNOWN",
+            f"The repository with name '{name}' does not exist in the registry with id '{_registry_id()}'",
+            head,
+        )
     digest, blob, media_type = _resolve_manifest(name, ref)
     if blob is None:
-        return _registry_error(
-            404,
-            "MANIFEST_UNKNOWN",
-            "manifest unknown to registry",
-            {"name": name, "reference": ref},
-        )
-    return _registry_ok(
-        200,
-        {
-            "Content-Length": str(len(blob)),
-            "Content-Type": media_type,
-            "Docker-Content-Digest": digest,
-        },
-        b"",
-    )
+        # r33-pre-trailing-v2-get: a repository CreateRepository made on a rule path, rule or not fillable.
+        if _cache_scoped(name) or ecr_pull_through.fillable(name):
+            return _v2_manifest_error(404, "MANIFEST_UNKNOWN", "Requested image not found", head)
+        # A pushed repository no rule covers: no capture, so the answer of v1.5.39.
+        return _registry_error(404, "MANIFEST_UNKNOWN", "manifest unknown to registry",
+                               {"name": name, "reference": ref})
+    headers = {"Content-Length": str(len(blob)), "Content-Type": media_type}
+    if head or not ecr_pull_through.is_cache_repository(name):
+        # AWS answers a manifest GET on a cache repository without Docker-Content-Digest (v20 line 192).
+        headers["Docker-Content-Digest"] = digest
+    return _registry_ok(200, headers, b"" if head else blob)
+
+
+def _v2_get_manifest(name, ref, unsigned=False):
+    return _v2_manifest(name, ref, head=False, unsigned=unsigned)
+
+
+def _v2_head_manifest(name, ref, unsigned=False):
+    return _v2_manifest(name, ref, head=True, unsigned=unsigned)
 
 
 def _v2_delete_manifest(name, ref):
@@ -1471,6 +1755,13 @@ def _v2_list_tags(name, query_params):
         n = None
     if n is not None and n >= 0:
         tags = tags[:n]
+    if ecr_pull_through.is_cache_repository(name):
+        # v20 line 193: a cache repository answers text/plain with a compact body.
+        return _registry_ok(
+            200,
+            {"Content-Type": "text/plain; charset=utf-8"},
+            json.dumps({"name": name, "tags": tags}, separators=(",", ":")).encode(),
+        )
     return _registry_ok(
         200,
         {"Content-Type": "application/json"},
@@ -1528,9 +1819,11 @@ async def handle_registry_request(method, path, headers, body, query_params):
 
     if verb == "blob":
         if method == "HEAD":
-            return _v2_head_blob(name, ref)
+            return await ecr_pull_through.run_fetching(
+                name, lambda: ecr_pull_through.layers_need_fetch(name, [ref]), _v2_head_blob, name, ref)
         if method == "GET":
-            return _v2_get_blob(name, ref)
+            return await ecr_pull_through.run_fetching(
+                name, lambda: ecr_pull_through.layers_need_fetch(name, [ref]), _v2_get_blob, name, ref)
         if method == "DELETE":
             return _v2_delete_blob(name, ref)
         return _registry_error(405, "UNSUPPORTED", "method not allowed", {})
@@ -1539,9 +1832,11 @@ async def handle_registry_request(method, path, headers, body, query_params):
         if method == "PUT":
             return _v2_put_manifest(name, ref, headers, body)
         if method == "GET":
-            return _v2_get_manifest(name, ref)
+            return await ecr_pull_through.run_fetching(
+                name, lambda: ecr_pull_through.manifest_needs_fetch(name, ref), _v2_get_manifest, name, ref, not _v2_request_signed(headers))
         if method == "HEAD":
-            return _v2_head_manifest(name, ref)
+            return await ecr_pull_through.run_fetching(
+                name, lambda: ecr_pull_through.manifest_needs_fetch(name, ref), _v2_head_manifest, name, ref, not _v2_request_signed(headers))
         if method == "DELETE":
             return _v2_delete_manifest(name, ref)
         return _registry_error(405, "UNSUPPORTED", "method not allowed", {})

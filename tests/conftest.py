@@ -304,6 +304,9 @@ def routed_request(key, service, method, path, body=b"", headers=None, host="loc
 
 
 _SERIAL_TESTS = {
+    # The 50-rule pull-through cache quota is per registry: filling it blocks every other rule-creating test.
+    "tests/test_ecr_pull_through.py::test_create_quota_50_rules",
+    "tests/test_ecr_pull_through_limits.py::test_quota_slot_is_after_every_other_create_check_and_before_the_duplicate",
     "tests/test_rds.py::test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster",
     "tests/test_rds.py::test_rds_cluster_password_reset_is_visible_before_it_settles",
     "tests/test_rds.py::test_rds_cluster_password_reset_on_stopped_cluster_is_rejected",

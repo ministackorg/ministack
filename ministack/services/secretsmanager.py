@@ -248,6 +248,30 @@ def secret_exists(secret_id):
     return bool(ver) and (ver.get("SecretString") is not None or ver.get("SecretBinary") is not None)
 
 
+def pull_through_secret_state(secret_id):
+    """``(state, kms_key_id)`` for a secret an ECR pull-through cache rule names, in the caller's account and
+    region. *state* is "missing" (no such secret, or no current value), "unreadable" (scheduled for deletion,
+    or a binary value) or "ok"."""
+    secret = find_secret(secret_id)
+    if not secret:
+        return "missing", None
+    _, ver = _find_stage_version(secret, "AWSCURRENT")
+    if not ver or (ver.get("SecretString") is None and ver.get("SecretBinary") is None):
+        return "missing", None
+    if secret.get("DeletedDate") or ver.get("SecretString") is None:
+        return "unreadable", None
+    return "ok", secret.get("KmsKeyId")
+
+
+def pull_through_secret_string(secret_id):
+    """The current string value of a readable secret an ECR pull-through cache rule names, else None."""
+    secret = find_secret(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        return None
+    _, ver = _find_stage_version(secret, "AWSCURRENT")
+    return ver.get("SecretString") if ver else None
+
+
 def create_secret_in_process(name, secret_string, description=""):
     """Create a secret on behalf of another service (e.g. RDS managed master
     user passwords) without going through the HTTP API.

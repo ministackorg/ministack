@@ -848,3 +848,145 @@ def test_ecr_held_image_archive_loads_as_its_repository_uri():
         with request_scope("111122223333", "us-east-2"):
             for store in (ecr._repositories, ecr._layer_blobs, ecr._manifest_blobs, ecr._images):
                 store.pop("held", None)
+
+
+# ── answers of existing operations (issue 2617) ───────────────────────────────────────────────────────────────
+# These use the boto3 client and raw requests only, so they run against code that predates the pull-through
+# cache. Answers captured on a rule path or a cache repository apply there only; an ordinary repository keeps
+# its v1.5.39 answer ("restored" below).
+
+_NAME_PATTERN = "[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*"
+_MANIFEST = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                        "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 1,
+                                   "digest": "sha256:" + "a" * 64},
+                        "layers": []})
+_SIGNED = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/ecr/aws4_request, "
+                            "SignedHeaders=host, Signature=x"}
+
+
+@pytest.fixture
+def named_repo(ecr):
+    """(name, registry id) of a new repository, deleted afterwards."""
+    name = f"msg-{_uuid_mod.uuid4().hex[:8]}"
+    registry = ecr.create_repository(repositoryName=name)["repository"]["registryId"]
+    yield name, registry
+    ecr.delete_repository(repositoryName=name, force=True)
+
+
+@pytest.fixture
+def rule_prefix(ecr):
+    """A pull-through cache rule prefix whose path no pull has filled, deleted afterwards."""
+    prefix = f"msgrule{_uuid_mod.uuid4().hex[:6]}"
+    ecr.create_pull_through_cache_rule(ecrRepositoryPrefix=prefix, upstreamRegistryUrl="public.ecr.aws")
+    yield prefix
+    ecr.delete_pull_through_cache_rule(ecrRepositoryPrefix=prefix)
+
+
+def _refused(call, code, message, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["Error"]["Message"] == message
+
+
+def _raw(action, body):
+    response = requests.post(
+        ENDPOINT, data=body if isinstance(body, str) else json.dumps(body),
+        headers={"X-Amz-Target": f"AmazonEC2ContainerRegistry_V20150921.{action}",
+                 "Content-Type": "application/x-amz-json-1.1", **_SIGNED})
+    return response.status_code, response.json()
+
+
+def test_ecr_missing_repository_on_a_path_no_rule_covers_names_the_registry(ecr):
+    """r07-pull-no-rule (BatchGetImage), r15-get-no-rule--repo (DescribeRepositories), r16-pull-e2-app--images
+    (DescribeImages, ledger line 225). The other operations keep the v1.5.39 text: MiniStack contract, uncaptured:
+    ledger line 222 (no capture on a path without a rule)."""
+    name = f"msg-none-{_uuid_mod.uuid4().hex[:8]}"
+    registry = get_account_id()
+    long_text = f"The repository with name '{name}' does not exist in the registry with id '{registry}'"
+    short_text = f"The repository with name '{name}' does not exist"
+    _refused(ecr.describe_repositories, "RepositoryNotFoundException", long_text, repositoryNames=[name])
+    _refused(ecr.batch_get_image, "RepositoryNotFoundException", long_text, repositoryName=name,
+             imageIds=[{"imageTag": "3.20"}])
+    _refused(ecr.describe_images, "RepositoryNotFoundException", long_text, repositoryName=name)
+    _refused(ecr.get_download_url_for_layer, "RepositoryNotFoundException", short_text, repositoryName=name,
+             layerDigest="sha256:" + "0" * 64)
+
+
+def test_ecr_missing_repository_on_a_rule_path_names_the_registry(ecr, rule_prefix):
+    """r07-pull-missing-upstream-repo--images (DescribeImages of a rule-path repository that does not exist)."""
+    name = f"{rule_prefix}/none"
+    _refused(ecr.describe_images, "RepositoryNotFoundException",
+             f"The repository with name '{name}' does not exist in the registry with id '{get_account_id()}'",
+             repositoryName=name)
+
+
+def test_ecr_ordinary_repository_keeps_its_v1_5_39_answers(ecr, named_repo):
+    """MiniStack contract, uncaptured: ledger line 222. Restored for a repository with no rule: no capture shows
+    these answers there (the captured ones, r07-cache-*, are on cache repositories)."""
+    name, registry = named_repo
+    _refused(ecr.get_repository_policy, "RepositoryPolicyNotFoundException",
+             f"Repository policy does not exist for '{name}'", repositoryName=name)
+    _refused(ecr.get_lifecycle_policy, "LifecyclePolicyNotFoundException",
+             f"Lifecycle policy does not exist for '{name}'", repositoryName=name)
+    _refused(ecr.create_repository, "RepositoryAlreadyExistsException",
+             f"The repository with name '{name}' already exists", repositoryName=name)
+    first = ecr.put_image(repositoryName=name, imageManifest=_MANIFEST, imageTag="t1")["image"]["imageId"]
+    again = ecr.put_image(repositoryName=name, imageManifest=_MANIFEST, imageTag="t1")["image"]["imageId"]
+    assert again == first
+    _refused(ecr.delete_repository, "RepositoryNotEmptyException",
+             f"The repository with name '{name}' is not empty", repositoryName=name)
+
+
+
+def test_ecr_ordinary_repository_answers_captured_without_a_rule(ecr, named_repo):
+    """r07-pre-pull-into-existing--repo and r18-root-pull-into-plain--repo (createdAt with a fraction on
+    repositories CreateRepository made before any rule), r16-pull-e2-app--images (DescribeImages registry-id
+    wording on a path no rule covers): ledger line 225."""
+    name, registry = named_repo
+    status, body = _raw("DescribeRepositories", {"repositoryNames": [name]})
+    assert isinstance(body["repositories"][0]["createdAt"], float)
+    missing = f"{name}-none"
+    _refused(ecr.describe_images, "RepositoryNotFoundException",
+             f"The repository with name '{missing}' does not exist in the registry with id '{get_account_id()}'",
+             repositoryName=missing)
+
+
+def test_ecr_batch_get_image_of_an_ordinary_repository_is_not_validated_as_on_a_rule_path(ecr, named_repo):
+    """MiniStack contract, uncaptured: ledger line 222. r07-pull-prefix-bad-name and r07-pull-prefix-no-image-ids
+    are rule-path captures, so a repository no rule covers answers as on v1.5.39: an empty imageIds is an empty
+    answer, and a digest request answers with the stored imageId."""
+    name, registry = named_repo
+    assert _raw("BatchGetImage", {"repositoryName": name, "imageIds": []}) == (200, {"images": [], "failures": []})
+    pushed = ecr.put_image(repositoryName=name, imageManifest=_MANIFEST, imageTag="t1")["image"]["imageId"]
+    got = ecr.batch_get_image(repositoryName=name, imageIds=[{"imageDigest": pushed["imageDigest"]}])
+    assert got["images"][0]["imageId"] == pushed
+
+
+def test_ecr_batch_get_image_checks_the_name_and_image_ids_on_a_rule_path(ecr, rule_prefix):
+    """r07-pull-prefix-bad-name, r07-pull-prefix-no-image-ids."""
+    _refused(ecr.batch_get_image, "InvalidParameterException",
+             f"Invalid parameter at 'repositoryName' failed to satisfy constraint: "
+             f"'must satisfy regular expression '{_NAME_PATTERN}''", repositoryName=f"{rule_prefix}/Docker/Library/Alpine",
+             imageIds=[{"imageTag": "3.20"}])
+    status, body = _raw("BatchGetImage", {"repositoryName": f"{rule_prefix}/docker/alpinex", "imageIds": []})
+    assert status == 400
+    assert body == {"__type": "InvalidParameterException",
+                    "message": "Invalid parameter at 'imageIds' failed to satisfy constraint: "
+                               "'Member must have length greater than or equal to 1'"}
+
+
+@pytest.mark.parametrize("image_ids,message", [
+    (["x"], "Unexpected field type"), ([1], "Unexpected field type"), ([None], "Unexpected field type"),
+    ([["x"]], None), ("x", "Unexpected field type"), (5, "Unexpected field type"),
+    ({"imageTag": "t"}, "Start of structure or map found where not expected"),
+])
+def test_ecr_batch_get_image_with_a_malformed_image_ids_is_a_serialization_error(named_repo, image_ids, message):
+    """MiniStack contract, uncaptured: ledger line 219 (no capture sends a malformed imageIds; the answer is the
+    SerializationException this change gives other wrong JSON types, never a 500)."""
+    name, _ = named_repo
+    status, body = _raw("BatchGetImage", {"repositoryName": name, "imageIds": image_ids})
+    assert status == 400
+    assert body == ({"__type": "SerializationException"} if message is None
+                    else {"__type": "SerializationException", "Message": message})

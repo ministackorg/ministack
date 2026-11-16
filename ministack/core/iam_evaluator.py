@@ -217,6 +217,10 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         return ctx.source_ip
     if k == "aws:tagkeys":
         return ctx.service_context.get(k, ctx.tag_keys)
+    if k == "aws:calledvia":
+        # The services that made the call on the principal's behalf, as a list. A direct call carries none,
+        # so the key is absent and ForAnyValue fails.
+        return ctx.service_context.get(k) or None
     if k.startswith("aws:requesttag/"):
         if k in ctx.service_context:
             return ctx.service_context[k]

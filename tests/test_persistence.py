@@ -5936,3 +5936,32 @@ def test_ec2_verified_access_reset_clears_stores():
         assert got["group"] not in mod._va_groups
         assert got["ep"] not in mod._va_endpoints
         assert mod._tags.get(got["inst"]) is None
+
+
+# ── ecr pull-through cache rules and registry policy ───────────────────
+
+def test_ecr_pull_through_rules_and_registry_policy_survive_warm_boot_in_every_scope():
+    """Rules, fill origins and the registry policy are scoped by account and region; every scope is saved."""
+    from ministack.core.responses import request_scope
+
+    mod = _get_module("ecr")
+    rules = _get_module("ecr_pull_through")
+    policies = _get_module("ecr_registry_policy")
+    mod.reset()
+    scopes = [("000000000000", "us-east-1"), ("000000000000", "eu-west-1"), ("111122223333", "us-east-1")]
+    for account, region in scopes:
+        with request_scope(account, region):
+            rules._rules["msc2617-persist"] = {
+                "ecrRepositoryPrefix": "msc2617-persist", "upstreamRegistryUrl": "public.ecr.aws",
+                "createdAt": 1.5, "registryId": account, "marker": f"{account}/{region}"}
+            rules._origins["msc2617-persist/app"] = {"host": "public.ecr.aws", "path": "app"}
+            policies._policies["policy"] = {"policyText": f"p-{account}-{region}"}
+
+    _round_trip_dict(mod, "ecr")
+
+    for account, region in scopes:
+        with request_scope(account, region):
+            assert rules._rules["msc2617-persist"]["marker"] == f"{account}/{region}"
+            assert rules._origins["msc2617-persist/app"]["path"] == "app"
+            assert policies._policies["policy"]["policyText"] == f"p-{account}-{region}"
+    mod.reset()

@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **ECR — pull-through cache rules and registry policy** — adds `CreatePullThroughCacheRule`, `UpdatePullThroughCacheRule`, `DeletePullThroughCacheRule`, `DescribePullThroughCacheRules`, `ValidatePullThroughCacheRule`, `PutRegistryPolicy`, `GetRegistryPolicy`, `DeleteRegistryPolicy` and `GetAccountSetting`. The first `BatchGetImage` or V2 manifest GET/HEAD of `<prefix>/<path>` fills the repository by pulling the image through the host Docker daemon (mount the Docker socket; the platform the daemon holds is stored, other platforms are pulled by digest on demand). Rules and the registry policy are scoped by account and region. Repository creation templates are not included. Reported in #2617. Contributed by @kharabasz.
+
+### Changed
+- **ECR** — a pull of a repository no rule covers answers as before, with these exceptions captured on AWS: `BatchGetImage`, `DescribeRepositories` and `DescribeImages` of a missing repository name the registry id in their message, `createdAt` has fractional seconds, and a V2 manifest request for a missing repository answers `NAME_UNKNOWN` (404 `404 page not found` when the name breaks the repository-name pattern). On pull-through cache repositories and rule paths: wording of repository, policy and delete errors, `PutImage` of a held tag and digest answers `ImageAlreadyExistsException`, `BatchGetImage` validates the name and `imageIds`, and a foreign `registryId` is refused without a repository policy. `BatchGetImage` with a malformed `imageIds` answers `SerializationException`. `DeleteRepository` now also drops the stored blobs. Registry policies accept every ECR action (and `*`) and refuse `NaN`/`Infinity`. Contributed by @kharabasz.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added

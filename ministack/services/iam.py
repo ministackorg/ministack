@@ -2156,6 +2156,53 @@ def _create_service_linked_role(p):
                 ns="iam")
 
 
+def ensure_service_linked_role(service_name, role_name, policy_arn):
+    """Create the service-linked role *role_name* for *service_name* in the caller's account, with
+    *policy_arn* attached, unless it exists. Used by services that create it as a side effect of an
+    operation (ECR pull-through cache); an existing role is never replaced."""
+    if role_name in _roles:
+        return
+    path = f"/aws-service-role/{service_name}/"
+    _roles[role_name] = {
+        "RoleName": role_name,
+        "Arn": f"arn:aws:iam::{get_account_id()}:role{path}{role_name}",
+        "RoleId": _gen_id("AROA"),
+        "CreateDate": _now(),
+        "Path": path,
+        "AssumeRolePolicyDocument": json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": {"Service": service_name}, "Action": "sts:AssumeRole"}],
+        }, separators=(",", ":")),
+        "Description": "",
+        "MaxSessionDuration": 3600,
+        "AttachedPolicies": [],
+        "InlinePolicies": {},
+        "Tags": [],
+    }
+    attach_managed_policy(_roles[role_name], policy_arn)
+
+
+def role_trusts_service(role_arn, service_principal):
+    """True when *role_arn* names a role of the caller's account whose trust policy lets *service_principal*
+    assume it (an Allow statement naming it under Principal.Service)."""
+    role = _roles.get(role_arn.rsplit("/", 1)[-1])
+    if role is None or role.get("Arn") != role_arn:
+        return False
+    try:
+        document = json.loads(role.get("AssumeRolePolicyDocument") or "{}")
+    except (TypeError, ValueError):
+        return False
+    statements = document.get("Statement", [])
+    for statement in [statements] if isinstance(statements, dict) else statements:
+        if statement.get("Effect") != "Allow":
+            continue
+        principal = statement.get("Principal")
+        services = principal.get("Service", []) if isinstance(principal, dict) else []
+        if service_principal in ([services] if isinstance(services, str) else services):
+            return True
+    return False
+
+
 def _delete_service_linked_role(p):
     role_name = _p(p, "RoleName")
     role = _roles.get(role_name)

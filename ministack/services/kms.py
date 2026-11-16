@@ -452,6 +452,46 @@ def resolve_key_for_s3(key_ref):
     return arn, None
 
 
+def held_key_state(key_ref):
+    """The KeyState of the key *key_ref* (ID, ARN or alias) names in this account and region, or None when
+    MiniStack KMS does not hold it. Other services use it to skip a key-state check for keys they cannot see."""
+    rec = _resolve_key(key_ref)
+    return rec["KeyState"] if rec else None
+
+
+def key_policy_grants_named_principal(key_ref, action, principal_arn):
+    """Whether the customer managed key *key_ref* names lets *principal_arn* use *action* through a key-policy
+    statement that names that principal. The account root statement does not count (it only lets IAM policies
+    grant access) and an explicit Deny wins. None when MiniStack KMS does not hold the key, or it is an AWS
+    managed key."""
+    rec = _resolve_key(key_ref)
+    if rec is None or rec.get("KeyManager") == "AWS":
+        return None
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    account = principal_arn.split(":")[4]
+    try:
+        document = json.loads(rec.get("Policy") or "{}")
+    except (TypeError, ValueError):
+        return False
+    statements = document.get("Statement", [])
+    kept = []
+    for statement in [statements] if isinstance(statements, dict) else statements:
+        if statement.get("Effect") == "Deny":
+            kept.append(statement)
+            continue
+        principal = statement.get("Principal")
+        # Principal "*" and {"AWS": "*"} grant every principal, so they count as naming the role.
+        named = ["*"] if principal == "*" else principal.get("AWS", []) if isinstance(principal, dict) else []
+        named = [named] if isinstance(named, str) else named
+        named = [n for n in named if n not in (account, f"arn:aws:iam::{account}:root")]
+        if named:
+            kept.append({**statement, "Principal": {"AWS": named}})
+    ctx = EvalContext(principal_arn=principal_arn, principal_type="AssumedRole", principal_account=account,
+                      action=f"kms:{action}", resource_arn=rec["Arn"], region=get_region())
+    return evaluate_resource_policy({"Version": "2012-10-17", "Statement": kept}, ctx).decision == "Allow"
+
+
 def _key_ref_from_arn(key_id_or_arn):
     try:
         spec = parse_arn(key_id_or_arn)
