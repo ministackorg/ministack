@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — a missing cluster in `EnableHttpEndpoint` and a bare-name member in `RemoveFromGlobalCluster`** — `EnableHttpEndpoint` on a cluster ARN that names no cluster answers `404 ResourceNotFoundFault` "The DB cluster <arn> wasn't found.", not `DBClusterNotFoundFault`. `RemoveFromGlobalCluster` with a `DbClusterIdentifier` that is not an ARN answers `400 InvalidParameterValue` "Malformed db cluster arn <name>" before it looks up the global cluster, as AWS does; pass the member's `DBClusterArn`. Contributed by @Areson.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added
