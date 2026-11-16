@@ -160,8 +160,42 @@ def test_rds_create_duplicate_instance(rds):
                 AllocatedStorage=20,
             )
         assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExists"
+        # As captured on AWS: the message does not name the instance.
+        assert exc.value.response["Error"]["Message"] == "DB instance already exists"
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="dup-create-db", SkipFinalSnapshot=True)
+
+
+def test_rds_concurrent_duplicate_create_accepts_exactly_one(rds):
+    """As on AWS: of several concurrent creates of one identifier, exactly one
+    succeeds and the others get DBInstanceAlreadyExists."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    db_id = f"race-create-{uuid.uuid4().hex[:8]}"
+
+    def create_once(_):
+        try:
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id,
+                DBInstanceClass="db.t3.micro",
+                Engine="mysql",
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+                AllocatedStorage=20,
+            )
+            return None
+        except ClientError as exc:
+            return exc.response["Error"]["Code"], exc.response["Error"]["Message"]
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(create_once, range(6)))
+        assert results.count(None) == 1, results
+        assert [r for r in results if r is not None] == [
+            ("DBInstanceAlreadyExists", "DB instance already exists")
+        ] * 5
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
 
 def test_rds_create_rejects_unknown_parameter_group(rds):
     """CreateDBInstance / CreateDBCluster reject a reference to a parameter group
@@ -18723,6 +18757,36 @@ def test_rds_cluster_member_settings_also_apply_immediately(imm_state, membershi
     _imm_modify_readback("sdk", ApplyImmediately=False, **dict.fromkeys(_IMM_FLAGS, True))
     assert all(instance[flag] is True for flag in _IMM_FLAGS)
     assert instance["PendingModifiedValues"] == {}
+
+
+def test_rds_modify_to_current_class_withdraws_deferred_class_change(rds):
+    """As on AWS: asking again for the current class with ApplyImmediately=False
+    drops the deferred class change, and the instance keeps its class."""
+    db_id = f"pending-class-{uuid.uuid4().hex[:8]}"
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id,
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+    )
+    try:
+        rds.modify_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.small", ApplyImmediately=False,
+        )
+        inst = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert inst["PendingModifiedValues"] == {"DBInstanceClass": "db.t3.small"}
+        assert inst["DBInstanceClass"] == "db.t3.micro"
+
+        rds.modify_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", ApplyImmediately=False,
+        )
+        inst = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert "DBInstanceClass" not in inst.get("PendingModifiedValues", {})
+        assert inst["DBInstanceClass"] == "db.t3.micro"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
 
 
 @pytest.mark.parametrize("param, value, stored", [

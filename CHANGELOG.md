@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — concurrent creates and withdrawn class changes** — several concurrent `CreateDBInstance` calls with one identifier all succeeded. Now exactly one does and the others answer `400 DBInstanceAlreadyExists` "DB instance already exists", which is also the message for a sequential duplicate. `ModifyDBInstance` with the current `DBInstanceClass` and `ApplyImmediately=false` withdraws a deferred class change instead of queuing a no-op in `PendingModifiedValues`. Contributed by @Areson.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added
