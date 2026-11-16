@@ -4389,6 +4389,7 @@ def _parse_docker_flags(flags: str) -> dict:
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-e", "--env", action="append", default=[])
+    parser.add_argument("-p", "--publish", action="append", default=[])
     parser.add_argument("-v", "--volume", action="append", default=[])
     parser.add_argument("--dns", action="append", default=[])
     parser.add_argument("--network")
@@ -4404,6 +4405,11 @@ def _parse_docker_flags(flags: str) -> dict:
     args, _ = parser.parse_known_args(shlex.split(flags))
 
     kwargs: dict = {}
+
+    if args.publish:
+        from docker.utils.ports import build_port_bindings
+        publications = [port if "/" in port else f"{port}/tcp" for port in args.publish]
+        kwargs["ports"] = build_port_bindings(publications)
 
     if args.env:
         env = {}
@@ -4991,6 +4997,14 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         df_mounts = df_kwargs.pop("mounts", [])
         if df_mounts:
             run_kwargs.setdefault("mounts", []).extend(df_mounts)
+        df_ports = df_kwargs.pop("ports", {})
+        if df_ports:
+            ports = run_kwargs.setdefault("ports", {})
+            for port, bindings in df_ports.items():
+                if port in ports:
+                    ports[port] = [ports[port], *bindings]
+                else:
+                    ports[port] = bindings
         run_kwargs.update(df_kwargs)
 
     # `host.docker.internal` only resolves out of the box on Docker Desktop

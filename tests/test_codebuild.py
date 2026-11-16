@@ -406,6 +406,21 @@ def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
     assert "CODEBUILD_BUILD_ID=demo:0001" in env_lines
 
 
+def test_execute_build_publishes_ports_from_docker_flags(monkeypatch, tmp_path):
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(codebuild, "CODEBUILD_DOCKER_FLAGS", "-p 127.0.0.1:18080:8080")
+    project = _execution_project()
+    build = _seed_execution_build(project)
+
+    codebuild._execute_build("demo:0001", project)
+
+    assert build["buildStatus"] == "SUCCEEDED"
+    assert docker.containers.kwargs["ports"] == {"8080/tcp": [("127.0.0.1", "18080")]}
+
+
 def test_execute_build_writes_agent_output_to_cloudwatch_logs(monkeypatch, tmp_path):
     from ministack.services import cloudwatch_logs as cwl
 

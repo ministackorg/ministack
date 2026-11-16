@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — Docker port publishing** — `-p` / `--publish` in `LAMBDA_DOCKER_FLAGS` now publishes ports on Lambda containers, allowing debuggers to attach. MiniStack retains its own invocation port when one is needed. The shared Docker flag parser also enables port publishing for `CODEBUILD_DOCKER_FLAGS`.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added

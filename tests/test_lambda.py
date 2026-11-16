@@ -8198,6 +8198,34 @@ def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypat
 
 # ──────────────────── LAMBDA_DOCKER_FLAGS ────────────────────
 
+@pytest.mark.parametrize("network", ["", "example-net"])
+@pytest.mark.parametrize("in_container", [False, True])
+def test_lambda_docker_flags_publish_ports_without_losing_runtime_port(monkeypatch, network, in_container):
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", network)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: in_container)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566",
+        docker_flags="-e NODE_OPTIONS=--inspect-brk=0.0.0.0:9449 "
+                     "-p 127.0.0.1:9449:9449 --publish=127.0.0.1::9229 "
+                     "-p 127.0.0.1:5353:5353/udp",
+    )
+    assert captured["environment"]["NODE_OPTIONS"] == "--inspect-brk=0.0.0.0:9449"
+    assert captured["ports"]["9449/tcp"] == [("127.0.0.1", "9449")]
+    assert captured["ports"]["9229/tcp"] == [("127.0.0.1", None)]
+    assert captured["ports"]["5353/udp"] == [("127.0.0.1", "5353")]
+    if not network:
+        assert captured["ports"]["8080/tcp"] == ("127.0.0.1", None)
+
+
+def test_lambda_docker_flags_keep_runtime_binding_when_publishing_same_port(monkeypatch):
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_NETWORK", "")
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566", docker_flags="-p 127.0.0.1:18080:8080",
+    )
+    assert captured["ports"]["8080/tcp"] == [("127.0.0.1", None), ("127.0.0.1", "18080")]
+
+
 def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     """LAMBDA_DOCKER_FLAGS env/volume/dns/network/cap/memory flags end up in containers.run() kwargs."""
     monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", (
