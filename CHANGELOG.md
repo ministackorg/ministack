@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — the engine-version catalog** — `DescribeDBEngineVersions` listed invented PostgreSQL, MySQL and MariaDB versions with families such as `16` instead of `postgres16`, left out `MajorEngineVersion`, `SupportedEngineModes`, `SupportedCACertificateIdentifiers`, `ServerlessV2FeaturesSupport` and the log types, and answered an unknown engine name with a made-up version. It now lists the versions AWS offers in us-east-1 with AWS's attributes, adds six missing Aurora MySQL versions, answers `--default-only` with AWS's defaults (PostgreSQL 18.3, MySQL 8.4.11, MariaDB 11.8.9) and refuses an unknown engine with `400 InvalidParameterValue` "Unrecognized engine name: <name>". The `MaxRecords` range message for RDS describe calls no longer ends with a period, as on AWS. Contributed by @Areson.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added
