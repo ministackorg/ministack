@@ -111,9 +111,15 @@ EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS = {
     "8.0.mysql_aurora.3.10.2": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.10.3": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.10.4": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.5": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.6": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.11.1": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.12.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.13.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.14.0": "aurora-mysql8.0",
     "8.4.mysql_aurora.8.4.7": "aurora-mysql8.4",
+    "8.4.mysql_aurora.8.4.8": "aurora-mysql8.4",
+    "8.4.mysql_aurora.8.4.10": "aurora-mysql8.4",
 }
 
 
@@ -160,8 +166,42 @@ def test_rds_create_duplicate_instance(rds):
                 AllocatedStorage=20,
             )
         assert exc.value.response["Error"]["Code"] == "DBInstanceAlreadyExists"
+        # As captured on AWS: the message does not name the instance.
+        assert exc.value.response["Error"]["Message"] == "DB instance already exists"
     finally:
         rds.delete_db_instance(DBInstanceIdentifier="dup-create-db", SkipFinalSnapshot=True)
+
+
+def test_rds_concurrent_duplicate_create_accepts_exactly_one(rds):
+    """As on AWS: of several concurrent creates of one identifier, exactly one
+    succeeds and the others get DBInstanceAlreadyExists."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    db_id = f"race-create-{uuid.uuid4().hex[:8]}"
+
+    def create_once(_):
+        try:
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id,
+                DBInstanceClass="db.t3.micro",
+                Engine="mysql",
+                MasterUsername="admin",
+                MasterUserPassword="password123",
+                AllocatedStorage=20,
+            )
+            return None
+        except ClientError as exc:
+            return exc.response["Error"]["Code"], exc.response["Error"]["Message"]
+
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(create_once, range(6)))
+        assert results.count(None) == 1, results
+        assert [r for r in results if r is not None] == [
+            ("DBInstanceAlreadyExists", "DB instance already exists")
+        ] * 5
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
 
 def test_rds_create_rejects_unknown_parameter_group(rds):
     """CreateDBInstance / CreateDBCluster reject a reference to a parameter group
@@ -242,7 +282,7 @@ def test_rds_create_instance_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass123",
+        MasterUserPassword="password123",
         AllocatedStorage=20,
         DBName="mydb",
     )
@@ -265,7 +305,7 @@ def test_rds_describe_instances_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="mysql",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     rds.create_db_instance(
@@ -273,7 +313,7 @@ def test_rds_describe_instances_v2(rds):
         DBInstanceClass="db.t3.small",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     resp = rds.describe_db_instances()
@@ -321,7 +361,7 @@ def test_rds_delete_instance_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     rds.delete_db_instance(DBInstanceIdentifier="rds-del-v2", SkipFinalSnapshot=True)
@@ -335,7 +375,7 @@ def test_rds_modify_instance_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     rds.modify_db_instance(
@@ -356,7 +396,7 @@ def test_rds_modify_instance_iam_database_authentication(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     inst = rds.modify_db_instance(
@@ -383,7 +423,7 @@ def test_rds_create_instance_honors_preferred_maintenance_window(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
         PreferredMaintenanceWindow="tue:03:00-tue:04:00",
     )
@@ -397,7 +437,7 @@ def test_rds_create_instance_default_preferred_maintenance_window(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     resp = rds.describe_db_instances(DBInstanceIdentifier="rds-pmw-default-v2")
@@ -459,7 +499,7 @@ def test_rds_snapshot_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     resp = rds.create_db_snapshot(
@@ -484,7 +524,7 @@ def test_rds_tags_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
         Tags=[{"Key": "env", "Value": "dev"}],
     )
@@ -1201,7 +1241,7 @@ def test_rds_global_cluster_with_source(rds):
         # Remove the member, then delete
         rds.remove_from_global_cluster(
             GlobalClusterIdentifier="test-global-src",
-            DbClusterIdentifier="gc-source-cluster",
+            DbClusterIdentifier=source["DBClusterArn"],
         )
         resp2 = rds.describe_global_clusters(GlobalClusterIdentifier="test-global-src")
         assert len(resp2["GlobalClusters"][0]["GlobalClusterMembers"]) == 0
@@ -1212,12 +1252,12 @@ def test_rds_global_cluster_with_source(rds):
 
 def test_rds_global_cluster_delete_with_members_fails(rds):
     """DeleteGlobalCluster fails when writer members still attached."""
-    rds.create_db_cluster(
+    member_arn = rds.create_db_cluster(
         DBClusterIdentifier="gc-member-cluster",
         Engine="aurora-postgresql",
         MasterUsername="admin",
         MasterUserPassword="password123",
-    )
+    )["DBCluster"]["DBClusterArn"]
     rds.create_global_cluster(
         GlobalClusterIdentifier="test-global-members",
         SourceDBClusterIdentifier="gc-member-cluster",
@@ -1229,7 +1269,7 @@ def test_rds_global_cluster_delete_with_members_fails(rds):
     finally:
         rds.remove_from_global_cluster(
             GlobalClusterIdentifier="test-global-members",
-            DbClusterIdentifier="gc-member-cluster",
+            DbClusterIdentifier=member_arn,
         )
         rds.delete_global_cluster(GlobalClusterIdentifier="test-global-members")
         rds.delete_db_cluster(DBClusterIdentifier="gc-member-cluster", SkipFinalSnapshot=True)
@@ -1806,6 +1846,105 @@ def test_rds_describe_aurora_postgresql_engine_version_status(rds):
     assert all(version["Status"] == "available" for version in default_versions)
 
 
+@pytest.mark.parametrize(
+    "engine, default_version, family, major",
+    [
+        ("postgres", "18.3", "postgres18", "18"),
+        ("mysql", "8.4.11", "mysql8.4", "8.4"),
+        ("mariadb", "11.8.9", "mariadb11.8", "11.8"),
+        ("aurora-mysql", "8.0.mysql_aurora.3.10.3", "aurora-mysql8.0", "8.0"),
+        ("aurora-postgresql", "17.9", "aurora-postgresql17", "17"),
+    ],
+)
+def test_rds_describe_engine_versions_default_and_families(
+    rds, engine, default_version, family, major
+):
+    """As on AWS: the family is the engine name plus the major version, and
+    MajorEngineVersion is that major version."""
+    versions = rds.describe_db_engine_versions(Engine=engine, MaxRecords=100)["DBEngineVersions"]
+    assert versions
+    assert all(
+        v["DBParameterGroupFamily"] == f"{engine}{v['MajorEngineVersion']}" for v in versions
+    )
+
+    default = rds.describe_db_engine_versions(Engine=engine, DefaultOnly=True)["DBEngineVersions"]
+    assert [(v["EngineVersion"], v["DBParameterGroupFamily"], v["MajorEngineVersion"])
+            for v in default] == [(default_version, family, major)]
+
+
+def _engine_version(rds, engine, version):
+    versions = rds.describe_db_engine_versions(
+        Engine=engine, EngineVersion=version
+    )["DBEngineVersions"]
+    assert len(versions) == 1, versions
+    return versions[0]
+
+
+def test_rds_describe_engine_versions_aurora_capability_fields(rds):
+    all_cas = ["rds-ca-ecc384-g1", "rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1"]
+    v = _engine_version(rds, "aurora-mysql", "8.0.mysql_aurora.3.10.3")
+    assert v["SupportedEngineModes"] == ["provisioned"]
+    assert v["ServerlessV2FeaturesSupport"] == {"MinCapacity": 0.0, "MaxCapacity": 256.0}
+    assert v["ExportableLogTypes"] == [
+        "audit", "error", "general", "iam-db-auth-error", "instance", "slowquery",
+    ]
+    assert v["SupportedCACertificateIdentifiers"] == all_cas
+    assert v["SupportsLogExportsToCloudwatchLogs"] is True
+    assert v["SupportsReadReplica"] is False
+    assert v["SupportsGlobalDatabases"] is True
+
+    v = _engine_version(rds, "aurora-mysql", "5.7.mysql_aurora.2.12.6")
+    assert "ServerlessV2FeaturesSupport" not in v
+    assert "instance" not in v["ExportableLogTypes"]
+
+    v = _engine_version(rds, "aurora-mysql", "8.0.mysql_aurora.3.14.0")
+    assert v["ServerlessV2FeaturesSupport"] == {"MinCapacity": 0.0, "MaxCapacity": 384.0}
+
+    v = _engine_version(rds, "aurora-postgresql", "13.9")
+    assert v["ServerlessV2FeaturesSupport"] == {"MinCapacity": 0.5, "MaxCapacity": 128.0}
+    assert v["ExportableLogTypes"] == ["iam-db-auth-error", "instance", "postgresql"]
+
+    v = _engine_version(rds, "aurora-postgresql", "12.22")
+    assert "ServerlessV2FeaturesSupport" not in v
+
+
+def test_rds_describe_engine_versions_non_aurora_capability_fields(rds):
+    v = _engine_version(rds, "postgres", "16.15")
+    assert v["DBParameterGroupFamily"] == "postgres16"
+    assert "SupportedEngineModes" not in v
+    assert "ServerlessV2FeaturesSupport" not in v
+    assert v["ExportableLogTypes"] == ["iam-db-auth-error", "postgresql", "upgrade"]
+    assert v["SupportedCACertificateIdentifiers"] == [
+        "rds-ca-ecc384-g1", "rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1",
+    ]
+    assert v["SupportsLogExportsToCloudwatchLogs"] is True
+    assert v["SupportsReadReplica"] is True
+    assert v["SupportsGlobalDatabases"] is False
+
+    v = _engine_version(rds, "mysql", "5.7.44-rds.20260902")
+    assert v["SupportedCACertificateIdentifiers"] == ["rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1"]
+    assert v["ExportableLogTypes"] == ["audit", "error", "general", "iam-db-auth-error", "slowquery"]
+
+
+def test_rds_describe_engine_versions_rejects_unrecognized_engine(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_engine_versions(Engine="no-such-engine", MaxRecords=20)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == "Unrecognized engine name: no-such-engine"
+
+    # A real RDS engine without a MiniStack catalog is not rejected.
+    rds.describe_db_engine_versions(Engine="oracle-ee")
+
+
+def test_rds_describe_engine_versions_max_records_range(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_engine_versions(Engine="mysql", MaxRecords=1000)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == (
+        "Invalid value 1000 for MaxRecords. Must be between 20 and 100"
+    )
+
+
 def test_rds_aurora_mysql_create_rejects_unsupported_explicit_engine_version(rds):
     with pytest.raises(ClientError) as cluster_exc:
         rds.create_db_cluster(
@@ -2110,16 +2249,15 @@ def test_rds_modify_global_cluster_applies_version_to_members(rds):
         Engine="aurora-postgresql",
         EngineVersion="16.8",
     )
-    member_created = False
+    member_arn = None
     try:
-        rds.create_db_cluster(
+        member_arn = rds.create_db_cluster(
             DBClusterIdentifier=member_id,
             Engine="aurora-postgresql",
             GlobalClusterIdentifier=global_id,
             MasterUsername="admin",
             MasterUserPassword="password123",
-        )
-        member_created = True
+        )["DBCluster"]["DBClusterArn"]
 
         gc = rds.modify_global_cluster(
             GlobalClusterIdentifier=global_id,
@@ -2151,10 +2289,10 @@ def test_rds_modify_global_cluster_applies_version_to_members(rds):
         )["DBCluster"]
         assert modified["EngineVersion"] == "16.10"
     finally:
-        if member_created:
+        if member_arn:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=member_id,
+                DbClusterIdentifier=member_arn,
             )
             rds.delete_db_cluster(
                 DBClusterIdentifier=member_id, SkipFinalSnapshot=True
@@ -2398,7 +2536,7 @@ def test_rds_handle_request_describe_with_json_body():
         "DBInstanceClass": ["db.t3.micro"],
         "Engine": ["postgres"],
         "MasterUsername": ["admin"],
-        "MasterUserPassword": ["pw"],
+        "MasterUserPassword": ["password"],
         "AllocatedStorage": ["20"],
     })
 
@@ -5157,7 +5295,7 @@ def test_rds_create_db_instance_returns_before_container_is_ready(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="secret",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     elapsed = time.time() - t0
@@ -5337,7 +5475,7 @@ def test_rds_create_read_replica(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass123",
+        MasterUserPassword="password123",
         AllocatedStorage=20,
     )
     try:
@@ -5410,7 +5548,7 @@ def test_rds_reboot_db_instance(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     try:
@@ -5791,7 +5929,7 @@ def test_rds_restore_from_snapshot(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
         DBName="srcdb",
     )
@@ -5860,7 +5998,7 @@ def test_rds_start_db_instance(rds):
         DBInstanceClass="db.t3.micro",
         Engine="mysql",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     try:
@@ -5893,7 +6031,7 @@ def test_rds_stop_db_instance(rds):
         DBInstanceClass="db.t3.micro",
         Engine="mysql",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     try:
@@ -6002,7 +6140,12 @@ def test_rds_enable_http_endpoint_not_found(rds):
         rds.enable_http_endpoint(
             ResourceArn="arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster"
         )
-    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    # As captured on AWS.
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundFault"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Message"] == (
+        "The DB cluster arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster wasn't found."
+    )
 
 
 def test_rds_disable_http_endpoint(rds):
@@ -6196,7 +6339,8 @@ def test_rds_describe_postgres_18_engine_version(rds):
     versions = resp["DBEngineVersions"]
     assert len(versions) == 1
     assert versions[0]["EngineVersion"] == "18.3"
-    assert versions[0]["DBParameterGroupFamily"] == "18"
+    assert versions[0]["DBParameterGroupFamily"] == "postgres18"
+    assert versions[0]["MajorEngineVersion"] == "18"
 
 
 def test_rds_create_db_instance_postgres_18(rds):
@@ -8121,7 +8265,7 @@ def test_rds_instances_are_region_scoped():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )
         west.create_db_instance(
@@ -8129,7 +8273,7 @@ def test_rds_instances_are_region_scoped():
             DBInstanceClass="db.t3.small",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=20,
         )
 
@@ -8157,7 +8301,7 @@ def test_rds_regional_instance_apis_reject_foreign_region_arns():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
         instance_arn = instance["DBInstanceArn"]
@@ -8701,6 +8845,49 @@ def test_remove_from_global_cluster_rejects_overlong_member_identifier(global_ex
             _delete_global_cluster(east, global_id)
 
 
+@pytest.mark.parametrize("global_exists", [False, True], ids=["missing-global", "existing-global"])
+def test_remove_from_global_cluster_rejects_bare_name_member(global_exists):
+    """As captured on AWS (us-east-1): a member that is not an ARN answers 400
+    InvalidParameterValue "Malformed db cluster arn <name>", checked before the
+    global cluster is looked up. With an existing global, the named member stays."""
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    global_id = f"remove-bare-{suffix}"
+    member_id = f"remove-bare-member-{suffix}"
+    if global_exists:
+        east.create_db_cluster(
+            DBClusterIdentifier=member_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id, SourceDBClusterIdentifier=member_id,
+        )
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=member_id,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Message"] == f"Malformed db cluster arn {member_id}"
+        if global_exists:
+            members = east.describe_global_clusters(
+                GlobalClusterIdentifier=global_id
+            )["GlobalClusters"][0]["GlobalClusterMembers"]
+            assert [m["DBClusterArn"].rsplit(":", 1)[1] for m in members] == [member_id]
+    finally:
+        if global_exists:
+            arn = east.describe_db_clusters(
+                DBClusterIdentifier=member_id
+            )["DBClusters"][0]["DBClusterArn"]
+            east.remove_from_global_cluster(GlobalClusterIdentifier=global_id, DbClusterIdentifier=arn)
+            _delete_global_cluster(east, global_id)
+            east.delete_db_cluster(DBClusterIdentifier=member_id, SkipFinalSnapshot=True)
+
+
 def test_remove_from_global_cluster_63_character_member_identifier_reaches_lookup():
     east = _regional_rds("us-east-1")
     with pytest.raises(ClientError) as exc:
@@ -8835,7 +9022,7 @@ def test_rds_same_region_arn_lookup_requires_stored_resource_arn_match():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
 
@@ -8866,7 +9053,7 @@ def test_rds_db_snapshot_filter_by_instance_arn_survives_source_deletion():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
         east.create_db_snapshot(
@@ -9005,7 +9192,7 @@ def test_rds_read_replica_from_instance_arn_stores_canonical_source_id():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
         replica = east.create_db_instance_read_replica(
@@ -18725,6 +18912,36 @@ def test_rds_cluster_member_settings_also_apply_immediately(imm_state, membershi
     assert instance["PendingModifiedValues"] == {}
 
 
+def test_rds_modify_to_current_class_withdraws_deferred_class_change(rds):
+    """As on AWS: asking again for the current class with ApplyImmediately=False
+    drops the deferred class change, and the instance keeps its class."""
+    db_id = f"pending-class-{uuid.uuid4().hex[:8]}"
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id,
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+        AllocatedStorage=20,
+    )
+    try:
+        rds.modify_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.small", ApplyImmediately=False,
+        )
+        inst = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert inst["PendingModifiedValues"] == {"DBInstanceClass": "db.t3.small"}
+        assert inst["DBInstanceClass"] == "db.t3.micro"
+
+        rds.modify_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", ApplyImmediately=False,
+        )
+        inst = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert "DBInstanceClass" not in inst.get("PendingModifiedValues", {})
+        assert inst["DBInstanceClass"] == "db.t3.micro"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
 @pytest.mark.parametrize("param, value, stored", [
     ("PreferredBackupWindow", "03:00-04:00", "03:00-04:00"),
     ("PreferredMaintenanceWindow", "sun:05:00-sun:06:00", "sun:05:00-sun:06:00"),
@@ -18983,5 +19200,113 @@ def test_rds_add_tags_rejects_reserved_aws_prefix(rds):
         assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == [
             {"Key": "sim2real-ok-tag", "Value": "yes"}
         ]
+_PI_RETENTION_VALID = (
+    "7, 31, 62, 93, 124, 155, 186, 217, 248, 279, 310, 341, 372, 403, 434, 465, 496, "
+    "527, 558, 589, 620, 651, 682, 713, 731"
+)
+
+
+@pytest.mark.parametrize("overrides, code, message", [
+    ({"Engine": "not-a-real-rds-engine"}, "InvalidParameterValue", "Invalid DB engine"),
+    ({"DBInstanceClass": "db.sim2real.bogus"}, "InvalidParameterValue",
+     "Invalid DB Instance class: db.sim2real.bogus"),
+    ({"VpcSecurityGroupIds": ["sg-00000000000000bad"]}, "InvalidParameterValue",
+     "Invalid security group , groupId= sg-00000000000000bad, groupName=."),
+    ({"StorageType": "turbo-ssd-9000"}, "StorageTypeNotSupported",
+     "Invalid storage type: turbo-ssd-9000"),
+    ({"StorageType": "standard"}, "InvalidParameterCombination",
+     "RDS can't create the DB instance because magnetic storage is deprecated. "
+     "Set StorageType to gp2, gp3, or io2."),
+    ({"StorageType": "gp3", "AllocatedStorage": 5}, "InvalidParameterCombination",
+     "Invalid storage size for engine name postgres and storage type gp3: 5"),
+    ({"MaxAllocatedStorage": 21}, "InvalidParameterCombination",
+     "The maximum allocated storage must be increased by at least 10 percent."),
+    ({"MasterUsername": "a" + "b" * 63}, "InvalidParameterValue", "Invalid master user name"),
+    ({"MasterUsername": "rdsadmin"}, "InvalidParameterValue",
+     "MasterUsername rdsadmin cannot be used as it is a reserved word used by the engine"),
+    ({"MasterUserPassword": "Sh0rt"}, "InvalidParameterValue",
+     "The parameter MasterUserPassword is not a valid password because it is shorter "
+     "than 8 characters."),
+    ({"EnablePerformanceInsights": True, "PerformanceInsightsRetentionPeriod": 94},
+     "InvalidParameterValue",
+     f"Invalid Performance Insights retention period. Valid values are: [{_PI_RETENTION_VALID}]"),
+], ids=["engine", "class", "security-group", "storage-type", "magnetic-storage", "gp3-size", "max-storage",
+        "username-length", "username-reserved", "password-length", "pi-retention"])
+def test_rds_create_db_instance_rejects_invalid_input(rds, overrides, code, message):
+    """CreateDBInstance refuses each invalid field with the AWS error and creates nothing."""
+    db_id = f"bad-input-{_uuid_mod.uuid4().hex[:8]}"
+    params = {
+        "DBInstanceIdentifier": db_id, "DBInstanceClass": "db.t3.micro", "Engine": "postgres",
+        "MasterUsername": "admin", "MasterUserPassword": "password123", "AllocatedStorage": 20,
+        **overrides,
+    }
+    with pytest.raises(ClientError) as exc:
+        rds.create_db_instance(**params)
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["Error"]["Message"] == message
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as missing:
+        rds.describe_db_instances(DBInstanceIdentifier=db_id)
+    assert missing.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+
+def test_rds_create_db_instance_accepts_valid_boundary_input(rds, ec2):
+    """The values next to each refused one are accepted."""
+    sg_id = ec2.create_security_group(
+        GroupName=f"rds-input-{_uuid_mod.uuid4().hex[:8]}", Description="rds input",
+    )["GroupId"]
+    db_id = f"good-input-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        created = rds.create_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", Engine="postgres",
+            MasterUsername="application_db_admin_user", MasterUserPassword="Aa1!-_xyz",
+            AllocatedStorage=20, StorageType="gp3", MaxAllocatedStorage=22,
+            VpcSecurityGroupIds=[sg_id], EnablePerformanceInsights=True,
+            PerformanceInsightsRetentionPeriod=31,
+        )["DBInstance"]
+        assert created["MasterUsername"] == "application_db_admin_user"
+        assert created["StorageType"] == "gp3"
+        assert created["MaxAllocatedStorage"] == 22
+        assert created["PerformanceInsightsRetentionPeriod"] == 31
+        assert [g["VpcSecurityGroupId"] for g in created["VpcSecurityGroups"]] == [sg_id]
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.parametrize("engine, storage_type, changes, code, message", [
+    ("postgres", None, {"AllocatedStorage": 10}, "InvalidParameterCombination",
+     "Invalid storage size for engine name postgres and storage type gp2: 10"),
+    ("mysql", "gp2", {"AllocatedStorage": 10}, "InvalidParameterCombination",
+     "Invalid storage size for engine name mysql and storage type gp2: 10"),
+    ("mysql", None, {"Engine": "postgres"}, "InvalidParameterCombination",
+     "Modification of database from engine mysql to engine postgres is not supported."),
+    ("postgres", None, {"MasterUserPassword": "weak1"}, "InvalidParameterValue",
+     "The parameter MasterUserPassword is not a valid password because it is shorter "
+     "than 8 characters."),
+], ids=["postgres-storage-decrease", "mysql-storage-decrease", "engine-change", "weak-password"])
+def test_rds_modify_db_instance_rejects_invalid_input(rds, engine, storage_type, changes, code, message):
+    """ModifyDBInstance refuses each invalid change and leaves the instance as it was."""
+    db_id = f"bad-modify-{_uuid_mod.uuid4().hex[:8]}"
+    extra = {"StorageType": storage_type} if storage_type else {}
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", Engine=engine,
+        MasterUsername="admin", MasterUserPassword="password123", AllocatedStorage=20, **extra,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_instance(DBInstanceIdentifier=db_id, ApplyImmediately=True, **changes)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+        instance = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert instance["Engine"] == engine
+        assert instance["AllocatedStorage"] == 20
+        assert instance.get("PendingModifiedValues", {}) == {}
+
+        rds.modify_db_instance(
+            DBInstanceIdentifier=db_id, AllocatedStorage=30,
+            MasterUserPassword="Sim2RealNewPwd456", ApplyImmediately=True,
+        )
+        instance = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert instance["AllocatedStorage"] == 30
     finally:
         rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
