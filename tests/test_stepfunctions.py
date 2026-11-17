@@ -2945,7 +2945,8 @@ def test_sfn_aws_sdk_rds_create_global_cluster_from_described_cluster_arn(sfn_sy
         try:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=primary_id,
+                DbClusterIdentifier=rds.describe_db_clusters(
+                    DBClusterIdentifier=primary_id)["DBClusters"][0]["DBClusterArn"],
             )
         except ClientError:
             pass
@@ -3128,14 +3129,16 @@ def test_sfn_aws_sdk_rds_global_cluster_readers_are_lists(sfn_sync, rds):
         try:
             west_rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=secondary_id,
+                DbClusterIdentifier=west_rds.describe_db_clusters(
+                    DBClusterIdentifier=secondary_id)["DBClusters"][0]["DBClusterArn"],
             )
         except ClientError:
             pass
         try:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=primary_id,
+                DbClusterIdentifier=rds.describe_db_clusters(
+                    DBClusterIdentifier=primary_id)["DBClusters"][0]["DBClusterArn"],
             )
         except ClientError:
             pass
