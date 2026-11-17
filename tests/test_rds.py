@@ -111,9 +111,15 @@ EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS = {
     "8.0.mysql_aurora.3.10.2": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.10.3": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.10.4": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.5": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.10.6": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.11.1": "aurora-mysql8.0",
     "8.0.mysql_aurora.3.12.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.13.0": "aurora-mysql8.0",
+    "8.0.mysql_aurora.3.14.0": "aurora-mysql8.0",
     "8.4.mysql_aurora.8.4.7": "aurora-mysql8.4",
+    "8.4.mysql_aurora.8.4.8": "aurora-mysql8.4",
+    "8.4.mysql_aurora.8.4.10": "aurora-mysql8.4",
 }
 
 
@@ -1838,6 +1844,105 @@ def test_rds_describe_aurora_postgresql_engine_version_status(rds):
     assert default_versions
     assert all(version["Status"] == "available" for version in family_versions)
     assert all(version["Status"] == "available" for version in default_versions)
+
+
+@pytest.mark.parametrize(
+    "engine, default_version, family, major",
+    [
+        ("postgres", "18.3", "postgres18", "18"),
+        ("mysql", "8.4.11", "mysql8.4", "8.4"),
+        ("mariadb", "11.8.9", "mariadb11.8", "11.8"),
+        ("aurora-mysql", "8.0.mysql_aurora.3.10.3", "aurora-mysql8.0", "8.0"),
+        ("aurora-postgresql", "17.9", "aurora-postgresql17", "17"),
+    ],
+)
+def test_rds_describe_engine_versions_default_and_families(
+    rds, engine, default_version, family, major
+):
+    """As on AWS: the family is the engine name plus the major version, and
+    MajorEngineVersion is that major version."""
+    versions = rds.describe_db_engine_versions(Engine=engine, MaxRecords=100)["DBEngineVersions"]
+    assert versions
+    assert all(
+        v["DBParameterGroupFamily"] == f"{engine}{v['MajorEngineVersion']}" for v in versions
+    )
+
+    default = rds.describe_db_engine_versions(Engine=engine, DefaultOnly=True)["DBEngineVersions"]
+    assert [(v["EngineVersion"], v["DBParameterGroupFamily"], v["MajorEngineVersion"])
+            for v in default] == [(default_version, family, major)]
+
+
+def _engine_version(rds, engine, version):
+    versions = rds.describe_db_engine_versions(
+        Engine=engine, EngineVersion=version
+    )["DBEngineVersions"]
+    assert len(versions) == 1, versions
+    return versions[0]
+
+
+def test_rds_describe_engine_versions_aurora_capability_fields(rds):
+    all_cas = ["rds-ca-ecc384-g1", "rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1"]
+    v = _engine_version(rds, "aurora-mysql", "8.0.mysql_aurora.3.10.3")
+    assert v["SupportedEngineModes"] == ["provisioned"]
+    assert v["ServerlessV2FeaturesSupport"] == {"MinCapacity": 0.0, "MaxCapacity": 256.0}
+    assert v["ExportableLogTypes"] == [
+        "audit", "error", "general", "iam-db-auth-error", "instance", "slowquery",
+    ]
+    assert v["SupportedCACertificateIdentifiers"] == all_cas
+    assert v["SupportsLogExportsToCloudwatchLogs"] is True
+    assert v["SupportsReadReplica"] is False
+    assert v["SupportsGlobalDatabases"] is True
+
+    v = _engine_version(rds, "aurora-mysql", "5.7.mysql_aurora.2.12.6")
+    assert "ServerlessV2FeaturesSupport" not in v
+    assert "instance" not in v["ExportableLogTypes"]
+
+    v = _engine_version(rds, "aurora-mysql", "8.0.mysql_aurora.3.14.0")
+    assert v["ServerlessV2FeaturesSupport"] == {"MinCapacity": 0.0, "MaxCapacity": 384.0}
+
+    v = _engine_version(rds, "aurora-postgresql", "13.9")
+    assert v["ServerlessV2FeaturesSupport"] == {"MinCapacity": 0.5, "MaxCapacity": 128.0}
+    assert v["ExportableLogTypes"] == ["iam-db-auth-error", "instance", "postgresql"]
+
+    v = _engine_version(rds, "aurora-postgresql", "12.22")
+    assert "ServerlessV2FeaturesSupport" not in v
+
+
+def test_rds_describe_engine_versions_non_aurora_capability_fields(rds):
+    v = _engine_version(rds, "postgres", "16.15")
+    assert v["DBParameterGroupFamily"] == "postgres16"
+    assert "SupportedEngineModes" not in v
+    assert "ServerlessV2FeaturesSupport" not in v
+    assert v["ExportableLogTypes"] == ["iam-db-auth-error", "postgresql", "upgrade"]
+    assert v["SupportedCACertificateIdentifiers"] == [
+        "rds-ca-ecc384-g1", "rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1",
+    ]
+    assert v["SupportsLogExportsToCloudwatchLogs"] is True
+    assert v["SupportsReadReplica"] is True
+    assert v["SupportsGlobalDatabases"] is False
+
+    v = _engine_version(rds, "mysql", "5.7.44-rds.20260902")
+    assert v["SupportedCACertificateIdentifiers"] == ["rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1"]
+    assert v["ExportableLogTypes"] == ["audit", "error", "general", "iam-db-auth-error", "slowquery"]
+
+
+def test_rds_describe_engine_versions_rejects_unrecognized_engine(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_engine_versions(Engine="no-such-engine", MaxRecords=20)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == "Unrecognized engine name: no-such-engine"
+
+    # A real RDS engine without a MiniStack catalog is not rejected.
+    rds.describe_db_engine_versions(Engine="oracle-ee")
+
+
+def test_rds_describe_engine_versions_max_records_range(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_engine_versions(Engine="mysql", MaxRecords=1000)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == (
+        "Invalid value 1000 for MaxRecords. Must be between 20 and 100"
+    )
 
 
 def test_rds_aurora_mysql_create_rejects_unsupported_explicit_engine_version(rds):
@@ -6230,7 +6335,8 @@ def test_rds_describe_postgres_18_engine_version(rds):
     versions = resp["DBEngineVersions"]
     assert len(versions) == 1
     assert versions[0]["EngineVersion"] == "18.3"
-    assert versions[0]["DBParameterGroupFamily"] == "18"
+    assert versions[0]["DBParameterGroupFamily"] == "postgres18"
+    assert versions[0]["MajorEngineVersion"] == "18"
 
 
 def test_rds_create_db_instance_postgres_18(rds):

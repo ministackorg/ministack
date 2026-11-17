@@ -219,7 +219,7 @@ exec gosu postgres postgres
 """
 
 # Aurora MySQL versions are the creatable set returned by AWS RDS as of
-# 2026-07-09. Refresh with:
+# 2026-11-16. Refresh with:
 #   aws rds describe-db-engine-versions --engine aurora-mysql \
 #     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
 #     --output text | sort -V
@@ -255,9 +255,15 @@ AURORA_MYSQL_ENGINE_VERSIONS = [
     ("8.0.mysql_aurora.3.10.2", "aurora-mysql8.0"),
     ("8.0.mysql_aurora.3.10.3", "aurora-mysql8.0"),
     ("8.0.mysql_aurora.3.10.4", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.5", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.10.6", "aurora-mysql8.0"),
     ("8.0.mysql_aurora.3.11.1", "aurora-mysql8.0"),
     ("8.0.mysql_aurora.3.12.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.13.0", "aurora-mysql8.0"),
+    ("8.0.mysql_aurora.3.14.0", "aurora-mysql8.0"),
     ("8.4.mysql_aurora.8.4.7", "aurora-mysql8.4"),
+    ("8.4.mysql_aurora.8.4.8", "aurora-mysql8.4"),
+    ("8.4.mysql_aurora.8.4.10", "aurora-mysql8.4"),
 ]
 AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
@@ -329,6 +335,171 @@ AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
 AURORA_POSTGRESQL_DEFAULT_ENGINE_VERSIONS = {
     "16": "16.11",
     "17": "17.9",
+}
+
+# Non-Aurora versions are the creatable set returned by AWS RDS (us-east-1) as
+# of 2026-11-16, for DescribeDBEngineVersions only. Refresh with:
+#   aws rds describe-db-engine-versions --engine <engine> \
+#     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
+#     --output text
+# The create paths keep their own defaults (_default_engine_version) because
+# they select the Docker image.
+POSTGRES_ENGINE_VERSIONS = [
+    ("11.22-rds.20241121", "postgres11"),
+    ("11.22-rds.20250220", "postgres11"),
+    ("11.22-rds.20250508", "postgres11"),
+    ("11.22-rds.20250814", "postgres11"),
+    ("11.22-rds.20251114", "postgres11"),
+    ("11.22-rds.20260224", "postgres11"),
+    ("11.22-rds.20260514", "postgres11"),
+    ("11.22-rds.20260822", "postgres11"),
+    ("12.22", "postgres12"),
+    ("12.22-rds.20250220", "postgres12"),
+    ("12.22-rds.20250508", "postgres12"),
+    ("12.22-rds.20250814", "postgres12"),
+    ("12.22-rds.20251114", "postgres12"),
+    ("12.22-rds.20260224", "postgres12"),
+    ("12.22-rds.20260514", "postgres12"),
+    ("12.22-rds.20260820", "postgres12"),
+    ("13.23", "postgres13"),
+    ("13.23-rds.20260224", "postgres13"),
+    ("13.23-rds.20260514", "postgres13"),
+    ("13.23-rds.20260819", "postgres13"),
+    ("14.18", "postgres14"),
+    ("14.19", "postgres14"),
+    ("14.20", "postgres14"),
+    ("14.21", "postgres14"),
+    ("14.22", "postgres14"),
+    ("14.23", "postgres14"),
+    ("14.24", "postgres14"),
+    ("15.13", "postgres15"),
+    ("15.14", "postgres15"),
+    ("15.15", "postgres15"),
+    ("15.16", "postgres15"),
+    ("15.17", "postgres15"),
+    ("15.18", "postgres15"),
+    ("15.19", "postgres15"),
+    ("16.9", "postgres16"),
+    ("16.10", "postgres16"),
+    ("16.11", "postgres16"),
+    ("16.12", "postgres16"),
+    ("16.13", "postgres16"),
+    ("16.14", "postgres16"),
+    ("16.15", "postgres16"),
+    ("17.5", "postgres17"),
+    ("17.6", "postgres17"),
+    ("17.7", "postgres17"),
+    ("17.8", "postgres17"),
+    ("17.9", "postgres17"),
+    ("17.10", "postgres17"),
+    ("17.11", "postgres17"),
+    ("18.1", "postgres18"),
+    ("18.2", "postgres18"),
+    ("18.3", "postgres18"),
+    ("18.4", "postgres18"),
+    ("18.6", "postgres18"),
+]
+MYSQL_ENGINE_VERSIONS = [
+    ("5.7.44-rds.20250213", "mysql5.7"),
+    ("5.7.44-rds.20250508", "mysql5.7"),
+    ("5.7.44-rds.20250818", "mysql5.7"),
+    ("5.7.44-rds.20251212", "mysql5.7"),
+    ("5.7.44-rds.20260212", "mysql5.7"),
+    ("5.7.44-rds.20260521", "mysql5.7"),
+    ("5.7.44-rds.20260624", "mysql5.7"),
+    ("5.7.44-rds.20260902", "mysql5.7"),
+    ("8.0.46", "mysql8.0"),
+    ("8.0.46-rds.20260624", "mysql8.0"),
+    ("8.0.46-rds.20260908", "mysql8.0"),
+    ("8.4.5", "mysql8.4"),
+    ("8.4.6", "mysql8.4"),
+    ("8.4.7", "mysql8.4"),
+    ("8.4.8", "mysql8.4"),
+    ("8.4.9", "mysql8.4"),
+    ("8.4.10", "mysql8.4"),
+    ("8.4.11", "mysql8.4"),
+]
+MARIADB_ENGINE_VERSIONS = [
+    ("10.5.28", "mariadb10.5"),
+    ("10.5.29", "mariadb10.5"),
+    ("10.6.22", "mariadb10.6"),
+    ("10.6.23", "mariadb10.6"),
+    ("10.6.24", "mariadb10.6"),
+    ("10.6.25", "mariadb10.6"),
+    ("10.6.27", "mariadb10.6"),
+    ("10.6.28", "mariadb10.6"),
+    ("10.11.13", "mariadb10.11"),
+    ("10.11.14", "mariadb10.11"),
+    ("10.11.15", "mariadb10.11"),
+    ("10.11.16", "mariadb10.11"),
+    ("10.11.18", "mariadb10.11"),
+    ("10.11.19", "mariadb10.11"),
+    ("11.4.7", "mariadb11.4"),
+    ("11.4.8", "mariadb11.4"),
+    ("11.4.9", "mariadb11.4"),
+    ("11.4.10", "mariadb11.4"),
+    ("11.4.12", "mariadb11.4"),
+    ("11.4.13", "mariadb11.4"),
+    ("11.8.3", "mariadb11.8"),
+    ("11.8.5", "mariadb11.8"),
+    ("11.8.6", "mariadb11.8"),
+    ("11.8.8", "mariadb11.8"),
+    ("11.8.9", "mariadb11.8"),
+    ("12.3.2", "mariadb12.3"),
+    ("12.3.3", "mariadb12.3"),
+]
+
+# DescribeDBEngineVersions --default-only answers, as returned by AWS RDS
+# (us-east-1) on 2026-11-16. Aurora engines use _default_engine_version.
+CATALOG_DEFAULT_ENGINE_VERSIONS = {
+    "postgres": "18.3",
+    "mysql": "8.4.11",
+    "mariadb": "11.8.9",
+}
+
+# Engine names that AWS RDS accepts but MiniStack has no catalog for: the
+# CreateDBInstance Engine list in the RDS API reference, plus docdb and neptune,
+# which share this API. AWS rejects any other name with "Unrecognized engine
+# name".
+UNCATALOGUED_RDS_ENGINES = {
+    "custom-oracle-ee", "custom-oracle-ee-cdb", "custom-oracle-se2",
+    "custom-oracle-se2-cdb", "custom-sqlserver-dev", "custom-sqlserver-ee",
+    "custom-sqlserver-se", "custom-sqlserver-web", "db2-ae", "db2-ce", "db2-se", "docdb",
+    "neptune", "oracle-ee", "oracle-ee-cdb", "oracle-se2", "oracle-se2-cdb",
+    "sqlserver-dev-ee", "sqlserver-ee", "sqlserver-ex", "sqlserver-se",
+    "sqlserver-web",
+}
+
+# Per-engine DBEngineVersion attributes, as returned by AWS RDS (us-east-1) on
+# 2026-11-16.
+_ENGINE_VERSION_LOG_TYPES = {
+    "postgres": ("iam-db-auth-error", "postgresql", "upgrade"),
+    "mysql": ("audit", "error", "general", "iam-db-auth-error", "slowquery"),
+    "mariadb": ("audit", "error", "general", "iam-db-auth-error", "slowquery"),
+    "aurora-mysql": (
+        "audit", "error", "general", "iam-db-auth-error", "instance", "slowquery",
+    ),
+    "aurora-postgresql": ("iam-db-auth-error", "instance", "postgresql"),
+}
+# Aurora MySQL 5.7 has no "instance" log.
+_AURORA_MYSQL_57_LOG_TYPES = ("audit", "error", "general", "iam-db-auth-error", "slowquery")
+_ENGINE_VERSION_CA_IDENTIFIERS = ("rds-ca-ecc384-g1", "rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1")
+# MySQL 5.7 does not offer the ECC CA.
+_MYSQL_57_CA_IDENTIFIERS = ("rds-ca-rsa4096-g1", "rds-ca-rsa2048-g1")
+# ServerlessV2FeaturesSupport per Aurora version. Families in
+# _SERVERLESS_V2_UNSUPPORTED_FAMILIES have no value; the versions in the two
+# sets below differ from the usual MinCapacity 0 / MaxCapacity 256.
+_SERVERLESS_V2_UNSUPPORTED_FAMILIES = {
+    "aurora-mysql5.7", "aurora-postgresql11", "aurora-postgresql12",
+}
+_SERVERLESS_V2_MIN_HALF_MAX_128_VERSIONS = {
+    "8.0.mysql_aurora.3.04.0", "8.0.mysql_aurora.3.04.1",
+    "8.0.mysql_aurora.3.04.2", "8.0.mysql_aurora.3.04.3",
+    "8.0.mysql_aurora.3.04.4", "8.0.mysql_aurora.3.04.6", "13.9", "14.6",
+}
+_SERVERLESS_V2_MAX_384_VERSIONS = {
+    "8.0.mysql_aurora.3.14.0", "8.4.mysql_aurora.8.4.10", "14.23", "14.24",
+    "15.18", "15.19", "16.14", "16.15", "17.10", "17.11", "18.4", "18.6",
 }
 
 AURORA_MYSQL_IMAGE_MAP = {
@@ -10394,8 +10565,70 @@ def _global_cluster_xml(gc):
 # Engine Versions & Orderable Options
 # ---------------------------------------------------------------------------
 
+_ENGINE_VERSION_CATALOG = {
+    "postgres": POSTGRES_ENGINE_VERSIONS,
+    "mysql": MYSQL_ENGINE_VERSIONS,
+    "mariadb": MARIADB_ENGINE_VERSIONS,
+    "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS,
+    "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
+}
+
+
+def _engine_version_xml(engine, ver, family):
+    """One DBEngineVersion member, with the attributes AWS reports per engine."""
+    catalogued = engine in _ENGINE_VERSION_CATALOG
+    aurora = engine in ("aurora-mysql", "aurora-postgresql")
+    major_xml = ""
+    log_types = ()
+    ca_identifiers = ()
+    if catalogued:
+        major_xml = f"<MajorEngineVersion>{family[len(engine):]}</MajorEngineVersion>"
+        log_types = (_AURORA_MYSQL_57_LOG_TYPES if family == "aurora-mysql5.7"
+                     else _ENGINE_VERSION_LOG_TYPES[engine])
+        ca_identifiers = (_MYSQL_57_CA_IDENTIFIERS if family == "mysql5.7"
+                          else _ENGINE_VERSION_CA_IDENTIFIERS)
+    aurora_xml = ""
+    if aurora:
+        aurora_xml = _string_list_xml("SupportedEngineModes", ("provisioned",))
+        if family not in _SERVERLESS_V2_UNSUPPORTED_FAMILIES:
+            if ver in _SERVERLESS_V2_MIN_HALF_MAX_128_VERSIONS:
+                min_capacity, max_capacity = 0.5, 128.0
+            elif ver in _SERVERLESS_V2_MAX_384_VERSIONS:
+                min_capacity, max_capacity = 0.0, 384.0
+            else:
+                min_capacity, max_capacity = 0.0, 256.0
+            aurora_xml += (
+                "<ServerlessV2FeaturesSupport>"
+                f"<MinCapacity>{min_capacity}</MinCapacity>"
+                f"<MaxCapacity>{max_capacity}</MaxCapacity>"
+                "</ServerlessV2FeaturesSupport>"
+            )
+    return f"""<DBEngineVersion>
+            <Engine>{engine}</Engine>
+            <EngineVersion>{ver}</EngineVersion>
+            {major_xml}
+            <DBParameterGroupFamily>{family}</DBParameterGroupFamily>
+            <DBEngineDescription>{engine.replace('-', ' ').title()}</DBEngineDescription>
+            <DBEngineVersionDescription>{engine} {ver}</DBEngineVersionDescription>
+            <ValidUpgradeTarget/>
+            {_string_list_xml("ExportableLogTypes", log_types)}
+            {_string_list_xml("SupportedCACertificateIdentifiers", ca_identifiers)}
+            {aurora_xml}
+            <SupportsLogExportsToCloudwatchLogs>{str(catalogued).lower()}</SupportsLogExportsToCloudwatchLogs>
+            <SupportsReadReplica>{str(not aurora).lower()}</SupportsReadReplica>
+            <SupportedFeatureNames/>
+            <Status>available</Status>
+            <SupportsParallelQuery>false</SupportsParallelQuery>
+            <SupportsGlobalDatabases>{str(aurora).lower()}</SupportsGlobalDatabases>
+            <SupportsBabelfish>false</SupportsBabelfish>
+            <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
+        </DBEngineVersion>"""
+
+
 def _describe_engine_versions(p):
     engine = _p(p, "Engine") or "postgres"
+    if engine not in _ENGINE_VERSION_CATALOG and engine not in UNCATALOGUED_RDS_ENGINES:
+        return _invalid_parameter_value(f"Unrecognized engine name: {engine}")
     version_filter = _p(p, "EngineVersion")
     default_only = _p(p, "DefaultOnly") == "true"
     major_version_filter = (
@@ -10406,25 +10639,10 @@ def _describe_engine_versions(p):
     default_version = (
         AURORA_POSTGRESQL_DEFAULT_ENGINE_VERSIONS.get(major_version_filter)
         if major_version_filter
-        else _default_engine_version(engine)
+        else CATALOG_DEFAULT_ENGINE_VERSIONS.get(engine) or _default_engine_version(engine)
     )
-    versions_map = {
-        "postgres": [
-            ("18.3", "18"), ("17.5", "17"), ("16.4", "16"),
-            ("15.3", "15"), ("14.8", "14"), ("13.11", "13"), ("12.15", "12"),
-        ],
-        "mysql": [
-            ("8.0.33", "8.0"), ("8.0.28", "8.0"), ("5.7.43", "5.7"),
-        ],
-        "mariadb": [
-            ("10.6.14", "10.6"), ("10.5.21", "10.5"),
-        ],
-        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS,
-        "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
-    }
-    versions = versions_map.get(engine, [("15.3", "15")])
+    versions = _ENGINE_VERSION_CATALOG.get(engine, [("15.3", "15")])
     members = ""
-    supports_global = engine in ("aurora-mysql", "aurora-postgresql")
     for ver, family in versions:
         if major_version_filter:
             if not ver.startswith(major_version_filter + "."):
@@ -10433,23 +10651,7 @@ def _describe_engine_versions(p):
             continue
         if default_only and ver != default_version:
             continue
-        members += f"""<DBEngineVersion>
-            <Engine>{engine}</Engine>
-            <EngineVersion>{ver}</EngineVersion>
-            <DBParameterGroupFamily>{family}</DBParameterGroupFamily>
-            <DBEngineDescription>{engine.replace('-', ' ').title()}</DBEngineDescription>
-            <DBEngineVersionDescription>{engine} {ver}</DBEngineVersionDescription>
-            <ValidUpgradeTarget/>
-            <ExportableLogTypes/>
-            <SupportsLogExportsToCloudwatchLogs>false</SupportsLogExportsToCloudwatchLogs>
-            <SupportsReadReplica>true</SupportsReadReplica>
-            <SupportedFeatureNames/>
-            <Status>available</Status>
-            <SupportsParallelQuery>false</SupportsParallelQuery>
-            <SupportsGlobalDatabases>{str(supports_global).lower()}</SupportsGlobalDatabases>
-            <SupportsBabelfish>false</SupportsBabelfish>
-            <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
-        </DBEngineVersion>"""
+        members += _engine_version_xml(engine, ver, family)
     members, marker_xml, page_error = _records_page(p, members, "DBEngineVersion")
     if page_error:
         return page_error
@@ -11421,7 +11623,7 @@ def _db_proxy_enum_error(params, label, allowed):
     return None
 
 
-def _db_proxy_int_error(params, label, minimum, maximum):
+def _db_proxy_int_error(params, label, minimum, maximum, range_end="."):
     """Return (value, error). value is None when the parameter is absent."""
     raw = _p(params, label)
     if not raw:
@@ -11435,7 +11637,7 @@ def _db_proxy_int_error(params, label, minimum, maximum):
     if value < minimum or value > maximum:
         return None, _invalid_parameter_value(
             f"Invalid value {value} for {label}. "
-            f"Must be between {minimum} and {maximum}."
+            f"Must be between {minimum} and {maximum}{range_end}"
         )
     return value, None
 
@@ -11508,7 +11710,10 @@ def _marker_xml(next_marker):
 
 def _offset_page(params, items, maximum=100):
     """Apply MaxRecords / Marker to a list. Returns ``(page, marker_xml, error)``."""
-    max_records, error = _db_proxy_int_error(params, "MaxRecords", _DB_PROXY_MIN_MAX_RECORDS, maximum)
+    # As captured on AWS (DescribeDBEngineVersions): this message has no final period.
+    max_records, error = _db_proxy_int_error(
+        params, "MaxRecords", _DB_PROXY_MIN_MAX_RECORDS, maximum, range_end="",
+    )
     if error:
         return None, None, error
     limit = max_records or _DB_PROXY_DEFAULT_MAX_RECORDS
