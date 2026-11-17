@@ -9343,6 +9343,10 @@ def _remove_from_global_cluster(p):
     if parsed_member and parsed_member[1] == "cluster" and len(parsed_member[2]) > 63:
         return _error("InvalidParameterValue",
             f"Invalid database cluster identifier:  {db_cluster_id}", 400)
+    # As captured on AWS: a member that is not an ARN is refused before the
+    # global cluster lookup.
+    if db_cluster_id and not parsed_member:
+        return _error("InvalidParameterValue", f"Malformed db cluster arn {db_cluster_id}", 400)
     gc = _resolve_global_cluster(gc_id)
     if not gc:
         return _error("GlobalClusterNotFoundFault",
@@ -10489,7 +10493,8 @@ def _enable_http_endpoint(p):
                 f"<ResourceArn>{arn}</ResourceArn>"
                 f"<HttpEndpointEnabled>true</HttpEndpointEnabled>"
                 f"</EnableHttpEndpointResult>")
-    return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
+    # As captured on AWS (2026-05-26).
+    return _error("ResourceNotFoundFault", f"The DB cluster {arn} wasn't found.", 404)
 
 
 def _disable_http_endpoint(p):

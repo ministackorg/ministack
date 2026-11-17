@@ -1241,7 +1241,7 @@ def test_rds_global_cluster_with_source(rds):
         # Remove the member, then delete
         rds.remove_from_global_cluster(
             GlobalClusterIdentifier="test-global-src",
-            DbClusterIdentifier="gc-source-cluster",
+            DbClusterIdentifier=source["DBClusterArn"],
         )
         resp2 = rds.describe_global_clusters(GlobalClusterIdentifier="test-global-src")
         assert len(resp2["GlobalClusters"][0]["GlobalClusterMembers"]) == 0
@@ -1252,12 +1252,12 @@ def test_rds_global_cluster_with_source(rds):
 
 def test_rds_global_cluster_delete_with_members_fails(rds):
     """DeleteGlobalCluster fails when writer members still attached."""
-    rds.create_db_cluster(
+    member_arn = rds.create_db_cluster(
         DBClusterIdentifier="gc-member-cluster",
         Engine="aurora-postgresql",
         MasterUsername="admin",
         MasterUserPassword="password123",
-    )
+    )["DBCluster"]["DBClusterArn"]
     rds.create_global_cluster(
         GlobalClusterIdentifier="test-global-members",
         SourceDBClusterIdentifier="gc-member-cluster",
@@ -1269,7 +1269,7 @@ def test_rds_global_cluster_delete_with_members_fails(rds):
     finally:
         rds.remove_from_global_cluster(
             GlobalClusterIdentifier="test-global-members",
-            DbClusterIdentifier="gc-member-cluster",
+            DbClusterIdentifier=member_arn,
         )
         rds.delete_global_cluster(GlobalClusterIdentifier="test-global-members")
         rds.delete_db_cluster(DBClusterIdentifier="gc-member-cluster", SkipFinalSnapshot=True)
@@ -2249,16 +2249,15 @@ def test_rds_modify_global_cluster_applies_version_to_members(rds):
         Engine="aurora-postgresql",
         EngineVersion="16.8",
     )
-    member_created = False
+    member_arn = None
     try:
-        rds.create_db_cluster(
+        member_arn = rds.create_db_cluster(
             DBClusterIdentifier=member_id,
             Engine="aurora-postgresql",
             GlobalClusterIdentifier=global_id,
             MasterUsername="admin",
             MasterUserPassword="password123",
-        )
-        member_created = True
+        )["DBCluster"]["DBClusterArn"]
 
         gc = rds.modify_global_cluster(
             GlobalClusterIdentifier=global_id,
@@ -2290,10 +2289,10 @@ def test_rds_modify_global_cluster_applies_version_to_members(rds):
         )["DBCluster"]
         assert modified["EngineVersion"] == "16.10"
     finally:
-        if member_created:
+        if member_arn:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=member_id,
+                DbClusterIdentifier=member_arn,
             )
             rds.delete_db_cluster(
                 DBClusterIdentifier=member_id, SkipFinalSnapshot=True
@@ -6141,7 +6140,12 @@ def test_rds_enable_http_endpoint_not_found(rds):
         rds.enable_http_endpoint(
             ResourceArn="arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster"
         )
-    assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    # As captured on AWS.
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundFault"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert exc.value.response["Error"]["Message"] == (
+        "The DB cluster arn:aws:rds:us-east-1:123456789012:cluster:no-such-cluster wasn't found."
+    )
 
 
 def test_rds_disable_http_endpoint(rds):
@@ -8839,6 +8843,49 @@ def test_remove_from_global_cluster_rejects_overlong_member_identifier(global_ex
     finally:
         if global_exists:
             _delete_global_cluster(east, global_id)
+
+
+@pytest.mark.parametrize("global_exists", [False, True], ids=["missing-global", "existing-global"])
+def test_remove_from_global_cluster_rejects_bare_name_member(global_exists):
+    """As captured on AWS (us-east-1): a member that is not an ARN answers 400
+    InvalidParameterValue "Malformed db cluster arn <name>", checked before the
+    global cluster is looked up. With an existing global, the named member stays."""
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    global_id = f"remove-bare-{suffix}"
+    member_id = f"remove-bare-member-{suffix}"
+    if global_exists:
+        east.create_db_cluster(
+            DBClusterIdentifier=member_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        east.create_global_cluster(
+            GlobalClusterIdentifier=global_id, SourceDBClusterIdentifier=member_id,
+        )
+    try:
+        with pytest.raises(ClientError) as exc:
+            east.remove_from_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                DbClusterIdentifier=member_id,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert exc.value.response["Error"]["Message"] == f"Malformed db cluster arn {member_id}"
+        if global_exists:
+            members = east.describe_global_clusters(
+                GlobalClusterIdentifier=global_id
+            )["GlobalClusters"][0]["GlobalClusterMembers"]
+            assert [m["DBClusterArn"].rsplit(":", 1)[1] for m in members] == [member_id]
+    finally:
+        if global_exists:
+            arn = east.describe_db_clusters(
+                DBClusterIdentifier=member_id
+            )["DBClusters"][0]["DBClusterArn"]
+            east.remove_from_global_cluster(GlobalClusterIdentifier=global_id, DbClusterIdentifier=arn)
+            _delete_global_cluster(east, global_id)
+            east.delete_db_cluster(DBClusterIdentifier=member_id, SkipFinalSnapshot=True)
 
 
 def test_remove_from_global_cluster_63_character_member_identifier_reaches_lookup():
