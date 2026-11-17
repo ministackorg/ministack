@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — `CreateDBCluster` status** — the `CreateDBCluster` response reported `Status` `available`. It now reports `creating`, as AWS does. `DescribeDBClusters` still reports the status from the cluster's members, so a cluster with no members is `available` at once. Contributed by @Areson.
+
 ## [1.5.42] — 2026-11-18
 
 ### Added
