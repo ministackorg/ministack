@@ -282,7 +282,7 @@ def test_rds_create_instance_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass123",
+        MasterUserPassword="password123",
         AllocatedStorage=20,
         DBName="mydb",
     )
@@ -305,7 +305,7 @@ def test_rds_describe_instances_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="mysql",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     rds.create_db_instance(
@@ -313,7 +313,7 @@ def test_rds_describe_instances_v2(rds):
         DBInstanceClass="db.t3.small",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     resp = rds.describe_db_instances()
@@ -361,7 +361,7 @@ def test_rds_delete_instance_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     rds.delete_db_instance(DBInstanceIdentifier="rds-del-v2", SkipFinalSnapshot=True)
@@ -375,7 +375,7 @@ def test_rds_modify_instance_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     rds.modify_db_instance(
@@ -396,7 +396,7 @@ def test_rds_modify_instance_iam_database_authentication(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     inst = rds.modify_db_instance(
@@ -423,7 +423,7 @@ def test_rds_create_instance_honors_preferred_maintenance_window(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
         PreferredMaintenanceWindow="tue:03:00-tue:04:00",
     )
@@ -437,7 +437,7 @@ def test_rds_create_instance_default_preferred_maintenance_window(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     resp = rds.describe_db_instances(DBInstanceIdentifier="rds-pmw-default-v2")
@@ -499,7 +499,7 @@ def test_rds_snapshot_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     resp = rds.create_db_snapshot(
@@ -524,7 +524,7 @@ def test_rds_tags_v2(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
         Tags=[{"Key": "env", "Value": "dev"}],
     )
@@ -2536,7 +2536,7 @@ def test_rds_handle_request_describe_with_json_body():
         "DBInstanceClass": ["db.t3.micro"],
         "Engine": ["postgres"],
         "MasterUsername": ["admin"],
-        "MasterUserPassword": ["pw"],
+        "MasterUserPassword": ["password"],
         "AllocatedStorage": ["20"],
     })
 
@@ -5295,7 +5295,7 @@ def test_rds_create_db_instance_returns_before_container_is_ready(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="secret",
+        MasterUserPassword="password",
         AllocatedStorage=20,
     )
     elapsed = time.time() - t0
@@ -5475,7 +5475,7 @@ def test_rds_create_read_replica(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass123",
+        MasterUserPassword="password123",
         AllocatedStorage=20,
     )
     try:
@@ -5548,7 +5548,7 @@ def test_rds_reboot_db_instance(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     try:
@@ -5929,7 +5929,7 @@ def test_rds_restore_from_snapshot(rds):
         DBInstanceClass="db.t3.micro",
         Engine="postgres",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=20,
         DBName="srcdb",
     )
@@ -5998,7 +5998,7 @@ def test_rds_start_db_instance(rds):
         DBInstanceClass="db.t3.micro",
         Engine="mysql",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     try:
@@ -6031,7 +6031,7 @@ def test_rds_stop_db_instance(rds):
         DBInstanceClass="db.t3.micro",
         Engine="mysql",
         MasterUsername="admin",
-        MasterUserPassword="pass",
+        MasterUserPassword="password",
         AllocatedStorage=10,
     )
     try:
@@ -8265,7 +8265,7 @@ def test_rds_instances_are_region_scoped():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )
         west.create_db_instance(
@@ -8273,7 +8273,7 @@ def test_rds_instances_are_region_scoped():
             DBInstanceClass="db.t3.small",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=20,
         )
 
@@ -8301,7 +8301,7 @@ def test_rds_regional_instance_apis_reject_foreign_region_arns():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
         instance_arn = instance["DBInstanceArn"]
@@ -9022,7 +9022,7 @@ def test_rds_same_region_arn_lookup_requires_stored_resource_arn_match():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
 
@@ -9053,7 +9053,7 @@ def test_rds_db_snapshot_filter_by_instance_arn_survives_source_deletion():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
         east.create_db_snapshot(
@@ -9192,7 +9192,7 @@ def test_rds_read_replica_from_instance_arn_stores_canonical_source_id():
             DBInstanceClass="db.t3.micro",
             Engine="postgres",
             MasterUsername="admin",
-            MasterUserPassword="pass",
+            MasterUserPassword="password",
             AllocatedStorage=10,
         )["DBInstance"]
         replica = east.create_db_instance_read_replica(
@@ -19105,3 +19105,115 @@ def test_rds_aurora_postgresql_has_builtin_roles(rds):
     finally:
         rds.delete_db_instance(DBInstanceIdentifier=f"{cluster_id}-1", SkipFinalSnapshot=True)
         rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+_PI_RETENTION_VALID = (
+    "7, 31, 62, 93, 124, 155, 186, 217, 248, 279, 310, 341, 372, 403, 434, 465, 496, "
+    "527, 558, 589, 620, 651, 682, 713, 731"
+)
+
+
+@pytest.mark.parametrize("overrides, code, message", [
+    ({"Engine": "not-a-real-rds-engine"}, "InvalidParameterValue", "Invalid DB engine"),
+    ({"DBInstanceClass": "db.sim2real.bogus"}, "InvalidParameterValue",
+     "Invalid DB Instance class: db.sim2real.bogus"),
+    ({"VpcSecurityGroupIds": ["sg-00000000000000bad"]}, "InvalidParameterValue",
+     "Invalid security group , groupId= sg-00000000000000bad, groupName=."),
+    ({"StorageType": "turbo-ssd-9000"}, "StorageTypeNotSupported",
+     "Invalid storage type: turbo-ssd-9000"),
+    ({"StorageType": "standard"}, "InvalidParameterCombination",
+     "RDS can't create the DB instance because magnetic storage is deprecated. "
+     "Set StorageType to gp2, gp3, or io2."),
+    ({"StorageType": "gp3", "AllocatedStorage": 5}, "InvalidParameterCombination",
+     "Invalid storage size for engine name postgres and storage type gp3: 5"),
+    ({"MaxAllocatedStorage": 21}, "InvalidParameterCombination",
+     "The maximum allocated storage must be increased by at least 10 percent."),
+    ({"MasterUsername": "a" + "b" * 63}, "InvalidParameterValue", "Invalid master user name"),
+    ({"MasterUsername": "rdsadmin"}, "InvalidParameterValue",
+     "MasterUsername rdsadmin cannot be used as it is a reserved word used by the engine"),
+    ({"MasterUserPassword": "Sh0rt"}, "InvalidParameterValue",
+     "The parameter MasterUserPassword is not a valid password because it is shorter "
+     "than 8 characters."),
+    ({"EnablePerformanceInsights": True, "PerformanceInsightsRetentionPeriod": 94},
+     "InvalidParameterValue",
+     f"Invalid Performance Insights retention period. Valid values are: [{_PI_RETENTION_VALID}]"),
+], ids=["engine", "class", "security-group", "storage-type", "magnetic-storage", "gp3-size", "max-storage",
+        "username-length", "username-reserved", "password-length", "pi-retention"])
+def test_rds_create_db_instance_rejects_invalid_input(rds, overrides, code, message):
+    """CreateDBInstance refuses each invalid field with the AWS error and creates nothing."""
+    db_id = f"bad-input-{_uuid_mod.uuid4().hex[:8]}"
+    params = {
+        "DBInstanceIdentifier": db_id, "DBInstanceClass": "db.t3.micro", "Engine": "postgres",
+        "MasterUsername": "admin", "MasterUserPassword": "password123", "AllocatedStorage": 20,
+        **overrides,
+    }
+    with pytest.raises(ClientError) as exc:
+        rds.create_db_instance(**params)
+    assert exc.value.response["Error"]["Code"] == code
+    assert exc.value.response["Error"]["Message"] == message
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    with pytest.raises(ClientError) as missing:
+        rds.describe_db_instances(DBInstanceIdentifier=db_id)
+    assert missing.value.response["Error"]["Code"] == "DBInstanceNotFound"
+
+
+def test_rds_create_db_instance_accepts_valid_boundary_input(rds, ec2):
+    """The values next to each refused one are accepted."""
+    sg_id = ec2.create_security_group(
+        GroupName=f"rds-input-{_uuid_mod.uuid4().hex[:8]}", Description="rds input",
+    )["GroupId"]
+    db_id = f"good-input-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        created = rds.create_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", Engine="postgres",
+            MasterUsername="application_db_admin_user", MasterUserPassword="Aa1!-_xyz",
+            AllocatedStorage=20, StorageType="gp3", MaxAllocatedStorage=22,
+            VpcSecurityGroupIds=[sg_id], EnablePerformanceInsights=True,
+            PerformanceInsightsRetentionPeriod=31,
+        )["DBInstance"]
+        assert created["MasterUsername"] == "application_db_admin_user"
+        assert created["StorageType"] == "gp3"
+        assert created["MaxAllocatedStorage"] == 22
+        assert created["PerformanceInsightsRetentionPeriod"] == 31
+        assert [g["VpcSecurityGroupId"] for g in created["VpcSecurityGroups"]] == [sg_id]
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.parametrize("engine, storage_type, changes, code, message", [
+    ("postgres", None, {"AllocatedStorage": 10}, "InvalidParameterCombination",
+     "Invalid storage size for engine name postgres and storage type gp2: 10"),
+    ("mysql", "gp2", {"AllocatedStorage": 10}, "InvalidParameterCombination",
+     "Invalid storage size for engine name mysql and storage type gp2: 10"),
+    ("mysql", None, {"Engine": "postgres"}, "InvalidParameterCombination",
+     "Modification of database from engine mysql to engine postgres is not supported."),
+    ("postgres", None, {"MasterUserPassword": "weak1"}, "InvalidParameterValue",
+     "The parameter MasterUserPassword is not a valid password because it is shorter "
+     "than 8 characters."),
+], ids=["postgres-storage-decrease", "mysql-storage-decrease", "engine-change", "weak-password"])
+def test_rds_modify_db_instance_rejects_invalid_input(rds, engine, storage_type, changes, code, message):
+    """ModifyDBInstance refuses each invalid change and leaves the instance as it was."""
+    db_id = f"bad-modify-{_uuid_mod.uuid4().hex[:8]}"
+    extra = {"StorageType": storage_type} if storage_type else {}
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", Engine=engine,
+        MasterUsername="admin", MasterUserPassword="password123", AllocatedStorage=20, **extra,
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_instance(DBInstanceIdentifier=db_id, ApplyImmediately=True, **changes)
+        assert exc.value.response["Error"]["Code"] == code
+        assert exc.value.response["Error"]["Message"] == message
+        instance = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert instance["Engine"] == engine
+        assert instance["AllocatedStorage"] == 20
+        assert instance.get("PendingModifiedValues", {}) == {}
+
+        rds.modify_db_instance(
+            DBInstanceIdentifier=db_id, AllocatedStorage=30,
+            MasterUserPassword="Sim2RealNewPwd456", ApplyImmediately=True,
+        )
+        instance = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+        assert instance["AllocatedStorage"] == 30
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
