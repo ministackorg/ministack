@@ -1248,7 +1248,41 @@ def _sse_description_from_spec(spec: dict | None) -> dict | None:
     return desc
 
 
-def _validate_data_plane_table_name(name) -> tuple | None:
+_EXPR_IDENT = re.compile(r"[A-Za-z0-9_#:]")
+
+
+def _leading_underscore_error(data, fields, envelope):
+    """A bare name starting with "_" is a syntax error in every expression; `near` is the token
+    before it, the underscore and the name after it, as written."""
+    for field in fields:
+        expr = data.get(field)
+        if not isinstance(expr, str):
+            continue
+        for i, ch in enumerate(expr):
+            if ch != "_" or (i and _EXPR_IDENT.match(expr[i - 1])) or (i and expr[i - 1] == "."):
+                continue
+            end = i + 1
+            while end < len(expr) and re.match(r"[A-Za-z0-9]", expr[end]):
+                end += 1
+            start = i
+            j = i
+            while j and expr[j - 1].isspace():
+                j -= 1
+            if j:
+                k = j - 1
+                if _EXPR_IDENT.match(expr[k]):
+                    while k and _EXPR_IDENT.match(expr[k - 1]):
+                        k -= 1
+                elif k and expr[k - 1:j] in ("<=", ">=", "<>"):
+                    k -= 1
+                start = k
+            message = f'Invalid {field}: Syntax error; token: "_", near: "{expr[start:end]}"'
+            return error_response_json("ValidationException",
+                ("1 validation error detected: " if envelope else "") + message, 400)
+    return None
+
+
+def _validate_data_plane_table_name(name, both: bool = False) -> tuple | None:
     """Used by PutItem/GetItem/DeleteItem/UpdateItem/Query/Scan: returns a
     ValidationException for null, empty, too-long, or pattern-violating
     table names — BEFORE any other validators fire so the conformance
@@ -1265,21 +1299,31 @@ def _validate_data_plane_table_name(name) -> tuple | None:
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
     if name.startswith("arn:"):
         return None  # A table ARN not in this account and region answers ResourceNotFoundException.
-    if len(name) > 255:
+    # Measured in characters; the first broken constraint alone, except UpdateItem lists the pattern then the length.
+    prefix = f"Value '{name}' at 'tableName' failed to satisfy constraint: Member must "
+    length = ("have length greater than or equal to 3" if len(name) < 3
+              else "have length less than or equal to 255" if len(name) > 255 else None)
+    pattern = None if re.fullmatch(r"[A-Za-z0-9_.\-]+", name) else "satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+    broken = [r for r in ((pattern, length) if both else (length, pattern)) if r]
+    if not both:
+        broken = broken[:1]
+    if broken:
         return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
-    if not re.match(r"^[A-Za-z0-9_.\-]+$", name):
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
+            f"{len(broken)} validation error{'s' if len(broken) > 1 else ''} detected: "
+            + "; ".join(prefix + r for r in broken), 400)
     return None
 
 
-# Regions that answer differently from the rest, per the paritysuite.org split registry (2026-10-22).
+# Regions that answer differently from the rest, per the paritysuite.org split registry.
 _OLDER_VALIDATION_REGIONS = frozenset(("eu-south-2", "me-central-1"))
 _OLDER_BATCH_GET_REGIONS = frozenset(("me-central-1",))
-_ECHOING_SCAN_REGIONS = frozenset((
-    "ap-northeast-1", "ap-south-2", "ap-southeast-6", "ap-southeast-7", "ca-central-1", "eu-central-2",
-    "eu-south-1", "eu-south-2", "eu-west-1", "me-central-1", "us-east-1", "us-east-2", "us-west-2"))
+_ECHOING_SCAN_REGIONS = frozenset(("me-central-1",))  # paritysuite.org split registry, 2026-11-14
+# Regions where UpdateItem accepts a 32-level ExpressionAttributeValue (same registry, 2026-11-14).
+_DEEP_EAV_REGIONS = frozenset((
+    "af-south-1", "ap-east-2", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-south-1", "ap-south-2",
+    "ap-southeast-1", "ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+    "ca-central-1", "eu-central-1", "eu-central-2", "eu-north-1", "eu-south-1", "eu-west-1", "eu-west-2",
+    "il-central-1", "sa-east-1", "us-east-2"))
 
 
 def _older_validation_region() -> bool:
@@ -1320,25 +1364,50 @@ def _older_layer_error(data, op: str) -> tuple | None:
     key_missing = op != "put" and "Key" not in data
     if not key_missing and max((_nesting_level(v) for v in _request_values(data)), default=0) <= _DDB_SECOND_NESTING_LEVEL:
         return None
-    pieces = []
-    rcc = data.get("ReturnConsumedCapacity")
-    if rcc is not None and rcc not in _RETURN_CONSUMED_CAPACITY_VALUES:
-        pieces.append(f"Value '{rcc}' at 'returnConsumedCapacity' failed to satisfy constraint: "
-                      "Member must satisfy enum value set: [INDEXES, TOTAL, NONE]")
-    if data.get("TableName") == "":
-        pieces.append("Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1")
-    rv = data.get("ReturnValues")
-    if rv is not None and rv not in _UPDATE_RV_VALUES:
-        pieces.append(f"Value '{rv}' at 'returnValues' failed to satisfy constraint: {_OLDER_RV_ENUM}")
-    co = data.get("ConditionalOperator")
-    if co is not None and co not in ("AND", "OR"):
-        pieces.append(f"Value '{co}' at 'conditionalOperator' failed to satisfy constraint: "
-                      "Member must satisfy enum value set: [OR, AND]")
-    if key_missing:
-        pieces.append("Value null at 'key' failed to satisfy constraint: Member must not be null")
+    def enum(member, wire, allowed, listed):
+        value = data.get(member)
+        if value is not None and value not in allowed:
+            return f"Value '{value}' at '{wire}' failed to satisfy constraint: Member must satisfy enum value set: [{listed}]"
+        return None
+
+    def absent(member, wire):
+        return f"Value null at '{wire}' failed to satisfy constraint: Member must not be null" if data.get(member) is None else None
+
+    name = data.get("TableName")
+    checks = {
+        "rv": lambda: enum("ReturnValues", "returnValues", _UPDATE_RV_VALUES, "ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW"),
+        "co": lambda: enum("ConditionalOperator", "conditionalOperator", ("AND", "OR"), "OR, AND"),
+        "rvoccf": lambda: enum("ReturnValuesOnConditionCheckFailure", "returnValuesOnConditionCheckFailure",
+                               ("ALL_OLD", "NONE"), "ALL_OLD, NONE"),
+        "rcc": lambda: enum("ReturnConsumedCapacity", "returnConsumedCapacity", _RETURN_CONSUMED_CAPACITY_VALUES,
+                            "INDEXES, TOTAL, NONE"),
+        "ricm": lambda: enum("ReturnItemCollectionMetrics", "returnItemCollectionMetrics", ("SIZE", "NONE"), "SIZE, NONE"),
+        "item": lambda: absent("Item", "item"),
+        "key": lambda: absent("Key", "key"),
+        "name": lambda: (absent("TableName", "tableName") if name is None else
+                         "Value '' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1"
+                         if name == "" else None),
+    }
+    order = {
+        "put": ("rv", "co", "item", "rvoccf", "rcc", "ricm", "name"),
+        "update": ("rcc", "name", "rv", "co", "rvoccf", "ricm", "key"),
+        "delete": ("rv", "co", "rvoccf", "rcc", "ricm", "key", "name"),
+    }[op]
+    pieces = [p for p in (checks[c]() for c in order) if p]
+    if not pieces and isinstance(name, str) and not name.startswith("arn:"):
+        # The name's length (in UTF-16 units) and pattern are checked once every member passes.
+        units = len(name.encode("utf-16-le")) // 2
+        if units < 3:
+            pieces.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3")
+        elif units > 255:
+            pieces.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255")
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name):
+            pieces.append(f"Value '{name}' at 'tableName' failed to satisfy constraint: "
+                          "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+")
     if pieces:
         return error_response_json("ValidationException",
             f"{len(pieces)} validation error{'s' if len(pieces) > 1 else ''} detected: " + "; ".join(pieces), 400)
+    rv = data.get("ReturnValues")
     if op == "delete" and rv in _UPDATE_RV_VALUES - _PUT_DELETE_RV_VALUES:
         return error_response_json("ValidationException", "ReturnValues can only be ALL_OLD or NONE", 400)
     return None
@@ -1436,6 +1505,27 @@ _VALID_TABLE_CLASSES = {"STANDARD", "STANDARD_INFREQUENT_ACCESS"}
 _VALID_PROJECTION_TYPES = {"ALL", "KEYS_ONLY", "INCLUDE"}
 
 
+def _name_constraint_errors(name, at, utf16):
+    """Every broken length and pattern constraint on a table or index name, length first.
+    Table names are measured in UTF-16 units; index names and ExclusiveStartTableName in characters."""
+    size = len(name.encode("utf-16-le")) // 2 if utf16 else len(name)
+    out = []
+    if size < 3:
+        out.append((name, at, "Member must have length greater than or equal to 3"))
+    elif size > 255:
+        out.append((name, at, "Member must have length less than or equal to 255"))
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name):
+        out.append((name, at, "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"))
+    return out
+
+
+def _control_plane_name_error(raw):
+    """DescribeTable, DeleteTable and UpdateTable check a plain table name before looking it up."""
+    if not isinstance(raw, str) or raw.startswith("arn:") or not raw:
+        return None
+    return _multi_validation_error(_name_constraint_errors(raw, "tableName", True))
+
+
 def _validate_table_name(name: str) -> tuple | None:
     """Per AWS DynamoDB Developer Guide: 3-255 chars, pattern [A-Za-z0-9_.-].
     Used by CreateTable; data-plane uses a wider 1..255 range via
@@ -1443,16 +1533,7 @@ def _validate_table_name(name: str) -> tuple | None:
     if not isinstance(name, str) or not name:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null", 400)
-    if len(name) < 3:
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", 400)
-    if len(name) > 255:
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
-    if not _TABLE_NAME_RE.match(name):
-        return error_response_json("ValidationException",
-            f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+", 400)
-    return None
+    return _multi_validation_error(_name_constraint_errors(name, "tableName", True))
 
 
 def _validate_key_schema(key_schema: list, attr_defs: list, context: str = "tableName") -> tuple | None:
@@ -1529,13 +1610,7 @@ def _create_table(data):
             iname = index.get("IndexName") if isinstance(index, dict) else None
             if not isinstance(iname, str):
                 continue
-            path = f"{member}.{position}.member.indexName"
-            if len(iname) < 3:
-                failures.append((iname, path, "Member must have length greater than or equal to 3"))
-            elif len(iname) > 255:
-                failures.append((iname, path, "Member must have length less than or equal to 255"))
-            elif not _INDEX_NAME_RE.match(iname):
-                failures.append((iname, path, "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"))
+            failures.extend(_name_constraint_errors(iname, f"{member}.{position}.member.indexName", False))
     err = _multi_validation_error(failures)
     if err:
         return err
@@ -1738,6 +1813,9 @@ def _create_table(data):
 
 
 def _delete_table(data):
+    err = _control_plane_name_error(data.get("TableName"))
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
@@ -1763,6 +1841,9 @@ def _delete_table(data):
 
 
 def _describe_table(data):
+    err = _control_plane_name_error(data.get("TableName"))
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
@@ -1772,6 +1853,10 @@ def _describe_table(data):
 def _list_tables(data):
     limit = data.get("Limit", 100)
     start = data.get("ExclusiveStartTableName", "")
+    if isinstance(start, str) and start:
+        err = _multi_validation_error(_name_constraint_errors(start, "exclusiveStartTableName", False))
+        if err:
+            return err
     names = sorted(_tables.keys())
     if start:
         names = [n for n in names if n > start]
@@ -1898,6 +1983,18 @@ def _warm_throughput_description(requested, current=None):
 
 
 def _update_table(data):
+    err = _control_plane_name_error(data.get("TableName"))
+    if err:
+        return err
+    failures = []
+    for position, update in enumerate(data.get("GlobalSecondaryIndexUpdates") or [], start=1):
+        iname = ((update or {}).get("Create") or {}).get("IndexName") if isinstance(update, dict) else None
+        if isinstance(iname, str):
+            failures.extend(_name_constraint_errors(
+                iname, f"globalSecondaryIndexUpdates.{position}.member.create.indexName", False))
+    err = _multi_validation_error(failures)
+    if err:
+        return err
     name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
@@ -2309,6 +2406,9 @@ def _put_item(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('ConditionExpression',), True)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, _PUT_DELETE_RV_VALUES)
     if err:
         return err
@@ -2385,6 +2485,9 @@ def _get_item(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('ProjectionExpression',), False)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, None)
     if err:
         return err
@@ -2429,6 +2532,9 @@ def _delete_item(data):
         return err
     name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
+    if err:
+        return err
+    err = _leading_underscore_error(data, ('ConditionExpression',), True)
     if err:
         return err
     if data.get("ReturnValues") in _UPDATE_RV_VALUES - _PUT_DELETE_RV_VALUES:
@@ -2496,7 +2602,10 @@ def _update_item(data):
     if err:
         return err
     name = _normalize_table_name(data.get("TableName"))
-    err = _validate_data_plane_table_name(name)
+    err = _validate_data_plane_table_name(name, both=True)
+    if err:
+        return err
+    err = _leading_underscore_error(data, ('UpdateExpression', 'ConditionExpression'), True)
     if err:
         return err
     # UpdateItem stops at the first invalid enum, unlike the other writes.
@@ -2524,7 +2633,7 @@ def _update_item(data):
     err = _envelope_condition_refs(_validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"), "envelope"))
     if err:
         return err
-    first_limit = _DDB_SECOND_NESTING_LEVEL if _older_validation_region() else _DDB_MAX_NESTING_DEPTH
+    first_limit = _DDB_MAX_NESTING_DEPTH + 1 if get_region() in _DEEP_EAV_REGIONS else _DDB_MAX_NESTING_DEPTH
     err = _value_nesting_error(data.get("ExpressionAttributeValues") or {}, first_limit)
     if err:
         return err
@@ -2704,12 +2813,16 @@ def _query(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('KeyConditionExpression', 'FilterExpression', 'ProjectionExpression'), False)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, None)
     if err:
         return err
     if data.get("ConditionalOperator") is not None and data["ConditionalOperator"] not in ("AND", "OR"):
         return error_response_json("ValidationException",
-            "Failed to satisfy constraint: Member must satisfy enum value set: [ALL, OR]", 400)
+            f"Value '{data['ConditionalOperator']}' at 'conditionalOperator' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [AND, OR]", 400)
     if data.get("KeyConditionExpression"):
         err = _key_condition_operand_error(data["KeyConditionExpression"], data.get("ExpressionAttributeValues"))
         if err:
@@ -3042,6 +3155,9 @@ def _scan(data):
     err = _validate_data_plane_table_name(name)
     if err:
         return err
+    err = _leading_underscore_error(data, ('FilterExpression', 'ProjectionExpression'), False)
+    if err:
+        return err
     err = _check_per_op_param_enums(data, None)
     if err:
         return err
@@ -3277,6 +3393,13 @@ def _execute_statement(data):
 
     if not statement or not statement.strip():
         return error_response_json("ValidationException", "Statement must not be null or empty", 400)
+    limit = data.get("Limit")
+    if isinstance(limit, str):
+        return error_response_json("SerializationException", "STRING_VALUE cannot be converted to Integer", 400)
+    if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit < 1:
+        return error_response_json("ValidationException",
+            f"1 validation error detected: Value '{limit}' at 'limit' failed to satisfy constraint: "
+            "Member must have value greater than or equal to 1", 400)
 
     try:
         parsed = _parse_partiql(statement, parameters)
@@ -3299,7 +3422,7 @@ def _execute_statement(data):
             overlap = _pq_overlap_error(table, parsed.get("where"))
             if overlap:
                 return error_response_json("ValidationException", overlap, 400)
-            status, headers, body = _partiql_select(table, parsed)
+            status, headers, body = _partiql_select_paged(table, parsed, data)
     elif op == "INSERT":
         status, headers, body = _partiql_insert(table, parsed)
     elif op == "UPDATE":
@@ -3321,6 +3444,45 @@ def _execute_statement(data):
             new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             return status, headers, new_body
     return status, headers, body
+
+
+def _pq_and_conjuncts(where):
+    out, stack = [], [where]
+    while stack:
+        node = stack.pop()
+        if node[0] == "and":
+            stack.extend((node[2], node[1]))
+        else:
+            out.append(node)
+    return out
+
+
+def _pq_path_roots(node):
+    roots, stack = [], [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, tuple) and n and n[0] == "path":
+            if n[1] and isinstance(n[1][0], str):
+                roots.append(n[1][0])
+        elif isinstance(n, (tuple, list)):
+            stack.extend(reversed([c for c in n if isinstance(c, (tuple, list))]))
+    return roots
+
+
+def _java_hash_set_order(names):
+    """Iteration order of a java.util.HashSet built from `names` (DynamoDB lists these that way)."""
+    names = list(dict.fromkeys(names))
+    capacity = 16
+    while len(names) > capacity * 0.75:
+        capacity *= 2
+
+    def bucket(name):
+        h = 0
+        for unit in struct.unpack(f">{len(name.encode('utf-16-be')) // 2}H", name.encode("utf-16-be")):
+            h = (31 * h + unit) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (capacity - 1)
+
+    return sorted(names, key=lambda n: (bucket(n), names.index(n)))
 
 
 def _partiql_select_index(table, parsed, data):
@@ -3362,8 +3524,17 @@ def _partiql_select_index(table, parsed, data):
 
     conditions = parsed.get("conditions") or []
     keyed = any(attr in key_names for attr, _op, _v in conditions)
+    filter_attrs = [a for a, _op, _v in conditions]
+    if not conditions and parsed.get("where") is not None and parsed["where"][0] == "and":
+        # An OR beside the key condition stays a filter on what it names.
+        for conjunct in _pq_and_conjuncts(parsed["where"]):
+            atoms = _pq_conditions(conjunct)
+            if atoms and all(a in key_names for a, _op, _v in atoms):
+                keyed = True
+            else:
+                filter_attrs.extend(_pq_path_roots(conjunct))
     if keyed and view_attrs is not None:
-        unprojected_filters = list(dict.fromkeys(a for a, _op, _v in conditions if a not in view_attrs))
+        unprojected_filters = list(dict.fromkeys(a for a in filter_attrs if a not in view_attrs))
         if unprojected_filters:
             return error_response_json("ValidationException",
                 f"One or more parameter values were invalid: Secondary index {index_name} does not project "
@@ -3372,7 +3543,7 @@ def _partiql_select_index(table, parsed, data):
     projections = parsed.get("projections")
     reach_back = False
     if projections and view_attrs is not None:
-        unprojected = [a for a in projections if a not in view_attrs]
+        unprojected = _java_hash_set_order(a for a in projections if a not in view_attrs)
         if unprojected:
             if is_gsi:
                 return error_response_json("ValidationException",
@@ -3395,32 +3566,46 @@ def _partiql_select_index(table, parsed, data):
         return tuple(json.dumps(it.get(k), sort_keys=True) for k in key_names + table_keys)
     members.sort(key=_order_key)
 
-    # Rows walked = rows matching the key conditions (filters apply later).
-    key_conds = [(a, o, v) for a, o, v in conditions if a in key_names]
-    walked = [it for it in members
-              if all(_eval_partiql_pred(_index_view(it), a, o, v) for a, o, v in key_conds)]
+    # A set of index keys (an OR or IN) reads each key in turn, each charged on its own.
+    idx_pk = next((k.get("AttributeName") for k in idx.get("KeySchema") or [] if k.get("KeyType") == "HASH"), None)
+    idx_sk = next((k.get("AttributeName") for k in idx.get("KeySchema") or [] if k.get("KeyType") == "RANGE"), None)
+    plan, plan_err = _pq_read_plan(
+        {"pk_name": idx_pk, "sk_name": idx_sk, "AttributeDefinitions": table.get("AttributeDefinitions")}, parsed)
+    segmented = not plan_err and plan is not None and len(plan) > 1
 
-    # Pagination: tokens are bound to the index that minted them.
-    offset = 0
     token = data.get("NextToken")
+    state = {}
     if token:
         try:
             import base64 as _b64
-            tk = json.loads(_b64.b64decode(token).decode("utf-8"))
-            assert tk.get("t") == table.get("TableName") and tk.get("i") == index_name
-            offset = int(tk.get("o", 0))
+            state = json.loads(_b64.b64decode(token).decode("utf-8"))
+            assert state.get("t") == table.get("TableName") and state.get("i") == index_name
+            assert ("s" in state) == segmented
         except Exception:
             return error_response_json("ValidationException",
                 "The provided NextToken is invalid", 400)
-    limit = data.get("Limit")
-    page = walked[offset:]
+    limit = _pq_limit(data)
     next_token = None
-    if limit is not None and int(limit) < len(page):
-        page = page[: int(limit)]
-        import base64 as _b64
-        next_token = _b64.b64encode(json.dumps(
-            {"t": table.get("TableName"), "i": index_name, "o": offset + len(page)}
-        ).encode("utf-8")).decode("ascii")
+    index_units = None
+    if segmented:
+        def size_units(rows):
+            return rate * max(1, -(-sum(_item_size_bytes(_index_view(r)) for r in rows) // 4096))
+        descending = bool(parsed.get("order") and parsed["order"][1])
+        page, index_units, nxt = _pq_walk(
+            plan, lambda v: [m for m in members if _ddb_equals(m.get(idx_pk), v)], idx_sk, _order_key,
+            limit, state, descending, size_units, False)
+        if nxt is not None:
+            next_token = _pq_token(table, {"i": index_name, **nxt})
+    else:
+        # Rows walked = rows matching the key conditions (filters apply later).
+        key_conds = [(a, o, v) for a, o, v in conditions if a in key_names]
+        walked = [it for it in members
+                  if all(_eval_partiql_pred(_index_view(it), a, o, v) for a, o, v in key_conds)]
+        offset = int(state.get("o", 0))
+        page = walked[offset:]
+        if limit is not None and limit < len(page):
+            page = page[:limit]
+            next_token = _pq_token(table, {"i": index_name, "o": offset + len(page)})
 
     where_fn = parsed.get("where_fn")
     kept = [it for it in page if (where_fn is None or where_fn(_index_view(it)))]
@@ -3452,11 +3637,12 @@ def _partiql_select_index(table, parsed, data):
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
         table_units = rate * len(page) if reach_back else 0.0
-        total = rate + table_units
+        index_units = rate if index_units is None else index_units
+        total = index_units + table_units
         cap = {"TableName": table.get("TableName"), "CapacityUnits": total}
         if rc == "INDEXES":
             cap["Table"] = {"CapacityUnits": table_units}
-            arm = {"GlobalSecondaryIndexes" if is_gsi else "LocalSecondaryIndexes": {index_name: {"CapacityUnits": rate}}}
+            arm = {"GlobalSecondaryIndexes" if is_gsi else "LocalSecondaryIndexes": {index_name: {"CapacityUnits": index_units}}}
             cap.update(arm)
         payload["ConsumedCapacity"] = cap
     return 200, {"Content-Type": "application/x-amz-json-1.0"}, json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3500,6 +3686,350 @@ def _partiql_select(table, parsed):
         filtered = projected
 
     return json_response({"Items": filtered})
+
+
+_PQ_RANGE_OPS = ("<", "<=", ">", ">=")
+_PQ_OVERLAPPING = "Overlapping conditions with range keys are not supported in where clause"
+
+
+def _pq_key_type(table, name):
+    for definition in table.get("AttributeDefinitions") or []:
+        if definition.get("AttributeName") == name:
+            return definition.get("AttributeType")
+    return None
+
+
+def _pq_key_dnf(node, keys, cap=512):
+    """The WHERE clause as OR-branches of key atoms (attr, op, value). A non-key or negated term reads as
+    true, so it adds nothing; a negated key term adds the marker ("~", attr). None when it grows too wide."""
+    kind = node[0]
+
+    def attr(n):
+        return n[1][0] if n[0] == "path" and len(n[1]) == 1 and n[1][0] in keys else None
+
+    if kind == "and":
+        left, right = _pq_key_dnf(node[1], keys, cap), _pq_key_dnf(node[2], keys, cap)
+        if left is None or right is None or len(left) * len(right) > cap:
+            return None
+        return [a + b for a in left for b in right]
+    if kind == "or":
+        left, right = _pq_key_dnf(node[1], keys, cap), _pq_key_dnf(node[2], keys, cap)
+        if left is None or right is None:
+            return None
+        if [] in left or [] in right:
+            return [[]]
+        return left + right if len(left) + len(right) <= cap else None
+    if kind == "not" or (kind == "cmp" and node[1] == "<>"):
+        names = set()
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, tuple) and n and n[0] == "path" and len(n[1]) == 1 and n[1][0] in keys:
+                names.add(n[1][0])
+            elif isinstance(n, (tuple, list)):
+                stack.extend(c for c in n if isinstance(c, (tuple, list)))
+        return [[(a, "~", None) for a in sorted(names)]]
+    flip = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "="}
+    if kind == "cmp" and node[1] in flip:
+        if attr(node[2]) and node[3][0] == "lit":
+            return [[(attr(node[2]), node[1], node[3][1])]]
+        if attr(node[3]) and node[2][0] == "lit":
+            return [[(attr(node[3]), flip[node[1]], node[2][1])]]
+    if kind == "between" and attr(node[1]) and node[2][0] == node[3][0] == "lit":
+        return [[(attr(node[1]), ">=", node[2][1]), (attr(node[1]), "<=", node[3][1])]]
+    if kind == "in" and attr(node[1]) and node[2][0] == "options" and all(o[0] == "lit" for o in node[2][1]):
+        return [[(attr(node[1]), "=", o[1])] for o in node[2][1]] or [[]]
+    if kind == "call" and node[1] == "begins_with" and len(node[2]) == 2 and attr(node[2][0]) \
+            and node[2][1][0] == "lit":
+        return [[(attr(node[2][0]), "begins_with", node[2][1][1])]]
+    return [[]]
+
+
+def _pq_or_conjunct_errors(table, where):
+    """An OR inside the top-level AND: a negated sort-key term there stays in the filter, which may
+    not name a key; a lone OR mixing a sort-key branch with a non-key branch overlaps."""
+    sk = table.get("sk_name")
+    if not sk or where is None or where[0] != "and":
+        return None
+    conjuncts, stack = [], [where]
+    while stack:
+        node = stack.pop()
+        if node[0] == "and":
+            stack.extend((node[2], node[1]))
+        else:
+            conjuncts.append(node)
+    ors = [c for c in conjuncts if c[0] == "or"]
+    keys = {table.get("pk_name"), sk}
+    raws = [_pq_key_dnf_raw(group, keys) or [] for group in ors]
+    if any((sk, "~", None) in b for raw in raws for b in raw):
+        return f"Filter Expression can only contain non-primary key attributes: Primary key attribute: {sk}"
+    if len(raws) == 1:
+        positive = [any(a == sk and op != "~" for a, op, _ in b) for b in raws[0]]
+        if any(positive) and [] in raws[0]:
+            return _PQ_OVERLAPPING
+    return None
+
+
+def _pq_key_dnf_raw(node, keys):
+    """The branches of a single OR, without folding a branch that reads as true into the rest."""
+    if node[0] != "or":
+        return _pq_key_dnf(node, keys)
+    left, right = _pq_key_dnf_raw(node[1], keys), _pq_key_dnf_raw(node[2], keys)
+    return None if left is None or right is None else left + right
+
+
+def _pq_read_plan(table, parsed):
+    """How a base-table SELECT reads: a list of (pk value, segment) key reads in read order, or None
+    for a scan, or an error message. A segment is ("point", value) or ("range", lo, lo_inc, hi, hi_inc, prefix)."""
+    where = parsed.get("where")
+    pk, sk = table.get("pk_name"), table.get("sk_name")
+    err = _pq_or_conjunct_errors(table, where)
+    if err:
+        return None, err
+    if where is None:
+        return None, None
+    branches = _pq_key_dnf(where, {pk, sk} - {None})
+    if branches is None:
+        return None, None
+    pk_type = _pq_key_type(table, pk)
+    reads = []  # (pk value, segment, negated)
+    for branch in branches:
+        pk_atoms = [(op, v) for a, op, v in branch if a == pk]
+        if not pk_atoms or any(op != "=" for op, _ in pk_atoms):
+            return None, None
+        values = [v for _, v in pk_atoms]
+        sk_atoms = [(op, v) for a, op, v in branch if a == sk and op != "~"]
+        ranged = any(op in _PQ_RANGE_OPS or op == "begins_with" for op, _ in sk_atoms)
+        vtype = next(iter(values[0])) if isinstance(values[0], dict) and values[0] else None
+        if vtype not in ("S", "N", "B"):
+            if ranged:
+                return None, None
+            return None, f"Key value must be of type S, N, or B. Key name: {pk}, Key type: {vtype}"
+        if vtype != pk_type:
+            if ranged:
+                return None, None
+            return None, f"Key attribute's data type should match its data type in table's schema: Key {pk}"
+        if any(not _ddb_equals(values[0], v) for v in values[1:]):
+            continue
+        negated = any(a == sk and op == "~" for a, op, _ in branch)
+        points = [v for op, v in sk_atoms if op == "="]
+        lo = hi = prefix = None
+        lo_inc = hi_inc = True
+        for op, v in sk_atoms:
+            if op in (">", ">="):
+                if lo is None or _compare_ddb(v, ">", lo) or (_ddb_equals(v, lo) and op == ">"):
+                    lo, lo_inc = v, op == ">="
+            elif op in ("<", "<="):
+                if hi is None or _compare_ddb(v, "<", hi) or (_ddb_equals(v, hi) and op == "<"):
+                    hi, hi_inc = v, op == "<="
+            elif op == "begins_with":
+                prefix = v
+        if points:
+            point = points[0]
+            if any(not _ddb_equals(point, p) for p in points[1:]):
+                continue
+            if not _pq_in_segment(point, ("range", lo, lo_inc, hi, hi_inc, prefix)):
+                continue
+            reads.append((values[0], ("point", point), negated))
+        else:
+            reads.append((values[0], ("range", lo, lo_inc, hi, hi_inc, prefix), negated))
+    # Order: by partition, then by the segment's first sort key.
+    partitions = []
+    for value, _seg, _neg in reads:
+        if not any(_ddb_equals(value, p) for p in partitions):
+            partitions.append(value)
+    order = parsed.get("order")
+    descending = bool(order and order[1])
+    if order and len(partitions) > 1 and order[0] != [pk]:
+        return None, ("Must have hash key in ORDER BY clause when more than one hash key condition "
+                      "specified in WHERE clause.")
+    plan = []
+    for value in sorted(partitions, key=_ddb_comparable):
+        segs = [(seg, neg) for v, seg, neg in reads if _ddb_equals(v, value)]
+        unique = []
+        for seg, neg in segs:
+            if not any(seg[0] == "point" == u[0][0] and _ddb_equals(seg[1], u[0][1]) for u in unique):
+                unique.append((seg, neg))
+        for i, (a, a_neg) in enumerate(unique):
+            for b, b_neg in unique[i + 1:]:
+                if not (a_neg or b_neg) and _pq_segments_meet(a, b):
+                    return None, _PQ_OVERLAPPING
+        if any(seg[0] == "range" and seg[1:] == (None, True, None, True, None) for seg, _ in unique) \
+                or any(_pq_segments_meet(a, b) for i, (a, _) in enumerate(unique) for b, _ in unique[i + 1:]):
+            unique = [(("range", None, True, None, True, None), False)]
+        unique.sort(key=lambda s: _ddb_comparable(_pq_segment_start(s[0])) if _pq_segment_start(s[0]) else ("",))
+        if descending:
+            unique.reverse()
+        plan.extend((value, seg) for seg, _ in unique)
+    return plan, None
+
+
+def _pq_segment_start(seg):
+    return seg[1] if seg[0] == "point" else (seg[1] if seg[1] is not None else seg[5])
+
+
+def _pq_in_segment(value, seg):
+    if seg[0] == "point":
+        return _ddb_equals(value, seg[1])
+    _, lo, lo_inc, hi, hi_inc, prefix = seg
+    if lo is not None and not _compare_ddb(value, ">=" if lo_inc else ">", lo):
+        return False
+    if hi is not None and not _compare_ddb(value, "<=" if hi_inc else "<", hi):
+        return False
+    if prefix is not None:
+        return _pq_truthy(_pq_call("begins_with", [value, prefix], None))
+    return True
+
+
+def _pq_segments_meet(a, b):
+    if a[0] == "point":
+        return _pq_in_segment(a[1], b)
+    if b[0] == "point":
+        return _pq_in_segment(b[1], a)
+    def bounded(seg):
+        _, lo, lo_inc, hi, hi_inc, prefix = seg
+        if isinstance(prefix, dict) and "S" in prefix:
+            if lo is None or _compare_ddb(prefix, ">", lo):
+                lo, lo_inc = prefix, True
+            ceiling = {"S": prefix["S"] + "\U0010ffff"}
+            if hi is None or _compare_ddb(ceiling, "<", hi):
+                hi, hi_inc = ceiling, True
+        return lo, lo_inc, hi, hi_inc
+
+    alo, alo_inc, ahi, ahi_inc = bounded(a)
+    blo, blo_inc, bhi, bhi_inc = bounded(b)
+    def below(hi, hi_inc, lo, lo_inc):
+        if hi is None or lo is None:
+            return False
+        return _compare_ddb(hi, "<", lo) or (_ddb_equals(hi, lo) and not (hi_inc and lo_inc))
+    return not below(ahi, ahi_inc, blo, blo_inc) and not below(bhi, bhi_inc, alo, alo_inc)
+
+
+def _pq_limit(data):
+    limit = data.get("Limit")
+    if limit is None:
+        return None
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        return None
+    return None if limit >= 2 ** 31 else int(limit)
+
+
+def _pq_token(table, payload):
+    return base64.b64encode(json.dumps({"t": table.get("TableName"), **payload}).encode()).decode("ascii")
+
+
+def _pq_read_token(table, token):
+    try:
+        decoded = json.loads(base64.b64decode(token).decode("utf-8"))
+        if decoded.get("t") != table.get("TableName") or "i" in decoded:
+            raise ValueError
+        return decoded
+    except Exception:
+        return None
+
+
+def _pq_walk(plan, partition_rows, sk, order_key, limit, state, descending, size_units, unique):
+    """Read the plan's segments in order from state {"s": segment, "n": rows already read in it}.
+    Each segment is charged on the page that reaches it. With a unique sort key, a page that ends
+    on a segment's closed bound moves on to the next segment, so the last one mints no token."""
+    index, skip = int(state.get("s", 0)), int(state.get("n", 0))
+    read, units, next_state = [], 0.0, None
+    while index < len(plan):
+        value, seg = plan[index]
+        rows = [r for r in partition_rows(value) if sk is None or (sk in r and _pq_in_segment(r[sk], seg))]
+        rows.sort(key=order_key or (lambda r: _ddb_comparable(r.get(sk)) if sk else 0))
+        if descending:
+            rows.reverse()
+        rows = rows[skip:]
+        room = None if limit is None else limit - len(read)
+        taken = rows if room is None else rows[:room]
+        read.extend(taken)
+        if taken or not skip:
+            units += size_units(taken)
+        if room is not None and len(taken) >= room:
+            last = taken[-1].get(sk) if taken and sk else None
+            if seg[0] == "point":
+                bound, inclusive = seg[1], True
+            else:
+                bound, inclusive = (seg[1], seg[2]) if descending else (seg[3], seg[4])
+            closed = unique and last is not None and bound is not None and inclusive and _ddb_equals(last, bound)
+            if closed or (unique and seg[0] == "point"):
+                if index + 1 < len(plan):
+                    next_state = {"s": index + 1}
+            else:
+                next_state = {"s": index, "n": skip + len(taken)}
+            break
+        index, skip = index + 1, 0
+    return read, units, next_state
+
+
+def _partiql_select_paged(table, parsed, data):
+    """ExecuteStatement's base-table SELECT: key reads in order, each branch charged on the page that
+    reaches it, Limit counting the items read and a page ending on a closed bound ending the read."""
+    plan, err = _pq_read_plan(table, parsed)
+    if err:
+        return error_response_json("ValidationException", err, 400)
+    consistent = bool(data.get("ConsistentRead"))
+    rate = 1.0 if consistent else 0.5
+    limit = _pq_limit(data)
+    state = {}
+    if data.get("NextToken"):
+        state = _pq_read_token(table, data["NextToken"])
+        if state is None:
+            return error_response_json("ValidationException", "The provided NextToken is invalid", 400)
+    pk, sk = table.get("pk_name"), table.get("sk_name")
+    where_fn = parsed.get("where_fn")
+    read, units, next_state = [], 0.0, None
+
+    def size_units(rows):
+        return rate * max(1, -(-sum(_item_size_bytes(r) for r in rows) // 4096))
+
+    if plan is None:
+        rows = [table["items"][p][s] for p in sorted(table["items"]) for s in sorted(table["items"][p])]
+        start = int(state.get("o", 0))
+        page = rows[start:] if limit is None else rows[start:start + limit]
+        read = page
+        if limit is not None and start + len(page) < len(rows):
+            next_state = {"o": start + len(page)}
+        units = rate * max(4, -(-sum(_item_size_bytes(r) for r in page) // 4096))
+    else:
+        descending = bool(parsed.get("order") and parsed["order"][1])
+        partitions = lambda value: (table["items"].get(_extract_key_val(value)) or {}).values()  # noqa: E731
+        read, units, next_state = _pq_walk(plan, partitions, sk, None, limit, state, descending, size_units, True)
+
+    items = [r for r in read if where_fn is None or where_fn(r)]
+    if plan is None and parsed.get("order"):
+        parts, desc = parsed["order"]
+        items.sort(key=lambda it: _ddb_comparable(_partiql_get_path(it, parts)) if _partiql_get_path(it, parts) else ("",),
+                   reverse=desc)
+    projections = parsed.get("projections")
+    if projections:
+        projected = []
+        for it in items:
+            row = {}
+            for attr in projections:
+                if attr in it:
+                    row[attr] = it[attr]
+                elif "." in attr or "[" in attr:
+                    try:
+                        parts = _partiql_parse_path(attr)
+                    except ValueError:
+                        continue
+                    leaf = _partiql_get_path(it, parts)
+                    if leaf is not None:
+                        row[next((seg for seg in reversed(parts) if isinstance(seg, str)), attr)] = leaf
+            projected.append(row)
+        items = projected
+    payload = {"Items": items}
+    if next_state is not None:
+        payload["NextToken"] = _pq_token(table, next_state)
+    rc = data.get("ReturnConsumedCapacity", "NONE")
+    if rc in ("TOTAL", "INDEXES"):
+        cap = {"TableName": table.get("TableName"), "CapacityUnits": units}
+        if rc == "INDEXES":
+            cap["Table"] = {"CapacityUnits": units}
+        payload["ConsumedCapacity"] = cap
+    return json_response(payload)
 
 
 def _partiql_insert(table, parsed):

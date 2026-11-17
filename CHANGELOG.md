@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **DynamoDB — PartiQL key reads** — a `SELECT` with an `OR` or `IN` on the sort key, or on an index key, reads each key in turn: each is charged on the page that reaches it, `Limit` pages through them, and a page ending on a closed bound ends the read. Overlapping branches, a negated sort key inside an `OR`, a wrong-typed partition key and a `Limit` below 1 answer AWS's errors. Reported by @hicksy and the paritysuite.org project.
+- **DynamoDB — validation messages** — deep writes list every bad member in AWS's order; table names are measured as AWS does (characters on item operations, UTF-16 units on table operations); a name starting with `_` in an expression is a syntax error; `Scan` and `Query` use AWS's current wording. Reported by @hicksy and the paritysuite.org project.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added

@@ -8100,3 +8100,114 @@ def test_dynamodb_import_table_creates_vector_indexes(ddb):
         assert ddb.describe_table(TableName=name)["Table"]["VectorIndexes"][0]["IndexName"] == "vix"
     finally:
         ddb.delete_table(TableName=name)
+
+
+def _composite_table(ddb, prefix, rows=()):
+    name = f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}],
+    )
+    for sk in rows:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": sk}})
+    return name
+
+
+def _partiql_walk(ddb, statement, **kwargs):
+    pages, token = [], None
+    for _ in range(8):
+        extra = {"NextToken": token} if token else {}
+        res = ddb.execute_statement(Statement=statement, ReturnConsumedCapacity="TOTAL", **kwargs, **extra)
+        pages.append(([i["sk"]["S"] for i in res["Items"]], "NextToken" in res, res["ConsumedCapacity"]["CapacityUnits"]))
+        token = res.get("NextToken")
+        if not token:
+            break
+    return pages
+
+
+def test_dynamodb_partiql_or_of_sort_keys_pages_key_by_key(ddb):
+    name = _composite_table(ddb, "pq-or", ["row-1", "row-2", "row-3"])
+    try:
+        base = f"SELECT * FROM \"{name}\" WHERE pk = 'p' AND "
+        assert _partiql_walk(ddb, base + "(sk = 'row-1' OR sk = 'row-2')", Limit=1) == [
+            (["row-1"], True, 0.5), (["row-2"], False, 0.5)]
+        assert _partiql_walk(ddb, base + "(sk = 'row-1' OR sk = 'row-9')", Limit=1) == [
+            (["row-1"], True, 0.5), ([], False, 0.5)]
+        assert _partiql_walk(ddb, base + "sk BETWEEN 'row-1' AND 'row-2'", Limit=1) == [
+            (["row-1"], True, 0.5), (["row-2"], False, 0.5)]
+        assert _partiql_walk(ddb, base + "sk IN ['row-0', 'row-2']", ConsistentRead=True) == [(["row-2"], False, 2.0)]
+        assert _partiql_walk(ddb, f"SELECT * FROM \"{name}\" WHERE pk = 'p'", ConsistentRead=True) == [
+            (["row-1", "row-2", "row-3"], False, 1.0)]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_partiql_select_refusals(ddb):
+    name = _composite_table(ddb, "pq-err")
+    try:
+        cases = [
+            (f"SELECT * FROM \"{name}\" WHERE pk = 'a' AND (sk <= 'b' OR sk >= 'b')", {},
+             "Overlapping conditions with range keys are not supported in where clause"),
+            (f"SELECT * FROM \"{name}\" WHERE pk = 'a' AND (NOT sk = 's' OR x = 1)", {},
+             "Filter Expression can only contain non-primary key attributes: Primary key attribute: sk"),
+            (f"SELECT * FROM \"{name}\" WHERE pk = 1", {},
+             "Key attribute's data type should match its data type in table's schema: Key pk"),
+            (f"SELECT * FROM \"{name}\" WHERE pk = true", {},
+             "Key value must be of type S, N, or B. Key name: pk, Key type: BOOL"),
+        ]
+        for statement, extra, message in cases:
+            with pytest.raises(ClientError) as exc:
+                ddb.execute_statement(Statement=statement, **extra)
+            assert exc.value.response["Error"]["Code"] == "ValidationException"
+            assert exc.value.response["Error"]["Message"] == message
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_deep_write_lists_members_in_aws_order(ddb):
+    deep = {"S": "leaf"}
+    for _ in range(100):
+        deep = {"M": {"n": deep}}
+    with pytest.raises(ClientError) as exc:
+        ddb.delete_item(TableName="absent-deep-order", Key={"pk": {"S": "a"}}, Expected={"d": {"Value": deep}},
+                        ConditionalOperator="XOR", ReturnValues="BOGUS", ReturnConsumedCapacity="BOGUS")
+    assert exc.value.response["Error"]["Message"] == (
+        "3 validation errors detected: "
+        "Value 'BOGUS' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: "
+        "[ALL_NEW, UPDATED_OLD, ALL_OLD, NONE, UPDATED_NEW]; "
+        "Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [OR, AND]; "
+        "Value 'BOGUS' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: "
+        "[INDEXES, TOTAL, NONE]")
+
+
+def test_dynamodb_table_name_units(ddb):
+    two_emoji = "\U0001F600\U0001F600"
+    pattern = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+    with pytest.raises(ClientError) as exc:
+        ddb.get_item(TableName=two_emoji, Key={"pk": {"S": "a"}})
+    assert exc.value.response["Error"]["Message"] == (
+        f"1 validation error detected: Value '{two_emoji}' at 'tableName' failed to satisfy constraint: "
+        "Member must have length greater than or equal to 3")
+    with pytest.raises(ClientError) as exc:
+        ddb.describe_table(TableName=two_emoji)
+    assert exc.value.response["Error"]["Message"] == (
+        f"1 validation error detected: Value '{two_emoji}' at 'tableName' failed to satisfy constraint: {pattern}")
+
+
+def test_dynamodb_leading_underscore_in_expression(ddb):
+    name = _composite_table(ddb, "us")
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb.query(TableName=name, KeyConditionExpression="pk = :p", FilterExpression="attribute_exists(_x)",
+                      ExpressionAttributeValues={":p": {"S": "p"}})
+        assert exc.value.response["Error"]["Message"] == 'Invalid FilterExpression: Syntax error; token: "_", near: "(_x"'
+        with pytest.raises(ClientError) as exc:
+            ddb.update_item(TableName=name, Key={"pk": {"S": "p"}, "sk": {"S": "s"}}, UpdateExpression="SET _x = :v",
+                            ExpressionAttributeValues={":v": {"S": "v"}})
+        assert exc.value.response["Error"]["Message"] == (
+            '1 validation error detected: Invalid UpdateExpression: Syntax error; token: "_", near: "SET _x"')
+        ddb.query(TableName=name, KeyConditionExpression="pk = :p", FilterExpression="attribute_exists(#x)",
+                  ExpressionAttributeNames={"#x": "_x"}, ExpressionAttributeValues={":p": {"S": "p"}})
+    finally:
+        ddb.delete_table(TableName=name)
