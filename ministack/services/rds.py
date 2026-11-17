@@ -6984,6 +6984,15 @@ def _apply_cluster_request_fields(cluster, p):
             "enabled" if _p(p, "EnableLocalWriteForwarding") == "true" else "disabled")
 
 
+def _cluster_backup_retention_error(value):
+    if value and not (value.isdigit() and 1 <= int(value) <= 35):
+        return _invalid_parameter_value(
+            f"Invalid backup retention period: {_esc(value)}. "
+            "Retention period must be between 1 and 35."
+        )
+    return None
+
+
 def _create_db_cluster(p):
     with _shared_container_lock:
         return _create_db_cluster_impl(p)
@@ -7028,6 +7037,10 @@ def _create_db_cluster_impl(p):
             and explicit_subnet_group not in _subnet_groups):
         return _error("DBSubnetGroupNotFoundFault",
                       f"DB subnet group '{explicit_subnet_group}' does not exist.", 404)
+
+    retention_error = _cluster_backup_retention_error(_p(p, "BackupRetentionPeriod"))
+    if retention_error:
+        return retention_error
 
     engine = _p(p, "Engine") or "aurora-postgresql"
     if global_cluster:
@@ -7191,7 +7204,10 @@ def _create_db_cluster_impl(p):
                                     or f"default.{_aurora_cluster_family(engine, engine_version) or engine}"),
         "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
         "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
-        "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
+        # AWS reads the day names back in lower case.
+        "PreferredMaintenanceWindow": (
+            _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00"
+        ).lower(),
         "ClusterCreateTime": _format_time(now_ts),
         "EarliestRestorableTime": _format_time(now_ts),
         "LatestRestorableTime": _format_time(now_ts),
@@ -7571,6 +7587,13 @@ def _modify_db_cluster_impl(p):
         # AWS Aurora user guide, in-place upgrade tutorial.
         return _error("InvalidParameterCombination",
                       "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.", 400)
+    requested_scaling = _serverlessv2_from_params(p)
+    if requested_scaling:
+        scaling = {**(cluster.get("ServerlessV2ScalingConfiguration") or {}), **requested_scaling}
+        if scaling.get("MinCapacity", 0) > scaling.get("MaxCapacity", math.inf):
+            return _invalid_parameter_value(
+                "Serverless v2 minimum capacity must be less than or equal to maximum capacity"
+            )
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(
@@ -9226,7 +9249,12 @@ def _tag_resource_scope_error(arn):
     return None
 
 
-def _add_tags(p):
+def _add_tags_to_resource(p):
+    return _add_tags(p, allow_reserved=False)
+
+
+def _add_tags(p, allow_reserved=True):
+    """AddTagsToResource. Only an AWS service, such as CloudFormation, can set aws: keys."""
     arn = _p(p, "ResourceName")
     new_tags = _parse_tags(p)
     if not arn:
@@ -9234,6 +9262,8 @@ def _add_tags(p):
     scope_error = _tag_resource_scope_error(arn)
     if scope_error:
         return scope_error
+    if not allow_reserved and any(t["Key"].lower().startswith("aws:") for t in new_tags):
+        return _invalid_parameter_value('Tag keys cannot start with the reserved prefix "aws:".')
 
     existing = _tags.get(arn, [])
     existing_keys = {t["Key"]: i for i, t in enumerate(existing)}
@@ -12927,7 +12957,7 @@ _ACTION_MAP = {
     "DescribeOptionGroups": _describe_option_groups,
     "DescribeOptionGroupOptions": _describe_option_group_options,
     "ListTagsForResource": _list_tags,
-    "AddTagsToResource": _add_tags,
+    "AddTagsToResource": _add_tags_to_resource,
     "RemoveTagsFromResource": _remove_tags,
     "DescribeDBEngineVersions": _describe_engine_versions,
     "DescribeOrderableDBInstanceOptions": _describe_orderable_options,
