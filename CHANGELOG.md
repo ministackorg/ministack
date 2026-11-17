@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Step Functions — a workflow with no terminal state** — `ValidateStateMachineDefinition` always returned `OK`, and `CreateStateMachine` and `UpdateStateMachine` stored a definition whose top-level states never end. A machine with no top-level `Succeed`, `Fail`, or `End: true` now fails validation with `MISSING_END_STATE`, and create and update answer `InvalidDefinition` without writing the definition.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added

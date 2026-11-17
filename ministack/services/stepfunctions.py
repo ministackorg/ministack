@@ -379,6 +379,40 @@ def _validate_definition_jsonata(definition_str) -> str | None:
     return walk(definition, "")
 
 
+def _missing_end_state_diagnostic(definition_str):
+    """The MISSING_END_STATE diagnostic, or None.
+
+    AWS refuses a workflow whose top-level states never end. A state is
+    terminal when Type is exactly Succeed or Fail, or End is JSON true.
+    Only that top-level States map is read: a Succeed, Fail, or End true
+    nested in a Parallel branch or a Map processor does not count, and a
+    top-level terminal counts even when StartAt never reaches it. Unparsed
+    JSON, a missing or empty States, or a non-object state stays on the
+    path the other checks already take.
+    """
+    if not isinstance(definition_str, str):
+        return None
+    try:
+        definition = json.loads(definition_str)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(definition, dict):
+        return None
+    states = definition.get("States")
+    if not isinstance(states, dict) or not states:
+        return None
+    if not all(isinstance(state, dict) for state in states.values()):
+        return None
+    for state in states.values():
+        if state.get("Type") in ("Succeed", "Fail") or state.get("End") is True:
+            return None
+    return {
+        "severity": "ERROR",
+        "code": "MISSING_END_STATE",
+        "message": "Workflow has no terminal state",
+    }
+
+
 _ENCRYPTION_TYPES = ("AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY")
 # What AWS stores when a CUSTOMER_MANAGED_KMS_KEY configuration has no reuse period.
 _DEFAULT_KMS_DATA_KEY_REUSE_PERIOD = 300
@@ -544,6 +578,12 @@ def _create_state_machine(data):
     invalid = _validate_definition_jsonata(data.get("definition"))
     if invalid:
         return error_response_json("InvalidDefinition", invalid, 400)
+    if _missing_end_state_diagnostic(data.get("definition")):
+        return error_response_json(
+            "InvalidDefinition",
+            "Invalid State Machine Definition: "
+            "'MISSING_END_STATE: Workflow has no terminal state at null'",
+            400)
     if encryption is not None:
         invalid = _encryption_configuration_error(encryption)
         if invalid:
@@ -753,6 +793,12 @@ def _update_state_machine(data):
         invalid = _validate_definition_jsonata(data["definition"])
         if invalid:
             return error_response_json("InvalidDefinition", invalid, 400)
+        if _missing_end_state_diagnostic(data["definition"]):
+            return error_response_json(
+                "InvalidDefinition",
+                "Invalid State Machine Definition: "
+                "'MISSING_END_STATE: Workflow has no terminal state at null'",
+                400)
         sm["definition"] = data["definition"]
     if "roleArn" in data:
         sm["roleArn"] = data["roleArn"]
@@ -1715,6 +1761,9 @@ def _test_state(data):
 # ---------------------------------------------------------------------------
 
 def _validate_state_machine_definition(data):
+    diagnostic = _missing_end_state_diagnostic(data.get("definition"))
+    if diagnostic:
+        return json_response({"result": "FAIL", "diagnostics": [diagnostic]})
     return json_response({"result": "OK", "diagnostics": []})
 
 

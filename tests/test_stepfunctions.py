@@ -7105,6 +7105,153 @@ def test_sfn_validate_state_machine_definition_with_type(sfn):
     assert isinstance(resp["diagnostics"], list)
 
 
+def test_sfn_missing_end_state_rejected(sfn):
+    """A workflow whose top-level states never end is refused.
+
+    ValidateStateMachineDefinition returns FAIL with MISSING_END_STATE, and
+    CreateStateMachine and UpdateStateMachine answer InvalidDefinition
+    without storing the definition. A top-level Succeed, Fail, or End true
+    is enough, including one StartAt never reaches. End must be boolean
+    true, and a terminal nested under Parallel or Map does not count.
+    """
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    diagnostics = [{
+        "severity": "ERROR",
+        "code": "MISSING_END_STATE",
+        "message": "Workflow has no terminal state",
+    }]
+    message = (
+        "Invalid State Machine Definition: "
+        "'MISSING_END_STATE: Workflow has no terminal state at null'"
+    )
+    captured = json.dumps({
+        "StartAt": "A",
+        "TimeoutSeconds": 60,
+        "States": {
+            "A": {"Type": "Pass", "Next": "W"},
+            "W": {"Type": "Wait", "Seconds": 15, "Next": "A"},
+        },
+    })
+    self_wait = json.dumps({
+        "StartAt": "W",
+        "States": {"W": {"Type": "Wait", "Seconds": 1, "Next": "W"}},
+    })
+    succeed = json.dumps({
+        "StartAt": "Done",
+        "States": {"Done": {"Type": "Succeed"}},
+    })
+
+    def assert_refused(definition):
+        resp = sfn.validate_state_machine_definition(definition=definition)
+        assert resp["result"] == "FAIL"
+        assert resp["diagnostics"] == diagnostics
+        name = f"sfn-no-end-{_uuid_mod.uuid4().hex}"
+        with pytest.raises(ClientError) as exc:
+            sfn.create_state_machine(name=name, definition=definition, roleArn=role)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "InvalidDefinition"
+        assert err["Message"] == message
+        # The refused create stored nothing, so the same name can be created.
+        created = sfn.create_state_machine(name=name, definition=succeed, roleArn=role)
+        sfn.delete_state_machine(stateMachineArn=created["stateMachineArn"])
+
+    assert_refused(captured)
+    assert_refused(self_wait)
+    # End true is the boolean true only.
+    assert_refused(json.dumps({
+        "StartAt": "P",
+        "States": {"P": {"Type": "Pass", "End": "true"}},
+    }))
+    # A Succeed nested in a branch or processor does not make the parent terminal.
+    assert_refused(json.dumps({
+        "StartAt": "P",
+        "States": {
+            "P": {
+                "Type": "Parallel",
+                "Branches": [{"StartAt": "S", "States": {"S": {"Type": "Succeed"}}}],
+                "Next": "P",
+            },
+        },
+    }))
+    assert_refused(json.dumps({
+        "StartAt": "M",
+        "States": {
+            "M": {
+                "Type": "Map",
+                "ItemProcessor": {"StartAt": "S", "States": {"S": {"Type": "Succeed"}}},
+                "Next": "M",
+            },
+        },
+    }))
+
+    name = f"sfn-no-end-{_uuid_mod.uuid4().hex}"
+    arn = sfn.create_state_machine(name=name, definition=succeed, roleArn=role)["stateMachineArn"]
+    try:
+        before = sfn.describe_state_machine(stateMachineArn=arn)
+        with pytest.raises(ClientError) as exc:
+            sfn.update_state_machine(stateMachineArn=arn, definition=captured)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "InvalidDefinition"
+        assert err["Message"] == message
+        after = sfn.describe_state_machine(stateMachineArn=arn)
+        assert after["definition"] == before["definition"]
+        assert after["revisionId"] == before["revisionId"]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+    happy = [
+        succeed,
+        json.dumps({
+            "StartAt": "Boom",
+            "States": {"Boom": {"Type": "Fail", "Error": "E", "Cause": "C"}},
+        }),
+        json.dumps({
+            "StartAt": "P",
+            "States": {"P": {"Type": "Pass", "End": True}},
+        }),
+        json.dumps({
+            "StartAt": "A",
+            "TimeoutSeconds": 60,
+            "States": {
+                "A": {"Type": "Pass", "Next": "W"},
+                "W": {"Type": "Wait", "Seconds": 15, "Next": "A"},
+                "Done": {"Type": "Succeed"},
+            },
+        }),
+        json.dumps({
+            "StartAt": "P",
+            "States": {
+                "P": {
+                    "Type": "Parallel",
+                    "Branches": [{"StartAt": "S", "States": {"S": {"Type": "Succeed"}}}],
+                    "End": True,
+                },
+            },
+        }),
+    ]
+    for definition in happy:
+        resp = sfn.validate_state_machine_definition(definition=definition)
+        assert resp["result"] == "OK"
+        assert resp["diagnostics"] == []
+        created = sfn.create_state_machine(
+            name=f"sfn-end-ok-{_uuid_mod.uuid4().hex}",
+            definition=definition,
+            roleArn=role,
+        )
+        sfn.delete_state_machine(stateMachineArn=created["stateMachineArn"])
+
+    # Unparsed JSON, or States missing, empty, or not a map of objects, is not this error.
+    for definition in (
+        "not-json",
+        json.dumps({"StartAt": "A"}),
+        json.dumps({"StartAt": "A", "States": {}}),
+        json.dumps({"StartAt": "A", "States": {"A": "nope"}}),
+        json.dumps({"StartAt": "A", "States": []}),
+    ):
+        resp = sfn.validate_state_machine_definition(definition=definition)
+        assert resp["result"] == "OK"
+        assert resp["diagnostics"] == []
+
 
 def test_sfn_intrinsic_functions_batch_2(sfn, sfn_sync):
     """Test batch 2 intrinsic functions."""
