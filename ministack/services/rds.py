@@ -5247,7 +5247,36 @@ def _unregister_instance_from_clusters(db_id):
 # DB Instances
 # ---------------------------------------------------------------------------
 
+# CreateDBInstance calls in progress, by account, Region and identifier.
+# Handlers run on worker threads, so the existence check and the insert in
+# _create_db_instance_impl are not atomic. AWS accepts exactly one of several
+# concurrent creates of the same identifier.
+_instance_creates_in_progress = set()
+_instance_creates_guard = threading.Lock()
+
+
 def _create_db_instance(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    if not db_id:
+        return _create_db_instance_with_cluster_lock(p)
+    key = (get_account_id(), get_region(), db_id)
+    with _instance_creates_guard:
+        if db_id in _instances or key in _instance_creates_in_progress:
+            return _instance_already_exists()
+        _instance_creates_in_progress.add(key)
+    try:
+        return _create_db_instance_with_cluster_lock(p)
+    finally:
+        with _instance_creates_guard:
+            _instance_creates_in_progress.discard(key)
+
+
+def _instance_already_exists():
+    # As captured on AWS: the message does not name the instance.
+    return _error("DBInstanceAlreadyExists", "DB instance already exists", 400)
+
+
+def _create_db_instance_with_cluster_lock(p):
     cluster = None
     cluster_id = _p(p, "DBClusterIdentifier")
     cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
@@ -5271,7 +5300,7 @@ def _create_db_instance_impl(p):
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
-        return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
+        return _instance_already_exists()
 
     engine = _p(p, "Engine") or "postgres"
     explicit_engine_version = _p(p, "EngineVersion")
@@ -6331,6 +6360,10 @@ def _modify_db_instance(p):
         # Not PendingModifiedValues members: AWS applies these whatever ApplyImmediately says.
         if apply_immediately or param_key in _IMMEDIATE_INSTANCE_SETTINGS:
             instance[instance_key] = val
+            pending.pop(instance_key, None)
+        elif param_key == "DBInstanceClass" and val == instance.get(instance_key):
+            # As seen on AWS: asking again for the current class withdraws a
+            # deferred class change instead of queuing a no-op.
             pending.pop(instance_key, None)
         else:
             pending[instance_key] = val
