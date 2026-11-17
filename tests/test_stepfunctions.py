@@ -2807,12 +2807,13 @@ def test_sfn_aws_sdk_rds_remove_from_global_cluster(sfn, sfn_sync, rds):
     sm_name = f"sdk-rds-global-{_uuid_mod.uuid4().hex[:8]}"
     sm_arn = None
 
-    rds.create_db_cluster(
+    # RemoveFromGlobalCluster takes the member's ARN, as on AWS.
+    cluster_arn = rds.create_db_cluster(
         DBClusterIdentifier=cluster_id,
         Engine="aurora-postgresql",
         MasterUsername="admin",
         MasterUserPassword="testpass123",
-    )
+    )["DBCluster"]["DBClusterArn"]
     rds.create_global_cluster(
         GlobalClusterIdentifier=global_id,
         SourceDBClusterIdentifier=cluster_id,
@@ -2826,7 +2827,7 @@ def test_sfn_aws_sdk_rds_remove_from_global_cluster(sfn, sfn_sync, rds):
                 "Resource": "arn:aws:states:::aws-sdk:rds:removeFromGlobalCluster",
                 "Parameters": {
                     "GlobalClusterIdentifier": global_id,
-                    "DbClusterIdentifier": cluster_id,
+                    "DbClusterIdentifier": cluster_arn,
                 },
                 "ResultPath": "$.removeResult",
                 "Next": "DeleteGlobal",
@@ -2860,7 +2861,7 @@ def test_sfn_aws_sdk_rds_remove_from_global_cluster(sfn, sfn_sync, rds):
         try:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=cluster_id,
+                DbClusterIdentifier=cluster_arn,
             )
         except ClientError:
             pass
