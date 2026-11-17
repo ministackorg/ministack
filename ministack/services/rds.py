@@ -5160,6 +5160,11 @@ def _create_db_instance_input_error(p, engine, parent):
     if parent or engine.lower().startswith("aurora"):
         return None
 
+    if (storage_type or "").lower() == "standard":
+        return _invalid_parameter_combination(
+            "RDS can't create the DB instance because magnetic storage is deprecated. "
+            "Set StorageType to gp2, gp3, or io2."
+        )
     allocated = int(_p(p, "AllocatedStorage") or "20")
     if (storage_type or "").lower() == "gp3" and allocated < 20:
         return _storage_size_error(engine, storage_type, allocated)

@@ -18904,6 +18904,9 @@ _PI_RETENTION_VALID = (
      "Invalid security group , groupId= sg-00000000000000bad, groupName=."),
     ({"StorageType": "turbo-ssd-9000"}, "StorageTypeNotSupported",
      "Invalid storage type: turbo-ssd-9000"),
+    ({"StorageType": "standard"}, "InvalidParameterCombination",
+     "RDS can't create the DB instance because magnetic storage is deprecated. "
+     "Set StorageType to gp2, gp3, or io2."),
     ({"StorageType": "gp3", "AllocatedStorage": 5}, "InvalidParameterCombination",
      "Invalid storage size for engine name postgres and storage type gp3: 5"),
     ({"MaxAllocatedStorage": 21}, "InvalidParameterCombination",
@@ -18917,7 +18920,7 @@ _PI_RETENTION_VALID = (
     ({"EnablePerformanceInsights": True, "PerformanceInsightsRetentionPeriod": 94},
      "InvalidParameterValue",
      f"Invalid Performance Insights retention period. Valid values are: [{_PI_RETENTION_VALID}]"),
-], ids=["engine", "class", "security-group", "storage-type", "gp3-size", "max-storage",
+], ids=["engine", "class", "security-group", "storage-type", "magnetic-storage", "gp3-size", "max-storage",
         "username-length", "username-reserved", "password-length", "pi-retention"])
 def test_rds_create_db_instance_rejects_invalid_input(rds, overrides, code, message):
     """CreateDBInstance refuses each invalid field with the AWS error and creates nothing."""
