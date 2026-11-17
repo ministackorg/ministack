@@ -4661,7 +4661,7 @@ def test_rds_cluster_member_connection_fields_are_normalized(monkeypatch):
             "DBInstanceIdentifier": "credential-member",
             "DBClusterIdentifier": "credential-cluster",
             "DBInstanceClass": "db.r6g.large",
-            "Engine": "aurora-postgresql",
+            "Engine": "aurora-mysql",
             "MasterUsername": "wrong_admin",
             "MasterUserPassword": "wrong-password",
             "DBName": "wrong_db",
@@ -17835,7 +17835,7 @@ def test_rds_create_global_cluster_from_a_source_syncs_aliases(monkeypatch):
         "GlobalClusterMembers"].append({"DBClusterArn": cluster["DBClusterArn"], "IsWriter": is_writer}))
     monkeypatch.setattr(m, "_global_cluster_xml", lambda gc: "<x/>")
     monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases", synced.append)
-    assert m._create_global_cluster({"GlobalClusterIdentifier": ["empty"]})[0] == 200
+    assert m._create_global_cluster({"GlobalClusterIdentifier": ["empty"], "Engine": ["aurora-postgresql"]})[0] == 200
     assert synced == []
     assert m._create_global_cluster(
         {"GlobalClusterIdentifier": ["fromsrc"], "SourceDBClusterIdentifier": ["src"]})[0] == 200

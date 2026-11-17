@@ -58,6 +58,7 @@ import socket
 import tarfile
 import threading
 import time
+import unicodedata
 import uuid
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
@@ -4652,7 +4653,8 @@ def _flatten_json_request_params(params, data):
 
 
 def _handle_request_sync(method, path, headers, body, query_params):
-    params = dict(query_params)
+    params = filter_query_params(query_params)
+    query_action = _query_action(params)
     if method == "POST" and body:
         raw = body if isinstance(body, str) else body.decode("utf-8-sig", errors="replace")
         stripped = raw.lstrip()
@@ -4668,8 +4670,7 @@ def _handle_request_sync(method, path, headers, body, query_params):
             except json.JSONDecodeError:
                 pass
         if not merged_json:
-            form_params = parse_qs(raw)
-            for k, v in form_params.items():
+            for k, v in parse_form_body(raw, query_action).items():
                 params[k] = v
 
     target = headers.get("x-amz-target", "") or headers.get("X-Amz-Target", "")
@@ -5073,10 +5074,525 @@ def _unregister_instance_from_clusters(db_id):
 
 
 # ---------------------------------------------------------------------------
+# Engine and typed-integer request validation (AWS captures)
+# ---------------------------------------------------------------------------
+
+_CLUSTER_ENGINES = frozenset({"aurora-postgresql", "aurora-mysql", "docdb", "neptune"})
+_GLOBAL_ENGINES = _CLUSTER_ENGINES
+# Engines CreateDBCluster answers with the C2 version-family errors.
+_CLUSTER_VERSION_FAMILY_ENGINES = frozenset({
+    "mariadb", "oracle-ee", "oracle-se2", "oracle-ee-cdb", "oracle-se2-cdb",
+    "sqlserver-ex", "sqlserver-se", "sqlserver-web", "sqlserver-ee", "sqlserver-dev-ee",
+    "db2-se", "db2-ae", "db2-ce",
+    "custom-sqlserver-ee", "custom-sqlserver-se", "custom-sqlserver-web", "custom-sqlserver-dev",
+})
+# CreateDBInstance engines; those without a runtime stay metadata-only.
+# oracle-se and oracle-se1 are retired editions that pass the engine check, then
+# behave like aurora (I1ose, I5cx).
+_RETIRED_INSTANCE_ENGINES = frozenset({"aurora", "oracle-se", "oracle-se1"})
+_INSTANCE_ENGINES = _CLUSTER_ENGINES | _CLUSTER_VERSION_FAMILY_ENGINES | _RETIRED_INSTANCE_ENGINES | frozenset({
+    "postgres", "mysql",
+})
+# Internal names AWS uses for these engines in ModifyDBInstance errors.
+_ENGINE_INTERNAL_NAMES = {
+    "aurora-postgresql": "manfred",
+    "aurora": "oscar",
+    "neptune": "graphdb",
+    "docdb": "chimera",
+    "custom-oracle-ee": "flex-oracle-ee",
+    "custom-oracle-ee-cdb": "flex-oracle-ee-cdb",
+    "custom-oracle-se2": "flex-oracle-se2",
+    "custom-oracle-se2-cdb": "flex-oracle-se2-cdb",
+}
+_CUSTOM_ORACLE_ENGINES = frozenset({
+    "custom-oracle-ee", "custom-oracle-ee-cdb", "custom-oracle-se2", "custom-oracle-se2-cdb",
+})
+_INT32_RE = re.compile(r"[+-]?\d+")
+_MESSAGE_ESCAPES = {'"': "&quot;"}
+
+
+def _escape_message(message):
+    """XML-escape an error message that echoes a request value (AWS captures)."""
+    return _esc(str(message), _MESSAGE_ESCAPES)
+
+
+# Blank POST values the parser keeps, per action (captured members only):
+# a blank Engine, SourceDBClusterIdentifier or typed integer gets its own
+# answer on AWS. Every other blank value is dropped.
+_ENGINE_BLANK_ACTIONS = frozenset({
+    "CreateDBInstance", "CreateDBCluster", "CreateGlobalCluster", "ModifyDBInstance",
+    "RestoreDBInstanceFromDBSnapshot", "RestoreDBInstanceToPointInTime",
+    "RestoreDBClusterFromSnapshot", "RestoreDBInstanceFromS3", "RestoreDBClusterFromS3",
+    "DescribeDBEngineVersions", "DescribeOrderableDBInstanceOptions",
+})
+_MODIFY_INSTANCE_INTEGER_MEMBERS = (
+    "DBPortNumber", "AllocatedStorage", "BackupRetentionPeriod", "Iops", "MaxAllocatedStorage",
+    "MonitoringInterval", "PromotionTier", "StorageThroughput",
+)
+_SERVERLESSV2_MEMBERS = (
+    "ServerlessV2ScalingConfiguration.MinCapacity", "ServerlessV2ScalingConfiguration.MaxCapacity",
+)
+_MODIFY_CLUSTER_INTEGER_MEMBERS = ("Port", "BackupRetentionPeriod", "AllocatedStorage", "Iops")
+_BLANK_KEPT_MEMBERS = {
+    "CreateDBInstance": frozenset({
+        "Port", "AllocatedStorage", "BackupRetentionPeriod", "Iops", "MonitoringInterval",
+        "PromotionTier", "StorageThroughput", "MaxAllocatedStorage", "EngineVersion",
+        "DBInstanceClass",
+    }),
+    "CreateDBCluster": frozenset({
+        "Port", "BackupRetentionPeriod", "Iops", "AllocatedStorage", "EngineVersion",
+        "MonitoringInterval", "BacktrackWindow", *_SERVERLESSV2_MEMBERS,
+    }),
+    "CreateGlobalCluster": frozenset({"SourceDBClusterIdentifier"}),
+    "CreateOptionGroup": frozenset({"MajorEngineVersion"}),
+    "ModifyDBInstance": frozenset(_MODIFY_INSTANCE_INTEGER_MEMBERS),
+    "ModifyDBCluster": frozenset({
+        *_MODIFY_CLUSTER_INTEGER_MEMBERS, "MonitoringInterval", "BacktrackWindow",
+        *_SERVERLESSV2_MEMBERS,
+    }),
+    "RestoreDBInstanceFromDBSnapshot": frozenset({
+        "Port", "Iops", "AllocatedStorage", "BackupRetentionPeriod", "StorageThroughput",
+    }),
+    "CreateDBInstanceReadReplica": frozenset({
+        "Port", "MaxAllocatedStorage", "Iops", "AllocatedStorage", "MonitoringInterval",
+        "StorageThroughput",
+    }),
+}
+
+
+_FILTER_ACTIONS = frozenset({
+    "DescribeDBInstances", "DescribeDBClusters", "DescribeDBEngineVersions",
+    "DescribeDBSnapshots", "DescribeDBClusterSnapshots",
+})
+_FILTER_NAME_KEY_RE = re.compile(r"Filters\.(?:Filter|member)\.[+-]?[0-9]+\.Name")
+_FILTER_VALUES_MARKER_RE = re.compile(r"Filters\.(?:Filter|member)\.[0-9]+\.Values")
+
+
+def _query_action(query_params):
+    value = query_params.get("Action") or [""]
+    return value[0] if isinstance(value, list) and value else (value if isinstance(value, str) else "")
+
+
+def filter_query_params(query_params):
+    """B1q: apply the body's blank-keep list to the query string."""
+    if not any(v == "" or v == [""] or (isinstance(v, list) and "" in v) for v in query_params.values()):
+        return dict(query_params)
+    parsed = {k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()}
+    return _filter_blanks(parsed, _query_action(parsed))
+
+
+def parse_form_body(raw, query_action=""):
+    """Parse a form-encoded body, keeping blank values only where AWS answers them."""
+    parsed = parse_qs(raw, keep_blank_values=True)
+    action = (parsed.get("Action") or [""])[0] or query_action
+    return _filter_blanks(parsed, action)
+
+
+def _filter_blanks(parsed, action):
+    kept = _BLANK_KEPT_MEMBERS.get(action, frozenset())
+    keep_engine = action in _ENGINE_BLANK_ACTIONS
+    params = {}
+    # F1b: blank values of an engine filter are kept.
+    engine_value_prefixes = tuple(
+        key[: -len("Name")] + "Values."
+        for key, values in parsed.items()
+        if action in _FILTER_ACTIONS and values and values[0] == "engine"
+        and _FILTER_NAME_KEY_RE.fullmatch(key)
+    )
+    for key, values in parsed.items():
+        if key in kept or (keep_engine and key == "Engine") or (
+            action in _FILTER_ACTIONS and _FILTER_VALUES_MARKER_RE.fullmatch(key)
+        ) or (engine_value_prefixes and key.startswith(engine_value_prefixes)):
+            params[key] = values
+            continue
+        values = [v for v in values if v != ""]
+        if values:
+            params[key] = values
+    return params
+_INTERNAL_FAILURE_MESSAGE = "An internal error has occurred. Please try your query again at a later time."
+
+
+def _malformed_input_error(message=None):
+    body = "<ErrorResponse xmlns=\"http://rds.amazonaws.com/doc/2014-10-31/\">\n    <Error><Type>Sender</Type><Code>MalformedInput</Code>"
+    if message:
+        body += f"<Message>{_escape_message(message)}</Message>"
+    body += f"</Error>\n    <RequestId>{new_uuid()}</RequestId>\n</ErrorResponse>"
+    return 400, {"Content-Type": "application/xml"}, body.encode("utf-8")
+
+
+def _typed_integer_error(p, keys, bits=32):
+    """MalformedInput for a typed integer member that is not a signed 32- or 64-bit integer."""
+    for key in keys:
+        if key not in p:
+            continue
+        value = _p(p, key)
+        if value == "":
+            return _malformed_input_error(
+                "missing value for decimal type" if bits == 32 else "missing value for long type"
+            )
+        if not _INT32_RE.fullmatch(value):
+            return _malformed_input_error()
+        number = _int32_value(value, bits)
+        if number is None:
+            return _malformed_input_error()
+        # Later int() calls then never see a padded or non-ASCII spelling.
+        p[key] = [str(number)]
+    return None
+
+
+def _int32_value(value, bits=32):
+    """The int of a validated integer string, or None outside int32/int64 (W1len: no length cap)."""
+    digits = "".join(str(unicodedata.decimal(c)) for c in value.lstrip("+-")).lstrip("0")
+    # Stripping the zeros first keeps int() clear of its 4300-digit limit.
+    if len(digits) > 19:
+        return None
+    number = -int(digits or "0") if value[0] == "-" else int(digits or "0")
+    return number if -(2 ** (bits - 1)) <= number <= 2 ** (bits - 1) - 1 else None
+
+
+_JAVA_DOUBLE_RE = re.compile(
+    r"[+-]?(?:NaN|Infinity"
+    r"|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[fFdD]?"
+    r"|0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)[pP][+-]?[0-9]+[fFdD]?)"
+)
+
+def _java_double(value):
+    """W1sv2: the float of a Java Double.parseDouble spelling, or None when it is refused."""
+    text = value.strip("".join(chr(c) for c in range(0x21)))
+    if not _JAVA_DOUBLE_RE.fullmatch(text):
+        return None
+    if text[-1] in "fFdD":
+        text = text[:-1]
+    try:
+        if "x" in text.lower():
+            return float.fromhex(text)
+        return float(text)
+    except OverflowError:
+        return float("-inf") if text.startswith("-") else float("inf")
+
+
+def _serverlessv2_input_error(p):
+    """W1sv2: MalformedInput for a MinCapacity/MaxCapacity that Java would not parse."""
+    for key in _SERVERLESSV2_MEMBERS:
+        if key not in p:
+            continue
+        value = _p(p, key)
+        if value == "":
+            return _malformed_input_error("missing value for double type")
+        if _java_double(value) is None:
+            return _malformed_input_error()
+    return None
+
+
+def _cluster_typed_input_error(p, integers):
+    """W1, W1x2 and W1sv2, in the order AWS checks them."""
+    return (
+        _typed_integer_error(p, integers)
+        or _typed_integer_error(p, ("MonitoringInterval",))
+        or _typed_integer_error(p, ("BacktrackWindow",), bits=64)
+        or _serverlessv2_input_error(p)
+    )
+
+
+def _engine_control_char_error(p):
+    engine = _p(p, "Engine")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in engine):
+        return _error(
+            "InvalidParameterValue",
+            "The input isn't valid. Input can't contain control characters.",
+            400,
+        )
+    return None
+
+
+_STANDALONE_REFUSED_ENGINES = frozenset({"aurora-postgresql", "aurora-mysql", "neptune"})
+_STANDALONE_REFUSED_DEFAULTS = {
+    # engine: (default EngineVersion, LicenseModel) AWS echoes in the message
+    "aurora-postgresql": ("17.9", "postgresql-license"),
+    "aurora-mysql": ("8.0.mysql_aurora.3.10.3", "general-public-license"),
+    "neptune": ("1.4.8.0", "amazon-license"),
+}
+
+
+# D1: engines the describe calls recognize (the CreateDBInstance set minus aurora).
+_DESCRIBE_ENGINES = _INSTANCE_ENGINES - _RETIRED_INSTANCE_ENGINES
+
+
+def _noncharacter_echo(value):
+    """X2: AWS answers an empty 400 where it would echo U+FFFE or U+FFFF."""
+    return "\ufffe" in value or "\uffff" in value
+
+
+def _empty_400():
+    return 400, {"Content-Type": "application/xml"}, b""
+
+
+def _unrecognized_engine_error(engine, x2=False):
+    if x2 and _noncharacter_echo(engine):
+        return _empty_400()
+    # D1lc: AWS names the value lower-cased.
+    return _error("InvalidParameterValue", f"Unrecognized engine name: {engine.lower()}", 400)
+
+
+_FILTER_KEY_RE = re.compile(r"Filters\.(?:Filter|member)\.([+-]?[0-9]+)\.(.+)", re.DOTALL)
+_SNAPSHOT_DESCRIBES = ("DescribeDBSnapshots", "DescribeDBClusterSnapshots")
+_ILLEGAL_INDEX_FLOOR = "999999999"
+
+
+def _messageless_error(code):
+    """A 400 Sender error with no Message element (F1s)."""
+    body = (
+        '<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">\n'
+        f"    <Error><Type>Sender</Type><Code>{code}</Code></Error>\n"
+        f"    <RequestId>{new_uuid()}</RequestId>\n</ErrorResponse>"
+    )
+    return 400, {"Content-Type": "application/xml"}, body.encode("utf-8")
+
+
+def _null_filter_name_error(p):
+    if _p(p, "Action") in _SNAPSHOT_DESCRIBES:
+        return _messageless_error("InvalidParameterValue")
+    return _error("InvalidParameterValue", "Unrecognized filter name: null", 400)
+
+
+def _index_token_error(p, token, is_filter):
+    """F1 steps 1-4 for one index token as sent."""
+    if token[0] == "-":
+        return _malformed_input_error(f"Key {token} may not have a leading '-'")
+    if token[0] == "+":
+        if is_filter:
+            return _null_filter_name_error(p)
+        return _malformed_input_error("Start of list found where not expected")
+    stripped = token.lstrip("0")
+    if not stripped:
+        return _malformed_input_error("0 is not a valid index")
+    # Compared as digit strings: a 4301-digit index never reaches int().
+    if len(stripped) > len(_ILLEGAL_INDEX_FLOOR) or (
+        len(stripped) == len(_ILLEGAL_INDEX_FLOOR) and stripped >= _ILLEGAL_INDEX_FLOOR
+    ):
+        return _malformed_input_error(f"Index {token} is illegal")
+    return None
+
+
+def _sparse_error(p, tokens, is_filter):
+    """F1 steps 5 and 6: one pass over the sorted indexes of one list."""
+    previous = 0
+    for number in sorted({int(t.lstrip("0")) for t in tokens}):
+        skip = number - previous - 1
+        if skip > 10:
+            return _malformed_input_error(
+                f"Excessively sparse input would skip {skip:,} list elements"
+            )
+        if skip > 0 and is_filter:
+            return _null_filter_name_error(p)
+        previous = number
+    return None
+
+
+def _engine_filter_prefixes(p):
+    """Key prefixes (``Filters.Filter.N.``) of the filters named engine, by index."""
+    found = []
+    for key in p:
+        match = _FILTER_KEY_RE.fullmatch(key)
+        if match and match.group(2) == "Name" and _p(p, key) == "engine":
+            token = match.group(1)
+            stripped = token.lstrip("+-0")
+            found.append(((len(stripped), stripped), key[: -len("Name")]))
+    return [prefix for _, prefix in sorted(found, key=lambda f: f[0])]
+
+
+def _has_control_character(value):
+    return any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+
+
+def _control_character_error():
+    return _error(
+        "InvalidParameterValue",
+        "The input isn't valid. Input can't contain control characters.",
+        400,
+    )
+
+
+def _filter_shape_error(p):
+    """F1 steps 1-6 on a request with an engine filter: every filter index, then its value indexes."""
+    prefixes = _engine_filter_prefixes(p)
+    if not prefixes:
+        return None
+    tokens = []
+    for key in p:
+        match = _FILTER_KEY_RE.fullmatch(key)
+        if match and match.group(1) not in tokens:
+            tokens.append(match.group(1))
+    for token in tokens:
+        if error := _index_token_error(p, token, True):
+            return error
+    if error := _sparse_error(p, tokens, True):
+        return error
+    for prefix in prefixes:
+        value_re = re.compile(re.escape(prefix) + r"Values\.(?:Value|member)\.([+-]?[0-9]+)")
+        values = [m.group(1) for key in p if (m := value_re.fullmatch(key))]
+        for token in values:
+            if error := _index_token_error(p, token, False):
+                return error
+        if error := _sparse_error(p, values, False):
+            return error
+    return None
+
+
+def _engine_filter_value_error(p):
+    """F1v, then step 7 (I3r, D1lc) on the values of the engine filters."""
+    prefixes = _engine_filter_prefixes(p)
+    snapshots = _p(p, "Action") in _SNAPSHOT_DESCRIBES
+    for prefix in prefixes:
+        marker = prefix + "Values"
+        has_values = any(k.startswith(prefix + "Values.") for k in p)
+        if snapshots and (marker in p or not has_values):
+            return _error("InvalidParameterCombination", "Invalid value '' for filter engine", 400)
+        if marker in p and not has_values:
+            return _error(
+                "InvalidParameterCombination", "The list of Engine Names must not be empty.", 400,
+            )
+        if not has_values:
+            return _error(
+                "InvalidParameterCombination",
+                "The values list cannot be null for the filter engine.", 400,
+            )
+    for prefix in prefixes:
+        value_re = re.compile(re.escape(prefix) + r"Values\.(?:Value|member)\.([0-9]+)")
+        by_index = {}
+        for key in p:
+            if match := value_re.fullmatch(key):
+                by_index.setdefault(int(match.group(1).lstrip("0")), key)
+        expected = 1
+        for index in sorted(by_index):
+            # A gap in the indexes reads as a blank value.
+            value = _p(p, by_index[index]) if index == expected else ""
+            if value == "":
+                return _error(
+                    "InvalidParameterCombination", "Invalid value '' for filter engine", 400,
+                )
+            expected += 1
+            if _has_control_character(value):
+                return _control_character_error()
+            if value.lower() not in _DESCRIBE_ENGINES:
+                return _unrecognized_engine_error(value, x2=True)
+    return None
+
+
+def _engine_filter_error(p):
+    """F1, I3r and D1: the ``engine`` filter of a describe call."""
+    return _filter_shape_error(p) or _engine_filter_value_error(p)
+
+
+def _docdb_cluster_required_error():
+    return _error(
+        "InvalidParameterCombination", "DBClusterIdentifier is required for engine docdb", 400,
+    )
+
+
+def _unsupported_instance_combination_error(p, engine):
+    """I5: an engine that only runs inside a cluster, created as a standalone instance."""
+    default_version, license_model = _STANDALONE_REFUSED_DEFAULTS[engine]
+    return _error(
+        "InvalidParameterCombination",
+        "RDS does not support creating a DB instance with the following combination: "
+        f"DBInstanceClass={_p(p, 'DBInstanceClass')}, Engine={engine}, "
+        f"EngineVersion={_p(p, 'EngineVersion') or default_version}, "
+        f"LicenseModel={license_model}. For supported combinations of instance class "
+        "and database engine version, see the documentation.",
+        400,
+    )
+
+
+_DB_IDENTIFIER_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}")
+_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
+_I5P_CLASS_ALLOWLIST = frozenset({
+    "db.t3.micro", "db.t4g.micro", "db.r6g.large", "db.m5.24xlarge", "db.x2g.16xlarge",
+    "db.serverless",
+})
+
+
+def _retired_instance_engine_error(p, engine):
+    """I5c/I5cv/I5p: a standalone aurora, oracle-se or oracle-se1 instance is never created.
+
+    With an EngineVersion member (blank included) AWS names the version; without
+    one it checks the identifier format and the class shape (Q21) and then fails
+    with a 500.
+    """
+    if "EngineVersion" in p:
+        return _error(
+            "InvalidParameterCombination",
+            f"Cannot find version {_p(p, 'EngineVersion')} for {engine}",
+            400,
+        )
+    db_id = _p(p, "DBInstanceIdentifier")
+    if db_id and (len(db_id) > 63 or not _ASCII_LETTER_RE.match(db_id)):
+        return _error("InvalidParameterValue", f"Invalid database identifier:  {db_id}", 400)
+    if db_id and (not _DB_IDENTIFIER_RE.fullmatch(db_id) or db_id.endswith("-") or "--" in db_id):
+        return _error(
+            "InvalidParameterValue",
+            "The parameter DBInstanceIdentifier is not a valid identifier. Identifiers must "
+            "begin with a letter; must contain only ASCII letters, digits, and hyphens; and "
+            "must not end with a hyphen or contain two consecutive hyphens.",
+            400,
+        )
+    # Q27: only these six classes reach the 500 (case ignored).
+    if "DBInstanceClass" not in p:
+        return _error("InvalidParameterValue", "Invalid DB Instance class: null", 400)
+    db_class = _p(p, "DBInstanceClass")
+    if db_class.lower() not in _I5P_CLASS_ALLOWLIST:
+        return _error(
+            "InvalidParameterValue", f"Invalid DB Instance class: {db_class}", 400,
+        )
+    return _internal_failure_error()
+
+
+def _invalid_engine_error():
+    return _error("InvalidParameterValue", "Invalid DB engine", 400)
+
+
+def _internal_failure_error():
+    return _error("InternalFailure", _INTERNAL_FAILURE_MESSAGE, 500)
+
+
+_INSTANCE_INTEGER_MEMBERS = (
+    "Port", "AllocatedStorage", "BackupRetentionPeriod", "Iops", "MonitoringInterval",
+    "PromotionTier", "StorageThroughput", "MaxAllocatedStorage",
+)
+
+
+# ---------------------------------------------------------------------------
 # DB Instances
 # ---------------------------------------------------------------------------
 
+def _version_tokens(version):
+    """I8v-norm: alphanumeric runs of a version; decimal runs compare as integers."""
+    tokens = []
+    run = ""
+    for ch in version + " ":
+        if ch.isalnum():
+            run += ch
+            continue
+        if run:
+            tokens.append(int(run) if run.isdecimal() else run.lower())
+            run = ""
+    return tokens
+
+
+def _member_version_matches(member_version, cluster_version, engine):
+    """I8v-norm: the member's version equals the cluster's, or its major (aurora engines)."""
+    member = _version_tokens(member_version)
+    cluster = _version_tokens(cluster_version)
+    if member == cluster:
+        return True
+    major_tokens = {"aurora-postgresql": 1, "aurora-mysql": 2}.get(engine)
+    return major_tokens is not None and member == cluster[:major_tokens]
+
+
 def _create_db_instance(p):
+    early_error = _typed_integer_error(p, _INSTANCE_INTEGER_MEMBERS) or _engine_control_char_error(p)
+    if early_error:
+        return early_error
     cluster = None
     cluster_id = _p(p, "DBClusterIdentifier")
     cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
@@ -5097,16 +5613,43 @@ def _create_db_instance(p):
 
 def _create_db_instance_impl(p):
     db_id = _p(p, "DBInstanceIdentifier")
-    if not db_id:
-        return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
     if db_id in _instances:
         return _error("DBInstanceAlreadyExists", f"DB instance {db_id} already exists", 400)
 
-    engine = _p(p, "Engine") or "postgres"
+    engine = _p(p, "Engine").lower()
+    cluster_id_param = _p(p, "DBClusterIdentifier")
+    if engine == "docdb" and not cluster_id_param:
+        return _docdb_cluster_required_error()
+    if not db_id:
+        return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
+
+    # AWS resolves the cluster before it looks at the engine.
+    # AWS joins a cluster only by its plain id. A cluster ARN, even of an existing
+    # cluster, and an id that names no cluster are not found.
+    parent = None
+    if cluster_id_param and not _parse_rds_arn(cluster_id_param):
+        parent = _resolve_cluster_in_request_region(cluster_id_param)
+    if cluster_id_param and not parent:
+        return _error(
+            "DBClusterNotFoundFault",
+            f"The source cluster could not be found or cannot be accessed: {_esc(cluster_id_param)}",
+            404,
+        )
+
+    if engine not in _INSTANCE_ENGINES:
+        return _invalid_engine_error()
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
+    # A member's version is compared with its cluster's instead (I8v below).
+    engine_version_error = None if parent else _unsupported_aurora_engine_version_error(
+        engine, explicit_engine_version,
+    )
     if engine_version_error:
         return engine_version_error
+    if not parent:
+        if engine in _RETIRED_INSTANCE_ENGINES:
+            return _retired_instance_engine_error(p, engine)
+        if engine in _STANDALONE_REFUSED_ENGINES:
+            return _unsupported_instance_combination_error(p, engine)
     engine_version = explicit_engine_version or _default_engine_version(engine)
     db_class = _p(p, "DBInstanceClass") or "db.t3.micro"
     master_user = _p(p, "MasterUsername") or "admin"
@@ -5115,20 +5658,6 @@ def _create_db_instance_impl(p):
     port = int(_p(p, "Port") or _default_port(engine))
 
     # Inherit credentials from cluster when instance is a cluster member.
-    cluster_id_param = _p(p, "DBClusterIdentifier")
-    parent = None
-    if cluster_id_param:
-        # AWS joins a cluster only by its plain id. A cluster ARN, even of an
-        # existing cluster, and an id that names no cluster are not found.
-        if not _parse_rds_arn(cluster_id_param):
-            parent = _resolve_cluster_in_request_region(cluster_id_param)
-        if parent is None:
-            return _error(
-                "DBClusterNotFoundFault",
-                "The source cluster could not be found or cannot be accessed: "
-                f"{_esc(cluster_id_param)}",
-                404,
-            )
     if parent:
         if parent.get("_shared_legacy_migration_in_progress"):
             return _error(
@@ -5153,6 +5682,23 @@ def _create_db_instance_impl(p):
                 "InvalidDBClusterStateFault",
                 f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
                 "state but expected it to be one of available.",
+                400,
+            )
+        if engine != str(parent.get("Engine", engine)).lower():
+            return _error(
+                "InvalidParameterCombination",
+                f"The engine name requested for your DB instance ({engine}) doesn't match "
+                f"the engine name of your DB cluster ({parent.get('Engine')}).",
+                400,
+            )
+        if explicit_engine_version and not _member_version_matches(
+            explicit_engine_version, parent.get("EngineVersion", ""), engine,
+        ):
+            return _error(
+                "InvalidParameterCombination",
+                "The engine version that you requested for your DB instance "
+                f"({explicit_engine_version}) does not match the engine version of your "
+                f"DB cluster ({parent.get('EngineVersion')}).",
                 400,
             )
         cluster_id_param = parent["DBClusterIdentifier"]
@@ -5872,6 +6418,8 @@ def _delete_db_instance_impl(p):
 
 
 def _describe_db_instances(p):
+    if filter_error := _engine_filter_error(p):
+        return filter_error
     db_id = _p(p, "DBInstanceIdentifier")
     if db_id:
         instance = _resolve_instance(db_id)
@@ -5991,7 +6539,7 @@ def _subnet_group_record(name):
     })
 
 
-def _apply_instance_request_overrides(instance, p):
+def _apply_instance_request_overrides(instance, p, skip=()):
     """Request fields CreateDBInstanceReadReplica and RestoreDBInstanceFromDBSnapshot set on the new instance."""
     for param, key, kind in (
         ("DBInstanceClass", "DBInstanceClass", str), ("AvailabilityZone", "AvailabilityZone", str),
@@ -6007,7 +6555,7 @@ def _apply_instance_request_overrides(instance, p):
         ("PreferredBackupWindow", "PreferredBackupWindow", str),
     ):
         val = _p(p, param)
-        if val:
+        if val and param not in skip:
             instance[key] = val == "true" if kind is bool else kind(val)
     if _p(p, "Port"):
         instance["Endpoint"] = {**instance.get("Endpoint", {}), "Port": int(_p(p, "Port"))}
@@ -6060,7 +6608,29 @@ def _rename_db_instance(instance, new_id):
             member["DBInstanceIdentifier"] = new_id
 
 
+def _modify_engine_error(instance, requested):
+    """M1: ModifyDBInstance cannot change the engine; blank or the same engine is a no-op."""
+    requested = requested.lower()
+    stored = str(instance.get("Engine") or "").lower()
+    if not requested or requested == stored:
+        return None
+    if _noncharacter_echo(requested) or _noncharacter_echo(stored):
+        return _empty_400()
+    return _error(
+        "InvalidParameterCombination",
+        "Modification of database from engine "
+        f"{_ENGINE_INTERNAL_NAMES.get(stored, stored)} to engine "
+        f"{_ENGINE_INTERNAL_NAMES.get(requested, requested)} is not supported.",
+        400,
+    )
+
+
 def _modify_db_instance(p):
+    early_error = _typed_integer_error(
+        p, _MODIFY_INSTANCE_INTEGER_MEMBERS,
+    ) or _engine_control_char_error(p)
+    if early_error:
+        return early_error
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
@@ -6089,6 +6659,10 @@ def _modify_db_instance(p):
     )
     if engine_version_error:
         return engine_version_error
+
+    engine_change_error = _modify_engine_error(instance, _p(p, "Engine"))
+    if engine_change_error:
+        return engine_change_error
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
 
@@ -6458,6 +7032,15 @@ def _finish_instance_reboot(instance, cluster):
 # ---------------------------------------------------------------------------
 
 def _create_read_replica(p):
+    if early_error := _typed_integer_error(
+        p, ("Port", "MaxAllocatedStorage", "Iops", "AllocatedStorage", "MonitoringInterval",
+            "StorageThroughput"),
+    ):
+        return early_error
+    # R3: AWS does not type BackupRetentionPeriod here; a non-integer reads as absent.
+    # More than 4300 digits is beyond int(), so it reads as absent too.
+    if not re.fullmatch(r"[0-9]{1,4300}", _p(p, "BackupRetentionPeriod")):
+        p.pop("BackupRetentionPeriod", None)
     source_id = _p(p, "SourceDBInstanceIdentifier")
     replica_id = _p(p, "DBInstanceIdentifier")
 
@@ -6510,6 +7093,14 @@ def _create_read_replica(p):
 # ---------------------------------------------------------------------------
 
 def _restore_from_snapshot(p):
+    early_error = (
+        _typed_integer_error(
+            p, ("Port", "Iops", "AllocatedStorage", "BackupRetentionPeriod", "StorageThroughput"),
+        )
+        or _engine_control_char_error(p)
+    )
+    if early_error:
+        return early_error
     db_id = _p(p, "DBInstanceIdentifier")
     snap_id = _p(p, "DBSnapshotIdentifier")
 
@@ -6519,6 +7110,19 @@ def _restore_from_snapshot(p):
     snap = _snapshots.get(snap_id)
     if not snap:
         return _error("DBSnapshotNotFound", f"DBSnapshot {snap_id} not found.", 404)
+
+    if "Engine" in p:
+        requested_engine = _p(p, "Engine").lower()
+        if requested_engine not in _INSTANCE_ENGINES:
+            return _invalid_engine_error()
+        if requested_engine == "docdb":
+            return _docdb_cluster_required_error()
+        if requested_engine != str(snap.get("Engine", "postgres")).lower():
+            return _error(
+                "InvalidParameterCombination",
+                "Requested DBSnapshot and Engine are incompatible.",
+                400,
+            )
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{db_id}"
     instance = {
@@ -6573,7 +7177,8 @@ def _restore_from_snapshot(p):
         "TagList": [],
         "_docker_container_id": None,
     }
-    _apply_instance_request_overrides(instance, p)
+    # R1mi: this action does not read MonitoringInterval.
+    _apply_instance_request_overrides(instance, p, skip=("MonitoringInterval",))
     _instances[db_id] = instance
     return _single_instance_response("RestoreDBInstanceFromDBSnapshotResponse",
                                      "RestoreDBInstanceFromDBSnapshotResult", instance)
@@ -6634,8 +7239,8 @@ def _serverlessv2_from_params(p):
     out = {}
     for key, field in (("MinCapacity", "MinCapacity"), ("MaxCapacity", "MaxCapacity")):
         raw = _p(p, f"{prefix}{key}")
-        if raw not in (None, ""):
-            out[field] = float(raw)
+        if raw:
+            out[field] = _java_double(raw)
     return out or None
 
 
@@ -6650,11 +7255,74 @@ def _apply_cluster_request_fields(cluster, p):
 
 
 def _create_db_cluster(p):
+    early_error = (
+        _cluster_typed_input_error(p, ("Port", "BackupRetentionPeriod", "Iops", "AllocatedStorage"))
+        or _engine_control_char_error(p)
+    )
+    if early_error:
+        return early_error
     with _shared_container_lock:
         return _create_db_cluster_impl(p)
 
 
+_ENGINE_NULL_MESSAGE = (
+    "1 validation error detected: Value null at 'engine' failed to satisfy "
+    "constraint: Member must not be null"
+)
+
+
+def _cluster_engine_not_cluster_error(p, engine):
+    """C2: a known engine that is not a cluster engine, on CreateDBCluster.
+
+    ``None`` means the engine is postgres or mysql with the Multi-AZ members
+    present; those clusters are created.
+    """
+    version_present = "EngineVersion" in p
+    version = _p(p, "EngineVersion")
+    if engine in _CLUSTER_VERSION_FAMILY_ENGINES:
+        if not version:
+            return _error(
+                "InvalidParameterCombination",
+                "The DB engine version wasn't specified and Amazon RDS couldn't identify "
+                f"a valid DB engine version for the {engine} DB cluster. Submit a new "
+                "request that specifies a valid DB engine version.",
+                400,
+            )
+        return _error(
+            "InvalidParameterCombination",
+            f"The specified DB engine version isn't valid for the {engine} DB cluster. "
+            "Specify a valid DB engine version.",
+            400,
+        )
+    if engine in _RETIRED_INSTANCE_ENGINES:
+        # C2ose, C2osev: oracle-se and oracle-se1 answer like aurora, which AWS calls oscar.
+        if not version_present:
+            internal = "oscar" if engine == "aurora" else engine
+            return _error("InvalidParameterValue", f"Engine version not found: {internal}/null", 400)
+        return _error(
+            "InvalidParameterCombination", f"Cannot find version {version} for {engine}", 400,
+        )
+    # postgres and mysql (Multi-AZ DB clusters)
+    if not _p(p, "AllocatedStorage"):
+        return _error("InvalidParameterValue", "AllocatedStorage is required.", 400)
+    if not _p(p, "DBClusterInstanceClass"):
+        return _error("InvalidParameterValue", "DBClusterInstanceClass is required.", 400)
+    return None
+
+
 def _create_db_cluster_impl(p):
+    # r23-n13-global-arn-*-engine-absent: AWS answers a global cluster ARN that names no
+    # global cluster as an invalid identifier before it answers an absent Engine. An ARN of
+    # an existing global cluster gets the absent-Engine answer (r24-n13-*-arn-engine-absent).
+    requested_global_id = _p(p, "GlobalClusterIdentifier")
+    invalid_global_id = _invalid_global_cluster_identifier_error(requested_global_id)
+    if invalid_global_id:
+        spec, _, global_name = _parse_rds_arn(requested_global_id)
+        if spec.account_id != get_account_id() or global_name not in _global_clusters:
+            return invalid_global_id
+    # AWS answers an absent Engine before it looks at the other identifiers.
+    if "Engine" not in p:
+        return _error("InvalidParameterValue", _ENGINE_NULL_MESSAGE, 400)
     cluster_id = _p(p, "DBClusterIdentifier")
     if not cluster_id:
         return _error("MissingParameter", "DBClusterIdentifier is required", 400)
@@ -6662,14 +7330,47 @@ def _create_db_cluster_impl(p):
         return _error("DBClusterAlreadyExistsFault",
             f"DB cluster {cluster_id} already exists.", 400)
 
-    global_cluster_id = _p(p, "GlobalClusterIdentifier")
-    invalid_global_id = _invalid_global_cluster_identifier_error(global_cluster_id)
     if invalid_global_id:
         return invalid_global_id
+    global_cluster_id = _p(p, "GlobalClusterIdentifier")
     global_cluster = _resolve_global_cluster(global_cluster_id) if global_cluster_id else None
     if global_cluster_id and not global_cluster:
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {global_cluster_id} not found.", 404)
+
+    # The engine is checked before the global writer-switch and member-region
+    # checks, and before the parameter group lookup.
+    engine = _p(p, "Engine")
+    not_cluster_engine = (
+        engine in _CLUSTER_VERSION_FAMILY_ENGINES
+        or engine in _RETIRED_INSTANCE_ENGINES
+        or engine in ("postgres", "mysql")
+    )
+    if global_cluster:
+        if engine in _CUSTOM_ORACLE_ENGINES:
+            return _invalid_engine_error()
+        if engine not in _CLUSTER_ENGINES and not not_cluster_engine:
+            return _internal_failure_error()
+        if engine in _CLUSTER_VERSION_FAMILY_ENGINES or engine in _RETIRED_INSTANCE_ENGINES:
+            return _cluster_engine_not_cluster_error(p, engine)
+        expected_engine = global_cluster.get("Engine")
+        if expected_engine and engine != expected_engine:
+            return _error(
+                # Real AWS message shape (InvalidParameterValue, Sender, 400),
+                # verbatim template from a captured CreateDBCluster transcript.
+                "InvalidParameterValue",
+                "Value for engine should match setting for global cluster "
+                f"{global_cluster_id}",
+                400,
+            )
+        engine = expected_engine or engine
+    elif engine not in _CLUSTER_ENGINES:
+        if not not_cluster_engine:
+            return _invalid_engine_error()
+        engine_error = _cluster_engine_not_cluster_error(p, engine)
+        if engine_error:
+            return engine_error
+
     if global_cluster:
         if switch_error := _mysql_global_writer_switch_mutation_error(
             _global_cluster_writer_cluster(global_cluster),
@@ -6694,19 +7395,6 @@ def _create_db_cluster_impl(p):
         return _error("DBSubnetGroupNotFoundFault",
                       f"DB subnet group '{explicit_subnet_group}' does not exist.", 404)
 
-    engine = _p(p, "Engine") or "aurora-postgresql"
-    if global_cluster:
-        expected_engine = global_cluster.get("Engine")
-        if _p(p, "Engine") and expected_engine and engine != expected_engine:
-            return _error(
-                # Real AWS message shape (InvalidParameterValue, Sender, 400),
-                # verbatim template from a captured CreateDBCluster transcript.
-                "InvalidParameterValue",
-                "Value for engine should match setting for global cluster "
-                f"{global_cluster_id}",
-                400,
-            )
-        engine = expected_engine or engine
     explicit_engine_version = _p(p, "EngineVersion")
     engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
@@ -7015,6 +7703,8 @@ def _cluster_view(c, advance):
 
 
 def _describe_db_clusters(p):
+    if filter_error := _engine_filter_error(p):
+        return filter_error
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
         cluster = _resolve_cluster_in_request_region(cluster_id)
@@ -7193,6 +7883,8 @@ def _apply_cluster_master_password_change(cluster, new_pass):
 
 
 def _modify_db_cluster(p):
+    if early_error := _cluster_typed_input_error(p, _MODIFY_CLUSTER_INTEGER_MEMBERS):
+        return early_error
     with _shared_container_lock:
         return _modify_db_cluster_impl(p)
 
@@ -7428,6 +8120,8 @@ def _delete_db_snapshot(p):
 
 
 def _describe_db_snapshots(p):
+    if filter_error := _engine_filter_error(p):
+        return filter_error
     snap_id = _p(p, "DBSnapshotIdentifier")
     db_id = _p(p, "DBInstanceIdentifier")
     snap_type = _p(p, "SnapshotType")
@@ -8002,6 +8696,8 @@ def _create_db_cluster_snapshot(p):
 
 
 def _describe_db_cluster_snapshots(p):
+    if filter_error := _engine_filter_error(p):
+        return filter_error
     snap_id = _p(p, "DBClusterSnapshotIdentifier")
     cluster_id = _p(p, "DBClusterIdentifier")
     snap_type = _p(p, "SnapshotType")
@@ -8783,15 +9479,55 @@ def _failover_db_cluster_impl(p):
 # Option Groups
 # ---------------------------------------------------------------------------
 
+_CUSTOM_SQLSERVER_ENGINES = frozenset({
+    "custom-sqlserver-ee", "custom-sqlserver-se", "custom-sqlserver-web", "custom-sqlserver-dev",
+})
+
+
+def _retired_option_group_error(p, engine, create=True):
+    """D3ret: oracle-se and oracle-se1 have no major version AWS still knows."""
+    major = _p(p, "MajorEngineVersion")
+    if create and not major and engine in ("oracle-se", "oracle-se1"):
+        return _error(
+            "InvalidParameterValue",
+            "The parameter MajorEngineVersion must be provided and must not be blank.",
+            400,
+        )
+    if major and engine in ("oracle-se", "oracle-se1"):
+        return _error(
+            "InvalidParameterCombination", f"Cannot find major version {major} for {engine}", 400,
+        )
+    return None
+
+
 def _create_option_group(p):
+    # I3og: a control character in EngineName answers before every other check.
+    if _has_control_character(_p(p, "EngineName")):
+        return _control_character_error()
     name = _p(p, "OptionGroupName")
-    if not name:
-        return _error("MissingParameter", "OptionGroupName is required", 400)
+    # D3order: the duplicate check runs before every engine check.
     if name in _option_groups:
         return _error("OptionGroupAlreadyExistsFault",
             f"Option group {name} already exists.", 400)
-
-    engine = _p(p, "EngineName") or "postgres"
+    if not _p(p, "EngineName"):
+        return _error(
+            "InvalidParameterValue",
+            "The parameter EngineName must be provided and must not be blank.",
+            400,
+        )
+    if not name:
+        return _error("MissingParameter", "OptionGroupName is required", 400)
+    engine = _p(p, "EngineName").lower()
+    if engine not in _INSTANCE_ENGINES:
+        return _invalid_engine_error()
+    if engine in _CUSTOM_SQLSERVER_ENGINES:
+        return _error(
+            "InvalidParameterCombination",
+            f"You can't create or assign a custom option group for engine {engine}.",
+            400,
+        )
+    if retired_error := _retired_option_group_error(p, engine):
+        return retired_error
     major_version = _p(p, "MajorEngineVersion") or "15"
     desc = _p(p, "OptionGroupDescription") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:og:{name}"
@@ -8822,7 +9558,7 @@ def _delete_option_group(p):
     name = _p(p, "OptionGroupName")
     og = _option_groups.pop(name, None)
     if not og:
-        return _error("OptionGroupNotFoundFault", f"Option group {name} not found.", 404)
+        return _error("OptionGroupNotFoundFault", f"Specified OptionGroupName: {name} not found.", 404)
     _tags.pop(og.get("OptionGroupArn", ""), None)
     return _xml(200, "DeleteOptionGroupResponse", "")
 
@@ -8830,17 +9566,21 @@ def _delete_option_group(p):
 def _describe_option_groups(p):
     name = _p(p, "OptionGroupName")
     engine = _p(p, "EngineName")
+    if _has_control_character(engine):
+        return _control_character_error()
+    if engine and engine.lower() not in _DESCRIBE_ENGINES:
+        return _unrecognized_engine_error(engine)
     major_version = _p(p, "MajorEngineVersion")
 
     if name:
         og = _option_groups.get(name)
         if not og:
-            return _error("OptionGroupNotFoundFault", f"Option group {name} not found.", 404)
+            return _error("OptionGroupNotFoundFault", f"Specified OptionGroupName: {name} not found.", 404)
         groups = [og]
     else:
         groups = list(_option_groups.values())
         if engine:
-            groups = [g for g in groups if g["EngineName"] == engine]
+            groups = [g for g in groups if g["EngineName"] == engine.lower()]
         if major_version:
             groups = [g for g in groups if g["MajorEngineVersion"] == major_version]
 
@@ -8854,6 +9594,15 @@ def _describe_option_groups(p):
 
 
 def _describe_option_group_options(p):
+    if not _p(p, "EngineName"):
+        return _error("InvalidParameterValue", "EngineName must be specified.", 400)
+    if _has_control_character(_p(p, "EngineName")):
+        return _control_character_error()
+    engine = _p(p, "EngineName").lower()
+    if engine not in _INSTANCE_ENGINES:
+        return _invalid_engine_error()
+    if error := _retired_option_group_error(p, engine, create=False):
+        return error
     return _xml(200, "DescribeOptionGroupOptionsResponse",
         "<DescribeOptionGroupOptionsResult><OptionGroupOptions/></DescribeOptionGroupOptionsResult>")
 
@@ -8985,20 +9734,59 @@ def _invalid_global_cluster_identifier_error(global_id):
 # move the data plane synchronously; lossy failover remains metadata-only.
 # ---------------------------------------------------------------------------
 
+_GLOBAL_DEFAULT_ENGINE_VERSIONS = {"neptune": "1.4.8.0", "docdb": "8.0.3"}
+
+
 def _create_global_cluster(p):
+    # I3g: a control character in Engine answers before every other check.
+    if control_error := _engine_control_char_error(p):
+        return control_error
     gc_id = _p(p, "GlobalClusterIdentifier")
     if not gc_id:
         return _error("MissingParameter", "GlobalClusterIdentifier is required", 400)
     invalid_id = _invalid_global_cluster_identifier_error(gc_id)
     if invalid_id:
         return invalid_id
+
+    source_cluster_id = _p(p, "SourceDBClusterIdentifier")
+    engine = _p(p, "Engine")
+    if source_cluster_id and "Engine" in p:
+        return _error(
+            "InvalidParameterCombination",
+            "When creating global cluster from existing db cluster, value for "
+            "engineName should not be specified since it will be inherited from "
+            "source cluster",
+            400,
+        )
+    if not source_cluster_id:
+        if "Engine" not in p:
+            return _error(
+                "InvalidParameterValue",
+                "When creating standalone global cluster, value for engineName "
+                "should be specified",
+                400,
+            )
+        # G1x: the engine is checked before a blank source (G3x).
+        if engine not in _INSTANCE_ENGINES:
+            return _invalid_engine_error()
+        if engine not in _GLOBAL_ENGINES:
+            return _error(
+                "InvalidParameterValue",
+                "The requested engine version was not found or does not support "
+                "global functionality",
+                400,
+            )
+        if "SourceDBClusterIdentifier" in p:
+            # G3x: AWS fails internally on a blank source cluster with a global engine.
+            return _internal_failure_error()
     if gc_id in _global_clusters:
         return _error("GlobalClusterAlreadyExistsFault",
             f"Global cluster {gc_id} already exists.", 400)
 
-    engine = _p(p, "Engine") or "aurora-postgresql"
-    engine_version = _p(p, "EngineVersion") or _default_engine_version(engine)
-    source_cluster_id = _p(p, "SourceDBClusterIdentifier")
+    # G1xv: a standalone neptune or docdb global defaults to its own engine version.
+    engine_version = _p(p, "EngineVersion") or _GLOBAL_DEFAULT_ENGINE_VERSIONS.get(
+        engine.lower(), _default_engine_version(engine or "aurora-postgresql"),
+    )
     storage_encrypted = _p(p, "StorageEncrypted") == "true"
     deletion_protection = _p(p, "DeletionProtection") == "true"
 
@@ -10362,7 +11150,16 @@ def _global_cluster_xml(gc):
 # ---------------------------------------------------------------------------
 
 def _describe_engine_versions(p):
-    engine = _p(p, "Engine") or "postgres"
+    if filter_error := _filter_shape_error(p):
+        return filter_error
+    requested_engine = _p(p, "Engine")
+    if _has_control_character(requested_engine):
+        return _control_character_error()
+    if requested_engine and requested_engine.lower() not in _DESCRIBE_ENGINES:
+        return _unrecognized_engine_error(requested_engine, x2=True)
+    if filter_error := _engine_filter_value_error(p):
+        return filter_error
+    engine = requested_engine.lower() or "postgres"
     version_filter = _p(p, "EngineVersion")
     default_only = _p(p, "DefaultOnly") == "true"
     major_version_filter = (
@@ -10425,7 +11222,13 @@ def _describe_engine_versions(p):
 
 
 def _describe_orderable_options(p):
-    engine = _p(p, "Engine") or "postgres"
+    if "Engine" not in p:
+        return _error("InvalidParameterValue", "Please specify a value for parameter 'engine'.", 400)
+    if _has_control_character(_p(p, "Engine")):
+        return _control_character_error()
+    engine = _p(p, "Engine").lower()
+    if engine not in _INSTANCE_ENGINES:
+        return _invalid_engine_error()
     engine_version = _p(p, "EngineVersion")
     db_class = _p(p, "DBInstanceClass")
     engine_version_error = _unsupported_aurora_engine_version_error(engine, engine_version)
@@ -11073,7 +11876,7 @@ def _apply_instance_filters(instances, filters):
                 if inst["DBInstanceIdentifier"] not in fvals:
                     match = False
             elif fname == "engine":
-                if inst["Engine"] not in fvals:
+                if inst["Engine"] not in {v.lower() for v in fvals}:
                     match = False
             elif fname == "db-cluster-id":
                 if inst.get("DBClusterIdentifier", "") not in fvals:
@@ -11092,7 +11895,7 @@ def _apply_cluster_filters(clusters, filters):
                 if cl["DBClusterIdentifier"] not in fvals:
                     match = False
             elif fname == "engine":
-                if cl["Engine"] not in fvals:
+                if cl["Engine"] not in {v.lower() for v in fvals}:
                     match = False
         if match:
             result.append(cl)
@@ -12496,6 +13299,7 @@ def _xml(status, root_tag, inner):
 def _error(code, message, status):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
+    message = _escape_message(message)
     body = f"""<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
     <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
     <RequestId>{new_uuid()}</RequestId>

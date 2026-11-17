@@ -629,6 +629,49 @@ def test_autoscaling_round_trip():
     _round_trip("autoscaling", "autoscaling", populate, observe)
 
 
+def test_rds_serverlessv2_floats_and_global_engine_version_round_trip():
+    """State created through the API survives a save and restore.
+
+    CreateGlobalCluster Engine=neptune without EngineVersion stores the default version, and
+    ModifyDBCluster ServerlessV2ScalingConfiguration.MinCapacity=1d (a Java double spelling) stores
+    the float 1.0; both are then read back through the Describe actions.
+    """
+    from urllib.parse import urlencode
+
+    headers = {
+        "authorization": "AWS4-HMAC-SHA256 Credential=test/20260930/us-east-1/rds/aws4_request",
+        "content-type": "application/x-www-form-urlencoded",
+    }
+
+    def call(mod, **params):
+        status, _, body = mod._handle_request_sync("POST", "/", headers, urlencode(params).encode(), {})
+        assert status == 200, body
+        return body.decode()
+
+    def populate(mod):
+        call(mod, Action="CreateGlobalCluster", GlobalClusterIdentifier="g-neptune", Engine="neptune")
+        call(mod, Action="CreateDBCluster", DBClusterIdentifier="c-sv2", Engine="aurora-postgresql",
+             MasterUsername="mscadmin", MasterUserPassword="MsCapture2637pw",
+             **{"ServerlessV2ScalingConfiguration.MinCapacity": "0.5",
+                "ServerlessV2ScalingConfiguration.MaxCapacity": "2"})
+        call(mod, Action="ModifyDBCluster", DBClusterIdentifier="c-sv2",
+             **{"ServerlessV2ScalingConfiguration.MinCapacity": "1d",
+                "ServerlessV2ScalingConfiguration.MaxCapacity": "2"})
+
+    def observe(mod):
+        assert mod._clusters["c-sv2"]["ServerlessV2ScalingConfiguration"] == {
+            "MinCapacity": 1.0, "MaxCapacity": 2.0,
+        }
+        assert isinstance(mod._clusters["c-sv2"]["ServerlessV2ScalingConfiguration"]["MinCapacity"], float)
+        clusters = call(mod, Action="DescribeDBClusters", DBClusterIdentifier="c-sv2")
+        assert "<MinCapacity>1.0</MinCapacity>" in clusters
+        assert "<MaxCapacity>2.0</MaxCapacity>" in clusters
+        globals_ = call(mod, Action="DescribeGlobalClusters", GlobalClusterIdentifier="g-neptune")
+        assert "<EngineVersion>1.4.8.0</EngineVersion>" in globals_
+
+    _round_trip("rds", "rds", populate, observe)
+
+
 def test_backup_round_trip():
     def populate(mod):
         mod._vaults["vault-test"] = {"BackupVaultName": "vault-test"}

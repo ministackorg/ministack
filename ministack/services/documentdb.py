@@ -15,7 +15,6 @@ import re
 import socket
 import threading
 import time
-from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
 from ministack.core import container_reaper
@@ -790,7 +789,7 @@ def _flatten_json_request_params(params, data):
 
 def _parse_request_params(body, headers, query_params):
     """Merge query-string, form-encoded, and JSON-body parameters into one map."""
-    params = dict(query_params)
+    params = _rds.filter_query_params(query_params)
     if not body:
         return params
     raw = body if isinstance(body, str) else body.decode("utf-8-sig", errors="replace")
@@ -806,7 +805,7 @@ def _parse_request_params(body, headers, query_params):
         except json.JSONDecodeError:
             pass
     if not merged_json:
-        for k, v in parse_qs(raw).items():
+        for k, v in _rds.parse_form_body(raw, _rds._query_action(params)).items():
             params[k] = v
     return params
 
@@ -834,7 +833,11 @@ def claims_request(params):
     """Whether an rds-signed request creates or names a DocumentDB cluster or instance."""
     if _evaluate_params(params, "Action") not in _ACTION_MAP:
         return False
-    if _evaluate_params(params, "Engine") == "docdb":
+    # Only creates are claimed by engine: ModifyDBInstance with Engine=docdb on
+    # an RDS instance is answered by RDS (AWS reports the engine change).
+    if _evaluate_params(params, "Engine") == "docdb" and _evaluate_params(params, "Action") in (
+        "CreateDBCluster", "CreateDBInstance",
+    ):
         return True
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     if cluster_id and cluster_id in _clusters:
@@ -863,8 +866,38 @@ def instance_members_xml(filters):
 # DB Instances
 # ---------------------------------------------------------------------------
 
+def _engine_checks_before_identifiers(params):
+    """AWS's Port, Engine and member-engine answers, which run before the identifier checks."""
+    if early_error := _rds._typed_integer_error(params, (
+        "Port", "AllocatedStorage", "BackupRetentionPeriod", "Iops", "MonitoringInterval",
+        "PromotionTier", "StorageThroughput", "MaxAllocatedStorage",
+    )):
+        return early_error
+    if early_error := _rds._engine_control_char_error(params):
+        return early_error
+    engine = _evaluate_params(params, "Engine").lower()
+    cluster_id = _evaluate_params(params, "DBClusterIdentifier")
+    if not cluster_id:
+        if engine == "docdb":
+            return _rds._docdb_cluster_required_error()
+        return None
+    if cluster_id in _clusters:
+        if engine in _rds._CUSTOM_ORACLE_ENGINES:
+            return _rds._invalid_engine_error()
+        if engine != "docdb":
+            return _error(
+                "InvalidParameterCombination",
+                "PubliclyAccessible flag cannot be set on a cluster member instance and "
+                "will be automatically inherited from the cluster.",
+                400,
+            )
+    return None
+
+
 def _create_db_instance(params):
     """Create a DB instance, optionally as a member of a DB cluster."""
+    if early_error := _engine_checks_before_identifiers(params):
+        return early_error
     db_id = _evaluate_params(params, "DBInstanceIdentifier")
     if not db_id:
         return _error("MissingParameter", "DBInstanceIdentifier is required", 400)
@@ -1203,10 +1236,19 @@ def _describe_db_instances(params):
 
 def _modify_db_instance(params):
     """Apply modifyable fields to a DB instance directly (no pending staging)."""
+    # W1d, then I3dm: both before the instance lookup.
+    if early_error := (
+        _rds._typed_integer_error(params, ("PromotionTier",))
+        or _rds._engine_control_char_error(params)
+    ):
+        return early_error
     db_id = _evaluate_params(params, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
     if not instance:
         return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+
+    if engine_error := _rds._modify_engine_error(instance, _evaluate_params(params, "Engine")):
+        return engine_error
 
     new_version = _evaluate_params(params, "EngineVersion")
     if new_version:
@@ -1325,6 +1367,8 @@ def _reboot_db_instance(params):
 
 def _create_db_cluster(params):
     """Create a DB cluster record; compute starts with its first member."""
+    if early_error := _rds._typed_integer_error(params, ("Port", "BackupRetentionPeriod")):
+        return early_error
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     if not cluster_id:
         return _error("MissingParameter", "DBClusterIdentifier is required", 400)
@@ -1484,6 +1528,8 @@ def _describe_db_clusters(params):
 
 def _modify_db_cluster(params):
     """Modify cluster settings; MasterUserPassword also rotates container creds."""
+    if early_error := _rds._typed_integer_error(params, ("Port", "BackupRetentionPeriod")):
+        return early_error
     cluster_id = _evaluate_params(params, "DBClusterIdentifier")
     cluster = _clusters.get(cluster_id)
     if not cluster:

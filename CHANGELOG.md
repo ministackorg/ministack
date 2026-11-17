@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — engine, typed-integer and filter validation** — an unknown `Engine` on `CreateDBInstance`, `CreateDBCluster`, `CreateGlobalCluster`, the option-group calls and the describe calls now answers the error AWS gives instead of storing the resource. Typed members (`MonitoringInterval`, `BacktrackWindow`, `ServerlessV2ScalingConfiguration.MinCapacity`/`MaxCapacity`) are parsed like AWS before the engine check, engine-filter list indexes follow AWS (`Index N is illegal`, `Excessively sparse input would skip N list elements`, null filter names), and a standalone `aurora`, `oracle-se` or `oracle-se1` instance gets the identifier and class answers AWS gives before its internal error. Contributed by @kharabasz.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added
