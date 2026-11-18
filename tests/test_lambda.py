@@ -16381,3 +16381,47 @@ def test_lambda_create_function_checks_pass_role_and_the_function_arn_contract(a
     other = f"pr-other-{suffix}"
     refused(scoped, other, "lambda:CreateFunction", f"arn:aws:lambda:us-east-1:000000000000:function:{other}",
             "because no identity-based policy allows the lambda:CreateFunction action")
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="needs node")
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("host", ["localhost", "000000000000.localhost", "data-localhost", "sync-localhost"])
+def test_lambda_node_worker_reaches_an_ipv4_gateway_through_prefixed_hosts(tmp_path, scheme, host):
+    """The Node worker sends localhost and the SDK v3 prefixed hosts to 127.0.0.1, also over TLS."""
+    import ssl
+    import subprocess
+
+    from ministack.core import tls
+    from ministack.core.lambda_runtime import GATEWAY_LOOPBACK_ENV, NODE_GATEWAY_LOOPBACK_BOOTSTRAP
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers["Host"])
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    env = {**os.environ, GATEWAY_LOOPBACK_ENV: "1"}
+    if scheme == "https":
+        cert, key = tls.resolve_tls_material()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        env["NODE_EXTRA_CA_CERTS"] = cert
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    script = tmp_path / "call.js"
+    script.write_text(NODE_GATEWAY_LOOPBACK_BOOTSTRAP + (
+        "require('%s').get('%s://%s:%d/', (res) => { res.resume(); console.log(res.statusCode); })"
+        ".on('error', (e) => console.log(e.code));\n" % (scheme, scheme, host, port)))
+    try:
+        out = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=20, env=env)
+    finally:
+        server.shutdown()
+    assert out.stdout.strip() == "200", out.stdout + out.stderr
+    assert seen == [f"{host}:{port}"]
