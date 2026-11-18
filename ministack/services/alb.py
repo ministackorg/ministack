@@ -2621,7 +2621,15 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
-    conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
+    if tg.get("Protocol", "HTTP").upper() == "HTTPS":
+        import ssl
+
+        # ALB does not validate target certificates, including self-signed certificates.
+        conn = http.client.HTTPSConnection(
+            host, port, timeout=TARGET_CONNECT_TIMEOUT, context=ssl._create_unverified_context(),
+        )
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
 
     def _open():
         try:
