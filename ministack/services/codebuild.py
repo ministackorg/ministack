@@ -129,7 +129,7 @@ def _build_id(project_name):
 
 
 def _make_build_record(project, build_id, source_version=None):
-    """Create a build record that immediately shows SUCCEEDED."""
+    """Create a terminal build record: SUCCEEDED with every phase done."""
     now = int(time.time())
     record = {
         "id": build_id,
@@ -769,18 +769,11 @@ def _start_build(data):
     project = _apply_build_overrides(_projects[project_name], data)
     bid = _build_id(project_name)
     build = _make_build_record(project, bid, data.get("sourceVersion"))
-
-    if EXECUTE_BUILDS:
-        now = build["startTime"]
-        build.pop("endTime", None)
-        build["buildStatus"] = "IN_PROGRESS"
-        build["currentPhase"] = "SUBMITTED"
-        build["phases"] = [
-            {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED", "startTime": now, "endTime": now},
-            {"phaseType": "QUEUED", "startTime": now},
-        ]
-
-    _builds[bid] = build
+    # StartBuild answers with the build as AWS submits it: IN_PROGRESS in QUEUED.
+    # An executed build keeps that state until its worker ends it; a metadata-only
+    # build is already SUCCEEDED for every later read.
+    started = _submitted_view(build)
+    _builds[bid] = started if EXECUTE_BUILDS else build
     logger.info("StartBuild: %s -> %s", project_name, bid)
 
     if EXECUTE_BUILDS:
@@ -793,7 +786,21 @@ def _start_build(data):
             daemon=True,
         ).start()
 
-    return json_response({"build": copy.deepcopy(build)})
+    return json_response({"build": copy.deepcopy(started)})
+
+
+def _submitted_view(build):
+    """A copy of ``build`` as StartBuild returns it: IN_PROGRESS in QUEUED, phase SUBMITTED done."""
+    now = build["startTime"]
+    view = copy.deepcopy(build)
+    view.pop("endTime", None)
+    view["buildStatus"] = "IN_PROGRESS"
+    view["currentPhase"] = "QUEUED"
+    view["phases"] = [
+        {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED", "startTime": now, "endTime": now},
+        {"phaseType": "QUEUED", "startTime": now},
+    ]
+    return view
 
 
 def _batch_get_builds(data):
