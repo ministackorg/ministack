@@ -5388,8 +5388,9 @@ def _create_db_instance_impl(p):
     if db_id in _instances:
         return _instance_already_exists()
 
-    engine = _p(p, "Engine") or "postgres"
-    if engine.lower() not in _ENGINE_VERSION_CATALOG and engine.lower() not in UNCATALOGUED_RDS_ENGINES:
+    engine = _p(p, "Engine")
+    if not engine or (engine.lower() not in _ENGINE_VERSION_CATALOG
+                      and engine.lower() not in UNCATALOGUED_RDS_ENGINES):
         return _invalid_parameter_value("Invalid DB engine")
     explicit_engine_version = _p(p, "EngineVersion")
     engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)

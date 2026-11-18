@@ -19346,3 +19346,20 @@ def test_rds_modify_db_instance_rejects_invalid_input(rds, engine, storage_type,
         assert instance["AllocatedStorage"] == 30
     finally:
         rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.parametrize("extra", [{}, {"Engine": ""}], ids=["absent", "blank"])
+def test_rds_create_db_instance_without_engine_is_refused(extra):
+    """AWS answers a missing or blank Engine 400 InvalidParameterValue "Invalid DB engine" (capture 2026-11-18)."""
+    from botocore.config import Config
+    client = boto3.client("rds", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                          region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test",
+                          config=Config(parameter_validation=False))
+    db_id = f"no-engine-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        client.create_db_instance(DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", AllocatedStorage=20,
+                                  MasterUsername="dbadmin", MasterUserPassword="Passw0rd1234", **extra)
+    err = exc.value.response
+    assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+        400, "InvalidParameterValue", "Invalid DB engine")
+    assert not any(i["DBInstanceIdentifier"] == db_id for i in client.describe_db_instances()["DBInstances"])
