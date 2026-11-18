@@ -24,9 +24,9 @@ from ministack.core.responses import AccountScopedDict, get_account_id, json_res
 logger = logging.getLogger("cloudfront-keyvaluestore")
 
 # ---------------------------------------------------------------------------
-# Path regexes — ARN contains a slash (e.g. arn:aws:cloudfront::123:key-value-store/name).
-# The store-name segment ([a-zA-Z0-9_-]+) never contains a slash, so the
-# /keys boundary anchors unambiguously against the trailing name segment.
+# Path regexes — ARN contains a slash (e.g. arn:aws:cloudfront::123:key-value-store/<id>).
+# The store-id segment ([a-zA-Z0-9_-]+) never contains a slash, so the
+# /keys boundary anchors unambiguously against the trailing id segment.
 # ---------------------------------------------------------------------------
 _KEY_RE = re.compile(r"^/key-value-stores/(arn:.+?/[a-zA-Z0-9_-]+)/keys/(.+)$")
 _KEYS_RE = re.compile(r"^/key-value-stores/(arn:.+?/[a-zA-Z0-9_-]+)/keys/?$")
@@ -73,7 +73,7 @@ def _error(code: str, message: str, status: int) -> tuple:
     return status, {"Content-Type": "application/json"}, body
 
 
-def _kvs_name_from_arn(arn: str):
+def _kvs_id_from_arn(arn: str):
     try:
         spec = parse_arn(arn)
     except ArnParseError:
@@ -89,25 +89,22 @@ def _kvs_name_from_arn(arn: str):
     prefix = "key-value-store/"
     if not spec.resource.startswith(prefix):
         return None, _error("ValidationException", f"Invalid KvsARN: {arn}", 400)
-    name = spec.resource[len(prefix):]
-    if not name or "/" in name:
+    kvs_id = spec.resource[len(prefix):]
+    if not kvs_id or "/" in kvs_id:
         return None, _error("ValidationException", f"Invalid KvsARN: {arn}", 400)
-    return name, None
+    return kvs_id, None
 
 
 def _get_store(arn: str):
-    name, err = _kvs_name_from_arn(arn)
+    _, err = _kvs_id_from_arn(arn)
     if err:
         return None, err
 
     store = _stores.get(arn)
     if store is None:
-        from ministack.services.cloudfront import _kvstores
+        from ministack.services.cloudfront import _kvs_by_arn
 
-        kvs = _kvstores.get(name)
-        if kvs and kvs.get("ARN") != arn:
-            kvs = None
-        if kvs is None:
+        if _kvs_by_arn(arn) is None:
             return None, _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
         store = {"etag": new_uuid(), "items": {}}
         _stores[arn] = store
