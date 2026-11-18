@@ -9330,6 +9330,13 @@ def test_lambda_ruby_4_0_runtime_maps_to_official_image():
     assert _RUNTIME_IMAGE_MAP.get("ruby4.0") == "public.ecr.aws/lambda/ruby:4.0"
 
 
+def test_lambda_nodejs_26_runtime_maps_to_official_image():
+    """nodejs26.x is in botocore's Runtime enum, runs on AWS (capture 2026-11-18) and has public.ecr.aws/lambda/nodejs:26."""
+    from ministack.services.lambda_svc import _RUNTIME_IMAGE_MAP
+
+    assert _RUNTIME_IMAGE_MAP.get("nodejs26.x") == "public.ecr.aws/lambda/nodejs:26"
+
+
 
 # ---------------------------------------------------------------------------
 # Lambda Durable Functions (Durable Execution).

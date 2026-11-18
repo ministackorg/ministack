@@ -3430,6 +3430,7 @@ _RUNTIME_IMAGE_MAP: dict[str, str] = {
     "nodejs20.x": "public.ecr.aws/lambda/nodejs:20",
     "nodejs22.x": "public.ecr.aws/lambda/nodejs:22",
     "nodejs24.x": "public.ecr.aws/lambda/nodejs:24",
+    "nodejs26.x": "public.ecr.aws/lambda/nodejs:26",
     "java25": "public.ecr.aws/lambda/java:25",
     "java21": "public.ecr.aws/lambda/java:21",
     "java17": "public.ecr.aws/lambda/java:17",

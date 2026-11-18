@@ -13795,7 +13795,9 @@ def test_s3_expired_presigned_url_error_carries_the_expiry_and_server_time(s3):
     bucket = f"presign-expired-{_uuid_mod.uuid4().hex[:8]}"
     s3.create_bucket(Bucket=bucket)
     try:
-        url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "k"}, ExpiresIn=1)
+        v4 = boto3.client("s3", endpoint_url=ENDPOINT, region_name="us-east-1", aws_access_key_id="test",
+                          aws_secret_access_key="test", config=Config(signature_version="s3v4"))
+        url = v4.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "k"}, ExpiresIn=1)
         _time.sleep(2.5)
         r = requests.get(url)
         root = _ET.fromstring(r.content)
