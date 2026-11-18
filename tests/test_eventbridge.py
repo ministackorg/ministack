@@ -2528,8 +2528,9 @@ def test_scheduler_cron_fires_after_scheduled_time(isolated_scheduler):
 def test_scheduler_cron_skips_before_scheduled_time(isolated_scheduler):
     """cron() rule does NOT dispatch before the next scheduled occurrence arrives."""
     _seed_rule(schedule="cron(0 * * * ? *)")  # every hour on the hour
-    # last_fired 10 s ago → next occurrence is ~59m50s from now → must not fire
-    _eb._rule_last_fired[_STATE_KEY] = _eb._now_ts() - 10
+    # last fired on this hour's occurrence → the next one is on the next hour → must not fire
+    now = _eb._now_ts()
+    _eb._rule_last_fired[_STATE_KEY] = now - now % 3600
     _eb._tick_scheduled_rules()
     isolated_scheduler.assert_not_called()
 
