@@ -367,11 +367,36 @@ def run():
 run()
 ''')
 
+# MiniStack's own endpoint for Node workers is http(s)://localhost:<port>, so
+# the host an SDK v3 operation builds with a prefix (ServiceDiscovery "data-",
+# Step Functions "sync-", the KeyValueStore "<account>.") is a valid URL. The
+# hook sends localhost, <label>.localhost and <label>-localhost to 127.0.0.1
+# (the gateway may listen on IPv4 only) and checks the gateway certificate
+# against localhost. It runs only when MiniStack set AWS_ENDPOINT_URL.
+GATEWAY_LOOPBACK_ENV = "_MINISTACK_GATEWAY_LOOPBACK"
+NODE_GATEWAY_LOOPBACK_BOOTSTRAP = r"""
+(function _msGatewayLoopback() {
+  if (process.env.%s !== "1") return;
+  const dns = require("dns");
+  const tls = require("tls");
+  const gateway = /^(?:[a-z0-9-]+[.-])?localhost$/i;
+  const lookup = dns.lookup;
+  dns.lookup = function (hostname, options, callback) {
+    if (typeof hostname === "string" && gateway.test(hostname)) hostname = "127.0.0.1";
+    return lookup.call(this, hostname, options, callback);
+  };
+  const checkServerIdentity = tls.checkServerIdentity;
+  tls.checkServerIdentity = function (hostname, cert) {
+    return checkServerIdentity.call(this, gateway.test(hostname) ? "localhost" : hostname, cert);
+  };
+}());
+""" % GATEWAY_LOOPBACK_ENV
+
 # ---------------------------------------------------------------------------
 # Node.js worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_NODEJS_WORKER_SCRIPT = _sub_runtime_tokens(r'''
+_NODEJS_WORKER_SCRIPT = NODE_GATEWAY_LOOPBACK_BOOTSTRAP + _sub_runtime_tokens(r'''
 const readline = require("readline");
 const path = require("path");
 const http = require("http");
@@ -1395,12 +1420,17 @@ class Worker:
         # the function nor the host set one.
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
         from ministack.core import tls as _tls
+        spawn_env.pop(GATEWAY_LOOPBACK_ENV, None)
         if "AWS_ENDPOINT_URL" not in spawn_env:
+            host = "127.0.0.1"
+            if runtime.startswith("nodejs"):
+                host = "localhost"
+                spawn_env[GATEWAY_LOOPBACK_ENV] = "1"
             if _tls.use_ssl_enabled():
-                spawn_env["AWS_ENDPOINT_URL"] = f"https://127.0.0.1:{port}"
+                spawn_env["AWS_ENDPOINT_URL"] = f"https://{host}:{port}"
                 _tls.trust_gateway_cert(spawn_env)
             else:
-                spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
+                spawn_env["AWS_ENDPOINT_URL"] = f"http://{host}:{port}"
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
         spawn_env.setdefault(HOST_PREFIX_ENV, "true")
