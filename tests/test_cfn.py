@@ -14438,8 +14438,8 @@ def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
 
     # Outputs carry the ARN + Id from the provisioner.
     outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
-    assert outputs["KvsArn"].endswith(f":key-value-store/{kvs_name}")
     assert outputs["KvsId"]
+    assert outputs["KvsArn"].endswith(f":key-value-store/{outputs['KvsId']}")
 
     # Native describe sees the create-time Comment.
     desc = cloudfront.describe_key_value_store(Name=kvs_name)

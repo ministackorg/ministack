@@ -12094,20 +12094,20 @@ def _cf_distribution_delete(physical_id, props):
 
 def _cf_kvs_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
-    arn = _cf._kvs_arn(name)
     if name not in _cf._kvstores:
+        kvs_id = new_uuid()
         _cf._kvstores[name] = {
-            "Id": new_uuid(),
+            "Id": kvs_id,
             "Name": name,
             "Comment": props.get("Comment", ""),
-            "ARN": arn,
+            "ARN": _cf._kvs_arn(kvs_id),
             "Status": "READY",
             "LastModifiedTime": now_iso(),
             "ETag": new_uuid(),
         }
     record = _cf._kvstores[name]
     # Return refs the spec exposes via Fn::GetAtt: Arn, Id, Status.
-    return name, {"Arn": arn, "Id": record["Id"], "Status": record["Status"]}
+    return name, {"Arn": record["ARN"], "Id": record["Id"], "Status": record["Status"]}
 
 
 def _cf_kvs_update(physical_id, old_props, new_props, stack_name):
