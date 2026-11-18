@@ -343,6 +343,82 @@ async def handle_request(method, path, headers, body, query_params):
 # State machine CRUD
 # ---------------------------------------------------------------------------
 
+_NEXT_OR_END_TYPES = ("Pass", "Task", "Wait", "Parallel", "Map")
+
+
+def _pointer(name):
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+def _structure_diagnostics(definition_str) -> list:
+    """The top-level structure errors AWS reports (AWS capture, 2026-11-18): a state with both or neither of
+    Next and End, a StartAt or Next naming no state, a state StartAt never reaches, and no terminal state.
+    A definition that is not an object with a States map of objects is left to the other checks."""
+    if not isinstance(definition_str, str):
+        return []
+    try:
+        definition = json.loads(definition_str)
+    except (TypeError, ValueError):
+        return []
+    states = definition.get("States") if isinstance(definition, dict) else None
+    if not isinstance(states, dict) or not states or not all(isinstance(s, dict) for s in states.values()):
+        return []
+
+    def diag(code, message, location=None):
+        d = {"severity": "ERROR", "code": code, "message": message}
+        if location is not None:
+            d["location"] = location
+        return d
+
+    out = []
+    for name, state in states.items():
+        if state.get("Type") in _NEXT_OR_END_TYPES:
+            has_next, has_end = "Next" in state, "End" in state
+            if has_next and has_end:
+                out.append(diag("SCHEMA_VALIDATION_FAILED",
+                                "There should only be one of the following fields: [Next, End]",
+                                f"/States/{_pointer(name)}"))
+            elif not has_next and not has_end:
+                out.append(diag("SCHEMA_VALIDATION_FAILED",
+                                "This object should have only one of the following fields: [Next, End]",
+                                f"/States/{_pointer(name)}"))
+    start = definition.get("StartAt")
+    if isinstance(start, str) and start not in states:
+        out.append(diag("MISSING_TRANSITION_TARGET", f"Missing 'Next' target: {start}", "/StartAt"))
+    for name, state in states.items():
+        target = state.get("Next")
+        if isinstance(target, str) and target not in states:
+            out.append(diag("MISSING_TRANSITION_TARGET", f"Missing 'Next' target: {target}",
+                            f"/States/{_pointer(name)}/Next"))
+    reached, todo = set(), [start] if start in states else []
+    while todo:
+        name = todo.pop()
+        if name in reached or name not in states:
+            continue
+        reached.add(name)
+        state = states[name]
+        targets = [state.get("Next"), state.get("Default")]
+        targets += [c.get("Next") for c in state.get("Choices") or [] if isinstance(c, dict)]
+        targets += [c.get("Next") for c in state.get("Catch") or [] if isinstance(c, dict)]
+        todo += [t for t in targets if isinstance(t, str)]
+    for name in states:
+        if name not in reached:
+            out.append(diag("MISSING_TRANSITION_TARGET", f'State "{name}" is not reachable.',
+                            f"/States/{_pointer(name)}"))
+    if not any(s.get("Type") in ("Succeed", "Fail") or s.get("End") is True for s in states.values()):
+        out.append(diag("MISSING_END_STATE", "Workflow has no terminal state"))
+    return out
+
+
+def _structure_refusal(definition_str) -> str | None:
+    """CreateStateMachine / UpdateStateMachine's InvalidDefinition message for those errors, or None."""
+    found = _structure_diagnostics(definition_str)
+    if not found:
+        return None
+    return "Invalid State Machine Definition: '" + ", ".join(
+        f"{d['code']}: {d['message']} at {d.get('location', 'null')}" for d in found) + "'"
+
+
 def _validate_definition_jsonata(definition_str) -> str | None:
     """The first malformed ``{% ... %}`` expression's refusal, or None.
 
@@ -541,7 +617,7 @@ def _create_state_machine(data):
         invalid = _encryption_validation_error(encryption)
     if invalid:
         return invalid
-    invalid = _validate_definition_jsonata(data.get("definition"))
+    invalid = _validate_definition_jsonata(data.get("definition")) or _structure_refusal(data.get("definition"))
     if invalid:
         return error_response_json("InvalidDefinition", invalid, 400)
     if encryption is not None:
@@ -750,7 +826,7 @@ def _update_state_machine(data):
                 "MissingRequiredParameter",
                 "The definition must be specified when updating the EncryptionConfiguration", 400)
     if "definition" in data:
-        invalid = _validate_definition_jsonata(data["definition"])
+        invalid = _validate_definition_jsonata(data["definition"]) or _structure_refusal(data["definition"])
         if invalid:
             return error_response_json("InvalidDefinition", invalid, 400)
         sm["definition"] = data["definition"]
@@ -1715,7 +1791,8 @@ def _test_state(data):
 # ---------------------------------------------------------------------------
 
 def _validate_state_machine_definition(data):
-    return json_response({"result": "OK", "diagnostics": []})
+    found = _structure_diagnostics(data.get("definition"))
+    return json_response({"result": "FAIL" if found else "OK", "diagnostics": found, "truncated": False})
 
 
 # ===================================================================

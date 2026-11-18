@@ -8211,3 +8211,116 @@ def test_dynamodb_leading_underscore_in_expression(ddb):
                   ExpressionAttributeNames={"#x": "_x"}, ExpressionAttributeValues={":p": {"S": "p"}})
     finally:
         ddb.delete_table(TableName=name)
+
+
+@pytest.mark.auth_contract
+def test_dynamodb_item_call_on_another_accounts_table_arn_contract(auth_enabled):
+    """An item call by another account's table ARN is resolved in the owner's account and needs both the
+    table's resource policy and the caller's identity policy (AWS capture, #2690)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    from botocore.exceptions import ClientError
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    owner, other = "111122223333", "444455556666"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    shared, bare = f"xacct-shared-{suffix}", f"xacct-nopolicy-{suffix}"
+    arn = lambda t: f"arn:aws:dynamodb:us-east-1:{owner}:table/{t}"
+    ddb_a, iam_b = client("dynamodb", owner), client("iam", other)
+    for t in (shared, bare):
+        ddb_a.create_table(TableName=t, BillingMode="PAY_PER_REQUEST",
+                           KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                           AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}])
+        ddb_a.put_item(TableName=t, Item={"pk": {"S": "k1"}, "v": {"S": "hello"}})
+
+    def user(name, statements):
+        iam_b.create_user(UserName=name)
+        iam_b.put_user_policy(UserName=name, PolicyName="ddb", PolicyDocument=json.dumps(
+            {"Version": "2012-10-17", "Statement": statements}))
+        key = iam_b.create_access_key(UserName=name)["AccessKey"]
+        return client("dynamodb", key["AccessKeyId"], key["SecretAccessKey"]), f"arn:aws:iam::{other}:user/{name}"
+
+    ddb_b, user_arn = user(f"xacct-user-{suffix}", [
+        {"Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:PutItem"], "Resource": "*"}])
+    noid_b, noid_arn = user(f"xacct-noid-{suffix}", [
+        {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}])
+    ddb_a.put_resource_policy(ResourceArn=arn(shared), Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": [user_arn, noid_arn]},
+        "Action": ["dynamodb:GetItem", "dynamodb:PutItem"], "Resource": arn(shared)}]}))
+
+    item = ddb_b.get_item(TableName=arn(shared), Key={"pk": {"S": "k1"}})["Item"]
+    assert item == {"pk": {"S": "k1"}, "v": {"S": "hello"}}
+    ddb_b.put_item(TableName=arn(shared), Item={"pk": {"S": "k2"}})
+    assert "Item" in ddb_a.get_item(TableName=shared, Key={"pk": {"S": "k2"}})
+
+    def refused(caller, table, reason, caller_arn):
+        with pytest.raises(ClientError) as exc:
+            caller.get_item(TableName=table, Key={"pk": {"S": "k1"}})
+        error = exc.value.response
+        assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
+            400, "AccessDeniedException",
+            f"User: {caller_arn} is not authorized to perform: dynamodb:GetItem on resource: {table} "
+            f"because no {reason}-based policy allows the dynamodb:GetItem action")
+
+    refused(ddb_b, arn(bare), "resource", user_arn)
+    refused(ddb_b, arn(f"xacct-missing-{suffix}"), "resource", user_arn)
+    refused(noid_b, arn(shared), "identity", noid_arn)
+    with pytest.raises(ClientError) as exc:
+        ddb_b.get_item(TableName=shared, Key={"pk": {"S": "k1"}})
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "ResourceNotFoundException", "Requested resource not found")
+
+
+@pytest.mark.auth_contract
+def test_dynamodb_tag_and_resource_policy_actions_check_the_table_contract(auth_enabled):
+    """Tag and resource-policy actions are checked on the table in ResourceArn (AWS capture, #2697)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    from botocore.exceptions import ClientError
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key="test", secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    ddb, iam = client("dynamodb"), client("iam")
+    arn = lambda t: f"arn:aws:dynamodb:us-east-1:000000000000:table/{t}"
+    mine, other = f"tagged-{suffix}", f"untagged-{suffix}"
+    for t in (mine, other):
+        ddb.create_table(TableName=t, BillingMode="PAY_PER_REQUEST", KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                         AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}])
+    name = f"tagger-{suffix}"
+    iam.create_user(UserName=name)
+    iam.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Resource": arn(mine), "Action": [
+            "dynamodb:TagResource", "dynamodb:UntagResource", "dynamodb:ListTagsOfResource", "dynamodb:PutResourcePolicy",
+            "dynamodb:GetResourcePolicy", "dynamodb:DeleteResourcePolicy"]}]}))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    c = client("dynamodb", key["AccessKeyId"], key["SecretAccessKey"])
+
+    def calls(t):
+        policy = json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"}, "Action": "dynamodb:GetItem",
+            "Resource": arn(t)}]})
+        return (("TagResource", lambda: c.tag_resource(ResourceArn=arn(t), Tags=[{"Key": "k", "Value": "v"}])),
+                ("ListTagsOfResource", lambda: c.list_tags_of_resource(ResourceArn=arn(t))),
+                ("UntagResource", lambda: c.untag_resource(ResourceArn=arn(t), TagKeys=["k"])),
+                ("PutResourcePolicy", lambda: c.put_resource_policy(ResourceArn=arn(t), Policy=policy)),
+                ("GetResourcePolicy", lambda: c.get_resource_policy(ResourceArn=arn(t))),
+                ("DeleteResourcePolicy", lambda: c.delete_resource_policy(ResourceArn=arn(t))))
+
+    for _action, call in calls(mine):
+        call()
+    for action, call in calls(other):
+        with pytest.raises(ClientError) as exc:
+            call()
+        error = exc.value.response
+        assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
+            400, "AccessDeniedException",
+            f"User: arn:aws:iam::000000000000:user/{name} is not authorized to perform: dynamodb:{action} on resource: "
+            f"{arn(other)} because no identity-based policy allows the dynamodb:{action} action")

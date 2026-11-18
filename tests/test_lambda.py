@@ -9330,6 +9330,14 @@ def test_lambda_ruby_4_0_runtime_maps_to_official_image():
     assert _RUNTIME_IMAGE_MAP.get("ruby4.0") == "public.ecr.aws/lambda/ruby:4.0"
 
 
+def test_lambda_nodejs_26_runtime_maps_to_official_image():
+    """nodejs26.x is in botocore's Runtime enum, runs on AWS (capture 2026-11-18) and has public.ecr.aws/lambda/nodejs:26."""
+    from ministack.services.lambda_svc import _RUNTIME_IMAGE_MAP
+
+    assert _RUNTIME_IMAGE_MAP.get("nodejs26.x") == "public.ecr.aws/lambda/nodejs:26"
+
+
+
 # ---------------------------------------------------------------------------
 # Lambda Durable Functions (Durable Execution).
 # Shapes verified against:
@@ -16301,3 +16309,75 @@ def test_lambda_log_events_carry_an_event_id(lam, logs):
         assert len(set(ids)) == len(ids)
     finally:
         lam.delete_function(FunctionName=name)
+
+
+@pytest.mark.auth_contract
+def test_lambda_create_function_checks_pass_role_and_the_function_arn_contract(auth_enabled):
+    """CreateFunction is checked on the new function's ARN, and the execution role as iam:PassRole with
+    iam:PassedToService lambda.amazonaws.com (AWS captures, #2695, #2698)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import uuid as _uuid
+    import zipfile as _zipfile
+
+    import boto3
+    from botocore.exceptions import ClientError
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key="test", secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    iam, suffix = client("iam"), _uuid.uuid4().hex[:8]
+    role_arn = iam.create_role(RoleName=f"pr-fn-{suffix}", AssumeRolePolicyDocument=json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                                                "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    buf = io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.py", "def handler(e, c):\n    return 'ok'\n")
+    code = {"ZipFile": buf.getvalue()}
+    base = {"Effect": "Allow", "Action": ["lambda:CreateFunction", "lambda:GetFunction"], "Resource": "*"}
+
+    def caller(tag, statements):
+        name = f"pr-{tag}-{suffix}"
+        iam.create_user(UserName=name)
+        iam.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=json.dumps(
+            {"Version": "2012-10-17", "Statement": statements}))
+        key = iam.create_access_key(UserName=name)["AccessKey"]
+        return client("lambda", key["AccessKeyId"], key["SecretAccessKey"]), f"arn:aws:iam::000000000000:user/{name}"
+
+    def create(lam, name):
+        return lam.create_function(FunctionName=name, Runtime="python3.12", Role=role_arn, Handler="index.handler",
+                                   Code=code)
+
+    def refused(lam, name, action, resource, reason):
+        with pytest.raises(ClientError) as exc:
+            create(lam, name)
+        error = exc.value.response
+        assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"]) == (403, "AccessDeniedException")
+        assert error["Error"]["Message"].endswith(f"is not authorized to perform: {action} on resource: {resource} "
+                                                  f"{reason}")
+
+    no_pass, _ = caller("none", [base])
+    refused(no_pass, f"pr-f0-{suffix}", "iam:PassRole", role_arn,
+            "because no identity-based policy allows the iam:PassRole action")
+    denied, _ = caller("deny", [base, {"Effect": "Allow", "Action": "iam:PassRole", "Resource": role_arn},
+                                {"Effect": "Deny", "Action": "iam:PassRole", "Resource": "*"}])
+    refused(denied, f"pr-f1-{suffix}", "iam:PassRole", role_arn, "with an explicit deny in an identity-based policy")
+    to_lambda, _ = caller("lam", [base, {"Effect": "Allow", "Action": "iam:PassRole", "Resource": role_arn,
+                                         "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}}])
+    create(to_lambda, f"pr-f2-{suffix}")
+    to_ec2, _ = caller("ec2", [base, {"Effect": "Allow", "Action": "iam:PassRole", "Resource": role_arn,
+                                      "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}}])
+    refused(to_ec2, f"pr-f3-{suffix}", "iam:PassRole", role_arn,
+            "because no identity-based policy allows the iam:PassRole action")
+    own = f"pr-own-{suffix}"
+    scoped, _ = caller("own", [
+        {"Effect": "Allow", "Action": ["lambda:CreateFunction", "lambda:GetFunction"],
+         "Resource": f"arn:aws:lambda:us-east-1:000000000000:function:{own}"},
+        {"Effect": "Allow", "Action": "iam:PassRole", "Resource": role_arn}])
+    create(scoped, own)
+    scoped.get_function(FunctionName=own)
+    other = f"pr-other-{suffix}"
+    refused(scoped, other, "lambda:CreateFunction", f"arn:aws:lambda:us-east-1:000000000000:function:{other}",
+            "because no identity-based policy allows the lambda:CreateFunction action")

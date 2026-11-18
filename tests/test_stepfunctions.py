@@ -2945,7 +2945,8 @@ def test_sfn_aws_sdk_rds_create_global_cluster_from_described_cluster_arn(sfn_sy
         try:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=primary_id,
+                DbClusterIdentifier=rds.describe_db_clusters(
+                    DBClusterIdentifier=primary_id)["DBClusters"][0]["DBClusterArn"],
             )
         except ClientError:
             pass
@@ -3128,14 +3129,16 @@ def test_sfn_aws_sdk_rds_global_cluster_readers_are_lists(sfn_sync, rds):
         try:
             west_rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=secondary_id,
+                DbClusterIdentifier=west_rds.describe_db_clusters(
+                    DBClusterIdentifier=secondary_id)["DBClusters"][0]["DBClusterArn"],
             )
         except ClientError:
             pass
         try:
             rds.remove_from_global_cluster(
                 GlobalClusterIdentifier=global_id,
-                DbClusterIdentifier=primary_id,
+                DbClusterIdentifier=rds.describe_db_clusters(
+                    DBClusterIdentifier=primary_id)["DBClusters"][0]["DBClusterArn"],
             )
         except ClientError:
             pass
@@ -10574,7 +10577,7 @@ def test_sfn_inline_map_with_a_distributed_map_field_fails_the_execution(sfn, ma
 def test_sfn_catch_or_retry_on_the_map_does_not_handle_the_inline_map_field_error(sfn, handler):
     desc, event_types = _run_inline_map(
         sfn, {"ItemsPath": "$.items", "ItemBatcher": {"MaxItemsPerBatch": 2}, **handler},
-        extra_states={"Caught": {"Type": "Pass", "End": True}})
+        extra_states={"Caught": {"Type": "Pass", "End": True}} if "Catch" in handler else None)
     assert (desc["status"], desc["error"], desc["cause"]) == ("FAILED", "States.Runtime", _inline_map_field_cause(2))
     assert event_types == ["ExecutionStarted", "MapStateEntered", "ExecutionFailed"]
 
@@ -11182,3 +11185,49 @@ def test_sfn_scheduler_scheduler_task_error_can_be_caught(sfn_sync, sched_group)
         assert json.loads(resp["output"])["error"]["Error"] == "Scheduler.ConflictException"
     finally:
         sfn_sync.delete_state_machine(stateMachineArn=arn)
+
+
+_STRUCTURE_CASES = [
+    ({"StartAt": "A", "States": {"A": {"Type": "Pass", "Next": "B"}, "B": {"Type": "Pass", "Next": "A"}}},
+     [("MISSING_END_STATE", "Workflow has no terminal state", None)]),
+    ({"StartAt": "A", "States": {"A": {"Type": "Pass", "Next": "Nope"}}},
+     [("MISSING_TRANSITION_TARGET", "Missing 'Next' target: Nope", "/States/A/Next"),
+      ("MISSING_END_STATE", "Workflow has no terminal state", None)]),
+    ({"StartAt": "Nope", "States": {"A": {"Type": "Pass", "End": True}}},
+     [("MISSING_TRANSITION_TARGET", "Missing 'Next' target: Nope", "/StartAt"),
+      ("MISSING_TRANSITION_TARGET", 'State "A" is not reachable.', "/States/A")]),
+    ({"StartAt": "A", "States": {"A": {"Type": "Pass", "Next": "B", "End": True}, "B": {"Type": "Succeed"}}},
+     [("SCHEMA_VALIDATION_FAILED", "There should only be one of the following fields: [Next, End]", "/States/A")]),
+    ({"StartAt": "A", "States": {"A": {"Type": "Pass"}}},
+     [("SCHEMA_VALIDATION_FAILED", "This object should have only one of the following fields: [Next, End]",
+       "/States/A"),
+      ("MISSING_END_STATE", "Workflow has no terminal state", None)]),
+]
+
+
+@pytest.mark.parametrize("definition,expected", _STRUCTURE_CASES)
+def test_sfn_definition_structure_errors(sfn, definition, expected):
+    """Validate, Create and Update refuse a broken state graph as AWS does (AWS capture 2026-11-18, #2680)."""
+    diagnostics = [{"severity": "ERROR", "code": c, "message": m, **({"location": loc} if loc else {})}
+                   for c, m, loc in expected]
+    body = json.dumps(definition)
+    resp = sfn.validate_state_machine_definition(definition=body)
+    assert (resp["result"], resp["diagnostics"], resp["truncated"]) == ("FAIL", diagnostics, False)
+    message = "Invalid State Machine Definition: '" + ", ".join(
+        f"{c}: {m} at {loc or 'null'}" for c, m, loc in expected) + "'"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    with pytest.raises(ClientError) as exc:
+        sfn.create_state_machine(name=f"sfn-bad-{_uuid_mod.uuid4().hex[:8]}", definition=body, roleArn=role)
+    assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+        "InvalidDefinition", message)
+    good = json.dumps({"StartAt": "A", "States": {"A": {"Type": "Pass", "End": True}}})
+    arn = sfn.create_state_machine(name=f"sfn-ok-{_uuid_mod.uuid4().hex[:8]}", definition=good,
+                                   roleArn=role)["stateMachineArn"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sfn.update_state_machine(stateMachineArn=arn, definition=body)
+        assert exc.value.response["Error"]["Message"] == message
+        assert sfn.describe_state_machine(stateMachineArn=arn)["definition"] == good
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+    assert sfn.validate_state_machine_definition(definition=good)["result"] == "OK"

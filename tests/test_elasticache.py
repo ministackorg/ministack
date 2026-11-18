@@ -3769,3 +3769,31 @@ def test_elasticache_user_group_duplicate_and_unknown_users(ec):
         ec.delete_user_group(UserGroupId=group)
         for user in (dflt, other):
             ec.delete_user(UserId=user)
+
+
+
+def test_elasticache_failed_replication_group_respawn_drops_the_stale_address(monkeypatch, caplog):
+    """A node group whose respawn fails reports the fallback endpoint, not its old address, and the log says it
+    failed (#2709)."""
+    import logging
+
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                        lambda name, engine, engine_version, labels, **_: (_ec.REDIS_DEFAULT_HOST, 6379, None))
+    old = {"Address": "192.168.148.10", "Port": 6379}
+    _ec.load_persisted_state({"replication_groups": {"rg-1": {
+        "ReplicationGroupId": "rg-1", "Engine": "valkey", "EngineVersion": "8.0",
+        "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                        "NodeGroupMembers": [{"ReadEndpoint": dict(old)}]}],
+        "_docker_container_ids": ["dead"]}}})
+    with caplog.at_level(logging.INFO):
+        _ec._ensure_live_containers()
+    ng = _ec._replication_groups["rg-1"]["NodeGroups"][0]
+    fallback = {"Address": _ec.REDIS_DEFAULT_HOST, "Port": 6379}
+    assert (ng["PrimaryEndpoint"], ng["ReaderEndpoint"], ng["NodeGroupMembers"][0]["ReadEndpoint"]) == (
+        fallback, fallback, fallback)
+    assert "failed to respawn node group(s) 0001 of replication group rg-1" in caplog.text
+    assert "respawned containers for replication group rg-1" not in caplog.text

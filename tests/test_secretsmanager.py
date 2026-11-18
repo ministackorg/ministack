@@ -1436,7 +1436,7 @@ def test_secret_policy_naming_the_user_allows_without_identity_policy(auth):
 def test_secret_policy_naming_the_account_needs_an_identity_policy(auth):
     arn = _policy_secret("Allow", "arn:aws:iam::000000000000:root")
     key, _user = inprocess_iam_user()
-    assert _get_secret_value(key, arn) == (403, "AccessDeniedException")
+    assert _get_secret_value(key, arn) == (400, "AccessDeniedException")  # AWS capture 2026-11-18
     key, _user = inprocess_iam_user(_ALLOW_SECRETS)
     assert _get_secret_value(key, arn) == (200, None)
 
@@ -1447,7 +1447,7 @@ def test_secret_policy_deny_beats_an_identity_allow(auth):
     status, _headers, body = routed_request(
         key, "secretsmanager", "POST", "/", json.dumps({"SecretId": arn}).encode(),
         {"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.GetSecretValue"})
-    assert (status, json.loads(body)) == (403, {"__type": "AccessDeniedException", "message": (
+    assert (status, json.loads(body)) == (400, {"__type": "AccessDeniedException", "message": (
         f"User: {user} is not authorized to perform: secretsmanager:GetSecretValue on resource: {arn} "
         "with an explicit deny in a resource-based policy")})
     status, _headers, body = routed_request(
@@ -1534,3 +1534,79 @@ def test_secretsmanager_primary_region_follows_replication(sm):
     assert resp["PrimaryRegion"] == resp["ARN"].split(":")[3]
     listed = [s for s in sm.list_secrets()["SecretList"] if s["Name"] == "sm-primary-region"]
     assert listed[0]["PrimaryRegion"] == resp["PrimaryRegion"]
+
+
+@pytest.mark.auth_contract
+def test_secret_of_another_account_by_arn_contract(auth_enabled):
+    """GetSecretValue / PutSecretValue by another account's secret ARN need the resource policy, the identity
+    policy and a customer managed key whose policy allows the caller (AWS capture, #2691)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    owner, other = "111122223333", "444455556666"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    iam_b, sm_a, kms_a = client("iam", other), client("secretsmanager", owner), client("kms", owner)
+    kms_actions = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
+
+    def user(name, statements):
+        iam_b.create_user(UserName=name)
+        iam_b.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=json.dumps(
+            {"Version": "2012-10-17", "Statement": statements}))
+        key = iam_b.create_access_key(UserName=name)["AccessKey"]
+        return client("secretsmanager", key["AccessKeyId"], key["SecretAccessKey"]), f"arn:aws:iam::{other}:user/{name}"
+
+    sm_b, user_arn = user(f"xsm-user-{suffix}", [
+        {"Effect": "Allow", "Action": ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"],
+         "Resource": "*"}, {"Effect": "Allow", "Action": kms_actions, "Resource": "*"}])
+    noid_b, noid_arn = user(f"xsm-noid-{suffix}", [{"Effect": "Allow", "Action": kms_actions, "Resource": "*"}])
+
+    def key(grant):
+        statements = [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{owner}:root"}, "Action": "kms:*",
+                       "Resource": "*"}]
+        if grant:
+            statements.append({"Effect": "Allow", "Principal": {"AWS": [user_arn, noid_arn]}, "Action": kms_actions,
+                               "Resource": "*"})
+        return kms_a.create_key(Policy=json.dumps({"Version": "2012-10-17", "Statement": statements}))[
+            "KeyMetadata"]["Arn"]
+
+    granted, ungranted = key(True), key(False)
+
+    def secret(name, kms_key, policy=True):
+        kw = {"KmsKeyId": kms_key} if kms_key else {}
+        arn = sm_a.create_secret(Name=f"xsm-{name}-{suffix}", SecretString="v1", **kw)["ARN"]
+        if policy:
+            sm_a.put_resource_policy(SecretId=arn, ResourcePolicy=json.dumps({"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": [user_arn, noid_arn]},
+                "Action": ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], "Resource": "*"}]}))
+        return arn
+
+    cmk, norp, nokey, managed = (secret("cmk", granted), secret("norp", granted, False), secret("nokey", ungranted),
+                                 secret("managed", None))
+    assert sm_b.get_secret_value(SecretId=cmk)["SecretString"] == "v1"
+    sm_b.put_secret_value(SecretId=cmk, SecretString="v2")
+    assert sm_a.get_secret_value(SecretId=cmk)["SecretString"] == "v2"
+
+    def refused(caller, arn, code, message):
+        for action, call in (("GetSecretValue", lambda: caller.get_secret_value(SecretId=arn)),
+                             ("PutSecretValue", lambda: caller.put_secret_value(SecretId=arn, SecretString="v3"))):
+            with pytest.raises(ClientError) as exc:
+                call()
+            error = exc.value.response
+            assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) \
+                == (400, code, message.replace("{action}", action))
+
+    def denial(caller_arn, arn, reason):
+        return (f"User: {caller_arn} is not authorized to perform: secretsmanager:{{action}} on resource: {arn} "
+                f"because no {reason}-based policy allows the secretsmanager:{{action}} action")
+
+    refused(sm_b, norp, "AccessDeniedException", denial(user_arn, norp, "resource"))
+    refused(sm_b, nokey, "AccessDeniedException", "Access to KMS is not allowed")
+    refused(sm_b, managed, "InvalidRequestException",
+            "You can't access a secret from a different AWS account if you encrypt the secret with the default KMS "
+            "service key.")
+    refused(noid_b, cmk, "AccessDeniedException", denial(noid_arn, cmk, "identity"))

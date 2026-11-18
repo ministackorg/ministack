@@ -1146,6 +1146,15 @@ def extract_resource_arn(service: str, method: str, path: str,
                 if func_name.startswith("arn:"):
                     return func_name
                 return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+            if method == "POST" and path_parts[-1] == "functions":
+                # CreateFunction is checked on the function it creates (Service Authorization Reference).
+                func_name = _safe_json_field(body, "FunctionName")
+                if isinstance(func_name, str) and func_name:
+                    if func_name.startswith("arn:"):
+                        return func_name
+                    if ":function:" in func_name:  # the partial ARN form, <account>:function:<name>
+                        return f"arn:aws:lambda:{region}:{func_name}"
+                    return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
         if "layers" in path_parts:
             li = path_parts.index("layers")
             if li + 1 < len(path_parts):
@@ -1177,7 +1186,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         # QueueName param (CreateQueue, GetQueueUrl)
         queue_name = _param(body, query_params, "QueueName")
         if queue_name:
-            return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+            owner = _param(body, query_params, "QueueOwnerAWSAccountId")
+            owner = owner if isinstance(owner, str) and re.fullmatch(r"\d{12}", owner) else account_id
+            return f"arn:aws:sqs:{region}:{owner}:{queue_name}"
         return "*"
 
     if service == "sns":
@@ -1187,6 +1198,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         target_arn = _query_param(query_params, "TargetArn")
         if target_arn:
             return target_arn
+        resource_arn = _query_param(query_params, "ResourceArn")
+        if resource_arn:
+            return resource_arn
+        subscription_arn = _query_param(query_params, "SubscriptionArn")
+        if isinstance(subscription_arn, str) and subscription_arn.count(":") >= 6:
+            # A subscription action is checked on the subscription's topic (Service Authorization Reference).
+            return subscription_arn.rsplit(":", 1)[0]
         # CreateTopic — name in params
         topic_name = _query_param(query_params, "Name")
         if topic_name:
@@ -1225,6 +1243,8 @@ def extract_resource_arn(service: str, method: str, path: str,
             from ministack.services import secretsmanager as secretsmanager_svc
 
             _, secret = secretsmanager_svc._resolve(secret_id)
+            if not secret and secret_id.startswith("arn:") and f":{region}:" in secret_id:
+                _, secret = secretsmanager_svc._resolve(secret_id, use_arn_scope=True, cross_account=True)
             if secret:
                 return secret["ARN"]
             if secret_id.startswith("arn:"):
@@ -1234,18 +1254,25 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "iam":
         # IAM actions target users, roles, policies — extract from params
-        role_name = _query_param(query_params, "RoleName")
-        if role_name:
-            return f"arn:aws:iam::{account_id}:role/{role_name}"
-        user_name = _query_param(query_params, "UserName")
-        if user_name:
-            return f"arn:aws:iam::{account_id}:user/{user_name}"
+        # The resource is the entity's ARN with its path: the stored one, or the Path a create names.
+        from ministack.services import iam as iam_svc
+
+        path_param = _query_param(query_params, "Path") or "/"
+        if not (isinstance(path_param, str) and path_param.startswith("/") and path_param.endswith("/")):
+            path_param = "/"
+        for param, kind, store in (("RoleName", "role", iam_svc._roles), ("UserName", "user", iam_svc._users),
+                                   ("GroupName", "group", iam_svc._groups)):
+            name = _query_param(query_params, param)
+            if name and param == "GroupName" and _query_param(query_params, "PolicyArn"):
+                break
+            if name:
+                entity = store.get_scoped(account_id, None, name) if isinstance(name, str) else None
+                if isinstance(entity, dict) and isinstance(entity.get("Arn"), str):
+                    return entity["Arn"]
+                return f"arn:aws:iam::{account_id}:{kind}{path_param}{name}"
         policy_arn = _query_param(query_params, "PolicyArn")
         if policy_arn:
             return policy_arn
-        group_name = _query_param(query_params, "GroupName")
-        if group_name:
-            return f"arn:aws:iam::{account_id}:group/{group_name}"
         return "*"
 
     if service == "sts":
@@ -1968,6 +1995,10 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
         return []
     table = data.get("TableName") if isinstance(data, dict) else None
+    resource = data.get("ResourceArn") if isinstance(data, dict) else None
+    if not table and isinstance(resource, str) and resource.startswith("arn:"):
+        # Tag and resource-policy actions are checked on the table or stream they name.
+        return [resource]
     if isinstance(table, str) and table:
         index = data.get("IndexName")
         suffix = f"/index/{index}" if isinstance(index, str) and index else ""
@@ -2525,6 +2556,20 @@ def _resource_policy_denial(service: str, action: str, principal_arn: str, resou
             "with an explicit deny in a resource-based policy")
 
 
+def _iam_denied_resource(resource_arn: str) -> str:
+    """How an IAM denial names a role or user (AWS capture 2026-11-18): an existing one as "role <name>" /
+    "user <name>", one being created by its ARN. Other IAM resources keep the message without a resource."""
+    _, _, tail = resource_arn.partition(":iam::")
+    kind, _, rest = tail.partition(":")[2].partition("/")
+    if kind not in ("role", "user") or not rest:
+        return ""
+    from ministack.services import iam as iam_svc
+
+    name = rest.rsplit("/", 1)[-1]
+    exists = name in (iam_svc._roles if kind == "role" else iam_svc._users)
+    return f"{kind} {name}" if exists else resource_arn
+
+
 def identity_denial_message(action: str, principal_arn: str, resource: str, explicit_deny: bool) -> str:
     """The message of a denial an identity-based policy decided, naming the resource."""
     reason = (
@@ -2541,7 +2586,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
                            resource_arn: str = "*", explicit_deny: bool = False,
-                           resource_policy_arn: str = "") -> tuple:
+                           resource_policy_arn: str = "", no_resource_allow: bool = False) -> tuple:
     """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
@@ -2566,6 +2611,20 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
         )
+    if service in ("dynamodb", "secretsmanager") and not error_code and resource_arn.startswith("arn:"):
+        # DynamoDB and Secrets Manager denials are HTTP 400 and name the resource; across accounts its own
+        # policy may be the one that did not allow (AWS captures).
+        if not message and explicit_deny and resource_policy_arn:
+            message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
+        elif not message and no_resource_allow:
+            message = (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
+                       f"because no resource-based policy allows the {action} action")
+        message = message or identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
+        content_type = "application/x-amz-json-1.0" if service == "dynamodb" else "application/x-amz-json-1.1"
+        return (
+            400, {"Content-Type": content_type, "x-amzn-errortype": "AccessDeniedException"},
+            json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
+        )
     if service == "iot-data":
         # The IoT data plane answers every refusal ForbiddenException: "Forbidden"
         # for a failed authentication, no message for a policy denial.
@@ -2583,6 +2642,8 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         )
         # IoT names the resource, "*" for an action that takes none.
         on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        if service == "iam" and (iam_resource := _iam_denied_resource(resource_arn)):
+            on_resource = f" on resource: {iam_resource}"
         message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403

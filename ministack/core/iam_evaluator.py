@@ -69,6 +69,7 @@ class EvalResult:
     matched_sid: str = ""
     reason: str = ""
     resource_policy_arn: str = ""  # set when the resource's own policy denied
+    no_resource_allow: bool = False  # the identity allowed; another account's resource policy did not
 
 
 @dataclass
@@ -780,7 +781,10 @@ def combine_resource_policy(identity: EvalResult, ctx: EvalContext,
                 within_limits
                 or evaluate_resource_policy(policy, ctx, direct_only=True).decision == "Allow"):
             return named
-    return resource if identity.decision == "Allow" else identity
+    if identity.decision == "Allow":
+        resource.no_resource_allow = True
+        return resource
+    return identity
 
 
 # Services whose resources carry their own policy: the module and the function
@@ -795,7 +799,12 @@ _RESOURCE_POLICY_LOOKUPS = {
     "kms": ("kms", "key_policy_for_arn"),
     "apigateway": ("apigateway_v1", "rest_api_policy_for_arn"),
     "kinesis": ("kinesis", "stream_policy_for_arn"),
+    "dynamodb": ("dynamodb", "table_policy_for_arn"),
 }
+
+_DYNAMODB_ITEM_ACTIONS = frozenset(f"dynamodb:{a}" for a in (
+    "GetItem", "PutItem", "UpdateItem", "DeleteItem", "Query", "Scan", "BatchGetItem", "BatchWriteItem",
+    "ConditionCheckItem"))
 
 # A key policy must allow even the owner's own users and roles.
 _POLICY_REQUIRED = frozenset({"kms"})
@@ -1768,6 +1777,8 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         result.principal_arn = principal.arn
         return result
     found = _resource_policy(service, resource_arn)
+    if found is not None and service == "dynamodb" and iam_action not in _DYNAMODB_ITEM_ACTIONS:
+        found = None  # Only item calls reach another account's table by its ARN.
     if found is not None and service == "s3" and "MultiRegionAccessPoint" in iam_action:
         found = None  # The MRAP policy governs data requests, not S3 Control's MRAP calls.
     if found is None and service == "s3" and context.get("ministack:s3foreignstep") == "bucket":

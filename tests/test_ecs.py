@@ -4746,3 +4746,56 @@ def test_ecs_service_deployments_after_a_second_deployment(ecs, deployment_servi
     assert [d["serviceDeploymentArn"] for d in details] == [b["serviceDeploymentArn"] for b in briefs]
     assert details[0]["sourceServiceRevisions"][0]["arn"] == first["targetServiceRevisionArn"]
     assert "sourceServiceRevisions" not in details[1]
+
+
+# ── ECR pull-through cache: ECS fills the cache, then runs from it ─────
+
+_PTC_IMAGE = "000000000000.dkr.ecr.us-east-1.amazonaws.com/dockerhub/permitio/pdp-v2:0.9.9"
+
+
+class _PtcDaemon:
+    """A container daemon: records every call; ``run`` fails with *fail* when given."""
+
+    def __init__(self, fail=None):
+        self.calls, self.fail = [], fail
+        self.images, self.containers = self, self
+
+    def pull(self, ref, **kwargs):
+        self.calls.append(("pull", ref, kwargs))
+
+    def run(self, image, **kwargs):
+        self.calls.append(("run", image, kwargs.get("platform")))
+        if self.fail:
+            raise self.fail
+        return SimpleNamespace(id="c")
+
+
+def test_ptc_fill_runs_before_the_image_is_used(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ecs_service.ecr, "fill_pull_through",
+                        lambda image, principal=None, docker_client=None: seen.append((image, principal, docker_client)))
+    daemon = _PtcDaemon()
+    cdef = {"name": "c", "image": _PTC_IMAGE}
+    ecs_service._fill_pull_through(cdef, {"executionRoleArn": "arn:aws:iam::000000000000:role/exec"}, daemon)
+    assert seen == [(_PTC_IMAGE, "arn:aws:iam::000000000000:role/exec", daemon)]
+    assert cdef == {"name": "c", "image": _PTC_IMAGE}
+
+
+@pytest.mark.parametrize("kind, error", [
+    ("secret", "_SecretResolutionError"), ("unavailable", "_ImagePullError"), ("repository", "_ImagePullError")])
+def test_ptc_fill_miss_fails_the_task_launch(monkeypatch, kind, error):
+    def miss(image, principal=None, docker_client=None):
+        raise ecs_service.ecr.PullThroughMiss(kind, "Unable to reach the upstream registry.")
+    monkeypatch.setattr(ecs_service.ecr, "fill_pull_through", miss)
+    with pytest.raises(getattr(ecs_service, error)):
+        ecs_service._fill_pull_through({"name": "c", "image": _PTC_IMAGE}, {}, _PtcDaemon())
+
+
+def test_pinned_platform_pull_failure_says_the_pull_failed(caplog):
+    from docker.errors import ImageNotFound
+    cdef = {"name": "c", "image": "quay.io/permitio/pdp-v2:0.9.9"}
+    daemon = _PtcDaemon(fail=ImageNotFound("pull access denied for permitio/pdp-v2"))
+    with pytest.raises(ImageNotFound):
+        ecs_service._run_docker_container(daemon, cdef, {"platform": "linux/arm64"})
+    assert "pulling quay.io/permitio/pdp-v2:0.9.9 for linux/arm64 failed" in caplog.text
+    assert "this host cannot run it" not in caplog.text

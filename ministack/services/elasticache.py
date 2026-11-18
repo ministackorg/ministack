@@ -317,7 +317,11 @@ def _ensure_live_containers_locked():
                 node["Endpoint"] = {"Address": host, "Port": port}
             if cl.get("ConfigurationEndpoint"):
                 cl["ConfigurationEndpoint"] = {"Address": host, "Port": port}
-            log.info("elasticache: respawned container for cluster %s after restart", name)
+            if cid:
+                log.info("elasticache: respawned container for cluster %s after restart", name)
+            else:
+                log.warning("elasticache: failed to respawn container for cluster %s on restart; "
+                            "endpoint will be unreachable", name)
         except Exception:
             log.warning(
                 "elasticache: failed to respawn container for cluster %s on restart; "
@@ -332,6 +336,7 @@ def _ensure_live_containers_locked():
             engine = rg.get("Engine", "redis")
             engine_version = rg.get("EngineVersion") or rg.get("CacheNodeType") or "7.1"
             node_groups = rg.get("NodeGroups") or []
+            failed = []
             for ng in node_groups:
                 ng_id = ng.get("NodeGroupId", "0001")
                 host, port, cid = _spawn_redis_container(
@@ -347,14 +352,21 @@ def _ensure_live_containers_locked():
                 )
                 if cid:
                     rg["_docker_container_ids"].append(cid)
-                    # The new container has a new address; report it, as the cache cluster respawn above does.
-                    old, new = dict(ng.get("PrimaryEndpoint") or {}), {"Address": host, "Port": port}
-                    ng["PrimaryEndpoint"], ng["ReaderEndpoint"] = dict(new), dict(new)
-                    for member in ng.get("NodeGroupMembers") or []:
-                        member["ReadEndpoint"] = dict(new)
-                    if rg.get("ConfigurationEndpoint") == old:
-                        rg["ConfigurationEndpoint"] = dict(new)
-            log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
+                else:
+                    failed.append(ng_id)
+                # Report the new container's address, or the fallback endpoint when the spawn failed, as the cache
+                # cluster respawn above does: the old address may now belong to another container.
+                old, new = dict(ng.get("PrimaryEndpoint") or {}), {"Address": host, "Port": port}
+                ng["PrimaryEndpoint"], ng["ReaderEndpoint"] = dict(new), dict(new)
+                for member in ng.get("NodeGroupMembers") or []:
+                    member["ReadEndpoint"] = dict(new)
+                if rg.get("ConfigurationEndpoint") == old:
+                    rg["ConfigurationEndpoint"] = dict(new)
+            if failed:
+                log.warning("elasticache: failed to respawn node group(s) %s of replication group %s on restart; "
+                            "endpoint will be unreachable", ", ".join(failed), rg_id)
+            else:
+                log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
         except Exception:
             log.warning(
                 "elasticache: failed to respawn containers for replication group %s "

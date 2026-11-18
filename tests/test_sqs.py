@@ -1997,8 +1997,8 @@ class TestCrossAccountSqs:
             _as(ACCT_B, sqs_svc._act_get_queue_url,
                 {"QueueName": name,
                  "QueueOwnerAWSAccountId": ACCT_A}, "")
-        assert exc.value.code == "AccessDenied"
-        assert exc.value.status == 403
+        assert (exc.value.code, exc.value.status, exc.value.message) == (
+            "QueueDoesNotExist", 400, "The specified queue does not exist or you do not have access to it.")
 
     def test_get_queue_url_same_account_denied_by_explicit_deny(self, auth):
         name = _uniq("xpol-q")
@@ -2696,3 +2696,82 @@ def test_removed_policies_remain_absent_after_persistence_round_trip(queue):
     sqs_svc.load_persisted_state(state)
     assert policies.keys().isdisjoint(_read("json", url, ["All"]))
     assert _read("json", url, ["QueueArn"])["QueueArn"].endswith(":policy-removal")
+
+
+@pytest.mark.auth_contract
+def test_sqs_get_queue_url_of_another_account_contract(auth_enabled):
+    """GetQueueUrl with QueueOwnerAWSAccountId is checked on the owner's queue ARN; a refused or unknown
+    cross-account lookup answers NonExistentQueue (AWS capture, #2689)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    owner, other = "111122223333", "444455556666"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    granted, bare = f"xacct-granted-{suffix}", f"xacct-bare-{suffix}"
+    iam_b = client("iam", other)
+
+    def user(name, actions, queue):
+        iam_b.create_user(UserName=name)
+        iam_b.put_user_policy(UserName=name, PolicyName="sqs", PolicyDocument=_json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": actions,
+                                                    "Resource": f"arn:aws:sqs:us-east-1:{owner}:*"}]}))
+        key = iam_b.create_access_key(UserName=name)["AccessKey"]
+        return client("sqs", key["AccessKeyId"], key["SecretAccessKey"]), f"arn:aws:iam::{other}:user/{name}"
+
+    sqs_b, user_arn = user(f"xacct-user-{suffix}", ["sqs:GetQueueUrl", "sqs:SendMessage"], granted)
+    noget_b, noget_arn = user(f"xacct-noget-{suffix}", ["sqs:SendMessage"], granted)
+    sqs_a = client("sqs", owner)
+    url = sqs_a.create_queue(QueueName=granted)["QueueUrl"]
+    sqs_a.create_queue(QueueName=bare)
+    sqs_a.set_queue_attributes(QueueUrl=url, Attributes={"Policy": _json.dumps({
+        "Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": [user_arn, noget_arn]},
+            "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+            "Resource": f"arn:aws:sqs:us-east-1:{owner}:{granted}"}]})})
+
+    assert sqs_b.get_queue_url(QueueName=granted, QueueOwnerAWSAccountId=owner)["QueueUrl"] == url
+    for caller, name in ((sqs_b, bare), (sqs_b, f"xacct-missing-{suffix}"), (noget_b, granted)):
+        with pytest.raises(ClientError) as exc:
+            caller.get_queue_url(QueueName=name, QueueOwnerAWSAccountId=owner)
+        error = exc.value.response
+        assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
+            400, "AWS.SimpleQueueService.NonExistentQueue",
+            "The specified queue does not exist or you do not have access to it.")
+
+
+def test_sqs_sender_id_is_the_user_or_role_session(sqs):
+    """SenderId is the sender's user ID, or role ID and session name (AWS capture, #2693)."""
+    import json as _json
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test", token=None):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret, aws_session_token=token)
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    iam = client("iam", "test")
+    allow = _json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]})
+    user = iam.create_user(UserName=f"sender-user-{suffix}")["User"]
+    iam.put_user_policy(UserName=user["UserName"], PolicyName="sqs", PolicyDocument=allow)
+    key = iam.create_access_key(UserName=user["UserName"])["AccessKey"]
+    role = iam.create_role(RoleName=f"sender-role-{suffix}", AssumeRolePolicyDocument=_json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                                                "Action": "sts:AssumeRole"}]}))["Role"]
+    iam.put_role_policy(RoleName=role["RoleName"], PolicyName="sqs", PolicyDocument=allow)
+    creds = client("sts", "test").assume_role(RoleArn=role["Arn"], RoleSessionName="my-session")["Credentials"]
+    url = sqs.create_queue(QueueName=f"sender-{suffix}")["QueueUrl"]
+    client("sqs", key["AccessKeyId"], key["SecretAccessKey"]).send_message(QueueUrl=url, MessageBody="from-user")
+    client("sqs", creds["AccessKeyId"], creds["SecretAccessKey"], creds["SessionToken"]).send_message_batch(
+        QueueUrl=url, Entries=[{"Id": "1", "MessageBody": "from-role-session"}])
+    seen = {}
+    for _ in range(3):
+        for m in sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10,
+                                     MessageSystemAttributeNames=["SenderId"]).get("Messages", []):
+            seen[m["Body"]] = m["Attributes"]["SenderId"]
+    assert seen == {"from-user": user["UserId"], "from-role-session": f"{role['RoleId']}:my-session"}

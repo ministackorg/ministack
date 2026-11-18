@@ -1911,3 +1911,64 @@ def test_request_field_condition_keys_contract(auth_enabled, iam_user):
             admin_iam.delete_role(RoleName=name)
         except ClientError:
             pass
+
+
+@pytest.mark.auth_contract
+def test_iam_role_and_user_resources_carry_their_path_contract(auth_enabled):
+    """IAM checks a role or user action on the entity's ARN with its path (AWS capture, #2694)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    import os
+    import uuid as _uuid
+
+    import boto3
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(key="test", secret="test"):
+        return boto3.client("iam", endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    admin, suffix = client(), _uuid.uuid4().hex[:8]
+    role, target = f"path-role-{suffix}", f"path-target-{suffix}"
+    trust = _json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    admin.create_role(RoleName=role, Path="/my/path/", AssumeRolePolicyDocument=trust)
+    admin.create_user(UserName=target, Path="/my/path/")
+
+    def caller(tag, resource, actions):
+        name = f"path-{tag}-{suffix}"
+        admin.create_user(UserName=name)
+        admin.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=_json.dumps({"Version": "2012-10-17",
+                              "Statement": [{"Effect": "Allow", "Action": actions, "Resource": resource}]}))
+        key = admin.create_access_key(UserName=name)["AccessKey"]
+        return client(key["AccessKeyId"], key["SecretAccessKey"])
+
+    doc = _json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "*"}]})
+    path = caller("rp", "arn:aws:iam::000000000000:role/my/path/*", ["iam:GetRole", "iam:PutRolePolicy"])
+    nopath = caller("rn", f"arn:aws:iam::000000000000:role/path-role-*", ["iam:GetRole", "iam:PutRolePolicy"])
+    path.get_role(RoleName=role)
+    path.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc)
+    rn = f"arn:aws:iam::000000000000:user/path-rn-{suffix}"
+    for action, call in (("GetRole", lambda: nopath.get_role(RoleName=role)),
+                         ("PutRolePolicy", lambda: nopath.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc))):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == ("AccessDenied", (
+            f"User: {rn} is not authorized to perform: iam:{action} on resource: role {role} "
+            f"because no identity-based policy allows the iam:{action} action"))
+    caller("up", "arn:aws:iam::000000000000:user/my/path/*", ["iam:GetUser"]).get_user(UserName=target)
+    with pytest.raises(ClientError) as exc:
+        caller("un", f"arn:aws:iam::000000000000:user/path-target-*", ["iam:GetUser"]).get_user(UserName=target)
+    assert exc.value.response["Error"]["Message"] == (
+        f"User: arn:aws:iam::000000000000:user/path-un-{suffix} is not authorized to perform: iam:GetUser on resource: "
+        f"user {target} because no identity-based policy allows the iam:GetUser action")
+    caller("cp", "arn:aws:iam::000000000000:role/my/path/*", ["iam:CreateRole"]).create_role(
+        RoleName=f"path-new-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
+    with pytest.raises(ClientError) as exc:
+        caller("cn", f"arn:aws:iam::000000000000:role/path-new2-*", ["iam:CreateRole"]).create_role(
+            RoleName=f"path-new3-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
+    assert exc.value.response["Error"]["Message"] == (
+        f"User: arn:aws:iam::000000000000:user/path-cn-{suffix} is not authorized to perform: iam:CreateRole on "
+        f"resource: arn:aws:iam::000000000000:role/my/path/path-new3-{suffix} "
+        "because no identity-based policy allows the iam:CreateRole action")

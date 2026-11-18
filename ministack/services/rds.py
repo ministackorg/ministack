@@ -5295,19 +5295,7 @@ def _create_db_instance_with_cluster_lock(p):
             _end_mysql_global_instance_mutation(cluster)
 
 
-# Engine names that CreateDBInstance accepts: the botocore list plus docdb and
-# neptune, which share this API. AWS answers any other name "Invalid DB engine".
-_CREATE_DB_INSTANCE_ENGINES = {
-    "aurora", "aurora-mysql", "aurora-postgresql",
-    "custom-oracle-ee", "custom-oracle-ee-cdb", "custom-oracle-se2",
-    "custom-oracle-se2-cdb", "custom-sqlserver-dev", "custom-sqlserver-ee",
-    "custom-sqlserver-se", "custom-sqlserver-web", "db2-ae", "db2-se", "docdb",
-    "mariadb", "mysql", "neptune", "oracle-ee", "oracle-ee-cdb", "oracle-se2",
-    "oracle-se2-cdb", "postgres", "sqlserver-dev-ee", "sqlserver-ee",
-    "sqlserver-ex", "sqlserver-se", "sqlserver-web",
-}
-# db.serverless, or db.<family>.<size> for the RDS instance families.
-_DB_INSTANCE_CLASS_RE = re.compile(r"^db\.(serverless|[cmrtxz][0-9][a-z0-9-]*\.[a-z0-9]+)$")
+_ORACLE_CDB_CONVERSIONS = {("oracle-ee", "oracle-ee-cdb"), ("oracle-se2", "oracle-se2-cdb")}
 _DB_STORAGE_TYPES = {"standard", "gp2", "gp3", "io1", "io2", "aurora", "aurora-iopt1"}
 _PERFORMANCE_INSIGHTS_RETENTION_PERIODS = (7, *range(31, 31 * 24, 31), 731)
 _POSTGRES_MASTER_USERNAME_MAX = 63
@@ -5332,10 +5320,6 @@ def _storage_size_error(engine, storage_type, size):
 
 def _create_db_instance_input_error(p, engine, parent):
     """The AWS error for an invalid CreateDBInstance field, else None."""
-    db_class = _p(p, "DBInstanceClass")
-    if db_class and not _DB_INSTANCE_CLASS_RE.match(db_class.lower()):
-        return _invalid_parameter_value(f"Invalid DB Instance class: {_esc(db_class)}")
-
     storage_type = _p(p, "StorageType")
     if storage_type and storage_type.lower() not in _DB_STORAGE_TYPES:
         return _error("StorageTypeNotSupported", f"Invalid storage type: {_esc(storage_type)}", 400)
@@ -5404,8 +5388,9 @@ def _create_db_instance_impl(p):
     if db_id in _instances:
         return _instance_already_exists()
 
-    engine = _p(p, "Engine") or "postgres"
-    if engine.lower() not in _CREATE_DB_INSTANCE_ENGINES:
+    engine = _p(p, "Engine")
+    if not engine or (engine.lower() not in _ENGINE_VERSION_CATALOG
+                      and engine.lower() not in UNCATALOGUED_RDS_ENGINES):
         return _invalid_parameter_value("Invalid DB engine")
     explicit_engine_version = _p(p, "EngineVersion")
     engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
@@ -6394,7 +6379,8 @@ def _modify_db_instance(p):
 
     new_engine = _p(p, "Engine")
     current_engine = instance.get("Engine") or ""
-    if new_engine and new_engine.lower() != current_engine.lower():
+    if (new_engine and new_engine.lower() != current_engine.lower()
+            and (current_engine.lower(), new_engine.lower()) not in _ORACLE_CDB_CONVERSIONS):
         return _invalid_parameter_combination(
             f"Modification of database from engine {_esc(current_engine)} to engine "
             f"{_esc(new_engine)} is not supported."

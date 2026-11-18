@@ -757,6 +757,11 @@ _CUSTOM_NAME_REPLACEMENT = {
         "exists": "A policy called {name} already exists. Duplicate names are not allowed.",
     },
     "AWS::ECR::Repository": {"name": "RepositoryName"},
+    "AWS::ECR::RepositoryCreationTemplate": {"name": "Prefix"},
+    "AWS::ECR::PullThroughCacheRule": {
+        "name": "EcrRepositoryPrefix",
+        "requires_replacement": lambda old, new: old != new,
+    },
     "AWS::IoT::ProvisioningTemplate": {
         "name": "TemplateName",
         "requires_replacement": lambda old, new: (
@@ -7982,6 +7987,106 @@ def _ecr_repo_delete(physical_id, props):
     })
     if status >= 400:
         raise ValueError(json.loads(body).get("message", body))
+
+
+def _ecr_call(handler, data):
+    status, _, body = handler(data)
+    if status >= 400:
+        raise ValueError(json.loads(body).get("message", body))
+    return json.loads(body)
+
+
+_ECR_PTC_PROPS = {
+    "EcrRepositoryPrefix": "ecrRepositoryPrefix", "UpstreamRegistryUrl": "upstreamRegistryUrl",
+    "CredentialArn": "credentialArn", "CustomRoleArn": "customRoleArn",
+    "UpstreamRegistry": "upstreamRegistry", "UpstreamRepositoryPrefix": "upstreamRepositoryPrefix",
+}
+
+
+def _ecr_ptc_rule_create(logical_id, props, stack_name):
+    data = {api: props[cfn] for cfn, api in _ECR_PTC_PROPS.items() if props.get(cfn) is not None}
+    rule = _ecr_call(_ecr._create_pull_through_cache_rule, data)
+    return rule["ecrRepositoryPrefix"], {}
+
+
+def _ecr_ptc_rule_delete(physical_id, props):
+    if physical_id in _ecr._ptc_rules:
+        _ecr_call(_ecr._delete_pull_through_cache_rule, {"ecrRepositoryPrefix": physical_id})
+
+
+def _ecr_rct_to_api(props):
+    data = {"prefix": props.get("Prefix"), "appliedFor": props.get("AppliedFor")}
+    for cfn, api in (("Description", "description"), ("ImageTagMutability", "imageTagMutability"),
+                     ("LifecyclePolicy", "lifecyclePolicy"), ("RepositoryPolicy", "repositoryPolicy"),
+                     ("CustomRoleArn", "customRoleArn")):
+        if props.get(cfn) is not None:
+            value = props[cfn]
+            data[api] = value if isinstance(value, str) or cfn not in ("LifecyclePolicy", "RepositoryPolicy") \
+                else json.dumps(value)
+    encryption = props.get("EncryptionConfiguration")
+    if encryption:
+        data["encryptionConfiguration"] = {"encryptionType": encryption.get("EncryptionType"),
+                                           **({"kmsKey": encryption["KmsKey"]} if encryption.get("KmsKey") else {})}
+    filters = props.get("ImageTagMutabilityExclusionFilters")
+    if filters:
+        data["imageTagMutabilityExclusionFilters"] = [
+            {"filterType": f.get("ImageTagMutabilityExclusionFilterType"),
+             "filter": f.get("ImageTagMutabilityExclusionFilterValue")} for f in filters]
+    if props.get("ResourceTags") is not None:
+        data["resourceTags"] = [{"Key": t.get("Key"), "Value": t.get("Value", "")} for t in props["ResourceTags"]]
+    return data
+
+
+def _ecr_rct_attrs(template):
+    def iso(epoch):
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(epoch))
+    return template["prefix"], {"CreatedAt": iso(template["createdAt"]), "UpdatedAt": iso(template["updatedAt"])}
+
+
+def _ecr_rct_create(logical_id, props, stack_name):
+    return _ecr_rct_attrs(_ecr_call(_ecr._create_creation_template, _ecr_rct_to_api(props))
+                          ["repositoryCreationTemplate"])
+
+
+def _ecr_rct_update(physical_id, old_props, new_props, stack_name):
+    template = _ecr._creation_templates.get(physical_id)
+    if template is None:
+        return _ecr_rct_create(None, new_props, stack_name)
+    kept = dict(template)
+    for key in _ecr._RCT_SETTINGS:
+        if key != "appliedFor":
+            template.pop(key, None)
+    try:
+        answer = _ecr_call(_ecr._update_creation_template, _ecr_rct_to_api(new_props))
+    except ValueError:
+        template.clear()
+        template.update(kept)
+        raise
+    return _ecr_rct_attrs(answer["repositoryCreationTemplate"])
+
+
+def _ecr_rct_delete(physical_id, props):
+    if physical_id in _ecr._creation_templates:
+        _ecr_call(_ecr._delete_creation_template, {"prefix": physical_id})
+
+
+def _ecr_registry_policy_text(props):
+    policy = props.get("PolicyText")
+    return policy if isinstance(policy, str) else json.dumps(policy)
+
+
+def _ecr_registry_policy_create(logical_id, props, stack_name):
+    registry = _ecr_call(_ecr._put_registry_policy, {"policyText": _ecr_registry_policy_text(props)})
+    return registry["registryId"], {"RegistryId": registry["registryId"]}
+
+
+def _ecr_registry_policy_update(physical_id, old_props, new_props, stack_name):
+    return _ecr_registry_policy_create(None, new_props, stack_name)
+
+
+def _ecr_registry_policy_delete(physical_id, props):
+    if _ecr._registry_policies.get(_ecr._REGISTRY_POLICY_KEY) is not None:
+        _ecr_call(_ecr._delete_registry_policy, {})
 
 
 # --- CodeBuild Project provisioner ---
@@ -15437,6 +15542,11 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::IAM::User": ("UserName",),
     "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
     "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
+    "AWS::ECR::RepositoryCreationTemplate": ("Prefix",),
+    "AWS::ECR::PullThroughCacheRule": (
+        "CredentialArn", "CustomRoleArn", "EcrRepositoryPrefix", "UpstreamRegistry",
+        "UpstreamRegistryUrl", "UpstreamRepositoryPrefix",
+    ),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
     "AWS::IoT::JobTemplate": (
         "JobTemplateId", "JobArn", "Description", "Document", "DocumentSource",
@@ -16050,6 +16160,20 @@ _RESOURCE_HANDLERS = {
         "update": _ecr_repo_update,
         "update_with_logical_id": True,
         "delete": _ecr_repo_delete,
+    },
+    "AWS::ECR::PullThroughCacheRule": {
+        "create": _ecr_ptc_rule_create,
+        "delete": _ecr_ptc_rule_delete,
+    },
+    "AWS::ECR::RepositoryCreationTemplate": {
+        "create": _ecr_rct_create,
+        "update": _ecr_rct_update,
+        "delete": _ecr_rct_delete,
+    },
+    "AWS::ECR::RegistryPolicy": {
+        "create": _ecr_registry_policy_create,
+        "update": _ecr_registry_policy_update,
+        "delete": _ecr_registry_policy_delete,
     },
     "AWS::CertificateManager::Certificate": {
         "create": _acm_certificate_create,

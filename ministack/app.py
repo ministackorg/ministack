@@ -337,6 +337,21 @@ class _ErrorModule:
         pass
 
 
+# SNS names the topic in these denials and spells the action SNS:<name> (AWS capture).
+_SNS_NAMED_DENIALS = frozenset(f"sns:{a}" for a in (
+    "TagResource", "UntagResource", "ListTagsForResource", "GetSubscriptionAttributes", "SetSubscriptionAttributes",
+    "Unsubscribe"))
+_PASSES_ROLE = frozenset({"lambda:CreateFunction", "lambda:UpdateFunctionConfiguration"})
+
+
+def _safe_body_field(body: bytes, field: str):
+    try:
+        data = json.loads(body or b"{}")
+    except (ValueError, TypeError):
+        return None
+    return data.get(field) if isinstance(data, dict) else None
+
+
 def _get_module(name: str):
     """Import and cache a service module by short name (e.g. 's3', 'lambda_svc')."""
     mod = _loaded_modules.get(name)
@@ -3143,6 +3158,7 @@ async def _dispatch_service_request(
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
+            identity_denial_message,
             iot_resource_arns,
             logs_service_context,
             request_field_context,
@@ -3248,6 +3264,17 @@ async def _dispatch_service_request(
                     if denied:
                         iam_action = extra_action
                         break
+            if service == "lambda" and not denied and iam_action in _PASSES_ROLE:
+                # Passing an execution role is authorized as iam:PassRole on it (IAM User Guide, PassRole).
+                role_arn = _safe_body_field(body, "Role")
+                if isinstance(role_arn, str) and role_arn.startswith("arn:"):
+                    passed = enforce(access_key, "iam:PassRole", "iam", region, resource_arn=role_arn,
+                                     service_context={"iam:PassedToService": "lambda.amazonaws.com"})
+                    if passed:
+                        denied, iam_action, resource_arn = passed, "iam:PassRole", role_arn
+                        if not isinstance(passed, AuthError):
+                            denial_message = identity_denial_message(
+                                "iam:PassRole", passed.principal_arn, role_arn, passed.decision == "Deny")
             if service == "dynamodb" and not denied and not transaction_checks:
                 resources = dynamodb_resource_arns(body, region, get_account_id())
                 for extra_arn in resources[1:]:
@@ -3260,6 +3287,7 @@ async def _dispatch_service_request(
                         service_context=service_context,
                     )
                     if denied:
+                        resource_arn = extra_arn
                         break
             # PutEvents carries one entry per event, and entries may name
             # different buses: AWS authorizes each against its own bus.
@@ -3311,10 +3339,21 @@ async def _dispatch_service_request(
             if denied:
                 if isinstance(denied, AuthError):
                     return _credential_failure(service, iam_action, request_id, denied, headers)
+                if service == "sns" and iam_action in _SNS_NAMED_DENIALS and not denial_message:
+                    named = "SNS:" + iam_action.split(":", 1)[1]
+                    denial_message = identity_denial_message(named, denied.principal_arn, resource_arn,
+                                                             denied.decision == "Deny")
+                if service == "lambda" and iam_action == "lambda:CreateFunction" and not denial_message:
+                    denial_message = identity_denial_message(iam_action, denied.principal_arn, resource_arn,
+                                                             denied.decision == "Deny")
+                if (service == "sqs" and iam_action == "sqs:GetQueueUrl" and resource_arn.startswith("arn:")
+                        and resource_arn.split(":")[4] != get_account_id()):
+                    return _get_module("sqs").nonexistent_queue_response(headers)
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
                     resource_policy_arn=denied.resource_policy_arn, message=denial_message,
+                    no_resource_allow=getattr(denied, "no_resource_allow", False),
                 )
 
     handler = SERVICE_HANDLERS.get(service)

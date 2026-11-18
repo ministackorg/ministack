@@ -97,6 +97,7 @@ _CANONICAL_NETLOC = f"{DEFAULT_HOST}:{DEFAULT_PORT}"
 _HOST_SANITY_RE = re.compile(r"^[A-Za-z0-9.\-\[\]:_]+$")
 _request_host: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_request_host", default="")
+_request_sender: contextvars.ContextVar[str] = contextvars.ContextVar("_request_sender", default="")
 
 
 def _owner_from_queue_arn(queue_arn: str) -> tuple[str | None, str | None]:
@@ -350,8 +351,12 @@ async def handle_request(method: str, path: str, headers: dict,
     # Record how the caller reached us so responses can echo that host in
     # queue URLs (see _externalize_url). Header keys are lowercased upstream.
     _request_host.set(headers.get("host", ""))
-    from ministack.core.iam_evaluator import pin_request_caller
+    from ministack.core.iam_evaluator import pin_request_caller, resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
     pin_request_caller(headers, query_params)
+    identity = resolve_caller_identity(extract_access_key_id(headers, query_params) or "")
+    # SenderId is the sender's user ID, or role ID and session name; the account root sends as the account.
+    _request_sender.set(identity["userId"] if identity else "")
     target = headers.get("x-amz-target", "")
 
     # JSON protocol  (X-Amz-Target: AmazonSQS.*)
@@ -588,19 +593,28 @@ def _act_list_queues(data: dict, _u: str) -> dict:
     return resp
 
 
+_MSG_NO_QUEUE_OR_ACCESS = "The specified queue does not exist or you do not have access to it."
+
+
+def nonexistent_queue_response(headers: dict) -> tuple:
+    """A refused cross-account GetQueueUrl, answered as an unknown queue name is (AWS capture)."""
+    if headers.get("x-amz-target"):
+        return _json_err_resp("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS)
+    return _xml_err_resp("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS)
+
+
 def _act_get_queue_url(data: dict, _u: str) -> dict:
     name = data.get("QueueName", "")
     owner = data.get("QueueOwnerAWSAccountId") or ""
     if owner and _ACCOUNT_ID_RE.match(owner) and owner != get_account_id():
         url = _queue_name_to_url.get_scoped(owner, get_region(), name)
-        if not url:
-            raise _Err("QueueDoesNotExist",
-                        "The specified queue does not exist.")
-        q = _queues.get_scoped(owner, get_region(), url)
+        q = _queues.get_scoped(owner, get_region(), url) if url else None
         if q is None:
-            raise _Err("QueueDoesNotExist",
-                        "The specified queue does not exist.")
-        _enforce_queue_policy(q, "sqs:GetQueueUrl")
+            raise _Err("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS)
+        try:
+            _enforce_queue_policy(q, "sqs:GetQueueUrl")
+        except _Err as refused:
+            raise _Err("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS) from refused
         return {"QueueUrl": url}
     url = _queue_name_to_url.get(name)
     if not url:
@@ -1424,7 +1438,7 @@ def _build_send_sys_attrs(now: float, sys_attrs_input: dict) -> dict:
     See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html
     """
     sys: dict = {
-        "SenderId": get_account_id(),
+        "SenderId": _request_sender.get() or get_account_id(),
         "SentTimestamp": str(int(now * 1000)),
     }
     if not sys_attrs_input:

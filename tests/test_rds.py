@@ -8085,6 +8085,9 @@ def _delete_instance(client, instance_id):
 
 def _remove_global_member(client, global_id, cluster_id):
     try:
+        if not cluster_id.startswith("arn:"):
+            cluster_id = client.describe_db_clusters(
+                DBClusterIdentifier=cluster_id)["DBClusters"][0]["DBClusterArn"]
         client.remove_from_global_cluster(
             GlobalClusterIdentifier=global_id,
             DbClusterIdentifier=cluster_id,
@@ -13592,7 +13595,7 @@ def test_rds_active_switchover_rejects_mutation(monkeypatch, mutation):
     elif mutation == "topology":
         result = m._remove_from_global_cluster({
             "GlobalClusterIdentifier": "global-repl",
-            "DbClusterIdentifier": "secondary",
+            "DbClusterIdentifier": target["DBClusterArn"],
         })
     else:
         result = m._failover_global_cluster({
@@ -18142,9 +18145,8 @@ def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
         except (ClientError, AssertionError):
             pass
         for call, kwargs in (
-            *((rds.remove_from_global_cluster, {
-                "GlobalClusterIdentifier": g,
-                "DbClusterIdentifier": cid}) for g in (gid, renamed)),
+            *((_remove_global_member, {"client": rds, "global_id": g, "cluster_id": cid})
+              for g in (gid, renamed)),
             (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
             (_wait_instance_gone, {"rds": rds, "instance_id": did}),
             (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
@@ -18190,7 +18192,7 @@ def test_rds_global_endpoint_verifies_against_the_server_certificate(rds, tmp_pa
             connection.close()
     finally:
         for call, kwargs in (
-            (rds.remove_from_global_cluster, {"GlobalClusterIdentifier": gid, "DbClusterIdentifier": cid}),
+            (_remove_global_member, {"client": rds, "global_id": gid, "cluster_id": cid}),
             (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
             (_wait_instance_gone, {"rds": rds, "instance_id": did}),
             (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
@@ -19212,8 +19214,6 @@ _PI_RETENTION_VALID = (
 
 @pytest.mark.parametrize("overrides, code, message", [
     ({"Engine": "not-a-real-rds-engine"}, "InvalidParameterValue", "Invalid DB engine"),
-    ({"DBInstanceClass": "db.sim2real.bogus"}, "InvalidParameterValue",
-     "Invalid DB Instance class: db.sim2real.bogus"),
     ({"VpcSecurityGroupIds": ["sg-00000000000000bad"]}, "InvalidParameterValue",
      "Invalid security group , groupId= sg-00000000000000bad, groupName=."),
     ({"StorageType": "turbo-ssd-9000"}, "StorageTypeNotSupported",
@@ -19234,7 +19234,7 @@ _PI_RETENTION_VALID = (
     ({"EnablePerformanceInsights": True, "PerformanceInsightsRetentionPeriod": 94},
      "InvalidParameterValue",
      f"Invalid Performance Insights retention period. Valid values are: [{_PI_RETENTION_VALID}]"),
-], ids=["engine", "class", "security-group", "storage-type", "magnetic-storage", "gp3-size", "max-storage",
+], ids=["engine", "security-group", "storage-type", "magnetic-storage", "gp3-size", "max-storage",
         "username-length", "username-reserved", "password-length", "pi-retention"])
 def test_rds_create_db_instance_rejects_invalid_input(rds, overrides, code, message):
     """CreateDBInstance refuses each invalid field with the AWS error and creates nothing."""
@@ -19277,6 +19277,38 @@ def test_rds_create_db_instance_accepts_valid_boundary_input(rds, ec2):
         rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
 
 
+def test_rds_create_db_instance_accepts_listed_engine_and_unlisted_class(rds):
+    """db2-ce is in the botocore Engine list; instance classes are not checked against a list."""
+    db_id = f"db2ce-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        created = rds.create_db_instance(
+            DBInstanceIdentifier=db_id, DBInstanceClass="db.q9.large", Engine="db2-ce",
+            MasterUsername="admin", MasterUserPassword="password123", AllocatedStorage=20,
+        )["DBInstance"]
+        assert created["Engine"] == "db2-ce"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.parametrize("source, target", [
+    ("oracle-ee", "oracle-ee-cdb"), ("oracle-se2", "oracle-se2-cdb"),
+])
+def test_rds_modify_db_instance_allows_oracle_cdb_conversion(rds, source, target):
+    """ModifyDBInstance Engine converts an Oracle non-CDB to a CDB (botocore Engine doc)."""
+    db_id = f"cdb-{_uuid_mod.uuid4().hex[:8]}"
+    rds.create_db_instance(
+        DBInstanceIdentifier=db_id, DBInstanceClass="db.m5.large", Engine=source,
+        MasterUsername="admin", MasterUserPassword="password123", AllocatedStorage=20,
+    )
+    try:
+        rds.modify_db_instance(DBInstanceIdentifier=db_id, Engine=target, ApplyImmediately=True)
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_instance(DBInstanceIdentifier=db_id, Engine="postgres", ApplyImmediately=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
 @pytest.mark.parametrize("engine, storage_type, changes, code, message", [
     ("postgres", None, {"AllocatedStorage": 10}, "InvalidParameterCombination",
      "Invalid storage size for engine name postgres and storage type gp2: 10"),
@@ -19314,3 +19346,20 @@ def test_rds_modify_db_instance_rejects_invalid_input(rds, engine, storage_type,
         assert instance["AllocatedStorage"] == 30
     finally:
         rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
+@pytest.mark.parametrize("extra", [{}, {"Engine": ""}], ids=["absent", "blank"])
+def test_rds_create_db_instance_without_engine_is_refused(extra):
+    """AWS answers a missing or blank Engine 400 InvalidParameterValue "Invalid DB engine" (capture 2026-11-18)."""
+    from botocore.config import Config
+    client = boto3.client("rds", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                          region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test",
+                          config=Config(parameter_validation=False))
+    db_id = f"no-engine-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        client.create_db_instance(DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro", AllocatedStorage=20,
+                                  MasterUsername="dbadmin", MasterUserPassword="Passw0rd1234", **extra)
+    err = exc.value.response
+    assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+        400, "InvalidParameterValue", "Invalid DB engine")
+    assert not any(i["DBInstanceIdentifier"] == db_id for i in client.describe_db_instances()["DBInstances"])
