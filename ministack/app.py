@@ -3260,6 +3260,7 @@ async def _dispatch_service_request(
                         service_context=service_context,
                     )
                     if denied:
+                        resource_arn = extra_arn
                         break
             # PutEvents carries one entry per event, and entries may name
             # different buses: AWS authorizes each against its own bus.
@@ -3318,6 +3319,7 @@ async def _dispatch_service_request(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
                     resource_policy_arn=denied.resource_policy_arn, message=denial_message,
+                    no_resource_allow=getattr(denied, "no_resource_allow", False),
                 )
 
     handler = SERVICE_HANDLERS.get(service)

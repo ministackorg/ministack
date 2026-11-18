@@ -1227,6 +1227,8 @@ def extract_resource_arn(service: str, method: str, path: str,
             from ministack.services import secretsmanager as secretsmanager_svc
 
             _, secret = secretsmanager_svc._resolve(secret_id)
+            if not secret and secret_id.startswith("arn:") and f":{region}:" in secret_id:
+                _, secret = secretsmanager_svc._resolve(secret_id, use_arn_scope=True, cross_account=True)
             if secret:
                 return secret["ARN"]
             if secret_id.startswith("arn:"):
@@ -2543,7 +2545,7 @@ def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
                            message: str = "", headers: dict | None = None,
                            resource_arn: str = "*", explicit_deny: bool = False,
-                           resource_policy_arn: str = "") -> tuple:
+                           resource_policy_arn: str = "", no_resource_allow: bool = False) -> tuple:
     """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
@@ -2566,6 +2568,20 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         message = identity_denial_message(action, principal_arn, key_arn_for_request(resource_arn), explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
+        )
+    if service in ("dynamodb", "secretsmanager") and not error_code and resource_arn.startswith("arn:"):
+        # DynamoDB and Secrets Manager denials are HTTP 400 and name the resource; across accounts its own
+        # policy may be the one that did not allow (AWS captures).
+        if not message and explicit_deny and resource_policy_arn:
+            message = _resource_policy_denial(service, action, principal_arn, resource_policy_arn)
+        elif not message and no_resource_allow:
+            message = (f"User: {principal_arn} is not authorized to perform: {action} on resource: {resource_arn} "
+                       f"because no resource-based policy allows the {action} action")
+        message = message or identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
+        content_type = "application/x-amz-json-1.0" if service == "dynamodb" else "application/x-amz-json-1.1"
+        return (
+            400, {"Content-Type": content_type, "x-amzn-errortype": "AccessDeniedException"},
             json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
         )
     if service == "iot-data":

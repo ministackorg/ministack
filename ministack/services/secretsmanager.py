@@ -29,6 +29,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 from ministack.core.responses import (
     json_response as _core_json_response,
@@ -605,7 +606,49 @@ async def handle_request(method, path, headers, body, query_params):
 
         access_key = (extract_access_key_id(headers, query_params) or "") if AUTH else None
         return handler(data, access_key)
+    owner, secret = _foreign_secret(action, data)
+    if owner:
+        refused = _foreign_key_refusal(action, secret, owner)
+        if refused:
+            return refused
+        with request_scope(owner, get_region()):
+            return handler(data)
     return handler(data)
+
+
+_FOREIGN_ACTIONS = {"GetSecretValue": "Decrypt", "PutSecretValue": "GenerateDataKey", "DescribeSecret": None}
+
+
+def _foreign_secret(action, data):
+    """``(owner account, secret)`` for a call naming another account's secret by ARN in this region."""
+    secret_id = data.get("SecretId") if isinstance(data, dict) else None
+    if action not in _FOREIGN_ACTIONS or not isinstance(secret_id, str) or not secret_id.startswith("arn:"):
+        return None, None
+    scope = _secret_scope_from_arn(secret_id)
+    if not scope or scope[0].account_id == get_account_id() or scope[0].region != get_region():
+        return None, None
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=True)
+    return (scope[0].account_id, secret) if secret else (None, None)
+
+
+def _foreign_key_refusal(action, secret, owner):
+    """Under AUTH=true, a value read or write of another account's secret needs a customer managed key whose
+    policy allows the caller; the AWS managed key cannot be used across accounts (AWS capture)."""
+    from ministack.app import AUTH
+    from ministack.services import kms
+    kms_action = _FOREIGN_ACTIONS[action]
+    if not AUTH or kms_action is None:
+        return None
+    kms_key = secret.get("KmsKeyId") or ""
+    if not kms_key or kms_key.endswith("alias/aws/secretsmanager"):
+        return error_response_json("InvalidRequestException", "You can't access a secret from a different AWS "
+                                   "account if you encrypt the secret with the default KMS service key.", 400)
+    if not kms_key.startswith("arn:"):
+        kms_key = f"arn:aws:kms:{get_region()}:{owner}:{'' if kms_key.startswith('alias/') else 'key/'}{kms_key}"
+    _owner, key = kms._foreign_key(kms_key)
+    if not key or not kms.key_policy_allows_caller(key, kms_action):
+        return error_response_json("AccessDeniedException", "Access to KMS is not allowed", 400)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1683,13 @@ def _stop_replication_to_replica(data):
 
 def secret_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     """The secret's resource policy and owner account, for the identity check."""
+    scope = _secret_scope_from_arn(resource_arn)
+    if scope and scope[0].account_id != get_account_id() and scope[0].region == get_region():
+        spec = scope[0]
+        secret = _secrets.get_scoped(spec.account_id, spec.region, resource_arn.partition(":secret:")[2][:-7])
+        if not secret or secret["ARN"] != resource_arn:
+            return None
+        return _resource_policies.get_scoped(spec.account_id, spec.region, resource_arn) or "", spec.account_id
     secret = _secrets.get(resource_arn.partition(":secret:")[2][:-7])
     if not secret or secret["ARN"] != resource_arn:
         return None

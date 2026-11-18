@@ -1199,7 +1199,12 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
     handler = handlers.get(action)
     if not handler:
         return error_response_json("UnknownOperationException", f"Unknown operation: {action}", 400)
-    status, resp_headers, resp_body = handler(data)
+    owner = _foreign_item_owner(action, data)
+    if owner:
+        with request_scope(owner, get_region()):
+            status, resp_headers, resp_body = handler(data)
+    else:
+        status, resp_headers, resp_body = handler(data)
     # Add CRC32 checksum — Go SDK v2 DynamoDB client validates this on Close()
     import zlib
     body_bytes = resp_body if isinstance(resp_body, bytes) else resp_body.encode("utf-8")
@@ -6206,6 +6211,52 @@ def _table_name_from_arn(arn: str) -> str | None:
         return None
     # Strip /stream/... or /index/... suffixes.
     return after.split("/")[0]
+
+
+_ITEM_ACTIONS = frozenset({"GetItem", "PutItem", "UpdateItem", "DeleteItem", "Query", "Scan", "BatchGetItem",
+                           "BatchWriteItem", "TransactGetItems", "TransactWriteItems"})
+
+
+def _item_table_refs(action, data):
+    if not isinstance(data, dict):
+        return []
+    if action in ("BatchGetItem", "BatchWriteItem"):
+        items = data.get("RequestItems")
+        return list(items) if isinstance(items, dict) else []
+    if action in ("TransactGetItems", "TransactWriteItems"):
+        items = data.get("TransactItems")
+        return [detail.get("TableName") for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict) for detail in item.values() if isinstance(detail, dict)]
+    return [data.get("TableName")]
+
+
+def _foreign_item_owner(action, data) -> str | None:
+    """The other account whose tables an item call names by ARN in this region; None for the caller's own."""
+    if action not in _ITEM_ACTIONS:
+        return None
+    owners = set()
+    for ref in _item_table_refs(action, data):
+        spec = _dynamodb_arn_spec(ref) if isinstance(ref, str) and ref.startswith("arn:") else None
+        if spec is None or spec.region != get_region() or not spec.resource.startswith("table/"):
+            owners.add(get_account_id())
+        else:
+            owners.add(spec.account_id)
+    owner = owners.pop() if len(owners) == 1 else None
+    return owner if owner and owner != get_account_id() else None
+
+
+def table_policy_for_arn(arn: str) -> tuple[str, str] | None:
+    """The table's resource policy and owner account, for the identity check. A table ARN of another
+    account answers even for a table that does not exist there, as AWS refuses it like a missing grant."""
+    spec = _dynamodb_arn_spec(arn) if isinstance(arn, str) else None
+    if spec is None or spec.region != get_region() or not spec.resource.startswith("table/"):
+        return None
+    name = spec.resource[len("table/"):].split("/")[0]
+    table_arn = f"arn:{spec.partition}:dynamodb:{spec.region}:{spec.account_id}:table/{name}"
+    if spec.account_id == get_account_id():
+        return None
+    entry = _resource_policies.get_scoped(spec.account_id, spec.region, table_arn)
+    return (entry or {}).get("Policy") or "", spec.account_id
 
 
 def _resource_arn_exists(arn: str) -> bool:

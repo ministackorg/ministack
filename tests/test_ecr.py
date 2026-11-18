@@ -1286,23 +1286,17 @@ def test_ptc_fill_copies_an_ecr_upstream_in_process(ptc_rules):
             _drop_repository(source)
 
 
-def test_ptc_batch_get_image_fills_or_reports_the_upstream(ptc_rules, monkeypatch):
+def test_ptc_batch_get_image_does_not_fill(ptc_rules, monkeypatch):
+    """The BatchGetImage API never fills the cache; AWS answers RepositoryNotFound (capture 2026-11-18)."""
     prefix = _ptc_prefix()
     _ptc_call("CreatePullThroughCacheRule", {"ecrRepositoryPrefix": prefix, "upstreamRegistryUrl": "quay.io"})
     name = f"{prefix}/org/app"
-    monkeypatch.setattr(ecr_svc, "_ptc_docker", lambda: _PtcDaemon(local={"quay.io/org/app:1"}))
-    try:
-        status, body = _ptc_call("BatchGetImage", {"repositoryName": name, "imageIds": [{"imageTag": "2"}]})
-        assert (status, body["images"], body["failures"]) == (200, [], [{
-            "imageId": {"imageTag": "2"}, "failureCode": "UpstreamUnavailable",
-            "failureReason": "Unable to reach the upstream registry."}])
-        assert name not in ecr_svc._repositories
-        status, body = _ptc_call("BatchGetImage", {"repositoryName": name, "imageIds": [{"imageTag": "1"}]})
-        assert (status, body["failures"], body["images"][0]["imageId"]["imageTag"]) == (200, [], "1")
-        status, body = _ptc_call("BatchGetImage", {"repositoryName": f"other{prefix}", "imageIds": [{"imageTag": "1"}]})
-        assert (status, body["__type"]) == (400, "RepositoryNotFoundException")
-    finally:
-        _drop_repository(name)
+    daemon = _PtcDaemon(local={"quay.io/org/app:1"})
+    monkeypatch.setattr(ecr_svc, "_ptc_docker", lambda: daemon)
+    status, body = _ptc_call("BatchGetImage", {"repositoryName": name, "imageIds": [{"imageTag": "1"}]})
+    assert (status, body["__type"], body["message"]) == (400, "RepositoryNotFoundException",
+        f"The repository with name '{name}' does not exist in the registry with id '000000000000'")
+    assert name not in ecr_svc._repositories and not daemon.calls
 
 
 def test_ptc_registry_api_fills_or_answers_manifest_unknown(ptc_rules, monkeypatch):
@@ -1338,7 +1332,9 @@ def test_repository_creation_template_lifecycle(ecr):
             == (prefix, ["PULL_THROUGH_CACHE"], "IMMUTABLE", [{"Key": "team", "Value": "a"}])
         with pytest.raises(ClientError) as exc:
             ecr.create_repository_creation_template(prefix=prefix, appliedFor=["PULL_THROUGH_CACHE"])
-        assert exc.value.response["Error"]["Code"] == "TemplateAlreadyExistsException"
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "TemplateAlreadyExistsException",
+            f"A repository creation template with prefix '{prefix}' already exists in the registry with id '000000000000'")
 
         described = ecr.describe_repository_creation_templates(prefixes=[prefix])["repositoryCreationTemplates"]
         assert [t["prefix"] for t in described] == [prefix]
@@ -1356,7 +1352,9 @@ def test_repository_creation_template_lifecycle(ecr):
                  lambda: ecr.update_repository_creation_template(prefix=prefix, imageTagMutability="MUTABLE")):
         with pytest.raises(ClientError) as exc:
             call()
-        assert exc.value.response["Error"]["Code"] == "TemplateNotFoundException"
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "TemplateNotFoundException",
+            f"A repository creation template with prefix '{prefix}' is not found in the registry with id '000000000000'")
     assert ecr.describe_repository_creation_templates(prefixes=[prefix])["repositoryCreationTemplates"] == []
 
 
@@ -1587,7 +1585,7 @@ def test_missing_repository_and_policy_errors_name_the_registry(ecr):
     ({"repositoryName": "batch-ok", "imageIds": {"imageTag": "1"}}, "SerializationException",
      "Start of structure or map found where not expected"),
     ({"repositoryName": "batch-ok", "imageIds": 5}, "SerializationException", "Unexpected field type"),
-    ({"repositoryName": "batch-ok", "imageIds": ["x"]}, "SerializationException", "Unexpected field type"),
+    ({"repositoryName": "batch-ok", "imageIds": ["x"]}, "SerializationException", "Unexpected value type in payload"),
 ])
 def test_batch_get_image_refuses_malformed_requests(body, code, message):
     status, answer = _ptc_call("BatchGetImage", body)

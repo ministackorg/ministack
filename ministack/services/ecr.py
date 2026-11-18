@@ -235,7 +235,7 @@ async def handle_request(method, path, headers, body, query_params):
                                             else "Unexpected value type in payload")
         return handler(data)
     if action == "BatchGetImage":
-        return await _batch_get_image_filling(data)
+        return _batch_get_image(data)
     return handler(data)
 
 
@@ -384,7 +384,7 @@ def _batch_get_image_refused(data):
         if isinstance(item, list):
             return _ptc_serialization_error()
         if not isinstance(item, dict):
-            return _ptc_serialization_error("Unexpected field type")
+            return _ptc_serialization_error("Unexpected value type in payload")
     if isinstance(name, str) and not _REPO_NAME_RE.fullmatch(name):
         return _invalid("Invalid parameter at 'repositoryName' failed to satisfy constraint: "
                         f"'must satisfy regular expression '{_REPO_NAME_PATTERN}''")
@@ -394,46 +394,14 @@ def _batch_get_image_refused(data):
     return None
 
 
-async def _batch_get_image_filling(data):
-    """BatchGetImage, filling each tag miss a pull-through cache rule covers first."""
+def _batch_get_image(data):
+    """BatchGetImage; the API call never fills a pull-through cache (AWS capture: RepositoryNotFound)."""
     refused = _batch_get_image_refused(data)
     if refused:
         return refused
     name = data.get("repositoryName", "")
-    if not isinstance(name, str) or _ptc_match(name)[0] is None:
-        return _batch_get_image(data)
-    from ministack.core.iam_evaluator import caller_arn
-    principal = caller_arn()
-    misses = {}
-    for iid in data.get("imageIds") or []:
-        tag = iid.get("imageTag") if isinstance(iid, dict) and "imageDigest" not in iid else None
-        if isinstance(tag, str) and tag:
-            try:
-                await asyncio.to_thread(_ptc_fill, name, tag, principal)
-            except PullThroughMiss as miss:
-                misses[tag] = miss
-        elif isinstance(iid, dict) and isinstance(iid.get("imageDigest"), str):
-            try:
-                await asyncio.to_thread(_ptc_fill_child, name, iid["imageDigest"], principal)
-            except PullThroughMiss:
-                pass  # answered as ImageNotFound, like any digest the cache does not hold
-    repository_miss = next((m for m in misses.values() if m.kind == "repository"), None)
-    if repository_miss is not None and name not in _repositories:
-        return error_response_json("RepositoryNotFoundException", str(repository_miss), 400)
-    return _batch_get_image(data, misses)
-
-
-def _batch_get_image(data, misses=None):
-    name = data.get("repositoryName", "")
     image_ids = data.get("imageIds", [])
-    misses = misses or {}
     if name not in _repositories:
-        if misses:
-            return json_response({"images": [], "failures": [
-                {"imageId": iid, "failureCode": "UpstreamUnavailable", "failureReason": str(misses[iid["imageTag"]])}
-                if isinstance(iid, dict) and iid.get("imageTag") in misses else
-                {"imageId": iid, "failureCode": "ImageNotFound", "failureReason": "Requested image not found"}
-                for iid in image_ids]})
         return error_response_json("RepositoryNotFoundException",
                                    f"The repository with name '{name}' does not exist in the registry with id '{_registry_id()}'", 400)
 
@@ -450,12 +418,6 @@ def _batch_get_image(data, misses=None):
                 "imageManifest": match.get("imageManifest", "{}"),
                 "imageManifestMediaType": match.get("imageManifestMediaType",
                     "application/vnd.docker.distribution.manifest.v2+json"),
-            })
-        elif isinstance(iid, dict) and iid.get("imageTag") in misses:
-            failures.append({
-                "imageId": iid,
-                "failureCode": "UpstreamUnavailable",
-                "failureReason": str(misses[iid["imageTag"]]),
             })
         else:
             failures.append({
@@ -2543,7 +2505,7 @@ _RCT_ACTIONS = frozenset((
     "DeleteRepositoryCreationTemplate", "DescribeRepositoryCreationTemplates",
 ))
 _RCT_APPLIED_FOR = ("REPLICATION", "PULL_THROUGH_CACHE", "CREATE_ON_PUSH")
-_RCT_MUTABILITY = ("MUTABLE", "IMMUTABLE", "IMMUTABLE_WITH_EXCLUSION", "MUTABLE_WITH_EXCLUSION")
+_RCT_MUTABILITY = ("IMMUTABLE", "MUTABLE", "MUTABLE_WITH_EXCLUSION", "IMMUTABLE_WITH_EXCLUSION")
 _RCT_ENCRYPTION = ("AES256", "KMS", "KMS_DSSE")
 _RCT_KMS_RE = re.compile(r"^$|arn:aws[a-z0-9-]*:kms:[a-z0-9-]+:[0-9]{12}:key\/[a-z0-9-]+")
 _RCT_FILTER_RE = re.compile(r"^[0-9a-zA-Z._*-]{1,128}$")
@@ -2624,7 +2586,7 @@ def _rct_refused(errors):
 
 def _rct_missing(prefix):
     return error_response_json("TemplateNotFoundException",
-                               f"The specified repository creation template with prefix '{prefix}' does not exist "
+                               f"A repository creation template with prefix '{prefix}' is not found "
                                f"in the registry with id '{get_account_id()}'", 400)
 
 
@@ -2643,7 +2605,7 @@ def _create_creation_template(data):
         return refused
     if prefix in _creation_templates:
         return error_response_json("TemplateAlreadyExistsException",
-                                   f"The repository creation template with prefix '{prefix}' already exists "
+                                   f"A repository creation template with prefix '{prefix}' already exists "
                                    f"in the registry with id '{get_account_id()}'", 400)
     now = int(time.time())
     template = {"prefix": prefix, **{k: copy.deepcopy(data[k]) for k in _RCT_SETTINGS if data.get(k) is not None},
