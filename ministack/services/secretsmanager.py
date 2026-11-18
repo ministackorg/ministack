@@ -237,6 +237,20 @@ def find_secret(secret_id):
     return _resolve_for_reader(secret_id)[1]
 
 
+def pull_through_secret(secret_id):
+    """``(state, kms_key_id, secret_string)`` of the secret an ECR pull-through cache rule names, in the caller's
+    account and region. *state* is "missing", "unreadable" (scheduled for deletion, or a binary value) or "ok"."""
+    secret = find_secret(secret_id)
+    if not secret:
+        return "missing", None, None
+    _, ver = _find_stage_version(secret, "AWSCURRENT")
+    if not ver or (ver.get("SecretString") is None and ver.get("SecretBinary") is None):
+        return "missing", None, None
+    if secret.get("DeletedDate") or ver.get("SecretString") is None:
+        return "unreadable", secret.get("KmsKeyId"), None
+    return "ok", secret.get("KmsKeyId"), ver["SecretString"]
+
+
 def secret_exists(secret_id):
     """True if *secret_id* (name, full or partial ARN) names a secret in the
     caller's account and region that is not scheduled for deletion and has a

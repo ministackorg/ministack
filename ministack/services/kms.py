@@ -581,6 +581,25 @@ def key_policy_allows_caller(rec, action, caller=None):
     return evaluate_resource_policy(rec.get("Policy") or "", ctx).decision == "Allow"
 
 
+def held_key_state(key_ref):
+    """KeyState of the key *key_ref* names in this account and region, or None when MiniStack does not hold it."""
+    rec = _resolve_key(key_ref)
+    return rec["KeyState"] if rec else None
+
+
+def key_policy_names(key_ref, action, principal_arn):
+    """Whether the key policy of the customer managed key *key_ref* allows *principal_arn* ``kms:<action>`` by naming
+    it; an account principal only delegates to IAM. An AWS managed or unheld key returns True."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+    rec = _resolve_key(key_ref)
+    if rec is None or rec.get("KeyManager") == "AWS":
+        return True
+    ctx = EvalContext(principal_arn=principal_arn, principal_type="AssumedRole",
+                      principal_account=principal_arn.split(":")[4], action=f"kms:{action}",
+                      resource_arn=rec["Arn"], region=get_region())
+    return evaluate_resource_policy(rec.get("Policy") or "", ctx, named_only=True).decision == "Allow"
+
+
 def _resolve_key(key_id_or_arn):
     if not key_id_or_arn:
         return None

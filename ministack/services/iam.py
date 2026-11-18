@@ -233,6 +233,9 @@ def _seed_aws_managed_policies() -> None:
         # A path-less spelling of them does not exist on AWS and answers
         # NoSuchEntity here too; the one-line fix for a template written
         # against the old seeds is to attach the real service-role/ ARN.
+        ('aws-service-role/AWSECRPullThroughCache_ServiceRolePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"ECR","Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:InitiateLayerUpload","ecr:UploadLayerPart","ecr:CompleteLayerUpload","ecr:PutImage","ecr:BatchGetImage","ecr:BatchImportUpstreamImage","ecr:GetDownloadUrlForLayer","ecr:GetImageCopyStatus"],"Resource":"*","Condition":{"StringEquals":{"aws:ResourceAccount":"${aws:PrincipalAccount}"}}},{"Sid":"SecretsManager","Effect":"Allow","Action":["secretsmanager:GetSecretValue"],"Resource":"arn:aws:secretsmanager:*:*:secret:ecr-pullthroughcache/*","Condition":{"StringEquals":{"aws:ResourceAccount":"${aws:PrincipalAccount}"}}}]}',
+         "Enables access to AWS services and resources used or managed by AWS ECR pull through cache"),
         ('service-role/AWSLambdaBasicExecutionRole',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
          "Provides write permissions to CloudWatch Logs."),
@@ -2156,6 +2159,28 @@ def _create_service_linked_role(p):
                 ns="iam")
 
 
+def ensure_service_linked_role(service_name, role_name, policy_arn):
+    """Create *role_name*, the service-linked role of *service_name*, in the caller's account unless it exists."""
+    if role_name in _roles:
+        return
+    path = f"/aws-service-role/{service_name}/"
+    _roles[role_name] = {
+        "RoleName": role_name,
+        "Arn": f"arn:aws:iam::{get_account_id()}:role{path}{role_name}",
+        "RoleId": _gen_id("AROA"),
+        "CreateDate": _now(),
+        "Path": path,
+        "AssumeRolePolicyDocument": json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Principal": {"Service": service_name}, "Action": "sts:AssumeRole"}]}),
+        "Description": "",
+        "MaxSessionDuration": 3600,
+        "AttachedPolicies": [],
+        "InlinePolicies": {},
+        "Tags": [],
+    }
+    attach_managed_policy(_roles[role_name], policy_arn)
+
+
 def _delete_service_linked_role(p):
     role_name = _p(p, "RoleName")
     role = _roles.get(role_name)
@@ -3835,3 +3860,21 @@ def reset():
 # scope (``_make_aws_managed_record`` references ``_now`` / ``_gen_id``
 # defined further down).
 _seed_aws_managed_policies()
+
+
+def role_trusts_service(role_arn, service_principal):
+    """True when *role_arn* names a role of the caller's account whose trust policy lets *service_principal* assume it."""
+    role = _roles.get(role_arn.rsplit("/", 1)[-1])
+    if role is None or role.get("Arn") != role_arn:
+        return False
+    try:
+        document = json.loads(role.get("AssumeRolePolicyDocument") or "{}")
+    except (TypeError, ValueError):
+        return False
+    statements = document.get("Statement", [])
+    for statement in [statements] if isinstance(statements, dict) else statements:
+        principal = statement.get("Principal") if statement.get("Effect") == "Allow" else None
+        services = principal.get("Service", []) if isinstance(principal, dict) else []
+        if service_principal in ([services] if isinstance(services, str) else services):
+            return True
+    return False

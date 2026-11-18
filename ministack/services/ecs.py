@@ -2026,6 +2026,18 @@ def _resolve_container_secrets(cdef):
     return resolved
 
 
+def _fill_pull_through(cdef, td, docker_client):
+    """Fill this MiniStack's ECR pull-through cache for *cdef*'s image, so it runs from that ECR."""
+    try:
+        ecr.fill_pull_through(cdef.get("image"),
+                              (td or {}).get("executionRoleArn") or f"arn:aws:iam::{get_account_id()}:root",
+                              docker_client)
+    except ecr.PullThroughMiss as miss:
+        if miss.kind == "secret":
+            raise _SecretResolutionError(str(miss)) from miss
+        raise _ImagePullError(f"{cdef.get('image')}: {miss}") from miss
+
+
 def _resolve_repository_credentials(cdef):
     repository_credentials = cdef.get("repositoryCredentials")
     if not repository_credentials:
@@ -2332,6 +2344,10 @@ def _prepare_service_images(task, td, docker_client):
         name = cdef["name"]
         if cdef.get("versionConsistency", "enabled") == "disabled" or name in digests:
             continue
+        try:
+            _fill_pull_through(cdef, td, docker_client)
+        except _ImagePullError:
+            pass  # the run step reports it
         image = cdef["image"]
         digest = image.split("@", 1)[1] if "@" in image else None
         held = not digest and ecr._held_image(image) is not None
@@ -2377,6 +2393,15 @@ def _prepare_service_images(task, td, docker_client):
 
 class _ImagePullError(Exception):
     """An image pull failed and the launch type has no usable cache."""
+
+
+def _is_pull_failure(exc):
+    """Whether a container start failed fetching the image rather than running it."""
+    from docker.errors import ImageNotFound
+    text = str(exc).lower()
+    return isinstance(exc, (_ImagePullError, ImageNotFound)) or any(
+        marker in text for marker in ("pull access denied", "no basic auth credentials", "manifest unknown",
+                                      "unauthorized", "repository does not exist"))
 
 
 def _load_held_image(docker_client, image, platform, principal_arn=None):
@@ -2443,12 +2468,16 @@ def _run_docker_container(
             pinned = run_kwargs.pop("platform", None)
             if not pinned:
                 raise
-            logger.warning(
-                "ECS: task definition declares %s but this host cannot "
-                "run it (%s); running %s on the host architecture "
-                "instead. Install a binfmt/qemu handler for real "
-                "cross-architecture execution.",
-                pinned, exc, cdef.get("image"))
+            if _is_pull_failure(exc):
+                logger.warning("ECS: pulling %s for %s failed (%s); trying the host architecture",
+                               cdef.get("image"), pinned, exc)
+            else:
+                logger.warning(
+                    "ECS: task definition declares %s but this host cannot "
+                    "run it (%s); running %s on the host architecture "
+                    "instead. Install a binfmt/qemu handler for real "
+                    "cross-architecture execution.",
+                    pinned, exc, cdef.get("image"))
             container = run()
 
         pinned = run_kwargs.get("platform")
@@ -2538,6 +2567,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         env.update(_resolve_container_secrets(cdef))
         env.update(env_override)
 
+        _fill_pull_through(cdef, td, docker_client)
         effective_cdef = dict(cdef)
         digest = deployment.get("_image_digests", {}).get(cdef["name"]) if deployment else None
         if deployment and "@" in cdef["image"]:
