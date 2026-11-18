@@ -13783,3 +13783,21 @@ def test_s3_bucket_policy_naming_a_user_or_role_of_another_account_contract(auth
                     exc.value.response["Error"]["Message"]) == (
                 403, "AccessDenied", f'User: {refused_arn} is not authorized to perform: {action} on resource: '
                 f'"arn:aws:s3:::{bucket}/{k}" because no resource-based policy allows the {action} action')
+
+
+def test_presigned_expiry_is_checked_when_the_request_arrives():
+    """S3 checks a presigned URL's expiry at the time of the HTTP request, so an upload that runs past it still
+    completes (S3 User Guide, presigned URLs; #2710)."""
+    import datetime as _dt
+
+    from ministack.core import sigv4
+
+    signed = _dt.datetime(2026, 11, 18, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    amz_date = signed.strftime("%Y%m%dT%H%M%SZ")
+    token = sigv4._request_arrival.set(signed + _dt.timedelta(seconds=4))
+    try:
+        assert not sigv4.presigned_request_is_expired(amz_date, 5)  # arrived in time; the wall clock is long past
+        sigv4._request_arrival.set(signed + _dt.timedelta(seconds=6))
+        assert sigv4.presigned_request_is_expired(amz_date, 5)
+    finally:
+        sigv4._request_arrival.reset(token)

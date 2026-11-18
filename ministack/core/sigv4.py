@@ -6,6 +6,7 @@ mapping verification failures to service-specific responses.
 """
 
 import base64
+import contextvars
 import datetime as dt
 import fnmatch
 import functools
@@ -168,6 +169,15 @@ def region_set_covers(region_set: str, region: str) -> bool:
     return any(fnmatch.fnmatchcase(region, entry.strip()) for entry in region_set.split(","))
 
 
+_request_arrival: contextvars.ContextVar[dt.datetime | None] = contextvars.ContextVar(
+    "ministack_request_arrival", default=None)
+
+
+def mark_request_arrival() -> None:
+    """Remember when the request arrived, before its body is read: S3 checks a presigned URL's expiry then."""
+    _request_arrival.set(dt.datetime.now(dt.timezone.utc))
+
+
 def presigned_request_is_expired(
     amz_date: str,
     expires: str | int,
@@ -180,7 +190,7 @@ def presigned_request_is_expired(
     apply its own validation or compatibility behavior.
     """
     signed_at = dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
-    current_time = now if now is not None else dt.datetime.now(dt.timezone.utc)
+    current_time = now if now is not None else _request_arrival.get() or dt.datetime.now(dt.timezone.utc)
     return current_time > signed_at + dt.timedelta(seconds=int(expires))
 
 

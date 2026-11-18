@@ -3572,6 +3572,8 @@ async def app(scope, receive, send):
     # (issue #398). Falls back to MINISTACK_REGION env. Presigned (SigV4 query)
     # requests carry the credential in query params, not the header.
     set_request_region(extract_region(headers, query_params))
+    from ministack.core.sigv4 import mark_request_arrival
+    mark_request_arrival()
 
     if await _send_if_handled(
         send, await _handle_pre_body_request(method, path, headers, query_params, request_id), receive
