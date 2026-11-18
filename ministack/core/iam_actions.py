@@ -1146,6 +1146,15 @@ def extract_resource_arn(service: str, method: str, path: str,
                 if func_name.startswith("arn:"):
                     return func_name
                 return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+            if method == "POST" and path_parts[-1] == "functions":
+                # CreateFunction is checked on the function it creates (Service Authorization Reference).
+                func_name = _safe_json_field(body, "FunctionName")
+                if isinstance(func_name, str) and func_name:
+                    if func_name.startswith("arn:"):
+                        return func_name
+                    if ":function:" in func_name:  # the partial ARN form, <account>:function:<name>
+                        return f"arn:aws:lambda:{region}:{func_name}"
+                    return f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
         if "layers" in path_parts:
             li = path_parts.index("layers")
             if li + 1 < len(path_parts):
@@ -1189,6 +1198,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         target_arn = _query_param(query_params, "TargetArn")
         if target_arn:
             return target_arn
+        resource_arn = _query_param(query_params, "ResourceArn")
+        if resource_arn:
+            return resource_arn
+        subscription_arn = _query_param(query_params, "SubscriptionArn")
+        if isinstance(subscription_arn, str) and subscription_arn.count(":") >= 6:
+            # A subscription action is checked on the subscription's topic (Service Authorization Reference).
+            return subscription_arn.rsplit(":", 1)[0]
         # CreateTopic — name in params
         topic_name = _query_param(query_params, "Name")
         if topic_name:
@@ -1979,6 +1995,10 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
         return []
     table = data.get("TableName") if isinstance(data, dict) else None
+    resource = data.get("ResourceArn") if isinstance(data, dict) else None
+    if not table and isinstance(resource, str) and resource.startswith("arn:"):
+        # Tag and resource-policy actions are checked on the table or stream they name.
+        return [resource]
     if isinstance(table, str) and table:
         index = data.get("IndexName")
         suffix = f"/index/{index}" if isinstance(index, str) and index else ""

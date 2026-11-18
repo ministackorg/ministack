@@ -2438,3 +2438,57 @@ def test_sns_to_lambda_event_sns_record_matches_aws(lam, sns, logs):
         "blob": {"Type": "Binary", "Value": "AAH/"},
         "tags": {"Type": "String", "Value": '["a","b"]'},
     }
+
+
+@pytest.mark.auth_contract
+def test_sns_tag_and_subscription_actions_check_the_topic_contract(auth_enabled):
+    """Tag actions are checked on ResourceArn, subscription actions on the subscription's topic (AWS capture, #2696)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    import os as _os
+    import uuid as _uuid
+
+    import boto3
+    from botocore.exceptions import ClientError
+    endpoint = _os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key="test", secret="test"):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret)
+
+    suffix = _uuid.uuid4().hex[:8]
+    sns, sqs, iam = client("sns"), client("sqs"), client("iam")
+    topic = sns.create_topic(Name=f"sub-topic-{suffix}")["TopicArn"]
+    for i, resources in enumerate(([topic], [f"{topic}:*"])):
+        q = sqs.create_queue(QueueName=f"sub-q{i}-{suffix}")["QueueUrl"]
+        qarn = sqs.get_queue_attributes(QueueUrl=q, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        sub = sns.subscribe(TopicArn=topic, Protocol="sqs", Endpoint=qarn, ReturnSubscriptionArn=True)["SubscriptionArn"]
+        name = f"sub-user{i}-{suffix}"
+        iam.create_user(UserName=name)
+        iam.put_user_policy(UserName=name, PolicyName="p", PolicyDocument=_json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["sns:TagResource", "sns:UntagResource", "sns:ListTagsForResource"],
+             "Resource": topic},
+            {"Effect": "Allow", "Action": ["sns:GetSubscriptionAttributes", "sns:SetSubscriptionAttributes",
+                                           "sns:Unsubscribe"], "Resource": resources}]}))
+        key = iam.create_access_key(UserName=name)["AccessKey"]
+        c = client("sns", key["AccessKeyId"], key["SecretAccessKey"])
+        calls = (("GetSubscriptionAttributes", lambda: c.get_subscription_attributes(SubscriptionArn=sub)),
+                 ("SetSubscriptionAttributes", lambda: c.set_subscription_attributes(
+                     SubscriptionArn=sub, AttributeName="RawMessageDelivery", AttributeValue="true")),
+                 ("Unsubscribe", lambda: c.unsubscribe(SubscriptionArn=sub)))
+        if i == 0:
+            c.tag_resource(ResourceArn=topic, Tags=[{"Key": "k", "Value": "v"}])
+            c.list_tags_for_resource(ResourceArn=topic)
+            c.untag_resource(ResourceArn=topic, TagKeys=["k"])
+            for _action, call in calls:
+                call()
+            continue
+        for action, call in calls:
+            with pytest.raises(ClientError) as exc:
+                call()
+            error = exc.value.response
+            assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
+                403, "AuthorizationError",
+                f"User: arn:aws:iam::000000000000:user/{name} is not authorized to perform: SNS:{action} on resource: "
+                f"{topic} because no identity-based policy allows the SNS:{action} action")
