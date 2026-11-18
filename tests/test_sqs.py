@@ -2743,3 +2743,35 @@ def test_sqs_get_queue_url_of_another_account_contract(auth_enabled):
         assert (error["ResponseMetadata"]["HTTPStatusCode"], error["Error"]["Code"], error["Error"]["Message"]) == (
             400, "AWS.SimpleQueueService.NonExistentQueue",
             "The specified queue does not exist or you do not have access to it.")
+
+
+def test_sqs_sender_id_is_the_user_or_role_session(sqs):
+    """SenderId is the sender's user ID, or role ID and session name (AWS capture, #2693)."""
+    import json as _json
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test", token=None):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret, aws_session_token=token)
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    iam = client("iam", "test")
+    allow = _json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sqs:*", "Resource": "*"}]})
+    user = iam.create_user(UserName=f"sender-user-{suffix}")["User"]
+    iam.put_user_policy(UserName=user["UserName"], PolicyName="sqs", PolicyDocument=allow)
+    key = iam.create_access_key(UserName=user["UserName"])["AccessKey"]
+    role = iam.create_role(RoleName=f"sender-role-{suffix}", AssumeRolePolicyDocument=_json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                                                "Action": "sts:AssumeRole"}]}))["Role"]
+    iam.put_role_policy(RoleName=role["RoleName"], PolicyName="sqs", PolicyDocument=allow)
+    creds = client("sts", "test").assume_role(RoleArn=role["Arn"], RoleSessionName="my-session")["Credentials"]
+    url = sqs.create_queue(QueueName=f"sender-{suffix}")["QueueUrl"]
+    client("sqs", key["AccessKeyId"], key["SecretAccessKey"]).send_message(QueueUrl=url, MessageBody="from-user")
+    client("sqs", creds["AccessKeyId"], creds["SecretAccessKey"], creds["SessionToken"]).send_message_batch(
+        QueueUrl=url, Entries=[{"Id": "1", "MessageBody": "from-role-session"}])
+    seen = {}
+    for _ in range(3):
+        for m in sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10,
+                                     MessageSystemAttributeNames=["SenderId"]).get("Messages", []):
+            seen[m["Body"]] = m["Attributes"]["SenderId"]
+    assert seen == {"from-user": user["UserId"], "from-role-session": f"{role['RoleId']}:my-session"}

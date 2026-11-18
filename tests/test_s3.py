@@ -13731,3 +13731,55 @@ def test_s3_mrap_list_skips_nothing_when_one_is_deleted_between_pages(s3control_
     finally:
         for name in set(names) - deleted:
             _mrap_delete(ctl, name)
+
+
+@pytest.mark.auth_contract
+def test_s3_bucket_policy_naming_a_user_or_role_of_another_account_contract(auth_enabled):
+    """A bucket policy naming a role or user of another account grants that principal only (AWS capture, #2692)."""
+    if not auth_enabled:
+        pytest.skip("needs AUTH=true")
+    import json as _json
+    from botocore.exceptions import ClientError
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def client(svc, key, secret="test", token=None):
+        return boto3.client(svc, endpoint_url=endpoint, region_name="us-east-1", aws_access_key_id=key,
+                            aws_secret_access_key=secret, aws_session_token=token)
+
+    owner, other = "111122223333", "444455556666"
+    suffix = uuid.uuid4().hex[:8]
+    iam_b, s3_a = client("iam", other), client("s3", owner)
+    allow_all = _json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]})
+    user = f"xs3-user-{suffix}"
+    iam_b.create_user(UserName=user)
+    iam_b.put_user_policy(UserName=user, PolicyName="s3", PolicyDocument=allow_all)
+    key = iam_b.create_access_key(UserName=user)["AccessKey"]
+    user_s3 = client("s3", key["AccessKeyId"], key["SecretAccessKey"])
+    role = f"xs3-role-{suffix}"
+    role_arn = iam_b.create_role(RoleName=role, AssumeRolePolicyDocument=_json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other}:root"}, "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    iam_b.put_role_policy(RoleName=role, PolicyName="s3", PolicyDocument=allow_all)
+    creds = client("sts", other).assume_role(RoleArn=role_arn, RoleSessionName="my-session")["Credentials"]
+    role_s3 = client("s3", creds["AccessKeyId"], creds["SecretAccessKey"], creds["SessionToken"])
+    user_arn = f"arn:aws:iam::{other}:user/{user}"
+    session_arn = f"arn:aws:sts::{other}:assumed-role/{role}/my-session"
+
+    for principal, granted, refused, refused_arn in ((role_arn, role_s3, user_s3, user_arn),
+                                                    (user_arn, user_s3, role_s3, session_arn)):
+        bucket = f"xs3-{uuid.uuid4().hex[:10]}"
+        s3_a.create_bucket(Bucket=bucket)
+        s3_a.put_object(Bucket=bucket, Key="seed.txt", Body=b"seed")
+        s3_a.put_bucket_policy(Bucket=bucket, Policy=_json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": principal}, "Action": ["s3:PutObject", "s3:GetObject"],
+            "Resource": f"arn:aws:s3:::{bucket}/*"}]}))
+        granted.put_object(Bucket=bucket, Key="from-b.txt", Body=b"x")
+        assert granted.get_object(Bucket=bucket, Key="seed.txt")["Body"].read() == b"seed"
+        for action, call in (("s3:PutObject", lambda: refused.put_object(Bucket=bucket, Key="from-b.txt", Body=b"x")),
+                             ("s3:GetObject", lambda: refused.get_object(Bucket=bucket, Key="seed.txt"))):
+            with pytest.raises(ClientError) as exc:
+                call()
+            k = "from-b.txt" if action == "s3:PutObject" else "seed.txt"
+            assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], exc.value.response["Error"]["Code"],
+                    exc.value.response["Error"]["Message"]) == (
+                403, "AccessDenied", f'User: {refused_arn} is not authorized to perform: {action} on resource: '
+                f'"arn:aws:s3:::{bucket}/{k}" because no resource-based policy allows the {action} action')

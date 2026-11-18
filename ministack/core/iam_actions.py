@@ -1238,18 +1238,25 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "iam":
         # IAM actions target users, roles, policies — extract from params
-        role_name = _query_param(query_params, "RoleName")
-        if role_name:
-            return f"arn:aws:iam::{account_id}:role/{role_name}"
-        user_name = _query_param(query_params, "UserName")
-        if user_name:
-            return f"arn:aws:iam::{account_id}:user/{user_name}"
+        # The resource is the entity's ARN with its path: the stored one, or the Path a create names.
+        from ministack.services import iam as iam_svc
+
+        path_param = _query_param(query_params, "Path") or "/"
+        if not (isinstance(path_param, str) and path_param.startswith("/") and path_param.endswith("/")):
+            path_param = "/"
+        for param, kind, store in (("RoleName", "role", iam_svc._roles), ("UserName", "user", iam_svc._users),
+                                   ("GroupName", "group", iam_svc._groups)):
+            name = _query_param(query_params, param)
+            if name and param == "GroupName" and _query_param(query_params, "PolicyArn"):
+                break
+            if name:
+                entity = store.get_scoped(account_id, None, name) if isinstance(name, str) else None
+                if isinstance(entity, dict) and isinstance(entity.get("Arn"), str):
+                    return entity["Arn"]
+                return f"arn:aws:iam::{account_id}:{kind}{path_param}{name}"
         policy_arn = _query_param(query_params, "PolicyArn")
         if policy_arn:
             return policy_arn
-        group_name = _query_param(query_params, "GroupName")
-        if group_name:
-            return f"arn:aws:iam::{account_id}:group/{group_name}"
         return "*"
 
     if service == "sts":

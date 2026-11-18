@@ -1318,6 +1318,17 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
     return _bucket_policy_allows(owner_account, bucket_name, key, method, query_params, caller, headers)
 
 
+def _foreign_caller(caller: str) -> tuple[str, str]:
+    """The caller's own principal for another account's bucket policy: the pinned user, role session or root."""
+    if not caller:
+        return "*", "Anonymous"
+    from ministack.core.iam_evaluator import caller_arn
+    arn = caller_arn()
+    if arn.split(":")[4:5] != [caller] or arn.endswith(":root"):
+        return f"arn:aws:iam::{caller}:root", "Root"
+    return arn, "AssumedRole" if ":assumed-role/" in arn else "FederatedUser" if ":federated-user/" in arn else "User"
+
+
 def _bucket_policy_allows(owner_account: str, bucket_name: str, key: str, method: str, query_params: dict,
                           caller: str, headers: dict | None = None, extra_context: dict | None = None) -> bool:
     """Whether the owner's bucket policy allows the caller's account (anonymous when *caller* is empty);
@@ -1333,9 +1344,10 @@ def _bucket_policy_allows(owner_account: str, bucket_name: str, key: str, method
         resource = f"arn:aws:s3:::{bucket_name}"
         with request_scope(owner_account, get_region()):
             service_context = s3_service_context(action, query_params, path, headers or {})
+        principal_arn, principal_type = _foreign_caller(caller)
         ctx = EvalContext(
-            principal_arn=f"arn:aws:iam::{caller}:root" if caller else "*",
-            principal_type="Root" if caller else "Anonymous",
+            principal_arn=principal_arn,
+            principal_type=principal_type,
             principal_account=caller or "",
             action=action,
             resource_arn=f"{resource}/{key}" if key else resource,
@@ -1585,9 +1597,24 @@ def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
         set_request_account_id(owner)
         return None
     if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller, headers):
-        return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+        return _error("AccessDenied", _foreign_denial_message(bucket, key, method, query_params,
+                                                              access_key and caller), 403,
+                      f"/{bucket}/{key}" if key else f"/{bucket}")
     set_request_account_id(owner)
     return None
+
+
+def _foreign_denial_message(bucket, key, method, query_params, caller):
+    """A user or role session refused by another account's bucket policy is named, with the object (AWS capture)."""
+    principal_arn, principal_type = _foreign_caller(caller)
+    if principal_type not in ("User", "AssumedRole"):
+        return "Access Denied"
+    from ministack.core.iam_actions import _s3_action
+    path = f"/{bucket}/{key}" if key else f"/{bucket}"
+    action = f"s3:{_s3_action(method, path, query_params) or ('GetObject' if method in ('GET', 'HEAD') else 'PutObject')}"
+    resource = f"arn:aws:s3:::{bucket}/{key}" if key else f"arn:aws:s3:::{bucket}"
+    return (f'User: {principal_arn} is not authorized to perform: {action} on resource: "{resource}" '
+            f"because no resource-based policy allows the {action} action")
 
 
 def _copy_source_denied(headers: dict, caller: str, anonymous: bool, internal: bool):
