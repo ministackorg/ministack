@@ -3311,6 +3311,9 @@ async def _dispatch_service_request(
             if denied:
                 if isinstance(denied, AuthError):
                     return _credential_failure(service, iam_action, request_id, denied, headers)
+                if (service == "sqs" and iam_action == "sqs:GetQueueUrl" and resource_arn.startswith("arn:")
+                        and resource_arn.split(":")[4] != get_account_id()):
+                    return _get_module("sqs").nonexistent_queue_response(headers)
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",

@@ -1177,7 +1177,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         # QueueName param (CreateQueue, GetQueueUrl)
         queue_name = _param(body, query_params, "QueueName")
         if queue_name:
-            return f"arn:aws:sqs:{region}:{account_id}:{queue_name}"
+            owner = _param(body, query_params, "QueueOwnerAWSAccountId")
+            owner = owner if isinstance(owner, str) and re.fullmatch(r"\d{12}", owner) else account_id
+            return f"arn:aws:sqs:{region}:{owner}:{queue_name}"
         return "*"
 
     if service == "sns":

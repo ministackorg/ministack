@@ -588,19 +588,28 @@ def _act_list_queues(data: dict, _u: str) -> dict:
     return resp
 
 
+_MSG_NO_QUEUE_OR_ACCESS = "The specified queue does not exist or you do not have access to it."
+
+
+def nonexistent_queue_response(headers: dict) -> tuple:
+    """A refused cross-account GetQueueUrl, answered as an unknown queue name is (AWS capture)."""
+    if headers.get("x-amz-target"):
+        return _json_err_resp("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS)
+    return _xml_err_resp("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS)
+
+
 def _act_get_queue_url(data: dict, _u: str) -> dict:
     name = data.get("QueueName", "")
     owner = data.get("QueueOwnerAWSAccountId") or ""
     if owner and _ACCOUNT_ID_RE.match(owner) and owner != get_account_id():
         url = _queue_name_to_url.get_scoped(owner, get_region(), name)
-        if not url:
-            raise _Err("QueueDoesNotExist",
-                        "The specified queue does not exist.")
-        q = _queues.get_scoped(owner, get_region(), url)
+        q = _queues.get_scoped(owner, get_region(), url) if url else None
         if q is None:
-            raise _Err("QueueDoesNotExist",
-                        "The specified queue does not exist.")
-        _enforce_queue_policy(q, "sqs:GetQueueUrl")
+            raise _Err("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS)
+        try:
+            _enforce_queue_policy(q, "sqs:GetQueueUrl")
+        except _Err as refused:
+            raise _Err("QueueDoesNotExist", _MSG_NO_QUEUE_OR_ACCESS) from refused
         return {"QueueUrl": url}
     url = _queue_name_to_url.get(name)
     if not url:
