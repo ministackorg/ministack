@@ -796,8 +796,10 @@ def _submitted_view(build):
     view.pop("endTime", None)
     view["buildStatus"] = "IN_PROGRESS"
     view["currentPhase"] = "QUEUED"
+    view["buildComplete"] = False
     view["phases"] = [
-        {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED", "startTime": now, "endTime": now},
+        {"phaseType": "SUBMITTED", "phaseStatus": "SUCCEEDED", "startTime": now, "endTime": now,
+         "durationInSeconds": 0},
         {"phaseType": "QUEUED", "startTime": now},
     ]
     return view
