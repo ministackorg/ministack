@@ -516,7 +516,7 @@ def _cloudfront_resource_exists(spec: Arn, arn: str) -> bool:
     if spec.resource.startswith("function/"):
         return _resource_tail(spec, arn, "function/") in svc._functions
     if spec.resource.startswith("key-value-store/"):
-        return _resource_tail(spec, arn, "key-value-store/") in svc._kvstores
+        return svc._kvs_by_arn(arn) is not None
     return arn in svc._tags
 
 

@@ -19200,6 +19200,10 @@ def test_rds_add_tags_rejects_reserved_aws_prefix(rds):
         assert rds.list_tags_for_resource(ResourceName=arn)["TagList"] == [
             {"Key": "sim2real-ok-tag", "Value": "yes"}
         ]
+    finally:
+        rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+
+
 _PI_RETENTION_VALID = (
     "7, 31, 62, 93, 124, 155, 186, 217, 248, 279, 310, 341, 372, 403, 434, 465, 496, "
     "527, 558, 589, 620, 651, 682, 713, 731"

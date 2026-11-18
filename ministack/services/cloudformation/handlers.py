@@ -593,6 +593,8 @@ def _describe_stack_events(params):
             f"{token_xml}"
             + (f"<DetailedStatus>{e['DetailedStatus']}</DetailedStatus>"
                if e.get("DetailedStatus") else "")
+            + (f"<ResourceProperties>{_esc(e['ResourceProperties'])}</ResourceProperties>"
+               if "ResourceProperties" in e else "")
             + "</member>"
         )
 

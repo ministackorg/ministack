@@ -1124,7 +1124,7 @@ def test_kvs_create_and_describe(cloudfront):
     assert kvs["Comment"] == "test comment"
     assert kvs["Status"] == "READY"
     assert "Id" in kvs
-    assert kvs["ARN"].endswith(":key-value-store/test-kvs-1")
+    assert kvs["ARN"].endswith(f":key-value-store/{kvs['Id']}")
     assert "LastModifiedTime" in kvs
     etag = resp["ETag"]
     assert etag
@@ -6903,3 +6903,29 @@ def test_dataplane_http_1_0_drops_accept_encoding(cf_compress_stack):
     assert "content-encoding" not in headers
     assert headers["x-seen-accept-encoding"] == "-"
     assert body == b"a" * 1000
+
+
+def _error_page_dist(cloudfront):
+    config = _custom_origin_distribution_config(f"cf-err-{_uuid_mod.uuid4().hex[:10]}")
+    config["DefaultCacheBehavior"]["ViewerProtocolPolicy"] = "allow-all"
+    config["DefaultCacheBehavior"]["AllowedMethods"] = {
+        "Quantity": 2, "Items": ["GET", "HEAD"], "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]}}
+    return cloudfront.create_distribution(DistributionConfig=config)["Distribution"]["DomainName"]
+
+
+@pytest.mark.parametrize("path", ["/%", "/api/%", "/a%2"])
+def test_bare_percent_in_the_path_answers_cloudfront_400(cloudfront, path):
+    """A real distribution answers a "%" without two hex digits with its own 400 page, 915 bytes."""
+    status, headers, body = _get(_error_page_dist(cloudfront), path)
+    assert (status, headers["X-Cache"], headers["Content-Type"]) == (400, "Error from cloudfront", "text/html")
+    assert b"<H1>400 ERROR</H1>" in body and b"\nBad request.\n" in body
+    assert len(body) == 915
+
+
+def test_method_error_page_is_the_real_page(cloudfront):
+    """The 403 page for a method the behavior does not allow is the 1053-byte page of a real distribution."""
+    status, headers, body = _get(_error_page_dist(cloudfront), "/", method="PROPFIND")
+    assert (status, headers["X-Cache"]) == (403, "Error from cloudfront")
+    assert len(body) == 1053
+    assert body.endswith(b"</PRE>\n<ADDRESS>\n</ADDRESS>\n</BODY></HTML>")
+

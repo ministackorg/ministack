@@ -1175,6 +1175,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::DocDB::DBInstance": ("Tags", "list"),
     "AWS::DocDB::DBSubnetGroup": ("Tags", "list"),
     "AWS::DocDB::DBClusterParameterGroup": ("Tags", "list"),
+    "AWS::S3::Bucket": ("Tags", "list"),
     "AWS::SES::ConfigurationSet": ("Tags", "list"),
     "AWS::SNS::Topic": ("Tags", "list"),
     "AWS::SQS::Queue": ("Tags", "list"),
@@ -1691,6 +1692,9 @@ def _s3_create(logical_id, props, stack_name):
     if "NotificationConfiguration" in props:
         _s3_apply_notification(name, props["NotificationConfiguration"])
     _s3_apply_configurations(name, props)
+    tags = _tag_map(props.get("Tags"))
+    if tags:
+        _s3._bucket_tags[name] = tags
     return name, _s3_attrs(name)
 
 
@@ -1714,6 +1718,12 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
             # Property removed on update — clear the configuration, as AWS does.
             _s3._bucket_notifications.pop(name, None)
         _s3_apply_configurations(name, new_props, old_props)
+        tags = dict(_s3._bucket_tags.get(name) or {})
+        _reconcile_tag_map(tags, old_props, new_props)
+        if tags:
+            _s3._bucket_tags[name] = tags
+        else:
+            _s3._bucket_tags.pop(name, None)
     else:
         return _s3_create(name, new_props, stack_name)
     return name, _s3_attrs(name)
@@ -2142,7 +2152,9 @@ def _ddb_create(logical_id, props, stack_name):
     if stream_spec.get("StreamViewType") and "StreamEnabled" not in stream_spec:
         stream_spec = {**stream_spec, "StreamEnabled": True}
     stream_enabled = stream_spec.get("StreamEnabled", False)
-    stream_arn = f"{arn}/stream/{now_iso()}" if stream_enabled else None
+    from ministack.services.dynamodb import _stream_label
+    stream_label = _stream_label() if stream_enabled else None
+    stream_arn = f"{arn}/stream/{stream_label}" if stream_enabled else None
 
     billing = props.get("BillingMode", "PROVISIONED")
 
@@ -2168,7 +2180,7 @@ def _ddb_create(logical_id, props, stack_name):
         "LocalSecondaryIndexes": lsis,
         "StreamSpecification": stream_spec if stream_enabled else None,
         "LatestStreamArn": stream_arn,
-        "LatestStreamLabel": now_iso() if stream_enabled else None,
+        "LatestStreamLabel": stream_label,
         "DeletionProtectionEnabled": props.get("DeletionProtectionEnabled", False),
         "SSEDescription": None,
         "Tags": [],
@@ -5107,7 +5119,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                               if v is not _NO_VALUE_SENTINEL()}
 
         _add_event(child_stack_id, child_name, child_logical_id, resource_type,
-                   f"{status_prefix}_IN_PROGRESS")
+                   f"{status_prefix}_IN_PROGRESS", properties=resolved_props)
         name_seed = ""
         try:
             prev = prev_resources.get(child_logical_id)
@@ -5150,7 +5162,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                 f"Resource {child_logical_id} failed: {exc}"
             )
             _add_event(child_stack_id, child_name, child_logical_id, resource_type,
-                       f"{status_prefix}_FAILED", str(exc))
+                       f"{status_prefix}_FAILED", str(exc), properties=resolved_props)
             raise
 
         provisioned[child_logical_id] = {
@@ -5165,7 +5177,8 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         if name_seed:
             provisioned[child_logical_id]["_name_seed"] = name_seed
         _add_event(child_stack_id, child_name, child_logical_id, resource_type,
-                   f"{status_prefix}_COMPLETE", physical_id=physical_id)
+                   f"{status_prefix}_COMPLETE", physical_id=physical_id,
+                   properties=resolved_props)
 
     if is_update:
         snapshot = previous_stack_snapshot or {}
@@ -12081,20 +12094,20 @@ def _cf_distribution_delete(physical_id, props):
 
 def _cf_kvs_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
-    arn = _cf._kvs_arn(name)
     if name not in _cf._kvstores:
+        kvs_id = new_uuid()
         _cf._kvstores[name] = {
-            "Id": new_uuid(),
+            "Id": kvs_id,
             "Name": name,
             "Comment": props.get("Comment", ""),
-            "ARN": arn,
+            "ARN": _cf._kvs_arn(kvs_id),
             "Status": "READY",
             "LastModifiedTime": now_iso(),
             "ETag": new_uuid(),
         }
     record = _cf._kvstores[name]
     # Return refs the spec exposes via Fn::GetAtt: Arn, Id, Status.
-    return name, {"Arn": arn, "Id": record["Id"], "Status": record["Status"]}
+    return name, {"Arn": record["ARN"], "Id": record["Id"], "Status": record["Status"]}
 
 
 def _cf_kvs_update(physical_id, old_props, new_props, stack_name):
