@@ -11907,6 +11907,86 @@ def test_cfn_stack_tags_reach_the_resources(cfn, sqs, ssm):
         _delete_cfn_test_stack(cfn, name)
 
 
+def test_cfn_bucket_tags_reach_get_bucket_tagging(cfn, s3):
+    """An AWS::S3::Bucket's Tags, the stack tags and the three
+    aws:cloudformation tags are the bucket's tag set; an update that drops a
+    template tag removes it from the bucket."""
+    name = f"cfn-bucket-tags-{_uuid_mod.uuid4().hex[:8]}"
+
+    def template(tags):
+        return json.dumps({
+            "Resources": {"B": {"Type": "AWS::S3::Bucket", "Properties": {"Tags": tags}}},
+            "Outputs": {"Name": {"Value": {"Ref": "B"}}},
+        })
+
+    def bucket_tags(bucket):
+        return {t["Key"]: t["Value"] for t in s3.get_bucket_tagging(Bucket=bucket)["TagSet"]}
+
+    cfn.create_stack(
+        StackName=name,
+        TemplateBody=template([{"Key": "aws-cdk:auto-delete-objects", "Value": "true"},
+                               {"Key": "env", "Value": "dev"}]),
+        Tags=[{"Key": "owner", "Value": "team-a"}],
+    )
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        bucket = _output(stack, "Name")
+        assert bucket_tags(bucket) == {
+            "aws-cdk:auto-delete-objects": "true",
+            "env": "dev",
+            "owner": "team-a",
+            **_system_tags(stack, "B"),
+        }
+        cfn.update_stack(
+            StackName=name,
+            TemplateBody=template([{"Key": "aws-cdk:auto-delete-objects", "Value": "true"}]),
+            Tags=[{"Key": "owner", "Value": "team-a"}],
+        )
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert bucket_tags(bucket) == {
+            "aws-cdk:auto-delete-objects": "true",
+            "owner": "team-a",
+            **_system_tags(stack, "B"),
+        }
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_table_stream_label_and_event_resource_properties(cfn, ddb):
+    """A stack's DynamoDB stream label has no trailing Z and ends its
+    LatestStreamArn; each event of the resource carries its properties with
+    every primitive a string, and the stack's own events carry none."""
+    name = f"cfn-event-props-{_uuid_mod.uuid4().hex[:8]}"
+    table = f"{name}-t"
+    props = {
+        "TableName": table,
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [{"AttributeName": "PK", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "PK", "KeyType": "HASH"}],
+        "DeletionProtectionEnabled": False,
+        "StreamSpecification": {"StreamViewType": "NEW_IMAGE"},
+    }
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(
+        {"Resources": {"T": {"Type": "AWS::DynamoDB::Table", "Properties": props}}}))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        desc = ddb.describe_table(TableName=table)["Table"]
+        label = desc["LatestStreamLabel"]
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}", label), label
+        assert desc["LatestStreamArn"].endswith(f"/stream/{label}")
+        events = cfn.describe_stack_events(StackName=name)["StackEvents"]
+        table_events = [e for e in events if e["LogicalResourceId"] == "T"]
+        assert {e["ResourceStatus"] for e in table_events} == {"CREATE_IN_PROGRESS", "CREATE_COMPLETE"}
+        for e in table_events:
+            assert json.loads(e["ResourceProperties"]) == {**props, "DeletionProtectionEnabled": "false"}
+        assert all("ResourceProperties" not in e for e in events if e["LogicalResourceId"] == name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_stack_tags_reach_a_nested_stack(cfn, s3, sqs):
     """The parent's stack tags reach the resources of a nested stack; the
     aws:cloudformation tags carry the nested stack's own name and id."""
