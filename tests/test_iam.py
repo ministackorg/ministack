@@ -1949,16 +1949,26 @@ def test_iam_role_and_user_resources_carry_their_path_contract(auth_enabled):
     nopath = caller("rn", f"arn:aws:iam::000000000000:role/path-role-*", ["iam:GetRole", "iam:PutRolePolicy"])
     path.get_role(RoleName=role)
     path.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc)
-    for call in (lambda: nopath.get_role(RoleName=role),
-                 lambda: nopath.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc)):
+    rn = f"arn:aws:iam::000000000000:user/path-rn-{suffix}"
+    for action, call in (("GetRole", lambda: nopath.get_role(RoleName=role)),
+                         ("PutRolePolicy", lambda: nopath.put_role_policy(RoleName=role, PolicyName="x", PolicyDocument=doc))):
         with pytest.raises(ClientError) as exc:
             call()
-        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == ("AccessDenied", (
+            f"User: {rn} is not authorized to perform: iam:{action} on resource: role {role} "
+            f"because no identity-based policy allows the iam:{action} action"))
     caller("up", "arn:aws:iam::000000000000:user/my/path/*", ["iam:GetUser"]).get_user(UserName=target)
-    with pytest.raises(ClientError):
+    with pytest.raises(ClientError) as exc:
         caller("un", f"arn:aws:iam::000000000000:user/path-target-*", ["iam:GetUser"]).get_user(UserName=target)
+    assert exc.value.response["Error"]["Message"] == (
+        f"User: arn:aws:iam::000000000000:user/path-un-{suffix} is not authorized to perform: iam:GetUser on resource: "
+        f"user {target} because no identity-based policy allows the iam:GetUser action")
     caller("cp", "arn:aws:iam::000000000000:role/my/path/*", ["iam:CreateRole"]).create_role(
         RoleName=f"path-new-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
-    with pytest.raises(ClientError):
+    with pytest.raises(ClientError) as exc:
         caller("cn", f"arn:aws:iam::000000000000:role/path-new2-*", ["iam:CreateRole"]).create_role(
-            RoleName=f"path-new2-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
+            RoleName=f"path-new3-{suffix}", Path="/my/path/", AssumeRolePolicyDocument=trust)
+    assert exc.value.response["Error"]["Message"] == (
+        f"User: arn:aws:iam::000000000000:user/path-cn-{suffix} is not authorized to perform: iam:CreateRole on "
+        f"resource: arn:aws:iam::000000000000:role/my/path/path-new3-{suffix} "
+        "because no identity-based policy allows the iam:CreateRole action")

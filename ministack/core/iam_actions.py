@@ -2556,6 +2556,20 @@ def _resource_policy_denial(service: str, action: str, principal_arn: str, resou
             "with an explicit deny in a resource-based policy")
 
 
+def _iam_denied_resource(resource_arn: str) -> str:
+    """How an IAM denial names a role or user (AWS capture 2026-11-18): an existing one as "role <name>" /
+    "user <name>", one being created by its ARN. Other IAM resources keep the message without a resource."""
+    _, _, tail = resource_arn.partition(":iam::")
+    kind, _, rest = tail.partition(":")[2].partition("/")
+    if kind not in ("role", "user") or not rest:
+        return ""
+    from ministack.services import iam as iam_svc
+
+    name = rest.rsplit("/", 1)[-1]
+    exists = name in (iam_svc._roles if kind == "role" else iam_svc._users)
+    return f"{kind} {name}" if exists else resource_arn
+
+
 def identity_denial_message(action: str, principal_arn: str, resource: str, explicit_deny: bool) -> str:
     """The message of a denial an identity-based policy decided, naming the resource."""
     reason = (
@@ -2628,6 +2642,8 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         )
         # IoT names the resource, "*" for an action that takes none.
         on_resource = f" on resource: {resource_arn}" if service == "iot" else ""
+        if service == "iam" and (iam_resource := _iam_denied_resource(resource_arn)):
+            on_resource = f" on resource: {iam_resource}"
         message = f"User: {principal_arn} is not authorized to perform: {action}{on_resource} {reason}"
     code = error_code or _DENIED_CODES.get(service, "AccessDenied")
     status = 403
