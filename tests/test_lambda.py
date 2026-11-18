@@ -9330,6 +9330,7 @@ def test_lambda_ruby_4_0_runtime_maps_to_official_image():
     assert _RUNTIME_IMAGE_MAP.get("ruby4.0") == "public.ecr.aws/lambda/ruby:4.0"
 
 
+
 # ---------------------------------------------------------------------------
 # Lambda Durable Functions (Durable Execution).
 # Shapes verified against:

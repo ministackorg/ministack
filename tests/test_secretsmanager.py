@@ -1436,7 +1436,7 @@ def test_secret_policy_naming_the_user_allows_without_identity_policy(auth):
 def test_secret_policy_naming_the_account_needs_an_identity_policy(auth):
     arn = _policy_secret("Allow", "arn:aws:iam::000000000000:root")
     key, _user = inprocess_iam_user()
-    assert _get_secret_value(key, arn) == (403, "AccessDeniedException")
+    assert _get_secret_value(key, arn) == (400, "AccessDeniedException")  # AWS capture 2026-11-18
     key, _user = inprocess_iam_user(_ALLOW_SECRETS)
     assert _get_secret_value(key, arn) == (200, None)
 
@@ -1447,7 +1447,7 @@ def test_secret_policy_deny_beats_an_identity_allow(auth):
     status, _headers, body = routed_request(
         key, "secretsmanager", "POST", "/", json.dumps({"SecretId": arn}).encode(),
         {"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.GetSecretValue"})
-    assert (status, json.loads(body)) == (403, {"__type": "AccessDeniedException", "message": (
+    assert (status, json.loads(body)) == (400, {"__type": "AccessDeniedException", "message": (
         f"User: {user} is not authorized to perform: secretsmanager:GetSecretValue on resource: {arn} "
         "with an explicit deny in a resource-based policy")})
     status, _headers, body = routed_request(
