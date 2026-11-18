@@ -140,9 +140,13 @@ def test_codebuild_start_build(codebuild):
     resp = codebuild.start_build(projectName="test-project")
     build = resp["build"]
     assert build["projectName"] == "test-project"
-    assert build["buildStatus"] == "SUCCEEDED"
+    assert build["buildStatus"] == "IN_PROGRESS"
+    assert build["currentPhase"] == "QUEUED"
+    assert [p["phaseType"] for p in build["phases"]] == ["SUBMITTED", "QUEUED"]
     assert build["arn"].startswith("arn:aws:codebuild:")
     assert "phases" in build
+    later = codebuild.batch_get_builds(ids=[build["id"]])["builds"][0]
+    assert later["buildStatus"] == "SUCCEEDED"
 
 
 def test_codebuild_batch_get_builds(codebuild):
@@ -360,7 +364,9 @@ def test_start_build_is_metadata_only_by_default(monkeypatch):
     status, _headers, body = codebuild._start_build({"projectName": "demo"})
 
     assert status == 200
-    assert json.loads(body)["build"]["buildStatus"] == "SUCCEEDED"
+    started = json.loads(body)["build"]
+    assert started["buildStatus"] == "IN_PROGRESS"
+    assert codebuild._builds[started["id"]]["buildStatus"] == "SUCCEEDED"
     assert calls == []
 
 
