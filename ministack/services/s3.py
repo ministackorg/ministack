@@ -2589,6 +2589,18 @@ def _presign_time_error(amz_date: str, expires: str, path: str) -> tuple | None:
     return None
 
 
+def _expired_error(amz_date: str, expires: str) -> tuple:
+    """403 AccessDenied "Request has expired" with the expiry and server time; AWS's has no Resource (capture 2026-11-18)."""
+    signed = _dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=_dt.timezone.utc)
+    root = Element("Error")
+    for tag, text in (("Code", "AccessDenied"), ("Message", "Request has expired"), ("X-Amz-Expires", str(int(expires))),
+                      ("Expires", (signed + _dt.timedelta(seconds=int(expires))).strftime("%Y-%m-%dT%H:%M:%SZ")),
+                      ("ServerTime", _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+                      ("RequestId", new_uuid())):
+        SubElement(root, tag).text = text
+    return 403, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
@@ -2636,7 +2648,7 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     if expires:
         try:
             if presigned_request_is_expired(amz_date, expires):
-                return _error("AccessDenied", "Request has expired", 403, path)
+                return _expired_error(amz_date, expires)
         except (ValueError, TypeError):
             pass
 

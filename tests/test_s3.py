@@ -13785,19 +13785,26 @@ def test_s3_bucket_policy_naming_a_user_or_role_of_another_account_contract(auth
                 f'"arn:aws:s3:::{bucket}/{k}" because no resource-based policy allows the {action} action')
 
 
-def test_presigned_expiry_is_checked_when_the_request_arrives():
-    """S3 checks a presigned URL's expiry at the time of the HTTP request, so an upload that runs past it still
-    completes (S3 User Guide, presigned URLs; #2710)."""
-    import datetime as _dt
 
-    from ministack.core import sigv4
+def test_s3_expired_presigned_url_error_carries_the_expiry_and_server_time(s3):
+    """AWS's body: Code, Message, X-Amz-Expires, Expires, ServerTime, RequestId; no Resource (capture 2026-11-18)."""
+    import time as _time
+    import xml.etree.ElementTree as _ET
+    from datetime import timedelta as _td
 
-    signed = _dt.datetime(2026, 11, 18, 12, 0, 0, tzinfo=_dt.timezone.utc)
-    amz_date = signed.strftime("%Y%m%dT%H%M%SZ")
-    token = sigv4._request_arrival.set(signed + _dt.timedelta(seconds=4))
+    bucket = f"presign-expired-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
     try:
-        assert not sigv4.presigned_request_is_expired(amz_date, 5)  # arrived in time; the wall clock is long past
-        sigv4._request_arrival.set(signed + _dt.timedelta(seconds=6))
-        assert sigv4.presigned_request_is_expired(amz_date, 5)
+        url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "k"}, ExpiresIn=1)
+        _time.sleep(2.5)
+        r = requests.get(url)
+        root = _ET.fromstring(r.content)
+        signed = datetime.strptime(dict(parse_qsl(urlsplit(url).query))["X-Amz-Date"], "%Y%m%dT%H%M%SZ")
+        assert r.status_code == 403
+        assert [c.tag for c in root] == ["Code", "Message", "X-Amz-Expires", "Expires", "ServerTime", "RequestId"]
+        assert (root.findtext("Code"), root.findtext("Message"), root.findtext("X-Amz-Expires")) == (
+            "AccessDenied", "Request has expired", "1")
+        assert root.findtext("Expires") == (signed + _td(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert root.findtext("ServerTime") > root.findtext("Expires")
     finally:
-        sigv4._request_arrival.reset(token)
+        s3.delete_bucket(Bucket=bucket)
