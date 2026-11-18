@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — output of child processes** — the in-process workers and the one-shot executor read their replies from the function's stdout, which child processes inherit, so a child that printed more than 200 lines at init or in the handler (`aws s3 sync` in the CDK `BucketDeployment` handler) failed the invocation. Replies now use their own descriptor, and stdout and stderr are only the log. A `provided` bootstrap in the one-shot executor that logged more than a pipe holds before it answered timed out; its log now goes to a file.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
