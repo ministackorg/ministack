@@ -185,11 +185,37 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
     if detailed_status:
         event["DetailedStatus"] = detailed_status
     if properties is not None:
-        event["ResourceProperties"] = json.dumps(_normalise_resource_properties(properties),
-                                                 separators=(",", ":"), default=str)
+        event["ResourceProperties"] = json.dumps(
+            _mask_no_echo(_normalise_resource_properties(properties), _no_echo_values(stack_name, stack_id)),
+            separators=(",", ":"), default=str)
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
+
+
+def _no_echo_values(stack_name, stack_id) -> list:
+    """The values of the stack's NoEcho parameters."""
+    from ministack.services.cloudformation import _stacks
+    stack = _stacks.get(stack_name)
+    if not stack or stack.get("StackId") != stack_id:
+        return []
+    return [str(p["ParameterValue"]) for p in stack.get("Parameters", [])
+            if p.get("NoEcho") and p.get("ParameterValue")]
+
+
+def _mask_no_echo(node, secrets):
+    """AWS shows a NoEcho parameter's value as **** in an event's ResourceProperties (capture 2026-11-18);
+    a value written in the template is shown as is."""
+    if not secrets:
+        return node
+    if isinstance(node, dict):
+        return {k: _mask_no_echo(v, secrets) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_no_echo(v, secrets) for v in node]
+    if isinstance(node, str):
+        for secret in secrets:
+            node = node.replace(secret, "****")
+    return node
 
 
 # The reasons AWS gives the events of an imported resource.
@@ -543,7 +569,7 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
             provisioned_resources.pop(logical_id, None)
             continue
         _add_event(stack_id, stack_name, logical_id, rtype,
-                   "DELETE_IN_PROGRESS", physical_id=pid)
+                   "DELETE_IN_PROGRESS", physical_id=pid, properties=res_props)
         try:
             if _runs_on_worker_thread(rtype):
                 await run_reentrant(
@@ -553,12 +579,12 @@ async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
             else:
                 _delete_resource(rtype, pid, res_props, stack_name, logical_id)
             _add_event(stack_id, stack_name, logical_id, rtype,
-                       "DELETE_COMPLETE", physical_id=pid)
+                       "DELETE_COMPLETE", physical_id=pid, properties=res_props)
         except Exception as del_exc:
             logger.error("Rollback delete of %s failed: %s",
                          logical_id, del_exc)
             _add_event(stack_id, stack_name, logical_id, rtype,
-                       "DELETE_FAILED", str(del_exc), pid)
+                       "DELETE_FAILED", str(del_exc), pid, properties=res_props)
             if cleanup_phase:
                 provisioned_resources.pop(logical_id, None)
                 continue

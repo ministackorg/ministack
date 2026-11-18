@@ -20137,8 +20137,12 @@ def test_cfn_opensearch_invalid_create_redacts_secret_and_rolls_back(cfn, opense
     stack = _wait_stack(cfn, stack_name)
     assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
     events = cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
-    assert sentinel not in json.dumps(events, default=str)
+    # AWS shows a password written in the template in ResourceProperties, never in a reason (capture 2026-11-18).
+    assert all(sentinel not in e.get("ResourceStatusReason", "") for e in events)
     assert sentinel not in json.dumps(stack, default=str)
+    domain_events = [e for e in events if e["LogicalResourceId"] != stack_name]
+    assert {e["ResourceStatus"] for e in domain_events} >= {"CREATE_IN_PROGRESS", "CREATE_FAILED"}
+    assert all(sentinel in e["ResourceProperties"] for e in domain_events)
     with pytest.raises(ClientError) as exc:
         opensearch.describe_domain(DomainName=invalid_name)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
@@ -39876,3 +39880,31 @@ def test_cfn_ecr_repository_creation_template_lifecycle(cfn, ecr):
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
     assert ecr.describe_repository_creation_templates(prefixes=[prefix])["repositoryCreationTemplates"] == []
+
+
+def test_cfn_event_properties_mask_a_no_echo_parameter_and_rollback_deletes_carry_them(cfn):
+    """A NoEcho parameter's value is **** in ResourceProperties, and the rollback deletes of a failed create
+    carry the properties too (AWS capture 2026-11-18)."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, secret = f"cfn-noecho-{suffix}", f"Secret-{suffix}"
+    template = {
+        "Parameters": {"Pw": {"Type": "String", "NoEcho": True}},
+        "Resources": {
+            "Q": {"Type": "AWS::SQS::Queue", "Properties": {"Tags": [{"Key": "pw", "Value": {"Ref": "Pw"}}]}},
+            "Bad": {"Type": "AWS::OpenSearchService::Domain", "DependsOn": "Q",
+                    "Properties": {"DomainName": f"INVALID-{suffix}"}},
+        },
+    }
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template),
+                     Parameters=[{"ParameterKey": "Pw", "ParameterValue": secret}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
+        events = cfn.describe_stack_events(StackName=name)["StackEvents"]
+        assert secret not in json.dumps(events, default=str)
+        q = {e["ResourceStatus"]: e for e in events if e["LogicalResourceId"] == "Q"}
+        assert {"CREATE_IN_PROGRESS", "CREATE_COMPLETE", "DELETE_IN_PROGRESS", "DELETE_COMPLETE"} <= set(q)
+        for e in q.values():
+            assert json.loads(e["ResourceProperties"]) == {"Tags": [{"Key": "pw", "Value": "****"}]}
+    finally:
+        _delete_cfn_test_stack(cfn, name)
