@@ -2076,6 +2076,14 @@ def _get_key_rotation_status(data):
 # ---- Key Policy ----
 
 
+def is_customer_key(key_arn: str) -> bool:
+    """Whether an ARN names a customer managed key, this account's or another's."""
+    owner, rec = _foreign_key(key_arn)
+    if not owner:
+        rec = _resolve_key(key_arn)
+    return bool(rec) and rec.get("KeyManager", "CUSTOMER") == "CUSTOMER"
+
+
 def key_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     """The key policy and owner account, for the identity check."""
     owner, rec = _foreign_key(resource_arn)

@@ -6,7 +6,6 @@ on:
       - "v*.*.*"
 
 env:
-  DOCKERHUB_IMAGE: nahuelnucera/ministack
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack
   # Free-to-pull mirror on the GitHub Container Registry. Repo-scoped under
   # the same org as Docker Hub so `ghcr.io/ministackorg/ministack:<tag>` is a
@@ -52,7 +51,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
             ${{ env.GHCR_IMAGE }}
           tags: |
@@ -70,7 +68,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
             ${{ env.GHCR_IMAGE }}
           flavor: |

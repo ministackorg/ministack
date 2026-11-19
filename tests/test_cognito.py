@@ -3340,14 +3340,6 @@ def _setup_saml_pool(cognito_idp, lambda_config=None):
     pid = cognito_idp.create_user_pool(
         PoolName="FedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
-    client = cognito_idp.create_user_pool_client(
-        UserPoolId=pid,
-        ClientName="FedApp",
-        CallbackURLs=["http://localhost:3000/callback"],
-        AllowedOAuthFlows=["code"],
-        AllowedOAuthScopes=["openid", "email"],
-        SupportedIdentityProviders=["TestSAML"],
-    )["UserPoolClient"]
     cognito_idp.create_identity_provider(
         UserPoolId=pid,
         ProviderName="TestSAML",
@@ -3358,6 +3350,14 @@ def _setup_saml_pool(cognito_idp, lambda_config=None):
             "name": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
         },
     )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="FedApp",
+        CallbackURLs=["http://localhost:3000/callback"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        SupportedIdentityProviders=["TestSAML"],
+    )["UserPoolClient"]
     return pid, client["ClientId"]
 
 
@@ -3825,14 +3825,6 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mappi
     pid = cognito_idp.create_user_pool(
         PoolName="OIDCFedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
-    client = cognito_idp.create_user_pool_client(
-        UserPoolId=pid,
-        ClientName="OIDCApp",
-        CallbackURLs=["http://localhost:3000/callback"],
-        AllowedOAuthFlows=["code"],
-        AllowedOAuthScopes=["openid", "email"],
-        SupportedIdentityProviders=["TestOIDC"],
-    )["UserPoolClient"]
     cognito_idp.create_identity_provider(
         UserPoolId=pid,
         ProviderName="TestOIDC",
@@ -3847,6 +3839,14 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mappi
         },
         AttributeMapping=attribute_mapping or {"email": "email", "name": "name"},
     )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="OIDCApp",
+        CallbackURLs=["http://localhost:3000/callback"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        SupportedIdentityProviders=["TestOIDC"],
+    )["UserPoolClient"]
     return pid, client["ClientId"]
 
 
@@ -15312,3 +15312,230 @@ def test_cognito_postauth_not_returning_the_event_fails_sign_in(cognito_idp, lam
         cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
                                   AuthParameters={"USERNAME": "u", "PASSWORD": "Pwd1234!"})
     assert exc.value.response["Error"]["Code"] == "InvalidLambdaResponseException"
+
+
+# -- Behaviour recorded on AWS (eu-north-1, 2026-11-18) ----------------------
+
+_OIDC_DETAILS = {"client_id": "abc", "client_secret": "def", "authorize_scopes": "openid email",
+                 "attributes_request_method": "GET", "oidc_issuer": "https://idp.example.com",
+                 "authorize_url": "https://idp.example.com/authorize", "token_url": "https://idp.example.com/token",
+                 "attributes_url": "https://idp.example.com/userinfo", "jwks_uri": "https://idp.example.com/jwks"}
+
+
+def test_cognito_oidc_endpoint_with_a_query_is_refused(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="oidc-query")["UserPool"]["Id"]
+    for key in ("authorize_url", "token_url", "attributes_url", "jwks_uri", "oidc_issuer"):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.create_identity_provider(
+                UserPoolId=pid, ProviderName=f"Q{key[:4]}", ProviderType="OIDC",
+                ProviderDetails={**_OIDC_DETAILS, key: _OIDC_DETAILS[key] + "?prompt=login"})
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == "Endpoint can not contain queries"
+    cognito_idp.create_identity_provider(UserPoolId=pid, ProviderName="Corp", ProviderType="OIDC",
+                                         ProviderDetails=_OIDC_DETAILS)
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.update_identity_provider(
+            UserPoolId=pid, ProviderName="Corp",
+            ProviderDetails={**_OIDC_DETAILS, "authorize_url": "https://idp.example.com/authorize?prompt=login"})
+    assert exc.value.response["Error"]["Message"] == "Endpoint can not contain queries"
+
+
+def test_cognito_client_supported_providers_must_exist(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="client-idps")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(UserPoolId=pid, ProviderName="Corp", ProviderType="OIDC",
+                                         ProviderDetails=_OIDC_DETAILS)
+    for names in (["Nope"], ["corp"]):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c", SupportedIdentityProviders=names)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+        assert exc.value.response["Error"]["Message"] == f"The provider {names[0]} does not exist for User Pool {pid}."
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c",
+                                              SupportedIdentityProviders=["Corp", "COGNITO"])["UserPoolClient"]["ClientId"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.update_user_pool_client(UserPoolId=pid, ClientId=cid, SupportedIdentityProviders=["Corp", "Nope"])
+    assert exc.value.response["Error"]["Message"] == f"The provider Nope does not exist for User Pool {pid}."
+    assert cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"][
+        "SupportedIdentityProviders"] == ["Corp", "COGNITO"]
+
+
+def test_cognito_link_provider_source_must_be_configured(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="link-src")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(UserPoolId=pid, ProviderName="Corp", ProviderType="OIDC",
+                                         ProviderDetails=_OIDC_DETAILS)
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="dest", MessageAction="SUPPRESS")
+    dest = {"ProviderName": "Cognito", "ProviderAttributeValue": "dest"}
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_link_provider_for_user(UserPoolId=pid, DestinationUser=dest, SourceUser={
+            "ProviderName": "Nope", "ProviderAttributeName": "Cognito_Subject", "ProviderAttributeValue": "x1"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == \
+        "SourceProviderName must match a Provider that is configured for the User Pool"
+    cognito_idp.admin_link_provider_for_user(UserPoolId=pid, DestinationUser=dest, SourceUser={
+        "ProviderName": "Corp", "ProviderAttributeName": "Cognito_Subject", "ProviderAttributeValue": "x2"})
+
+
+def _secret_hash(username, cid, secret):
+    return base64.b64encode(hmac.new(secret.encode(), (username + cid).encode(), hashlib.sha256).digest()).decode()
+
+
+def test_cognito_client_secret_rotation(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="secret-rotation")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c", GenerateSecret=True,
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"])["UserPoolClient"]
+    cid, first = client["ClientId"], client["ClientSecret"]
+    listed = cognito_idp.list_user_pool_client_secrets(UserPoolId=pid, ClientId=cid)["ClientSecrets"]
+    assert len(listed) == 1 and listed[0]["ClientSecretId"].startswith(f"{cid}--")
+    assert "ClientSecretValue" not in listed[0]
+
+    added = cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid)["ClientSecretDescriptor"]
+    second = added["ClientSecretValue"]
+    assert len(second) == 51
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.add_user_pool_client_secret(UserPoolId=pid, ClientId=cid)
+    assert exc.value.response["Error"]["Code"] == "LimitExceededException"
+    assert exc.value.response["Error"]["Message"] == "Client secrets cannot exceed limit of 2 secrets."
+    assert cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]["ClientSecret"] == first
+
+    ids = [s["ClientSecretId"] for s in cognito_idp.list_user_pool_client_secrets(
+        UserPoolId=pid, ClientId=cid)["ClientSecrets"]]
+    cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=ids[0])
+    assert "ClientSecret" not in cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=ids[1])
+    assert exc.value.response["Error"]["Message"] == "Cannot delete the only client secret."
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.delete_user_pool_client_secret(UserPoolId=pid, ClientId=cid, ClientSecretId=f"{cid}--1")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_cognito_authorize_goes_to_the_only_external_provider(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="sole-idp")["UserPool"]["Id"]
+    cognito_idp.create_identity_provider(UserPoolId=pid, ProviderName="Corp", ProviderType="OIDC",
+                                         ProviderDetails=_OIDC_DETAILS)
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c", SupportedIdentityProviders=["Corp"],
+        CallbackURLs=["http://localhost:3000/callback"], AllowedOAuthFlows=["code"], AllowedOAuthScopes=["openid"],
+        AllowedOAuthFlowsUserPoolClient=True)["UserPoolClient"]["ClientId"]
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _no_redirect_opener.open(f"{ENDPOINT}/oauth2/authorize?response_type=code&client_id={cid}"
+                                 f"&redirect_uri=http://localhost:3000/callback&scope=openid&state=s1")
+    assert exc.value.code == 302
+    assert exc.value.headers["Location"].startswith("https://idp.example.com/authorize?")
+
+
+def _revoke(data: bytes, headers: dict):
+    req = urllib.request.Request(f"{ENDPOINT}/oauth2/revoke", data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def test_cognito_oauth2_revoke(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="revoke")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c", GenerateSecret=True,
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"])["UserPoolClient"]
+    cid, sec = client["ClientId"], client["ClientSecret"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="u1", MessageAction="SUPPRESS")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="u1", Password="Passw0rd!Passw0rd", Permanent=True)
+    sh = _secret_hash("u1", cid, sec)
+    refresh = cognito_idp.initiate_auth(ClientId=cid, AuthFlow="USER_PASSWORD_AUTH", AuthParameters={
+        "USERNAME": "u1", "PASSWORD": "Passw0rd!Passw0rd", "SECRET_HASH": sh})["AuthenticationResult"]["RefreshToken"]
+    basic = "Basic " + base64.b64encode(f"{cid}:{sec}".encode()).decode()
+    form = {"Content-Type": "application/x-www-form-urlencoded", "Authorization": basic}
+    status, body = _revoke(b"", form)
+    assert status == 400
+    assert json.loads(body) == {"error": "invalid_request", "error_description": "Invalid parameter in request"}
+    status, body = _revoke(_urlencode({"token": refresh}).encode(), {
+        **form, "Authorization": "Basic " + base64.b64encode(f"{cid}:wrong".encode()).decode()})
+    assert status == 401 and json.loads(body)["error"] == "invalid_client"
+    assert _revoke(json.dumps({"token": refresh}).encode(), {**form, "Content-Type": "application/json"}) == (415, b"")
+    assert _revoke(_urlencode({"token": refresh}).encode(), form) == (200, b"")
+    assert _revoke(_urlencode({"token": refresh}).encode(), form) == (200, b"")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+                                  AuthParameters={"REFRESH_TOKEN": refresh, "SECRET_HASH": sh})
+    assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_oidc_token_refusal_returns_to_the_app(cognito_idp):
+    import http.server
+    import threading
+
+    class _Refuse(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            payload = b'{"error":"invalid_client","error_description":"invalid_client_secret"}'
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Refuse)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _pid, cid = _setup_oidc_pool(cognito_idp, f"http://127.0.0.1:{srv.server_address[1]}/token")
+        status, location = _oidc_idpresponse(cid)
+        assert status == 302
+        query = _parse_qs(urlparse(location).query)
+        assert location.startswith("http://localhost:3000/callback?")
+        assert query == {"error": ["invalid_request"], "state": ["s"],
+                         "error_description": ["TestOIDC Error - 400 invalid_client invalid_client_secret"]}
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    _pid, cid = _setup_oidc_pool(cognito_idp, "http://token.unreachable.invalid/token")
+    status, location = _oidc_idpresponse(cid)
+    assert status == 302
+    assert _parse_qs(urlparse(location).query)["error_description"] == ["token.unreachable.invalid"]
+
+
+def test_cognito_oidc_federation_stores_only_mapped_claims(cognito_idp):
+    token_url, _recorded, stop = _start_fake_oidc_idp({
+        "sub": "staff-1", "email": "staff@example.com", "email_verified": True, "nickname": "nick",
+        "given_name": "Given", "department": "ops"})
+    try:
+        pid, cid = _setup_oidc_pool(cognito_idp, token_url, attribute_mapping={"email": "email"})
+        status, _ = _oidc_idpresponse(cid)
+        assert status == 302
+        user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestOIDC_staff-1")
+        attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+        assert set(attrs) == {"email", "email_verified", "sub", "identities"}
+        assert attrs["email"] == "staff@example.com" and attrs["email_verified"] == "false"
+    finally:
+        stop()
+
+
+def test_cognito_secret_hash_accepts_every_active_client_secret(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    monkeypatch.setattr(mod, "_user_pools", AccountRegionScopedDict())
+    pid = json.loads(mod._create_user_pool({"PoolName": "two-secrets"})[2])["UserPool"]["Id"]
+    client = json.loads(mod._create_user_pool_client({
+        "UserPoolId": pid, "ClientName": "c", "GenerateSecret": True})[2])["UserPoolClient"]
+    cid, first = client["ClientId"], client["ClientSecret"]
+    second = json.loads(mod._add_user_pool_client_secret({"UserPoolId": pid, "ClientId": cid})[2])[
+        "ClientSecretDescriptor"]["ClientSecretValue"]
+
+    def check(secret):
+        return mod._validate_client_secret_hash("SignUp", {
+            "ClientId": cid, "Username": "u1", "SecretHash": _secret_hash("u1", cid, secret)})
+
+    assert check(first) is None and check(second) is None
+    ids = [s["ClientSecretId"] for s in json.loads(mod._list_user_pool_client_secrets(
+        {"UserPoolId": pid, "ClientId": cid})[2])["ClientSecrets"]]
+    mod._delete_user_pool_client_secret({"UserPoolId": pid, "ClientId": cid, "ClientSecretId": ids[0]})
+    assert check(second) is None
+    refused = check(first)
+    assert refused[0] == 400 and json.loads(refused[2])["message"] == f"Unable to verify secret hash for client {cid}"

@@ -201,7 +201,7 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
     """Resolve a global condition context key to its value."""
     k = key.lower()
     if k == "aws:principalarn":
-        return ctx.principal_arn
+        return ctx.principal_keys.get(k, ctx.principal_arn)
     if k == "aws:principalaccount":
         return ctx.principal_account
     if k == "aws:principaltype":
@@ -1178,14 +1178,16 @@ def _principal_keys(credential: ResolvedCredential) -> dict[str, Any]:
     from ministack.services import iam as iam_svc
     from ministack.services import sts as sts_svc
 
-    keys: dict[str, Any] = {"aws:userid": credential.principal_id}
+    keys: dict[str, Any] = {"aws:userid": credential.principal_id, "aws:principalisawsservice": "false"}
     entity = {}
     if credential.principal_type == "User":
         keys["aws:username"] = credential.principal_name
         entity = iam_svc._users.get_scoped(credential.account_id, None, credential.principal_name)
     elif credential.principal_type == "AssumedRole":
-        entity = iam_svc._roles.get_scoped(
-            credential.account_id, None, _role_name_from_assumed_arn(credential.principal_arn))
+        role_name = _role_name_from_assumed_arn(credential.principal_arn)
+        entity = iam_svc._roles.get_scoped(credential.account_id, None, role_name)
+        # aws:PrincipalArn of a role session is the role's ARN, path included.
+        keys["aws:principalarn"] = (entity or {}).get("Arn") or f"arn:aws:iam::{credential.account_id}:role/{role_name}"
     tags = list((entity or {}).get("Tags") or [])
     session = sts_svc._sessions.get(credential.access_key_id)
     if session is not None:

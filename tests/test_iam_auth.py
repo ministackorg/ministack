@@ -6698,3 +6698,75 @@ def test_sigv4a_signatures_are_verified_contract(auth_enabled, iam_user):
                                                  Details={"Name": name})
         admin.delete_object(Bucket=bucket, Key="k")
         admin.delete_bucket(Bucket=bucket)
+
+
+# -- Behaviour recorded on AWS (eu-north-1, 2026-11-18) ----------------------
+
+@pytest.fixture
+def pathed_role_session():
+    """A role at path /team/ with a session, and a policy setter for it."""
+    from ministack.services import iam as iam_svc
+    from ministack.services import sts as sts_svc
+    _iam_call("CreateRole", RoleName="cond-role", Path="/team/", AssumeRolePolicyDocument=json.dumps({"Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "000000000000"}, "Action": "sts:AssumeRole"}]}))
+    sts_svc._sessions["ASIATESTCONDKEYS01"] = {
+        "Arn": "arn:aws:sts::000000000000:assumed-role/cond-role/s1",
+        "UserId": "AROACOND:s1", "SecretAccessKey": "s", "PrincipalType": "AssumedRole",
+        "AccountId": "000000000000", "Expiration": time.time() + 3600,
+    }
+
+    def put(statement):
+        _iam_call("PutRolePolicy", RoleName="cond-role", PolicyName="p",
+                  PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [statement]}))
+    try:
+        yield "ASIATESTCONDKEYS01", put
+    finally:
+        sts_svc._sessions.pop("ASIATESTCONDKEYS01", None)
+        _iam_call("DeleteRolePolicy", RoleName="cond-role", PolicyName="p")
+        iam_svc._roles.pop("cond-role", None)
+
+
+def test_principal_arn_of_a_role_session_is_the_role_arn(pathed_role_session):
+    key, put = pathed_role_session
+    allow = {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}
+    put({**allow, "Condition": {"ArnEquals": {"aws:PrincipalArn": "arn:aws:iam::000000000000:role/team/cond-role"}}})
+    assert enforce(key, "sqs:ListQueues", "sqs", "us-east-1") is None
+    put({**allow, "Condition": {"ArnLike": {"aws:PrincipalArn": "arn:aws:sts::000000000000:assumed-role/cond-role/*"}}})
+    assert enforce(key, "sqs:ListQueues", "sqs", "us-east-1") is not None
+
+
+def test_principal_is_aws_service_is_false_for_a_direct_call(pathed_role_session):
+    key, put = pathed_role_session
+    allow = {"Effect": "Allow", "Action": "sqs:ListQueues", "Resource": "*"}
+    put({**allow, "Condition": {"Bool": {"aws:PrincipalIsAWSService": "false"}}})
+    assert enforce(key, "sqs:ListQueues", "sqs", "us-east-1") is None
+    put({**allow, "Condition": {"Null": {"aws:PrincipalIsAWSService": "true"}}})
+    assert enforce(key, "sqs:ListQueues", "sqs", "us-east-1") is not None
+
+
+def test_dynamodb_leading_keys_come_from_the_request():
+    from ministack.core.iam_actions import dynamodb_leading_keys
+    from ministack.core.responses import request_scope
+    from ministack.services import dynamodb as ddb
+
+    name = f"lk-{time.time_ns()}"
+    arn = f"arn:aws:dynamodb:us-east-1:000000000000:table/{name}"
+    with request_scope("000000000000", "us-east-1"):
+        ddb._create_table({"TableName": name, "BillingMode": "PAY_PER_REQUEST",
+                           "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"},
+                                                    {"AttributeName": "sk", "AttributeType": "S"}],
+                           "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"},
+                                         {"AttributeName": "sk", "KeyType": "RANGE"}]})
+        try:
+            put = {"TableName": name, "Item": {"pk": {"S": "tenant-a"}, "sk": {"S": "1"}}}
+            assert dynamodb_leading_keys("dynamodb:PutItem", put, arn) == {"dynamodb:LeadingKeys": ["tenant-a"]}
+            query = {"TableName": name, "KeyConditionExpression": "#p = :v AND sk > :s",
+                     "ExpressionAttributeNames": {"#p": "pk"},
+                     "ExpressionAttributeValues": {":v": {"S": "tenant-b"}, ":s": {"S": "0"}}}
+            assert dynamodb_leading_keys("dynamodb:Query", query, arn) == {"dynamodb:LeadingKeys": ["tenant-b"]}
+            batch = {"RequestItems": {name: {"Keys": [{"pk": {"S": "a"}, "sk": {"S": "1"}},
+                                                      {"pk": {"S": "b"}, "sk": {"S": "1"}}]}}}
+            assert sorted(dynamodb_leading_keys("dynamodb:BatchGetItem", batch, arn)["dynamodb:LeadingKeys"]) == ["a", "b"]
+            assert dynamodb_leading_keys("dynamodb:Scan", {"TableName": name}, arn) == {}
+        finally:
+            ddb._tables.pop(name, None)

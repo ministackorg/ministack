@@ -23,6 +23,7 @@ import string
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -1320,23 +1321,31 @@ def _rotate_secret(data):
     secret["RotationEnabled"] = True
 
     vid = data.get("ClientRequestToken", new_uuid())
-    now = int(time.time())
-
-    curr_vid, curr_ver = _find_stage_version(secret, "AWSCURRENT")
-    secret["Versions"][vid] = {
-        "SecretString": curr_ver["SecretString"] if curr_ver else None,
-        "SecretBinary": curr_ver["SecretBinary"] if curr_ver else None,
-        "CreatedDate": now,
-        "Stages": ["AWSPENDING"],
-    }
-
-    logger.info("RotateSecret stub for %s (Lambda: %s)", secret["Name"], lambda_arn)
-
-    _apply_current_promotion(secret, vid)
-    secret["LastChangedDate"] = now
     _sync_replicas(secret)
-
+    if secret.get("RotationLambdaARN"):
+        # The rotation runs asynchronously: the function gets createSecret, setSecret, testSecret and
+        # finishSecret in turn and moves the stages itself. RotateImmediately=false runs testSecret only.
+        steps = (("createSecret", "setSecret", "testSecret", "finishSecret")
+                 if data.get("RotateImmediately", True) is not False else ("testSecret",))
+        spawn_background(_run_rotation, secret["ARN"], secret["RotationLambdaARN"], vid, steps,
+                         thread_name="secretsmanager-rotation")
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "VersionId": vid})
+
+
+def _run_rotation(secret_arn: str, lambda_arn: str, token: str, steps) -> None:
+    from ministack.services import lambda_svc
+
+    record, config, _name = lambda_svc._get_func_record_for_ref(lambda_arn)
+    if record is None or config is None:
+        logger.warning("RotateSecret: rotation function %s not found for %s", lambda_arn, secret_arn)
+        return
+    exec_record = lambda_svc._execution_record_for_config(record, config)
+    for step in steps:
+        event = {"ClientRequestToken": token, "RotationToken": new_uuid(), "SecretId": secret_arn, "Step": step}
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+        if result.get("error"):
+            logger.warning("RotateSecret: %s failed at %s: %s", secret_arn, step, result.get("body"))
+            return
 
 
 def _get_random_password(data):

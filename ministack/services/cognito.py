@@ -78,7 +78,7 @@ import threading
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, unquote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
@@ -2569,6 +2569,24 @@ def _cleanup_expired_relay_codes():
         _auth_codes.pop(k, None)
 
 
+def _oauth2_revoke(method, headers, body):
+    """POST /oauth2/revoke: a form post revoking a refresh token and the tokens issued from it (recorded on AWS,
+    eu-north-1). Success, an unknown token and one already revoked all answer 200 with an empty body."""
+    content_type = (headers or {}).get("content-type", "").split(";", 1)[0].strip().lower()
+    if method != "POST" or content_type != "application/x-www-form-urlencoded":
+        return 415, {}, b""
+    form = {k: v[0] for k, v in parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True).items()}
+    token = form.get("token", "")
+    if not token:
+        return _oauth2_error("invalid_request", "Invalid parameter in request")
+    cid, csec = _authenticate_client(headers, form)
+    _pid, _pool, client = _find_pool_by_client_id(cid)
+    if not client or (client.get("ClientSecret") and csec not in _client_secret_values(client)):
+        return _oauth2_error("invalid_client", "Invalid client credentials in request", 401)
+    _revoke_token({"Token": token})
+    return 200, {}, b""
+
+
 def _authenticate_client(headers: dict, form: dict):
     """Extract client_id / client_secret from Basic auth header or form body."""
     auth = headers.get("authorization", "") if headers else ""
@@ -2660,6 +2678,8 @@ async def handle_request(method, path, headers, body, query_params):
     if path.startswith("/oauth2/token"):
         return await run_reentrant(_run_oauth2_token, {}, query_params, body, headers,
                                    thread_name="ministack-cognito-trigger")
+    if path.startswith("/oauth2/revoke"):
+        return _oauth2_revoke(method, headers, body)
 
     try:
         data = json.loads(body) if body else {}
@@ -2844,14 +2864,14 @@ def _validate_client_secret_hash(action: str, data: dict):
             f"Client {cid} is configured with secret but SECRET_HASH was not received", 400,
         )
     if isinstance(username, str) and isinstance(supplied, str) and supplied.isascii():
-        try:
-            expected = base64.b64encode(hmac.new(
-                client["ClientSecret"].encode("utf-8"),
-                (username + cid).encode("utf-8"), hashlib.sha256,
-            ).digest())
-        except UnicodeEncodeError:
-            pass
-        else:
+        for secret_value in _client_secret_values(client):
+            try:
+                expected = base64.b64encode(hmac.new(
+                    secret_value.encode("utf-8"),
+                    (username + cid).encode("utf-8"), hashlib.sha256,
+                ).digest())
+            except UnicodeEncodeError:
+                continue
             if hmac.compare_digest(expected, supplied.encode("ascii")):
                 return None
     return error_response_json(
@@ -2923,6 +2943,9 @@ async def _dispatch_idp(action: str, data: dict):
         "CreateUserPoolClient": _create_user_pool_client,
         "DeleteUserPoolClient": _delete_user_pool_client,
         "DescribeUserPoolClient": _describe_user_pool_client,
+        "AddUserPoolClientSecret": _add_user_pool_client_secret,
+        "ListUserPoolClientSecrets": _list_user_pool_client_secrets,
+        "DeleteUserPoolClientSecret": _delete_user_pool_client_secret,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
         "GetUICustomization": _get_ui_customization,
@@ -3439,6 +3462,8 @@ def _create_user_pool_client(data):
         rotation, err = _refresh_token_rotation(data["RefreshTokenRotation"], data.get("ExplicitAuthFlows"))
         if err:
             return err
+    if (err := _unknown_supported_provider(pool, pid, data.get("SupportedIdentityProviders"))):
+        return err
 
     cid = _client_id()
     now = _now_epoch()
@@ -3497,7 +3522,91 @@ def _describe_user_pool_client(data):
     client = pool["_clients"].get(cid)
     if not client:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+    return json_response({"UserPoolClient": _client_view(pool, client)})
+
+
+def _client_view(pool, client):
+    """The client as AWS describes it: ``ClientSecret`` is the secret it was created with, absent once deleted."""
+    hidden = client["ClientId"] in pool.get("_client_secret_hidden", ())
+    return {k: v for k, v in client.items() if v is not None and not (hidden and k == "ClientSecret")}
+
+
+def _client_secret_list(pool, client):
+    """The client's active secrets, oldest first; a client created with a secret starts with that one."""
+    store = pool.setdefault("_client_secrets", {})
+    cid = client["ClientId"]
+    if cid not in store:
+        created = client.get("CreationDate") or _now_epoch()
+        store[cid] = ([{"id": f"{cid}--{int(created * 1000)}", "value": client["ClientSecret"], "created": created}]
+                      if client.get("ClientSecret") else [])
+    return store[cid]
+
+
+def _client_secret_values(client) -> list:
+    """Every secret the client accepts (AddUserPoolClientSecret allows two at once)."""
+    if not client.get("ClientSecret"):
+        return []
+    pool = _get_pool_unscoped(client.get("UserPoolId", ""))
+    added = ((pool or {}).get("_client_secrets") or {}).get(client.get("ClientId"))
+    return [s["value"] for s in added] if added else [client["ClientSecret"]]
+
+
+def _client_for_secret_call(data):
+    pool, err = _resolve_pool(data.get("UserPoolId"))
+    if err:
+        return None, None, err
+    client = pool["_clients"].get(data.get("ClientId"))
+    if not client:
+        return None, None, error_response_json("ResourceNotFoundException",
+                                               f"Client {data.get('ClientId')} not found.", 400)
+    return pool, client, None
+
+
+def _add_user_pool_client_secret(data):
+    pool, client, err = _client_for_secret_call(data)
+    if err:
+        return err
+    if not client.get("ClientSecret"):
+        return error_response_json("InvalidParameterException",
+                                   "User pool client secret not enabled. Cannot create new secret.", 400)
+    current = _client_secret_list(pool, client)
+    if len(current) >= 2:
+        return error_response_json("LimitExceededException", "Client secrets cannot exceed limit of 2 secrets.", 400)
+    supplied = data.get("ClientSecret")
+    value = supplied or "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(51))
+    now = _now_epoch()
+    entry = {"id": f"{client['ClientId']}--{int(now * 1000)}", "value": value, "created": now}
+    current.append(entry)
+    descriptor = {"ClientSecretId": entry["id"], "ClientSecretCreateDate": now}
+    if not supplied:
+        descriptor["ClientSecretValue"] = value
+    return json_response({"ClientSecretDescriptor": descriptor})
+
+
+def _list_user_pool_client_secrets(data):
+    pool, client, err = _client_for_secret_call(data)
+    if err:
+        return err
+    return json_response({"ClientSecrets": [{"ClientSecretId": s["id"], "ClientSecretCreateDate": s["created"]}
+                                            for s in _client_secret_list(pool, client)]})
+
+
+def _delete_user_pool_client_secret(data):
+    pool, client, err = _client_for_secret_call(data)
+    if err:
+        return err
+    current = _client_secret_list(pool, client)
+    entry = next((s for s in current if s["id"] == data.get("ClientSecretId")), None)
+    if entry is None:
+        return error_response_json("ResourceNotFoundException", "Client secret does not exist", 400)
+    if len(current) == 1:
+        return error_response_json("InvalidParameterException", "Cannot delete the only client secret.", 400)
+    current.remove(entry)
+    if entry["value"] == client.get("ClientSecret"):
+        # The client keeps a secret, but no longer describes one.
+        client["ClientSecret"] = current[0]["value"]
+        pool.setdefault("_client_secret_hidden", {})[client["ClientId"]] = True
+    return json_response({})
 
 
 def _list_user_pool_clients(data):
@@ -3538,6 +3647,8 @@ def _update_user_pool_client(data):
         "AnalyticsConfiguration", "PreventUserExistenceErrors", "EnableTokenRevocation",
         "EnablePropagateAdditionalUserContextData", "AuthSessionValidity",
     }
+    if (err := _unknown_supported_provider(pool, pid, data.get("SupportedIdentityProviders"))):
+        return err
     # Left out of an update, rotation stays as it was, as on AWS.
     rotation = data["RefreshTokenRotation"] if data.get("RefreshTokenRotation") is not None else client.get("RefreshTokenRotation")
     if rotation is not None:
@@ -3549,7 +3660,7 @@ def _update_user_pool_client(data):
         if k in data:
             client[k] = data[k]
     client["LastModifiedDate"] = _now_epoch()
-    return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
+    return json_response({"UserPoolClient": _client_view(pool, client)})
 
 
 def _ui_customization_target(data):
@@ -5999,7 +6110,7 @@ def _get_tokens_from_refresh_token(data):
     if AUTH and secret and not data.get("ClientSecret"):
         return error_response_json("NotAuthorizedException",
                                    f"Client {cid} is configured for secret but secret was not received", 400)
-    if AUTH and secret and data.get("ClientSecret") != secret:
+    if AUTH and secret and data.get("ClientSecret") not in _client_secret_values(pool["_clients"][cid]):
         return error_response_json("NotAuthorizedException", f"Unable to verify secret hash for client {cid}", 400)
     result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
     if err:
@@ -7021,6 +7132,28 @@ def _describe_user_pool_domain(data):
 VALID_PROVIDER_TYPES = {"SAML", "Facebook", "Google", "LoginWithAmazon", "SignInWithApple", "OIDC"}
 
 
+_OIDC_ENDPOINT_KEYS = ("oidc_issuer", "authorize_url", "token_url", "attributes_url", "jwks_uri")
+
+
+def _oidc_endpoint_query_error(provider_type, details):
+    """AWS refuses an OIDC endpoint that carries a query string (recorded on AWS, eu-north-1)."""
+    if provider_type != "OIDC" or not isinstance(details, dict):
+        return None
+    if any("?" in str(details.get(k) or "") for k in _OIDC_ENDPOINT_KEYS):
+        return error_response_json("InvalidParameterException", "Endpoint can not contain queries", 400)
+    return None
+
+
+def _unknown_supported_provider(pool, pool_id, names):
+    """``SupportedIdentityProviders`` may name only COGNITO and the pool's own providers, case-sensitively."""
+    providers = pool.get("_identity_providers", {})
+    for name in names if isinstance(names, list) else []:
+        if name != "COGNITO" and name not in providers:
+            return error_response_json("InvalidParameterException",
+                                       f"The provider {name} does not exist for User Pool {pool_id}.", 400)
+    return None
+
+
 def _create_identity_provider(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -7038,6 +7171,8 @@ def _create_identity_provider(data):
     if provider_name in providers:
         return error_response_json("DuplicateProviderException",
                                    f"A provider with name {provider_name} already exists.", 400)
+    if (err := _oidc_endpoint_query_error(provider_type, data.get("ProviderDetails"))):
+        return err
     idp_identifiers = data.get("IdpIdentifiers", [])
     # Check identifier uniqueness across all providers in this pool
     existing_ids = set()
@@ -7089,6 +7224,8 @@ def _update_identity_provider(data):
     if not provider:
         return error_response_json("ResourceNotFoundException",
                                    f"Identity provider {provider_name} does not exist.", 400)
+    if (err := _oidc_endpoint_query_error(provider.get("ProviderType"), data.get("ProviderDetails"))):
+        return err
     if "ProviderDetails" in data:
         provider["ProviderDetails"] = data["ProviderDetails"]
     if "AttributeMapping" in data:
@@ -7308,6 +7445,10 @@ def _admin_link_provider_for_user(data):
         return error_response_json(
             "InvalidParameterException",
             "SourceUser must be a federated user, not a Cognito user.", 400)
+    if source["ProviderName"] not in pool.get("_identity_providers", {}):
+        return error_response_json(
+            "InvalidParameterException",
+            "SourceProviderName must match a Provider that is configured for the User Pool", 400)
 
     # "For a native username + password user, the ProviderAttributeValue for
     # the DestinationUser should be the username in the user pool. For a
@@ -8202,6 +8343,11 @@ def handle_oauth2_authorize(method, path, headers, query_params):
     identity_provider = _qp(query_params, "identity_provider")
     if identity_provider:
         return _oauth2_authorize_federation(query_params)
+    # A client whose only provider is an external one goes straight to it (recorded on AWS, eu-north-1).
+    _pid, sole_pool, sole_client = _find_pool_by_client_id(_qp(query_params, "client_id"))
+    sole = (sole_client or {}).get("SupportedIdentityProviders") or []
+    if len(sole) == 1 and sole[0] != "COGNITO" and sole[0] in (sole_pool or {}).get("_identity_providers", {}):
+        return _oauth2_authorize_federation({**query_params, "identity_provider": sole[0]})
 
     # Managed login UI
     client_id = _qp(query_params, "client_id")
@@ -8430,6 +8576,13 @@ def _decode_id_token_unverified(id_token: str) -> dict:
     return json.loads(payload_bytes.decode("utf-8"))
 
 
+def _federation_error_redirect(redirect_uri: str, app_state: str, description: str):
+    params = [("error_description", description)] + ([("state", app_state)] if app_state else []) + \
+        [("error", "invalid_request")]
+    sep = "&" if "?" in redirect_uri else "?"
+    return 302, {"Location": f"{redirect_uri}{sep}{urlencode(params)}", "Content-Type": "text/html"}, b""
+
+
 def _oauth2_idp_response(method, body, query_params):
     """GET/POST /oauth2/idpresponse — external OIDC IdP callback.
 
@@ -8524,14 +8677,19 @@ def _oauth2_idp_response(method, body, query_params):
         with urllib.request.urlopen(req, timeout=10) as resp:
             token_payload = resp.read()
     except urllib.error.HTTPError as exc:
-        logger.warning("Cognito: OIDC token exchange failed: HTTP %s — %s",
-                       exc.code, exc.reason)
-        return error_response_json("InvalidParameterException",
-                                   f"OIDC token exchange failed: HTTP {exc.code}", 400)
+        # The refusal goes back to the app: "<provider> Error - <status> <error> <error_description>".
+        logger.warning("Cognito: OIDC token exchange failed: HTTP %s — %s", exc.code, exc.reason)
+        try:
+            answer = json.loads(exc.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, OSError):
+            answer = None
+        detail = (" ".join(str(answer[k]) for k in ("error", "error_description") if answer.get(k))
+                  if isinstance(answer, dict) else "") or "error getting token"
+        return _federation_error_redirect(redirect_uri, app_state, f"{provider_name} Error - {exc.code} {detail}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # A token endpoint that cannot be reached is described by its host (recorded on AWS, eu-north-1).
         logger.warning("Cognito: OIDC token exchange failed: %s", exc)
-        return error_response_json("InvalidParameterException",
-                                   f"OIDC token exchange failed: {exc}", 400)
+        return _federation_error_redirect(redirect_uri, app_state, urlparse(token_url).hostname or token_url)
 
     try:
         token_data = json.loads(token_payload.decode("utf-8"))
@@ -8566,16 +8724,13 @@ def _oauth2_idp_response(method, body, query_params):
     if to_map:
         idp_claims = _drop_unmapped_reserved_claims(to_map, attr_mapping)
     else:
+        # Only the claims the attribute mapping names reach the user (recorded on AWS, eu-north-1).
         idp_claims = {}
         for k, v in claims.items():
-            if k in _FEDERATION_RESERVED_CLAIMS:
-                continue
             if k in reverse_mapping:
                 value = _federation_claim_value(v)
-            else:
-                value = str(v) if isinstance(v, (str, int, float, bool)) else None
-            if value is not None:
-                idp_claims[k] = value
+                if value is not None:
+                    idp_claims[k] = value
     user_attrs = {}
     for idp_claim, value in idp_claims.items():
         user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value
@@ -8601,6 +8756,9 @@ def _oauth2_idp_response(method, body, query_params):
         sub = new_uuid()
         if "email" not in user_attrs and "@" in name_id:
             user_attrs["email"] = name_id
+        if "email" in user_attrs and "email_verified" not in attr_mapping:
+            # A mapped email starts unverified unless the mapping names email_verified (recorded on AWS).
+            user_attrs["email_verified"] = "false"
         try:
             presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
         except _PreSignUpRejected as e:
@@ -9255,7 +9413,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         return _oauth2_error("invalid_grant", "Invalid refresh token.")
     client_id = cid or str(claims.get("client_id", ""))
     _, _, client = _find_pool_by_client_id(client_id)
-    if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
+    if not client or (client.get("ClientSecret") and csec not in _client_secret_values(client)):
         return _oauth2_error("invalid_client", "Invalid client credentials.")
     result, err = _refresh_auth_result(pool, pid, client_id, refresh_val, reused=_oauth2_refresh_token_reused)
     if err:
@@ -9324,7 +9482,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             # on the retry. Consuming the code first turned that retry into
             # invalid_grant "Invalid or expired authorization code" (#932).
             _, _, client = _find_pool_by_client_id(cid)
-            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
+            if client and client.get("ClientSecret") and csec not in _client_secret_values(client):
                 return _oauth2_error("invalid_client", "Invalid client credentials.")
 
             # Consume code (one-time use). This handler runs off the loop
@@ -9450,7 +9608,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
         # Validate client secret if client has one
         _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
-        if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
+        if client and client.get("ClientSecret") and csec and csec not in _client_secret_values(client):
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         client_id = cid or entry["client_id"]
@@ -9491,7 +9649,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         pool_id, pool, client = _find_pool_by_client_id(cid)
         if not pool or not client:
             return _oauth2_error("invalid_client", "Client not found.")
-        if csec != (client.get("ClientSecret") or ""):
+        if (csec not in _client_secret_values(client)) if client.get("ClientSecret") else csec != "":
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         scope_error = _client_credentials_scope_error(pool, client, form.get("scope"))

@@ -2098,6 +2098,100 @@ _DYNAMODB_TRANSACT_ITEM_ACTIONS = {
 }
 
 
+def _dynamodb_partition_key(table_arn: str) -> str | None:
+    """The partition key attribute of the table an ARN names, or None when the table is unknown."""
+    from ministack.services import dynamodb as ddb
+
+    parts = table_arn.split(":", 5)
+    if len(parts) < 6 or not parts[5].startswith("table/"):
+        return None
+    table = ddb._tables.get_scoped(parts[4], parts[3], parts[5][len("table/"):].split("/", 1)[0])
+    for element in (table or {}).get("KeySchema", []):
+        if element.get("KeyType") == "HASH":
+            return element.get("AttributeName")
+    return None
+
+
+def _dynamodb_key_value(item, name: str):
+    attr = item.get(name) if isinstance(item, dict) else None
+    if isinstance(attr, dict) and len(attr) == 1:
+        value = next(iter(attr.values()))
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _dynamodb_query_key(data: dict, name: str):
+    """The partition key value a Query's key condition names."""
+    legacy = data.get("KeyConditions")
+    if isinstance(legacy, dict) and isinstance(legacy.get(name), dict):
+        values = legacy[name].get("AttributeValueList")
+        if isinstance(values, list) and values:
+            return _dynamodb_key_value({name: values[0]}, name)
+    expression = data.get("KeyConditionExpression")
+    if not isinstance(expression, str):
+        return None
+    names = data.get("ExpressionAttributeNames") if isinstance(data.get("ExpressionAttributeNames"), dict) else {}
+    values = data.get("ExpressionAttributeValues") if isinstance(data.get("ExpressionAttributeValues"), dict) else {}
+    for left, right in re.findall(r"([#\w.]+)\s*=\s*(:\w+)", expression):
+        if names.get(left, left) == name:
+            return _dynamodb_key_value({name: values.get(right)}, name)
+    return None
+
+
+def dynamodb_leading_keys(iam_action: str, detail, table_arn: str) -> dict:
+    """``dynamodb:LeadingKeys`` of a request (or of one transaction item) on one table: the partition key
+    value of every item it reads or writes. Empty for Scan and any call that names no item."""
+    if not isinstance(detail, dict):
+        return {}
+    name = _dynamodb_partition_key(table_arn)
+    if not name:
+        return {}
+    action = iam_action.split(":", 1)[-1]
+    if action in ("GetItem", "DeleteItem", "UpdateItem", "ConditionCheckItem"):
+        values = [_dynamodb_key_value(detail.get("Key"), name)]
+    elif action == "PutItem":
+        values = [_dynamodb_key_value(detail.get("Item"), name)]
+    elif action == "Query":
+        values = [_dynamodb_query_key(detail, name)]
+    elif action in ("BatchGetItem", "BatchWriteItem"):
+        requests = detail.get("RequestItems") if isinstance(detail.get("RequestItems"), dict) else {}
+        entry = next((v for k, v in requests.items() if k == table_arn or table_arn.endswith(f":table/{k}")), None)
+        if action == "BatchGetItem":
+            keys = entry.get("Keys") if isinstance(entry, dict) else None
+            values = [_dynamodb_key_value(k, name) for k in keys] if isinstance(keys, list) else []
+        else:
+            values = []
+            for request in entry if isinstance(entry, list) else []:
+                if isinstance(request, dict):
+                    put, delete = request.get("PutRequest"), request.get("DeleteRequest")
+                    values.append(_dynamodb_key_value((put or {}).get("Item") if isinstance(put, dict)
+                                                      else (delete or {}).get("Key") if isinstance(delete, dict)
+                                                      else None, name))
+    else:
+        return {}
+    values = [v for v in values if v is not None]
+    return {"dynamodb:LeadingKeys": list(dict.fromkeys(values))} if values else {}
+
+
+def dynamodb_transaction_items(body: bytes) -> list:
+    """Each transaction item's detail, in the order of ``dynamodb_transaction_checks``."""
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    items = data.get("TransactItems") if isinstance(data, dict) else None
+    details = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for member in _DYNAMODB_TRANSACT_ITEM_ACTIONS:
+            detail = item.get(member)
+            if isinstance(detail, dict) and isinstance(detail.get("TableName"), str) and detail["TableName"]:
+                details.append(detail)
+    return details
+
+
 def dynamodb_transaction_checks(
     iam_action: str, body: bytes, region: str, account_id: str
 ) -> list[tuple[str, str]]:
