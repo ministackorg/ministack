@@ -11231,3 +11231,128 @@ def test_sfn_definition_structure_errors(sfn, definition, expected):
     finally:
         sfn.delete_state_machine(stateMachineArn=arn)
     assert sfn.validate_state_machine_definition(definition=good)["result"] == "OK"
+
+
+@contextmanager
+def _http_task_endpoint(status=200, body=None):
+    """A local API for the HTTP Task to call. Yields (url, captured requests)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    captured = []
+    payload = json.dumps(body if body is not None else {"id": "o-1", "status": "NEW"}).encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            captured.append({
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": self.rfile.read(length).decode("utf-8") if length else "",
+            })
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_PATCH = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", captured
+    finally:
+        server.shutdown()
+
+
+def _run_http_task(sfn, parameters, catch=False):
+    task = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": parameters, "End": True}
+    states = {"Call": task}
+    if catch:
+        task["Catch"] = [{"ErrorEquals": ["States.ALL"], "Next": "Caught"}]
+        states["Caught"] = {"Type": "Pass", "End": True}
+    arn = sfn.create_state_machine(
+        name=f"sfn-http-{_uuid_mod.uuid4().hex[:8]}",
+        definition=json.dumps({"StartAt": "Call", "States": states}),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"orderId": "o-1"}))
+        return _wait_sfn(sfn, execution["executionArn"])
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_http_task_calls_api_through_connection(sfn, eb):
+    """Result shape as AWS returns it (AWS capture 2026-11-19, us-west-2); request merging per the AWS docs."""
+    name = f"sfn-http-conn-{_uuid_mod.uuid4().hex[:8]}"
+    conn_arn = eb.create_connection(
+        Name=name,
+        AuthorizationType="BASIC",
+        AuthParameters={
+            "BasicAuthParameters": {"Username": "u", "Password": "p"},
+            "InvocationHttpParameters": {
+                "HeaderParameters": [{"Key": "X-Source", "Value": "connection"}],
+                "QueryStringParameters": [{"Key": "tenant", "Value": "connection"}],
+                "BodyParameters": [{"Key": "mode", "Value": "connection"}],
+            },
+        },
+    )["ConnectionArn"]
+    try:
+        with _http_task_endpoint() as (url, captured):
+            desc = _run_http_task(sfn, {
+                "ApiEndpoint.$": f"States.Format('{url}/v1/orders/{{}}', $.orderId)",
+                "Method": "PATCH",
+                "Authentication": {"ConnectionArn": conn_arn},
+                "Headers": {"X-Source": "task", "X-Request-Id": "r-1"},
+                "QueryParameters": {"tenant": "task", "fields": "status"},
+                "RequestBody": {"status": "SHIPPED", "mode": "task"},
+            })
+        assert desc["status"] == "SUCCEEDED", desc
+        request = captured[0]
+        assert request["method"] == "PATCH"
+        assert request["path"] == "/v1/orders/o-1?tenant=connection&fields=status"
+        # base64("u:p")
+        assert request["headers"]["authorization"] == "Basic dTpw"
+        assert request["headers"]["x-source"] == "connection"
+        assert request["headers"]["x-request-id"] == "r-1"
+        assert request["headers"]["content-type"] == "application/json; charset=UTF-8"
+        assert request["headers"]["user-agent"] == "Amazon|StepFunctions|HttpInvoke|us-east-1"
+        assert json.loads(request["body"]) == {"status": "SHIPPED", "mode": "connection"}
+        output = json.loads(desc["output"])
+        assert output["StatusCode"] == 200
+        assert output["StatusText"] == "OK"
+        assert output["ResponseBody"] == {"id": "o-1", "status": "NEW"}
+        assert output["Headers"]["Content-Type"] == ["application/json"]
+    finally:
+        eb.delete_connection(Name=name)
+
+
+def test_sfn_http_task_failures_are_catchable(sfn, eb):
+    """A non-2xx fails as States.Http.StatusCode.<code> with the status phrase as Cause (AWS capture 2026-11-19)."""
+    name = f"sfn-http-conn-{_uuid_mod.uuid4().hex[:8]}"
+    conn_arn = eb.create_connection(
+        Name=name, AuthorizationType="API_KEY",
+        AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "k"}},
+    )["ConnectionArn"]
+    try:
+        with _http_task_endpoint(status=404, body={"message": "no such order"}) as (url, captured):
+            desc = _run_http_task(
+                sfn, {"ApiEndpoint": f"{url}/v1/orders/x", "Method": "GET", "Authentication": {"ConnectionArn": conn_arn}},
+                catch=True)
+        assert desc["status"] == "SUCCEEDED", desc
+        assert captured[0]["headers"]["x-api-key"] == "k"
+        caught = json.loads(desc["output"])
+        assert caught["Error"] == "States.Http.StatusCode.404"
+        assert caught["Cause"] == "Not Found"
+    finally:
+        eb.delete_connection(Name=name)
+    desc = _run_http_task(
+        sfn, {"ApiEndpoint": "http://127.0.0.1:9/x", "Method": "GET", "Authentication": {"ConnectionArn": conn_arn}},
+        catch=True)
+    assert json.loads(desc["output"])["Error"] == "Events.ConnectionResource.ResourceNotFound"

@@ -6035,7 +6035,110 @@ def _invoke_events_put_events(resource, input_data):
     return result
 
 
+_HTTP_TASK_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD")
+_HTTP_TASK_TIMEOUT_SECONDS = 60
+
+
+def _invoke_http_endpoint(resource, input_data):
+    """arn:aws:states:::http:invoke — call an HTTP(S) API through an EventBridge connection.
+
+    The connection supplies the authorization, and its invocation parameters are
+    merged over the task's own Headers, QueryParameters and RequestBody (the
+    connection wins a duplicate key). Transform (URL-encoded bodies) is not
+    implemented and fails the task rather than sending JSON in its place.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http import HTTPStatus
+
+    from ministack.services import eventbridge
+
+    endpoint = input_data.get("ApiEndpoint")
+    method = input_data.get("Method")
+    conn_arn = (input_data.get("InvocationConfig") or input_data.get("Authentication") or {}).get("ConnectionArn")
+    if not isinstance(endpoint, str) or not endpoint:
+        raise _ExecutionError("States.Runtime", "The HTTP Task requires an ApiEndpoint")
+    if method not in _HTTP_TASK_METHODS:
+        raise _ExecutionError("States.Runtime", f"The HTTP Task does not support the method {method!r}")
+    if not conn_arn:
+        raise _ExecutionError("States.Runtime", "The HTTP Task requires a ConnectionArn")
+    if (input_data.get("Transform") or {}).get("RequestBodyEncoding", "NONE") != "NONE":
+        raise _ExecutionError(
+            "States.Runtime", "Transform.RequestBodyEncoding is not yet implemented in MiniStack's HTTP Task")
+
+    # arn:aws:events:<region>:<account>:connection/<name>[/<uuid>]
+    conn_name = conn_arn.split(":connection/", 1)[-1].split("/", 1)[0]
+    conn = eventbridge._connections.get(conn_name)
+    if conn is None:
+        raise _ExecutionError("Events.ConnectionResource.ResourceNotFound", f"Connection {conn_arn} does not exist.")
+    if conn.get("ConnectionState") != "AUTHORIZED":
+        raise _ExecutionError(
+            "Events.ConnectionResource.InvalidConnectionState",
+            f"Connection {conn_arn} is in state {conn.get('ConnectionState')}.")
+
+    invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
+    conn_body = eventbridge._connection_params_map(invocation.get("BodyParameters"))
+    headers = {
+        "User-Agent": f"Amazon|StepFunctions|HttpInvoke|{get_region()}",
+        "Range": "bytes=0-262144",
+        **(input_data.get("Headers") or {}),
+        **eventbridge._connection_params_map(invocation.get("HeaderParameters")),
+    }
+    query = {
+        **(input_data.get("QueryParameters") or {}),
+        **eventbridge._connection_params_map(invocation.get("QueryStringParameters")),
+    }
+
+    body = input_data.get("RequestBody")
+    if conn_body:
+        if body is not None and not isinstance(body, dict):
+            raise _ExecutionError(
+                "States.Runtime", "A RequestBody that is not an object cannot be merged with the connection's body parameters")
+        body = {**(body or {}), **conn_body}
+    data = None
+    if body is not None:
+        data = (body if isinstance(body, str) else json.dumps(body, separators=(",", ":"))).encode("utf-8")
+        if not any(name.lower() == "content-type" for name in headers):
+            headers["Content-Type"] = "application/json; charset=UTF-8"
+
+    url = endpoint
+    if query:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(query, doseq=True)
+    token_key = (get_account_id(), get_region(), conn_name)
+    headers.update(eventbridge._connection_auth_headers(conn, token_key))
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with eventbridge._http_open(request, timeout=_HTTP_TASK_TIMEOUT_SECONDS) as response:
+            status, reason, response_headers, raw = response.status, response.reason, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        status, reason, response_headers, raw = exc.code, exc.reason, exc.headers, exc.read()
+    except (OSError, ValueError) as exc:
+        raise _ExecutionError("States.Http.Socket", str(exc)) from None
+
+    # AWS reports the standard phrase for the code ("Unprocessable Content" for a 422), as StatusText on
+    # success and as the Cause on failure; the response body of a failed call is not passed on.
+    try:
+        status_text = HTTPStatus(status).phrase
+    except ValueError:
+        status_text = reason
+    if not 200 <= status < 300:
+        raise _ExecutionError(f"States.Http.StatusCode.{status}", status_text)
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        response_body = json.loads(text)
+    except ValueError:
+        response_body = text
+    return {
+        "Headers": {name: response_headers.get_all(name) for name in dict.fromkeys(response_headers.keys())},
+        "ResponseBody": response_body,
+        "StatusCode": status,
+        "StatusText": status_text,
+    }
+
+
 _SERVICE_DISPATCH = {
+    "arn:aws:states:::http:invoke": _invoke_http_endpoint,
     "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
     "arn:aws:states:::sns:publish": _invoke_sns_publish,
     "arn:aws:states:::events:putEvents": _invoke_events_put_events,
