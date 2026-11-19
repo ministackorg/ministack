@@ -1342,7 +1342,30 @@ DSQL_SETTINGS = {
 # settable.
 _UNSETTABLE_PARAMS = frozenset({
     "default_statistics_target", "statement_timeout", "work_mem",
+    "default_transaction_isolation", "transaction_isolation",  # eu-north-1, 2026-11-19
 })
+
+# DSQL runs every transaction at REPEATABLE READ and refuses any other level (eu-north-1, 2026-11-19).
+_ISOLATION_HEAD_RE = re.compile(
+    r"\s*(?:BEGIN|START\s+TRANSACTION|SET\s+SESSION\s+CHARACTERISTICS\s+AS\s+TRANSACTION|SET\s+(TRANSACTION))\b",
+    re.I,
+)
+_ISOLATION_LEVEL_RE = re.compile(
+    r"\bISOLATION\s+LEVEL\s+(READ\s+COMMITTED|READ\s+UNCOMMITTED|SERIALIZABLE|REPEATABLE\s+READ)\b", re.I
+)
+
+
+def _check_isolation_level(sql):
+    head = _ISOLATION_HEAD_RE.match(sql)
+    level = head and _ISOLATION_LEVEL_RE.search(sql, head.end())
+    if not level:
+        return None
+    name = " ".join(level.group(1).upper().split())
+    if name != "REPEATABLE READ":
+        return DsqlError("0A000", f"Unsupported isolation level: {name}")
+    if head.group(1):
+        return DsqlError("0A000", f'setting configuration parameter "{head.group(1)}" not supported')
+    return None
 
 _SET_RE = re.compile(
     r"\s*SET\s+(?:SESSION\s+|LOCAL\s+)?([\w.]+)\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$",
@@ -1499,6 +1522,9 @@ def validate(sql, txn_state=None):
     if err:
         return err
     err = _check_locking_clause(s)
+    if err:
+        return err
+    err = _check_isolation_level(s)
     if err:
         return err
     err = _check_settings(s)

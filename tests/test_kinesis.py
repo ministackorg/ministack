@@ -666,6 +666,36 @@ def test_kinesis_iterator_reuse_on_retry(kin):
     assert len(resp3["Records"]) == 0
 
 
+def test_kinesis_cbor_epoch_timestamps_past_year_9999(kin):
+    import struct
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    kin.create_stream(StreamName="cbor-epoch-stream", ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName="cbor-epoch-stream")["StreamDescriptionSummary"]["StreamARN"]
+    kin.put_record(StreamName="cbor-epoch-stream", Data=b"a", PartitionKey="k")
+
+    def call(target, body):
+        req = urllib.request.Request(endpoint, data=body, method="POST", headers={
+            "Content-Type": "application/x-amz-cbor-1.1", "X-Amz-Target": f"Kinesis_20131202.{target}"})
+        with urllib.request.urlopen(req) as resp:
+            return cbor2.loads(resp.read())
+
+    def text(s):
+        b = s.encode()
+        return bytes([0x78, len(b)]) + b
+
+    for epoch in (1795013310, 253402300800, 1795013310123):
+        body = (b"\xa2" + text("StreamARN") + text(arn) + text("StreamCreationTimestamp")
+                + b"\xc1\x1b" + struct.pack(">Q", epoch))
+        assert call("ListShards", body)["Shards"][0]["ShardId"] == "shardId-000000000000"
+
+    body = (b"\xa4" + text("StreamName") + text("cbor-epoch-stream") + text("ShardId") + text("shardId-000000000000")
+            + text("ShardIteratorType") + text("AT_TIMESTAMP") + text("Timestamp") + b"\xc1\x1a" + struct.pack(">I", 1700000000))
+    it = call("GetShardIterator", body)["ShardIterator"]
+    assert len(kin.get_records(ShardIterator=it)["Records"]) == 1
+
+
 def test_kinesis_cbor_put_record(kin):
     """Java SDK sends CBOR-encoded PutRecord; ministack must decode it."""
     import urllib.request

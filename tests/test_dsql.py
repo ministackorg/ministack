@@ -1472,7 +1472,40 @@ class TestDsqlSettings:
 
         assert dsql_mod.PG_COMMAND == [
             "postgres", "-c", "dsql.enable_batched_nestloop=on",
+            "-c", "default_transaction_isolation=repeatable read",
         ]
+
+    @pytest.mark.parametrize(
+        "sql,message",
+        [
+            ("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED", "Unsupported isolation level: READ COMMITTED"),
+            ("BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", "Unsupported isolation level: READ UNCOMMITTED"),
+            ("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE", "Unsupported isolation level: SERIALIZABLE"),
+            ("START TRANSACTION ISOLATION LEVEL SERIALIZABLE", "Unsupported isolation level: SERIALIZABLE"),
+            ("begin isolation level read committed", "Unsupported isolation level: READ COMMITTED"),
+            ("BEGIN READ ONLY, ISOLATION LEVEL SERIALIZABLE", "Unsupported isolation level: SERIALIZABLE"),
+            ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", "Unsupported isolation level: READ COMMITTED"),
+            ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+             'setting configuration parameter "TRANSACTION" not supported'),
+            ("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+             "Unsupported isolation level: READ COMMITTED"),
+            ("SET default_transaction_isolation = 'repeatable read'",
+             'setting configuration parameter "default_transaction_isolation" not supported'),
+            ("SET transaction_isolation = 'read committed'",
+             'setting configuration parameter "transaction_isolation" not supported'),
+            ("SELECT set_config('default_transaction_isolation', 'read committed', false)",
+             'setting configuration parameter "default_transaction_isolation" not supported'),
+        ],
+    )
+    def test_isolation_level_other_than_repeatable_read_refused(self, sql, message):
+        # Measured live (eu-north-1, 2026-11-19).
+        err = pgproxy.validate(sql, pgproxy.TxnState())
+        assert err.sqlstate == "0A000", sql
+        assert err.message == message
+
+    @pytest.mark.parametrize("sql", ["BEGIN", "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"])
+    def test_repeatable_read_begin_allowed(self, sql):
+        assert pgproxy.validate(sql, pgproxy.TxnState()) is None
 
 
 class TestStatisticsRules:
