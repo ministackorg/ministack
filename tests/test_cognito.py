@@ -11038,6 +11038,43 @@ def test_cognito_admin_link_provider_errors(cognito_idp):
     assert exc_info.value.response["Error"]["Code"] == "LimitExceededException"
 
 
+def test_cognito_admin_link_provider_refuses_a_provider_the_pool_does_not_have(cognito_idp):
+    pid = cognito_idp.create_user_pool(PoolName="LinkUnknownProviderPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="alice", MessageAction="SUPPRESS")
+    dest = {"ProviderName": "Cognito", "ProviderAttributeValue": "alice"}
+    source = {"ProviderName": "NoSuchProvider", "ProviderAttributeName": "Cognito_Subject",
+              "ProviderAttributeValue": "external-123"}
+
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.admin_link_provider_for_user(
+            UserPoolId=pid, DestinationUser=dest, SourceUser=source)
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc_info.value.response["Error"]["Message"] == (
+        "SourceProviderName must match a Provider that is configured for the User Pool")
+    attrs = {a["Name"] for a in cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="alice")["UserAttributes"]}
+    assert "identities" not in attrs
+
+    # With the provider in the pool, the same call links the user.
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="NoSuchProvider", ProviderType="OIDC",
+        ProviderDetails={
+            "oidc_issuer": "https://idp.example.com",
+            "authorize_url": "https://idp.example.com/authorize",
+            "token_url": "https://idp.example.com/token",
+            "client_id": "oidc-client-id",
+            "client_secret": "oidc-client-secret",
+            "authorize_scopes": "openid",
+        },
+    )
+    cognito_idp.admin_link_provider_for_user(
+        UserPoolId=pid, DestinationUser=dest, SourceUser=source)
+    attrs = {a["Name"]: a["Value"] for a in cognito_idp.admin_get_user(
+        UserPoolId=pid, Username="alice")["UserAttributes"]}
+    assert json.loads(attrs["identities"])[0]["providerName"] == "NoSuchProvider"
+
+
 def test_cognito_admin_link_provider_rejects_an_already_signed_in_user(
     cognito_idp,
 ):

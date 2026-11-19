@@ -7326,6 +7326,12 @@ def _admin_link_provider_for_user(data):
             "InvalidParameterException",
             "SourceUser must be a federated user, not a Cognito user.", 400)
 
+    # The source identity has to come from an identity provider of the pool.
+    if source["ProviderName"] not in pool.get("_identity_providers", {}):
+        return error_response_json(
+            "InvalidParameterException",
+            "SourceProviderName must match a Provider that is configured for the User Pool", 400)
+
     # "For a native username + password user, the ProviderAttributeValue for
     # the DestinationUser should be the username in the user pool. For a
     # federated user, it should be the provider-specific user_id." The
