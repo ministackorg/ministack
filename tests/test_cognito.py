@@ -2194,6 +2194,64 @@ def test_cognito_update_user_pool_client(cognito_idp):
     desc = cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"]
     assert desc["ClientName"] == "UpdatedName"
 
+
+def test_cognito_user_pool_client_supported_identity_providers_must_exist(cognito_idp):
+    """A client can only name COGNITO or an identity provider the pool has; the match is case-sensitive."""
+    pid = cognito_idp.create_user_pool(PoolName="ClientIdpPool")["UserPool"]["Id"]
+
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.create_user_pool_client(
+            UserPoolId=pid, ClientName="early", SupportedIdentityProviders=["NoSuchProvider"])
+    error = exc_info.value.response["Error"]
+    assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert error["Code"] == "InvalidParameterException"
+    assert error["Message"] == f"The provider NoSuchProvider does not exist for User Pool {pid}."
+    assert cognito_idp.list_user_pool_clients(UserPoolId=pid, MaxResults=10)["UserPoolClients"] == []
+
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="app")["UserPoolClient"]["ClientId"]
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.update_user_pool_client(
+            UserPoolId=pid, ClientId=cid, SupportedIdentityProviders=["COGNITO", "NoSuchProvider"])
+    assert exc_info.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc_info.value.response["Error"]["Message"] == (
+        f"The provider NoSuchProvider does not exist for User Pool {pid}.")
+    assert cognito_idp.describe_user_pool_client(
+        UserPoolId=pid, ClientId=cid)["UserPoolClient"].get("SupportedIdentityProviders", []) == []
+
+    # With several missing names, the first one in list order is named.
+    with pytest.raises(ClientError) as exc_info:
+        cognito_idp.update_user_pool_client(
+            UserPoolId=pid, ClientId=cid, SupportedIdentityProviders=["OtherMissing", "NoSuchProvider"])
+    assert "The provider OtherMissing does not exist" in exc_info.value.response["Error"]["Message"]
+
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="my-oidc", ProviderType="OIDC",
+        ProviderDetails={
+            "oidc_issuer": "https://idp.example.com",
+            "authorize_url": "https://idp.example.com/authorize",
+            "token_url": "https://idp.example.com/token",
+            "client_id": "oidc-client-id",
+            "client_secret": "oidc-client-secret",
+            "authorize_scopes": "openid",
+        },
+    )
+    for wrong_case in ("MY-OIDC", "cognito"):
+        with pytest.raises(ClientError) as exc_info:
+            cognito_idp.update_user_pool_client(
+                UserPoolId=pid, ClientId=cid, SupportedIdentityProviders=[wrong_case])
+        assert exc_info.value.response["Error"]["Message"] == (
+            f"The provider {wrong_case} does not exist for User Pool {pid}.")
+
+    updated = cognito_idp.update_user_pool_client(
+        UserPoolId=pid, ClientId=cid, SupportedIdentityProviders=["COGNITO", "my-oidc"])["UserPoolClient"]
+    assert updated["SupportedIdentityProviders"] == ["COGNITO", "my-oidc"]
+    assert cognito_idp.describe_user_pool_client(
+        UserPoolId=pid, ClientId=cid)["UserPoolClient"]["SupportedIdentityProviders"] == ["COGNITO", "my-oidc"]
+    created = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="late", SupportedIdentityProviders=["my-oidc"])["UserPoolClient"]
+    assert created["SupportedIdentityProviders"] == ["my-oidc"]
+
+
 def test_cognito_admin_reset_user_password(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="ResetPwdPool")["UserPool"]["Id"]
     cognito_idp.admin_create_user(UserPoolId=pid, Username="resetuser", UserAttributes=[{"Name": "email", "Value": "resetuser@example.com"}, {"Name": "email_verified", "Value": "true"}])
@@ -3340,14 +3398,7 @@ def _setup_saml_pool(cognito_idp, lambda_config=None):
     pid = cognito_idp.create_user_pool(
         PoolName="FedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
-    client = cognito_idp.create_user_pool_client(
-        UserPoolId=pid,
-        ClientName="FedApp",
-        CallbackURLs=["http://localhost:3000/callback"],
-        AllowedOAuthFlows=["code"],
-        AllowedOAuthScopes=["openid", "email"],
-        SupportedIdentityProviders=["TestSAML"],
-    )["UserPoolClient"]
+    # A client can only name a provider the pool already has.
     cognito_idp.create_identity_provider(
         UserPoolId=pid,
         ProviderName="TestSAML",
@@ -3358,6 +3409,14 @@ def _setup_saml_pool(cognito_idp, lambda_config=None):
             "name": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
         },
     )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="FedApp",
+        CallbackURLs=["http://localhost:3000/callback"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        SupportedIdentityProviders=["TestSAML"],
+    )["UserPoolClient"]
     return pid, client["ClientId"]
 
 
@@ -3825,14 +3884,7 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mappi
     pid = cognito_idp.create_user_pool(
         PoolName="OIDCFedPool", **({"LambdaConfig": lambda_config} if lambda_config else {}),
     )["UserPool"]["Id"]
-    client = cognito_idp.create_user_pool_client(
-        UserPoolId=pid,
-        ClientName="OIDCApp",
-        CallbackURLs=["http://localhost:3000/callback"],
-        AllowedOAuthFlows=["code"],
-        AllowedOAuthScopes=["openid", "email"],
-        SupportedIdentityProviders=["TestOIDC"],
-    )["UserPoolClient"]
+    # A client can only name a provider the pool already has.
     cognito_idp.create_identity_provider(
         UserPoolId=pid,
         ProviderName="TestOIDC",
@@ -3847,6 +3899,14 @@ def _setup_oidc_pool(cognito_idp, token_url, lambda_config=None, attribute_mappi
         },
         AttributeMapping=attribute_mapping or {"email": "email", "name": "name"},
     )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="OIDCApp",
+        CallbackURLs=["http://localhost:3000/callback"],
+        AllowedOAuthFlows=["code"],
+        AllowedOAuthScopes=["openid", "email"],
+        SupportedIdentityProviders=["TestOIDC"],
+    )["UserPoolClient"]
     return pid, client["ClientId"]
 
 

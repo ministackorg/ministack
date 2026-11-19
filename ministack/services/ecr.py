@@ -2136,10 +2136,11 @@ def _create_pull_through_cache_rule(data):
                                        "Upstream registry URL cannot be the same as the cache registry.", 400)
         if credential is not None:
             return _invalid(_MSG_TYPE_MISMATCH)
-        if role is None:
-            return _invalid(_MSG_NEEDS_ROLE)
         if url_account == get_account_id():
-            return _invalid(_MSG_TYPE_MISMATCH)
+            if role is not None:
+                return _invalid(_MSG_TYPE_MISMATCH)
+        elif role is None:
+            return _invalid(_MSG_NEEDS_ROLE)
     elif upstream in _PTC_SECRET_UPSTREAMS:
         if credential is None:
             return error_response_json("UnsupportedUpstreamRegistryException", _MSG_NEEDS_SECRET, 400)
@@ -3002,15 +3003,16 @@ def _ptc_fill_from_ecr(rule, repo, path, tag):
     from ministack.app import AUTH
     from ministack.services import iam
     role = rule.get("customRoleArn")
-    if not role or not iam.role_trusts_service(role, _PTC_ROLE_SERVICE):
-        raise PullThroughMiss("unavailable", "Unable to reach the upstream registry.")
     up_account, up_region = _PTC_ECR_URL_RE.fullmatch(rule["upstreamRegistryUrl"]).groups()
+    cross_account = up_account != get_account_id()
+    if cross_account and (not role or not iam.role_trusts_service(role, _PTC_ROLE_SERVICE)):
+        raise PullThroughMiss("unavailable", "Unable to reach the upstream registry.")
     missing = PullThroughMiss("repository", f"The repository with name '{repo}' does not exist in the registry "
                                             f"with id '{get_account_id()}'")
     with request_scope(up_account, up_region):
         if path not in _repositories:
             raise missing
-        if AUTH:
+        if AUTH and cross_account:
             from ministack.core.iam_evaluator import EvalContext, resource_policy_allows
             policy = _repo_policies.get(path)
             if not all(policy is not None and resource_policy_allows(policy, EvalContext(
