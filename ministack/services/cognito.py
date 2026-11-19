@@ -3429,9 +3429,23 @@ def _refresh_token_rotation(rotation, explicit_auth_flows):
     return {"Feature": feature, "RetryGracePeriodSeconds": int(grace or 0) if feature == "ENABLED" else 0}, None
 
 
+def _unknown_supported_provider(pool, data):
+    """The error AWS answers for the first SupportedIdentityProviders name the pool does not have, else None."""
+    for name in data.get("SupportedIdentityProviders") or []:
+        # The match is case-sensitive, also for COGNITO.
+        if name != "COGNITO" and name not in pool.get("_identity_providers", {}):
+            return error_response_json(
+                "InvalidParameterException",
+                f"The provider {name} does not exist for User Pool {pool['Id']}.", 400)
+    return None
+
+
 def _create_user_pool_client(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    err = _unknown_supported_provider(pool, data)
     if err:
         return err
     rotation = None
@@ -3530,6 +3544,9 @@ def _update_user_pool_client(data):
     client = pool["_clients"].get(cid)
     if not client:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    err = _unknown_supported_provider(pool, data)
+    if err:
+        return err
     updatable = {
         "ClientName", "RefreshTokenValidity", "AccessTokenValidity", "IdTokenValidity",
         "TokenValidityUnits", "ReadAttributes", "WriteAttributes", "ExplicitAuthFlows",

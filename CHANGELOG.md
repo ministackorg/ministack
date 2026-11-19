@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `SupportedIdentityProviders` of an app client** — `CreateUserPoolClient` and `UpdateUserPoolClient` refuse a name that is neither `COGNITO` nor an identity provider of the pool with 400 `InvalidParameterException` `The provider <name> does not exist for User Pool <pool id>.`, naming the first missing name in list order; the match is case-sensitive, also for `COGNITO`. The client is not created or changed. Create the identity provider before the client that names it. Reported by @TheKerbycz.
+
 ## [1.5.42] — 2026-11-18
 
 ### Added
