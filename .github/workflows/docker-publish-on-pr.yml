@@ -2,7 +2,7 @@ name: Docker Publish on PR
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
 
 concurrency:
   group: docker-preview-${{ github.event.pull_request.number }}
@@ -17,6 +17,10 @@ env:
 
 jobs:
   publish-pr:
+    # No preview for drafts or for authors with no merged commit here.
+    if: >-
+      ${{ !github.event.pull_request.draft &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association) }}
     runs-on: ubuntu-latest
 
     permissions:
