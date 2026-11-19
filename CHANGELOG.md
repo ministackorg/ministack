@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `AdminLinkProviderForUser` source provider** — a `SourceUser.ProviderName` that is not an identity provider of the pool is refused with 400 `InvalidParameterException` `SourceProviderName must match a Provider that is configured for the User Pool`, and the user keeps its `identities`. Reported by @TheKerbycz.
+
 ## [1.5.42] — 2026-11-18
 
 ### Added
