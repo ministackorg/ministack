@@ -10612,6 +10612,8 @@ def auth_condition_bucket(s3):
 
 
 _ALLOW_ALL_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+_ALLOW_S3_AND_KMS = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["s3:*", "kms:GenerateDataKey", "kms:Decrypt"], "Resource": "*"}]}
 
 
 def _assert_s3_condition(auth_enabled, allowed, call):
@@ -10694,7 +10696,7 @@ def test_s3_kms_key_id_condition_contract(auth_enabled, iam_user, s3, kms_client
     completion; no SSE, AES256 or another key is refused.
     """
     meta, alias = kms_key_with_alias
-    user = iam_user(policy=_ALLOW_ALL_S3)
+    user = iam_user(policy=_ALLOW_S3_AND_KMS)
     bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
     s3.put_object(Bucket=bucket, Key="source", Body=b"x")
     client = user.client("s3")
@@ -10736,7 +10738,7 @@ def test_s3_kms_key_id_condition_bucket_default_contract(auth_enabled, iam_user,
     keeps the key it started with after the default changes to AES256.
     """
     meta, _ = kms_key_with_alias
-    user = iam_user(policy=_ALLOW_ALL_S3)
+    user = iam_user(policy=_ALLOW_S3_AND_KMS)
     bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
     s3.put_object(Bucket=bucket, Key="source", Body=b"x")
     s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
@@ -10798,7 +10800,7 @@ def test_s3_kms_key_id_condition_access_point_contract(auth_enabled, iam_user, s
     """
     meta, _ = kms_key_with_alias
     user = iam_user(policy={"Version": "2012-10-17", "Statement": [
-        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Allow", "Action": ["s3:*", "kms:GenerateDataKey", "kms:Decrypt"], "Resource": "*"},
         {"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*",
          "Condition": {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}}}]})
     bucket = auth_condition_bucket(user.arn, "s3:GetObject", {"Bool": {"aws:SecureTransport": "true"}})

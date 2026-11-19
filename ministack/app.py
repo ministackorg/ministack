@@ -3160,8 +3160,8 @@ async def _dispatch_service_request(
         from ministack.core.iam_actions import (
             access_denied_response,
             agentcore_endpoint_arn,
-            dynamodb_resource_arns,
             dynamodb_leading_keys,
+            dynamodb_resource_arns,
             dynamodb_service_context,
             dynamodb_transaction_checks,
             dynamodb_transaction_items,
