@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **RDS — `CreateDBCluster` status** — the `CreateDBCluster` response reported `Status` `available`. It now reports `creating`, as AWS does. `DescribeDBClusters` still reports the status from the cluster's members, so a cluster with no members is `available` at once. Contributed by @Areson.
 - **ECR — pull-through cache rule for an ECR upstream in the same account** — `CreatePullThroughCacheRule` for an ECR upstream in the caller's account and another region asked for a `customRoleArn`, and refused one with "Upstream registry URL and provided credential type do not match", so the rule could never be created. It is now created without a role, as on AWS, and the first pull copies the upstream image without one. Rules for an upstream in another account are unchanged. Reported by @kharabasz.
 
 ## [1.5.42] — 2026-11-18
