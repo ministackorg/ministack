@@ -7252,8 +7252,12 @@ def _create_db_cluster_impl(p):
         _tags[arn] = req_tags
         cluster["TagList"] = req_tags
 
+    # AWS answers CreateDBCluster with Status "creating". The stored cluster
+    # stays "available" (its status comes from its members), so only the
+    # create response reports "creating".
+    created = {**cluster, "Status": "creating"}
     return _xml(200, "CreateDBClusterResponse",
-        f"<CreateDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></CreateDBClusterResult>")
+        f"<CreateDBClusterResult><DBCluster>{_cluster_xml(created)}</DBCluster></CreateDBClusterResult>")
 
 
 def _delete_db_cluster(p):
