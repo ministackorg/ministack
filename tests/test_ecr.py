@@ -1286,6 +1286,31 @@ def test_ptc_fill_copies_an_ecr_upstream_in_process(ptc_rules):
             _drop_repository(source)
 
 
+def test_ptc_fill_copies_a_same_account_ecr_upstream_without_a_role(ptc_rules):
+    prefix, source = _ptc_prefix(), f"src{_uuid_mod.uuid4().hex[:8]}/app"
+    config = b'{"architecture":"arm64","os":"linux"}'
+    config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
+    manifest = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                           "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                                      "size": len(config), "digest": config_digest}, "layers": []}).encode()
+    with request_scope("000000000000", "us-west-2"):
+        _create_repository(source)
+        ecr_svc._layer_blobs.setdefault(source, {})[config_digest] = config
+        ecr_svc._v2_put_manifest(source, "edge", {}, manifest)
+    status, created = _ptc_call("CreatePullThroughCacheRule", {
+        "ecrRepositoryPrefix": prefix, "upstreamRegistryUrl": "000000000000.dkr.ecr.us-west-2.amazonaws.com",
+        "upstreamRepositoryPrefix": source.split("/")[0]})
+    try:
+        assert (status, created["ecrRepositoryPrefix"]) == (200, prefix)
+        digest = ecr_svc.fill_pull_through(f"{_CACHE}/{prefix}/app:edge")
+        assert digest == "sha256:" + hashlib.sha256(manifest).hexdigest()
+        assert ecr_svc._layer_blobs[f"{prefix}/app"] == {config_digest: config}
+    finally:
+        _drop_repository(f"{prefix}/app")
+        with request_scope("000000000000", "us-west-2"):
+            _drop_repository(source)
+
+
 def test_ptc_batch_get_image_does_not_fill(ptc_rules, monkeypatch):
     """The BatchGetImage API never fills the cache; AWS answers RepositoryNotFound (capture 2026-11-18)."""
     prefix = _ptc_prefix()
