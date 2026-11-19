@@ -299,7 +299,12 @@ def _consumer_by_stream_and_name(stream_arn, consumer_name):
 def _expire_records(stream):
     cutoff = time.time() - stream["RetentionPeriodHours"] * 3600
     for shard in stream["shards"].values():
-        shard["records"] = [r for r in shard["records"] if r["ApproximateArrivalTimestamp"] >= cutoff]
+        records = shard["records"]
+        expired = 0
+        while expired < len(records) and records[expired]["ApproximateArrivalTimestamp"] < cutoff:
+            expired += 1
+        if expired:
+            del records[:expired]
 
 
 def _expire_iterators():
@@ -359,6 +364,44 @@ def put_record_internal(stream_arn: str, partition_key: str, data: bytes) -> boo
 # Request dispatcher
 # ---------------------------------------------------------------------------
 
+def _copy_without_epoch_tags(buf, i, out):
+    """Copy the CBOR item at ``i`` into ``out`` minus its tag-1 headers, so a timestamp stays a
+    plain epoch number as in JSON (cbor2 refuses one past year 9999). Returns the next offset."""
+    major, info = buf[i] >> 5, buf[i] & 31
+    if info < 24:
+        n, head = info, 1
+    elif info < 28:
+        head = 1 + (1 << (info - 24))
+        n = int.from_bytes(buf[i + 1:i + head], "big")
+    elif info == 31 and major in (2, 3, 4, 5):
+        n, head = None, 1
+    else:
+        raise ValueError(f"unsupported CBOR header byte {buf[i]:#x}")
+    if major == 6:
+        if n != 1:
+            out += buf[i:i + head]
+        return _copy_without_epoch_tags(buf, i + head, out)
+    out += buf[i:i + head]
+    i += head
+    if major in (2, 3):
+        if n is not None:
+            out += buf[i:i + n]
+            return i + n
+        while buf[i] != 0xFF:
+            i = _copy_without_epoch_tags(buf, i, out)
+    elif major in (4, 5):
+        if n is not None:
+            for _ in range(n * (major - 3)):
+                i = _copy_without_epoch_tags(buf, i, out)
+            return i
+        while buf[i] != 0xFF:
+            i = _copy_without_epoch_tags(buf, i, out)
+    else:
+        return i
+    out.append(0xFF)
+    return i + 1
+
+
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
@@ -369,7 +412,9 @@ async def handle_request(method, path, headers, body, query_params):
     try:
         if is_cbor and body:
             import cbor2
-            data = cbor2.loads(body)
+            out = bytearray()
+            _copy_without_epoch_tags(body, 0, out)
+            data = cbor2.loads(bytes(out))
             # CBOR Data field arrives as raw bytes; base64-encode for uniform handling
             if "Data" in data and isinstance(data["Data"], (bytes, bytearray)):
                 data["Data"] = base64.b64encode(data["Data"]).decode("ascii")

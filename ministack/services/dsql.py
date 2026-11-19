@@ -49,7 +49,7 @@ PG_COMMAND = ["postgres"] + [
     arg
     for name, default in pgproxy.DSQL_SETTINGS.items()
     for arg in ("-c", f"{name}={default}")
-]
+] + ["-c", "default_transaction_isolation=repeatable read"]
 DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes")
 # Backend containers are opt-in: default is control-plane-only (metadata stubs).
 DSQL_STRICT = os.environ.get("DSQL_STRICT", "0").lower() in ("1", "true", "yes")
