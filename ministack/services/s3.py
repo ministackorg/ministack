@@ -1193,6 +1193,30 @@ def _bucket_owner_account(name: str) -> str | None:
     return None
 
 
+def _expected_owner_mismatch(method: str, bucket: str, key: str, headers: dict, query_params: dict):
+    """Bucket owner condition: ``x-amz-expected-bucket-owner`` (and, on a copy, ``x-amz-source-expected-bucket-owner``
+    for the source) must name the bucket's owner, else 403 AccessDenied. CreateBucket and ListBuckets ignore it."""
+    if not bucket or (method == "PUT" and not key and not set(query_params) - {"x-id"}):
+        return None
+    checks = [(headers.get("x-amz-expected-bucket-owner", ""), bucket)]
+    source = headers.get("x-amz-copy-source", "")
+    if source:
+        checks.append((headers.get("x-amz-source-expected-bucket-owner", ""),
+                       url_unquote(source.lstrip("/")).split("/", 1)[0]))
+    resource = f"/{bucket}/{key}" if key else f"/{bucket}"
+    for expected, name in checks:
+        if not expected:
+            continue
+        if not re.fullmatch(r"\d{12}", expected):
+            return _error("InvalidBucketOwnerAWSAccountID",
+                          f"The value of the expected bucket owner parameter must be an AWS Account ID... [{expected}]",
+                          400, resource)
+        owner = _bucket_owner_for_caller(name)
+        if owner is not None and owner != expected:
+            return _error("AccessDenied", "Access Denied", 403, resource)
+    return None
+
+
 def _bucket_owner_for_caller(name: str) -> str | None:
     """The account whose bucket *name* the current caller reads: its own, else the owner, or None."""
     caller = get_account_id()
@@ -1270,6 +1294,56 @@ def _write_kms_key(bucket_name: str, headers: dict) -> str | None:
     (all recorded on AWS, us-east-2: that write fails before the policy).
     """
     return _resolve_kms_write(headers, bucket_name)[0]
+
+
+def kms_checks(method: str, path: str, headers: dict, query_params: dict) -> list[tuple[str, str, str]]:
+    """``(kms action, key ARN, object ARN)`` an S3 request needs on a customer managed key: a write under SSE-KMS
+    ``kms:GenerateDataKey``, a read (and a copy's source) of an SSE-KMS object ``kms:Decrypt`` (S3 User Guide,
+    "Using server-side encryption with AWS KMS keys"). HeadObject is answered without a KMS check."""
+    from ministack.services.kms import is_customer_key
+
+    bucket_name, key = _parse_bucket_key(path, headers)
+    if not bucket_name or not key or method not in ("GET", "PUT", "POST"):
+        return []
+    checks = []
+    upload_id = _qp(query_params, "uploadId", "") or None
+    if method in ("PUT", "POST") and not {"tagging", "acl", "retention", "legal-hold", "annotation"} & set(query_params):
+        if method == "PUT" or "uploads" in query_params:
+            checks.append(("kms:GenerateDataKey", kms_key_for_condition(bucket_name, headers, upload_id), key))
+        source = headers.get("x-amz-copy-source", "")
+        if method == "PUT" and source:
+            src = url_unquote(source.lstrip("/"))
+            src_path, _, src_query = src.partition("?")
+            src_bucket, _, src_key = src_path.partition("/")
+            version = _parse_qs(src_query).get("versionId", [""])[0]
+            checks.append(("kms:Decrypt", _stored_kms_key(src_bucket, src_key, version), src_key, src_bucket))
+    elif method == "GET" and not {"tagging", "acl", "retention", "legal-hold", "attributes", "uploadId",
+                                  "annotation"} & set(query_params):
+        checks.append(("kms:Decrypt", _stored_kms_key(bucket_name, key, _qp(query_params, "versionId", "")), key))
+    out = []
+    for check in checks:
+        action, arn, obj_key = check[:3]
+        obj_bucket = check[3] if len(check) > 3 else bucket_name
+        if arn and is_customer_key(arn):
+            out.append((action, arn, f"arn:aws:s3:::{obj_bucket}/{obj_key}"))
+    return out
+
+
+def _stored_kms_key(bucket_name: str, key: str, version_id: str = "") -> str | None:
+    """The KMS key ARN an object (or one version of it) is encrypted under, or None."""
+    owner = _bucket_owner_for_caller(bucket_name)
+    bucket = _buckets.get_scoped(owner, None, bucket_name) if owner else None
+    if not bucket:
+        return None
+    obj = None
+    if version_id and version_id != "null":
+        for v in _object_versions.get_scoped(owner, None, (bucket_name, key)) or []:
+            if v["version_id"] == version_id and not v.get("is_delete_marker"):
+                obj = _object_record_from_version(v)
+                break
+    else:
+        obj = bucket["objects"].get(key)
+    return _stored_sse_headers(obj or {}).get(_SSE_KMS_KEY_HEADER) or None
 
 
 def kms_key_for_condition(bucket_name: str, headers: dict, upload_id: str | None = None) -> str | None:
@@ -2887,6 +2961,8 @@ async def handle_request(
     if denied is None and enforce_bucket_region:
         # After the scope is pinned, so the owner's record names the home region.
         denied = _check_bucket_region(method, bucket, key, headers, query_params, home=access_point_region)
+    if denied is None and not internal:
+        denied = _expected_owner_mismatch(method, bucket, key, headers, query_params)
     if denied is not None:
         _request_caller.reset(caller_token)
         status, resp_headers, resp_body = denied

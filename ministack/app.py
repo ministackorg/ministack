@@ -344,6 +344,14 @@ _SNS_NAMED_DENIALS = frozenset(f"sns:{a}" for a in (
 _PASSES_ROLE = frozenset({"lambda:CreateFunction", "lambda:UpdateFunctionConfiguration"})
 
 
+def _safe_json(body: bytes):
+    try:
+        data = json.loads(body or b"{}")
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _safe_body_field(body: bytes, field: str):
     try:
         data = json.loads(body or b"{}")
@@ -3152,9 +3160,11 @@ async def _dispatch_service_request(
         from ministack.core.iam_actions import (
             access_denied_response,
             agentcore_endpoint_arn,
+            dynamodb_leading_keys,
             dynamodb_resource_arns,
             dynamodb_service_context,
             dynamodb_transaction_checks,
+            dynamodb_transaction_items,
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
@@ -3214,6 +3224,7 @@ async def _dispatch_service_request(
             service_context = {**request_tag_context(service, iam_action, body, routing_params),
                                **request_field_context(service, iam_action, body, routing_params, region),
                                **(service_context or {})}
+            dynamodb_body = _safe_json(body) if service == "dynamodb" else None
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
             transaction_checks = (
@@ -3224,10 +3235,13 @@ async def _dispatch_service_request(
                 denied = None
                 item_context = {**(service_context or {}),
                                 "dynamodb:EnclosingOperation": [iam_action.split(":", 1)[1]]}
-                for item_action, item_arn in transaction_checks:
+                item_details = dynamodb_transaction_items(body)
+                for index, (item_action, item_arn) in enumerate(transaction_checks):
+                    detail = item_details[index] if index < len(item_details) else None
                     denied = enforce(
                         access_key, item_action, service, region,
-                        resource_arn=item_arn, service_context=item_context,
+                        resource_arn=item_arn,
+                        service_context={**item_context, **dynamodb_leading_keys(item_action, detail, item_arn)},
                     )
                     if denied:
                         iam_action = item_action  # named in the AccessDenied message
@@ -3235,7 +3249,9 @@ async def _dispatch_service_request(
             else:
                 # Through an S3 access point alias the check is made on the access point and on its bucket.
                 for checked_arn, keys in (s3_access_point_resources(resource_arn, iam_action) if service == "s3"
-                                          else [(resource_arn, {})]):
+                                          else [(resource_arn, dynamodb_leading_keys(iam_action, dynamodb_body,
+                                                                                     resource_arn))]
+                                          if service == "dynamodb" else [(resource_arn, {})]):
                     denied = enforce(
                         access_key, iam_action, service, region,
                         resource_arn=checked_arn, service_context={**service_context, **keys},
@@ -3264,6 +3280,20 @@ async def _dispatch_service_request(
                     if denied:
                         iam_action = extra_action
                         break
+            if service == "s3" and not denied:
+                # SSE-KMS: the caller needs the key permission too, checked as a KMS call made through S3.
+                for kms_action, key_arn, object_arn in _get_module("s3").kms_checks(
+                        method, path, _get_module("s3")._merge_hoisted_amz_headers(headers, query_params),
+                        query_params):
+                    kms_denied = enforce(access_key, kms_action, "kms", region, resource_arn=key_arn,
+                                         service_context={"kms:viaservice": f"s3.{region}.amazonaws.com",
+                                                          "kms:encryptioncontext:aws:s3:arn": object_arn})
+                    if kms_denied:
+                        denied, iam_action, resource_arn = kms_denied, kms_action, key_arn
+                        if not isinstance(kms_denied, AuthError):
+                            denial_message = identity_denial_message(kms_action, kms_denied.principal_arn, key_arn,
+                                                                     kms_denied.decision == "Deny")
+                        break
             if service == "lambda" and not denied and iam_action in _PASSES_ROLE:
                 # Passing an execution role is authorized as iam:PassRole on it (IAM User Guide, PassRole).
                 role_arn = _safe_body_field(body, "Role")
@@ -3284,7 +3314,8 @@ async def _dispatch_service_request(
                         service,
                         region,
                         resource_arn=extra_arn,
-                        service_context=service_context,
+                        service_context={**service_context,
+                                         **dynamodb_leading_keys(iam_action, dynamodb_body, extra_arn)},
                     )
                     if denied:
                         resource_arn = extra_arn

@@ -49,7 +49,7 @@ def test_secretsmanager_validate_resource_policy(sm):
     assert resp["PolicyValidationPassed"] is True
 
 def test_secretsmanager_rotate_secret(sm):
-    """RotateSecret creates a new version and promotes it to AWSCURRENT."""
+    """RotateSecret records the rotation; the value changes only when the function rotates it."""
     sm.create_secret(Name="rotate-test-v39", SecretString="original")
     resp = sm.rotate_secret(
         SecretId="rotate-test-v39",
@@ -224,7 +224,7 @@ def test_secretsmanager_replicated_secret_versions_stay_in_sync(sm):
     assert west.get_secret_value(SecretId=name)["SecretString"] == "put-value"
 
     token = _uuid_mod.uuid4().hex
-    sm.rotate_secret(SecretId=name, ClientRequestToken=token)
+    sm.put_secret_value(SecretId=name, SecretString="tokened", ClientRequestToken=token)
     replica_stages = west.describe_secret(SecretId=name)["VersionIdsToStages"]
     assert replica_stages[token] == ["AWSCURRENT"]
 
@@ -1610,3 +1610,51 @@ def test_secret_of_another_account_by_arn_contract(auth_enabled):
             "You can't access a secret from a different AWS account if you encrypt the secret with the default KMS "
             "service key.")
     refused(noid_b, cmk, "AccessDeniedException", denial(noid_arn, cmk, "identity"))
+
+
+_ROTATOR = '''import json, os, urllib.request
+def _sm(target, body):
+    req = urllib.request.Request(os.environ["AWS_ENDPOINT_URL"], data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/x-amz-json-1.1", "X-Amz-Target": "secretsmanager." + target})
+    return json.loads(urllib.request.urlopen(req, timeout=10).read() or b"{}")
+def handler(event, ctx):
+    sid, token, step = event["SecretId"], event["ClientRequestToken"], event["Step"]
+    if step == "createSecret":
+        _sm("PutSecretValue", {"SecretId": sid, "ClientRequestToken": token, "VersionStages": ["AWSPENDING"],
+                               "SecretString": json.dumps(sorted(event))})
+    elif step == "finishSecret":
+        current = [v for v in _sm("ListSecretVersionIds", {"SecretId": sid})["Versions"]
+                   if "AWSCURRENT" in v["VersionStages"]][0]["VersionId"]
+        _sm("UpdateSecretVersionStage", {"SecretId": sid, "VersionStage": "AWSCURRENT",
+                                         "MoveToVersionId": token, "RemoveFromVersionId": current})
+'''
+
+
+def test_secretsmanager_rotate_secret_runs_the_rotation_function(sm, lam):
+    """Recorded on AWS (eu-north-1, 2026-11-18): the four steps run, the new version becomes AWSCURRENT."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", _ROTATOR)
+    fn = f"rotator-{_uuid_mod.uuid4().hex[:8]}"
+    arn = lam.create_function(FunctionName=fn, Runtime="python3.12", Role="arn:aws:iam::000000000000:role/r",
+                              Handler="index.handler", Code={"ZipFile": buf.getvalue()}, Timeout=15)["FunctionArn"]
+    name = f"rot-{_uuid_mod.uuid4().hex[:8]}"
+    old = sm.create_secret(Name=name, SecretString="original")["VersionId"]
+    try:
+        new = sm.rotate_secret(SecretId=name, RotationLambdaARN=arn,
+                               RotationRules={"AutomaticallyAfterDays": 30})["VersionId"]
+        for _ in range(60):
+            if sm.get_secret_value(SecretId=name)["VersionId"] == new:
+                break
+            time.sleep(0.5)
+        current = sm.get_secret_value(SecretId=name)
+        assert current["VersionId"] == new
+        assert json.loads(current["SecretString"]) == ["ClientRequestToken", "RotationToken", "SecretId", "Step"]
+        stages = {v["VersionId"]: v["VersionStages"] for v in sm.list_secret_version_ids(SecretId=name)["Versions"]}
+        assert sorted(stages[new]) == ["AWSCURRENT", "AWSPENDING"] and stages[old] == ["AWSPREVIOUS"]
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+        lam.delete_function(FunctionName=fn)

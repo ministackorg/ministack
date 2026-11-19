@@ -10612,6 +10612,8 @@ def auth_condition_bucket(s3):
 
 
 _ALLOW_ALL_S3 = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}
+_ALLOW_S3_AND_KMS = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["s3:*", "kms:GenerateDataKey", "kms:Decrypt"], "Resource": "*"}]}
 
 
 def _assert_s3_condition(auth_enabled, allowed, call):
@@ -10694,7 +10696,7 @@ def test_s3_kms_key_id_condition_contract(auth_enabled, iam_user, s3, kms_client
     completion; no SSE, AES256 or another key is refused.
     """
     meta, alias = kms_key_with_alias
-    user = iam_user(policy=_ALLOW_ALL_S3)
+    user = iam_user(policy=_ALLOW_S3_AND_KMS)
     bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
     s3.put_object(Bucket=bucket, Key="source", Body=b"x")
     client = user.client("s3")
@@ -10736,7 +10738,7 @@ def test_s3_kms_key_id_condition_bucket_default_contract(auth_enabled, iam_user,
     keeps the key it started with after the default changes to AES256.
     """
     meta, _ = kms_key_with_alias
-    user = iam_user(policy=_ALLOW_ALL_S3)
+    user = iam_user(policy=_ALLOW_S3_AND_KMS)
     bucket = auth_condition_bucket(user.arn, "s3:PutObject", {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}})
     s3.put_object(Bucket=bucket, Key="source", Body=b"x")
     s3.put_bucket_encryption(Bucket=bucket, ServerSideEncryptionConfiguration={"Rules": [
@@ -10798,7 +10800,7 @@ def test_s3_kms_key_id_condition_access_point_contract(auth_enabled, iam_user, s
     """
     meta, _ = kms_key_with_alias
     user = iam_user(policy={"Version": "2012-10-17", "Statement": [
-        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Allow", "Action": ["s3:*", "kms:GenerateDataKey", "kms:Decrypt"], "Resource": "*"},
         {"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*",
          "Condition": {"StringNotEquals": {_KMS_KEY_ID_CONDITION: meta["Arn"]}}}]})
     bucket = auth_condition_bucket(user.arn, "s3:GetObject", {"Bool": {"aws:SecureTransport": "true"}})
@@ -13810,3 +13812,52 @@ def test_s3_expired_presigned_url_error_carries_the_expiry_and_server_time(s3):
         assert root.findtext("ServerTime") > root.findtext("Expires")
     finally:
         s3.delete_bucket(Bucket=bucket)
+
+
+def test_s3_expected_bucket_owner(s3):
+    """Recorded on AWS (eu-north-1, 2026-11-18)."""
+    bucket = f"ebo-{uuid.uuid4().hex[:10]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x", ExpectedBucketOwner="000000000000")
+    with pytest.raises(ClientError) as exc:
+        s3.get_object(Bucket=bucket, Key="k", ExpectedBucketOwner="111111111111")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    assert exc.value.response["Error"]["Message"] == "Access Denied"
+    with pytest.raises(ClientError) as exc:
+        s3.copy_object(Bucket=bucket, Key="k2", CopySource={"Bucket": bucket, "Key": "k"},
+                       ExpectedSourceBucketOwner="111111111111")
+    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    with pytest.raises(ClientError) as exc:
+        s3.list_objects_v2(Bucket=bucket, ExpectedBucketOwner="not-an-account")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"]["Code"] == "InvalidBucketOwnerAWSAccountID"
+
+
+def test_s3_sse_kms_needs_kms_permissions(auth):
+    """Recorded on AWS (eu-north-1, 2026-11-18): SSE-KMS writes need kms:GenerateDataKey, reads kms:Decrypt."""
+    import xml.etree.ElementTree as ET
+
+    from ministack.services import kms as kms_svc
+
+    key_arn = json.loads(kms_svc._create_key({})[2])["KeyMetadata"]["Arn"]
+    bucket = f"ssekms-{uuid.uuid4().hex[:8]}"
+    assert _root_request("PUT", f"/{bucket}")[0] == 200
+    sse = {"x-amz-server-side-encryption": "aws:kms", "x-amz-server-side-encryption-aws-kms-key-id": key_arn}
+    assert _root_request("PUT", f"/{bucket}/k", b"x")[0] == 200
+    key, user = inprocess_iam_user(_ALLOW_S3)
+    status, _headers, body = routed_request(key, "s3", "PUT", f"/{bucket}/enc", b"x", headers=sse)
+    assert status == 403 and ET.fromstring(body).findtext("Message") == (
+        f"User: {user} is not authorized to perform: kms:GenerateDataKey on resource: {key_arn} "
+        "because no identity-based policy allows the kms:GenerateDataKey action")
+    assert routed_request(key, "s3", "PUT", f"/{bucket}/plain", b"x")[0] == 200
+
+    both = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:*", "kms:GenerateDataKey"], "Resource": "*"}]}
+    key, user = inprocess_iam_user(both)
+    assert routed_request(key, "s3", "PUT", f"/{bucket}/enc", b"x", headers=sse)[0] == 200
+    status, _headers, body = routed_request(key, "s3", "GET", f"/{bucket}/enc")
+    assert status == 403 and ET.fromstring(body).findtext("Message") == (
+        f"User: {user} is not authorized to perform: kms:Decrypt on resource: {key_arn} "
+        "because no identity-based policy allows the kms:Decrypt action")
+    assert routed_request(key, "s3", "HEAD", f"/{bucket}/enc")[0] == 200
