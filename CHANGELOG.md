@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Cognito — `SupportedIdentityProviders` of an app client** — `CreateUserPoolClient` and `UpdateUserPoolClient` refuse a name that is neither `COGNITO` nor an identity provider of the pool with 400 `InvalidParameterException` `The provider <name> does not exist for User Pool <pool id>.`, naming the first missing name in list order; the match is case-sensitive, also for `COGNITO`. The client is not created or changed. Create the identity provider before the client that names it. Reported by @TheKerbycz.
+- **RDS — `CreateDBCluster` status** — the `CreateDBCluster` response reported `Status` `available`. It now reports `creating`, as AWS does. `DescribeDBClusters` still reports the status from the cluster's members, so a cluster with no members is `available` at once. Contributed by @Areson.
+- **ECR — pull-through cache rule for an ECR upstream in the same account** — `CreatePullThroughCacheRule` for an ECR upstream in the caller's account and another region asked for a `customRoleArn`, and refused one with "Upstream registry URL and provided credential type do not match", so the rule could never be created. It is now created without a role, as on AWS, and the first pull copies the upstream image without one. Rules for an upstream in another account are unchanged. Reported by @kharabasz.
 
 ## [1.5.42] — 2026-11-18
 

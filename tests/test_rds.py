@@ -477,7 +477,7 @@ def test_rds_create_cluster_v2(rds):
     )
     cluster = resp["DBCluster"]
     assert cluster["DBClusterIdentifier"] == "rds-cc-v2"
-    assert cluster["Status"] == "available"
+    assert cluster["Status"] == "creating"
     assert cluster["Engine"] == "aurora-postgresql"
     assert "DBClusterArn" in cluster
 
@@ -19363,3 +19363,18 @@ def test_rds_create_db_instance_without_engine_is_refused(extra):
     assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
         400, "InvalidParameterValue", "Invalid DB engine")
     assert not any(i["DBInstanceIdentifier"] == db_id for i in client.describe_db_instances()["DBInstances"])
+
+
+def test_rds_create_db_cluster_response_reports_creating(rds):
+    """CreateDBCluster answers Status "creating", as AWS does. A cluster with no
+    members is then described as "available"."""
+    created = rds.create_db_cluster(
+        DBClusterIdentifier="rds-cc-creating",
+        Engine="aurora-postgresql",
+        MasterUsername="probeadmin",
+        MasterUserPassword="password123",
+    )["DBCluster"]
+    assert created["Status"] == "creating"
+    described = rds.describe_db_clusters(DBClusterIdentifier="rds-cc-creating")["DBClusters"][0]
+    assert described["Status"] == "available"
+    rds.delete_db_cluster(DBClusterIdentifier="rds-cc-creating", SkipFinalSnapshot=True)
