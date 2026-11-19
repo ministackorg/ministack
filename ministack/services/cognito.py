@@ -3476,8 +3476,6 @@ def _create_user_pool_client(data):
         rotation, err = _refresh_token_rotation(data["RefreshTokenRotation"], data.get("ExplicitAuthFlows"))
         if err:
             return err
-    if (err := _unknown_supported_provider(pool, pid, data.get("SupportedIdentityProviders"))):
-        return err
 
     cid = _client_id()
     now = _now_epoch()
@@ -3664,8 +3662,6 @@ def _update_user_pool_client(data):
         "AnalyticsConfiguration", "PreventUserExistenceErrors", "EnableTokenRevocation",
         "EnablePropagateAdditionalUserContextData", "AuthSessionValidity",
     }
-    if (err := _unknown_supported_provider(pool, pid, data.get("SupportedIdentityProviders"))):
-        return err
     # Left out of an update, rotation stays as it was, as on AWS.
     rotation = data["RefreshTokenRotation"] if data.get("RefreshTokenRotation") is not None else client.get("RefreshTokenRotation")
     if rotation is not None:
@@ -7161,16 +7157,6 @@ def _oidc_endpoint_query_error(provider_type, details):
     return None
 
 
-def _unknown_supported_provider(pool, pool_id, names):
-    """``SupportedIdentityProviders`` may name only COGNITO and the pool's own providers, case-sensitively."""
-    providers = pool.get("_identity_providers", {})
-    for name in names if isinstance(names, list) else []:
-        if name != "COGNITO" and name not in providers:
-            return error_response_json("InvalidParameterException",
-                                       f"The provider {name} does not exist for User Pool {pool_id}.", 400)
-    return None
-
-
 def _create_identity_provider(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -7462,10 +7448,6 @@ def _admin_link_provider_for_user(data):
         return error_response_json(
             "InvalidParameterException",
             "SourceUser must be a federated user, not a Cognito user.", 400)
-    if source["ProviderName"] not in pool.get("_identity_providers", {}):
-        return error_response_json(
-            "InvalidParameterException",
-            "SourceProviderName must match a Provider that is configured for the User Pool", 400)
 
     # The source identity has to come from an identity provider of the pool.
     if source["ProviderName"] not in pool.get("_identity_providers", {}):

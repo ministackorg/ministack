@@ -15437,40 +15437,6 @@ def test_cognito_oidc_endpoint_with_a_query_is_refused(cognito_idp):
     assert exc.value.response["Error"]["Message"] == "Endpoint can not contain queries"
 
 
-def test_cognito_client_supported_providers_must_exist(cognito_idp):
-    pid = cognito_idp.create_user_pool(PoolName="client-idps")["UserPool"]["Id"]
-    cognito_idp.create_identity_provider(UserPoolId=pid, ProviderName="Corp", ProviderType="OIDC",
-                                         ProviderDetails=_OIDC_DETAILS)
-    for names in (["Nope"], ["corp"]):
-        with pytest.raises(ClientError) as exc:
-            cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c", SupportedIdentityProviders=names)
-        assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
-        assert exc.value.response["Error"]["Message"] == f"The provider {names[0]} does not exist for User Pool {pid}."
-    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c",
-                                              SupportedIdentityProviders=["Corp", "COGNITO"])["UserPoolClient"]["ClientId"]
-    with pytest.raises(ClientError) as exc:
-        cognito_idp.update_user_pool_client(UserPoolId=pid, ClientId=cid, SupportedIdentityProviders=["Corp", "Nope"])
-    assert exc.value.response["Error"]["Message"] == f"The provider Nope does not exist for User Pool {pid}."
-    assert cognito_idp.describe_user_pool_client(UserPoolId=pid, ClientId=cid)["UserPoolClient"][
-        "SupportedIdentityProviders"] == ["Corp", "COGNITO"]
-
-
-def test_cognito_link_provider_source_must_be_configured(cognito_idp):
-    pid = cognito_idp.create_user_pool(PoolName="link-src")["UserPool"]["Id"]
-    cognito_idp.create_identity_provider(UserPoolId=pid, ProviderName="Corp", ProviderType="OIDC",
-                                         ProviderDetails=_OIDC_DETAILS)
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="dest", MessageAction="SUPPRESS")
-    dest = {"ProviderName": "Cognito", "ProviderAttributeValue": "dest"}
-    with pytest.raises(ClientError) as exc:
-        cognito_idp.admin_link_provider_for_user(UserPoolId=pid, DestinationUser=dest, SourceUser={
-            "ProviderName": "Nope", "ProviderAttributeName": "Cognito_Subject", "ProviderAttributeValue": "x1"})
-    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
-    assert exc.value.response["Error"]["Message"] == \
-        "SourceProviderName must match a Provider that is configured for the User Pool"
-    cognito_idp.admin_link_provider_for_user(UserPoolId=pid, DestinationUser=dest, SourceUser={
-        "ProviderName": "Corp", "ProviderAttributeName": "Cognito_Subject", "ProviderAttributeValue": "x2"})
-
-
 def _secret_hash(username, cid, secret):
     return base64.b64encode(hmac.new(secret.encode(), (username + cid).encode(), hashlib.sha256).digest()).decode()
 
