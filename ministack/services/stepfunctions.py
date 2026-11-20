@@ -6035,7 +6035,178 @@ def _invoke_events_put_events(resource, input_data):
     return result
 
 
+_HTTP_TASK_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+_HTTP_TASK_TIMEOUT_SECONDS = 60
+_HTTP_TASK_DENIED_HEADERS = frozenset({
+    "authorization", "connection", "content-md5", "expect", "host", "max-forwards", "proxy-authenticate", "server",
+    "te", "trailer", "transfer-encoding", "upgrade", "via", "www-authenticate",
+})
+_HTTP_TASK_DENIED_HEADER_PREFIXES = ("x-amz-", "x-amzn-", "x-forwarded-")
+# Step Functions' own phrase for a status code: the StatusText of a result and the Cause of a failed call. It is not
+# the phrase the server sent, and a code that is not here (418, 599) has none.
+_HTTP_TASK_STATUS_TEXT = {
+    200: "OK", 201: "Created", 202: "Accepted", 203: "Non Authoritative Information", 204: "No Content",
+    205: "Reset Content", 206: "Partial Content", 207: "Multi-Status", 208: "Already Reported", 226: "IM Used",
+    300: "Multiple Choices", 301: "Moved Permanently", 302: "Moved Temporarily", 303: "See Other",
+    304: "Not Modified", 305: "Use Proxy", 307: "Temporary Redirect", 308: "Permanent Redirect",
+    400: "Bad Request", 401: "Unauthorized", 402: "Payment Required", 403: "Forbidden", 404: "Not Found",
+    405: "Method Not Allowed", 406: "Not Acceptable", 407: "Proxy Authentication Required", 408: "Request Timeout",
+    409: "Conflict", 410: "Gone", 411: "Length Required", 412: "Precondition Failed", 413: "Request Too Long",
+    414: "Request-URI Too Long", 415: "Unsupported Media Type", 416: "Requested Range Not Satisfiable",
+    417: "Expectation Failed", 421: "Misdirected Request", 422: "Unprocessable Content", 423: "Locked",
+    424: "Failed Dependency", 425: "Too Early", 426: "Upgrade Required", 428: "Precondition Required",
+    429: "Too Many Requests", 431: "Request Header Fields Too Large", 451: "Unavailable For Legal Reasons",
+    500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable",
+    504: "Gateway Timeout", 505: "Http Version Not Supported", 506: "Variant Also Negotiates",
+    507: "Insufficient Storage", 508: "Loop Detected", 510: "Not Extended", 511: "Network Authentication Required",
+}
+
+
+def _http_task_query_pairs(key, value):
+    """One QueryParameters entry as (name, text) pairs: a[k]=v for an object, a[0]=v for a list."""
+    if isinstance(value, dict):
+        for name, item in value.items():
+            yield from _http_task_query_pairs(f"{key}[{name}]", item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _http_task_query_pairs(f"{key}[{index}]", item)
+    else:
+        yield key, value if isinstance(value, str) else json.dumps(value)
+
+
+def _invoke_http_endpoint(resource, input_data):
+    """arn:aws:states:::http:invoke — call an HTTP API through an EventBridge connection.
+
+    Where MiniStack differs from AWS on purpose: AWS takes only an https ApiEndpoint on a public domain name with no
+    port, and refuses http, an IP address, localhost and a port. A local API is none of those, so they are accepted
+    here, as API destinations accept them. Transform (URL-encoded bodies) is not implemented and fails the task.
+    """
+    import socket
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from ministack.services import eventbridge
+
+    def parameter_error(message):
+        parameters = json.dumps(input_data, separators=(",", ":"))
+        return _ExecutionError(
+            "States.Runtime", f"The Parameters '{parameters}' could not be used to start the Task: [{message}]")
+
+    endpoint = input_data.get("ApiEndpoint")
+    conn_arn = (input_data.get("InvocationConfig") or input_data.get("Authentication") or {}).get("ConnectionArn")
+    task_headers = input_data.get("Headers") or {}
+    # QueryParameters that are not an object are left out of the request.
+    task_query = input_data.get("QueryParameters") if isinstance(input_data.get("QueryParameters"), dict) else {}
+    if conn_arn is None:
+        raise parameter_error("The field 'InvocationConfig.ConnectionArn' is required but was missing")
+    if not conn_arn:
+        raise parameter_error("The value for the 'ConnectionArn' field must have a minimum length of 1")
+    if input_data.get("Method") not in _HTTP_TASK_METHODS:
+        raise parameter_error(
+            "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]")
+    url = urllib.parse.urlsplit(endpoint) if isinstance(endpoint, str) else None
+    if url is None or not url.scheme or not url.netloc:
+        raise parameter_error("The value for the 'ApiEndpoint' field is not valid")
+    if url.scheme not in ("http", "https"):
+        raise parameter_error("The value for the 'ApiEndpoint' field must have the scheme 'https'")
+    if url.query:
+        raise parameter_error("The value for the 'ApiEndpoint' field must not contain query parameters")
+    denied = [name.lower() for name in task_headers
+              if name.lower() in _HTTP_TASK_DENIED_HEADERS or name.lower().startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES)]
+    if denied:
+        raise parameter_error(f"The 'Headers' field contains unsupported values: [{', '.join(denied)}]")
+    if (input_data.get("Transform") or {}).get("RequestBodyEncoding", "NONE") != "NONE":
+        raise _ExecutionError(
+            "States.Runtime", "Transform.RequestBodyEncoding is not yet implemented in MiniStack's HTTP Task")
+
+    # arn:aws:events:<region>:<account>:connection/<name>[/<uuid>]
+    conn_name = conn_arn.split(":connection/", 1)[-1].split("/", 1)[0]
+    conn = eventbridge._connections.get(conn_name)
+    if conn is None:
+        raise _ExecutionError("Events.ConnectionResource.ResourceNotFound", "Connection resource not found.")
+    if conn.get("ConnectionState") != "AUTHORIZED":
+        raise _ExecutionError(
+            "Events.ConnectionResource.InvalidConnectionState",
+            "Connection resource is not authorized. This is likely a configuration issue with your connection.")
+
+    # The connection's own parameters win over the task's, for a header whatever its case.
+    invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
+    conn_query = eventbridge._connection_params_map(invocation.get("QueryStringParameters"))
+    conn_body = eventbridge._connection_params_map(invocation.get("BodyParameters"))
+    headers = {name.lower(): (name, value) for name, value in task_headers.items()}
+    headers.update((name.lower(), (name, value)) for name, value in
+                   eventbridge._connection_params_map(invocation.get("HeaderParameters")).items())
+
+    body = input_data.get("RequestBody")
+    if conn_body:
+        if body is not None and not isinstance(body, dict):
+            raise _ExecutionError(
+                "States.Runtime", "Cannot merge connection body authorization parameters with request body.")
+        body = {**(body or {}), **conn_body}
+    data = None
+    if body is not None:
+        data = (body if isinstance(body, str) else json.dumps(body, separators=(",", ":"))).encode("utf-8")
+        content_type = "application/json; charset=UTF-8" if isinstance(body, dict) else "*/*; charset=UTF-8"
+        headers.setdefault("content-type", ("Content-Type", content_type))
+    # A task cannot replace these two: its own User-Agent or Range is dropped.
+    headers["user-agent"] = ("User-Agent", f"Amazon|StepFunctions|HttpInvoke|{get_region()}")
+    headers["range"] = ("Range", "bytes=0-262144")
+
+    query = {name: value for name, value in task_query.items() if name not in conn_query} | conn_query
+    pairs = [pair for name, value in query.items() for pair in _http_task_query_pairs(name, value)]
+    if pairs:
+        endpoint += "?" + "&".join(
+            f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(text, safe='')}" for name, text in pairs)
+    request = urllib.request.Request(
+        endpoint, data=data, method=input_data["Method"],
+        headers={**dict(headers.values()),
+                 **eventbridge._connection_auth_headers(conn, (get_account_id(), get_region(), conn_name))})
+    try:
+        with eventbridge._http_open(request, timeout=_HTTP_TASK_TIMEOUT_SECONDS) as response:
+            status, response_headers, raw = response.status, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        status, response_headers, raw = exc.code, exc.headers, exc.read()
+    except OSError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.gaierror):
+            raise _ExecutionError(
+                "States.Http.IpError", f"Unable to resolve domain '{url.hostname}' to IpV4 address.") from None
+        if isinstance(reason, TimeoutError):
+            raise _ExecutionError("States.Http.Socket", "Request timed out.") from None
+        # AWS cannot reach a closed local port (it refuses localhost and ports), so it has no answer to copy here.
+        raise _ExecutionError("States.Http.Socket", str(reason)) from None
+
+    status_text = _HTTP_TASK_STATUS_TEXT.get(status)
+    if status == 401:
+        conn["ConnectionState"] = "DEAUTHORIZED"
+        conn["StateReason"] = ("Request failed due to Unauthorized access. Authorization could not be granted "
+                               "using the credentials provided in the request.")
+    if not 200 <= status < 300:
+        raise _ExecutionError(f"States.Http.StatusCode.{status}", status_text)
+    media_type = response_headers.get_content_type()
+    if media_type == "application/octet-stream" or media_type.startswith(("image/", "video/", "audio/")):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Unsupported response content-type '{media_type}'. Please see documentation for list of unsupported content-types.")
+    result = {
+        "Headers": {name: response_headers.get_all(name) for name in dict.fromkeys(response_headers.keys())},
+        "StatusCode": status,
+    }
+    if status_text:
+        result["StatusText"] = status_text
+    if raw:
+        result["ResponseBody"] = raw.decode("utf-8", errors="replace")
+        if media_type == "application/json":
+            try:
+                result["ResponseBody"] = json.loads(result["ResponseBody"])
+            except ValueError:
+                pass
+    return result
+
+
 _SERVICE_DISPATCH = {
+    "arn:aws:states:::http:invoke": _invoke_http_endpoint,
     "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
     "arn:aws:states:::sns:publish": _invoke_sns_publish,
     "arn:aws:states:::events:putEvents": _invoke_events_put_events,
