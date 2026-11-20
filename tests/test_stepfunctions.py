@@ -11319,3 +11319,208 @@ def test_sfn_definition_structure_errors(sfn, definition, expected):
     finally:
         sfn.delete_state_machine(stateMachineArn=arn)
     assert sfn.validate_state_machine_definition(definition=good)["result"] == "OK"
+
+
+@contextmanager
+def _http_task_endpoint():
+    """A local API for the HTTP Task to call, the same one the AWS captures used. The first path segment picks the
+    answer: /status/<code>, /text, /jsonastext, /empty, /binary, /video, and anything else echoes the request as JSON.
+    Yields its URL."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            path, _, query = self.path.partition("?")
+            kind, _, arg = path.strip("/").partition("/")
+            seen = json.dumps({
+                "method": self.command, "path": path, "rawQueryString": query,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": self.rfile.read(length).decode("utf-8") if length else None,
+            })
+            status, content_type, payload = {
+                "status": (int(arg) if kind == "status" else 200, "application/json", seen),
+                "text": (200, "text/plain", "plain text answer"),
+                "jsonastext": (200, "text/plain", '{"a":1}'),
+                "empty": (204, "application/json", ""),
+                "binary": (200, "application/octet-stream", "\x00\x01"),
+                "video": (200, "video/mp4", "\x00\x01"),
+            }.get(kind, (200, "application/json; charset=utf-8", seen))
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+        do_GET = do_PATCH = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+
+
+@contextmanager
+def _http_task_connection(eb, **auth_parameters):
+    name = f"sfn-http-conn-{_uuid_mod.uuid4().hex[:8]}"
+    arn = eb.create_connection(
+        Name=name, AuthorizationType="BASIC",
+        AuthParameters={"BasicAuthParameters": {"Username": "u", "Password": "p"}, **auth_parameters},
+    )["ConnectionArn"]
+    try:
+        yield name, arn
+    finally:
+        eb.delete_connection(Name=name)
+
+
+def _run_http_task(sfn, parameters, catch=False):
+    """Run one HTTP Task. Returns its output, or the catcher's when catch is set; a failed execution's description
+    otherwise."""
+    task = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": parameters, "End": True}
+    states = {"Call": task}
+    if catch:
+        task["Catch"] = [{"ErrorEquals": ["States.TaskFailed"], "Next": "Caught"}]
+        states["Caught"] = {"Type": "Pass", "End": True}
+    arn = sfn.create_state_machine(
+        name=f"sfn-http-{_uuid_mod.uuid4().hex[:8]}",
+        definition=json.dumps({"StartAt": "Call", "States": states}),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"orderId": "o-1"}))
+        desc = _wait_sfn(sfn, execution["executionArn"])
+        return json.loads(desc["output"]) if desc["status"] == "SUCCEEDED" else desc
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_http_task_request_and_result(sfn, eb):
+    """The request AWS builds and the result it returns: the connection wins a duplicate header, query or body key,
+    and a task cannot replace User-Agent or Range (AWS capture 2026-11-20, us-west-2)."""
+    invocation = {
+        "HeaderParameters": [{"Key": "X-Source", "Value": "connection"}],
+        "QueryStringParameters": [{"Key": "tenant", "Value": "connection"}],
+        "BodyParameters": [{"Key": "mode", "Value": "connection"}],
+    }
+    with _http_task_endpoint() as url, _http_task_connection(eb, InvocationHttpParameters=invocation) as (_, conn):
+        output = _run_http_task(sfn, {
+            "ApiEndpoint.$": f"States.Format('{url}/v1/orders/{{}}', $.orderId)",
+            "Method": "PATCH",
+            "InvocationConfig": {"ConnectionArn": conn},
+            "Headers": {"x-source": "task", "X-Request-Id": "r-1", "User-Agent": "mine", "Range": "bytes=0-1"},
+            "QueryParameters": {"tenant": "task", "fields": "status"},
+            "RequestBody": {"status": "SHIPPED", "mode": "task"},
+        })
+        assert output["StatusCode"] == 200
+        assert output["StatusText"] == "OK"
+        assert output["Headers"]["Content-Type"] == ["application/json; charset=utf-8"]
+        request = output["ResponseBody"]
+        assert request["method"] == "PATCH"
+        assert (request["path"], request["rawQueryString"]) == ("/v1/orders/o-1", "fields=status&tenant=connection")
+        assert request["body"] == '{"status":"SHIPPED","mode":"connection"}'
+        assert request["headers"]["authorization"] == "Basic dTpw"  # base64("u:p")
+        assert request["headers"]["x-source"] == "connection"
+        assert request["headers"]["x-request-id"] == "r-1"
+        assert request["headers"]["content-type"] == "application/json; charset=UTF-8"
+        assert request["headers"]["user-agent"] == "Amazon|StepFunctions|HttpInvoke|us-east-1"
+        assert request["headers"]["range"] == "bytes=0-262144"
+
+
+def test_sfn_http_task_query_and_body_encoding(sfn, eb):
+    """Query values are percent-encoded with a[0] and a[k] keys, an empty list is left out, and a body that is not
+    an object goes out as '*/*; charset=UTF-8', also on a GET (AWS capture 2026-11-20)."""
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (_, conn):
+        request = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn},
+            "QueryParameters": {"q": "a b&c", "list": ["x", "y"], "o": {"k": "v"}, "n": 5, "b": True, "s": "é/+",
+                                "z": None, "e": "", "f": 1.5, "none": []},
+            "RequestBody": "plain string",
+        })["ResponseBody"]
+        assert request["rawQueryString"] == (
+            "q=a%20b%26c&list%5B0%5D=x&list%5B1%5D=y&o%5Bk%5D=v&n=5&b=true&s=%C3%A9%2F%2B&z=null&e=&f=1.5")
+        assert request["body"] == "plain string"
+        assert request["headers"]["content-type"] == "*/*; charset=UTF-8"
+        ignored = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn},
+            "QueryParameters": "a=1&b=2",
+        })["ResponseBody"]
+        assert ignored["rawQueryString"] == ""
+
+
+def test_sfn_http_task_response_body(sfn, eb):
+    """Only an application/json body is parsed, an empty body leaves ResponseBody out, and a binary one fails the
+    task (AWS capture 2026-11-20)."""
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (_, conn):
+        def call(path):
+            return _run_http_task(
+                sfn, {"ApiEndpoint": f"{url}/{path}", "Method": "GET", "InvocationConfig": {"ConnectionArn": conn}})
+
+        assert call("text")["ResponseBody"] == "plain text answer"
+        assert call("jsonastext")["ResponseBody"] == '{"a":1}'
+        assert call("status/201")["StatusText"] == "Created"
+        empty = call("empty")
+        assert (empty["StatusCode"], empty["StatusText"], "ResponseBody" in empty) == (204, "No Content", False)
+        assert "StatusText" not in call("status/299")
+        for path, media_type in (("binary", "application/octet-stream"), ("video", "video/mp4")):
+            failed = call(path)
+            assert (failed["error"], failed["cause"]) == (
+                "States.Runtime",
+                f"Unsupported response content-type '{media_type}'. "
+                "Please see documentation for list of unsupported content-types.")
+
+
+def test_sfn_http_task_failed_calls(sfn, eb):
+    """A non-2xx answer fails as States.Http.StatusCode.<code> with Step Functions' phrase for the code as Cause,
+    or none when it has no phrase. A 401 also deauthorizes the connection (AWS capture 2026-11-20)."""
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (name, conn):
+        def call(endpoint, arn=conn):
+            return _run_http_task(
+                sfn, {"ApiEndpoint": endpoint, "Method": "GET", "InvocationConfig": {"ConnectionArn": arn}}, catch=True)
+
+        assert call(f"{url}/status/404") == {"Error": "States.Http.StatusCode.404", "Cause": "Not Found"}
+        assert call(f"{url}/status/422") == {"Error": "States.Http.StatusCode.422", "Cause": "Unprocessable Content"}
+        assert call(f"{url}/status/301") == {"Error": "States.Http.StatusCode.301", "Cause": "Moved Permanently"}
+        assert call(f"{url}/status/418") == {"Error": "States.Http.StatusCode.418", "Cause": None}
+        assert call(f"https://sfn-http-{_uuid_mod.uuid4().hex[:8]}.invalid/echo")["Error"] == "States.Http.IpError"
+        assert call(f"{url}/echo", arn=conn.replace(name, "sfn-http-none")) == {
+            "Error": "Events.ConnectionResource.ResourceNotFound", "Cause": "Connection resource not found."}
+
+        assert call(f"{url}/status/401") == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        described = eb.describe_connection(Name=name)
+        assert described["ConnectionState"] == "DEAUTHORIZED"
+        assert described["StateReason"] == (
+            "Request failed due to Unauthorized access. Authorization could not be granted using the credentials "
+            "provided in the request.")
+        assert call(f"{url}/echo") == {
+            "Error": "Events.ConnectionResource.InvalidConnectionState",
+            "Cause": "Connection resource is not authorized. This is likely a configuration issue with your connection."}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"Method": "TRACE"}, "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
+    ({"ApiEndpoint": "not a url"}, "The value for the 'ApiEndpoint' field is not valid"),
+    ({"ApiEndpoint": "http://127.0.0.1:9/echo?a=1"}, "The value for the 'ApiEndpoint' field must not contain query parameters"),
+    ({"Headers": {"Authorization": "Bearer x", "X-Amz-Date": "x", "Accept": "x"}},
+     "The 'Headers' field contains unsupported values: [authorization, x-amz-date]"),
+    ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
+    ({"InvocationConfig": {"ConnectionArn": ""}}, "The value for the 'ConnectionArn' field must have a minimum length of 1"),
+    ({"ApiEndpoint": "ftp://example.com/echo"}, "The value for the 'ApiEndpoint' field must have the scheme 'https'"),
+    ({"ApiEndpoint": "http://127.0.0.1:9/echo?a=1", "Method": "TRACE"},
+     "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
+])
+def test_sfn_http_task_refuses_parameters(sfn, change, message):
+    """Parameters the task cannot start with fail it as States.Runtime (AWS capture 2026-11-20)."""
+    parameters = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+                  "InvocationConfig": {"ConnectionArn": "arn:aws:events:us-east-1:000000000000:connection/none"},
+                  **change}
+    failed = _run_http_task(sfn, parameters)
+    assert failed["error"] == "States.Runtime"
+    assert failed["cause"] == (
+        f"The Parameters '{json.dumps(parameters, separators=(',', ':'))}' could not be used to start the Task: "
+        f"[{message}]")
