@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — MySQL and Aurora MySQL TLS certificates** — MySQL and Aurora MySQL databases now present a server certificate signed by the RDS CA served at `GET /_ministack/rds/ca.pem`, naming their DNS endpoints, as PostgreSQL databases already did; before, they presented a certificate from the mysql image's own auto-generated CA, which no client verifying the server could trust. Matches real AWS (us-east-1, RDS MySQL 8.4 and Aurora MySQL 3), where the certificate chains to the regional RDS root and names the endpoint.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
