@@ -16385,7 +16385,8 @@ def test_lambda_create_function_checks_pass_role_and_the_function_arn_contract(a
 
 @pytest.mark.skipif(not shutil.which("node"), reason="needs node")
 @pytest.mark.parametrize("scheme", ["http", "https"])
-@pytest.mark.parametrize("host", ["localhost", "000000000000.localhost", "data-localhost", "sync-localhost"])
+@pytest.mark.parametrize("host", ["localhost", "000000000000.localhost", "data-localhost", "sync-localhost",
+                                  "abc123.appsync-api.us-east-1.localhost"])
 def test_lambda_node_worker_reaches_an_ipv4_gateway_through_prefixed_hosts(tmp_path, scheme, host):
     """The Node worker sends localhost and the SDK v3 prefixed hosts to 127.0.0.1, also over TLS."""
     import ssl

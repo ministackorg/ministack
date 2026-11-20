@@ -1887,6 +1887,71 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
         lam.delete_function(FunctionName=int_fn)
 
 
+def test_apigw_v2_events_carry_domain_prefix(apigw, lam):
+    """Payload 2.0 proxy and REQUEST authorizer events name domainPrefix, the first label of domainName."""
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    auth_fn, int_fn = f"v2-prefix-auth-{suffix}", f"v2-prefix-int-{suffix}"
+    auth_code = (
+        b"def handler(event, context):\n"
+        b"    rc = event['requestContext']\n"
+        b"    return {'isAuthorized': True, 'context': {'domainName': rc['domainName'],\n"
+        b"                                              'domainPrefix': rc.get('domainPrefix')}}\n"
+    )
+    int_code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    rc = event['requestContext']\n"
+        b"    return {'statusCode': 200, 'body': json.dumps({'domainName': rc['domainName'],\n"
+        b"        'domainPrefix': rc.get('domainPrefix'), 'authorizer': rc['authorizer']['lambda']})}\n"
+    )
+    for name, code in ((auth_fn, auth_code), (int_fn, int_code)):
+        lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                            Handler="index.handler", Code={"ZipFile": _make_zip(code)})
+    api_id = apigw.create_api(Name=f"v2-prefix-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id, AuthorizerType="REQUEST", Name="prefix",
+            AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+            AuthorizerPayloadFormatVersion="2.0", EnableSimpleResponses=True,
+            IdentitySource=["$request.header.Authorization"], AuthorizerResultTtlInSeconds=0,
+        )["AuthorizerId"]
+        int_id = apigw.create_integration(
+            ApiId=api_id, IntegrationType="AWS_PROXY", PayloadFormatVersion="2.0",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+        )["IntegrationId"]
+        apigw.create_route(ApiId=api_id, RouteKey="GET /ctx", Target=f"integrations/{int_id}",
+                           AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        req = _urlreq.Request(f"http://{host}/ctx", headers={"Host": host, "Authorization": "x"})
+        seen = json.loads(_urlreq.urlopen(req).read())
+        assert seen["domainPrefix"] == api_id and seen["domainName"].split(".")[0] == api_id
+        assert seen["authorizer"]["domainPrefix"] == api_id
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=auth_fn)
+        lam.delete_function(FunctionName=int_fn)
+
+
+def test_apigw_local_cognito_jwks_is_read_in_process(monkeypatch):
+    """A MiniStack pool's keys never go over the wire, so a TLS-only gateway cannot refuse the fetch."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import cognito
+
+    async def _no_network(*_args):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _no_network)
+    url = asyncio.run(apigw_mod._resolve_jwks_url(
+        {"jwtConfiguration": {"issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc"}}))
+    keys = asyncio.run(apigw_mod._fetch_jwks(url))
+    assert keys == json.loads(cognito.well_known_jwks("us-east-1_abc")[2])
+
+
 def test_apigw_request_authorizer_iam_policy_response_enforced_in_data_plane(apigw, lam):
     """A CUSTOM route backed by a REQUEST (Lambda) authorizer using the IAM
     policy response format (the default when `enableSimpleResponses` is not

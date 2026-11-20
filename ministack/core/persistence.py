@@ -154,6 +154,9 @@ def save_state(service: str, data: dict) -> None:
                     {"__ministack_format__": _state_format_version(service), "payload": data},
                     f, default=_json_default,
                 )
+                # On disk before the rename, or a host that stops right after shutdown keeps an empty file.
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         except BaseException:
             # Clean up temp file on any failure to avoid stale partial writes

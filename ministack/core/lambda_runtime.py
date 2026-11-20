@@ -370,7 +370,7 @@ run()
 # MiniStack's own endpoint for Node workers is http(s)://localhost:<port>, so
 # the host an SDK v3 operation builds with a prefix (ServiceDiscovery "data-",
 # Step Functions "sync-", the KeyValueStore "<account>.") is a valid URL. The
-# hook sends localhost, <label>.localhost and <label>-localhost to 127.0.0.1
+# hook sends localhost, any name under localhost and <label>-localhost to 127.0.0.1
 # (the gateway may listen on IPv4 only) and checks the gateway certificate
 # against localhost. It runs only when MiniStack set AWS_ENDPOINT_URL.
 GATEWAY_LOOPBACK_ENV = "_MINISTACK_GATEWAY_LOOPBACK"
@@ -379,7 +379,7 @@ NODE_GATEWAY_LOOPBACK_BOOTSTRAP = r"""
   if (process.env.%s !== "1") return;
   const dns = require("dns");
   const tls = require("tls");
-  const gateway = /^(?:[a-z0-9-]+[.-])?localhost$/i;
+  const gateway = /^(?:[a-z0-9-]+\.)*(?:[a-z0-9-]+-)?localhost$/i;
   const lookup = dns.lookup;
   dns.lookup = function (hostname, options, callback) {
     if (typeof hostname === "string" && gateway.test(hostname)) hostname = "127.0.0.1";

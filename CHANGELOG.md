@@ -7,6 +7,19 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **AppSync Events — a channel namespace without auth modes** — it took the API's `defaultPublishAuthModes` for both publish and subscribe, so a subscriber the API's subscribe default allows was refused. It now keeps no modes of its own: `CreateChannelNamespace` leaves them out of its answer, reads report `[]`, and each call takes the API's current publish or subscribe default, also after `UpdateApi`. Reported by @Tanato.
+- **Cognito — PostAuthentication on Hosted UI sign-in** — a sign-in through `POST /login` never invoked the trigger. It now runs before the authorization code is issued. A trigger that fails gives no code, and the sign-in page answers 401 with "PostAuthentication failed with error <message>.". `POST /login` also runs off the event loop, so a trigger that calls MiniStack does not stall it. Reported by @Tanato.
+- **Cognito — `identity_provider=COGNITO` on `/oauth2/authorize`** — it was looked up as a federated provider and answered "Identity provider COGNITO not found.". It now shows the pool's own sign-in page, as Amplify's `signInWithRedirect` expects. Reported by @Tanato.
+- **API Gateway — `requestContext.domainPrefix` in HTTP API events** — payload 2.0 proxy events and 2.0 `REQUEST` authorizer events now carry it, the first label of `domainName`. Reported by @Tanato.
+- **API Gateway — JWT and Cognito authorizers under `USE_SSL`** — the keys of a MiniStack user pool were fetched over plain HTTP, which a TLS-only gateway refuses, so every token was rejected. They are now read in-process. Reported by @Tanato.
+- **CloudFront — alternate domain names under the MiniStack host** — an alias such as `docs.stage.localhost` was taken for an S3 virtual-hosted request and answered `NoSuchBucket`. The distribution now serves it unless a bucket by that name exists. Reported by @Tanato.
+- **CloudFront — `aws:SourceAccount` on origin access control fetches** — the request context carried only `aws:SourceArn`, so a bucket policy conditioned on `AWS:SourceAccount` denied every fetch. It now also carries the distribution's account. Reported by @Tanato.
+- **EventBridge — `ListEventSources`** — it always answered an empty list. It now lists the partner event sources offered to the account, with `Arn`, `CreatedBy`, `CreationTime`, `Name` and `State`, `PENDING` until the account creates the matching partner event bus and `ACTIVE` after. Reported by @Tanato.
+- **EventBridge — tags on a rule of a partner event bus** — `TagResource` and `ListTagsForResource` answered `ResourceNotFoundException` for an ARN like `rule/aws.partner/<partner>/<source>/<rule>`. They now resolve it. Reported by @Tanato.
+- **Lambda — Node.js handlers and `*.localhost` hosts** — under the local executor only one label below `localhost` resolved, so a host such as an Event API's `<api>.appsync-api.<region>.localhost` failed with `ENOTFOUND`. Any name under `localhost` now reaches MiniStack. Reported by @Tanato.
+- **Persistence — state files after a host stop** — the state saved at shutdown was renamed into place without being synced, so a host that stopped right after could bring it back as an empty file. Each file is now synced before the rename. Reported by @Tanato.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
