@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 import io
 import json
@@ -2775,3 +2776,260 @@ def test_sqs_sender_id_is_the_user_or_role_session(sqs):
                                      MessageSystemAttributeNames=["SenderId"]).get("Messages", []):
             seen[m["Body"]] = m["Attributes"]["SenderId"]
     assert seen == {"from-user": user["UserId"], "from-role-session": f"{role['RoleId']}:my-session"}
+
+
+# ── Message move tasks (dead-letter queue redrive) ─────────
+# Expected codes, messages and shapes were captured from real AWS (us-east-1).
+
+def _move_queues(sqs, fifo=False):
+    """A DLQ, a source queue that dead-letters into it after one receive, and another queue."""
+    sfx = ".fifo" if fifo else ""
+    attrs = {"FifoQueue": "true", "ContentBasedDeduplication": "true"} if fifo else {}
+    tag = _uuid_mod.uuid4().hex[:8]
+
+    def make(name, **extra):
+        url = sqs.create_queue(QueueName=f"mm-{name}-{tag}{sfx}", Attributes={**attrs, **extra})["QueueUrl"]
+        arn = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+        return url, arn
+
+    dlq = make("dlq")
+    src = make("src", RedrivePolicy=json.dumps({"deadLetterTargetArn": dlq[1], "maxReceiveCount": "1"}))
+    other = make("other")
+    return dlq, src, other
+
+
+def _dead_letter(sqs, src_url, bodies, **send_kw):
+    for body in bodies:
+        sqs.send_message(QueueUrl=src_url, MessageBody=body, **send_kw)
+    for _ in range(2):  # maxReceiveCount 1: the second receive moves them to the DLQ
+        sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=10, VisibilityTimeout=0)
+
+
+def _visible(sqs, url):
+    return int(sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"])["Attributes"]["ApproximateNumberOfMessages"])
+
+
+def _error(fn, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        fn(**kwargs)
+    r = exc.value.response
+    return r["ResponseMetadata"]["HTTPStatusCode"], r["Error"]["Code"], r["Error"]["Message"]
+
+
+def test_sqs_message_move_back_to_source(sqs):
+    (dlq_url, dlq_arn), (src_url, src_arn), _ = _move_queues(sqs)
+    sqs.send_message(QueueUrl=src_url, MessageBody="m0",
+                     MessageAttributes={"kind": {"DataType": "String", "StringValue": "k0"}})
+    _dead_letter(sqs, src_url, ["m1"])
+    dead = sqs.receive_message(QueueUrl=dlq_url, MaxNumberOfMessages=10, VisibilityTimeout=0,
+                               MessageAttributeNames=["All"])["Messages"]
+    assert sorted(m["Body"] for m in dead) == ["m0", "m1"]
+
+    handle = sqs.start_message_move_task(SourceArn=dlq_arn)["TaskHandle"]
+    assert json.loads(base64.b64decode(handle))["sourceArn"] == dlq_arn
+
+    task = sqs.list_message_move_tasks(SourceArn=dlq_arn)["Results"]
+    assert task == [{"Status": "COMPLETED", "SourceArn": dlq_arn, "ApproximateNumberOfMessagesMoved": 2,
+                     "ApproximateNumberOfMessagesToMove": 2, "StartedTimestamp": task[0]["StartedTimestamp"]}]
+    assert _visible(sqs, dlq_url) == 0
+    moved = sqs.receive_message(QueueUrl=src_url, MaxNumberOfMessages=10, AttributeNames=["All"],
+                                MessageAttributeNames=["All"])["Messages"]
+    by_body = {m["Body"]: m for m in moved}
+    assert sorted(by_body) == ["m0", "m1"]
+    old_ids = {m["MessageId"] for m in dead}
+    for m in moved:
+        # A moved message is a new message: new id, receive count 1 on this first receive,
+        # and no DeadLetterQueueSourceArn.
+        assert m["MessageId"] not in old_ids
+        assert m["Attributes"]["ApproximateReceiveCount"] == "1"
+        assert "DeadLetterQueueSourceArn" not in m["Attributes"]
+    assert by_body["m0"]["MessageAttributes"] == {"kind": {"StringValue": "k0", "DataType": "String"}}
+    assert by_body["m0"]["MD5OfMessageAttributes"] == next(
+        m for m in dead if m["Body"] == "m0")["MD5OfMessageAttributes"]
+
+
+def test_sqs_message_move_to_destination(sqs):
+    (dlq_url, dlq_arn), _, (other_url, other_arn) = _move_queues(sqs)
+    for i in range(3):
+        sqs.send_message(QueueUrl=dlq_url, MessageBody=f"m{i}")
+    sqs.start_message_move_task(SourceArn=dlq_arn, DestinationArn=other_arn)
+    [task] = sqs.list_message_move_tasks(SourceArn=dlq_arn, MaxResults=10)["Results"]
+    assert task["Status"] == "COMPLETED"
+    assert task["DestinationArn"] == other_arn
+    assert task["ApproximateNumberOfMessagesMoved"] == 3
+    assert "MaxNumberOfMessagesPerSecond" not in task and "TaskHandle" not in task
+    assert (_visible(sqs, dlq_url), _visible(sqs, other_url)) == (0, 3)
+
+
+def test_sqs_message_move_fifo_keeps_group_and_dedup_id(sqs):
+    (dlq_url, dlq_arn), (src_url, _), _ = _move_queues(sqs, fifo=True)
+    _dead_letter(sqs, src_url, ["f0"], MessageGroupId="g1", MessageDeduplicationId="d0")
+    [dead] = sqs.receive_message(QueueUrl=dlq_url, AttributeNames=["All"], VisibilityTimeout=0)["Messages"]
+    sqs.start_message_move_task(SourceArn=dlq_arn)
+    assert sqs.list_message_move_tasks(SourceArn=dlq_arn)["Results"][0]["Status"] == "COMPLETED"
+    [moved] = sqs.receive_message(QueueUrl=src_url, AttributeNames=["All"])["Messages"]
+    assert moved["Body"] == "f0"
+    assert moved["MessageId"] != dead["MessageId"]
+    assert moved["Attributes"]["MessageGroupId"] == "g1"
+    assert moved["Attributes"]["MessageDeduplicationId"] == dead["Attributes"]["MessageDeduplicationId"]
+    assert int(moved["Attributes"]["SequenceNumber"]) > int(dead["Attributes"]["SequenceNumber"])
+
+
+def test_sqs_message_move_fails_without_message_source(sqs):
+    (dlq_url, dlq_arn), _, _ = _move_queues(sqs)
+    sqs.send_message(QueueUrl=dlq_url, MessageBody="sent straight to the DLQ")
+    sqs.start_message_move_task(SourceArn=dlq_arn)
+    [task] = sqs.list_message_move_tasks(SourceArn=dlq_arn)["Results"]
+    assert task["Status"] == "FAILED"
+    assert task["FailureReason"] == "CouldNotDetermineMessageSource"
+    assert task["ApproximateNumberOfMessagesMoved"] == 0
+    assert _visible(sqs, dlq_url) == 1  # the message stays in the DLQ
+
+
+def test_sqs_message_move_errors(sqs):
+    (dlq_url, dlq_arn), _, (other_url, other_arn) = _move_queues(sqs)
+    (_, fifo_arn), _, _ = _move_queues(sqs, fifo=True)
+    missing = dlq_arn + "-missing"
+    fmt = "You must use this format to specify the {}: arn:<partition>:<service>:<region>:<account-id>:<resource-id>"
+    start, list_, cancel = sqs.start_message_move_task, sqs.list_message_move_tasks, sqs.cancel_message_move_task
+    invalid = (400, "InvalidParameterValue")
+
+    assert _error(start, SourceArn=other_arn) == (*invalid, "Source queue must be configured as a Dead Letter Queue.")
+    assert _error(start, SourceArn=missing) == (
+        404, "ResourceNotFoundException", "The resource that you specified for the SourceArn parameter doesn't exist.")
+    assert _error(start, SourceArn="not-an-arn") == (*invalid, fmt.format("SourceArn"))
+    assert _error(start, SourceArn="") == (*invalid, fmt.format("SourceArn"))
+    assert _error(start, SourceArn=dlq_arn, DestinationArn="not-an-arn") == (*invalid, fmt.format("DestinationArn"))
+    assert _error(start, SourceArn=dlq_arn, DestinationArn=missing) == (
+        404, "ResourceNotFoundException", "The resource that you specified for the DestinationArn parameter doesn't exist.")
+    assert _error(start, SourceArn=dlq_arn, DestinationArn=fifo_arn) == (
+        *invalid, "The source queue and destination queue must be of the same queue type.")
+    for rate in (0, 501):
+        assert _error(start, SourceArn=dlq_arn, MaxNumberOfMessagesPerSecond=rate) == (
+            *invalid, "Value for parameter MaxNumberOfMessagesPerSecond is invalid. "
+                      "Reason: You must enter a number that's between 1 and 500.")
+
+    assert list_(SourceArn=other_arn)["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert "Results" not in list_(SourceArn=dlq_arn)
+    assert _error(list_, SourceArn=missing)[:2] == (404, "ResourceNotFoundException")
+    assert _error(list_, SourceArn="not-an-arn") == (*invalid, fmt.format("SourceArn"))
+    for n in (0, 11):
+        assert _error(list_, SourceArn=dlq_arn, MaxResults=n) == (
+            *invalid, "Value for parameter MaxResults is invalid. Reason: You must enter a number that's between 1 and 10.")
+
+    assert _error(cancel, TaskHandle="bm90LWEtaGFuZGxl") == (*invalid, "Value for parameter TaskHandle is invalid.")
+    unknown = base64.b64encode(json.dumps({"taskId": str(_uuid_mod.uuid4()), "sourceArn": dlq_arn}).encode()).decode()
+    assert _error(cancel, TaskHandle=unknown) == (404, "ResourceNotFoundException", "Task does not exist.")
+    done = start(SourceArn=dlq_arn)["TaskHandle"]  # empty DLQ: completes at once
+    assert list_(SourceArn=dlq_arn)["Results"][0]["Status"] == "COMPLETED"
+    assert _error(cancel, TaskHandle=done) == (*invalid, "Only active tasks can be cancelled.")
+    sqs.delete_queue(QueueUrl=dlq_url)
+    assert _error(cancel, TaskHandle=done) == (
+        404, "ResourceNotFoundException", "The resource that you specified for the SourceArn parameter doesn't exist.")
+
+
+def test_sqs_message_move_error_wire_format(monkeypatch):
+    *_, (_, dest_arn) = _move_inproc(monkeypatch)
+    body = json.dumps({"SourceArn": dest_arn}).encode()
+    status, headers, raw = asyncio.run(sqs_svc.handle_request(
+        "POST", "/", {"x-amz-target": "AmazonSQS.StartMessageMoveTask"}, body, {}))
+    assert status == 400
+    assert headers["x-amzn-query-error"] == "InvalidParameterValue;Sender"
+    assert json.loads(raw)["__type"] == "InvalidParameterValueException"
+
+
+def _move_inproc(monkeypatch):
+    monkeypatch.setattr(sqs_svc, "_move_tasks", AccountRegionScopedDict())
+    clock, create, counts, _ = _sqs_inproc(monkeypatch)
+    tag = _uuid_mod.uuid4().hex[:8]
+    dlq = create(f"mm-dlq-{tag}")
+    dlq_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": dlq, "AttributeNames": ["QueueArn"]}, dlq)["Attributes"]["QueueArn"]
+    create(f"mm-src-{tag}", RedrivePolicy=json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "1"}))
+    dest = create(f"mm-dest-{tag}")
+    dest_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": dest, "AttributeNames": ["QueueArn"]}, dest)["Attributes"]["QueueArn"]
+    for i in range(20):
+        sqs_svc._act_send_message({"QueueUrl": dlq, "MessageBody": f"m{i}"}, dlq)
+
+    def call(action, **data):
+        return asyncio.run(sqs_svc._dispatch(action, data, ""))
+
+    return clock, counts, call, (dlq, dlq_arn), (dest, dest_arn)
+
+
+def test_sqs_message_move_rate(monkeypatch):
+    clock, counts, call, (dlq, dlq_arn), (dest, dest_arn) = _move_inproc(monkeypatch)
+    handle = call("StartMessageMoveTask", SourceArn=dlq_arn, DestinationArn=dest_arn,
+                  MaxNumberOfMessagesPerSecond=2)["TaskHandle"]
+    clock.now += 3
+    [task] = call("ListMessageMoveTasks", SourceArn=dlq_arn)["Results"]
+    assert (task["Status"], task["TaskHandle"], task["MaxNumberOfMessagesPerSecond"]) == ("RUNNING", handle, 2)
+    assert (task["ApproximateNumberOfMessagesMoved"], task["ApproximateNumberOfMessagesToMove"]) == (6, 20)
+    assert counts(dlq)[0] == 14 and counts(dest)[0] == 6
+    clock.now += 10
+    [task] = call("ListMessageMoveTasks", SourceArn=dlq_arn)["Results"]
+    assert (task["Status"], task["ApproximateNumberOfMessagesMoved"]) == ("COMPLETED", 20)
+
+
+def test_sqs_message_move_cancel(monkeypatch):
+    clock, counts, call, (dlq, dlq_arn), (dest, dest_arn) = _move_inproc(monkeypatch)
+    handle = call("StartMessageMoveTask", SourceArn=dlq_arn, DestinationArn=dest_arn,
+                  MaxNumberOfMessagesPerSecond=1)["TaskHandle"]
+    clock.now += 4
+    with pytest.raises(sqs_svc._Err) as exc:
+        call("StartMessageMoveTask", SourceArn=dlq_arn)
+    assert exc.value.message.startswith("There is already a task running.")
+    assert call("CancelMessageMoveTask", TaskHandle=handle) == {"ApproximateNumberOfMessagesMoved": 4}
+    [task] = call("ListMessageMoveTasks", SourceArn=dlq_arn)["Results"]
+    assert task["Status"] == "CANCELLING" and "TaskHandle" not in task
+    # Cancelling: a second cancel answers again, a new task is still refused.
+    assert call("CancelMessageMoveTask", TaskHandle=handle) == {"ApproximateNumberOfMessagesMoved": 4}
+    with pytest.raises(sqs_svc._Err):
+        call("StartMessageMoveTask", SourceArn=dlq_arn)
+    clock.now += 5
+    [task] = call("ListMessageMoveTasks", SourceArn=dlq_arn)["Results"]
+    assert (task["Status"], task["ApproximateNumberOfMessagesMoved"]) == ("CANCELLED", 4)
+    assert counts(dlq)[0] == 16 and counts(dest)[0] == 4
+    with pytest.raises(sqs_svc._Err) as exc:
+        call("CancelMessageMoveTask", TaskHandle=handle)
+    assert exc.value.message == "Only active tasks can be cancelled."
+    # A new task may start now; the list shows the newest first.
+    call("StartMessageMoveTask", SourceArn=dlq_arn, DestinationArn=dest_arn)
+    tasks = call("ListMessageMoveTasks", SourceArn=dlq_arn, MaxResults=10)["Results"]
+    assert [t["Status"] for t in tasks] == ["COMPLETED", "CANCELLED"]
+    assert tasks[0]["ApproximateNumberOfMessagesMoved"] == 16
+
+
+def test_sqs_message_move_query_protocol(monkeypatch):
+    clock, _, _, (dlq, dlq_arn), (dest, dest_arn) = _move_inproc(monkeypatch)
+
+    def query(action, **params):
+        body = urlencode({"Action": action, **params}).encode()
+        status, _, raw = asyncio.run(sqs_svc.handle_request(
+            "POST", "/", {"content-type": "application/x-www-form-urlencoded"}, body, {}))
+        return status, ET.fromstring(raw)
+
+    ns = "{http://queue.amazonaws.com/doc/2012-11-05/}"
+    status, doc = query("StartMessageMoveTask", SourceArn=dlq_arn, DestinationArn=dest_arn,
+                        MaxNumberOfMessagesPerSecond="500")
+    assert status == 200 and doc.findtext(f"{ns}StartMessageMoveTaskResult/{ns}TaskHandle")
+    clock.now += 1
+    status, doc = query("ListMessageMoveTasks", SourceArn=dlq_arn, MaxResults="10")
+    entry = doc.find(f"{ns}ListMessageMoveTasksResult/{ns}ListMessageMoveTasksResultEntry")
+    assert status == 200
+    assert entry.findtext(f"{ns}Status") == "COMPLETED"
+    assert entry.findtext(f"{ns}DestinationArn") == dest_arn
+    assert entry.findtext(f"{ns}MaxNumberOfMessagesPerSecond") == "500"
+    status, doc = query("StartMessageMoveTask", SourceArn=dest_arn)
+    assert status == 400 and doc.findtext(f"{ns}Error/{ns}Code") == "InvalidParameterValue"
+
+
+def test_sqs_message_move_tasks_persist(monkeypatch):
+    clock, _, call, (dlq, dlq_arn), (dest, dest_arn) = _move_inproc(monkeypatch)
+    call("StartMessageMoveTask", SourceArn=dlq_arn, DestinationArn=dest_arn, MaxNumberOfMessagesPerSecond=1)
+    saved = sqs_svc.get_state()["move_tasks"]
+    monkeypatch.setattr(sqs_svc, "_move_tasks", AccountRegionScopedDict())
+    sqs_svc._move_tasks.update(saved)
+    clock.now += 5
+    [task] = call("ListMessageMoveTasks", SourceArn=dlq_arn)["Results"]
+    assert (task["Status"], task["ApproximateNumberOfMessagesMoved"]) == ("RUNNING", 5)

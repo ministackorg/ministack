@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **SQS — dead-letter queue redrive** — `StartMessageMoveTask`, `ListMessageMoveTasks` and `CancelMessageMoveTask`, over JSON and Query. The source queue must be the dead-letter queue of some queue. A task moves the messages that are visible when it starts: to `DestinationArn`, or else each one back to its `DeadLetterQueueSourceArn`. It moves `MaxNumberOfMessagesPerSecond` (1–500) per second, or all of them at once without it. A moved message is a new message, with a new `MessageId` and `SentTimestamp`, a receive count of 0 and no `DeadLetterQueueSourceArn`. It keeps its body and message attributes, and on FIFO queues its `MessageGroupId` and `MessageDeduplicationId`. A message without a source and no `DestinationArn` fails the task with `CouldNotDetermineMessageSource` and stays in the queue. One task runs per source queue at a time: a second one gives `InvalidParameterValueException` "There is already a task running. Only one active task is allowed for a source queue arn at a given time.". `CancelMessageMoveTask` puts a running task in `CANCELLING` and then `CANCELLED`, and a task that is not active gives "Only active tasks can be cancelled.". `ListMessageMoveTasks` returns the newest tasks first (`MaxResults` 1–10, default 1) and gives the `TaskHandle` of a running task only. An unknown queue gives 404 `ResourceNotFoundException`. Reported by @kharabasz.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
