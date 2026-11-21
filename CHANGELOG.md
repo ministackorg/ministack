@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Lambda — end of a Docker invocation's log** — the log of a RIE invocation was read as soon as RIE answered, so it could miss `END` and `REPORT`, which RIE writes after the reply; the `LogResult` tail missed them. The log is now read until RIE's `REPORT` line, for at most 250 ms, the hard cap of the warm worker's log drain.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added

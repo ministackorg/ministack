@@ -4338,7 +4338,12 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed, raw_payload = body, True
-            logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
+            # The REPORT line can reach the container log after RIE has answered.
+            deadline = time.monotonic() + 0.25
+            while (f"REPORT RequestId: {request_id}" not in (logs := container.logs(
+                    stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip())
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
             # RIE owns the platform lines, including handler errors returned as HTTP 200.
