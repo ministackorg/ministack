@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **WAFv2 — web ACLs on CloudFront viewer requests** — a distribution's web ACL now decides each viewer request: rule priority, Allow, Block with a custom response, Count, CAPTCHA and Challenge (405 and 202, no tokens), labels, rule groups with overrides, inserted headers, rate-based rules, and the byte, regex, size and IP set statements. Of the AWS managed rules, the Core rule set `SizeRestrictions_*` and `NoUserAgent_HEADER` and `PROPFIND_METHOD` are evaluated. A rule MiniStack cannot decide never matches and is logged once.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
