@@ -5546,7 +5546,7 @@ def test_multiple_set_cookie_headers_all_carried_through(cf_stack):
 
 def test_aws_owned_origin_host_refused_before_any_socket():
     origin = {
-        "domain_name": "abcd1234.execute-api.us-east-1.amazonaws.com.",  # trailing dot
+        "domain_name": "unknown.us-east-1.amazonaws.com.",  # trailing dot; no MiniStack service
         "origin_path": "", "custom_headers": [], "s3_bucket": None,
         "http_port": 80, "https_port": 443, "protocol_policy": "https-only",
     }
@@ -6929,3 +6929,66 @@ def test_method_error_page_is_the_real_page(cloudfront):
     assert len(body) == 1053
     assert body.endswith(b"</PRE>\n<ADDRESS>\n</ADDRESS>\n</BODY></HTML>")
 
+
+# ---------------------------------------------------------------------------
+# Origin modification helpers (Developer Guide, "Helper methods for origin modification").
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def origin_helper_host(cloudfront, cf_backend):
+    """A distribution whose default origin is unreachable and whose viewer-request function picks the
+    origin by the first path segment, which it then removes."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    api_host = cf_backend["origin_domain"].replace(".localhost", ".us-east-1.amazonaws.com")
+    fn_arn = _create_function(cloudfront, f"cf-origin-helpers-{suffix}", f"""import cf from 'cloudfront';
+function handler(event) {{
+  const helper = event.request.uri.split('/')[1];
+  event.request.uri = event.request.uri.slice(helper.length + 1);
+  if (helper === 'update') cf.updateRequestOrigin({{ domainName: '{api_host}', originPath: '/up',
+    customHeaders: {{ 'x-picked': 'update' }}, customOriginConfig: {{ port: 443, protocol: 'https', sslProtocols: ['TLSv1.2'] }} }});
+  if (helper === 'unserved') cf.updateRequestOrigin({{ domainName: 'unknown.us-east-1.amazonaws.com' }});
+  if (helper === 'select') cf.selectRequestOriginById('api');
+  if (helper === 'missing') cf.selectRequestOriginById('no-such-origin');
+  if (helper === 'group') cf.createRequestOriginGroup({{ originIds: [{{ originId: 'api' }}, {{ originId: 'api-b' }}],
+    failoverCriteria: {{ statusCodes: [500] }} }});
+  return event.request;
+}}
+""".encode())
+    api = {"CustomOriginConfig": {"HTTPPort": int(GATEWAY_PORT), "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"},
+           "DomainName": cf_backend["origin_domain"]}
+    origins = [{"Id": "dead", "DomainName": "127.0.0.1",
+                "CustomOriginConfig": {"HTTPPort": 9, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"}},
+               {"Id": "api", **api}, {"Id": "api-b", "OriginPath": "/b", **api}]
+    return cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cf-origin-helpers-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": len(origins), "Items": origins},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "dead", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
+            "FunctionAssociations": {"Quantity": 1, "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}]},
+        },
+    })["Distribution"]["DomainName"]
+
+
+def test_update_request_origin_reaches_an_execute_api_host_this_ministack_serves(origin_helper_host, cf_backend):
+    _skip_without_node()
+    status, _headers, body = _get(origin_helper_host, "/update/x")
+    assert status == 200, body
+    echoed = json.loads(body)
+    assert echoed["path"] == "/up/x"
+    assert echoed["headers"]["x-picked"] == "update"
+    assert echoed["headers"]["host"] == cf_backend["origin_domain"].replace(".localhost", ".us-east-1.amazonaws.com")
+    assert _get(origin_helper_host, "/unserved/x")[0] == 502
+
+
+def test_select_request_origin_by_id_and_origin_group_failover(origin_helper_host):
+    _skip_without_node()
+    status, _headers, body = _get(origin_helper_host, "/select/x")
+    assert (status, json.loads(body)["path"]) == (200, "/x")
+    assert _get(origin_helper_host, "/missing/x")[0] == 502
+    status, _headers, body = _get(origin_helper_host, "/group/status/500")
+    assert (status, json.loads(body)["path"]) == (200, "/b/status/500")
+    status, _headers, body = _get(origin_helper_host, "/group/x")
+    assert (status, json.loads(body)["path"]) == (200, "/x")
+    # Origin failover applies to GET, HEAD and OPTIONS only.
+    assert _get(origin_helper_host, "/group/status/500", method="POST")[0] == 500

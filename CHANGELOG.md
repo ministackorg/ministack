@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFront — origin modification helpers** — a viewer-request function can pick the origin of a request with `cf.updateRequestOrigin()`, `cf.selectRequestOriginById()` and `cf.createRequestOriginGroup()`, which fails over to the second origin on its status codes, a timeout or a connection failure (GET, HEAD and OPTIONS only). An origin at an AWS host that MiniStack serves, such as `<apiId>.execute-api.<region>.amazonaws.com`, an S3 REST endpoint or a regional service endpoint, goes to MiniStack's own gateway, which also accepts AWS execute-api hosts now; other AWS hosts keep the `502`.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
