@@ -453,8 +453,10 @@ def _get_records(data):
         )
     page = _cap_page_bytes(page)
     next_position = position + len(page)
-    # The Streams Record shape carries no eventSourceARN (Lambda events do).
-    page = [{k: v for k, v in r.items() if k != "eventSourceARN"} for r in page]
+    # The Streams Record shape carries no eventSourceARN (Lambda events do),
+    # and spells userIdentity as {"Type", "PrincipalId"} (Lambda events use
+    # lowercase "type" and "principalId").
+    page = [_streams_record(r) for r in page]
     if closed and next_position >= closed["trimmed"] + len(closed["records"]):
         # "If set to null, the shard has been closed and the requested
         # iterator will not return any more data."
@@ -472,6 +474,14 @@ def _get_records(data):
         "Records": page,
         "NextShardIterator": next_iterator,
     })
+
+
+def _streams_record(record: dict) -> dict:
+    out = {k: v for k, v in record.items() if k != "eventSourceARN"}
+    identity = out.get("userIdentity")
+    if identity:
+        out["userIdentity"] = {"Type": identity["type"], "PrincipalId": identity["principalId"]}
+    return out
 
 
 # ---------------------------------------------------------------------------

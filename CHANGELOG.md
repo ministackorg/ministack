@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **DynamoDB Streams — TTL deletions** — an item removed by the TTL reaper wrote nothing to the table's stream. It now writes a `REMOVE` record, shaped by the stream's `StreamViewType`, with `userIdentity` set to the DynamoDB service. `GetRecords` returns it as `{"Type": "Service", "PrincipalId": "dynamodb.amazonaws.com"}`, as captured from AWS; a Lambda event source mapping sees it with lowercase `type` and `principalId`, so the filters AWS documents for TTL deletions match. Reported by @fdrvrtm. Contributed by @emreocell.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added

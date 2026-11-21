@@ -995,9 +995,11 @@ def _next_stream_seq():
         return f"{int(time.time() * 1000):020d}{_stream_seq_counter:010d}"
 
 
-def _build_change_record(table: dict, event_name: str, old_item: dict | None, new_item: dict | None, view_type: str) -> dict:
+def _build_change_record(table: dict, event_name: str, old_item: dict | None, new_item: dict | None, view_type: str,
+                         ttl: bool = False) -> dict:
     """Build a DynamoDB Streams-shaped change record. ``view_type`` controls
-    whether OldImage / NewImage are populated."""
+    whether OldImage / NewImage are populated. ``ttl`` marks a deletion made by
+    the TTL service, which AWS records with a service ``userIdentity``."""
     record: dict = {
         "eventID": new_uuid(),
         "eventName": event_name,
@@ -1027,11 +1029,16 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
     if view_type in ("NEW_AND_OLD_IMAGES", "NEW_IMAGE") and new_item:
         record["dynamodb"]["NewImage"] = new_item
 
+    if ttl:
+        # The Lambda event form, which event source mapping filters match;
+        # GetRecords answers the same identity with capitalised keys.
+        record["userIdentity"] = {"type": "Service", "principalId": "dynamodb.amazonaws.com"}
+
     return record
 
 
 def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, new_item: dict | None,
-                       replicate: bool = True):
+                       replicate: bool = True, ttl: bool = False):
     """Emit a change to DynamoDB Streams (if enabled) and to any ACTIVE Kinesis
     streaming destinations registered for this table.
 
@@ -1054,7 +1061,7 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
     # A PutItem/UpdateItem that changes no data writes no stream record.
     if streams_enabled and not (event_name == "MODIFY" and old_item == new_item):
         view_type = spec.get("StreamViewType", "NEW_AND_OLD_IMAGES")
-        record = _build_change_record(table, event_name, old_item, new_item, view_type)
+        record = _build_change_record(table, event_name, old_item, new_item, view_type, ttl=ttl)
         if table_name not in _stream_records:
             _stream_records[table_name] = []
         _stream_records[table_name].append(record)
@@ -1099,34 +1106,45 @@ def _fan_out_to_kinesis(table_name: str, record: dict) -> None:
 # TTL background reaper
 # ---------------------------------------------------------------------------
 
+def _reap_expired_items(now: float):
+    """Delete every item whose TTL attribute is at or before ``now``, writing
+    each deletion to the table's stream as AWS does for a TTL delete."""
+    with _lock:
+        for (account_id, region, table_name), setting in list(_ttl_settings.all_items()):
+            if setting.get("TimeToLiveStatus") != "ENABLED":
+                continue
+            attr = setting.get("AttributeName", "")
+            if not attr:
+                continue
+            table = _tables.get_scoped(account_id, region, table_name)
+            if not table:
+                continue
+            for pk_val, sk_map in list(table["items"].items()):
+                for sk_val, item in list(sk_map.items()):
+                    ttl_attr = item.get(attr)
+                    if ttl_attr is None:
+                        continue
+                    ttl_val = _extract_key_val(ttl_attr)
+                    try:
+                        expired = float(ttl_val) <= now
+                    except (ValueError, TypeError):
+                        continue
+                    if not expired:
+                        continue
+                    old_item = _remove_item(table, pk_val, sk_val)
+                    if old_item is not None:
+                        with request_scope(account_id, region):
+                            _emit_stream_event(table_name, "REMOVE", old_item, None,
+                                               replicate=False, ttl=True)
+                    logger.debug("TTL expired item %s/%s from %s", pk_val, sk_val, table_name)
+
+
 def _ttl_reaper():
     """Periodically delete items whose TTL attribute has expired."""
     while True:
         time.sleep(60)
-        now = time.time()
         try:
-            with _lock:
-                for (account_id, region, table_name), setting in list(_ttl_settings.all_items()):
-                    if setting.get("TimeToLiveStatus") != "ENABLED":
-                        continue
-                    attr = setting.get("AttributeName", "")
-                    if not attr:
-                        continue
-                    table = _tables.get_scoped(account_id, region, table_name)
-                    if not table:
-                        continue
-                    for pk_val, sk_map in list(table["items"].items()):
-                        for sk_val, item in list(sk_map.items()):
-                            ttl_attr = item.get(attr)
-                            if ttl_attr is None:
-                                continue
-                            ttl_val = _extract_key_val(ttl_attr)
-                            try:
-                                if float(ttl_val) <= now:
-                                    _remove_item(table, pk_val, sk_val)
-                                    logger.debug("TTL expired item %s/%s from %s", pk_val, sk_val, table_name)
-                            except (ValueError, TypeError):
-                                pass
+            _reap_expired_items(time.time())
         except Exception as exc:
             logger.error("TTL reaper error: %s", exc)
 

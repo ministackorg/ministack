@@ -611,3 +611,135 @@ def test_unknown_shard_is_resource_not_found(ddb, ddb_streams):
         assert exc.value.response["Error"]["Message"] == "Requested resource not found: Shard does not exist"
     finally:
         ddb.delete_table(TableName=name)
+
+
+# ---------------------------------------------------------------------------
+# TTL deletions (white-box: the reaper runs on a 60 s timer, so these call its
+# pass directly and read the stream through the public Streams handlers).
+# The expected record shape is a real AWS GetRecords capture of a TTL deletion
+# posted on ministackorg/ministack#2744 (eu-central-1, NEW_AND_OLD_IMAGES).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def ttl_state(streams_state):
+    ddb_service, streams_service, time = streams_state
+    saved_ttl = dict(ddb_service._ttl_settings._data)
+    try:
+        yield ddb_service, streams_service, time
+    finally:
+        ddb_service._ttl_settings._data.clear()
+        ddb_service._ttl_settings._data.update(saved_ttl)
+
+
+def _ttl_table(ddb_service, name, view_type="NEW_AND_OLD_IMAGES", stream_enabled=True):
+    account, region = "000000000000", "us-east-1"
+    table = {
+        "TableName": name,
+        "TableArn": f"arn:aws:dynamodb:{region}:{account}:table/{name}",
+        "pk_name": "pk",
+        "sk_name": None,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "items": {},
+    }
+    arn = None
+    if stream_enabled:
+        label = "2026-01-01T00:00:00.000"
+        arn = f"{table['TableArn']}/stream/{label}"
+        table["LatestStreamArn"] = arn
+        table["LatestStreamLabel"] = label
+        table["StreamSpecification"] = {"StreamEnabled": True, "StreamViewType": view_type}
+    ddb_service._tables[name] = table
+    ddb_service._ttl_settings[name] = {"TimeToLiveStatus": "ENABLED", "AttributeName": "expiresAt"}
+    return table, arn
+
+
+def _put(ddb_service, table, key, **attrs):
+    item = {"pk": {"S": key}, **attrs}
+    ddb_service._set_item(table, key, "__no_sort__", item)
+    return item
+
+
+def _read_stream(streams_service, arn):
+    return _json(streams_service._get_records({
+        "ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON"),
+    }))["Records"]
+
+
+@pytest.mark.parametrize("view_type", ["NEW_AND_OLD_IMAGES", "OLD_IMAGE", "NEW_IMAGE", "KEYS_ONLY"])
+def test_ttl_deletion_writes_remove_record_with_service_identity(ttl_state, view_type):
+    ddb_service, streams_service, time = ttl_state
+    name = f"ttl-stream-{view_type.lower().replace('_', '-')}"
+    table, arn = _ttl_table(ddb_service, name, view_type)
+    now = time.time()
+    expired = _put(ddb_service, table, "expired", expiresAt={"N": str(int(now) - 3600)}, v={"S": "x"})
+    _put(ddb_service, table, "live", expiresAt={"N": str(int(now) + 3600)})
+    _put(ddb_service, table, "no-ttl")
+
+    ddb_service._reap_expired_items(now)
+
+    assert sorted(table["items"]) == ["live", "no-ttl"]
+    records = _read_stream(streams_service, arn)
+    assert len(records) == 1
+    record = records[0]
+    assert record["eventName"] == "REMOVE"
+    assert record["eventSource"] == "aws:dynamodb"
+    assert record["eventVersion"] == "1.1"
+    # GetRecords spells the identity with capitalised keys, as AWS does.
+    assert record["userIdentity"] == {"Type": "Service", "PrincipalId": "dynamodb.amazonaws.com"}
+    assert "eventSourceARN" not in record
+    stream = record["dynamodb"]
+    assert stream["Keys"] == {"pk": {"S": "expired"}}
+    assert stream["StreamViewType"] == view_type
+    assert "NewImage" not in stream
+    if view_type in ("NEW_AND_OLD_IMAGES", "OLD_IMAGE"):
+        assert stream["OldImage"] == expired
+    else:
+        assert "OldImage" not in stream
+
+
+def test_ttl_deletion_record_matches_the_documented_event_source_mapping_filters(ttl_state):
+    """Lambda event source mappings see the lowercase identity, so the filters
+    AWS documents for TTL deletions must match the record the poller reads."""
+    import json
+
+    from ministack.services import lambda_svc
+
+    ddb_service, _streams_service, time = ttl_state
+    name = "ttl-stream-esm-filter"
+    table, _arn = _ttl_table(ddb_service, name)
+    now = time.time()
+    _put(ddb_service, table, "expired", expiresAt={"N": str(int(now) - 1)})
+    ddb_service._reap_expired_items(now)
+
+    batch = ddb_service.stream_records_since(name, 0, 10)
+    assert batch[0]["userIdentity"] == {"type": "Service", "principalId": "dynamodb.amazonaws.com"}
+    for pattern in (
+        {"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}},
+        {"eventName": ["REMOVE"], "userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}},
+    ):
+        esm = {"FilterCriteria": {"Filters": [{"Pattern": json.dumps(pattern)}]}}
+        assert lambda_svc._apply_filter_criteria(batch, esm) == batch
+
+
+def test_ttl_deletion_without_a_stream_writes_no_record(ttl_state):
+    ddb_service, _streams_service, time = ttl_state
+    name = "ttl-no-stream"
+    table, _arn = _ttl_table(ddb_service, name, stream_enabled=False)
+    now = time.time()
+    _put(ddb_service, table, "expired", expiresAt={"N": str(int(now) - 1)})
+
+    ddb_service._reap_expired_items(now)
+
+    assert table["items"] == {}
+    assert not ddb_service._stream_records.get(name)
+
+
+def test_ordinary_remove_record_carries_no_user_identity(ttl_state):
+    ddb_service, streams_service, _time = ttl_state
+    _table, arn = _ttl_table(ddb_service, "ttl-user-delete")
+
+    ddb_service._emit_stream_event("ttl-user-delete", "REMOVE", {"pk": {"S": "a"}}, None)
+
+    record = _read_stream(streams_service, arn)[0]
+    assert record["eventName"] == "REMOVE"
+    assert "userIdentity" not in record
