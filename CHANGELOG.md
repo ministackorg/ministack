@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Cognito — `expires_in` of a refreshed token** — the `refresh_token` grant of `/oauth2/token` answered `expires_in: 3600` whatever the app client's `AccessTokenValidity`, while the token itself lived as long as the client allows. It now answers the token's lifetime.
+
 ## [1.5.43] — 2026-11-19
 
 ### Added
