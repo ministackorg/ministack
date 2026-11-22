@@ -1223,10 +1223,50 @@ def test_eventbridge_endpoints_and_partner_stubs(eb):
     assert acc["PartnerEventSourceAccounts"] == []
 
     es = eb.list_event_sources()
-    assert es["EventSources"] == []
+    assert not any(e["Name"] == "saas.src" for e in es["EventSources"])
 
     pe = eb.put_partner_events(Entries=[{"Source": "p", "DetailType": "t", "Detail": "{}"}])
     assert pe["FailedEntryCount"] == 0
+
+
+def test_eventbridge_list_event_sources_shows_partner_sources_for_the_account(eb):
+    tag = _uuid_mod.uuid4().hex[:8]
+    source = f"aws.partner/mongodb.com/stitch.trigger/{tag}"
+    eb.create_partner_event_source(Name=source, Account="000000000000")
+    eb.create_partner_event_source(Name=f"aws.partner/mongodb.com/other/{tag}", Account="111111111111")
+    try:
+        listed = eb.list_event_sources(NamePrefix="aws.partner/mongodb.com")["EventSources"]
+        mine = [e for e in listed if e["Name"].endswith(tag)]
+        assert [e["Name"] for e in mine] == [source]
+        assert mine[0]["Arn"] == f"arn:aws:events:us-east-1::event-source/{source}"
+        assert mine[0]["CreatedBy"] == "aws.partner/mongodb.com"
+        assert mine[0]["State"] == "PENDING" and mine[0]["CreationTime"]
+        eb.create_event_bus(Name=source, EventSourceName=source)
+        try:
+            listed = eb.list_event_sources(NamePrefix=source)["EventSources"]
+            assert [e["State"] for e in listed] == ["ACTIVE"]
+        finally:
+            eb.delete_event_bus(Name=source)
+    finally:
+        eb.delete_partner_event_source(Name=source, Account="000000000000")
+        eb.delete_partner_event_source(Name=f"aws.partner/mongodb.com/other/{tag}", Account="111111111111")
+
+
+def test_eventbridge_tags_on_a_partner_bus_rule(eb):
+    source = f"aws.partner/mongodb.com/stitch.trigger/rules-{_uuid_mod.uuid4().hex[:8]}"
+    eb.create_partner_event_source(Name=source, Account="000000000000")
+    eb.create_event_bus(Name=source, EventSourceName=source)
+    try:
+        arn = eb.put_rule(Name="r", EventBusName=source, EventPattern=json.dumps({"source": [source]}),
+                          Tags=[{"Key": "sst:app", "Value": "a"}])["RuleArn"]
+        assert arn.endswith(f":rule/{source}/r")
+        eb.tag_resource(ResourceARN=arn, Tags=[{"Key": "sst:stage", "Value": "s"}])
+        tags = eb.list_tags_for_resource(ResourceARN=arn)["Tags"]
+        assert sorted((t["Key"], t["Value"]) for t in tags) == [("sst:app", "a"), ("sst:stage", "s")]
+        eb.delete_rule(Name="r", EventBusName=source)
+    finally:
+        eb.delete_event_bus(Name=source)
+        eb.delete_partner_event_source(Name=source, Account="000000000000")
 
 
 def test_eventbridge_replay_lifecycle(eb):

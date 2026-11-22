@@ -15,6 +15,7 @@ import io
 import json
 import os
 import shutil
+import time
 import zipfile
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -51,13 +52,18 @@ def _node_worker(code, extra_files=None):
 def _spawn_proc():
     """Minimal Popen mock sufficient for one _spawn() call."""
     proc = MagicMock()
-    # stdout: return the init-ready JSON then EOF
-    ready = json.dumps({"status": "ready"}) + "\n"
-    proc.stdout.readline.return_value = ready
-    # stderr: empty iterator so the daemon thread exits immediately
-    proc.stderr = iter([])
+    # The log: an empty iterator, so the daemon thread exits immediately.
+    proc.stdout = iter([])
     proc.poll.return_value = None
     return proc
+
+
+def _fake_open(file, *args, **kwargs):
+    """Files that _spawn() writes are mocks; its reply pipe holds one ready line."""
+    if not isinstance(file, int):
+        return mock_open()()
+    os.close(file)
+    return io.StringIO(json.dumps({"status": "ready"}) + "\n")
 
 
 def _protocol_line(status, **fields):
@@ -68,10 +74,9 @@ def _mock_worker(stdout_lines):
     worker = Worker("test-fn", _config(), b"ignored-zip")
     proc = MagicMock()
     proc.poll.return_value = None
-    proc.stdout.readline.side_effect = list(stdout_lines)
     proc.stdin = MagicMock()
-    proc.stderr = iter([])
     worker._proc = proc
+    worker._responses = io.StringIO("".join(stdout_lines))
     return worker, proc
 
 
@@ -117,7 +122,7 @@ def test_tmpdir_cleaned_before_respawn():
         patch("ministack.core.lambda_runtime.os.path.exists", return_value=True),
         patch("ministack.core.lambda_runtime.os.makedirs"),
         patch("ministack.core.lambda_runtime.zipfile.ZipFile"),
-        patch("builtins.open", mock_open()),
+        patch("builtins.open", side_effect=_fake_open),
         patch(
             "ministack.core.lambda_runtime.subprocess.Popen",
             side_effect=lambda *a, **k: next(procs),
@@ -208,75 +213,6 @@ def handler(event, context):
     assert 0 < context["remaining_time"] <= 30_000
 
 
-def test_invoke_ignores_json_logs_on_stdout():
-    """Pino-style JSON on fd 1 must not be mistaken for the protocol response."""
-    ok_line = _protocol_line("ok", result={"ok": True})
-    log_line = json.dumps({"level": 30, "msg": "hi"}) + "\n"
-    result, _, _ = _invoke_worker([log_line, ok_line])
-
-    assert result["status"] == "ok"
-    assert result["result"] == {"ok": True}
-
-
-def test_invoke_ignores_raw_text_on_stdout():
-    """Plain fd-1 writes must not prevent reading the protocol response."""
-    ok_line = _protocol_line("ok", result={"ok": True})
-    result, _, _ = _invoke_worker(["hi\n", ok_line])
-
-    assert result["status"] == "ok"
-    assert result["result"] == {"ok": True}
-
-
-def test_invoke_ignores_json_with_unrelated_status_key():
-    """HTTP-style JSON logs with a status code must not end the read loop."""
-    junk = json.dumps({"status": 200, "message": "ok"}) + "\n"
-    ok_line = _protocol_line("ok", result={"n": 1})
-    result, _, _ = _invoke_worker([junk, ok_line])
-
-    assert result["status"] == "ok"
-    assert result["result"] == {"n": 1}
-
-
-def test_invoke_ignores_many_log_lines_before_protocol():
-    """A burst of structured logs must not hide the real protocol line."""
-    logs = [
-        json.dumps({"level": 30, "msg": f"line-{i}"}) + "\n"
-        for i in range(8)
-    ]
-    ok_line = _protocol_line("ok", result={"done": True})
-    result, _, _ = _invoke_worker(logs + [ok_line])
-
-    assert result["status"] == "ok"
-    assert result["result"] == {"done": True}
-
-
-def test_invoke_skips_malformed_json_lines():
-    """Broken JSON on stdout must be ignored, not treated as the response."""
-    ok_line = _protocol_line("ok", result={})
-    result, _, _ = _invoke_worker(['{"truncated":\n', ok_line])
-
-    assert result["status"] == "ok"
-
-
-def test_invoke_skips_empty_lines():
-    """Blank lines between junk output and the protocol line are ignored."""
-    ok_line = _protocol_line("ok", result={"x": 1})
-    result, _, _ = _invoke_worker(["\n", "noise\n", "\n", ok_line])
-
-    assert result["status"] == "ok"
-    assert result["result"] == {"x": 1}
-
-
-def test_invoke_skips_ready_status_during_invoke():
-    """Init-only ready messages must not satisfy an invocation read."""
-    ready = _protocol_line("ready", cold=False)
-    ok_line = _protocol_line("ok", result={"v": 2})
-    result, _, _ = _invoke_worker([ready, ok_line])
-
-    assert result["status"] == "ok"
-    assert result["result"] == {"v": 2}
-
-
 def test_invoke_still_surfaces_protocol_error():
     """Protocol error lines must still fail the invocation."""
     error_line = _protocol_line("error", error="boom")
@@ -285,26 +221,6 @@ def test_invoke_still_surfaces_protocol_error():
     assert result["status"] == "error"
     assert result["error"] == "boom"
     proc.terminate.assert_called_once_with()
-
-
-def test_invoke_error_after_junk_stdout():
-    """Handler errors must win even when stdout already has log noise."""
-    junk = json.dumps({"level": 50, "msg": "warn"}) + "\n"
-    err_line = _protocol_line("error", error="fail")
-    result, proc, _ = _invoke_worker([junk, "oops\n", err_line])
-
-    assert result["status"] == "error"
-    assert result["error"] == "fail"
-    proc.terminate.assert_called_once_with()
-
-
-def test_invoke_gives_up_after_max_lines():
-    """Stop after 200 non-protocol lines instead of hanging forever."""
-    worker, proc = _mock_worker(["noise\n"] * 201)
-    result = worker.invoke({}, request_id="req-max")
-
-    assert result["status"] == "error"
-    assert "No JSON response" in result["error"]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
@@ -439,3 +355,69 @@ def test_python_worker_cwd_is_code_dir():
     assert result["status"] == "ok", result
     assert os.path.realpath(result["result"]["cwd"]) == os.path.realpath(result["result"]["root"])
     assert result["result"]["cwd"] == result["result"]["root"]
+
+
+
+def test_python_worker_child_process_output_is_log():
+    """A child process that prints 300 lines at init and in the handler (`aws s3 sync`
+    in the CDK BucketDeployment handler) writes to the log, not into the replies."""
+    code = (
+        "import subprocess, sys\n"
+        "def burst():\n"
+        "    subprocess.run([sys.executable, '-c', 'for i in range(300): print(\"line\", i)'], check=True)\n"
+        "burst()\n"
+        "def handler(event, context):\n"
+        "    burst()\n"
+        "    return {'ok': True}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", code)
+    worker = Worker("test-fn", _config(), buf.getvalue())
+    try:
+        result = worker.invoke({}, request_id="child-output")
+    finally:
+        worker.kill()
+    assert result["status"] == "ok", result
+    assert result["result"] == {"ok": True}
+    assert "line 299" in result["log"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_child_process_output_is_log():
+    worker = _node_worker(
+        """
+const burst = () => require("child_process").spawnSync(
+  process.execPath, ["-e", "for (let i = 0; i < 300; i++) console.log('line', i)"], { stdio: "inherit" });
+burst();
+exports.handler = async () => { burst(); return { ok: true }; };
+"""
+    )
+    try:
+        result = worker.invoke({}, request_id="child-output")
+    finally:
+        worker.kill()
+    assert result["status"] == "ok", result
+    assert result["result"] == {"ok": True}
+    assert "line 299" in result["log"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def test_node_worker_crash_with_a_detached_child_is_an_exit():
+    worker = _node_worker(
+        """
+const { spawn } = require("child_process");
+exports.handler = async () => {
+  spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { detached: true, stdio: "ignore" }).unref();
+  process.exit(3);
+};
+"""
+    )
+    worker.config["Timeout"] = 15
+    started = time.monotonic()
+    try:
+        result = worker.invoke({}, request_id="crash")
+    finally:
+        worker.kill()
+    assert time.monotonic() - started < 10
+    assert result.get("error_type") == "Runtime.ExitError", result

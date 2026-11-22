@@ -7796,6 +7796,41 @@ def test_sfn_state_machine_alias_single_version(sfn):
         sfn.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_execution_runs_the_version_it_was_started_on(sfn):
+    """An execution started on a version or alias ARN runs that version's definition and reports the ARN, as on AWS."""
+    def definition(result):
+        return json.dumps({"StartAt": "P", "States": {"P": {"Type": "Pass", "Result": result, "End": True}}})
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm = sfn.create_state_machine(name=f"version-exec-{uid}", definition=definition("v1"),
+                                  roleArn="arn:aws:iam::000000000000:role/r", publish=True)
+    sm_arn, v1 = sm["stateMachineArn"], sm["stateMachineVersionArn"]
+    try:
+        v2 = sfn.update_state_machine(stateMachineArn=sm_arn, definition=definition("v2"),
+                                      publish=True)["stateMachineVersionArn"]
+        alias = sfn.create_state_machine_alias(
+            name="live", routingConfiguration=[{"stateMachineVersionArn": v1, "weight": 100}])["stateMachineAliasArn"]
+
+        for target, output, version, alias_arn in [
+            (sm_arn, '"v2"', None, None), (v1, '"v1"', v1, None), (v2, '"v2"', v2, None), (alias, '"v1"', v1, alias),
+        ]:
+            exec_arn = sfn.start_execution(stateMachineArn=target)["executionArn"]
+            desc = _wait_sfn(sfn, exec_arn)
+            assert desc["output"] == output
+            assert desc["stateMachineArn"] == sm_arn
+            assert desc.get("stateMachineVersionArn") == version
+            assert desc.get("stateMachineAliasArn") == alias_arn
+            started = sfn.get_execution_history(executionArn=exec_arn)["events"][0]["executionStartedEventDetails"]
+            assert started.get("stateMachineVersionArn") == version
+            assert started.get("stateMachineAliasArn") == alias_arn
+            ran = sfn.describe_state_machine_for_execution(executionArn=exec_arn)
+            assert ran["stateMachineArn"] == sm_arn
+            assert json.loads(ran["definition"])["States"]["P"]["Result"] == json.loads(output)
+        sfn.delete_state_machine_alias(stateMachineAliasArn=alias)
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_alias_rejects_weights_not_summing_to_100(sfn):
     """Alias creation requires routing weights sum to 100."""
     uid = _uuid_mod.uuid4().hex[:8]

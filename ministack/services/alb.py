@@ -2591,7 +2591,7 @@ async def _await_http_disconnect(receive) -> None:
 
 
 async def _proxy_http_target(target, tg, method, path, headers, body, query_params, raw_query_string=None):
-    """Forward a data-plane request to an instance/ip target over HTTP.
+    """Forward a data-plane request to an instance/ip target over HTTP, or TLS for an HTTPS target group.
 
     The target Id is used as the host to connect to — an IP address for
     ip target groups, or any resolvable hostname for instance target
@@ -2621,7 +2621,16 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
-    conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
+    if str(tg.get("Protocol") or "").upper() == "HTTPS":
+        # "The load balancer does not validate these certificates": self-signed or expired ones serve.
+        import ssl
+
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT, context=context)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
 
     def _open():
         try:

@@ -992,12 +992,8 @@ def _resolve_taggable_events_arn(arn):
             exists = bool(record) and record.get("Arn") == arn
     elif resource.startswith("rule/"):
         parts = resource.split("/")
-        if len(parts) == 2:
-            bus, rule = "default", parts[1]
-        elif len(parts) == 3:
-            _, bus, rule = parts
-        else:
-            bus, rule = "", ""
+        # A partner event bus name has slashes of its own: rule/aws.partner/<partner>/<source>/<rule>.
+        bus, rule = ("default", parts[1]) if len(parts) == 2 else ("/".join(parts[1:-1]), parts[-1])
         record = _rules.get(_rule_key(rule, bus)) if rule else None
         exists = bool(record) and record.get("Arn") == arn
     elif resource.startswith("archive/"):
@@ -3938,6 +3934,7 @@ def _create_partner_event_source(data):
         "Name": name,
         "Account": account,
         "EventSourceArn": arn,
+        "CreationTime": _now_ts(),
     }
     return json_response({"EventSourceArn": arn})
 
@@ -3984,9 +3981,24 @@ def _list_partner_event_source_accounts(data):
 
 
 def _list_event_sources(data):
+    """The partner event sources offered to the caller's account, from any partner account, in this region."""
     prefix = data.get("NamePrefix", "")
-    _ = prefix
-    return json_response({"EventSources": []})
+    account, region = get_account_id(), get_region()
+    results = []
+    for (_owner, rec_region, _pk), rec in list(_partner_event_sources._data.items()):
+        name = rec["Name"]
+        if rec_region != region or rec["Account"] != account or (prefix and not name.startswith(prefix)):
+            continue
+        results.append({
+            "Arn": f"arn:aws:events:{region}::event-source/{name}",
+            "CreatedBy": "/".join(name.split("/")[:2]),
+            "CreationTime": rec.get("CreationTime", 0),
+            "Name": name,
+            # ACTIVE once the account has created the source's partner event bus.
+            "State": "ACTIVE" if name in _event_buses else "PENDING",
+        })
+    results.sort(key=lambda r: r["Name"])
+    return _offset_page(data, "EventSources", results)
 
 
 def _put_partner_events(data):

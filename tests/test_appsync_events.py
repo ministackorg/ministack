@@ -537,11 +537,12 @@ def test_api_key_crud_via_v1_path(appsync, api):
 def test_channel_namespace_crud(appsync, api):
     ns = appsync.create_channel_namespace(apiId=api, name="chat")["channelNamespace"]
     assert ns["name"] == "chat"
-    assert ns["publishAuthModes"]
-    assert ns["subscribeAuthModes"]
+    # Measured live (eu-north-1, 2026-11-20): create leaves out modes it was not given, reads report [].
+    assert "publishAuthModes" not in ns and "subscribeAuthModes" not in ns
 
     fetched = appsync.get_channel_namespace(apiId=api, name="chat")["channelNamespace"]
     assert fetched["name"] == "chat"
+    assert fetched["publishAuthModes"] == [] and fetched["subscribeAuthModes"] == []
 
     listed = appsync.list_channel_namespaces(apiId=api)["channelNamespaces"]
     names = {n["name"] for n in listed}
@@ -630,6 +631,29 @@ def test_publish_follows_the_authorization_modes_contract(auth_enabled, iam_user
                              "message": "You are not authorized to make this call."}]}
     expected = [(401, refused), (401, wrong_key), 200, (401, refused), 200] if auth_enabled else [200] * 5
     assert [answer[0] if answer[0] == 200 else answer for answer in answers] == expected
+
+
+@pytest.mark.auth_contract
+def test_namespace_without_modes_takes_the_api_default(auth_enabled, appsync):
+    # Measured live (eu-north-1, 2026-11-20): the API's current default applies, also after UpdateApi.
+    modes = lambda *types: [{"authType": t} for t in types]  # noqa: E731
+    name = f"events-default-{int(time.time() * 1000)}"
+    config = {"authProviders": modes("API_KEY", "AWS_IAM"), "connectionAuthModes": modes("API_KEY"),
+              "defaultPublishAuthModes": modes("API_KEY"), "defaultSubscribeAuthModes": modes("AWS_IAM")}
+    api_id = appsync.create_api(name=name, eventConfig=config)["api"]["apiId"]
+    try:
+        _create_namespace(appsync, api_id, "inherited")
+        key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+        first = _publish_http(api_id, "/inherited/c", [json.dumps("x")], api_key=key)
+        appsync.update_api(apiId=api_id, name=name, eventConfig={**config, "defaultPublishAuthModes": modes("AWS_IAM")})
+        second = _publish_http(api_id, "/inherited/c", [json.dumps("x")], api_key=key)
+    finally:
+        appsync.delete_api(apiId=api_id)
+    assert first[0] == 200
+    if auth_enabled:
+        assert second == (401, {"errors": [{"errorType": "UnauthorizedException"}]})
+    else:
+        assert second[0] == 200
 
 
 @pytest.mark.parametrize("payload, status, error_type, message", [

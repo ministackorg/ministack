@@ -40,6 +40,7 @@ process.stdout.write = (chunk, enc, cb) => _stderrWrite(chunk, enc, cb);
 // runtime, instead of silently succeeding against Node's surface.
 // One request per worker at a time, so the call's key value store snapshot can live here.
 let _currentKvs = null;
+let _currentOrigin = null;
 let _currentRuntime = "";
 
 // Observed on AWS: these error names and messages.
@@ -49,8 +50,17 @@ function _awsError(name, message) {
   return err;
 }
 
-// cf.kvs() helpers (CloudFront Developer Guide, "Helper methods for key value stores").
+// The cloudfront module (CloudFront Developer Guide, "Helper methods for origin modification" and "for key value stores").
 const cloudfrontModule = {
+  updateRequestOrigin(origin) {
+    _currentOrigin = { update: origin };
+  },
+  selectRequestOriginById(originId, originOverrides) {
+    _currentOrigin = { group: { originIds: [{ originId, originOverrides }] } };
+  },
+  createRequestOriginGroup(group) {
+    _currentOrigin = { group };
+  },
   kvs() {
     // A top-level cf.kvs() runs once per compiled function, so the methods read the current call's store.
     const current = () => {
@@ -130,6 +140,7 @@ function compile(code) {
 async function run(req) {
   const { code, event } = req;
   _currentKvs = req.kvs || null;
+  _currentOrigin = null;
   _currentRuntime = req.runtime || "";
   const entry = compile(code);
   if (typeof entry.handler !== "function") {
@@ -142,7 +153,7 @@ async function run(req) {
     if (value && typeof value.then === "function") {
       value = await value;
     }
-    return { status: "ok", value: value === undefined ? null : value };
+    return { status: "ok", value: value === undefined ? null : value, origin: _currentOrigin };
   } catch (err) {
     return { status: "error", message: String((err && err.stack) || err) };
   }
@@ -173,8 +184,8 @@ _pool = node_pool.NodeWorkerPool(
 
 
 def evaluate(code: bytes, event: dict, runtime: str = "", kvs: dict | None = None):
-    """Run a published function's code against `event`; return its returned
-    request/response object (a dict), or raise CloudFrontFunctionError.
+    """Run a published function's code against `event`; return its returned request/response object
+    (a dict) and the origin its origin helper picked (or None), or raise CloudFrontFunctionError.
     `kvs` is the associated key value store: {"items", "created", "updated"}."""
     try:
         out = _pool.call({"code": code.decode("utf-8"), "event": event, "runtime": runtime, "kvs": kvs},
@@ -192,7 +203,7 @@ def evaluate(code: bytes, event: dict, runtime: str = "", kvs: dict | None = Non
 
     if out["status"] == "error":
         raise CloudFrontFunctionError(out.get("message", "function execution error"))
-    return out.get("value")
+    return out.get("value"), out.get("origin")
 
 
 def reset():

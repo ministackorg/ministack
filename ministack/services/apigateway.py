@@ -736,6 +736,12 @@ async def _resolve_jwks_url(authorizer: dict) -> str | None:
 
 
 async def _fetch_jwks(url: str) -> dict:
+    local = f"http://{_HOST}:{_PORT}/"
+    if url.startswith(local) and url.endswith("/.well-known/jwks.json"):
+        # A MiniStack pool's keys are read in-process, so a TLS-only gateway does not refuse the fetch.
+        from ministack.services import cognito
+
+        return json.loads(cognito.well_known_jwks(url[len(local):-len("/.well-known/jwks.json")])[2])
     cached = _jwks_cache.get(url)
     now = time.time()
     if cached and cached.get("expiresAt", 0) > now:
@@ -1111,6 +1117,7 @@ async def _authorize_request_v2(
                 "accountId": owner_account_id,
                 "apiId": api_id,
                 "domainName": f"{api_id}.execute-api.{_HOST}",
+                "domainPrefix": api_id,
                 "http": {
                     "method": method,
                     "path": path,
@@ -1686,6 +1693,7 @@ async def _invoke_lambda_proxy(
             "accountId": get_account_id(),
             "apiId": api_id,
             "domainName": f"{api_id}.execute-api.{_HOST}",
+            "domainPrefix": api_id,
             "http": {
                 "method": method,
                 "path": path,
