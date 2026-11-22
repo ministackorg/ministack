@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **SQS — dead-letter queue redrive** — `StartMessageMoveTask`, `ListMessageMoveTasks` and `CancelMessageMoveTask`, over JSON and Query. A task moves the messages visible in the dead-letter queue when it starts, to `DestinationArn` or each back to its `DeadLetterQueueSourceArn`, at `MaxNumberOfMessagesPerSecond` or all at once. A moved message is a new message that keeps its body, message attributes and FIFO group and deduplication ids. A message with no source fails the task with `CouldNotDetermineMessageSource` and stays put. One task runs per queue at a time, and `ListMessageMoveTasks` shows the 10 most recent. A cancelled task goes on moving as `CANCELLING` for about 20 seconds before it is `CANCELLED`. Reported by @kharabasz.
 - **CloudFront — origin modification helpers** — a viewer-request function can pick the origin of a request with `cf.updateRequestOrigin()`, `cf.selectRequestOriginById()` and `cf.createRequestOriginGroup()`, which fails over to the second origin on its status codes, a timeout or a connection failure (GET, HEAD and OPTIONS only). An origin at an AWS host that MiniStack serves, such as `<apiId>.execute-api.<region>.amazonaws.com`, an S3 REST endpoint or a regional service endpoint, goes to MiniStack's own gateway, which also accepts AWS execute-api hosts now; other AWS hosts keep the `502`.
 - **WAFv2 — web ACLs on CloudFront viewer requests** — a distribution's web ACL now decides each viewer request: rule priority, Allow, Block with a custom response, Count, CAPTCHA and Challenge (405 and 202, no tokens), labels, rule groups with overrides, inserted headers, rate-based rules, and the byte, regex, size and IP set statements. Of the AWS managed rules, the Core rule set `SizeRestrictions_*` and `NoUserAgent_HEADER` and `PROPFIND_METHOD` are evaluated. A rule MiniStack cannot decide never matches and is logged once.
 ### Fixed
@@ -26,6 +27,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **EventBridge — tags on a rule of a partner event bus** — `TagResource` and `ListTagsForResource` answered `ResourceNotFoundException` for an ARN like `rule/aws.partner/<partner>/<source>/<rule>`. They now resolve it. Reported by @Tanato.
 - **Lambda — Node.js handlers and `*.localhost` hosts** — under the local executor only one label below `localhost` resolved, so a host such as an Event API's `<api>.appsync-api.<region>.localhost` failed with `ENOTFOUND`. Any name under `localhost` now reaches MiniStack. Reported by @Tanato.
 - **Persistence — state files after a host stop** — the state saved at shutdown was renamed into place without being synced, so a host that stopped right after could bring it back as an empty file. Each file is now synced before the rename. Reported by @Tanato.
+- **ALB — HTTPS target groups** — the load balancer forwarded to them over plain HTTP, so a TLS-only target answered 502. It now connects over TLS and, as AWS does, does not validate the target's certificate. Reported by @rszabo50.
+- **DynamoDB Streams — TTL deletes** — an item removed by TTL wrote no stream record. It now writes a `REMOVE` with `userIdentity` `{"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}` in `GetRecords`, and `{"principalId": "dynamodb.amazonaws.com", "type": "Service"}` in the Lambda event, so the TTL filter pattern matches. On a global table only the region that expired the item marks the record. Reported by @fdrvrtm.
+
 
 ## [1.5.43] — 2026-11-19
 

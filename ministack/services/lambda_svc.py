@@ -8388,6 +8388,9 @@ def _poll_dynamodb_streams():
             batch = _ddb.stream_records_since(table_name, pos, batch_size)
             if not batch:
                 continue
+            # GetRecords keys userIdentity PrincipalId/Type; the Lambda event keys it principalId/type.
+            batch = [{**r, "userIdentity": {k[0].lower() + k[1:]: v for k, v in r["userIdentity"].items()}}
+                     if r.get("userIdentity") else r for r in batch]
 
             raw_len = len(batch)
             batch = _apply_filter_criteria(batch, esm)

@@ -6623,6 +6623,45 @@ def test_poll_kinesis_returns_false_when_invoke_fails(esm_poll_state, monkeypatc
     assert _lsvc._poll_kinesis() is False
 
 
+def test_ttl_delete_writes_a_service_remove_record(esm_poll_state, monkeypatch):
+    """GetRecords keys userIdentity PrincipalId/Type, the Lambda event principalId/type."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+    _ddb._create_table({"TableName": "ttl-t", "BillingMode": "PAY_PER_REQUEST",
+                        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                        "StreamSpecification": {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"}})
+    _ddb._update_ttl({"TableName": "ttl-t", "TimeToLiveSpecification": {"Enabled": True, "AttributeName": "exp"}})
+    now = time.time()
+    _ddb._put_item({"TableName": "ttl-t", "Item": {"pk": {"S": "old"}, "exp": {"N": str(int(now) - 5)}}})
+    _ddb._put_item({"TableName": "ttl-t", "Item": {"pk": {"S": "new"}, "exp": {"N": str(int(now) + 3600)}}})
+    _ddb._put_item({"TableName": "ttl-t", "Item": {"pk": {"S": "user"}}})
+    _ddb._delete_item({"TableName": "ttl-t", "Key": {"pk": {"S": "user"}}})
+    _ddb._reap_expired_items(now)
+
+    records = _ddb.stream_live_records("ttl-t")
+    ttl = [r for r in records if r.get("userIdentity")]
+    assert [(r["eventName"], r["dynamodb"]["Keys"]) for r in ttl] == [("REMOVE", {"pk": {"S": "old"}})]
+    assert ttl[0]["userIdentity"] == {"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}
+    assert ttl[0]["dynamodb"]["OldImage"]["pk"] == {"S": "old"}
+    assert "Item" in _ddb._get_item({"TableName": "ttl-t", "Key": {"pk": {"S": "new"}}})[2].decode()
+
+    stream_arn = _ddb._tables["ttl-t"]["LatestStreamArn"]
+    _lsvc._functions["ttl-fn"] = {"config": {"FunctionName": "ttl-fn",
+                                             "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:ttl-fn"},
+                                  "versions": {}, "aliases": {}}
+    pattern = {"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}}
+    _lsvc._esms["ttl-esm"] = {"UUID": "ttl-esm", "EventSourceArn": stream_arn, "FunctionName": "ttl-fn",
+                              "State": "Enabled", "Enabled": True, "BatchSize": 100, "StartingPosition": "TRIM_HORIZON",
+                              "FilterCriteria": {"Filters": [{"Pattern": json.dumps(pattern)}]}}
+    events = []
+    monkeypatch.setattr(_lsvc, "_execute_function", lambda _f, event: events.append(event) or {"error": False, "body": {}})
+    assert _lsvc._poll_dynamodb_streams() is True
+    [event] = events
+    assert [(r["eventName"], r["userIdentity"]) for r in event["Records"]] == [
+        ("REMOVE", {"principalId": "dynamodb.amazonaws.com", "type": "Service"})]
+    assert ttl[0]["userIdentity"] == {"PrincipalId": "dynamodb.amazonaws.com", "Type": "Service"}
+
+
 def test_poll_dynamodb_streams_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
     """A failed invoke doesn't advance the stream position, so the next pass
     would refetch the same batch — _poll_loop must not skip its idle sleep
