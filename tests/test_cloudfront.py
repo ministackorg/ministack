@@ -5151,6 +5151,38 @@ def test_routes_by_alternate_domain_name(cloudfront, cf_backend):
     assert json.loads(body)["path"] == "/exact/hello"
 
 
+
+def test_web_acl_inspects_viewer_requests(cloudfront, cf_backend):
+    wafv2 = make_client("wafv2")
+    vis = {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"}
+
+    def byte_rule(name, priority, field, search, action):
+        return {"Name": name, "Priority": priority, "Action": action, "VisibilityConfig": vis,
+                "Statement": {"ByteMatchStatement": {"FieldToMatch": field, "SearchString": search,
+                              "PositionalConstraint": "STARTS_WITH",
+                              "TextTransformations": [{"Priority": 0, "Type": "NONE"}]}}}
+
+    acl_arn = wafv2.create_web_acl(
+        Name=f"cf-waf-{_uuid_mod.uuid4().hex[:8]}", Scope="CLOUDFRONT", DefaultAction={"Allow": {}},
+        VisibilityConfig=vis, Rules=[
+            byte_rule("tag", 0, {"SingleHeader": {"Name": "x-tag"}}, b"tag", {"Count": {"CustomRequestHandling": {
+                "InsertHeaders": [{"Name": "tagged", "Value": "yes"}]}}}),
+            byte_rule("block", 1, {"UriPath": {}}, b"/blocked", {"Block": {}}),
+        ])["Summary"]["ARN"]
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["waf.example.test"], "/p")
+    cfg = cloudfront.get_distribution_config(Id=_ALIAS_DISTRIBUTIONS[-1])
+    config = cfg["DistributionConfig"]
+    config["DefaultCacheBehavior"]["OriginRequestPolicyId"] = _ALL_VIEWER_EXCEPT_HOST
+    cloudfront.update_distribution(Id=_ALIAS_DISTRIBUTIONS[-1], IfMatch=cfg["ETag"],
+                                   DistributionConfig={**config, "WebACLId": acl_arn})
+
+    status, _, body = _get("waf.example.test", "/blocked/x")
+    assert status == 403 and b"Request blocked." in body
+    status, _, body = _get("waf.example.test", "/ok", extra_headers={"X-Tag": "tag"})
+    assert status == 200
+    assert json.loads(body)["headers"]["x-amzn-waf-tagged"] == "yes"
+
+
 def _served_by(host):
     return json.loads(_get(host, "/hello")[2])["path"]
 

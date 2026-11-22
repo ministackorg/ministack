@@ -56,7 +56,8 @@ Supports:
   Web ACL: AssociateDistributionWebACL, DisassociateDistributionWebACL
 
 Data plane (handle_viewer_request): serves viewer requests to <label>.cloudfront.net /
-<label>.cloudfront.<MINISTACK_HOST>. Not modelled: caching, WAF, logging, geo restrictions,
+<label>.cloudfront.<MINISTACK_HOST>. The WAFv2 web ACL in WebACLId inspects each request after the
+method check (waf.evaluate_web_acl). Not modelled: caching, logging, geo restrictions,
 signed URLs and cookies, Lambda@Edge, CORS preflight, synthetic CloudFront-Viewer-* headers,
 origins at AWS hostnames (502) other than a load balancer or Function URL in this MiniStack, which is
 served in-process.
@@ -6450,6 +6451,30 @@ def _apply_default_root_object(default_root_object: str, request_uri: str) -> st
     return request_uri
 
 
+def _check_web_acl(dist: dict, method: str, raw_uri: str, raw_query_string: str, headers: dict, body: bytes,
+                   client_ip: str):
+    """``(response, headers)``: the viewer response when the web ACL does not allow the request, else None
+    and the headers with the ones the web ACL inserts. A default block is CloudFront's 403 error page."""
+    from ministack.services import waf
+
+    acl_arn = _text(_dist_config_el(dist), "WebACLId")
+    if not acl_arn:
+        return None, headers
+    acl = waf.resource_by_arn(acl_arn, "webacl")
+    if acl is None:
+        logger.warning("Distribution %s: WebACLId %s names no WAFv2 web ACL, so requests are not inspected",
+                       dist["Id"], acl_arn)
+        return None, headers
+    action, result = waf.evaluate_web_acl(acl, method, raw_uri, raw_query_string, headers, body, client_ip)
+    if action == "Allow":
+        return None, {**headers, **result}
+    if result is None:
+        return _cf_error_response(403, "Request blocked.", _ERROR_X_CACHE), headers
+    status, response_headers, response_body = result
+    return (status, _render_headers(_add_cloudfront_headers(response_headers, _ERROR_X_CACHE), title_case=True),
+            response_body), headers
+
+
 def _check_stacked_distribution(headers: dict):
     """403 for a request that already passed through this hop (Developer Guide, stacked distributions)."""
     if "(cloudfront)" in headers.get("via", "").lower():
@@ -6507,6 +6532,9 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
     methods_response = _check_allowed_methods(behavior, method)
     if methods_response is not None:
         return methods_response
+    waf_response, headers = _check_web_acl(dist, method, raw_uri, raw_query_string, headers, body, client_ip)
+    if waf_response is not None:
+        return waf_response
 
     request_headers = dict(headers)
     if http_version == "1.0":
