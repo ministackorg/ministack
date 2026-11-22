@@ -4224,6 +4224,11 @@ def _invoke_sqs_send_message(resource, input_data):
             payload["MessageBody"] = json.dumps(body)
         result = sqs._act_send_message(payload, url)
         return result
+    except sqs._KmsErr as e:
+        raise _ExecutionError(
+            f"SQS.{e.code}Exception",
+            f"{e.message} (Service: AmazonSQS; Status Code: 400; Error Code: "
+            f"{sqs._QUERY_COMPAT_CODES.get(e.code, e.code)}; Request ID: {new_uuid()}; Proxy: null)")
     except sqs._Err as e:
         raise _ExecutionError(f"SQS.{e.code}", e.message)
 
@@ -5434,7 +5439,7 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     if status >= 400:
         try:
             err_data = json.loads(decoded)
-            code = err_data.get("__type") or err_data.get("code") or "ServiceException"
+            code = (err_data.get("__type") or err_data.get("code") or "ServiceException").rsplit("#", 1)[-1]
             msg = err_data.get("message") or err_data.get("Message") or decoded
             raise _ExecutionError(_prefix_sdk_error(service_name, code), msg)
         except _ExecutionError:

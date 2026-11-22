@@ -254,6 +254,40 @@ class _Err(Exception):
         super().__init__(message)
 
 
+_KMS_REFUSAL_HOLD_S = 7
+
+
+class _KmsErr(_Err):
+    """KMS refused the queue's data key."""
+
+
+def _check_queue_key(q: dict, use: str) -> None:
+    """Raise the KMS error for the queue's key; *use* ("send"/"receive") keeps its own data key and refusal."""
+    key_ref = q["attributes"].get("KmsMasterKeyId")
+    if not key_ref:
+        return
+    now = time.time()
+    cache = q.setdefault("_kms_data_key", {})
+    if cache.get("key") != key_ref:
+        cache.clear()
+        cache["key"] = key_ref
+    if cache.get(use, 0) > now:
+        return
+    held = cache.get(f"{use}_refused")
+    if held and held[2] > now:
+        raise _KmsErr(held[0], held[1])
+    from ministack.services.kms import sqs_key_error
+    refused = sqs_key_error(key_ref)
+    if refused:
+        cache[f"{use}_refused"] = (*refused, now + _KMS_REFUSAL_HOLD_S)
+        raise _KmsErr(*refused)
+    try:
+        period = int(q["attributes"].get("KmsDataKeyReusePeriodSeconds", "300"))
+    except (TypeError, ValueError):
+        period = 300
+    cache[use] = now + period
+
+
 # ── Queue URL ───────────────────────────────────────────────
 
 def _queue_url(name: str) -> str:
@@ -645,7 +679,7 @@ def queue_delay(q: dict) -> int:
 
 # ── SendMessage ─────────────────────────────────────────────
 
-def _act_send_message(data: dict, qurl: str) -> dict:
+def _act_send_message(data: dict, qurl: str, key_refused: _KmsErr | None = None) -> dict:
     url = data.get("QueueUrl", qurl)
     q = _get_q(url, "sqs:SendMessage")
 
@@ -709,6 +743,12 @@ def _act_send_message(data: dict, qurl: str) -> dict:
         dedup_cache_key = (
             f"{group_id}:{dedup_id}" if dedup_scope == "messageGroup" else dedup_id
         )
+
+    if key_refused:
+        raise key_refused
+    _check_queue_key(q, "send")
+
+    if q["is_fifo"]:
         _prune_dedup(q)
         cached = q["dedup_cache"].get(dedup_cache_key)
         if cached:
@@ -795,6 +835,8 @@ async def _act_receive_message(data: dict, qurl: str) -> dict:
     while True:
         _expire_retained(q)
         _dlq_sweep(q)
+        if _has_deliverable(q):
+            _check_queue_key(q, "receive")
         msgs = _collect_msgs(q, max_n, vis)
         if msgs or time.time() >= deadline:
             break
@@ -1088,7 +1130,7 @@ def _act_purge_queue(data: dict, qurl: str) -> dict:
 
 def _act_send_message_batch(data: dict, qurl: str) -> dict:
     url = data.get("QueueUrl", qurl)
-    _get_q(url, "sqs:SendMessage")
+    q = _get_q(url, "sqs:SendMessage")
     entries = data.get("Entries", [])
     _validate_batch_entries(entries, "SendMessageBatchRequestEntry")
 
@@ -1109,8 +1151,14 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
             f"You have sent {total_bytes} bytes.",
         )
 
+    try:
+        _check_queue_key(q, "send")
+        key_refused = None
+    except _KmsErr as refused:
+        key_refused = refused
     ok: list = []
     fail: list = []
+    kms_fail: list = []
     for e in entries:
         try:
             sub: dict = {
@@ -1121,13 +1169,16 @@ def _act_send_message_batch(data: dict, qurl: str) -> dict:
                 "MessageGroupId": e.get("MessageGroupId"),
                 "MessageDeduplicationId": e.get("MessageDeduplicationId"),
             }
-            r = _act_send_message(sub, url)
+            r = _act_send_message(sub, url, key_refused)
             r["Id"] = e.get("Id", "")
             ok.append(r)
+        except _KmsErr as ex:
+            kms_fail.append({"Id": e.get("Id", ""), "Code": _QUERY_COMPAT_CODES.get(ex.code, ex.code),
+                             "Message": ex.message, "SenderFault": True})
         except _Err as ex:
             fail.append({"Id": e.get("Id", ""), "Code": ex.code,
                          "Message": ex.message, "SenderFault": True})
-    return {"Successful": ok, "Failed": fail}
+    return {"Successful": ok, "Failed": fail + kms_fail}
 
 
 # ── DeleteMessageBatch ─────────────────────────────────────
@@ -1535,6 +1586,16 @@ def _refresh_counts(q: dict) -> None:
 
 # ── Collect visible messages for ReceiveMessage ────────────
 
+def _has_deliverable(q: dict) -> bool:
+    """Whether _collect_msgs would hand out at least one message right now."""
+    now = time.time()
+    if not q["is_fifo"]:
+        return any(m["visible_at"] <= now for m in q["messages"])
+    inflight = {m.get("group_id") for m in q["messages"]
+                if m["visible_at"] > now and m.get("receive_count", 0) > 0 and m.get("group_id")}
+    return any(m["visible_at"] <= now and m.get("group_id") not in inflight for m in q["messages"])
+
+
 def _collect_msgs(q: dict, max_n: int, vis_timeout: int) -> list:
     now = time.time()
     if q["is_fifo"]:
@@ -1788,12 +1849,12 @@ _QUERY_COMPAT_CODES: dict[str, str] = {
     "RequestThrottled":               "RequestThrottled",
     "ResourceNotFoundException":      "ResourceNotFoundException",
     "InvalidParameterValueException": "InvalidParameterValue",
-    # KMS errors — no namespace prefix
-    "KmsAccessDenied":                "KmsAccessDenied",
-    "KmsDisabled":                    "KmsDisabled",
+    # KMS errors
+    "KmsAccessDenied":                "KMS.AccessDeniedException",
+    "KmsDisabled":                    "KMS.DisabledException",
     "KmsInvalidKeyUsage":             "KmsInvalidKeyUsage",
-    "KmsInvalidState":                "KmsInvalidState",
-    "KmsNotFound":                    "KmsNotFound",
+    "KmsInvalidState":                "KMS.InvalidStateException",
+    "KmsNotFound":                    "KMS.NotFoundException",
     "KmsOptInRequired":               "KmsOptInRequired",
     "KmsThrottled":                   "KmsThrottled",
 }
@@ -1807,7 +1868,7 @@ def _json_err_resp(code: str, msg: str, status: int = 400) -> tuple:
         "x-amzn-query-error": f"{legacy};{fault}",
         "x-amzn-errortype": code,
     }
-    return (status, headers, json.dumps({"__type": code, "message": msg}).encode("utf-8"))
+    return (status, headers, json.dumps({"__type": f"com.amazonaws.sqs#{code}", "message": msg}).encode("utf-8"))
 
 
 # ── XML ─────────────────────────────────────────────────────
@@ -1827,9 +1888,9 @@ def _xml_err_resp(code: str, msg: str, status: int = 400) -> tuple:
     sender_type = "Sender" if status < 500 else "Receiver"
     legacy = _QUERY_COMPAT_CODES.get(code, code)
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
+        f'<?xml version="1.0"?>'
         f'<ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
-        f'<Error><Type>{sender_type}</Type><Code>{_esc(legacy)}</Code><Message>{_esc(msg)}</Message></Error>'
+        f'<Error><Type>{sender_type}</Type><Code>{_esc(legacy)}</Code><Message>{_esc(msg)}</Message><Detail/></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'
         f'</ErrorResponse>'
     ).encode("utf-8")
