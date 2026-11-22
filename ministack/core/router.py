@@ -699,6 +699,17 @@ def _documentdb_claims(params):
     return claims_request(params)
 
 
+def service_for_host(host: str) -> str | None:
+    """The service a Host header names, or None. Only a host this stack serves counts, so a
+    customer domain such as ``probe.iot.example.com`` is not IoT; tokens match at a label boundary."""
+    if _host_served_by_stack(host):
+        for svc, patterns in SERVICE_PATTERNS.items():
+            for hp in patterns.get("host_patterns", []):
+                if _anchored_host_pattern(hp).search(host):
+                    return svc
+    return None
+
+
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
     """Detect which AWS service a request is targeting."""
     host = headers.get("host", "")
@@ -1358,17 +1369,9 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         if "granite" in path_lower or "cloudwatch" in path_lower:
             return "monitoring"
 
-    # 5. Check host header patterns — only for hosts this stack actually
-    # serves. The patterns are service tokens (``iot\.``, ``logs\.``,
-    # ``email\.`` ...) and a customer domain that happens to contain one
-    # (``probe.iot.example.com``, ``logs.example.com``) must not be routed
-    # into that service; it falls through to the default like any other
-    # unclassified request. Each token is matched at a label boundary.
-    if _host_served_by_stack(host):
-        for svc, patterns in SERVICE_PATTERNS.items():
-            for hp in patterns.get("host_patterns", []):
-                if _anchored_host_pattern(hp).search(host):
-                    return svc
+    # 5. Check host header patterns.
+    if svc := service_for_host(host):
+        return svc
 
     # 6a. A Query-protocol call to a service we don't implement (redshift,
     # elasticbeanstalk, cloudsearch, sdb, importexport, ...) is a POST to the
