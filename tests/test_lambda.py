@@ -4323,6 +4323,43 @@ def test_lambda_provided_runtime_env_has_function_vars(monkeypatch, tmp_path):
     assert body["log_stream"]
 
 
+def test_lambda_provided_one_shot_logs_more_than_a_pipe_holds(monkeypatch, tmp_path):
+    """The one-shot executor reads the log only after the reply, so it must not fill a pipe."""
+    from ministack.services import lambda_svc as lmod
+
+    bootstrap_script = (
+        "#!/usr/bin/env python3\n"
+        "import os, urllib.request\n"
+        "api = os.environ['AWS_LAMBDA_RUNTIME_API']\n"
+        "nxt = urllib.request.urlopen(f'http://{api}/2018-06-01/runtime/invocation/next')\n"
+        "rid = nxt.headers['Lambda-Runtime-Aws-Request-Id']\n"
+        "for i in range(50000):\n"
+        "    print('upload', i, flush=True)\n"
+        "urllib.request.urlopen(urllib.request.Request(\n"
+        "    f'http://{api}/2018-06-01/runtime/invocation/{rid}/response',\n"
+        "    data=b'{\"ok\": true}', method='POST'))\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        info = zipfile.ZipInfo("bootstrap")
+        info.external_attr = 0o755 << 16
+        zf.writestr(info, bootstrap_script)
+    func = {
+        "config": {
+            "FunctionName": "provided-log",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:provided-log",
+            "Timeout": 15,
+            "Handler": "bootstrap",
+        },
+        "code_zip": buf.getvalue(),
+    }
+    monkeypatch.setattr(lmod, "_PROVIDED_CODE_CACHE", str(tmp_path / "provided"))
+    monkeypatch.setattr(lmod, "_provided_code_dirs", {})
+    result = lmod._execute_function_provided(func, {}, request_id="request-1")
+    assert result["body"] == {"ok": True}, result
+    assert "upload 49999" in result["log"]
+
+
 def test_lambda_provided_runtime_parallel_invocations(monkeypatch, tmp_path):
     """Concurrent provided.* invocations must not fail with ETXTBSY (#1051).
 
@@ -4722,6 +4759,47 @@ def test_lambda_warm_worker_nodejs_esm_uses_layer(lam):
         assert payload["esm"] is True
     finally:
         lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
+def test_lambda_one_shot_child_process_stdout_is_log(runtime):
+    if runtime.startswith("nodejs"):
+        if not shutil.which("node"):
+            pytest.skip("needs node")
+        code = _make_zip_js(
+            "const { spawnSync } = require('child_process');\n"
+            "exports.handler = async () => {\n"
+            "  spawnSync(process.execPath, ['-e', 'console.log(\\'upload 1\\')'], { stdio: 'inherit' });\n"
+            "  return { ok: true };\n"
+            "};\n")
+    else:
+        code = _make_zip(
+            "import subprocess, sys\n"
+            "def handler(event, context):\n"
+            "    subprocess.run([sys.executable, '-c', 'print(\\'upload 1\\')'], check=True)\n"
+            "    return {'ok': True}\n")
+    config = {"FunctionName": "one-shot", "Runtime": runtime, "Handler": "index.handler",
+              "MemorySize": 128, "Timeout": 30,
+              "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:one-shot"}
+    result = _lambda_mod._execute_function_local({"config": config, "code_zip": code}, {}, "req-1")
+    assert result["body"] == {"ok": True}, result
+    assert "upload 1" in result["log"]
+
+
+def test_lambda_one_shot_crash_with_a_detached_child_is_an_exit():
+    code = _make_zip(
+        "import os, subprocess, sys\n"
+        "def handler(event, context):\n"
+        "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'], start_new_session=True)\n"
+        "    os._exit(3)\n")
+    config = {"FunctionName": "one-shot", "Runtime": "python3.12", "Handler": "index.handler",
+              "MemorySize": 128, "Timeout": 15,
+              "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:one-shot"}
+    started = time.monotonic()
+    result = _lambda_mod._execute_function_local({"config": config, "code_zip": code}, {}, "req-2")
+    assert time.monotonic() - started < 10
+    assert result["body"]["errorType"] == "Runtime.ExitError", result
+
 
 # ---------------------------------------------------------------------------
 # Terraform compatibility tests
@@ -8626,7 +8704,10 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(code_dir)
 
-        env = {**os.environ, "AWS_ENDPOINT_URL": _endpoint}
+        from ministack.core.lambda_runtime import RESPONSE_FD_ENV
+
+        resp_r, resp_w = os.pipe()
+        env = {**os.environ, "AWS_ENDPOINT_URL": _endpoint, RESPONSE_FD_ENV: str(resp_w)}
         if env_extra:
             env.update(env_extra)
 
@@ -8635,10 +8716,13 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            pass_fds=(resp_w,),
             text=True,
             bufsize=1,
             env=env,
         )
+        os.close(resp_w)
+        replies = open(resp_r, encoding="utf-8")
 
         init = json.dumps({
             "code_dir": code_dir,
@@ -8652,7 +8736,7 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
         proc.stdin.write(init + "\n")
         proc.stdin.flush()
 
-        init_resp = json.loads(proc.stdout.readline())
+        init_resp = json.loads(replies.readline())
         assert init_resp.get("status") == "ready", (
             f"Worker init failed: {init_resp}; stderr: {proc.stderr.read(2048)}"
         )
@@ -8661,8 +8745,9 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
         proc.stdin.write(event + "\n")
         proc.stdin.flush()
 
-        invoke_resp = json.loads(proc.stdout.readline())
+        invoke_resp = json.loads(replies.readline())
         proc.terminate()
+        replies.close()
         return invoke_resp
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

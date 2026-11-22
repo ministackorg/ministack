@@ -18302,6 +18302,80 @@ def test_rds_postgres_serves_verified_tls(rds, tmp_path, engine):
                 pass
 
 
+@pytest.mark.data_plane
+@pytest.mark.parametrize("engine", ("mysql", "aurora-mysql"))
+def test_rds_mysql_serves_verified_tls(rds, tmp_path, engine):
+    """Real AWS (us-east-1, RDS MySQL 8.4 and Aurora MySQL 3): the server
+    certificate chains to the regional RDS root and names the endpoint, so a
+    client verifying the server and its hostname with our CA connects."""
+    pymysql = pytest.importorskip("pymysql")
+    db_id = f"tls-{engine.split('-')[-1]}-{_uuid_mod.uuid4().hex[:8]}"
+    cluster_id = f"{db_id}-c"
+    try:
+        if engine == "aurora-mysql":
+            rds.create_db_cluster(
+                DBClusterIdentifier=cluster_id, Engine=engine,
+                MasterUsername="admin", MasterUserPassword="password",
+                DatabaseName="appdb",
+            )
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.r6g.large", Engine=engine,
+            )
+        else:
+            rds.create_db_instance(
+                DBInstanceIdentifier=db_id, DBInstanceClass="db.t3.micro",
+                Engine="mysql", MasterUsername="admin",
+                MasterUserPassword="password", DBName="appdb",
+                AllocatedStorage=20,
+            )
+        endpoint = None
+        for _ in range(90):
+            detail = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
+            if detail["DBInstanceStatus"] == "available" and detail.get("Endpoint"):
+                endpoint = detail["Endpoint"]
+                break
+            time.sleep(2)
+        if endpoint is None:
+            pytest.skip("no backing container available in this environment")
+
+        dial_host, dial_port = _host_dialable(endpoint)
+        # pymysql checks the host it dials, which differs from the advertised name
+        # for an alias and is not on the certificate for a container IP; the name
+        # is checked against the certificate below.
+        name = endpoint["Address"]
+        try:
+            ipaddress.ip_address(name)
+            name = "localhost"
+        except ValueError:
+            pass
+        context = ssl.create_default_context(cafile=_rds_ca_pem(tmp_path))
+        context.check_hostname = False
+        connection = pymysql.connect(
+            host=dial_host, port=dial_port, user="admin", password="password",
+            database="appdb", ssl=context, connect_timeout=15,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SHOW SESSION STATUS LIKE 'Ssl_version'")
+                assert cursor.fetchone()[1].startswith("TLSv1.")
+            leaf = connection._sock.getpeercert()
+        finally:
+            connection.close()
+        sans = [value for kind, value in leaf["subjectAltName"] if kind == "DNS"]
+        assert name in sans
+    finally:
+        try:
+            rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
+        except ClientError:
+            pass
+        if engine == "aurora-mysql":
+            try:
+                rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+            except ClientError:
+                pass
+
+
 def test_rds_ca_endpoint_serves_one_stable_ca(tmp_path):
     """The CA is minted once and served as PEM, the local stand-in for AWS's
     certificate bundle."""

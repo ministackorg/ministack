@@ -5548,6 +5548,29 @@ def test_oauth2_token_refresh_token():
     assert 'id_token' in resp2
 
 
+
+def test_oauth2_token_refresh_token_expires_with_the_client():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _setup_pool_with_user(cognito_idp)
+    client_id = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='long-lived',
+        ExplicitAuthFlows=['ALLOW_ADMIN_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        AccessTokenValidity=12, TokenValidityUnits={'AccessToken': 'hours'},
+    )['UserPoolClient']['ClientId']
+    refresh_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow='ADMIN_USER_PASSWORD_AUTH',
+        AuthParameters={'USERNAME': 'testuser', 'PASSWORD': 'TestPass1!'},
+    )['AuthenticationResult']['RefreshToken']
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'refresh_token', 'refresh_token': refresh_token, 'client_id': client_id})
+
+    assert status == 200
+    resp = json.loads(body)
+    claims = _decode_jwt_claims(resp['access_token'])
+    assert resp['expires_in'] == claims['exp'] - claims['iat'] == 43200
+
+
 _RESOURCE = 'https://api.example.com/api/mcp/plugin'
 
 

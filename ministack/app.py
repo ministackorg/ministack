@@ -46,8 +46,10 @@ def _version() -> str:
             _VERSION = "dev"
     return _VERSION
 
-# Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
-_EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
+# Matches host headers like "{apiId}.execute-api.<host>[:port]" or AWS's "{apiId}.execute-api.<region>.amazonaws.com"
+_EXECUTE_API_RE = re.compile(
+    r"^([a-f0-9]{8})\.execute-api\.(?:[a-z0-9-]+\.amazonaws\.com|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
+)
 # A distribution's DomainName: <label>.cloudfront.net, or <label>.cloudfront.<MINISTACK_HOST>.
 _CLOUDFRONT_HOST_RE = re.compile(
     r"^([a-z0-9]+)\.cloudfront\.(?:net|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"

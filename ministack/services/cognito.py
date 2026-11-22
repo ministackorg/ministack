@@ -9441,7 +9441,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         "access_token": result["AccessToken"],
         "id_token": result["IdToken"],
         "token_type": "Bearer",
-        "expires_in": 3600,
+        "expires_in": result["ExpiresIn"],
     }
     if result.get("RefreshToken"):
         resp["refresh_token"] = result["RefreshToken"]
