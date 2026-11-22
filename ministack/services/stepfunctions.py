@@ -965,6 +965,13 @@ def _start_execution(data):
     sm_arn = base_arn
 
     sm = _state_machines[sm_arn]
+    # An execution started on a version or an alias runs that version (StartExecution) and reports its ARN, and the
+    # alias ARN when started on an alias.
+    version_arn = _execution_version_arn(requested_arn)
+    started_on = {
+        **({"stateMachineVersionArn": version_arn} if version_arn else {}),
+        **({"stateMachineAliasArn": requested_arn} if requested_arn in _state_machine_aliases else {}),
+    }
     name = data.get("name") or new_uuid()
     exec_arn = (f"arn:aws:states:{get_region()}:{get_account_id()}"
                 f":execution:{sm['name']}:{name}")
@@ -996,12 +1003,13 @@ def _start_execution(data):
         # the execution started with: the version's when a version or an alias
         # was named.
         "encryptionConfiguration": copy.deepcopy(
-            (_state_machine_versions.get(_execution_version_arn(requested_arn)) or sm)
+            (_state_machine_versions.get(version_arn) or sm)
             .get("encryptionConfiguration") or _default_encryption()),
+        **started_on,
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
-                 "input": input_str, "roleArn": sm["roleArn"]}},
+                 "input": input_str, "roleArn": sm["roleArn"], **started_on}},
         ],
     }
 
@@ -1082,6 +1090,9 @@ def _describe_execution(data):
         result["mapRunArn"] = execution["mapRunArn"]
     if execution.get("traceHeader"):
         result["traceHeader"] = execution["traceHeader"]
+    for key in ("stateMachineVersionArn", "stateMachineAliasArn"):
+        if execution.get(key):
+            result[key] = execution[key]
     return json_response(result)
 
 
@@ -1339,10 +1350,11 @@ def _describe_state_machine_for_execution(data):
             "StateMachineDoesNotExist",
             f"State machine {sm_arn} not found", 400)
 
+    ran = _state_machine_versions.get(execution.get("stateMachineVersionArn")) or sm
     return json_response({
         "stateMachineArn": sm["stateMachineArn"],
         "name": sm["name"],
-        "definition": sm["definition"],
+        "definition": ran["definition"],
         "roleArn": sm["roleArn"],
         "updateDate": sm.get("creationDate", now_iso()),
         "encryptionConfiguration": copy.deepcopy(
@@ -1899,7 +1911,8 @@ def _run_execution(exec_arn):
         return
 
     try:
-        definition = json.loads(sm["definition"])
+        definition = json.loads(
+            (_state_machine_versions.get(execution.get("stateMachineVersionArn")) or sm)["definition"])
     except json.JSONDecodeError:
         _fail_execution(execution, "InvalidDefinition",
                         "Could not parse state machine definition")
