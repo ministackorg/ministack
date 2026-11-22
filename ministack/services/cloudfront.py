@@ -56,7 +56,8 @@ Supports:
   Web ACL: AssociateDistributionWebACL, DisassociateDistributionWebACL
 
 Data plane (handle_viewer_request): serves viewer requests to <label>.cloudfront.net /
-<label>.cloudfront.<MINISTACK_HOST>. Not modelled: caching, WAF, logging, geo restrictions,
+<label>.cloudfront.<MINISTACK_HOST>. The WAFv2 web ACL in WebACLId inspects each request after the
+method check (waf.evaluate_web_acl). Not modelled: caching, logging, geo restrictions,
 signed URLs and cookies, Lambda@Edge, CORS preflight, synthetic CloudFront-Viewer-* headers,
 origins at AWS hostnames (502) other than a load balancer or Function URL in this MiniStack, which is
 served in-process.
@@ -101,6 +102,7 @@ from ministack.core.responses import (
     new_uuid,
     request_scope,
 )
+from ministack.core.router import service_for_host
 
 logger = logging.getLogger("cloudfront")
 
@@ -5705,7 +5707,7 @@ def _body_from_response_event(response: dict, fallback: bytes) -> bytes:
     return fallback
 
 
-async def _run_function(function_arn: str, event: dict) -> dict:
+async def _run_function(function_arn: str, event: dict) -> tuple:
     code = live_function_code(function_arn)
     if code is None:
         raise CloudFrontFunctionError(f"{function_arn} has no published (LIVE) code")
@@ -5720,6 +5722,53 @@ async def _run_function(function_arn: str, event: dict) -> dict:
         return await run_offloop(cloudfront_js.evaluate, code, event, view.get("runtime", fn["runtime"]), kvs)
     except cloudfront_js.CloudFrontFunctionError as exc:
         raise CloudFrontFunctionError(str(exc)) from exc
+
+
+def _updated_origin(base: dict, params: dict) -> dict:
+    """The origin cf.updateRequestOrigin() sets; a setting it leaves out keeps the base origin's."""
+    origin = dict(base)
+    oac = params.get("originAccessControlConfig")
+    if oac is not None:
+        signs = oac.get("enabled") and oac.get("signingBehavior") != "never"
+        origin["oac_id"] = (base["oac_id"] or "updateRequestOrigin") if signs else ""
+    if "domainName" in params:
+        origin["domain_name"] = params["domainName"]
+        if base["s3_bucket"] is not None or (oac or {}).get("originType") == "s3":
+            origin["s3_bucket"] = _s3_origin_bucket(params["domainName"])
+    if host := params.get("hostHeader") or params.get("domainName"):
+        origin["host_header"] = host
+    if "originPath" in params:
+        origin["origin_path"] = params["originPath"]
+    if "customHeaders" in params:
+        origin["custom_headers"] = list(params["customHeaders"].items())
+    if "readTimeout" in params.get("timeouts", {}):
+        origin["read_timeout"] = int(params["timeouts"]["readTimeout"])
+    custom = params.get("customOriginConfig")
+    if custom:
+        origin["protocol_policy"] = f"{custom['protocol']}-only"
+        origin[f"{custom['protocol']}_port"] = int(custom["port"])
+    return origin
+
+
+def _requested_origins(parsed: dict, origin: dict, picked) -> tuple:
+    """(origins, failover status codes) for one request: the behavior's origin, or those that the
+    viewer-request function's origin helper picked, primary first. The origins are None when an
+    origin ID is not in the distribution."""
+    if not picked:
+        return [origin], set()
+    if "update" in picked:
+        return [_updated_origin(origin, picked["update"] or {})], set()
+    group = picked["group"] or {}
+    origins = []
+    for ref in group.get("originIds") or []:
+        ref = ref if isinstance(ref, dict) else {"originId": ref}
+        chosen = parsed["origins"].get(ref.get("originId"))
+        if chosen is None:
+            return None, set()
+        host = ref.get("originOverrides", {}).get("hostHeader")
+        origins.append(dict(chosen, host_header=host) if host else chosen)
+    criteria = group.get("failoverCriteria") or {}
+    return origins or None, set(criteria.get("statusCodes", []) if isinstance(criteria, dict) else criteria)
 
 
 # ---------------------------------------------------------------------------
@@ -6072,8 +6121,8 @@ def _origin_request_headers(origin: dict, headers: dict, client_ip: str, viewer_
     fwd_headers = {k: v for k, v in headers.items() if k not in _CONNECTION_MANAGEMENT_HEADERS}
     for name, value in origin.get("custom_headers") or []:
         _set_header_ci(fwd_headers, name, value)
-    # Host is the origin's DomainName unless the policies forward the viewer's Host.
-    _set_header_ci(fwd_headers, "Host", headers.get("host", origin["domain_name"]))
+    # Host is the origin's DomainName unless an origin helper or the policies set it.
+    _set_header_ci(fwd_headers, "Host", origin.get("host_header") or headers.get("host", origin["domain_name"]))
     _set_header_ci(fwd_headers, "Via", f"1.1 {_cf_via_hash()}.cloudfront.net (CloudFront)")
     _set_header_ci(fwd_headers, "X-Amz-Cf-Id", _cf_request_id())
     # Always appended (Developer Guide, "Client IP addresses").
@@ -6092,8 +6141,14 @@ def _forward_to_origin(origin: dict, method: str, uri: str, query_string: str,
     """Blocking: run under core.concurrency.run_reentrant (the origin may be
     MiniStack itself). Returns (status, reason, headers, body)."""
     conn_host, conn_port, use_https = _origin_connect_target(origin, viewer_is_https)
-    if _is_aws_owned_host(_normalize_origin_host(conn_host)):
-        raise OriginUnreachable(f"refusing to dial AWS-owned origin host {conn_host!r}")
+    if _is_aws_owned_host(host := _normalize_origin_host(conn_host)):
+        if service_for_host(host) is None:
+            raise OriginUnreachable(f"refusing to dial AWS-owned origin host {conn_host!r}")
+        # A host this MiniStack serves goes to its own gateway, which routes it by the Host header.
+        from ministack import app
+        from ministack.core import tls
+
+        conn_host, conn_port, use_https = "localhost", int(app._resolve_port()), tls.use_ssl_enabled()
     target_path = uri + (f"?{query_string}" if query_string else "")
     send_headers = _origin_request_headers(origin, headers, client_ip, viewer_x_forwarded_for)
 
@@ -6302,6 +6357,22 @@ async def _fetch_from_origin(origin: dict, method: str, uri: str, query_string: 
     return status, reason, _multidict_from_pairs(header_pairs), data
 
 
+async def _fetch_with_failover(origins: list, failover_codes: set, method: str, *args) -> tuple:
+    """The first origin's response, or the next one's when it fails over (Developer Guide, "Optimize high
+    availability with CloudFront origin failover": GET, HEAD and OPTIONS only)."""
+    if method not in ("GET", "HEAD", "OPTIONS"):
+        origins = origins[:1]
+    *primaries, last = origins
+    for origin in primaries:
+        try:
+            response = await _fetch_from_origin(origin, method, *args)
+        except (OriginTimeout, OriginUnreachable):
+            continue
+        if response[0] not in failover_codes:
+            return response
+    return await _fetch_from_origin(last, method, *args)
+
+
 def _with_content_length(headers: dict, data: bytes) -> dict:
     """An in-process origin's buffered body, framed with the Content-Length its wire response carries."""
     if "content-length" not in headers and "transfer-encoding" not in headers:
@@ -6450,6 +6521,30 @@ def _apply_default_root_object(default_root_object: str, request_uri: str) -> st
     return request_uri
 
 
+def _check_web_acl(dist: dict, method: str, raw_uri: str, raw_query_string: str, headers: dict, body: bytes,
+                   client_ip: str):
+    """``(response, headers)``: the viewer response when the web ACL does not allow the request, else None
+    and the headers with the ones the web ACL inserts. A default block is CloudFront's 403 error page."""
+    from ministack.services import waf
+
+    acl_arn = _text(_dist_config_el(dist), "WebACLId")
+    if not acl_arn:
+        return None, headers
+    acl = waf.resource_by_arn(acl_arn, "webacl")
+    if acl is None:
+        logger.warning("Distribution %s: WebACLId %s names no WAFv2 web ACL, so requests are not inspected",
+                       dist["Id"], acl_arn)
+        return None, headers
+    action, result = waf.evaluate_web_acl(acl, method, raw_uri, raw_query_string, headers, body, client_ip)
+    if action == "Allow":
+        return None, {**headers, **result}
+    if result is None:
+        return _cf_error_response(403, "Request blocked.", _ERROR_X_CACHE), headers
+    status, response_headers, response_body = result
+    return (status, _render_headers(_add_cloudfront_headers(response_headers, _ERROR_X_CACHE), title_case=True),
+            response_body), headers
+
+
 def _check_stacked_distribution(headers: dict):
     """403 for a request that already passed through this hop (Developer Guide, stacked distributions)."""
     if "(cloudfront)" in headers.get("via", "").lower():
@@ -6507,6 +6602,9 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
     methods_response = _check_allowed_methods(behavior, method)
     if methods_response is not None:
         return methods_response
+    waf_response, headers = _check_web_acl(dist, method, raw_uri, raw_query_string, headers, body, client_ip)
+    if waf_response is not None:
+        return waf_response
 
     request_headers = dict(headers)
     if http_version == "1.0":
@@ -6518,13 +6616,14 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
     function_touched_querystring = False  # set when a function returns a changed querystring object
 
     request_function_arn = behavior["functions"].get("viewer-request")
+    picked_origin = None
     if request_function_arn:
         event = _build_function_event(
             "viewer-request", dist_id, dist_domain, request_id,
             method, request_uri, request_query, request_headers, client_ip,
         )
         try:
-            result = await _run_function(request_function_arn, event)
+            result, picked_origin = await _run_function(request_function_arn, event)
         except CloudFrontFunctionError:
             logger.exception("viewer-request function error (distribution=%s)", dist_id)
             return _cf_error_response(503, "The Lambda function failed to execute.", _ERROR_X_CACHE)
@@ -6566,7 +6665,8 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
                 request_query[name] = values
 
     origin = parsed["origins"].get(behavior["target_origin_id"])
-    if origin is None:
+    origins, failover_codes = _requested_origins(parsed, origin, picked_origin) if origin else (None, set())
+    if origins is None:
         return _cf_error_response(502, "The request could not be satisfied.", _ERROR_X_CACHE)
 
     header_allowed, cookie_allowed, qs_allowed = _forwarding_predicates(behavior)
@@ -6608,8 +6708,8 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
         )
 
     try:
-        status, reason, origin_headers, origin_body = await _fetch_from_origin(
-            origin, method, request_uri, forward_qs, fwd_headers, body, viewer_is_https,
+        status, reason, origin_headers, origin_body = await _fetch_with_failover(
+            origins, failover_codes, method, request_uri, forward_qs, fwd_headers, body, viewer_is_https,
             client_ip, request_headers.get("x-forwarded-for", ""), dist.get("ARN", ""),
         )
         origin_status = status
@@ -6654,7 +6754,7 @@ async def _handle_viewer_request(dist: dict, method: str, path: str, raw_uri: st
         )
         event["response"] = _response_event_fields(status, reason, response_headers)
         try:
-            result = await _run_function(response_function_arn, event)
+            result, _ = await _run_function(response_function_arn, event)
         except CloudFrontFunctionError:
             logger.exception("viewer-response function error (distribution=%s)", dist_id)
             return _cf_error_response(503, "The Lambda function failed to execute.", _ERROR_X_CACHE)

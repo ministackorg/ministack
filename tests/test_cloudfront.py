@@ -5151,6 +5151,38 @@ def test_routes_by_alternate_domain_name(cloudfront, cf_backend):
     assert json.loads(body)["path"] == "/exact/hello"
 
 
+
+def test_web_acl_inspects_viewer_requests(cloudfront, cf_backend):
+    wafv2 = make_client("wafv2")
+    vis = {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"}
+
+    def byte_rule(name, priority, field, search, action):
+        return {"Name": name, "Priority": priority, "Action": action, "VisibilityConfig": vis,
+                "Statement": {"ByteMatchStatement": {"FieldToMatch": field, "SearchString": search,
+                              "PositionalConstraint": "STARTS_WITH",
+                              "TextTransformations": [{"Priority": 0, "Type": "NONE"}]}}}
+
+    acl_arn = wafv2.create_web_acl(
+        Name=f"cf-waf-{_uuid_mod.uuid4().hex[:8]}", Scope="CLOUDFRONT", DefaultAction={"Allow": {}},
+        VisibilityConfig=vis, Rules=[
+            byte_rule("tag", 0, {"SingleHeader": {"Name": "x-tag"}}, b"tag", {"Count": {"CustomRequestHandling": {
+                "InsertHeaders": [{"Name": "tagged", "Value": "yes"}]}}}),
+            byte_rule("block", 1, {"UriPath": {}}, b"/blocked", {"Block": {}}),
+        ])["Summary"]["ARN"]
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["waf.example.test"], "/p")
+    cfg = cloudfront.get_distribution_config(Id=_ALIAS_DISTRIBUTIONS[-1])
+    config = cfg["DistributionConfig"]
+    config["DefaultCacheBehavior"]["OriginRequestPolicyId"] = _ALL_VIEWER_EXCEPT_HOST
+    cloudfront.update_distribution(Id=_ALIAS_DISTRIBUTIONS[-1], IfMatch=cfg["ETag"],
+                                   DistributionConfig={**config, "WebACLId": acl_arn})
+
+    status, _, body = _get("waf.example.test", "/blocked/x")
+    assert status == 403 and b"Request blocked." in body
+    status, _, body = _get("waf.example.test", "/ok", extra_headers={"X-Tag": "tag"})
+    assert status == 200
+    assert json.loads(body)["headers"]["x-amzn-waf-tagged"] == "yes"
+
+
 def _served_by(host):
     return json.loads(_get(host, "/hello")[2])["path"]
 
@@ -5194,6 +5226,19 @@ def test_signed_api_call_is_not_alias_viewer_traffic(cloudfront, cf_backend):
     signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20261030/us-east-1/s3/aws4_request, "
                                "SignedHeaders=host, Signature=00"}
     assert "X-Cache" not in _get("api.sig.example.test", "/hello", extra_headers=signed)[1]
+
+
+def test_alias_under_the_ministack_host_is_not_an_s3_bucket(cloudfront, s3, cf_backend):
+    # docs.<x>.localhost has the shape of an S3 virtual-hosted bucket; the alias serves it unless that bucket exists.
+    label = f"cfa{_uuid_mod.uuid4().hex[:8]}"
+    host = f"{label}.stage.localhost"
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], [host], "/under-host")
+    assert _served_by(host) == "/under-host/hello"
+    s3.create_bucket(Bucket=label)
+    try:
+        assert b"NoSuchKey" in _get(host, "/hello")[2]
+    finally:
+        s3.delete_bucket(Bucket=label)
 
 
 def test_function_event_host_is_lower_cased_without_port():
@@ -5546,7 +5591,7 @@ def test_multiple_set_cookie_headers_all_carried_through(cf_stack):
 
 def test_aws_owned_origin_host_refused_before_any_socket():
     origin = {
-        "domain_name": "abcd1234.execute-api.us-east-1.amazonaws.com.",  # trailing dot
+        "domain_name": "unknown.us-east-1.amazonaws.com.",  # trailing dot; no MiniStack service
         "origin_path": "", "custom_headers": [], "s3_bucket": None,
         "http_port": 80, "https_port": 443, "protocol_policy": "https-only",
     }
@@ -5743,6 +5788,37 @@ def test_s3_origin_without_a_bucket_policy_grant_is_denied(cloudfront, s3):
     status, _headers, body = _get(dist["DomainName"], "/hello.txt")
     assert status == 403
     assert b"<Code>AccessDenied</Code>" in body
+
+
+def test_s3_origin_policy_on_source_account_allows_the_fetch(cloudfront, s3):
+    """An OAC fetch carries aws:SourceAccount, the distribution's account."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    bucket = f"cf-dp-s3-acct-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="hello.txt", Body=b"hi")
+    dist = cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cf-dp-s3-acct-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "s3-origin", "DomainName": f"{bucket}.s3.amazonaws.com",
+            "S3OriginConfig": {"OriginAccessIdentity": ""}, "OriginAccessControlId": "test-oac-id",
+        }]},
+        "DefaultCacheBehavior": {"TargetOriginId": "s3-origin", "ViewerProtocolPolicy": "allow-all",
+                                 "CachePolicyId": _CACHING_DISABLED},
+    })["Distribution"]
+    account = dist["ARN"].split(":")[4]
+
+    def policy(value):
+        s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Statement": [{
+            "Effect": "Allow", "Principal": {"Service": "cloudfront.amazonaws.com"},
+            "Action": "s3:GetObject", "Resource": f"arn:aws:s3:::{bucket}/*",
+            "Condition": {"StringEquals": {"AWS:SourceAccount": value},
+                          "StringLike": {"AWS:SourceArn": f"arn:aws:cloudfront::{account}:distribution/*"}},
+        }]}))
+
+    policy(account)
+    assert _get(dist["DomainName"], "/hello.txt")[0] == 200
+    policy("999999999999")
+    assert _get(dist["DomainName"], "/hello.txt")[0] == 403
 
 
 def test_s3_origin_serves_bucket_object(cf_s3_stack):
@@ -6929,3 +7005,66 @@ def test_method_error_page_is_the_real_page(cloudfront):
     assert len(body) == 1053
     assert body.endswith(b"</PRE>\n<ADDRESS>\n</ADDRESS>\n</BODY></HTML>")
 
+
+# ---------------------------------------------------------------------------
+# Origin modification helpers (Developer Guide, "Helper methods for origin modification").
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def origin_helper_host(cloudfront, cf_backend):
+    """A distribution whose default origin is unreachable and whose viewer-request function picks the
+    origin by the first path segment, which it then removes."""
+    suffix = _uuid_mod.uuid4().hex[:10]
+    api_host = cf_backend["origin_domain"].replace(".localhost", ".us-east-1.amazonaws.com")
+    fn_arn = _create_function(cloudfront, f"cf-origin-helpers-{suffix}", f"""import cf from 'cloudfront';
+function handler(event) {{
+  const helper = event.request.uri.split('/')[1];
+  event.request.uri = event.request.uri.slice(helper.length + 1);
+  if (helper === 'update') cf.updateRequestOrigin({{ domainName: '{api_host}', originPath: '/up',
+    customHeaders: {{ 'x-picked': 'update' }}, customOriginConfig: {{ port: 443, protocol: 'https', sslProtocols: ['TLSv1.2'] }} }});
+  if (helper === 'unserved') cf.updateRequestOrigin({{ domainName: 'unknown.us-east-1.amazonaws.com' }});
+  if (helper === 'select') cf.selectRequestOriginById('api');
+  if (helper === 'missing') cf.selectRequestOriginById('no-such-origin');
+  if (helper === 'group') cf.createRequestOriginGroup({{ originIds: [{{ originId: 'api' }}, {{ originId: 'api-b' }}],
+    failoverCriteria: {{ statusCodes: [500] }} }});
+  return event.request;
+}}
+""".encode())
+    api = {"CustomOriginConfig": {"HTTPPort": int(GATEWAY_PORT), "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"},
+           "DomainName": cf_backend["origin_domain"]}
+    origins = [{"Id": "dead", "DomainName": "127.0.0.1",
+                "CustomOriginConfig": {"HTTPPort": 9, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only"}},
+               {"Id": "api", **api}, {"Id": "api-b", "OriginPath": "/b", **api}]
+    return cloudfront.create_distribution(DistributionConfig={
+        "CallerReference": f"cf-origin-helpers-{suffix}", "Comment": "", "Enabled": True,
+        "Origins": {"Quantity": len(origins), "Items": origins},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "dead", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
+            "FunctionAssociations": {"Quantity": 1, "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}]},
+        },
+    })["Distribution"]["DomainName"]
+
+
+def test_update_request_origin_reaches_an_execute_api_host_this_ministack_serves(origin_helper_host, cf_backend):
+    _skip_without_node()
+    status, _headers, body = _get(origin_helper_host, "/update/x")
+    assert status == 200, body
+    echoed = json.loads(body)
+    assert echoed["path"] == "/up/x"
+    assert echoed["headers"]["x-picked"] == "update"
+    assert echoed["headers"]["host"] == cf_backend["origin_domain"].replace(".localhost", ".us-east-1.amazonaws.com")
+    assert _get(origin_helper_host, "/unserved/x")[0] == 502
+
+
+def test_select_request_origin_by_id_and_origin_group_failover(origin_helper_host):
+    _skip_without_node()
+    status, _headers, body = _get(origin_helper_host, "/select/x")
+    assert (status, json.loads(body)["path"]) == (200, "/x")
+    assert _get(origin_helper_host, "/missing/x")[0] == 502
+    status, _headers, body = _get(origin_helper_host, "/group/status/500")
+    assert (status, json.loads(body)["path"]) == (200, "/b/status/500")
+    status, _headers, body = _get(origin_helper_host, "/group/x")
+    assert (status, json.loads(body)["path"]) == (200, "/x")
+    # Origin failover applies to GET, HEAD and OPTIONS only.
+    assert _get(origin_helper_host, "/group/status/500", method="POST")[0] == 500

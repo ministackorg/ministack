@@ -135,6 +135,19 @@ def test_account_region_scoped_dict_isolates_account_and_region():
         set_request_region(original_region)
 
 
+def test_save_state_syncs_the_file_before_the_rename(monkeypatch, tmp_path):
+    """A host that stops right after shutdown must not come back to an empty state file."""
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    events = []
+    real_fsync, real_replace = persistence.os.fsync, persistence.os.replace
+    monkeypatch.setattr(persistence.os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(persistence.os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
+    persistence.save_state("fsync-probe", {"k": 1})
+    assert events == ["fsync", "replace"]
+    assert persistence.load_state("fsync-probe") == {"k": 1}
+
+
 def test_account_region_scoped_dict_persistence_round_trip(monkeypatch, tmp_path):
     """Account+region scoped stores must survive the JSON persistence path."""
     from ministack.core.responses import (

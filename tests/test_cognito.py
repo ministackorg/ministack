@@ -4493,6 +4493,18 @@ def test_oauth2_authorize_shows_login_form():
     assert client_id in html
 
 
+def test_oauth2_authorize_identity_provider_cognito_shows_login_form():
+    # identity_provider=COGNITO names the pool's own sign-in, as Amplify signInWithRedirect sends it.
+    cognito_idp = make_client('cognito-idp')
+    _pool_id, client = _setup_pool_with_user(cognito_idp)
+    status, _headers, body = _get(f'{ENDPOINT}/oauth2/authorize?response_type=code'
+                                  f'&client_id={client["ClientId"]}'
+                                  f'&redirect_uri=http://localhost:3000/callback'
+                                  f'&scope=openid&identity_provider=COGNITO')
+    assert status == 200
+    assert '<form' in body.decode('utf-8')
+
+
 def test_oauth2_authorize_invalid_client():
     url = (f'{ENDPOINT}/oauth2/authorize?response_type=code'
            f'&client_id=nonexistent'
@@ -5534,6 +5546,29 @@ def test_oauth2_token_refresh_token():
     resp2 = json.loads(body2)
     assert 'access_token' in resp2
     assert 'id_token' in resp2
+
+
+
+def test_oauth2_token_refresh_token_expires_with_the_client():
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _setup_pool_with_user(cognito_idp)
+    client_id = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='long-lived',
+        ExplicitAuthFlows=['ALLOW_ADMIN_USER_PASSWORD_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+        AccessTokenValidity=12, TokenValidityUnits={'AccessToken': 'hours'},
+    )['UserPoolClient']['ClientId']
+    refresh_token = cognito_idp.admin_initiate_auth(
+        UserPoolId=pool_id, ClientId=client_id, AuthFlow='ADMIN_USER_PASSWORD_AUTH',
+        AuthParameters={'USERNAME': 'testuser', 'PASSWORD': 'TestPass1!'},
+    )['AuthenticationResult']['RefreshToken']
+
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'refresh_token', 'refresh_token': refresh_token, 'client_id': client_id})
+
+    assert status == 200
+    resp = json.loads(body)
+    claims = _decode_jwt_claims(resp['access_token'])
+    assert resp['expires_in'] == claims['exp'] - claims['iat'] == 43200
 
 
 _RESOURCE = 'https://api.example.com/api/mcp/plugin'
@@ -15388,6 +15423,27 @@ def test_cognito_postauth_not_run_on_refresh(cognito_idp, lam):
     assert cognito_idp.initiate_auth(ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
                                      AuthParameters={"REFRESH_TOKEN": refresh_token})["AuthenticationResult"]
     assert cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken=refresh_token)["AuthenticationResult"]
+
+
+def test_cognito_postauth_runs_on_hosted_ui_sign_in(cognito_idp, lam):
+    """Measured live (eu-north-1, 2026-11-20): a passing trigger lets /login issue a code, a throwing one
+    issues none and shows its error on the sign-in page with 401."""
+    allow = _pretoken_lambda(lam, "ministack-postauth-hosted-allow", "def handler(event, ctx):\n    return event\n")
+    reject = _pretoken_lambda(lam, "ministack-postauth-hosted-reject",
+                              "def handler(event, ctx):\n    raise RuntimeError('hosted refuses')\n")
+    pool_id, client = _setup_pool_with_user(cognito_idp, lambda_config={"PostAuthentication": allow})
+    form = {"username": "testuser", "password": "TestPass1!", "client_id": client["ClientId"],
+            "redirect_uri": "http://localhost:3000/callback", "scope": "openid", "response_type": "code"}
+    try:
+        status, headers, _ = _post_form(f"{ENDPOINT}/login", form, follow_redirects=False)
+        assert status == 302 and "code=" in headers.get("location", "")
+        cognito_idp.update_user_pool(UserPoolId=pool_id, LambdaConfig={"PostAuthentication": reject})
+        status, headers, body = _post_form(f"{ENDPOINT}/login", form, follow_redirects=False)
+        assert status == 401
+        assert "location" not in headers
+        assert "PostAuthentication failed with error hosted refuses." in body.decode()
+    finally:
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
 def test_cognito_postauth_missing_lambda_fails_sign_in(cognito_idp, lam):
