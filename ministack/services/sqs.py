@@ -56,6 +56,8 @@ _ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 _queues = AccountRegionScopedDict()
 _queue_name_to_url = AccountRegionScopedDict()
 _queues_lock = threading.Lock()
+# StartMessageMoveTask tasks, keyed by task id in the source queue's account and region.
+_move_tasks = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -68,6 +70,7 @@ def get_state():
     return {
         "queues": copy.deepcopy(_queues),
         "queue_name_to_url": copy.deepcopy(_queue_name_to_url),
+        "move_tasks": copy.deepcopy(_move_tasks),
     }
 
 
@@ -78,6 +81,7 @@ def load_persisted_state(data):
 def _restore_state(data):
     if data:
         _queues.update(data.get("queues", {}))
+        _move_tasks.update(data.get("move_tasks", {}))
         _queue_name_to_url.clear()
         _rebuild_queue_name_index()
 
@@ -413,6 +417,9 @@ async def _dispatch(action: str, data: dict, qurl: str) -> dict:
     if fn is None:
         raise _Err("InvalidAction",
                     f"The action {action} is not valid for this endpoint.")
+    if any(t["status"] in _MOVE_ACTIVE for t in _move_tasks.all_values()):
+        with _queues_lock:
+            _advance_move_tasks()
     result = fn(data, qurl)
     if asyncio.iscoroutine(result):
         result = await result
@@ -1196,6 +1203,215 @@ def _act_untag_queue(data: dict, qurl: str) -> dict:
     return {}
 
 
+
+# ── Message move tasks (dead-letter queue redrive) ─────────
+#
+# A task moves the messages visible in its source DLQ when it starts, to DestinationArn or each back to its
+# DeadLetterQueueSourceArn, at MaxNumberOfMessagesPerSecond or all at once. Tasks advance on SQS requests and
+# Lambda event source polls; there is no timer.
+
+_MOVE_ACTIVE = ("RUNNING", "CANCELLING")
+_MOVE_CANCEL_SETTLE_S = 20.0  # a cancelled task goes on moving, CANCELLING, this long before it is CANCELLED
+
+
+def _move_invalid(message: str) -> _Err:
+    return _Err("InvalidParameterValueException", message)
+
+
+def _move_queue(data: dict, param: str) -> tuple[str, dict]:
+    arn = data.get(param) or ""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        spec = None
+    if spec is None or not spec.resource:
+        raise _move_invalid(f"You must use this format to specify the {param}: "
+                            "arn:<partition>:<service>:<region>:<account-id>:<resource-id>")
+    q = _queue_by_arn(arn)
+    if q is None:
+        raise _Err("ResourceNotFoundException",
+                   f"The resource that you specified for the {param} parameter doesn't exist.",
+                   404)
+    return arn, q
+
+
+def _is_dead_letter_queue(arn: str) -> bool:
+    """Whether a queue of the DLQ's own account and region names it as its deadLetterTargetArn."""
+    spec = parse_arn(arn)
+    for q in _queues.values_scoped(spec.account_id, spec.region):
+        try:
+            rp = json.loads(q.get("attributes", {}).get("RedrivePolicy") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(rp, dict) and rp.get("deadLetterTargetArn") == arn:
+            return True
+    return False
+
+
+def _move_handle(task: dict) -> str:
+    raw = json.dumps({"taskId": task["id"], "sourceArn": task["source_arn"]}, separators=(",", ":"))
+    return base64.b64encode(raw.encode()).decode()
+
+
+def _source_tasks(source_arn: str) -> list:
+    """The tasks of a source queue, oldest first."""
+    spec = parse_arn(source_arn)
+    return sorted((t for t in _move_tasks.values_scoped(spec.account_id, spec.region)
+                   if t["source_arn"] == source_arn), key=lambda t: t["started_at"])
+
+
+def _move_message(m: dict, dest: dict, now: float) -> None:
+    """A moved message is a new message that keeps its body, attributes and FIFO group and deduplication ids."""
+    moved = dict(m)
+    moved.update(id=new_uuid(), receipt_handle=None, receive_count=0, first_receive_at=None,
+                 sent_at=now, enqueued_at=now, visible_at=now, dedup_cache_key=None, seq=None)
+    moved["sys"] = {k: v for k, v in m.get("sys", {}).items() if k != "DeadLetterQueueSourceArn"}
+    moved["sys"]["SentTimestamp"] = str(int(now * 1000))
+    if dest.get("is_fifo"):
+        dest["fifo_seq"] += 1
+        moved["seq"] = str(dest["fifo_seq"]).zfill(20)
+    dest["messages"].append(moved)
+    esm_wake.set()
+
+
+def _advance_move_task(task: dict, now: float) -> None:
+    if task["status"] == "CANCELLING" and now - task["cancelled_at"] >= _MOVE_CANCEL_SETTLE_S:
+        task["status"] = "CANCELLED"
+        return
+    src = _queue_by_arn(task["source_arn"])
+    dest = _queue_by_arn(task["destination_arn"]) if task["destination_arn"] else None
+    if src is None or (task["destination_arn"] and dest is None):
+        task.update(status="FAILED", failure_reason="AWS.SimpleQueueService.NonExistentQueue", pending=[])
+        return
+    _expire_retained(src)
+    budget = (int((now - task["started_at"]) * task["rate"]) - task["moved"]) if task["rate"] else len(task["pending"])
+    pending = set(task["pending"])
+    keep: list = []
+    messages = src["messages"]
+    for i, m in enumerate(messages):
+        if budget <= 0 or m.get("id") not in pending or m["visible_at"] > now:
+            keep.append(m)
+            continue
+        target = dest
+        if target is None:
+            origin = m.get("sys", {}).get("DeadLetterQueueSourceArn")
+            target = _queue_by_arn(origin) if origin else None
+        if target is None:
+            src["messages"] = keep + messages[i:]
+            task.update(status="FAILED", failure_reason="CouldNotDetermineMessageSource", pending=[])
+            return
+        _move_message(m, target, now)
+        pending.discard(m["id"])
+        task["moved"] += 1
+        budget -= 1
+    src["messages"] = keep
+    # Messages deleted, expired or received since the start are not moved.
+    still_there = {m.get("id") for m in keep if m["visible_at"] <= now}
+    task["pending"] = [mid for mid in task["pending"] if mid in pending and mid in still_there]
+    if not task["pending"] and task["status"] == "RUNNING":
+        task["status"] = "COMPLETED"
+
+
+def _advance_move_tasks() -> None:
+    """Move what the running tasks are due to have moved by now. Called with _queues_lock held."""
+    now = time.time()
+    for task in _move_tasks.all_values():
+        if task["status"] in _MOVE_ACTIVE:
+            _advance_move_task(task, now)
+
+
+def _act_start_message_move_task(data: dict, _u: str) -> dict:
+    source_arn, src = _move_queue(data, "SourceArn")
+    _enforce_queue_policy(src, "sqs:StartMessageMoveTask")
+    if not _is_dead_letter_queue(source_arn):
+        raise _move_invalid("Source queue must be configured as a Dead Letter Queue.")
+    destination_arn = None
+    if data.get("DestinationArn"):
+        destination_arn, dest = _move_queue(data, "DestinationArn")
+        if bool(dest.get("is_fifo")) != bool(src.get("is_fifo")):
+            raise _move_invalid("The source queue and destination queue must be of the same queue type.")
+    rate = data.get("MaxNumberOfMessagesPerSecond")
+    if rate not in (None, ""):
+        try:
+            rate = int(rate)
+        except (TypeError, ValueError):
+            rate = 0
+        if not 1 <= rate <= 500:
+            raise _move_invalid("Value for parameter MaxNumberOfMessagesPerSecond is invalid. "
+                                "Reason: You must enter a number that's between 1 and 500.")
+    else:
+        rate = None
+    if any(t["status"] in _MOVE_ACTIVE for t in _source_tasks(source_arn)):
+        raise _move_invalid("There is already a task running. Only one active task is allowed "
+                            "for a source queue arn at a given time.")
+    _expire_retained(src)
+    now = time.time()
+    pending = [m.get("id") for m in src["messages"] if m["visible_at"] <= now]
+    task = {"id": new_uuid(), "source_arn": source_arn, "destination_arn": destination_arn, "rate": rate,
+            "status": "RUNNING" if pending else "COMPLETED", "pending": pending, "moved": 0,
+            "to_move": len(pending), "started_at": now, "cancelled_at": None, "failure_reason": None}
+    spec = parse_arn(source_arn)
+    # ListMessageMoveTasks shows at most the 10 most recent, so older finished tasks are dropped.
+    for old in _source_tasks(source_arn)[:-9]:
+        _move_tasks.pop_scoped(spec.account_id, spec.region, old["id"])
+    _move_tasks.set_scoped(spec.account_id, spec.region, task["id"], task)
+    return {"TaskHandle": _move_handle(task)}
+
+
+def _act_list_message_move_tasks(data: dict, _u: str) -> dict:
+    source_arn, src = _move_queue(data, "SourceArn")
+    _enforce_queue_policy(src, "sqs:ListMessageMoveTasks")
+    max_results = data.get("MaxResults")
+    try:
+        max_results = 1 if max_results in (None, "") else int(max_results)
+    except (TypeError, ValueError):
+        max_results = 0
+    if not 1 <= max_results <= 10:
+        raise _move_invalid("Value for parameter MaxResults is invalid. "
+                            "Reason: You must enter a number that's between 1 and 10.")
+    results = []
+    for t in reversed(_source_tasks(source_arn)[-max_results:]):
+        entry: dict = {}
+        if t["status"] == "RUNNING":
+            entry["TaskHandle"] = _move_handle(t)
+        entry["Status"] = t["status"]
+        entry["SourceArn"] = t["source_arn"]
+        if t["destination_arn"]:
+            entry["DestinationArn"] = t["destination_arn"]
+        if t["rate"]:
+            entry["MaxNumberOfMessagesPerSecond"] = t["rate"]
+        entry["ApproximateNumberOfMessagesMoved"] = t["moved"]
+        entry["ApproximateNumberOfMessagesToMove"] = t["to_move"]
+        if t["failure_reason"]:
+            entry["FailureReason"] = t["failure_reason"]
+        entry["StartedTimestamp"] = int(t["started_at"] * 1000)
+        results.append(entry)
+    return {"Results": results} if results else {}
+
+
+def _act_cancel_message_move_task(data: dict, _u: str) -> dict:
+    try:
+        decoded = json.loads(base64.b64decode(data.get("TaskHandle") or "", validate=True))
+        task_id, source_arn = decoded["taskId"], decoded["sourceArn"]
+        spec = parse_arn(source_arn)
+    except (ValueError, TypeError, KeyError, ArnParseError):
+        raise _move_invalid("Value for parameter TaskHandle is invalid.") from None
+    src = _queue_by_arn(source_arn)
+    if src is None:
+        raise _Err("ResourceNotFoundException",
+                   "The resource that you specified for the SourceArn parameter doesn't exist.",
+                   404)
+    _enforce_queue_policy(src, "sqs:CancelMessageMoveTask")
+    task = _move_tasks.get_scoped(spec.account_id, spec.region, task_id)
+    if task is None or task["source_arn"] != source_arn:
+        raise _Err("ResourceNotFoundException", "Task does not exist.", 404)
+    if task["status"] == "RUNNING":
+        task.update(status="CANCELLING", cancelled_at=time.time())
+    elif task["status"] not in ("CANCELLING", "CANCELLED"):
+        raise _move_invalid("Only active tasks can be cancelled.")
+    return {"ApproximateNumberOfMessagesMoved": task["moved"]}
+
+
 # ── Register handlers ──────────────────────────────────────
 
 _HANDLERS.update({
@@ -1218,6 +1434,9 @@ _HANDLERS.update({
     "ListQueueTags":                _act_list_queue_tags,
     "TagQueue":                     _act_tag_queue,
     "UntagQueue":                   _act_untag_queue,
+    "StartMessageMoveTask":         _act_start_message_move_task,
+    "ListMessageMoveTasks":         _act_list_message_move_tasks,
+    "CancelMessageMoveTask":        _act_cancel_message_move_task,
 })
 
 
@@ -1568,6 +1787,7 @@ _QUERY_COMPAT_CODES: dict[str, str] = {
     "InvalidAddress":                 "InvalidAddress",
     "RequestThrottled":               "RequestThrottled",
     "ResourceNotFoundException":      "ResourceNotFoundException",
+    "InvalidParameterValueException": "InvalidParameterValue",
     # KMS errors — no namespace prefix
     "KmsAccessDenied":                "KmsAccessDenied",
     "KmsDisabled":                    "KmsDisabled",
@@ -1739,6 +1959,25 @@ def _to_xml(action: str, result: dict) -> tuple:
     if action == "UntagQueue":
         return _xml_resp(200, "UntagQueueResponse", "")
 
+    if action == "StartMessageMoveTask":
+        return _xml_resp(200, "StartMessageMoveTaskResponse",
+                         f'<StartMessageMoveTaskResult><TaskHandle>{_esc(result["TaskHandle"])}</TaskHandle>'
+                         f'</StartMessageMoveTaskResult>')
+
+    if action == "CancelMessageMoveTask":
+        return _xml_resp(200, "CancelMessageMoveTaskResponse",
+                         f'<CancelMessageMoveTaskResult><ApproximateNumberOfMessagesMoved>'
+                         f'{result["ApproximateNumberOfMessagesMoved"]}</ApproximateNumberOfMessagesMoved>'
+                         f'</CancelMessageMoveTaskResult>')
+
+    if action == "ListMessageMoveTasks":
+        entries = "".join("<ListMessageMoveTasksResultEntry>"
+                          + "".join(f"<{k}>{_esc(str(v))}</{k}>" for k, v in e.items())
+                          + "</ListMessageMoveTasksResultEntry>" for e in result.get("Results", []))
+        return _xml_resp(200, "ListMessageMoveTasksResponse",
+                         f"<ListMessageMoveTasksResult>{entries}</ListMessageMoveTasksResult>" if entries
+                         else "<ListMessageMoveTasksResult/>")
+
     return _xml_resp(200, f"{action}Response", "")
 
 
@@ -1818,7 +2057,8 @@ def _normalise(action: str, params: dict) -> dict:
                 "MaxNumberOfMessages", "MaxResults", "QueueNamePrefix",
                 "QueueOwnerAWSAccountId",
                 "NextToken", "MessageGroupId", "MessageDeduplicationId",
-                "ReceiveRequestAttemptId"):
+                "ReceiveRequestAttemptId", "SourceArn", "DestinationArn",
+                "MaxNumberOfMessagesPerSecond", "TaskHandle"):
         v = _p(params, key)
         if v:
             d[key] = v
@@ -1995,6 +2235,7 @@ def _url_from_path(path: str) -> str:
 def reset():
     _queues.clear()
     _queue_name_to_url.clear()
+    _move_tasks.clear()
 
 
 # ────────────────────────────────────────────────────────────
@@ -2016,6 +2257,7 @@ def _receive_messages_for_esm(queue_url: str, max_number: int) -> list[dict]:
         q = _get_q(queue_url)
         max_n = min(int(max_number or 1), 10)
         vis = int(q["attributes"].get("VisibilityTimeout", "30"))
+        _advance_move_tasks()
         _expire_retained(q)
         _dlq_sweep(q)
         return _collect_msgs(q, max_n, vis)
