@@ -5173,3 +5173,90 @@ def test_ec2_transit_gateway_terraform_lifecycle(ec2):
     assert gone["State"] == "deleted"
     ec2.delete_subnet(SubnetId=subnet_id)
     ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_vpc_secondary_cidr_block_association_matches_aws(ec2):
+    from botocore.exceptions import ClientError
+
+    def err(op, **kw):
+        with pytest.raises(ClientError) as exc:
+            getattr(ec2, op)(**kw)
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    vpc_id = ec2.create_vpc(CidrBlock="10.61.0.0/16")["Vpc"]["VpcId"]
+    r = ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="100.64.0.0/16")
+    a1 = r["CidrBlockAssociation"]["AssociationId"]
+    assert (r["VpcId"], r["CidrBlockAssociation"]["CidrBlock"], r["CidrBlockAssociation"]["CidrBlockState"]) == (
+        vpc_id, "100.64.0.0/16", {"State": "associating"})
+    [vpc] = ec2.describe_vpcs(Filters=[{"Name": "cidr-block-association.association-id", "Values": [a1]}])["Vpcs"]
+    assert [(a["CidrBlock"], a["CidrBlockState"]["State"]) for a in vpc["CidrBlockAssociationSet"]] == [
+        ("10.61.0.0/16", "associated"), ("100.64.0.0/16", "associated")]
+    primary = vpc["CidrBlockAssociationSet"][0]["AssociationId"]
+    assert [v["VpcId"] for v in ec2.describe_vpcs(Filters=[
+        {"Name": "cidr-block-association.cidr-block", "Values": ["100.64.0.0/16"]}])["Vpcs"]] == [vpc_id]
+    assert ec2.describe_vpcs(Filters=[{"Name": "cidr", "Values": ["100.64.0.0/16"]},
+                                      {"Name": "vpc-id", "Values": [vpc_id]}])["Vpcs"] == []
+
+    conflict = ("CidrConflict", f"CIDR range conflicts with 100.64.0.0/16 with association ID {a1}")
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock="100.64.0.0/16") == conflict
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock="100.64.128.0/17") == conflict
+    restricted = ("The CIDR '{}' is restricted. Use a CIDR from the same private address range as the current VPC "
+                  "CIDR, or use a publicly-routable CIDR. For additional restrictions, see "
+                  "https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html")
+    for cidr in ("172.16.0.0/16", "192.168.1.0/24"):
+        assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock=cidr) == (
+            "InvalidVpc.Range", restricted.format(cidr))
+    for cidr in ("100.65.0.0/29", "100.66.0.0/15"):
+        assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock=cidr) == (
+            "InvalidVpc.Range", f"The CIDR '{cidr}' is invalid.")
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock="nope") == (
+        "InvalidCidrBlock.Malformed", "nope is not a well-formed IPv4 CIDR block")
+    assert err("associate_vpc_cidr_block", VpcId="vpc-0123456789abcdef0", CidrBlock="100.68.0.0/16") == (
+        "InvalidVpcID.NotFound", "vpc-0123456789abcdef0 is not found for user.")
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id)[0] == "InvalidParameterCombination"
+    assert ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="10.62.0.0/16")["CidrBlockAssociation"]["CidrBlock"] \
+        == "10.62.0.0/16"
+    assert ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="100.67.0.1/16")["CidrBlockAssociation"][
+        "CidrBlock"] == "100.67.0.0/16"
+    [rtb] = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
+    assert [x["DestinationCidrBlock"] for x in rtb["Routes"] if x.get("GatewayId") == "local"] == [
+        "10.61.0.0/16", "10.62.0.0/16", "100.64.0.0/16", "100.67.0.0/16"]
+
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="100.64.1.0/24")["Subnet"]["SubnetId"]
+    assert err("disassociate_vpc_cidr_block", AssociationId=a1) == (
+        "InvalidCidrBlock.InUse", f"The vpc {vpc_id} currently has a subnet within CIDR block 100.64.0.0/16")
+    assert err("disassociate_vpc_cidr_block", AssociationId=primary) == (
+        "OperationNotPermitted", f"The vpc CIDR block with association ID {primary} may not be disassociated. "
+                                 "It is the primary IPv4 CIDR block of the VPC")
+    assert err("disassociate_vpc_cidr_block", AssociationId="vpc-cidr-assoc-0123456789abcdef0") == (
+        "InvalidVpcCidrBlockAssociationID.NotFound",
+        "The vpc CIDR block with association ID 'vpc-cidr-assoc-0123456789abcdef0' does not exist")
+    assert err("disassociate_vpc_cidr_block", AssociationId="nope") == (
+        "InvalidVpcCidrBlockAssociationId.Malformed", "The vpc CIDR block with association ID nope is malformed")
+    ec2.delete_subnet(SubnetId=subnet_id)
+
+    r = ec2.disassociate_vpc_cidr_block(AssociationId=a1)
+    assert (r["VpcId"], r["CidrBlockAssociation"]["CidrBlockState"]) == (vpc_id, {"State": "disassociating"})
+    [vpc] = ec2.describe_vpcs(Filters=[{"Name": "cidr-block-association.association-id", "Values": [a1]}])["Vpcs"]
+    assert ("100.64.0.0/16", a1, "disassociated") in [
+        (a["CidrBlock"], a["AssociationId"], a["CidrBlockState"]["State"]) for a in vpc["CidrBlockAssociationSet"]]
+    assert [v["VpcId"] for v in ec2.describe_vpcs(Filters=[
+        {"Name": "cidr-block-association.state", "Values": ["disassociated"]},
+        {"Name": "vpc-id", "Values": [vpc_id]}])["Vpcs"]] == [vpc_id]
+    assert ec2.disassociate_vpc_cidr_block(AssociationId=a1)["CidrBlockAssociation"]["CidrBlockState"] == {
+        "State": "disassociated"}
+    [rtb] = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
+    assert "100.64.0.0/16" not in {x["DestinationCidrBlock"] for x in rtb["Routes"]}
+    a2 = ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="100.64.0.0/16")["CidrBlockAssociation"]["AssociationId"]
+    assert a2 != a1
+    [vpc] = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"]
+    assert [(a["CidrBlock"], a["CidrBlockState"]["State"]) for a in vpc["CidrBlockAssociationSet"]] == [
+        ("10.61.0.0/16", "associated"), ("100.64.0.0/16", "disassociated"), ("10.62.0.0/16", "associated"),
+        ("100.67.0.0/16", "associated"), ("100.64.0.0/16", "associated")]
+
+    vpc2 = ec2.create_vpc(CidrBlock="192.168.0.0/24")["Vpc"]["VpcId"]
+    ec2.associate_vpc_cidr_block(VpcId=vpc2, CidrBlock="100.64.0.0/16")
+    assert err("associate_vpc_cidr_block", VpcId=vpc2, CidrBlock="10.0.0.0/16") == (
+        "InvalidVpc.Range", restricted.format("10.0.0.0/16"))
+    ec2.delete_vpc(VpcId=vpc2)
+    ec2.delete_vpc(VpcId=vpc_id)

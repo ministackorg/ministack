@@ -69,6 +69,7 @@ Supports:
 import base64
 import copy
 import hashlib
+import ipaddress
 import logging
 import os
 import random
@@ -2967,6 +2968,120 @@ def _describe_vpcs(p):
     return _xml(200, "DescribeVpcsResponse", f"<vpcSet>{''.join(items)}</vpcSet>{next_xml}")
 
 
+_VPC_CIDR_ASSOC_FILTERS = {"cidr-block-association.cidr-block": "CidrBlock",
+                           "cidr-block-association.association-id": "AssociationId",
+                           "cidr-block-association.state": "State"}
+
+
+def _vpc_cidr_associations(vpc):
+    primary = {"CidrBlock": vpc["CidrBlock"], "State": "associated",
+               "AssociationId": vpc.get("_cidr_assoc_id", f"vpc-cidr-assoc-{vpc['VpcId'][4:]}")}
+    return [primary, *vpc.get("SecondaryCidrBlocks", [])]
+
+
+def _vpc_cidr_assoc_xml(assoc, state=None):
+    return (f"<item><cidrBlock>{_esc(assoc['CidrBlock'])}</cidrBlock>"
+            f"<associationId>{_esc(assoc['AssociationId'])}</associationId>"
+            f"<cidrBlockState><state>{state or assoc['State']}</state></cidrBlockState></item>")
+
+
+def _vpc_cidr_assoc_response(action, vpc_id, assoc, state):
+    return _xml(200, f"{action}Response",
+                f"<vpcId>{_esc(vpc_id)}</vpcId><cidrBlockAssociation>"
+                f"<associationId>{_esc(assoc['AssociationId'])}</associationId>"
+                f"<cidrBlock>{_esc(assoc['CidrBlock'])}</cidrBlock>"
+                f"<cidrBlockState><state>{state}</state></cidrBlockState></cidrBlockAssociation>")
+
+
+_RFC1918 = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+_VPC_CIDR_ASSOC_ID_RE = re.compile(r"vpc-cidr-assoc-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+
+
+def _rfc1918_range(net):
+    return next((r for r in _RFC1918 if net.subnet_of(r)), None)
+
+
+def _set_vpc_local_route(vpc_id, cidr, present):
+    for rtb in _route_tables.values():
+        if rtb.get("VpcId") != vpc_id:
+            continue
+        routes = [r for r in rtb.get("Routes", []) if not (
+            r.get("GatewayId") == "local" and r.get("DestinationCidrBlock") == cidr)]
+        if present:
+            routes.append({"DestinationCidrBlock": cidr, "GatewayId": "local", "State": "active",
+                           "Origin": "CreateRouteTable"})
+            local = sorted((r for r in routes if r.get("GatewayId") == "local" and "DestinationCidrBlock" in r),
+                           key=lambda r: ipaddress.ip_network(r["DestinationCidrBlock"]))
+            routes = local + [r for r in routes if r not in local]
+        rtb["Routes"] = routes
+
+
+def _associate_vpc_cidr_block(p):
+    vpc_id = _p(p, "VpcId")
+    cidr = _p(p, "CidrBlock")
+    if not cidr:
+        return _error("InvalidParameterCombination",
+                      "Either amazonProvidedIpv6CidrBlock must be set to true or one of the following must be "
+                      "specified: cidrBlock, ipv4IpamPoolId, ipv6Pool, ipv6IpamPoolId", 400)
+    vpc = _vpcs.get(vpc_id)
+    if not vpc:
+        return _error("InvalidVpcID.NotFound", f"{vpc_id} is not found for user.", 400)
+    try:
+        net = ipaddress.IPv4Network(cidr, strict=False)
+    except ValueError:
+        return _error("InvalidCidrBlock.Malformed", f"{cidr} is not a well-formed IPv4 CIDR block", 400)
+    if not 16 <= net.prefixlen <= 28:
+        return _error("InvalidVpc.Range", f"The CIDR '{cidr}' is invalid.", 400)
+    primary_range = _rfc1918_range(ipaddress.ip_network(vpc["CidrBlock"], strict=False))
+    new_range = _rfc1918_range(net)
+    if primary_range and new_range and new_range != primary_range:
+        return _error("InvalidVpc.Range",
+                      f"The CIDR '{cidr}' is restricted. Use a CIDR from the same private address range as the "
+                      "current VPC CIDR, or use a publicly-routable CIDR. For additional restrictions, see "
+                      "https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html", 400)
+    for existing in _vpc_cidr_associations(vpc):
+        if existing["State"] != "disassociated" and net.overlaps(ipaddress.ip_network(existing["CidrBlock"])):
+            return _error("CidrConflict", f"CIDR range conflicts with {existing['CidrBlock']} with association ID "
+                                          f"{existing['AssociationId']}", 400)
+    assoc = {"CidrBlock": str(net), "State": "associated",
+             "AssociationId": "vpc-cidr-assoc-" + "".join(random.choices(string.hexdigits[:16], k=17))}
+    vpc.setdefault("SecondaryCidrBlocks", []).append(assoc)
+    _set_vpc_local_route(vpc_id, assoc["CidrBlock"], True)
+    return _vpc_cidr_assoc_response("AssociateVpcCidrBlock", vpc_id, assoc, "associating")
+
+
+def _disassociate_vpc_cidr_block(p):
+    assoc_id = _p(p, "AssociationId")
+    if not _VPC_CIDR_ASSOC_ID_RE.fullmatch(assoc_id):
+        return _error("InvalidVpcCidrBlockAssociationId.Malformed",
+                      f"The vpc CIDR block with association ID {assoc_id} is malformed", 400)
+    for vpc in _vpcs.values():
+        primary = _vpc_cidr_associations(vpc)[0]
+        if primary["AssociationId"] == assoc_id:
+            return _error("OperationNotPermitted",
+                          f"The vpc CIDR block with association ID {assoc_id} may not be disassociated. "
+                          "It is the primary IPv4 CIDR block of the VPC", 400)
+        for assoc in vpc.get("SecondaryCidrBlocks", []):
+            if assoc["AssociationId"] != assoc_id:
+                continue
+            if assoc["State"] == "disassociated":
+                return _vpc_cidr_assoc_response("DisassociateVpcCidrBlock", vpc["VpcId"], assoc, "disassociated")
+            block = ipaddress.ip_network(assoc["CidrBlock"])
+            for subnet in _subnets.values():
+                try:
+                    inside = ipaddress.ip_network(subnet["CidrBlock"], strict=False).subnet_of(block)
+                except (KeyError, ValueError, TypeError):
+                    inside = False
+                if subnet.get("VpcId") == vpc["VpcId"] and inside:
+                    return _error("InvalidCidrBlock.InUse", f"The vpc {vpc['VpcId']} currently has a subnet "
+                                                            f"within CIDR block {assoc['CidrBlock']}", 400)
+            assoc["State"] = "disassociated"
+            _set_vpc_local_route(vpc["VpcId"], assoc["CidrBlock"], False)
+            return _vpc_cidr_assoc_response("DisassociateVpcCidrBlock", vpc["VpcId"], assoc, "disassociating")
+    return _error("InvalidVpcCidrBlockAssociationID.NotFound",
+                  f"The vpc CIDR block with association ID '{assoc_id}' does not exist", 400)
+
+
 def _matches_vpc_filters(vpc, filters):
     if not _resource_matches_tag_filters(vpc["VpcId"], filters):
         return False
@@ -2974,14 +3089,11 @@ def _matches_vpc_filters(vpc, filters):
         if name == "vpc-id":
             if vpc["VpcId"] not in vals:
                 return False
-        elif name == "cidr" or name == "cidr-block-association.cidr-block":
+        elif name == "cidr":
             if vpc["CidrBlock"] not in vals:
                 return False
-        elif name == "cidr-block-association.association-id":
-            if vpc.get("_cidr_assoc_id", f"vpc-cidr-assoc-{vpc['VpcId'][4:]}") not in vals:
-                return False
-        elif name == "cidr-block-association.state":
-            if "associated" not in vals:
+        elif name in _VPC_CIDR_ASSOC_FILTERS:
+            if not any(a[_VPC_CIDR_ASSOC_FILTERS[name]] in vals for a in _vpc_cidr_associations(vpc)):
                 return False
         elif name == "state":
             if vpc["State"] not in vals:
@@ -4763,7 +4875,7 @@ def _vpc_fields_xml(vpc, tag="item"):
                 <cidrBlock>{_esc(str(cidr))}</cidrBlock>
                 <associationId>{_esc(str(assoc_id))}</associationId>
                 <cidrBlockState><state>associated</state></cidrBlockState>
-            </item>
+            </item>{"".join(_vpc_cidr_assoc_xml(a) for a in vpc.get("SecondaryCidrBlocks", []))}
         </cidrBlockAssociationSet>
         <dhcpOptionsId>{_esc(str(vpc['DhcpOptionsId']))}</dhcpOptionsId>
         <instanceTenancy>{_esc(str(vpc['InstanceTenancy']))}</instanceTenancy>
@@ -10264,4 +10376,6 @@ _ACTION_MAP = {
     "DescribeFleets": _describe_fleets,
     **_VERIFIED_ACCESS_ACTIONS,
     **_TRANSIT_GATEWAY_ACTIONS,
+    "AssociateVpcCidrBlock": _associate_vpc_cidr_block,
+    "DisassociateVpcCidrBlock": _disassociate_vpc_cidr_block,
 }
