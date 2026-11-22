@@ -5063,3 +5063,113 @@ def test_ec2_xml_special_characters_are_escaped(ec2):
         ec2.delete_subnet(SubnetId=subnet_id)
         ec2.delete_vpc(VpcId=vpc_id)
         ec2.delete_key_pair(KeyName=key_name)
+
+
+def test_ec2_transit_gateway_not_found_errors_match_aws(ec2):
+    from botocore.exceptions import ClientError
+    cases = [
+        ("describe_transit_gateways", {"TransitGatewayIds": ["tgw-0123456789abcdef0"]},
+         "InvalidTransitGatewayID.NotFound", "Transit Gateway tgw-0123456789abcdef0 was deleted or does not exist."),
+        ("describe_transit_gateways", {"TransitGatewayIds": ["tgw-nope"]},
+         "InvalidTransitGatewayID.Malformed", "Invalid Transit Gateway id tgw-nope."),
+        ("describe_transit_gateway_route_tables", {"TransitGatewayRouteTableIds": ["tgw-rtb-0123456789abcdef0"]},
+         "InvalidRouteTableID.NotFound",
+         "Transit Gateway Route Table tgw-rtb-0123456789abcdef0 was deleted or does not exist."),
+        ("describe_transit_gateway_vpc_attachments", {"TransitGatewayAttachmentIds": ["tgw-attach-0123456789abcdef0"]},
+         "InvalidTransitGatewayAttachmentID.NotFound",
+         "Transit Gateway Attachment tgw-attach-0123456789abcdef0 was deleted or does not exist."),
+        ("describe_transit_gateway_attachments", {"TransitGatewayAttachmentIds": ["tgw-attach-0123456789abcdef0"]},
+         "InvalidTransitGatewayAttachmentID.NotFound",
+         "Transit Gateway Attachment tgw-attach-0123456789abcdef0 was deleted or does not exist."),
+        ("delete_transit_gateway", {"TransitGatewayId": "tgw-0123456789abcdef0"},
+         "InvalidTransitGatewayID.NotFound", "Transit Gateway tgw-0123456789abcdef0 was deleted or does not exist."),
+    ]
+    for op, kw, code, message in cases:
+        with pytest.raises(ClientError) as exc:
+            getattr(ec2, op)(**kw)
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (code, message)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_ec2_transit_gateway_terraform_lifecycle(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.91.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.91.1.0/24")["Subnet"]["SubnetId"]
+    tag = _uuid_mod.uuid4().hex[:8]
+    tgw = ec2.create_transit_gateway(Description="t", TagSpecifications=[
+        {"ResourceType": "transit-gateway", "Tags": [{"Key": "t", "Value": tag}]}])["TransitGateway"]
+    tgw_id = tgw["TransitGatewayId"]
+    assert tgw["State"] == "pending"
+    assert tgw["TransitGatewayArn"].endswith(f":transit-gateway/{tgw_id}")
+    default_rt = tgw["Options"]["AssociationDefaultRouteTableId"]
+    assert default_rt == tgw["Options"]["PropagationDefaultRouteTableId"]
+    assert {k: tgw["Options"][k] for k in ("AmazonSideAsn", "DnsSupport", "DefaultRouteTableAssociation")} == {
+        "AmazonSideAsn": 64512, "DnsSupport": "enable", "DefaultRouteTableAssociation": "enable"}
+    [found] = ec2.describe_transit_gateways(Filters=[{"Name": "tag:t", "Values": [tag]}])["TransitGateways"]
+    assert found["State"] == "available"
+    ec2.modify_transit_gateway(TransitGatewayId=tgw_id, Description="t2", Options={"DnsSupport": "disable"})
+    [found] = ec2.describe_transit_gateways(TransitGatewayIds=[tgw_id])["TransitGateways"]
+    assert (found["Description"], found["Options"]["DnsSupport"]) == ("t2", "disable")
+    [drt] = ec2.describe_transit_gateway_route_tables(
+        Filters=[{"Name": "transit-gateway-id", "Values": [tgw_id]}])["TransitGatewayRouteTables"]
+    assert (drt["TransitGatewayRouteTableId"], drt["DefaultAssociationRouteTable"]) == (default_rt, True)
+
+    rt = ec2.create_transit_gateway_route_table(TransitGatewayId=tgw_id)["TransitGatewayRouteTable"]
+    rt_id = rt["TransitGatewayRouteTableId"]
+    assert (rt["State"], rt["DefaultAssociationRouteTable"]) == ("pending", False)
+
+    att = ec2.create_transit_gateway_vpc_attachment(
+        TransitGatewayId=tgw_id, VpcId=vpc_id, SubnetIds=[subnet_id])["TransitGatewayVpcAttachment"]
+    att_id = att["TransitGatewayAttachmentId"]
+    assert (att["State"], att["SubnetIds"], att["Options"]["DnsSupport"]) == ("pending", [subnet_id], "enable")
+    [d] = ec2.describe_transit_gateway_attachments(TransitGatewayAttachmentIds=[att_id])["TransitGatewayAttachments"]
+    assert (d["State"], d["ResourceType"], d["ResourceId"]) == ("available", "vpc", vpc_id)
+    assert d["Association"] == {"TransitGatewayRouteTableId": default_rt, "State": "associated"}
+    ec2.modify_transit_gateway_vpc_attachment(TransitGatewayAttachmentId=att_id, Options={"DnsSupport": "disable"})
+    [v] = ec2.describe_transit_gateway_vpc_attachments(TransitGatewayAttachmentIds=[att_id])[
+        "TransitGatewayVpcAttachments"]
+    assert v["Options"]["DnsSupport"] == "disable"
+
+    assert ec2.disassociate_transit_gateway_route_table(
+        TransitGatewayRouteTableId=default_rt, TransitGatewayAttachmentId=att_id)["Association"]["State"] == \
+        "disassociating"
+    assert ec2.get_transit_gateway_route_table_associations(TransitGatewayRouteTableId=default_rt)["Associations"] == []
+    assert ec2.associate_transit_gateway_route_table(
+        TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)["Association"]["State"] == "associating"
+    assert ec2.get_transit_gateway_route_table_associations(TransitGatewayRouteTableId=rt_id)["Associations"] == [
+        {"TransitGatewayAttachmentId": att_id, "ResourceId": vpc_id, "ResourceType": "vpc", "State": "associated"}]
+
+    assert ec2.enable_transit_gateway_route_table_propagation(
+        TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)["Propagation"]["State"] == "enabling"
+    [prop] = ec2.get_transit_gateway_route_table_propagations(TransitGatewayRouteTableId=rt_id)[
+        "TransitGatewayRouteTablePropagations"]
+    assert (prop["TransitGatewayAttachmentId"], prop["State"]) == (att_id, "enabled")
+
+    route = ec2.create_transit_gateway_route(DestinationCidrBlock="10.200.0.0/16", TransitGatewayRouteTableId=rt_id,
+                                             TransitGatewayAttachmentId=att_id)["Route"]
+    assert (route["Type"], route["State"], route["TransitGatewayAttachments"][0]["ResourceId"]) == (
+        "static", "active", vpc_id)
+    ec2.create_transit_gateway_route(DestinationCidrBlock="10.201.0.0/16", TransitGatewayRouteTableId=rt_id,
+                                     Blackhole=True)
+    r = ec2.search_transit_gateway_routes(TransitGatewayRouteTableId=rt_id,
+                                          Filters=[{"Name": "type", "Values": ["static"]}])
+    assert sorted((x["DestinationCidrBlock"], x["State"]) for x in r["Routes"]) == [
+        ("10.200.0.0/16", "active"), ("10.201.0.0/16", "blackhole")]
+    assert r["AdditionalRoutesAvailable"] is False
+    [prop_route] = ec2.search_transit_gateway_routes(
+        TransitGatewayRouteTableId=rt_id, Filters=[{"Name": "type", "Values": ["propagated"]}])["Routes"]
+    assert prop_route["DestinationCidrBlock"] == "10.91.0.0/16"
+    assert ec2.delete_transit_gateway_route(DestinationCidrBlock="10.200.0.0/16",
+                                            TransitGatewayRouteTableId=rt_id)["Route"]["State"] == "deleted"
+
+    assert ec2.disable_transit_gateway_route_table_propagation(
+        TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)["Propagation"]["State"] == "disabling"
+    ec2.disassociate_transit_gateway_route_table(TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)
+    assert ec2.delete_transit_gateway_vpc_attachment(TransitGatewayAttachmentId=att_id)[
+        "TransitGatewayVpcAttachment"]["State"] == "deleting"
+    assert ec2.delete_transit_gateway_route_table(TransitGatewayRouteTableId=rt_id)[
+        "TransitGatewayRouteTable"]["State"] == "deleting"
+    assert ec2.delete_transit_gateway(TransitGatewayId=tgw_id)["TransitGateway"]["State"] == "deleting"
+    [gone] = ec2.describe_transit_gateways(TransitGatewayIds=[tgw_id])["TransitGateways"]
+    assert gone["State"] == "deleted"
+    ec2.delete_subnet(SubnetId=subnet_id)
+    ec2.delete_vpc(VpcId=vpc_id)
