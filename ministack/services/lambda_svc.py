@@ -62,6 +62,7 @@ from ministack.core.lambda_runtime import (
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
     MISSING_BOOTSTRAP_MESSAGE,
+    RESPONSE_FD_ENV,
     LambdaServiceError,
     RuntimeExitError,
     acquire_worker,
@@ -839,9 +840,8 @@ import sys, os, json
 
 sys.path.insert(0, os.environ["_LAMBDA_CODE_DIR"])
 
-_REAL_STDOUT = sys.__stdout__
-# Match AWS Lambda semantics: logs go to CloudWatch (stderr here),
-# while the Invoke response payload must be clean JSON on stdout.
+_REAL_STDOUT = os.fdopen(int(os.environ.pop("__RESPONSE_FD_ENV__")), "w", encoding="utf-8")
+# Match AWS Lambda semantics: logs go to CloudWatch (stderr here).
 sys.stdout = sys.stderr
 
 for _ld in filter(None, os.environ.get("_LAMBDA_LAYERS_DIRS", "").split(os.pathsep)):
@@ -921,7 +921,7 @@ if _result is not None:
         _fail(_doc("Unable to marshal response: %s" % e, "Runtime.MarshalError", []))
     _REAL_STDOUT.write(_out)
     _REAL_STDOUT.flush()
-"""
+""".replace("__RESPONSE_FD_ENV__", RESPONSE_FD_ENV)
 
 # Docker variant: paths fixed to /var/task (code) and /opt (layers).
 _DOCKER_WRAPPER_SCRIPT = """\
@@ -984,8 +984,10 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 
-// Reserve stdout for the Invoke payload, including during module initialization.
-const realStdoutWrite = process.stdout.write.bind(process.stdout);
+// The Invoke payload goes to its own descriptor; stdout is the function's log.
+const responseFd = Number(process.env.__RESPONSE_FD_ENV__);
+delete process.env.__RESPONSE_FD_ENV__;
+const realStdoutWrite = (text) => fs.writeFileSync(responseFd, text);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 // Direct fd writes also belong to the log channel (e.g. pino).
 const realWriteSync = fs.writeSync.bind(fs);
@@ -1100,7 +1102,7 @@ process.stdin.on('end', async () => {
     fail(err);
   });
 });
-"""
+""".replace("__RESPONSE_FD_ENV__", RESPONSE_FD_ENV)
 
 
 # ---------------------------------------------------------------------------
@@ -4338,7 +4340,12 @@ def _invoke_rie(container, event: dict, timeout: int, request_id: str) -> dict:
                 parsed = json.loads(body)
             except json.JSONDecodeError:
                 parsed, raw_payload = body, True
-            logs = container.logs(stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip()
+            # The REPORT line can reach the container log after RIE has answered.
+            deadline = time.monotonic() + 0.25
+            while (f"REPORT RequestId: {request_id}" not in (logs := container.logs(
+                    stdout=True, stderr=True, since=invoke_time).decode("utf-8", errors="replace").strip())
+                   and time.monotonic() < deadline):
+                time.sleep(0.05)
             err_header = (resp.headers.get("X-Amz-Function-Error")
                           or resp.headers.get("Lambda-Runtime-Function-Error-Type") or "")
             # RIE owns the platform lines, including handler errors returned as HTTP 200.
@@ -5957,6 +5964,11 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
         server_thread = threading.Thread(target=_serve, daemon=True)
         server_thread.start()
         server_ready.wait(timeout=5)
+        log_file = tempfile.TemporaryFile()
+
+        def _log():
+            log_file.seek(0)
+            return log_file.read().decode("utf-8", errors="replace").strip()
 
         try:
             proc_env = _provided_worker_env(config, code_dir, port)
@@ -5977,8 +5989,9 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
                         [bootstrap_path],
                         cwd=code_dir,
                         env=proc_env,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        # A file, not a pipe: nothing reads the log before the reply.
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
                     )
                 except OSError as exc:
                     return {"body": {"errorMessage": f"Couldn't execute the bootstrap binary: {exc}",
@@ -5990,32 +6003,28 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
                     break
                 if proc.poll() is not None and not response_received.wait(0.05):
                     # The bootstrap died before answering: AWS reports how it exited, not a timeout.
-                    stdout, stderr = proc.communicate(timeout=5)
-                    logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
                     return {"body": {"errorMessage": runtime_exit_message(request_id, runtime_exit_reason(proc.returncode)),
-                                     "errorType": "Runtime.ExitError"}, "error": True, "log": logs}
+                                     "errorType": "Runtime.ExitError"}, "error": True, "log": _log()}
             if response_received.is_set():
                 proc.terminate()
                 try:
-                    _, stderr_out = proc.communicate(timeout=5)
-                    if stderr_out:
-                        logger.info("Lambda %s stderr: %s", config.get("FunctionName", "?"), stderr_out.decode("utf-8", errors="replace")[:500])
-                except Exception:
-                    pass
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
                 if result_holder["error"]:
                     err = result_holder["error"]
                     if isinstance(err, dict):
-                        return {"body": err, "error": True}
-                    return {"body": {"errorMessage": str(err), "errorType": "Runtime.HandlerError"}, "error": True}
+                        return {"body": err, "error": True, "log": _log()}
+                    return {"body": {"errorMessage": str(err), "errorType": "Runtime.HandlerError"}, "error": True, "log": _log()}
                 return {"body": result_holder["response"],
-                        "raw_payload": result_holder.get("raw_payload", False)}
+                        "raw_payload": result_holder.get("raw_payload", False), "log": _log()}
             else:
                 proc.kill()
-                stdout, stderr = proc.communicate(timeout=5)
-                logs = (stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")).strip()
-                return {"body": {"errorMessage": f"Task timed out after {timeout}.00 seconds", "errorType": "Sandbox.Timedout"}, "error": True, "log": logs}
+                proc.wait(timeout=5)
+                return {"body": {"errorMessage": f"Task timed out after {timeout}.00 seconds", "errorType": "Sandbox.Timedout"}, "error": True, "log": _log()}
         finally:
             server.shutdown()
+            log_file.close()
 
     except Exception as e:
         logger.error("provided runtime execution error: %s", e)
@@ -6142,21 +6151,33 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
             env["_LAMBDA_REQUEST_ID"] = request_id
 
             cmd = ["node", wrapper_path] if is_node else ["python3", wrapper_path]
-            proc = subprocess.run(
-                cmd,
-                input=json.dumps(event),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-                cwd=code_dir,
-            )
-
-            log_tail = proc.stderr.strip()
+            # Files, not pipes: a process the handler starts can keep them open after it exits.
+            with tempfile.TemporaryFile(dir=tmpdir) as reply, tempfile.TemporaryFile(dir=tmpdir) as log:
+                env[RESPONSE_FD_ENV] = str(reply.fileno())
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=json.dumps(event),
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        pass_fds=(reply.fileno(),),
+                        text=True,
+                        timeout=timeout,
+                        env=env,
+                        cwd=code_dir,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    log.seek(0)
+                    exc.stdout = log.read()
+                    raise
+                reply.seek(0)
+                log.seek(0)
+                payload = reply.read().decode("utf-8")
+                log_tail = log.read().decode("utf-8", errors="replace").strip()
 
             marker = "\x1eMINISTACK-ERROR\x1e"
-            if proc.returncode == 0 and proc.stdout.startswith(marker):
-                return {"body": json.loads(proc.stdout[len(marker):]), "error": True, "log": log_tail}
+            if proc.returncode == 0 and payload.startswith(marker):
+                return {"body": json.loads(payload[len(marker):]), "error": True, "log": log_tail}
             if proc.returncode != 0:
                 # The wrapper reports handler errors itself, so any other exit is the runtime dying.
                 return {
@@ -6165,13 +6186,13 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
                     "error": True,
                     "log": log_tail,
                 }
-            stdout = proc.stdout.strip()
-            if not stdout:
+            payload = payload.strip()
+            if not payload:
                 return {"body": None, "log": log_tail}
             try:
-                return {"body": json.loads(stdout), "log": log_tail}
+                return {"body": json.loads(payload), "log": log_tail}
             except json.JSONDecodeError:
-                return {"body": stdout, "log": log_tail, "raw_payload": True}
+                return {"body": payload, "log": log_tail, "raw_payload": True}
 
     except subprocess.TimeoutExpired as exc:
         try:

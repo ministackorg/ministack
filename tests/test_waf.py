@@ -1,3 +1,4 @@
+import base64
 import json
 import uuid as _uuid_mod
 
@@ -1022,3 +1023,129 @@ def test_waf_list_resources_for_web_acl_filters_by_resource_type(direct_waf_scop
     _, payload = _waf_payload(waf_service._list_resources_for_web_acl(
         {"WebACLArn": web_acl_arn, "ResourceType": "COGNITO_USER_POOL"}))
     assert payload["ResourceArns"] == [pool]
+
+
+
+# ---------------------------------------------------------------------------
+# Web ACL evaluation (CloudFront viewer requests)
+# ---------------------------------------------------------------------------
+
+_VIS = {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"}
+
+
+def _rule(name, priority, statement, action="Block", labels=(), **extra):
+    return {"Name": name, "Priority": priority, "Statement": statement, "Action": {action: {}},
+            "VisibilityConfig": _VIS, "RuleLabels": [{"Name": label} for label in labels], **extra}
+
+
+def _byte(field, search, position="EXACTLY", transforms=("NONE",)):
+    return {"ByteMatchStatement": {
+        "FieldToMatch": field, "SearchString": base64.b64encode(search).decode(), "PositionalConstraint": position,
+        "TextTransformations": [{"Priority": i, "Type": t} for i, t in enumerate(transforms)]}}
+
+
+def _eval_acl(rules, default="Allow", **extra):
+    _, payload = _waf_payload(waf_service._create_web_acl({
+        "Name": f"eval-{_uuid_mod.uuid4().hex[:8]}", "Scope": "CLOUDFRONT", "DefaultAction": {default: {}},
+        "Rules": rules, "VisibilityConfig": _VIS, **extra}))
+    return waf_service.resource_by_arn(payload["Summary"]["ARN"], "webacl")
+
+
+def _decide(acl, method="GET", path="/", query="", headers=None, body=b"", ip="10.0.0.1"):
+    return waf_service.evaluate_web_acl(acl, method, path, query, {"user-agent": "test", **(headers or {})}, body, ip)
+
+
+_HEADER_X = {"SingleHeader": {"Name": "X-Test"}}
+
+
+@pytest.mark.parametrize("statement,request_kwargs,blocked", [
+    (_byte(_HEADER_X, b"bad", "CONTAINS"), {"headers": {"x-test": "a-bad-one"}}, True),
+    (_byte(_HEADER_X, b"bad", "CONTAINS_WORD"), {"headers": {"x-test": "a_bad"}}, False),
+    (_byte({"UriPath": {}}, b"/abc", transforms=("URL_DECODE", "LOWERCASE")), {"path": "/A%42c"}, True),
+    (_byte({"UriPath": {}}, b"/a/c", transforms=("NORMALIZE_PATH",)), {"path": "/a//b/../c"}, True),
+    (_byte({"SingleQueryArgument": {"Name": "Q"}}, b"1"), {"query": "x=2&q=1"}, True),
+    ({"SizeConstraintStatement": {"FieldToMatch": {"QueryString": {}}, "ComparisonOperator": "GT", "Size": 5,
+                                  "TextTransformations": [{"Priority": 0, "Type": "NONE"}]}}, {"query": "a=123456"}, True),
+    ({"RegexMatchStatement": {"FieldToMatch": {"Method": {}}, "RegexString": "^(PUT|DELETE)$",
+                              "TextTransformations": [{"Priority": 0, "Type": "NONE"}]}}, {"method": "DELETE"}, True),
+    ({"NotStatement": {"Statement": _byte({"Method": {}}, b"GET")}}, {}, False),
+    ({"AndStatement": {"Statements": [_byte({"Method": {}}, b"GET"), _byte({"UriPath": {}}, b"/x")]}}, {}, False),
+    ({"SqliMatchStatement": {}}, {}, False),
+    (_byte({"Body": {"OversizeHandling": "MATCH"}}, b"never"), {"body": b"x" * (16 * 1024 + 1)}, True),
+])
+def test_web_acl_statements(direct_waf_scope, statement, request_kwargs, blocked):
+    acl = _eval_acl([_rule("r", 0, statement)])
+    assert _decide(acl, **request_kwargs)[0] == ("Block" if blocked else "Allow")
+
+
+def test_web_acl_priority_count_labels_and_responses(direct_waf_scope):
+    insert = {"CustomRequestHandling": {"InsertHeaders": [{"Name": "seen", "Value": "1"}]}}
+    acl = _eval_acl([
+        _rule("teapot", 2, {"LabelMatchStatement": {"Scope": "NAMESPACE", "Key": "ns:"}}, "Block"),
+        {**_rule("count", 1, _byte(_HEADER_X, b"tag"), "Count", labels=("ns:tagged",)), "Action": {"Count": insert}},
+    ], CustomResponseBodies={"k": {"ContentType": "APPLICATION_JSON", "Content": '{"no": 1}'}})
+    acl["Rules"][0]["Action"] = {"Block": {"CustomResponse": {
+        "ResponseCode": 418, "CustomResponseBodyKey": "k", "ResponseHeaders": [{"Name": "x-why", "Value": "label"}]}}}
+    assert _decide(acl, headers={"x-test": "tag"}) == (
+        "Block", (418, {"x-why": "label", "content-type": "application/json"}, b'{"no": 1}'))
+    acl["Rules"][0]["Statement"]["LabelMatchStatement"]["Key"] = "other:"
+    assert _decide(acl, headers={"x-test": "tag"}) == ("Allow", {"x-amzn-waf-seen": "1"})
+    assert _decide(acl) == ("Allow", {})
+
+
+def test_web_acl_rule_group_overrides_and_labels(direct_waf_scope):
+    _, payload = _waf_payload(waf_service._create_rule_group({
+        "Name": "rg", "Scope": "CLOUDFRONT", "Capacity": 10, "VisibilityConfig": _VIS,
+        "Rules": [_rule("a", 0, _byte({"Method": {}}, b"POST"), labels=("hit",)),
+                  _rule("b", 1, _byte({"Method": {}}, b"PUT"))]}))
+    group = {"ARN": payload["Summary"]["ARN"], "RuleActionOverrides": [{"Name": "a", "ActionToUse": {"Count": {}}}]}
+    acl = _eval_acl([
+        {"Name": "g", "Priority": 0, "Statement": {"RuleGroupReferenceStatement": group},
+         "OverrideAction": {"None": {}}, "VisibilityConfig": _VIS},
+        _rule("l", 1, {"LabelMatchStatement": {"Scope": "LABEL", "Key": "awswaf:000000000000:rulegroup:rg:hit"}}),
+    ])
+    assert _decide(acl, method="POST")[0] == "Block"  # a counted, its label then blocks in the web ACL
+    assert _decide(acl, method="PUT")[0] == "Block"
+    acl["Rules"][0]["OverrideAction"] = {"Count": {}}
+    assert _decide(acl, method="PUT")[0] == "Allow"
+
+
+@pytest.mark.parametrize("request_kwargs,blocked", [
+    ({"headers": {"user-agent": None}}, True),
+    ({"body": b"x" * 8193}, True),
+    ({"method": "PROPFIND"}, True),
+    ({"query": "a=" + "x" * 3000}, True),
+    ({"body": b"x" * 8192}, False),
+])
+def test_web_acl_managed_rules(direct_waf_scope, request_kwargs, blocked):
+    acl = _eval_acl([{"Name": f"m{i}", "Priority": i, "OverrideAction": {"None": {}}, "VisibilityConfig": _VIS,
+                      "Statement": {"ManagedRuleGroupStatement": {"VendorName": "AWS", "Name": name}}}
+                     for i, name in enumerate(["AWSManagedRulesCommonRuleSet", "AWSManagedRulesKnownBadInputsRuleSet"])])
+    headers = {k: v for k, v in {"user-agent": "test", **request_kwargs.pop("headers", {})}.items() if v is not None}
+    result = waf_service.evaluate_web_acl(acl, request_kwargs.get("method", "GET"), "/", request_kwargs.get("query", ""),
+                                          headers, request_kwargs.get("body", b""), "10.0.0.1")
+    assert result[0] == ("Block" if blocked else "Allow")
+
+
+def test_web_acl_ip_sets_rate_and_tokens(direct_waf_scope):
+    _, payload = _waf_payload(waf_service._create_ip_set({
+        "Name": "ips", "Scope": "CLOUDFRONT", "IPAddressVersion": "IPV4", "Addresses": ["10.1.0.0/16"]}))
+    forwarded = {"ARN": payload["Summary"]["ARN"], "IPSetForwardedIPConfig": {
+        "HeaderName": "X-Forwarded-For", "FallbackBehavior": "MATCH", "Position": "LAST"}}
+    acl = _eval_acl([
+        _rule("direct", 0, {"IPSetReferenceStatement": {"ARN": payload["Summary"]["ARN"]}}),
+        _rule("forwarded", 1, {"IPSetReferenceStatement": forwarded}, "Captcha"),
+        _rule("rate", 2, {"RateBasedStatement": {"Limit": 2, "AggregateKeyType": "IP"}}, "Challenge"),
+    ])
+    assert _decide(acl, ip="10.1.2.3")[0] == "Block"
+    assert _decide(acl, headers={"x-forwarded-for": "1.1.1.1, 10.1.9.9"}) == (
+        "Captcha", (405, {"x-amzn-waf-action": "captcha"}, b""))
+    assert _decide(acl, headers={"x-forwarded-for": "not-an-ip"})[0] == "Captcha"  # FallbackBehavior MATCH
+    assert [_decide(acl, ip="10.9.0.1")[0] for _ in range(3)] == ["Allow", "Allow", "Challenge"]
+
+
+def test_cfn_byte_match_search_string_becomes_base64():
+    rules = [{"Statement": {"ByteMatchStatement": {"SearchString": "bad"}}},
+             {"Statement": {"ByteMatchStatement": {"SearchStringBase64": "YmFk"}}}]
+    assert [r["Statement"]["ByteMatchStatement"] for r in waf_service.api_rules_from_cfn(rules)] == [
+        {"SearchString": "YmFk"}] * 2

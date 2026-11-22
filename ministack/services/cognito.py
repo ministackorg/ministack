@@ -8346,12 +8346,13 @@ def handle_oauth2_authorize(method, path, headers, query_params):
     otherwise show managed login form."""
     # Federation redirect (SAML / OIDC external IdP)
     identity_provider = _qp(query_params, "identity_provider")
-    if identity_provider:
+    if identity_provider and identity_provider != "COGNITO":  # COGNITO names the pool's own sign-in page
         return _oauth2_authorize_federation(query_params)
     # A client whose only provider is an external one goes straight to it (recorded on AWS, eu-north-1).
     _pid, sole_pool, sole_client = _find_pool_by_client_id(_qp(query_params, "client_id"))
     sole = (sole_client or {}).get("SupportedIdentityProviders") or []
-    if len(sole) == 1 and sole[0] != "COGNITO" and sole[0] in (sole_pool or {}).get("_identity_providers", {}):
+    if (not identity_provider and len(sole) == 1 and sole[0] != "COGNITO"
+            and sole[0] in (sole_pool or {}).get("_identity_providers", {})):
         return _oauth2_authorize_federation({**query_params, "identity_provider": sole[0]})
 
     # Managed login UI
@@ -9064,6 +9065,15 @@ def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username,
     pkce_error = _pkce_error_redirect(redirect_uri, code_challenge, code_challenge_method, state)
     if pkce_error:
         return pkce_error
+    user = (_user_pools.get(pool_id) or {}).get("_users", {}).get(username)
+    try:
+        if user:
+            _apply_postauth_trigger(pool_id, client_id, user, None)
+    except (_PreTokenRejected, _PreTokenUnavailable, _PostAuthenticationInvalid) as e:
+        # No code: AWS sends the browser back to /login, which answers 401 with the trigger's error (eu-north-1, 2026-11-20).
+        page = _login_page_html(client_id, redirect_uri, scope, state, "code", code_challenge, code_challenge_method,
+                                nonce, resource, error_message=str(e))
+        return 401, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, page.encode("utf-8")
     code = _generate_auth_code()
     _authorization_codes[code] = {
         "client_id": client_id,
@@ -9431,7 +9441,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         "access_token": result["AccessToken"],
         "id_token": result["IdToken"],
         "token_type": "Bearer",
-        "expires_in": 3600,
+        "expires_in": result["ExpiresIn"],
     }
     if result.get("RefreshToken"):
         resp["refresh_token"] = result["RefreshToken"]

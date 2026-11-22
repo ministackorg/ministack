@@ -46,8 +46,10 @@ def _version() -> str:
             _VERSION = "dev"
     return _VERSION
 
-# Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
-_EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
+# Matches host headers like "{apiId}.execute-api.<host>[:port]" or AWS's "{apiId}.execute-api.<region>.amazonaws.com"
+_EXECUTE_API_RE = re.compile(
+    r"^([a-f0-9]{8})\.execute-api\.(?:[a-z0-9-]+\.amazonaws\.com|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
+)
 # A distribution's DomainName: <label>.cloudfront.net, or <label>.cloudfront.<MINISTACK_HOST>.
 _CLOUDFRONT_HOST_RE = re.compile(
     r"^([a-z0-9]+)\.cloudfront\.(?:net|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
@@ -221,7 +223,7 @@ _NON_S3_VHOST_NAMES = frozenset(
 )
 
 from ministack.core import container_reaper
-from ministack.core.concurrency import spawn_background
+from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
 from ministack.core.iam_evaluator import (
     AmbiguousAccessKeyError,
@@ -1547,7 +1549,9 @@ def _handle_transfer_sftp_ports_request(method: str, path: str):
 async def _handle_cognito_body_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
     """Handle Cognito routes that require the parsed request body."""
     if path in ("/oauth2/login", "/login") and method == "POST":
-        return _get_module("cognito").handle_login_submit(method, path, headers, body, query_params)
+        # A sign-in can run a trigger that calls back into MiniStack, so it stays off the event loop.
+        return await run_reentrant(_get_module("cognito").handle_login_submit, method, path, headers, body,
+                                   query_params, thread_name="ministack-cognito-trigger")
     if path == "/oauth2/token" and method == "POST":
         return await _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
     if path in _COGNITO_USERINFO_PATHS and method == "POST":
@@ -2466,6 +2470,12 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
+        return None
+    # A distribution's alternate domain name is viewer traffic unless a bucket by that name exists.
+    if (not headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            and not any(k.lower() == "x-amz-credential" for k in (query_params or {}))
+            and _get_module("s3")._bucket_owner_account(bucket) is None
+            and _resolve_cloudfront_alias_request(host) is not None):
         return None
     # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3` or unsigned.
     access_point_region = access_point_alias = None
