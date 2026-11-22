@@ -843,7 +843,7 @@ def _update_state_machine(data):
     # (matches AWS optimistic-concurrency semantics).
     sm["revisionId"] = new_uuid()
     ts = now_iso()
-    response = {"updateDate": ts}
+    response = {"updateDate": ts, "revisionId": sm["revisionId"]}
     # UpdateStateMachine also supports publish=True, which atomically
     # publishes a new version with the post-update state; response
     # carries the new stateMachineVersionArn. Mirrors AWS.
@@ -867,7 +867,6 @@ def _update_state_machine(data):
                if sm.get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
-        response["revisionId"] = sm["revisionId"]
     return json_response(response)
 
 

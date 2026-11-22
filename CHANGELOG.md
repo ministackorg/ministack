@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Step Functions — `UpdateStateMachine` returns `revisionId` without `publish`** — the response now carries the state machine's new `revisionId` on every update, which `PublishStateMachineVersion` takes as its precondition; before, it was returned only with `publish: true` (#2770). Matches real AWS (us-east-1).
 - **RDS — MySQL and Aurora MySQL TLS certificates** — MySQL and Aurora MySQL databases now present a server certificate signed by the RDS CA served at `GET /_ministack/rds/ca.pem`, naming their DNS endpoints, as PostgreSQL databases already did; before, they presented a certificate from the mysql image's own auto-generated CA, which no client verifying the server could trust. Matches real AWS (us-east-1, RDS MySQL 8.4 and Aurora MySQL 3), where the certificate chains to the regional RDS root and names the endpoint.
 
 ## [1.5.43] — 2026-11-19

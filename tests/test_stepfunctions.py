@@ -7593,6 +7593,34 @@ def test_sfn_publish_state_machine_version_revisionid_precondition(sfn):
         sfn.delete_state_machine(stateMachineArn=sm_arn)
 
 
+def test_sfn_update_state_machine_returns_revisionid_without_publish(sfn):
+    """UpdateStateMachine returns the new revisionId with or without publish, as on AWS; publishing with it succeeds."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    sm_arn = sfn.create_state_machine(
+        name=f"update-rev-{uid}",
+        definition=json.dumps({"StartAt": "P", "States": {"P": {"Type": "Pass", "End": True}}}),
+        roleArn="arn:aws:iam::000000000000:role/r",
+    )["stateMachineArn"]
+    try:
+        updated = sfn.update_state_machine(
+            stateMachineArn=sm_arn,
+            definition=json.dumps({"StartAt": "P", "States": {"P": {"Type": "Pass", "Result": 1, "End": True}}}),
+        )
+        assert "stateMachineVersionArn" not in updated
+        assert updated["revisionId"] == sfn.describe_state_machine(stateMachineArn=sm_arn)["revisionId"]
+        published = sfn.publish_state_machine_version(stateMachineArn=sm_arn, revisionId=updated["revisionId"])
+        assert published["stateMachineVersionArn"] == f"{sm_arn}:1"
+        with_publish = sfn.update_state_machine(
+            stateMachineArn=sm_arn,
+            definition=json.dumps({"StartAt": "P", "States": {"P": {"Type": "Pass", "Result": 2, "End": True}}}),
+            publish=True,
+        )
+        assert with_publish["stateMachineVersionArn"] == f"{sm_arn}:2"
+        assert with_publish["revisionId"] == sfn.describe_state_machine(stateMachineArn=sm_arn)["revisionId"]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm_arn)
+
+
 def test_sfn_describe_state_machine_on_version_arn(sfn):
     """DescribeStateMachine accepts a qualified version ARN and returns
     the snapshot captured at publish time."""
