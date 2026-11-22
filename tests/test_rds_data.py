@@ -584,7 +584,7 @@ def test_substitute_named_params_preserves_cast_and_unknowns():
 
 
 def test_substitute_named_params_keeps_literal_percent():
-    """A literal % in the SQL reaches the engine unchanged next to named parameters, as on AWS (#2769): the driver
+    """A literal % in the SQL reaches the engine unchanged next to named parameters, as on AWS: the driver
     renders %(name)s placeholders with % formatting, so every other % must be escaped."""
     from ministack.services.rds_data import _substitute_named_params
 

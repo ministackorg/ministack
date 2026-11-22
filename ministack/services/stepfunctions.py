@@ -6108,8 +6108,8 @@ def _publish_state_machine_version(data):
     if requested_revision and requested_revision != sm.get("revisionId"):
         return error_response_json(
             "ConflictException",
-            "Request cannot be applied because the state machine's "
-            "revisionId has changed since the supplied revisionId was read.",
+            f"Failed to publish the State Machine version for revision {requested_revision}. "
+            f"The current State Machine revision is {sm.get('revisionId')}.",
             400,
         )
 

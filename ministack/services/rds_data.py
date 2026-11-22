@@ -578,7 +578,7 @@ def _substitute_named_params(sql, param_names):
     (so it reaches the engine unchanged instead of becoming a bad placeholder).
     When parameters are supplied the driver renders the placeholders with %
     formatting, so every % already in the SQL is escaped first and reaches the
-    engine as written (#2769).
+    engine as written.
     """
     if not param_names:
         return sql

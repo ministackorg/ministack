@@ -7585,6 +7585,9 @@ def test_sfn_publish_state_machine_version_revisionid_precondition(sfn):
                 stateMachineArn=sm_arn, revisionId=current_rev,
             )
         assert exc.value.response["Error"]["Code"] == "ConflictException"
+        assert exc.value.response["Error"]["Message"] == (
+            f"Failed to publish the State Machine version for revision {current_rev}. "
+            f"The current State Machine revision is {rev_after_update}.")
 
         # Publish without revisionId always succeeds (no precondition).
         v2 = sfn.publish_state_machine_version(stateMachineArn=sm_arn)
