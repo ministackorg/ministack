@@ -576,6 +576,9 @@ def _substitute_named_params(sql, param_names):
     right, makes them distinct regardless of length or order, leaves a "::type"
     cast intact, and passes through any ":word" that is not a supplied parameter
     (so it reaches the engine unchanged instead of becoming a bad placeholder).
+    When parameters are supplied the driver renders the placeholders with %
+    formatting, so every % already in the SQL is escaped first and reaches the
+    engine as written (#2769).
     """
     if not param_names:
         return sql
@@ -585,7 +588,7 @@ def _substitute_named_params(sql, param_names):
         name = match.group(1)
         return f"%({name})s" if name in names else match.group(0)
 
-    return _RE_NAMED_PARAM.sub(_repl, sql)
+    return _RE_NAMED_PARAM.sub(_repl, sql.replace("%", "%%"))
 
 
 def _convert_parameters(parameters):

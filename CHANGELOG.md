@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **RDS Data API — a literal `%` next to named parameters** — `ExecuteStatement` (and `BatchExecuteStatement`, which shares the substitution) now passes a `%` already in the SQL (`LIKE 'step.%'`, `'100%'`, `DATE_FORMAT(d, '%Y')`) to the engine as written when named parameters are supplied; before, the driver's `%` formatting read it as a placeholder, failing with `not enough arguments for format string`, turning `'%%'` into `'%'`, or filling a `'%(name)s'` literal with the parameter's value (#2769). Matches real AWS for `ExecuteStatement` (us-east-1, Aurora MySQL 3).
 - **RDS — MySQL and Aurora MySQL TLS certificates** — MySQL and Aurora MySQL databases now present a server certificate signed by the RDS CA served at `GET /_ministack/rds/ca.pem`, naming their DNS endpoints, as PostgreSQL databases already did; before, they presented a certificate from the mysql image's own auto-generated CA, which no client verifying the server could trust. Matches real AWS (us-east-1, RDS MySQL 8.4 and Aurora MySQL 3), where the certificate chains to the regional RDS root and names the endpoint.
 
 ## [1.5.43] — 2026-11-19
