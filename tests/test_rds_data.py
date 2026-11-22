@@ -583,6 +583,18 @@ def test_substitute_named_params_preserves_cast_and_unknowns():
     assert _substitute_named_params("SELECT :id, :identity", {"id": 1}) == "SELECT %(id)s, :identity"
 
 
+def test_substitute_named_params_keeps_literal_percent():
+    """A literal % in the SQL reaches the engine unchanged next to named parameters, as on AWS (#2769): the driver
+    renders %(name)s placeholders with % formatting, so every other % must be escaped."""
+    from ministack.services.rds_data import _substitute_named_params
+
+    sql = "SELECT :id AS id, 'step.x' LIKE 'step.%' AS m, '100%' AS a, '%%' AS b, '%s' AS c, '%(id)s' AS d"
+    rendered = _substitute_named_params(sql, {"id": 1}) % {"id": "1"}
+    assert rendered == "SELECT 1 AS id, 'step.x' LIKE 'step.%' AS m, '100%' AS a, '%%' AS b, '%s' AS c, '%(id)s' AS d"
+    # Without parameters the driver does no formatting, so the SQL is passed through as written.
+    assert _substitute_named_params("SELECT '100%'", {}) == "SELECT '100%'"
+
+
 # ── Stub mode tests ────────────────────────────────────────
 
 def _setup_stub_cluster(rds, sm):
