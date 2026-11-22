@@ -32,6 +32,9 @@ logger = logging.getLogger("lambda_runtime")
 # by its x-amz-request-route header instead. A function's own value wins.
 HOST_PREFIX_ENV = "AWS_DISABLE_HOST_PREFIX_INJECTION"
 
+# Env var with the descriptor for the bootstrap's replies, so stdout and stderr stay the log.
+RESPONSE_FD_ENV = "_MINISTACK_RESPONSE_FD"
+
 _RESERVED_RUNTIME_ENV_VARS = {
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
@@ -46,6 +49,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "_LAMBDA_TIMEOUT",
     "LAMBDA_TASK_ROOT",
     "AWS_EXECUTION_ENV",
+    RESPONSE_FD_ENV,
 }
 
 
@@ -170,6 +174,7 @@ def _sub_runtime_tokens(script: str) -> str:
     """Substitute the per-invocation carrier names into a bootstrap script."""
     return (
         script.replace("__DEPTH_ENV__", INVOKE_DEPTH_ENV)
+        .replace("__RESPONSE_FD_ENV__", RESPONSE_FD_ENV)
         .replace("__DEPTH_HEADER__", INVOKE_DEPTH_HEADER)
         .replace("__DURABLE_ENV_VARS__", json.dumps(list(DURABLE_ENV_VARS)))
     )
@@ -214,8 +219,9 @@ _PYTHON_WORKER_SCRIPT = INVOKE_DEPTH_BOOTSTRAP + _sub_runtime_tokens('''
 import sys, json, importlib, traceback, os, time
 
 def run():
-    # Redirect print() to stderr so stdout stays clean for JSON-line protocol
-    _real_stdout = sys.stdout
+    _resp_fd = int(os.environ.pop("__RESPONSE_FD_ENV__"))
+    os.set_inheritable(_resp_fd, False)
+    _real_stdout = os.fdopen(_resp_fd, "w", encoding="utf-8")
     sys.stdout = sys.stderr
 
     init = json.loads(sys.stdin.readline())
@@ -370,7 +376,7 @@ run()
 # MiniStack's own endpoint for Node workers is http(s)://localhost:<port>, so
 # the host an SDK v3 operation builds with a prefix (ServiceDiscovery "data-",
 # Step Functions "sync-", the KeyValueStore "<account>.") is a valid URL. The
-# hook sends localhost, <label>.localhost and <label>-localhost to 127.0.0.1
+# hook sends localhost, any name under localhost and <label>-localhost to 127.0.0.1
 # (the gateway may listen on IPv4 only) and checks the gateway certificate
 # against localhost. It runs only when MiniStack set AWS_ENDPOINT_URL.
 GATEWAY_LOOPBACK_ENV = "_MINISTACK_GATEWAY_LOOPBACK"
@@ -379,7 +385,7 @@ NODE_GATEWAY_LOOPBACK_BOOTSTRAP = r"""
   if (process.env.%s !== "1") return;
   const dns = require("dns");
   const tls = require("tls");
-  const gateway = /^(?:[a-z0-9-]+[.-])?localhost$/i;
+  const gateway = /^(?:[a-z0-9-]+\.)*(?:[a-z0-9-]+-)?localhost$/i;
   const lookup = dns.lookup;
   dns.lookup = function (hostname, options, callback) {
     if (typeof hostname === "string" && gateway.test(hostname)) hostname = "127.0.0.1";
@@ -404,9 +410,12 @@ const https = require("https");
 const url = require("url");
 const Module = require("module");
 
-// Redirect stdout to stderr so stdout stays clean for JSON-line protocol
 const fs = require("fs");
-const _realStdoutWrite = process.stdout.write.bind(process.stdout);
+// Reopened, because Node opens with close-on-exec: a child process must not hold the reply pipe open.
+const _responseFd = fs.openSync(`/dev/fd/${process.env.__RESPONSE_FD_ENV__}`, "w");
+fs.closeSync(Number(process.env.__RESPONSE_FD_ENV__));
+delete process.env.__RESPONSE_FD_ENV__;
+const _realStdoutWrite = (text) => fs.writeFileSync(_responseFd, text);
 const _stderrWrite = process.stderr.write.bind(process.stderr);
 process.stdout.write = function(chunk, encoding, callback) {
   return _stderrWrite(chunk, encoding, callback);
@@ -1292,11 +1301,12 @@ class Worker:
         self._start_time = None
         self._stderr_queue: queue.Queue = queue.Queue()
         self._stderr_thread: threading.Thread | None = None
+        self._responses = None
 
     def _read_stderr(self):
-        """Background daemon thread: continuously drain stderr into queue."""
+        """Background daemon thread: continuously drain the log into queue."""
         try:
-            for line in self._proc.stderr:
+            for line in self._proc.stdout:
                 self._stderr_queue.put(line.rstrip("\n"))
         except Exception:
             pass
@@ -1466,16 +1476,23 @@ class Worker:
                 else:
                     spawn_env["NODE_PATH"] = os.pathsep.join(node_paths)
 
-        self._proc = subprocess.Popen(
-            [binary, worker_path],
-            cwd=code_dir,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=spawn_env,
-        )
+        resp_r, resp_w = os.pipe()
+        self._responses = open(resp_r, encoding="utf-8")
+        spawn_env[RESPONSE_FD_ENV] = str(resp_w)
+        try:
+            self._proc = subprocess.Popen(
+                [binary, worker_path],
+                cwd=code_dir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                pass_fds=(resp_w,),
+                text=True,
+                bufsize=1,
+                env=spawn_env,
+            )
+        finally:
+            os.close(resp_w)
 
         self._stderr_queue = queue.Queue()
         self._stderr_thread = threading.Thread(
@@ -1501,31 +1518,18 @@ class Worker:
         self._proc.stdin.write(json.dumps(init) + "\n")
         self._proc.stdin.flush()
 
-        # Read init response, skipping non-JSON lines (stray console output from modules)
-        response = None
-        for _ in range(200):
-            response_line = self._proc.stdout.readline()
-            if not response_line:
-                stderr_out = ""
-                try:
-                    stderr_out = self._proc.stderr.read(4096)
-                except Exception:
-                    pass
-                try:
-                    returncode = self._proc.wait(timeout=5)
-                except Exception:
-                    returncode = 1
-                raise RuntimeExitError(returncode, stderr_out)
-            response_line = response_line.strip()
-            if not response_line or not response_line.startswith("{"):
-                continue
+        response_line = self._responses.readline()
+        if not response_line:
             try:
-                response = json.loads(response_line)
-                break
-            except json.JSONDecodeError:
-                continue
-        if response is None:
-            raise LambdaServiceError("No JSON init response from worker")
+                returncode = self._proc.wait(timeout=5)
+            except Exception:
+                returncode = 1
+            self._stderr_thread.join(timeout=1)
+            raise RuntimeExitError(returncode, self._drain_stderr())
+        try:
+            response = json.loads(response_line)
+        except json.JSONDecodeError as exc:
+            raise LambdaServiceError(f"Unreadable init reply from worker: {response_line[:200]!r}") from exc
         if response.get("status") != "ready":
             if response.get("errorType"):
                 raise ProvidedRuntimeError(response.get("error", ""), response["errorType"], response.get("payload"))
@@ -1625,29 +1629,16 @@ class Worker:
                 try:
                     self._proc.stdin.write(json.dumps(envelope) + "\n")
                     self._proc.stdin.flush()
-                    for _ in range(200):
-                        response_line = self._proc.stdout.readline()
-                        if not response_line:
-                            try:
-                                returncode = self._proc.wait(timeout=5)
-                            except Exception:
-                                returncode = 1
-                            result_box.append({"status": "error", "error_type": RuntimeExitError.error_type,
-                                               "error": runtime_exit_message(request_id, runtime_exit_reason(returncode))})
-                            return
-                        response_line = response_line.strip()
-                        if not response_line:
-                            continue
-                        if response_line.startswith("{"):
-                            try:
-                                response = json.loads(response_line)
-                                if response.get("status") in ("ok", "error"):
-                                    result_box.append(response)
-                                    return
-                            except json.JSONDecodeError:
-                                continue
-                    result_box.append({"status": "error", "service_error": True,
-                                       "error": "No JSON response from worker after 200 lines"})
+                    response_line = self._responses.readline()
+                    if not response_line:
+                        try:
+                            returncode = self._proc.wait(timeout=5)
+                        except Exception:
+                            returncode = 1
+                        result_box.append({"status": "error", "error_type": RuntimeExitError.error_type,
+                                           "error": runtime_exit_message(request_id, runtime_exit_reason(returncode))})
+                        return
+                    result_box.append(json.loads(response_line))
                 except Exception as e:
                     result_box.append({"status": "error", "service_error": True, "error": str(e)})
 

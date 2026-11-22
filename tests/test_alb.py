@@ -851,14 +851,14 @@ def test_alb_set_security_groups(elbv2):
     assert resp["SecurityGroupIds"] == ["sg-bbb", "sg-ccc"]
 
 
-def _alb_http_target_setup(elbv2, lb_name, target_id, target_port, target_type="ip"):
+def _alb_http_target_setup(elbv2, lb_name, target_id, target_port, target_type="ip", protocol="HTTP"):
     """Create LB + instance/ip TG + listener + register an HTTP target.
     Returns (lb_arn, tg_arn, l_arn).
     """
     lb_arn = elbv2.create_load_balancer(Name=lb_name)["LoadBalancers"][0]["LoadBalancerArn"]
     tg_arn = elbv2.create_target_group(
         Name=f"{lb_name}-tg",
-        Protocol="HTTP",
+        Protocol=protocol,
         Port=target_port,
         VpcId="vpc-00000001",
         TargetType=target_type,
@@ -947,7 +947,7 @@ def test_elbv2_dataplane_http2_connection_answers_past_a_thousand_requests(elbv2
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
 
 
-def _start_echo_server():
+def _start_echo_server(tls=False):
     """Answer every GET with the request target and headers the target received, as JSON."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -967,6 +967,14 @@ def _start_echo_server():
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    if tls:
+        import ssl
+
+        from ministack.core import tls as _tls
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(*_tls.resolve_tls_material())
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -990,6 +998,21 @@ def test_elbv2_dataplane_forwards_the_client_host_header(elbv2):
             {"Key": "routing.http.preserve_host_header.enabled", "Value": "true"}])
         req = _req.Request(f"{_endpoint}/_alb/{lb_name}/", headers={"Host": "app.example.test:8443"})
         assert json.loads(_req.urlopen(req).read())["headers"]["host"] == ["app.example.test:8443"]
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
+def test_elbv2_dataplane_https_target_group_speaks_tls_without_validating(elbv2):
+    """An HTTPS target group reaches its target over TLS and accepts a certificate it cannot validate."""
+    server = _start_echo_server(tls=True)
+    lb_name = "dp-alb-https-tg"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1],
+                                                   protocol="HTTPS")
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/tls?x=1"))
+        assert resp.status == 200
+        assert json.loads(resp.read())["path"] == "/tls?x=1"
     finally:
         _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
         _stop_server(server)

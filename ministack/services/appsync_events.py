@@ -452,6 +452,9 @@ def _operation_auth_modes(api_id: str, channel: str | None, operation: str) -> s
     else:
         namespace = _channel_namespaces.get(api_id, {}).get(_channel_namespace_for(channel or "")) or {}
         modes = namespace.get("publishAuthModes" if operation == EVENT_PUBLISH else "subscribeAuthModes")
+        if not modes:  # a namespace without modes takes the API's current default (eu-north-1, 2026-11-20)
+            config = (_apis.get(api_id) or {}).get("eventConfig") or {}
+            modes = config.get("defaultPublishAuthModes" if operation == EVENT_PUBLISH else "defaultSubscribeAuthModes")
     return {mode.get("authType") for mode in modes or [] if isinstance(mode, dict)}
 
 
@@ -834,17 +837,20 @@ def _create_channel_namespace(api_id, body):
         )
 
     now = _now()
-    default_modes = _apis[api_id]["eventConfig"]["defaultPublishAuthModes"]
     namespaces[name] = {
-        "publishAuthModes": data.get("publishAuthModes") or default_modes,
-        "subscribeAuthModes": data.get("subscribeAuthModes") or default_modes,
+        "publishAuthModes": data.get("publishAuthModes") or [],
+        "subscribeAuthModes": data.get("subscribeAuthModes") or [],
         "codeHandlers": data.get("codeHandlers"),
         "handlerConfigs": data.get("handlerConfigs"),
         "tags": data.get("tags", {}),
         "created": now,
         "lastModified": now,
     }
-    return json_response({"channelNamespace": _channel_response(api_id, name)})
+    created = _channel_response(api_id, name)
+    for field in ("publishAuthModes", "subscribeAuthModes"):
+        if not created[field]:  # CreateChannelNamespace leaves out modes it was not given
+            del created[field]
+    return json_response({"channelNamespace": created})
 
 
 def _get_channel_namespace(api_id, name):
