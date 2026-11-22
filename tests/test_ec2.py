@@ -1357,6 +1357,25 @@ def test_ec2_describe_vpcs_tag_filter(ec2):
         ec2.delete_vpc(VpcId=untagged_vpc)
 
 
+def test_ec2_describe_vpcs_cidr_block_association_filters(ec2):
+    """The association filters read the VPC's CidrBlockAssociationSet, as botocore's DescribeVpcs filters describe."""
+    vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")["Vpc"]
+    other = ec2.create_vpc(CidrBlock="10.96.0.0/16")["Vpc"]["VpcId"]
+    assoc = vpc["CidrBlockAssociationSet"][0]["AssociationId"]
+    try:
+        def ids(name, value):
+            return [v["VpcId"] for v in ec2.describe_vpcs(Filters=[{"Name": name, "Values": [value]}])["Vpcs"]]
+
+        assert ids("cidr-block-association.association-id", assoc) == [vpc["VpcId"]]
+        assert ids("cidr-block-association.association-id", "vpc-cidr-assoc-0123456789abcdef0") == []
+        assert ids("cidr-block-association.state", "disassociated") == []
+        listed = ids("cidr-block-association.state", "associated")
+        assert vpc["VpcId"] in listed and other in listed
+    finally:
+        ec2.delete_vpc(VpcId=vpc["VpcId"])
+        ec2.delete_vpc(VpcId=other)
+
+
 def test_ec2_describe_security_groups_tag_filter(ec2):
     suffix = _uuid_mod.uuid4().hex[:8]
     vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")["Vpc"]["VpcId"]

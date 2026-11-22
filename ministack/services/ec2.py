@@ -2965,6 +2965,12 @@ def _matches_vpc_filters(vpc, filters):
         elif name == "cidr" or name == "cidr-block-association.cidr-block":
             if vpc["CidrBlock"] not in vals:
                 return False
+        elif name == "cidr-block-association.association-id":
+            if vpc.get("_cidr_assoc_id", f"vpc-cidr-assoc-{vpc['VpcId'][4:]}") not in vals:
+                return False
+        elif name == "cidr-block-association.state":
+            if "associated" not in vals:
+                return False
         elif name == "state":
             if vpc["State"] not in vals:
                 return False
