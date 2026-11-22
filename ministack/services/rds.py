@@ -1243,14 +1243,15 @@ def _rds_container_is_owned_by(
 
 
 # ---------------------------------------------------------------------------
-# PostgreSQL server TLS. AWS installs the DB server certificate itself and
-# rotates it; there is no way to supply your own ("The CA signs the DB server
+# PostgreSQL and MySQL server TLS. AWS installs the DB server certificate itself
+# and rotates it; there is no way to supply your own ("The CA signs the DB server
 # certificate, which is installed on each DB instance", UsingWithRDS.SSL), and
 # every instance we report already carries CACertificateIdentifier
 # rds-ca-rsa2048-g1. So MiniStack mints its own CA and signs a per-container
-# server certificate, and TLS is always on. The stock postgres image ships no
-# key material and dies with `ssl=on` alone, unlike MySQL, which
-# auto-generates (measured: `auto-generate-certs TRUE`).
+# server certificate, and TLS is always on. Measured on real AWS (us-east-1,
+# RDS MySQL 8.4 and Aurora MySQL 3): MySQL endpoints present a certificate that
+# chains to the regional RDS root and names the endpoint, not one from the CA
+# the stock mysql image auto-generates.
 # ---------------------------------------------------------------------------
 
 _PG_TLS_DIR = "/ministack-rds-tls"
@@ -1296,9 +1297,9 @@ def _pg_server_material(names, ips) -> tuple[str, str]:
     return cert_pem, key_pem
 
 
-def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
+def _pg_tls_archive(cert_pem: str, key_pem: str, postgres: bool) -> bytes:
     """The cert and key as a tar for put_archive: no host path is shared with
-    the daemon, and the key lands outside every PGDATA mount at 0600."""
+    the daemon, and the key lands outside every data mount at 0600."""
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as bundle:
         entry = tarfile.TarInfo(_PG_TLS_DIR.lstrip("/"))
@@ -1311,12 +1312,13 @@ def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
             entry.mode = 0o600
             entry.size = len(data)
             bundle.addfile(entry, io.BytesIO(data))
-        # Runs once, when the image initializes a fresh data directory.
-        data = _PG_RDS_INIT.encode()
-        entry = tarfile.TarInfo("docker-entrypoint-initdb.d/ministack-rds.sh")
-        entry.mode = 0o755
-        entry.size = len(data)
-        bundle.addfile(entry, io.BytesIO(data))
+        if postgres:
+            # Runs once, when the image initializes a fresh data directory.
+            data = _PG_RDS_INIT.encode()
+            entry = tarfile.TarInfo("docker-entrypoint-initdb.d/ministack-rds.sh")
+            entry.mode = 0o755
+            entry.size = len(data)
+            bundle.addfile(entry, io.BytesIO(data))
     return archive.getvalue()
 
 
@@ -1341,21 +1343,21 @@ SQL
 
 
 def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tls_ips=()):
-    """Start a backing container, with PostgreSQL TLS enabled.
+    """Start a backing container, with TLS enabled.
 
-    MySQL needs nothing: its image generates its own material and defaults to
-    ssl=ON. PostgreSQL gets a certificate copied in before it starts, so a
-    client using sslmode=verify-full with our CA connects. Plaintext clients
-    keep working, as they do on AWS without rds.force_ssl.
+    PostgreSQL and MySQL get a certificate copied in before they start, so a
+    client verifying the server with our CA connects. PostgreSQL plaintext
+    clients keep working, as they do on AWS without rds.force_ssl.
     """
-    if engine in ("postgres", "aurora-postgresql") or _is_mysql_engine(engine):
+    postgres = engine in ("postgres", "aurora-postgresql")
+    if postgres or _is_mysql_engine(engine):
         # IAM database authentication calls back to a host-run MiniStack.
         container_kwargs.setdefault("extra_hosts", {}).setdefault(
             "host.docker.internal", "host-gateway")
-    if engine not in ("postgres", "aurora-postgresql"):
+    if not postgres and engine not in ("mysql", "aurora-mysql"):
         return docker_client.containers.run(**container_kwargs)
     # Injecting the certificate needs create -> put_archive -> start, so a
-    # client that cannot do that keeps the plain launch and serves plaintext.
+    # client that cannot do that keeps the plain launch, without our certificate.
     if not hasattr(docker_client.containers, "create"):
         return docker_client.containers.run(**container_kwargs)
 
@@ -1365,17 +1367,25 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
         names += [n for n in ("localhost", _MINISTACK_HOST) if n and n not in names]
         ips = [i for i in dict.fromkeys(tuple(tls_ips) + ("127.0.0.1", "::1")) if i]
         cert_pem, key_pem = _pg_server_material(names, ips)
-        archive = _pg_tls_archive(cert_pem, key_pem)
+        archive = _pg_tls_archive(cert_pem, key_pem, postgres)
 
         kwargs = dict(container_kwargs)
-        command = list(kwargs.get("command") or ["postgres"])
-        if command[:2] == ["sh", "-c"]:
-            # `sh -c SCRIPT` takes the next argument as $0, so the flags land
-            # in "$@" for the script's own exec.
-            command.append("ministack-pg")
-        command += ["-c", "ssl=on",
-                    "-c", f"ssl_cert_file={_PG_TLS_DIR}/server.crt",
-                    "-c", f"ssl_key_file={_PG_TLS_DIR}/server.key"]
+        if postgres:
+            owner = "postgres"
+            command = list(kwargs.get("command") or ["postgres"])
+            if command[:2] == ["sh", "-c"]:
+                # `sh -c SCRIPT` takes the next argument as $0, so the flags land
+                # in "$@" for the script's own exec.
+                command.append("ministack-pg")
+            command += ["-c", "ssl=on",
+                        "-c", f"ssl_cert_file={_PG_TLS_DIR}/server.crt",
+                        "-c", f"ssl_key_file={_PG_TLS_DIR}/server.key"]
+        else:
+            # The image's entrypoint runs mysqld when the arguments are options.
+            owner = "mysql"
+            command = list(kwargs.get("command") or [])
+            command += [f"--ssl-cert={_PG_TLS_DIR}/server.crt",
+                        f"--ssl-key={_PG_TLS_DIR}/server.key"]
         entrypoint = kwargs.get("entrypoint") or ["docker-entrypoint.sh"]
         if isinstance(entrypoint, str):
             entrypoint = [entrypoint]
@@ -1385,7 +1395,7 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
         kwargs["user"] = "0:0"
         kwargs["entrypoint"] = [
             "sh", "-c",
-            f"chown -R postgres:postgres {_PG_TLS_DIR} && exec \"$@\"",
+            f"chown -R {owner}:{owner} {_PG_TLS_DIR} && exec \"$@\"",
             "ministack-pg-tls",
         ]
         kwargs["command"] = list(entrypoint) + command
@@ -1397,7 +1407,7 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
             docker_client.images.pull(kwargs["image"])
             container = docker_client.containers.create(**kwargs)
         if not container.put_archive("/", archive):
-            raise RuntimeError("Docker rejected the PostgreSQL TLS archive")
+            raise RuntimeError("Docker rejected the RDS TLS archive")
         container.start()
         return container
     except Exception:

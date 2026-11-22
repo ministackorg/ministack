@@ -12044,7 +12044,7 @@ def _waf_web_acl_parts(physical_id, props):
 def _waf_web_acl_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
     uid, arn, record = _waf.create_web_acl_record(
-        name, props.get("Scope", "REGIONAL"), props)
+        name, props.get("Scope", "REGIONAL"), {**props, "Rules": _waf.api_rules_from_cfn(props.get("Rules", []))})
     # Ref is "name|id|scope", not the bare id: "The Ref for the resource,
     # containing the resource name, physical ID, and scope, formatted as
     # follows: name|id|scope" (aws-resource-wafv2-webacl). The scope comes
@@ -12087,7 +12087,7 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
     if replaced is not None:
         return replaced
 
-    _waf.update_web_acl_record(acl, new_props)
+    _waf.update_web_acl_record(acl, {**new_props, "Rules": _waf.api_rules_from_cfn(new_props.get("Rules", []))})
     return physical_id, {"Arn": acl["ARN"], "Id": acl_id}
 
 
