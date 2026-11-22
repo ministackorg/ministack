@@ -11,13 +11,20 @@ Supports: CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs,
           CreateRuleGroup, GetRuleGroup, UpdateRuleGroup, DeleteRuleGroup, ListRuleGroups,
           TagResource, UntagResource, ListTagsForResource,
           CheckCapacity, DescribeManagedRuleGroup.
+Data plane: evaluate_web_acl decides a CloudFront viewer request.
 """
 
+import base64
+import collections
 import copy
+import hashlib
+import ipaddress
 import json
 import logging
+import operator
 import os
 import re
+import time
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -907,6 +914,363 @@ def _describe_managed_rule_group(data):
     })
 
 
+# ---------------------------------------------------------------------------
+# Web ACL evaluation (CloudFront viewer requests)
+# ---------------------------------------------------------------------------
+# Rules run in ascending Priority: Allow, Block, Captcha and Challenge stop, Count adds the rule's labels
+# and goes on, and no match takes the DefaultAction. A rule that MiniStack cannot decide never matches,
+# and the first time it is skipped in each web ACL version is logged.
+
+
+class _Unknown(Exception):
+    pass
+
+
+class _NotApplied(Exception):
+    """The forwarded IP header is absent, so AWS WAF does not apply the rule at all."""
+
+
+def _one(union):
+    return next(iter((union or {}).items()), (None, {}))
+
+
+def _size_gt(field_to_match, size):
+    return {"SizeConstraintStatement": {"FieldToMatch": field_to_match, "ComparisonOperator": "GT", "Size": size,
+                                        "TextTransformations": [{"Priority": 0, "Type": "NONE"}]}}
+
+
+# The AWS managed rules whose criterion the Developer Guide states exactly (aws-managed-rule-groups-baseline),
+# as (name, label, statement); the other rules of these groups and all other managed groups never match.
+_MANAGED_RULES = {
+    "AWSManagedRulesCommonRuleSet": ("awswaf:managed:aws:core-rule-set:", [
+        ("NoUserAgent_HEADER", "NoUserAgent_Header",
+         {"NotStatement": {"Statement": _size_gt({"SingleHeader": {"Name": "user-agent"}}, -1)}}),
+        ("SizeRestrictions_QUERYSTRING", "SizeRestrictions_QueryString", _size_gt({"QueryString": {}}, 2048)),
+        ("SizeRestrictions_Cookie_HEADER", "SizeRestrictions_Cookie_Header",
+         _size_gt({"SingleHeader": {"Name": "cookie"}}, 10240)),
+        ("SizeRestrictions_BODY", "SizeRestrictions_Body", _size_gt({"Body": {}}, 8192)),
+        ("SizeRestrictions_URIPATH", "SizeRestrictions_URIPath", _size_gt({"UriPath": {}}, 1024)),
+    ]),
+    "AWSManagedRulesKnownBadInputsRuleSet": ("awswaf:managed:aws:known-bad-inputs:", [
+        ("PROPFIND_METHOD", "Propfind_Method", {"ByteMatchStatement": {
+            "FieldToMatch": {"Method": {}}, "PositionalConstraint": "EXACTLY",
+            "SearchString": base64.b64encode(b"PROPFIND").decode(),
+            "TextTransformations": [{"Priority": 0, "Type": "NONE"}]}}),
+    ]),
+}
+
+# MiniStack issues no CAPTCHA or challenge tokens, so every request gets the response for a missing token.
+_TOKEN_STATUS = {"Captcha": 405, "Challenge": 202}
+_CONTENT_TYPES = {"TEXT_PLAIN": "text/plain", "TEXT_HTML": "text/html", "APPLICATION_JSON": "application/json"}
+_rate_windows = {}  # (web ACL ARN, rule path, aggregate key) -> request times
+_reported = {}  # (web ACL ARN, LockToken) -> rule paths already logged as skipped
+
+
+class _Request:
+    def __init__(self, acl, method, path, query, headers, body, client_ip):
+        self.acl, self.method, self.path, self.query, self.body, self.ip = acl, method, path, query, body, client_ip
+        self.headers = [(k.lower(), v) for k, v in headers.items()]
+        self.labels, self.inserted, self.skipped = [], {}, {}
+        limit = (((acl.get("AssociationConfig") or {}).get("RequestBody") or {}).get("CLOUDFRONT") or {}).get(
+            "DefaultSizeInspectionLimit", "KB_16")
+        self.body_limit = int(limit[3:]) * 1024
+
+
+def resource_by_arn(arn, resource_type):
+    """The stored resource of ``resource_type`` that ``arn`` names, in the ARN's own account and Region, or None."""
+    try:
+        spec = parse_arn(arn or "")
+    except ArnParseError:
+        return None
+    parts = spec.resource.split("/")
+    if spec.service != "wafv2" or len(parts) != 4 or parts[1] != resource_type:
+        return None
+    resource = _resource_store(resource_type).get_scoped(spec.account_id, spec.region, parts[3])
+    return resource if resource and resource["ARN"] == arn else None
+
+
+def _ref(spec, resource_type):
+    resource = resource_by_arn(spec.get("ARN"), resource_type)
+    if resource is None:
+        raise _Unknown(f"{resource_type} {spec.get('ARN')} not found")
+    return resource
+
+
+def evaluate_web_acl(acl, method, path, query, headers, body, client_ip):
+    """``("Allow", headers to insert)``, or ``("Block", None)`` for the host's own block page, or the action
+    with a ``(status, headers, body)`` response."""
+    req = _Request(acl, method, path, query, headers, body or b"", client_ip)
+    bodies = acl.get("CustomResponseBodies") or {}
+    outcome = _run_rules(req, acl.get("Rules") or [], f"awswaf:{acl['ARN'].split(':')[4]}:webacl:{acl['Name']}:",
+                         bodies, {}, acl["Name"]) or (*_one(acl.get("DefaultAction")), bodies)
+    seen = _reported.setdefault((acl["ARN"], acl.get("LockToken")), set())
+    if new := [f"{p} ({r})" for p, r in req.skipped.items() if p not in seen]:
+        seen.update(req.skipped)
+        logger.warning("WAFv2 web ACL %s: rules not evaluated, they never match: %s", acl["Name"], "; ".join(new))
+    name, action, bodies = outcome
+    if name == "Allow":
+        _insert_headers(req, action)
+        return name, req.inserted
+    if name in _TOKEN_STATUS:
+        return name, (_TOKEN_STATUS[name], {"x-amzn-waf-action": name.lower()}, b"")
+    custom = action.get("CustomResponse")
+    if not custom:
+        return name, None
+    response_headers = {h["Name"]: h["Value"] for h in custom.get("ResponseHeaders") or []}
+    content = bodies.get(custom.get("CustomResponseBodyKey"))
+    if content:
+        response_headers["content-type"] = _CONTENT_TYPES[content["ContentType"]]
+    return name, (int(custom["ResponseCode"]), response_headers, content["Content"].encode() if content else b"")
+
+
+def _insert_headers(req, action):
+    for header in ((action or {}).get("CustomRequestHandling") or {}).get("InsertHeaders") or []:
+        req.inserted[f"x-amzn-waf-{header['Name']}".lower()] = header["Value"]
+
+
+def _run_rules(req, rules, prefix, bodies, overrides, path):
+    """The terminating ``(action name, action, custom response bodies)``, or None."""
+    for rule in sorted(rules, key=lambda r: r.get("Priority", 0)):
+        rule_path = f"{path}/{rule.get('Name')}"
+        try:
+            outcome = _run_rule(req, rule, prefix, bodies, overrides, rule_path)
+        except _NotApplied:
+            continue
+        except Exception as exc:
+            req.skipped[rule_path] = str(exc) if isinstance(exc, _Unknown) else repr(exc)
+            continue
+        if outcome:
+            return outcome
+    return None
+
+
+def _run_rule(req, rule, prefix, bodies, overrides, path):
+    kind, spec = _one(rule.get("Statement"))
+    if spec.get("ScopeDownStatement") and not _eval(req, spec["ScopeDownStatement"], prefix):
+        return None
+    if kind in ("ManagedRuleGroupStatement", "RuleGroupReferenceStatement"):
+        outcome = _run_group(req, kind, spec, bodies, path)
+        return None if _one(rule.get("OverrideAction"))[0] == "Count" else outcome
+    if not (_rate(req, spec, prefix, path) if kind == "RateBasedStatement" else _eval(req, rule["Statement"], prefix)):
+        return None
+    name, action, bodies = overrides.get(rule.get("Name")) or (*_one(rule.get("Action")), bodies)
+    req.labels += [prefix + label["Name"] for label in rule.get("RuleLabels") or []]
+    if name == "Count":
+        _insert_headers(req, action)
+        return None
+    return name, action, bodies
+
+
+def _run_group(req, kind, spec, bodies, path):
+    overrides = {r["Name"]: ("Count", {}, bodies) for r in spec.get("ExcludedRules") or []}
+    overrides.update({o["Name"]: (*_one(o["ActionToUse"]), bodies) for o in spec.get("RuleActionOverrides") or []})
+    if kind == "RuleGroupReferenceStatement":
+        group = _ref(spec, "rulegroup")
+        return _run_rules(req, group.get("Rules") or [], f"awswaf:{group['ARN'].split(':')[4]}:rulegroup:{group['Name']}:",
+                          group.get("CustomResponseBodies") or {}, overrides, path)
+    managed = _MANAGED_RULES.get(spec.get("Name")) if spec.get("VendorName") == "AWS" else None
+    if managed is None:
+        raise _Unknown("managed rule group not modelled")
+    namespace, rules = managed
+    req.skipped[path] = f"only {', '.join(r[0] for r in rules)} of this managed rule group are evaluated"
+    return _run_rules(req, [{"Name": name, "Priority": i, "Statement": statement, "Action": {"Block": {}},
+                             "RuleLabels": [{"Name": label}]} for i, (name, label, statement) in enumerate(rules)],
+                      namespace, {}, overrides, path)
+
+
+_POSITIONS = {
+    "EXACTLY": operator.eq, "STARTS_WITH": bytes.startswith, "ENDS_WITH": bytes.endswith,
+    "CONTAINS": lambda value, search: search in value,
+    "CONTAINS_WORD": lambda value, search: re.search(
+        rb"(?<![A-Za-z0-9_])" + re.escape(search) + rb"(?![A-Za-z0-9_])", value) is not None,
+}
+_COMPARISONS = {"EQ": operator.eq, "NE": operator.ne, "LE": operator.le, "LT": operator.lt,
+                "GE": operator.ge, "GT": operator.gt}
+
+
+def _eval(req, statement, prefix):
+    kind, spec = _one(statement)
+    if kind in ("AndStatement", "OrStatement"):
+        results = [_eval(req, member, prefix) for member in spec["Statements"]]
+        return all(results) if kind == "AndStatement" else any(results)
+    if kind == "NotStatement":
+        return not _eval(req, spec["Statement"], prefix)
+    if kind == "ByteMatchStatement":
+        search, test = base64.b64decode(spec["SearchString"]), _POSITIONS[spec["PositionalConstraint"]]
+        return _field_match(req, spec, lambda value: test(value, search))
+    if kind in ("RegexMatchStatement", "RegexPatternSetReferenceStatement"):
+        # Python's re stands in for the regex library of AWS WAF.
+        patterns = [re.compile(p["RegexString"]) for p in (
+            [spec] if kind == "RegexMatchStatement" else _ref(spec, "regexpatternset")["RegularExpressionList"])]
+        return _field_match(req, spec, lambda value: any(p.search(value.decode("latin-1")) for p in patterns))
+    if kind == "SizeConstraintStatement":
+        compare = _COMPARISONS[spec["ComparisonOperator"]]
+        return _field_match(req, spec, lambda value: compare(len(value), spec["Size"]))
+    if kind == "IPSetReferenceStatement":
+        networks = [ipaddress.ip_network(a, strict=False) for a in _ref(spec, "ipset")["Addresses"]]
+        config = spec.get("IPSetForwardedIPConfig")
+        ips = _forwarded_ips(req, config) if config else [ipaddress.ip_address(req.ip)]
+        if isinstance(ips, bool):
+            return ips
+        return any(ip in network for ip in ips for network in networks)
+    if kind == "LabelMatchStatement":
+        return any(_label_matches(label, spec["Key"], spec["Scope"], prefix) for label in req.labels)
+    raise _Unknown(kind)
+
+
+def _label_matches(label, key, scope, prefix):
+    """Developer Guide, waf-rule-label-match: a key without the ``awswaf:`` prefix is read in the
+    context of the rule; LABEL matches the end of the label, NAMESPACE contiguous namespaces."""
+    qualified = key.startswith("awswaf:")
+    if not qualified:
+        if not label.startswith(prefix):
+            return False
+        label = label[len(prefix):]
+    if scope == "LABEL":
+        return label == key or not qualified and label.endswith(":" + key)
+    namespace = key.rstrip(":") + ":"
+    return label.startswith(namespace) if qualified else f":{namespace}" in f":{label.rpartition(':')[0]}:"
+
+
+def _forwarded_ips(req, config):
+    """The valid addresses at the configured position of the forwarded IP header, or the fallback outcome."""
+    values = [v for n, v in req.headers if n == config["HeaderName"].lower()]
+    if not values:
+        raise _NotApplied()
+    parts = [p.strip() for p in ",".join(values).split(",")]
+    ips = []
+    for part in {"FIRST": parts[:1], "LAST": parts[-1:]}.get(config.get("Position", "FIRST"), parts[-10:]):
+        try:
+            ips.append(ipaddress.ip_address(part))
+        except ValueError:
+            pass
+    return ips or config["FallbackBehavior"] == "MATCH"
+
+
+def _rate(req, spec, prefix, path):
+    key_type = spec.get("AggregateKeyType", "IP")
+    if key_type == "FORWARDED_IP":
+        ips = _forwarded_ips(req, spec["ForwardedIPConfig"])
+        if isinstance(ips, bool):
+            return ips
+        key = str(ips[0])
+    elif key_type in ("IP", "CONSTANT"):
+        key = req.ip if key_type == "IP" else ""
+    else:
+        raise _Unknown(f"aggregate key type {key_type}")
+    now = time.monotonic()
+    times = _rate_windows.setdefault((req.acl["ARN"], path, key), collections.deque())
+    times.append(now)
+    while times[0] <= now - spec.get("EvaluationWindowSec", 300):
+        times.popleft()
+    return len(times) > spec["Limit"]
+
+
+def _field_match(req, spec, test):
+    values = _field_values(req, spec["FieldToMatch"])
+    if isinstance(values, bool):
+        return values
+    return any(test(_transform(value, spec.get("TextTransformations") or [])) for value in values)
+
+
+def _oversize(spec, over):
+    """None to inspect the component, else the outcome its OversizeHandling forces."""
+    handling = spec.get("OversizeHandling", "CONTINUE")
+    return None if not over or handling == "CONTINUE" else handling == "MATCH"
+
+
+def _latin1(text):
+    return text.encode("latin-1", "replace")
+
+
+def _field_values(req, field_to_match):
+    """The values to inspect, any one of which can match, or the outcome that the component decides.
+    A component the request lacks has no values, so it does not match."""
+    kind, spec = _one(field_to_match)
+    if kind == "UriPath":
+        return [_latin1(req.path)]
+    if kind == "QueryString":
+        return [_latin1(req.query)] if req.query else []
+    if kind == "Method":
+        return [_latin1(req.method)]
+    if kind == "SingleHeader":
+        return [_latin1(v) for n, v in req.headers if n == spec["Name"].lower()]
+    if kind in ("SingleQueryArgument", "AllQueryArguments"):
+        args = [part.partition("=") for part in req.query.split("&") if part]
+        return [_latin1(v) for n, _, v in args if kind == "AllQueryArguments" or n.lower() == spec["Name"].lower()]
+    if kind == "Body":
+        if (forced := _oversize(spec, len(req.body) > req.body_limit)) is not None:
+            return forced
+        return [req.body[:req.body_limit]] if req.body else []
+    if kind == "UriFragment":
+        # A request target never carries a fragment (RFC 9112), so the fallback applies.
+        return spec.get("FallbackBehavior") == "MATCH"
+    raise _Unknown(f"FieldToMatch {kind}")
+
+
+def _normalize_path(value):
+    out = []
+    for segment in re.sub(rb"/{2,}", b"/", value).split(b"/"):
+        if segment == b"." and out:
+            continue
+        if segment == b".." and out and out[-1] not in (b"", b".."):
+            out.pop()
+            continue
+        out.append(segment)
+    if value.endswith((b"/.", b"/..")) and out and out[-1] != b"..":
+        out.append(b"")
+    return b"/".join(out)
+
+
+_SPACE = b" \t\n\r\x0b\x0c"
+# Developer Guide, waf-rule-statement-transformation; any other type makes its rule not evaluated.
+_TRANSFORMS = {
+    "NONE": lambda v: v,
+    "LOWERCASE": bytes.lower,
+    "UPPERCASE": bytes.upper,
+    "COMPRESS_WHITE_SPACE": lambda v: re.sub(rb"[ \t\n\r\x0b\x0c\xa0]+", b" ", v),
+    "NORMALIZE_PATH": _normalize_path,
+    "NORMALIZE_PATH_WIN": lambda v: _normalize_path(v.replace(b"\\", b"/")),
+    "REMOVE_NULLS": lambda v: v.replace(b"\0", b""),
+    "REPLACE_NULLS": lambda v: v.replace(b"\0", b" "),
+    "REMOVE_WHITESPACE": lambda v: v.translate(None, _SPACE),
+    "TRIM": lambda v: v.strip(_SPACE),
+    "TRIM_LEFT": lambda v: v.lstrip(_SPACE),
+    "TRIM_RIGHT": lambda v: v.rstrip(_SPACE),
+    "REPLACE_COMMENTS": lambda v: re.sub(rb"/\*.*?(?:\*/|\Z)", b" ", v, flags=re.S),
+    "REMOVE_COMMENTS_CHAR": lambda v: re.sub(rb"/\*|\*/|--|#", b"", v),
+    "URL_DECODE": lambda v: re.sub(rb"%([0-9A-Fa-f]{2})", lambda m: bytes.fromhex(m[1].decode()), v),
+    "BASE64_DECODE": lambda v: base64.b64decode(v, validate=True),
+    "HEX_DECODE": lambda v: bytes.fromhex(v.decode()),
+    "SQL_HEX_DECODE": lambda v: re.sub(rb"0x((?:[0-9A-Fa-f]{2})+)", lambda m: bytes.fromhex(m[1].decode()), v),
+    "MD5": lambda v: hashlib.md5(v).digest(),
+    "SHA256": lambda v: hashlib.sha256(v).digest(),
+}
+
+
+def _transform(value, transformations):
+    for transformation in sorted(transformations, key=lambda t: t.get("Priority", 0)):
+        if (fn := _TRANSFORMS.get(transformation["Type"])) is None:
+            raise _Unknown(f"text transformation {transformation['Type']}")
+        value = fn(value)
+    return value
+
+
+def api_rules_from_cfn(rules):
+    """CloudFormation rules in the API shape: a ByteMatchStatement's plain SearchString, or its
+    SearchStringBase64, becomes the API's base64 blob (aws-properties-wafv2-webacl-bytematchstatement)."""
+    if isinstance(rules, list):
+        return [api_rules_from_cfn(r) for r in rules]
+    if not isinstance(rules, dict):
+        return rules
+    out = {k: api_rules_from_cfn(v) for k, v in rules.items()}
+    if isinstance(match := out.get("ByteMatchStatement"), dict) and "SearchString" in match:
+        match["SearchString"] = base64.b64encode(str(match["SearchString"]).encode()).decode()
+    if isinstance(match, dict) and "SearchStringBase64" in match:
+        match["SearchString"] = match.pop("SearchStringBase64")
+    return out
+
+
 def reset():
     _web_acls.clear()
     _ip_sets.clear()
@@ -914,3 +1278,5 @@ def reset():
     _rule_groups.clear()
     _associations.clear()
     _waf_tags.clear()
+    _rate_windows.clear()
+    _reported.clear()
