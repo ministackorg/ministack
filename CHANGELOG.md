@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Step Functions — executions started on a version or alias** — `StartExecution` on a state machine version ARN, or on an alias, now runs that version's definition and records the version (and alias) ARN, which `DescribeExecution` and the `ExecutionStarted` event report, and `DescribeStateMachineForExecution` returns the version's definition; before, it ran the state machine's latest definition and reported neither ARN (#2776). Matches real AWS (us-east-1), where an execution started on version 1 after version 2 is published runs version 1.
 - **RDS — MySQL and Aurora MySQL TLS certificates** — MySQL and Aurora MySQL databases now present a server certificate signed by the RDS CA served at `GET /_ministack/rds/ca.pem`, naming their DNS endpoints, as PostgreSQL databases already did; before, they presented a certificate from the mysql image's own auto-generated CA, which no client verifying the server could trust. Matches real AWS (us-east-1, RDS MySQL 8.4 and Aurora MySQL 3), where the certificate chains to the regional RDS root and names the endpoint.
 
 ## [1.5.43] — 2026-11-19
