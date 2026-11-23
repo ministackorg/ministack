@@ -2021,7 +2021,7 @@ def test_s3_batch_delete_enforces_lock(s3):
     resp = s3.delete_objects(Bucket=bkt, Delete={"Objects": [{"Key": "a.txt"}]})
     assert resp["Deleted"][0]["DeleteMarker"] is True
 
-def test_s3_copy_preserves_tags_and_lock(s3):
+def test_s3_copy_preserves_tags_not_lock(s3):
     src = "intg-s3-copy-tag-src"
     dst = "intg-s3-copy-tag-dst"
     s3.create_bucket(Bucket=src, ObjectLockEnabledForBucket=True)
@@ -2038,8 +2038,8 @@ def test_s3_copy_preserves_tags_and_lock(s3):
     tag_map = {t["Key"]: t["Value"] for t in tags["TagSet"]}
     assert tag_map["env"] == "staging"
 
-    hold = s3.get_object_legal_hold(Bucket=dst, Key="copy.txt")
-    assert hold["LegalHold"]["Status"] == "ON"
+    head = s3.head_object(Bucket=dst, Key="copy.txt")
+    assert "ObjectLockLegalHoldStatus" not in head and "ObjectLockMode" not in head
 
 def test_s3_copy_replace_tags(s3):
     bkt = "intg-s3-copy-repl-tag"
@@ -11310,6 +11310,231 @@ def test_s3_copy_and_multipart_refuse_object_lock_headers_without_object_lock(s3
     finally:
         for v in s3.list_object_versions(Bucket=bkt).get("Versions", []):
             s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"])
+        s3.delete_bucket(Bucket=bkt)
+
+
+def _empty_lock_bucket(s3, bkt):
+    try:
+        locked = bool(s3.get_object_lock_configuration(Bucket=bkt)["ObjectLockConfiguration"])
+    except ClientError:
+        locked = False
+    listed = s3.list_object_versions(Bucket=bkt)
+    for v in listed.get("Versions", []) + listed.get("DeleteMarkers", []):
+        if locked:
+            try:
+                s3.put_object_legal_hold(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"], LegalHold={"Status": "OFF"})
+            except ClientError:
+                pass
+        s3.delete_object(Bucket=bkt, Key=v["Key"], VersionId=v["VersionId"],
+                         **({"BypassGovernanceRetention": True} if locked else {}))
+    for u in s3.list_multipart_uploads(Bucket=bkt).get("Uploads", []):
+        s3.abort_multipart_upload(Bucket=bkt, Key=u["Key"], UploadId=u["UploadId"])
+    s3.delete_bucket(Bucket=bkt)
+
+
+def _lock_state(s3, bkt, key):
+    head = s3.head_object(Bucket=bkt, Key=key)
+    return head.get("ObjectLockMode"), bool(head.get("ObjectLockRetainUntilDate")), head.get("ObjectLockLegalHoldStatus")
+
+
+def test_s3_copy_object_takes_the_destinations_lock_not_the_sources(s3):
+    """As on AWS: the copy gets the request's lock or the destination's default retention, never the source's."""
+    from datetime import datetime, timedelta, timezone
+
+    tag = _uuid_mod.uuid4().hex[:8]
+    src, plain, deflt = f"intg-s3-cplk-src-{tag}", f"intg-s3-cplk-plain-{tag}", f"intg-s3-cplk-dflt-{tag}"
+    for b in (src, plain, deflt):
+        s3.create_bucket(Bucket=b, ObjectLockEnabledForBucket=True)
+    s3.put_object_lock_configuration(Bucket=deflt, ObjectLockConfiguration={
+        "ObjectLockEnabled": "Enabled", "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 1}}})
+    until = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=2)
+    try:
+        s3.put_object(Bucket=src, Key="locked", Body=b"abc", ObjectLockMode="GOVERNANCE",
+                      ObjectLockRetainUntilDate=until, ObjectLockLegalHoldStatus="ON")
+        s3.put_object(Bucket=src, Key="free", Body=b"abc")
+
+        s3.copy_object(Bucket=plain, Key="c1", CopySource={"Bucket": src, "Key": "locked"})
+        assert _lock_state(s3, plain, "c1") == (None, False, None)
+
+        s3.copy_object(Bucket=deflt, Key="c2", CopySource={"Bucket": src, "Key": "free"})
+        assert _lock_state(s3, deflt, "c2") == ("GOVERNANCE", True, None)
+
+        s3.copy_object(Bucket=plain, Key="c3", CopySource={"Bucket": src, "Key": "free"}, ObjectLockMode="GOVERNANCE",
+                       ObjectLockRetainUntilDate=until, ObjectLockLegalHoldStatus="ON")
+        assert _lock_state(s3, plain, "c3") == ("GOVERNANCE", True, "ON")
+    finally:
+        for b in (src, plain, deflt):
+            _empty_lock_bucket(s3, b)
+
+
+def test_s3_multipart_upload_keeps_the_lock_it_was_created_with(s3):
+    """As on AWS: the completed object carries the retention or legal hold named at CreateMultipartUpload."""
+    from datetime import datetime, timedelta, timezone
+
+    bkt = f"intg-s3-mpulk-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    until = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=1)
+    try:
+        for key, lock, expected in (
+            ("ret", {"ObjectLockMode": "GOVERNANCE", "ObjectLockRetainUntilDate": until}, ("GOVERNANCE", True, None)),
+            ("hold", {"ObjectLockLegalHoldStatus": "ON"}, (None, False, "ON")),
+        ):
+            up = s3.create_multipart_upload(Bucket=bkt, Key=key, **lock)["UploadId"]
+            part = s3.upload_part(Bucket=bkt, Key=key, UploadId=up, PartNumber=1, Body=b"x" * 16)
+            version = s3.complete_multipart_upload(Bucket=bkt, Key=key, UploadId=up, MultipartUpload={
+                "Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]})["VersionId"]
+            assert _lock_state(s3, bkt, key) == expected
+            with pytest.raises(ClientError) as exc:
+                s3.delete_object(Bucket=bkt, Key=key, VersionId=version)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    finally:
+        _empty_lock_bucket(s3, bkt)
+
+
+def test_s3_copy_object_destination_conditions(s3):
+    """CopyObject judges If-Match / If-None-Match against the destination, as AWS does."""
+    bkt = f"intg-s3-cpcond-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    src = {"Bucket": bkt, "Key": "src"}
+    s3.put_object(Bucket=bkt, Key="src", Body=b"new")
+    old = s3.put_object(Bucket=bkt, Key="dst", Body=b"old")["ETag"]
+    zero = '"00000000000000000000000000000000"'
+
+    def refused(**kw):
+        with pytest.raises(ClientError) as exc:
+            s3.copy_object(Bucket=bkt, CopySource=src, **kw)
+        e = exc.value.response
+        return e["Error"]["Code"], e["ResponseMetadata"]["HTTPStatusCode"]
+
+    try:
+        assert refused(Key="absent", IfMatch=zero) == ("NoSuchKey", 404)
+        assert refused(Key="dst", IfMatch=zero) == ("PreconditionFailed", 412)
+        assert refused(Key="dst", IfNoneMatch="*") == ("PreconditionFailed", 412)
+        assert refused(Key="dst", IfMatch="*") == ("NotImplemented", 501)
+        assert refused(Key="dst", IfNoneMatch=zero) == ("NotImplemented", 501)
+        assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"old"
+        assert "absent" not in [o["Key"] for o in s3.list_objects_v2(Bucket=bkt)["Contents"]]
+
+        s3.copy_object(Bucket=bkt, Key="dst", CopySource=src, IfMatch=old)
+        s3.copy_object(Bucket=bkt, Key="fresh", CopySource=src, IfNoneMatch="*")
+        assert s3.get_object(Bucket=bkt, Key="dst")["Body"].read() == b"new"
+        assert s3.get_object(Bucket=bkt, Key="fresh")["Body"].read() == b"new"
+    finally:
+        for o in s3.list_objects_v2(Bucket=bkt)["Contents"]:
+            s3.delete_object(Bucket=bkt, Key=o["Key"])
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_copy_object_destination_condition_errors_match_aws(s3):
+    """Recorded on AWS (eu-north-1, 2026-11-22): the 501 comes before the 404, with these extra elements."""
+    bkt = f"intg-s3-cpcond-err-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src", Body=b"new")
+
+    def error(**kw):
+        with pytest.raises(ClientError) as exc:
+            s3.copy_object(Bucket=bkt, Key="absent", CopySource={"Bucket": bkt, "Key": "src"}, **kw)
+        e = exc.value.response["Error"]
+        return {k: v for k, v in e.items()}, exc.value.response["ResponseMetadata"]["HTTPStatusCode"]
+
+    try:
+        for header, kw in (("If-Match", {"IfMatch": "*"}),
+                           ("If-None-Match", {"IfNoneMatch": '"00000000000000000000000000000000"'})):
+            assert error(**kw) == ({
+                "Code": "NotImplemented", "Message": "A header you provided implies functionality that is not implemented",
+                "Header": header, "additionalMessage": f"We don't accept the provided value of {header} header for this API",
+            }, 501)
+        assert error(IfMatch='"00000000000000000000000000000000"') == (
+            {"Code": "NoSuchKey", "Message": "The specified key does not exist.", "Key": "absent"}, 404)
+    finally:
+        s3.delete_object(Bucket=bkt, Key="src")
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_governance_bypass_needs_an_object_lock_bucket(s3):
+    """Recorded on AWS (eu-north-1, 2026-11-22): DeleteObject with the bypass on a bucket without Object Lock."""
+    bkt = f"intg-s3-bypass-nolock-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    version = s3.put_object(Bucket=bkt, Key="k", Body=b"x")["VersionId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.delete_object(Bucket=bkt, Key="k", VersionId=version, BypassGovernanceRetention=True)
+        assert ({k: v for k, v in exc.value.response["Error"].items()},
+                exc.value.response["ResponseMetadata"]["HTTPStatusCode"]) == ({
+                    "Code": "InvalidArgument",
+                    "Message": "x-amz-bypass-governance-retention is only applicable to Object Lock enabled buckets.",
+                    "ArgumentName": "x-amz-bypass-governance-retention"}, 400)
+        assert s3.get_object(Bucket=bkt, Key="k", VersionId=version)["Body"].read() == b"x"
+    finally:
+        s3.delete_object(Bucket=bkt, Key="k", VersionId=version)
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_object_lock_bucket_refuses_suspended_versioning(s3):
+    """Recorded on AWS (eu-north-1, 2026-11-22)."""
+    bkt = f"intg-s3-lock-susp-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Suspended"})
+        assert ({k: v for k, v in exc.value.response["Error"].items()},
+                exc.value.response["ResponseMetadata"]["HTTPStatusCode"]) == ({
+                    "Code": "InvalidBucketState",
+                    "Message": "An Object Lock configuration is present on this bucket, so the versioning state cannot be "
+                               "changed."}, 409)
+        assert s3.get_bucket_versioning(Bucket=bkt)["Status"] == "Enabled"
+        s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    finally:
+        s3.delete_bucket(Bucket=bkt)
+
+
+def test_s3_multipart_upload_takes_the_buckets_default_retention(s3):
+    """Recorded on AWS (eu-north-1, 2026-11-22): no lock headers, bucket default GOVERNANCE 1 day."""
+    bkt = f"intg-s3-mpudflt-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt, ObjectLockEnabledForBucket=True)
+    s3.put_object_lock_configuration(Bucket=bkt, ObjectLockConfiguration={
+        "ObjectLockEnabled": "Enabled", "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 1}}})
+    try:
+        up = s3.create_multipart_upload(Bucket=bkt, Key="mpu")["UploadId"]
+        part = s3.upload_part(Bucket=bkt, Key="mpu", UploadId=up, PartNumber=1, Body=b"x" * 16)
+        s3.complete_multipart_upload(Bucket=bkt, Key="mpu", UploadId=up,
+                                     MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": part["ETag"]}]})
+        assert _lock_state(s3, bkt, "mpu") == ("GOVERNANCE", True, None)
+    finally:
+        _empty_lock_bucket(s3, bkt)
+
+
+def test_s3_copy_object_if_match_on_a_delete_marker_is_no_such_key(s3):
+    bkt = f"intg-s3-cpcond-dm-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_versioning(Bucket=bkt, VersioningConfiguration={"Status": "Enabled"})
+    s3.put_object(Bucket=bkt, Key="src", Body=b"new")
+    etag = s3.put_object(Bucket=bkt, Key="dst", Body=b"old")["ETag"]
+    s3.delete_object(Bucket=bkt, Key="dst")
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.copy_object(Bucket=bkt, Key="dst", CopySource={"Bucket": bkt, "Key": "src"}, IfMatch=etag)
+        assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+    finally:
+        _empty_lock_bucket(s3, bkt)
+
+
+def test_s3_upload_part_copy_refuses_another_keys_upload(s3):
+    """As on AWS, and as UploadPart already does: an upload ID names one key's upload."""
+    bkt = f"intg-s3-upc-key-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_object(Bucket=bkt, Key="src", Body=b"x" * 16)
+    up = s3.create_multipart_upload(Bucket=bkt, Key="a")["UploadId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            s3.upload_part_copy(Bucket=bkt, Key="b", UploadId=up, PartNumber=2, CopySource={"Bucket": bkt, "Key": "src"})
+        assert (exc.value.response["Error"]["Code"], exc.value.response["ResponseMetadata"]["HTTPStatusCode"]) == (
+            "NoSuchUpload", 404)
+        assert s3.list_parts(Bucket=bkt, Key="a", UploadId=up).get("Parts", []) == []
+    finally:
+        s3.abort_multipart_upload(Bucket=bkt, Key="a", UploadId=up)
+        s3.delete_object(Bucket=bkt, Key="src")
         s3.delete_bucket(Bucket=bkt)
 
 

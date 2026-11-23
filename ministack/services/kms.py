@@ -452,6 +452,43 @@ def resolve_key_for_s3(key_ref):
     return arn, None
 
 
+_SQS_KMS_ERRORS = {
+    "Disabled": ("KmsDisabled", "DisabledException", "{arn} is disabled."),
+    "PendingDeletion": ("KmsInvalidState", "KMSInvalidStateException", "{arn} is pending deletion."),
+    "PendingImport": ("KmsInvalidState", "KMSInvalidStateException", "{arn} is pending import."),
+}
+
+
+def _sqs_kms_message(text, kms_code):
+    return f"{text} (Service: AWSKMS; Status Code: 400; Error Code: {kms_code}; Request ID: {new_uuid()}; Proxy: null)"
+
+
+def sqs_key_error(key_ref):
+    """``(SQS error shape, message)`` when KMS refuses SQS a data key for *key_ref*, else None."""
+    region, account = get_region(), get_account_id()
+    if key_ref in ("alias/aws/sqs", f"arn:aws:kms:{region}:{account}:alias/aws/sqs"):
+        return None
+    if key_ref in (_AWS_S3_ALIAS, f"arn:aws:kms:{region}:{account}:{_AWS_S3_ALIAS}"):
+        from ministack.core.iam_evaluator import caller_arn
+        return "KmsAccessDenied", _sqs_kms_message(
+            f"User: {caller_arn()} is not authorized to perform: kms:GenerateDataKey on resource: "
+            f"{aws_managed_s3_key()['Arn']} because no resource-based policy allows the kms:GenerateDataKey action",
+            "AccessDeniedException")
+    if not key_ref.startswith(("arn:", "alias/")) and not _KEY_ID_RE.fullmatch(key_ref):
+        return "KmsNotFound", _sqs_kms_message(f"Invalid keyId {key_ref}", "NotFoundException")
+    arn, err = _s3_key_arn(key_ref)
+    if err:
+        if err[0] == "AccessDenied":
+            return "KmsAccessDenied", _sqs_kms_message(err[1], "AccessDeniedException")
+        return "KmsNotFound", _sqs_kms_message(err[1], "NotFoundException")
+    rec = _keys.get(arn.rsplit("/", 1)[-1]) if arn.split(":")[4] == account else _foreign_key(arn)[1]
+    shape = _SQS_KMS_ERRORS.get((rec or {}).get("KeyState"))
+    if shape is None:
+        return None
+    sqs_code, kms_code, text = shape
+    return sqs_code, _sqs_kms_message(text.format(arn=arn), kms_code)
+
+
 def _key_ref_from_arn(key_id_or_arn):
     try:
         spec = parse_arn(key_id_or_arn)

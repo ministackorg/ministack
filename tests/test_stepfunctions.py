@@ -3434,6 +3434,28 @@ def test_sfn_integration_sqs_send_message(sfn, sqs):
     assert len(msgs.get("Messages", [])) == 1
     assert msgs["Messages"][0]["Body"] == "hello from sfn"
 
+def test_sfn_integration_sqs_send_message_disabled_key(sfn, sqs, kms_client):
+    key = kms_client.create_key()["KeyMetadata"]
+    url = sqs.create_queue(QueueName=f"sfn-kms-{_uuid_mod.uuid4().hex[:8]}",
+                           Attributes={"KmsMasterKeyId": key["Arn"]})["QueueUrl"]
+    kms_client.disable_key(KeyId=key["KeyId"])
+    sm = sfn.create_state_machine(
+        name=f"sfn-sqs-kms-{_uuid_mod.uuid4().hex[:8]}", roleArn="arn:aws:iam::000000000000:role/R",
+        definition=json.dumps({"StartAt": "S", "States": {"S": {
+            "Type": "Task", "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {"QueueUrl": url, "MessageBody": "x"}, "End": True}}}))
+    try:
+        desc = _wait_sfn(sfn, sfn.start_execution(stateMachineArn=sm["stateMachineArn"])["executionArn"])
+        assert (desc["status"], desc["error"]) == ("FAILED", "SQS.KmsDisabledException")
+        assert re.fullmatch(
+            re.escape(f"{key['Arn']} is disabled.") + r" \(Service: AWSKMS; Status Code: 400; Error Code: "
+            r"DisabledException; Request ID: [0-9a-f-]{36}; Proxy: null\) \(Service: AmazonSQS; Status Code: 400; "
+            r"Error Code: KMS\.DisabledException; Request ID: [0-9a-f-]{36}; Proxy: null\)", desc["cause"]), desc["cause"]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=sm["stateMachineArn"])
+        sqs.delete_queue(QueueUrl=url)
+
+
 def test_sfn_integration_events_put_events(sfn, eb, sqs):
     """Task state publishes to EventBridge via arn:aws:states:::events:putEvents,
     and the event is actually delivered to a rule target — not a silent no-op
@@ -7585,6 +7607,9 @@ def test_sfn_publish_state_machine_version_revisionid_precondition(sfn):
                 stateMachineArn=sm_arn, revisionId=current_rev,
             )
         assert exc.value.response["Error"]["Code"] == "ConflictException"
+        assert exc.value.response["Error"]["Message"] == (
+            f"Failed to publish the State Machine version for revision {current_rev}. "
+            f"The current State Machine revision is {rev_after_update}.")
 
         # Publish without revisionId always succeeds (no precondition).
         v2 = sfn.publish_state_machine_version(stateMachineArn=sm_arn)

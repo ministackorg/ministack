@@ -1357,6 +1357,25 @@ def test_ec2_describe_vpcs_tag_filter(ec2):
         ec2.delete_vpc(VpcId=untagged_vpc)
 
 
+def test_ec2_describe_vpcs_cidr_block_association_filters(ec2):
+    """The association filters read the VPC's CidrBlockAssociationSet, as botocore's DescribeVpcs filters describe."""
+    vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")["Vpc"]
+    other = ec2.create_vpc(CidrBlock="10.96.0.0/16")["Vpc"]["VpcId"]
+    assoc = vpc["CidrBlockAssociationSet"][0]["AssociationId"]
+    try:
+        def ids(name, value):
+            return [v["VpcId"] for v in ec2.describe_vpcs(Filters=[{"Name": name, "Values": [value]}])["Vpcs"]]
+
+        assert ids("cidr-block-association.association-id", assoc) == [vpc["VpcId"]]
+        assert ids("cidr-block-association.association-id", "vpc-cidr-assoc-0123456789abcdef0") == []
+        assert ids("cidr-block-association.state", "disassociated") == []
+        listed = ids("cidr-block-association.state", "associated")
+        assert vpc["VpcId"] in listed and other in listed
+    finally:
+        ec2.delete_vpc(VpcId=vpc["VpcId"])
+        ec2.delete_vpc(VpcId=other)
+
+
 def test_ec2_describe_security_groups_tag_filter(ec2):
     suffix = _uuid_mod.uuid4().hex[:8]
     vpc = ec2.create_vpc(CidrBlock="10.97.0.0/16")["Vpc"]["VpcId"]
@@ -5044,3 +5063,207 @@ def test_ec2_xml_special_characters_are_escaped(ec2):
         ec2.delete_subnet(SubnetId=subnet_id)
         ec2.delete_vpc(VpcId=vpc_id)
         ec2.delete_key_pair(KeyName=key_name)
+
+
+def test_ec2_transit_gateway_not_found_errors_match_aws(ec2):
+    from botocore.exceptions import ClientError
+    cases = [
+        ("describe_transit_gateways", {"TransitGatewayIds": ["tgw-0123456789abcdef0"]},
+         "InvalidTransitGatewayID.NotFound", "Transit Gateway tgw-0123456789abcdef0 was deleted or does not exist."),
+        ("describe_transit_gateways", {"TransitGatewayIds": ["tgw-nope"]},
+         "InvalidTransitGatewayID.Malformed", "Invalid Transit Gateway id tgw-nope."),
+        ("describe_transit_gateway_route_tables", {"TransitGatewayRouteTableIds": ["tgw-rtb-0123456789abcdef0"]},
+         "InvalidRouteTableID.NotFound",
+         "Transit Gateway Route Table tgw-rtb-0123456789abcdef0 was deleted or does not exist."),
+        ("describe_transit_gateway_vpc_attachments", {"TransitGatewayAttachmentIds": ["tgw-attach-0123456789abcdef0"]},
+         "InvalidTransitGatewayAttachmentID.NotFound",
+         "Transit Gateway Attachment tgw-attach-0123456789abcdef0 was deleted or does not exist."),
+        ("describe_transit_gateway_attachments", {"TransitGatewayAttachmentIds": ["tgw-attach-0123456789abcdef0"]},
+         "InvalidTransitGatewayAttachmentID.NotFound",
+         "Transit Gateway Attachment tgw-attach-0123456789abcdef0 was deleted or does not exist."),
+        ("delete_transit_gateway", {"TransitGatewayId": "tgw-0123456789abcdef0"},
+         "InvalidTransitGatewayID.NotFound", "Transit Gateway tgw-0123456789abcdef0 was deleted or does not exist."),
+    ]
+    for op, kw, code, message in cases:
+        with pytest.raises(ClientError) as exc:
+            getattr(ec2, op)(**kw)
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (code, message)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_ec2_transit_gateway_terraform_lifecycle(ec2):
+    vpc_id = ec2.create_vpc(CidrBlock="10.91.0.0/16")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.91.1.0/24")["Subnet"]["SubnetId"]
+    tag = _uuid_mod.uuid4().hex[:8]
+    tgw = ec2.create_transit_gateway(Description="t", TagSpecifications=[
+        {"ResourceType": "transit-gateway", "Tags": [{"Key": "t", "Value": tag}]}])["TransitGateway"]
+    tgw_id = tgw["TransitGatewayId"]
+    assert tgw["State"] == "pending"
+    assert tgw["TransitGatewayArn"].endswith(f":transit-gateway/{tgw_id}")
+    default_rt = tgw["Options"]["AssociationDefaultRouteTableId"]
+    assert default_rt == tgw["Options"]["PropagationDefaultRouteTableId"]
+    assert {k: tgw["Options"][k] for k in ("AmazonSideAsn", "DnsSupport", "DefaultRouteTableAssociation")} == {
+        "AmazonSideAsn": 64512, "DnsSupport": "enable", "DefaultRouteTableAssociation": "enable"}
+    [found] = ec2.describe_transit_gateways(Filters=[{"Name": "tag:t", "Values": [tag]}])["TransitGateways"]
+    assert found["State"] == "available"
+    ec2.modify_transit_gateway(TransitGatewayId=tgw_id, Description="t2", Options={"DnsSupport": "disable"})
+    [found] = ec2.describe_transit_gateways(TransitGatewayIds=[tgw_id])["TransitGateways"]
+    assert (found["Description"], found["Options"]["DnsSupport"]) == ("t2", "disable")
+    [drt] = ec2.describe_transit_gateway_route_tables(
+        Filters=[{"Name": "transit-gateway-id", "Values": [tgw_id]}])["TransitGatewayRouteTables"]
+    assert (drt["TransitGatewayRouteTableId"], drt["DefaultAssociationRouteTable"]) == (default_rt, True)
+
+    rt = ec2.create_transit_gateway_route_table(TransitGatewayId=tgw_id, TagSpecifications=[
+        {"ResourceType": "transit-gateway-route-table", "Tags": [{"Key": "t", "Value": tag}]}])["TransitGatewayRouteTable"]
+    rt_id = rt["TransitGatewayRouteTableId"]
+    assert (rt["State"], rt["DefaultAssociationRouteTable"]) == ("pending", False)
+    assert rt["Tags"] == [{"Key": "t", "Value": tag}]
+
+    att = ec2.create_transit_gateway_vpc_attachment(
+        TransitGatewayId=tgw_id, VpcId=vpc_id, SubnetIds=[subnet_id], TagSpecifications=[
+            {"ResourceType": "transit-gateway-attachment", "Tags": [{"Key": "t", "Value": tag}]}])[
+        "TransitGatewayVpcAttachment"]
+    att_id = att["TransitGatewayAttachmentId"]
+    assert (att["State"], att["SubnetIds"], att["Options"]["DnsSupport"]) == ("pending", [subnet_id], "enable")
+    assert att["Tags"] == [{"Key": "t", "Value": tag}]
+    [d] = ec2.describe_transit_gateway_attachments(TransitGatewayAttachmentIds=[att_id])["TransitGatewayAttachments"]
+    assert (d["State"], d["ResourceType"], d["ResourceId"]) == ("available", "vpc", vpc_id)
+    assert d["Association"] == {"TransitGatewayRouteTableId": default_rt, "State": "associated"}
+    ec2.modify_transit_gateway_vpc_attachment(TransitGatewayAttachmentId=att_id, Options={"DnsSupport": "disable"})
+    [v] = ec2.describe_transit_gateway_vpc_attachments(TransitGatewayAttachmentIds=[att_id])[
+        "TransitGatewayVpcAttachments"]
+    assert v["Options"]["DnsSupport"] == "disable"
+
+    assert ec2.disassociate_transit_gateway_route_table(
+        TransitGatewayRouteTableId=default_rt, TransitGatewayAttachmentId=att_id)["Association"]["State"] == \
+        "disassociating"
+    assert ec2.get_transit_gateway_route_table_associations(TransitGatewayRouteTableId=default_rt)["Associations"] == []
+    assert ec2.associate_transit_gateway_route_table(
+        TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)["Association"]["State"] == "associating"
+    assert ec2.get_transit_gateway_route_table_associations(TransitGatewayRouteTableId=rt_id)["Associations"] == [
+        {"TransitGatewayAttachmentId": att_id, "ResourceId": vpc_id, "ResourceType": "vpc", "State": "associated"}]
+
+    assert ec2.enable_transit_gateway_route_table_propagation(
+        TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)["Propagation"]["State"] == "enabling"
+    [prop] = ec2.get_transit_gateway_route_table_propagations(TransitGatewayRouteTableId=rt_id)[
+        "TransitGatewayRouteTablePropagations"]
+    assert (prop["TransitGatewayAttachmentId"], prop["State"]) == (att_id, "enabled")
+
+    route = ec2.create_transit_gateway_route(DestinationCidrBlock="10.200.0.0/16", TransitGatewayRouteTableId=rt_id,
+                                             TransitGatewayAttachmentId=att_id)["Route"]
+    assert (route["Type"], route["State"], route["TransitGatewayAttachments"][0]["ResourceId"]) == (
+        "static", "active", vpc_id)
+    ec2.create_transit_gateway_route(DestinationCidrBlock="10.201.0.0/16", TransitGatewayRouteTableId=rt_id,
+                                     Blackhole=True)
+    r = ec2.search_transit_gateway_routes(TransitGatewayRouteTableId=rt_id,
+                                          Filters=[{"Name": "type", "Values": ["static"]}])
+    assert sorted((x["DestinationCidrBlock"], x["State"]) for x in r["Routes"]) == [
+        ("10.200.0.0/16", "active"), ("10.201.0.0/16", "blackhole")]
+    assert r["AdditionalRoutesAvailable"] is False
+    [prop_route] = ec2.search_transit_gateway_routes(
+        TransitGatewayRouteTableId=rt_id, Filters=[{"Name": "type", "Values": ["propagated"]}])["Routes"]
+    assert prop_route["DestinationCidrBlock"] == "10.91.0.0/16"
+    assert ec2.delete_transit_gateway_route(DestinationCidrBlock="10.200.0.0/16",
+                                            TransitGatewayRouteTableId=rt_id)["Route"]["State"] == "deleted"
+
+    assert ec2.disable_transit_gateway_route_table_propagation(
+        TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)["Propagation"]["State"] == "disabling"
+    ec2.disassociate_transit_gateway_route_table(TransitGatewayRouteTableId=rt_id, TransitGatewayAttachmentId=att_id)
+    assert ec2.delete_transit_gateway_vpc_attachment(TransitGatewayAttachmentId=att_id)[
+        "TransitGatewayVpcAttachment"]["State"] == "deleting"
+    assert ec2.delete_transit_gateway_route_table(TransitGatewayRouteTableId=rt_id)[
+        "TransitGatewayRouteTable"]["State"] == "deleting"
+    assert ec2.delete_transit_gateway(TransitGatewayId=tgw_id)["TransitGateway"]["State"] == "deleting"
+    [gone] = ec2.describe_transit_gateways(TransitGatewayIds=[tgw_id])["TransitGateways"]
+    assert gone["State"] == "deleted"
+    ec2.delete_subnet(SubnetId=subnet_id)
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_vpc_secondary_cidr_block_association_matches_aws(ec2):
+    from botocore.exceptions import ClientError
+
+    def err(op, **kw):
+        with pytest.raises(ClientError) as exc:
+            getattr(ec2, op)(**kw)
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    vpc_id = ec2.create_vpc(CidrBlock="10.61.0.0/16")["Vpc"]["VpcId"]
+    r = ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="100.64.0.0/16")
+    a1 = r["CidrBlockAssociation"]["AssociationId"]
+    assert (r["VpcId"], r["CidrBlockAssociation"]["CidrBlock"], r["CidrBlockAssociation"]["CidrBlockState"]) == (
+        vpc_id, "100.64.0.0/16", {"State": "associating"})
+    [vpc] = ec2.describe_vpcs(Filters=[{"Name": "cidr-block-association.association-id", "Values": [a1]}])["Vpcs"]
+    assert [(a["CidrBlock"], a["CidrBlockState"]["State"]) for a in vpc["CidrBlockAssociationSet"]] == [
+        ("10.61.0.0/16", "associated"), ("100.64.0.0/16", "associated")]
+    primary = vpc["CidrBlockAssociationSet"][0]["AssociationId"]
+    assert [v["VpcId"] for v in ec2.describe_vpcs(Filters=[
+        {"Name": "cidr-block-association.cidr-block", "Values": ["100.64.0.0/16"]}])["Vpcs"]] == [vpc_id]
+    assert ec2.describe_vpcs(Filters=[{"Name": "cidr", "Values": ["100.64.0.0/16"]},
+                                      {"Name": "vpc-id", "Values": [vpc_id]}])["Vpcs"] == []
+
+    conflict = ("CidrConflict", f"CIDR range conflicts with 100.64.0.0/16 with association ID {a1}")
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock="100.64.0.0/16") == conflict
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock="100.64.128.0/17") == conflict
+    restricted = ("The CIDR '{}' is restricted. Use a CIDR from the same private address range as the current VPC "
+                  "CIDR, or use a publicly-routable CIDR. For additional restrictions, see "
+                  "https://docs.aws.amazon.com/vpc/latest/userguide/vpc-cidr-blocks.html")
+    for cidr in ("172.16.0.0/16", "192.168.1.0/24"):
+        assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock=cidr) == (
+            "InvalidVpc.Range", restricted.format(cidr))
+    for cidr in ("100.65.0.0/29", "100.66.0.0/15"):
+        assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock=cidr) == (
+            "InvalidVpc.Range", f"The CIDR '{cidr}' is invalid.")
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id, CidrBlock="nope") == (
+        "InvalidCidrBlock.Malformed", "nope is not a well-formed IPv4 CIDR block")
+    assert err("associate_vpc_cidr_block", VpcId="vpc-0123456789abcdef0", CidrBlock="100.68.0.0/16") == (
+        "InvalidVpcID.NotFound", "vpc-0123456789abcdef0 is not found for user.")
+    assert err("associate_vpc_cidr_block", VpcId=vpc_id)[0] == "InvalidParameterCombination"
+    assert ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="10.62.0.0/16")["CidrBlockAssociation"]["CidrBlock"] \
+        == "10.62.0.0/16"
+    assert ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="100.67.0.1/16")["CidrBlockAssociation"][
+        "CidrBlock"] == "100.67.0.0/16"
+    [rtb] = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
+    assert [x["DestinationCidrBlock"] for x in rtb["Routes"] if x.get("GatewayId") == "local"] == [
+        "10.61.0.0/16", "10.62.0.0/16", "100.64.0.0/16", "100.67.0.0/16"]
+
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="100.64.1.0/24")["Subnet"]["SubnetId"]
+    assert err("create_subnet", VpcId=vpc_id, CidrBlock="100.90.1.0/24") == (
+        "InvalidSubnet.Range", "The CIDR '100.90.1.0/24' is invalid.")
+    assert err("disassociate_vpc_cidr_block", AssociationId=a1) == (
+        "InvalidCidrBlock.InUse", f"The vpc {vpc_id} currently has a subnet within CIDR block 100.64.0.0/16")
+    assert err("disassociate_vpc_cidr_block", AssociationId=primary) == (
+        "OperationNotPermitted", f"The vpc CIDR block with association ID {primary} may not be disassociated. "
+                                 "It is the primary IPv4 CIDR block of the VPC")
+    assert err("disassociate_vpc_cidr_block", AssociationId="vpc-cidr-assoc-0123456789abcdef0") == (
+        "InvalidVpcCidrBlockAssociationID.NotFound",
+        "The vpc CIDR block with association ID 'vpc-cidr-assoc-0123456789abcdef0' does not exist")
+    assert err("disassociate_vpc_cidr_block", AssociationId="nope") == (
+        "InvalidVpcCidrBlockAssociationId.Malformed", "The vpc CIDR block with association ID nope is malformed")
+    ec2.delete_subnet(SubnetId=subnet_id)
+
+    r = ec2.disassociate_vpc_cidr_block(AssociationId=a1)
+    assert (r["VpcId"], r["CidrBlockAssociation"]["CidrBlockState"]) == (vpc_id, {"State": "disassociating"})
+    [vpc] = ec2.describe_vpcs(Filters=[{"Name": "cidr-block-association.association-id", "Values": [a1]}])["Vpcs"]
+    assert ("100.64.0.0/16", a1, "disassociated") in [
+        (a["CidrBlock"], a["AssociationId"], a["CidrBlockState"]["State"]) for a in vpc["CidrBlockAssociationSet"]]
+    assert [v["VpcId"] for v in ec2.describe_vpcs(Filters=[
+        {"Name": "cidr-block-association.state", "Values": ["disassociated"]},
+        {"Name": "vpc-id", "Values": [vpc_id]}])["Vpcs"]] == [vpc_id]
+    assert ec2.disassociate_vpc_cidr_block(AssociationId=a1)["CidrBlockAssociation"]["CidrBlockState"] == {
+        "State": "disassociated"}
+    [rtb] = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["RouteTables"]
+    assert "100.64.0.0/16" not in {x["DestinationCidrBlock"] for x in rtb["Routes"]}
+    a2 = ec2.associate_vpc_cidr_block(VpcId=vpc_id, CidrBlock="100.64.0.0/16")["CidrBlockAssociation"]["AssociationId"]
+    assert a2 != a1
+    [vpc] = ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"]
+    assert [(a["CidrBlock"], a["CidrBlockState"]["State"]) for a in vpc["CidrBlockAssociationSet"]] == [
+        ("10.61.0.0/16", "associated"), ("100.64.0.0/16", "disassociated"), ("10.62.0.0/16", "associated"),
+        ("100.67.0.0/16", "associated"), ("100.64.0.0/16", "associated")]
+
+    vpc2 = ec2.create_vpc(CidrBlock="192.168.0.0/24")["Vpc"]["VpcId"]
+    ec2.associate_vpc_cidr_block(VpcId=vpc2, CidrBlock="100.64.0.0/16")
+    assert err("associate_vpc_cidr_block", VpcId=vpc2, CidrBlock="10.0.0.0/16") == (
+        "InvalidVpc.Range", restricted.format("10.0.0.0/16"))
+    ec2.delete_vpc(VpcId=vpc2)
+    ec2.delete_vpc(VpcId=vpc_id)

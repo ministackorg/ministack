@@ -4224,6 +4224,11 @@ def _invoke_sqs_send_message(resource, input_data):
             payload["MessageBody"] = json.dumps(body)
         result = sqs._act_send_message(payload, url)
         return result
+    except sqs._KmsErr as e:
+        raise _ExecutionError(
+            f"SQS.{e.code}Exception",
+            f"{e.message} (Service: AmazonSQS; Status Code: 400; Error Code: "
+            f"{sqs._QUERY_COMPAT_CODES.get(e.code, e.code)}; Request ID: {new_uuid()}; Proxy: null)")
     except sqs._Err as e:
         raise _ExecutionError(f"SQS.{e.code}", e.message)
 
@@ -4683,6 +4688,12 @@ _EC2_QUERY_LIST_NAMES = {
     "OwnerIds": "Owner",
     "Resources": "ResourceId",
     "RestorableByUserIds": "RestorableBy",
+    "AddTransitGatewayCidrBlocks": "AddTransitGatewayCidrBlocks",
+    "RemoveTransitGatewayCidrBlocks": "RemoveTransitGatewayCidrBlocks",
+    "TransitGatewayAttachmentIds": "TransitGatewayAttachmentIds",
+    "TransitGatewayCidrBlocks": "TransitGatewayCidrBlocks",
+    "TransitGatewayIds": "TransitGatewayIds",
+    "TransitGatewayRouteTableIds": "TransitGatewayRouteTableIds",
     "TunnelOptions": "TunnelOptions",
     "UserIdGroupPairs": "Groups",
     "Versions": "LaunchTemplateVersion",
@@ -4701,6 +4712,11 @@ _EC2_QUERY_LIST_NAMES_BY_PARENT = {
 _EC2_QUERY_LIST_NAMES_BY_ACTION = {
     ("CreateNetworkInterface", "Ipv6Addresses"): "Ipv6Addresses",
     ("CreateNetworkInterface", "PrivateIpAddresses"): "PrivateIpAddresses",
+    ("CreateTransitGatewayRouteTable", "TagSpecifications"): "TagSpecifications",
+    ("CreateTransitGatewayVpcAttachment", "SubnetIds"): "SubnetIds",
+    ("CreateTransitGatewayVpcAttachment", "TagSpecifications"): "TagSpecifications",
+    ("ModifyTransitGatewayVpcAttachment", "AddSubnetIds"): "AddSubnetIds",
+    ("ModifyTransitGatewayVpcAttachment", "RemoveSubnetIds"): "RemoveSubnetIds",
     ("DescribeVpcClassicLinkDnsSupport", "VpcIds"): "VpcIds",
     ("ModifySnapshotAttribute", "GroupNames"): "UserGroup",
 }
@@ -5434,7 +5450,7 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     if status >= 400:
         try:
             err_data = json.loads(decoded)
-            code = err_data.get("__type") or err_data.get("code") or "ServiceException"
+            code = (err_data.get("__type") or err_data.get("code") or "ServiceException").rsplit("#", 1)[-1]
             msg = err_data.get("message") or err_data.get("Message") or decoded
             raise _ExecutionError(_prefix_sdk_error(service_name, code), msg)
         except _ExecutionError:
@@ -6108,8 +6124,8 @@ def _publish_state_machine_version(data):
     if requested_revision and requested_revision != sm.get("revisionId"):
         return error_response_json(
             "ConflictException",
-            "Request cannot be applied because the state machine's "
-            "revisionId has changed since the supplied revisionId was read.",
+            f"Failed to publish the State Machine version for revision {requested_revision}. "
+            f"The current State Machine revision is {sm.get('revisionId')}.",
             400,
         )
 

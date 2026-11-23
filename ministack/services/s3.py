@@ -42,6 +42,7 @@ import re
 import shutil
 import string
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -3398,6 +3399,7 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
         # here created a spurious empty folder at DATA_DIR/<bucket> (#824).
         os.makedirs(os.path.join(DATA_DIR, get_account_id(), name), exist_ok=True)
     logger.info("S3 bucket created: %s%s", name, f" (region={region})" if region else "")
+    _refresh_lambda_bucket_hosts()
     return 200, {"Location": f"/{name}"}, b""
 
 
@@ -3408,6 +3410,15 @@ def _bucket_has_versions(name: str) -> bool:
     markers still holds every one of those versions, and AWS refuses to
     delete it until they are removed by version id."""
     return any(bn == name and versions for (bn, _), versions in _object_versions.items())
+
+
+def _refresh_lambda_bucket_hosts():
+    lambda_svc = sys.modules.get("ministack.services.lambda_svc")
+    if lambda_svc is not None:
+        try:
+            lambda_svc.refresh_s3_bucket_hosts()
+        except Exception as exc:
+            logger.debug("Lambda bucket hosts refresh failed: %s", exc)
 
 
 def _delete_bucket(name: str):
@@ -3600,6 +3611,10 @@ def _put_bucket_versioning(name: str, body: bytes):
     if (status_el is not None and status_el.text not in ("Enabled", "Suspended")) or (
             mfa_el is not None and mfa_el.text not in ("Enabled", "Disabled")):
         return _error("MalformedXML", _MALFORMED_XML, 400)
+    if status_el is not None and status_el.text == "Suspended" and _bucket_object_lock.get(name):
+        return _object_error(
+            "InvalidBucketState",
+            "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.", 409)
     if status_el is not None:
         _bucket_versioning[name] = status_el.text
     return 200, {}, b""
@@ -6600,6 +6615,10 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
+    if headers.get("x-amz-bypass-governance-retention", "").lower() == "true" and not _bucket_object_lock.get(bucket_name):
+        return _object_error(
+            "InvalidArgument", "x-amz-bypass-governance-retention is only applicable to Object Lock enabled buckets.", 400,
+            ArgumentName="x-amz-bypass-governance-retention")
 
     # x-amz-if-match-size and x-amz-if-match-last-modified-time are directory-
     # bucket features that general-purpose buckets refuse outright. Measured
@@ -6783,6 +6802,20 @@ def _check_copy_source_preconditions(headers: dict, src_obj: dict):
     return None
 
 
+def _check_copy_dest_preconditions(headers: dict, dest_key: str, dest_obj: dict | None):
+    """CopyObject takes `If-Match: <etag>` and `If-None-Match: *` on the destination; the other two forms are 501."""
+    if_match = headers.get("if-match", "").strip()
+    if_none_match = headers.get("if-none-match", "").strip()
+    for header, refused in (("If-Match", if_match == "*"), ("If-None-Match", if_none_match not in ("", "*"))):
+        if refused:
+            return _object_error(
+                "NotImplemented", "A header you provided implies functionality that is not implemented", 501,
+                Header=header, additionalMessage=f"We don't accept the provided value of {header} header for this API")
+    if if_match and dest_obj is None:
+        return _object_error("NoSuchKey", "The specified key does not exist.", 404, Key=dest_key)
+    return _check_put_preconditions(headers, dest_obj)
+
+
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # Split the raw header at "?" before percent-decoding: a key legitimately
     # containing "?versionId" arrives encoded (%3FversionId) and must stay
@@ -6890,6 +6923,9 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     copy_src_vid = src_version_id or src_obj.get("version_id")
 
     precond_err = _check_copy_source_preconditions(headers, src_obj)
+    if precond_err is not None:
+        return precond_err
+    precond_err = _check_copy_dest_preconditions(headers, dest_key, dest_bucket["objects"].get(dest_key))
     if precond_err is not None:
         return precond_err
 
@@ -7000,10 +7036,8 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     )
 
     dest_version_id = dest_obj.get("version_id")
-    src_lock_key = (src_bucket_name, src_key, src_obj.get("version_id"))
-    for store in (_object_retention, _object_legal_hold):
-        if src_lock_key in store and _bucket_object_lock.get(bucket_name):
-            store[(bucket_name, dest_key, dest_version_id)] = copy.deepcopy(store[src_lock_key])
+    # The copy's lock comes from the request or the destination's default retention, never from the source.
+    _apply_object_lock_from_headers(bucket_name, dest_key, headers, dest_version_id)
     if pending_dest_annotations:
         _object_annotations[(bucket_name, dest_key, dest_version_id)] = pending_dest_annotations
         if dest_obj.get("_replica"):
@@ -8952,6 +8986,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "storage_class": storage_class,
         "checksum_algorithm": checksum_algorithm,
         "tags": tags,
+        "lock_headers": {h: headers[h] for h in _OBJECT_LOCK_HEADERS if headers.get(h)},
         "created": now_iso(),
     }
 
@@ -9030,6 +9065,8 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     part_number = int(_qp(query_params, "partNumber", "1"))
 
     if upload_id not in _multipart_uploads:
+        return _no_such_upload(upload_id)
+    if _multipart_uploads[upload_id]["bucket"] != bucket_name or _multipart_uploads[upload_id]["key"] != dest_key:
         return _no_such_upload(upload_id)
 
     sse_part_err = _check_sse_c_part(headers, _multipart_uploads[upload_id])
@@ -9309,6 +9346,7 @@ def _complete_multipart_upload(
     tags = upload.get("tags")
     _maybe_replicate(bucket_name, key, obj, combined, tags)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
+    _apply_object_lock_from_headers(bucket_name, key, upload.get("lock_headers") or {}, obj.get("version_id"))
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
     _fire_s3_event_async(
