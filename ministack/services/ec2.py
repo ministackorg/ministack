@@ -5105,16 +5105,17 @@ def _p(params, key, default=""):
 
 
 def _parse_tag_specs(p, resource_type, resource_id):
-    """Parse TagSpecification.N from params and store tags for the given resource."""
+    """Parse TagSpecification.N (TagSpecifications.N on some actions) and store tags for the given resource."""
+    spec = "TagSpecifications" if _p(p, "TagSpecifications.1.ResourceType") else "TagSpecification"
     i = 1
-    while _p(p, f"TagSpecification.{i}.ResourceType"):
-        if _p(p, f"TagSpecification.{i}.ResourceType") == resource_type:
+    while _p(p, f"{spec}.{i}.ResourceType"):
+        if _p(p, f"{spec}.{i}.ResourceType") == resource_type:
             tags = []
             j = 1
-            while _p(p, f"TagSpecification.{i}.Tag.{j}.Key"):
+            while _p(p, f"{spec}.{i}.Tag.{j}.Key"):
                 tags.append({
-                    "Key": _p(p, f"TagSpecification.{i}.Tag.{j}.Key"),
-                    "Value": _p(p, f"TagSpecification.{i}.Tag.{j}.Value", ""),
+                    "Key": _p(p, f"{spec}.{i}.Tag.{j}.Key"),
+                    "Value": _p(p, f"{spec}.{i}.Tag.{j}.Value", ""),
                 })
                 j += 1
             if tags:

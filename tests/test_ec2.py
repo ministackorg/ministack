@@ -5113,14 +5113,19 @@ def test_ec2_transit_gateway_terraform_lifecycle(ec2):
         Filters=[{"Name": "transit-gateway-id", "Values": [tgw_id]}])["TransitGatewayRouteTables"]
     assert (drt["TransitGatewayRouteTableId"], drt["DefaultAssociationRouteTable"]) == (default_rt, True)
 
-    rt = ec2.create_transit_gateway_route_table(TransitGatewayId=tgw_id)["TransitGatewayRouteTable"]
+    rt = ec2.create_transit_gateway_route_table(TransitGatewayId=tgw_id, TagSpecifications=[
+        {"ResourceType": "transit-gateway-route-table", "Tags": [{"Key": "t", "Value": tag}]}])["TransitGatewayRouteTable"]
     rt_id = rt["TransitGatewayRouteTableId"]
     assert (rt["State"], rt["DefaultAssociationRouteTable"]) == ("pending", False)
+    assert rt["Tags"] == [{"Key": "t", "Value": tag}]
 
     att = ec2.create_transit_gateway_vpc_attachment(
-        TransitGatewayId=tgw_id, VpcId=vpc_id, SubnetIds=[subnet_id])["TransitGatewayVpcAttachment"]
+        TransitGatewayId=tgw_id, VpcId=vpc_id, SubnetIds=[subnet_id], TagSpecifications=[
+            {"ResourceType": "transit-gateway-attachment", "Tags": [{"Key": "t", "Value": tag}]}])[
+        "TransitGatewayVpcAttachment"]
     att_id = att["TransitGatewayAttachmentId"]
     assert (att["State"], att["SubnetIds"], att["Options"]["DnsSupport"]) == ("pending", [subnet_id], "enable")
+    assert att["Tags"] == [{"Key": "t", "Value": tag}]
     [d] = ec2.describe_transit_gateway_attachments(TransitGatewayAttachmentIds=[att_id])["TransitGatewayAttachments"]
     assert (d["State"], d["ResourceType"], d["ResourceId"]) == ("available", "vpc", vpc_id)
     assert d["Association"] == {"TransitGatewayRouteTableId": default_rt, "State": "associated"}
