@@ -3239,3 +3239,12 @@ def _sqs_json_raw(action: str, payload: dict) -> tuple[int, str]:
             return r.status, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
+
+
+def test_sqs_missing_queue_message_per_protocol():
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    url = f"{endpoint}/000000000000/ms-missing-{_uuid_mod.uuid4().hex[:8]}"
+    status, body = _sqs_json_raw("SendMessage", {"QueueUrl": url, "MessageBody": "x"})
+    assert status == 400 and json.loads(body)["message"] == "The specified queue does not exist."
+    status, body = _sqs_query_raw({"Action": "SendMessage", "QueueUrl": url, "MessageBody": "x"})
+    assert status == 400 and "<Message>The specified queue does not exist for this wsdl version.</Message>" in body

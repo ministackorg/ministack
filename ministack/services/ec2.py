@@ -3307,6 +3307,16 @@ def _matches_subnet_filters(subnet, filters):
 def _create_subnet(p):
     vpc_id = _p(p, "VpcId") or _DEFAULT_VPC_ID
     cidr = _p(p, "CidrBlock") or "10.0.1.0/24"
+    vpc = _vpcs.get(vpc_id)
+    if vpc and _p(p, "CidrBlock"):
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            inside = any(net.subnet_of(ipaddress.ip_network(a["CidrBlock"], strict=False))
+                         for a in _vpc_cidr_associations(vpc) if a["State"] == "associated")
+        except (ValueError, TypeError):
+            inside = True
+        if not inside:
+            return _error("InvalidSubnet.Range", f"The CIDR '{cidr}' is invalid.", 400)
     # AvailabilityZone and AvailabilityZoneId are one mapping on AWS, never two
     # independent inputs: every CreateSubnet response pairs a zone name with
     # that zone's own id. Honouring a supplied id alongside a conflicting name

@@ -5223,6 +5223,8 @@ def test_ec2_vpc_secondary_cidr_block_association_matches_aws(ec2):
         "10.61.0.0/16", "10.62.0.0/16", "100.64.0.0/16", "100.67.0.0/16"]
 
     subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="100.64.1.0/24")["Subnet"]["SubnetId"]
+    assert err("create_subnet", VpcId=vpc_id, CidrBlock="100.90.1.0/24") == (
+        "InvalidSubnet.Range", "The CIDR '100.90.1.0/24' is invalid.")
     assert err("disassociate_vpc_cidr_block", AssociationId=a1) == (
         "InvalidCidrBlock.InUse", f"The vpc {vpc_id} currently has a subnet within CIDR block 100.64.0.0/16")
     assert err("disassociate_vpc_cidr_block", AssociationId=primary) == (

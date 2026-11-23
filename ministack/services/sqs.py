@@ -1868,6 +1868,8 @@ def _json_err_resp(code: str, msg: str, status: int = 400) -> tuple:
         "x-amzn-query-error": f"{legacy};{fault}",
         "x-amzn-errortype": code,
     }
+    if msg == "The specified queue does not exist for this wsdl version.":
+        msg = "The specified queue does not exist."
     return (status, headers, json.dumps({"__type": f"com.amazonaws.sqs#{code}", "message": msg}).encode("utf-8"))
 
 
