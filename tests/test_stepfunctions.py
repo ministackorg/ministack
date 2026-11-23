@@ -11379,7 +11379,7 @@ def _http_task_connection(eb, **auth_parameters):
         eb.delete_connection(Name=name)
 
 
-def _run_http_task(sfn, parameters, catch=False):
+def _run_http_task(sfn, parameters, catch=False, execution_input=None):
     """Run one HTTP Task. Returns its output, or the catcher's when catch is set; a failed execution's description
     otherwise."""
     task = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": parameters, "End": True}
@@ -11393,7 +11393,8 @@ def _run_http_task(sfn, parameters, catch=False):
         roleArn="arn:aws:iam::000000000000:role/sfn-role",
     )["stateMachineArn"]
     try:
-        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps({"orderId": "o-1"}))
+        payload = {"orderId": "o-1"} if execution_input is None else execution_input
+        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(payload))
         desc = _wait_sfn(sfn, execution["executionArn"])
         return json.loads(desc["output"]) if desc["status"] == "SUCCEEDED" else desc
     finally:
@@ -11402,7 +11403,8 @@ def _run_http_task(sfn, parameters, catch=False):
 
 def test_sfn_http_task_request_and_result(sfn, eb):
     """The request AWS builds and the result it returns: the connection wins a duplicate header, query or body key,
-    and a task cannot replace User-Agent or Range (AWS capture 2026-11-20, us-west-2)."""
+    array header values are comma-joined, null Headers is accepted, and a task cannot replace User-Agent or Range
+    (AWS captures 2026-11-20 & 2026-11-22, us-west-2)."""
     invocation = {
         "HeaderParameters": [{"Key": "X-Source", "Value": "connection"}],
         "QueryStringParameters": [{"Key": "tenant", "Value": "connection"}],
@@ -11413,7 +11415,10 @@ def test_sfn_http_task_request_and_result(sfn, eb):
             "ApiEndpoint.$": f"States.Format('{url}/v1/orders/{{}}', $.orderId)",
             "Method": "PATCH",
             "InvocationConfig": {"ConnectionArn": conn},
-            "Headers": {"x-source": "task", "X-Request-Id": "r-1", "User-Agent": "mine", "Range": "bytes=0-1"},
+            "Headers": {
+                "x-source": "task", "X-Request-Id": "r-1", "X-Multi": ["v1", "v2"], "X-Empty": [],
+                "User-Agent": "mine", "Range": "bytes=0-1",
+            },
             "QueryParameters": {"tenant": "task", "fields": "status"},
             "RequestBody": {"status": "SHIPPED", "mode": "task"},
         })
@@ -11427,9 +11432,16 @@ def test_sfn_http_task_request_and_result(sfn, eb):
         assert request["headers"]["authorization"] == "Basic dTpw"  # base64("u:p")
         assert request["headers"]["x-source"] == "connection"
         assert request["headers"]["x-request-id"] == "r-1"
+        assert request["headers"]["x-multi"] == "v1, v2"
+        assert request["headers"]["x-empty"] == ""
         assert request["headers"]["content-type"] == "application/json; charset=UTF-8"
         assert request["headers"]["user-agent"] == "Amazon|StepFunctions|HttpInvoke|us-east-1"
         assert request["headers"]["range"] == "bytes=0-262144"
+        null_headers = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "InvocationConfig": {"ConnectionArn": conn}, "Headers": None,
+        })
+        assert null_headers["StatusCode"] == 200
 
 
 def test_sfn_http_task_query_and_body_encoding(sfn, eb):
@@ -11508,6 +11520,24 @@ def test_sfn_http_task_failed_calls(sfn, eb):
     ({"ApiEndpoint": "http://127.0.0.1:9/echo?a=1"}, "The value for the 'ApiEndpoint' field must not contain query parameters"),
     ({"Headers": {"Authorization": "Bearer x", "X-Amz-Date": "x", "Accept": "x"}},
      "The 'Headers' field contains unsupported values: [authorization, x-amz-date]"),
+    ({"Headers": {"Origin": "https://a.example", "Authorization": "Bearer x"}},
+     "The 'Headers' field contains unsupported values: [authorization]"),
+    ({"Headers": "X-Foo: bar"}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": ""}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": ["X-Foo: bar"]}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": []}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": 123}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": True}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": {"": "v"}}, "The 'Headers' field cannot contain empty keys."),
+    ({"Headers": {"   ": "v"}}, "The 'Headers' field cannot contain empty keys."),
+    ({"Headers": {"X-A": None}}, "The 'Headers' field cannot contain null values."),
+    ({"Headers": {"X-A": {"k": "v"}}}, "The 'Headers' field cannot contain nested values."),
+    ({"Headers": {"X-A": [{"k": "v"}]}}, "The 'Headers' field cannot contain nested values."),
+    ({"Headers": {"X-A": [["a"]]}}, "The 'Headers' field cannot contain nested values."),
+    ({"Headers": {"X-A": 123}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-A": True}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-A": [1, 2]}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-A": [None]}}, "'Header' values must be strings or arrays of strings."),
     ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
     ({"InvocationConfig": {"ConnectionArn": ""}}, "The value for the 'ConnectionArn' field must have a minimum length of 1"),
     ({"ApiEndpoint": "ftp://example.com/echo"}, "The value for the 'ApiEndpoint' field must have the scheme 'https'"),
@@ -11515,12 +11545,155 @@ def test_sfn_http_task_failed_calls(sfn, eb):
      "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
 ])
 def test_sfn_http_task_refuses_parameters(sfn, change, message):
-    """Parameters the task cannot start with fail it as States.Runtime (AWS capture 2026-11-20)."""
-    parameters = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
-                  "InvocationConfig": {"ConnectionArn": "arn:aws:events:us-east-1:000000000000:connection/none"},
-                  **change}
-    failed = _run_http_task(sfn, parameters)
+    """Dynamic parameters that fail schema checks fail the task as States.Runtime (AWS captures 2026-11-20 & 2026-11-22)."""
+    resolved = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+                "InvocationConfig": {"ConnectionArn": "arn:aws:events:us-east-1:000000000000:connection/none"},
+                **change}
+    template = {f"{k}.$": f"$.{k}" for k in resolved}
+    failed = _run_http_task(sfn, template, execution_input=resolved)
     assert failed["error"] == "States.Runtime"
     assert failed["cause"] == (
-        f"The Parameters '{json.dumps(parameters, separators=(',', ':'))}' could not be used to start the Task: "
+        f"The Parameters '{json.dumps(resolved, separators=(',', ':'))}' could not be used to start the Task: "
         f"[{message}]")
+
+
+def test_sfn_http_task_runtime_denied_headers(sfn):
+    """The 15 runtime-only denied headers pass definition validation and fail at runtime with a bare
+    States.Runtime cause (AWS capture 2026-11-22, us-west-2)."""
+    conn = "arn:aws:events:us-east-1:000000000000:connection/none"
+    runtime_only = [
+        "A-IM", "Accept-Charset", "Accept-Datetime", "Accept-Encoding", "Cache-Control", "Content-Encoding",
+        "Date", "Forwarded", "From", "HTTP2-Settings", "Origin", "Pragma", "Proxy-Authorization", "Referer", "Warning",
+    ]
+    for header in runtime_only:
+        params = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+                  "InvocationConfig": {"ConnectionArn": conn}, "Headers": {header: "v"}}
+        defn = json.dumps({"StartAt": "Call", "States": {
+            "Call": {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True},
+        }})
+        assert sfn.validate_state_machine_definition(definition=defn)["result"] == "OK"
+        failed = _run_http_task(sfn, params)
+        assert (failed["error"], failed["cause"]) == (
+            "States.Runtime", f"The 'Headers' field contains unsupported values: [{header.lower()}]")
+
+    multi = _run_http_task(sfn, {
+        "ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+        "InvocationConfig": {"ConnectionArn": conn},
+        "Headers": {"Origin": "https://a.example", "Cache-Control": "no-cache", "Accept-Encoding": "gzip"},
+    })
+    assert (multi["error"], multi["cause"]) == (
+        "States.Runtime", "The 'Headers' field contains unsupported values: [origin, cache-control, accept-encoding]")
+
+
+def test_sfn_http_task_definition_validation(sfn, sfn_sync):
+    """ValidateStateMachineDefinition, CreateStateMachine, UpdateStateMachine, and TestState reject static
+    schema-denied headers, malformed Headers, and invalid HTTP Task parameters (AWS capture 2026-11-22, us-west-2)."""
+    conn = "arn:aws:events:us-east-1:000000000000:connection/none"
+    base = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn}}
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+
+    def make_def(params):
+        return json.dumps({"StartAt": "Call", "States": {
+            "Call": {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True},
+        }})
+
+    schema_denied = [
+        "Authorization", "Connection", "Content-MD5", "Expect", "Host", "Max-Forwards", "Proxy-Authenticate",
+        "Server", "TE", "Trailer", "Transfer-Encoding", "Upgrade", "Via", "WWW-Authenticate",
+        "X-Amz-Date", "X-Amzn-Trace-Id", "X-Forwarded-For",
+    ]
+    for header in schema_denied:
+        expected_msg = f"The 'Headers' field contains unsupported values: [{header.lower()}]"
+        resp = sfn.validate_state_machine_definition(definition=make_def({**base, "Headers": {header: "v"}}))
+        assert resp == {
+            "result": "FAIL",
+            "diagnostics": [{"severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+                             "message": expected_msg, "location": "/States/Call/Parameters"}],
+            "truncated": False,
+            **({"ResponseMetadata": resp["ResponseMetadata"]}),
+        }
+
+    bad_cases = [
+        ({**base, "Headers": "foo"}, "The value of the field 'Headers' has an invalid format"),
+        ({**base, "Headers": ["a"]}, "The value of the field 'Headers' has an invalid format"),
+        ({**base, "Headers": []}, "The value of the field 'Headers' has an invalid format"),
+        ({**base, "Headers": {"": "v"}}, "The 'Headers' field cannot contain empty keys."),
+        ({**base, "Headers": {"X-A": None}}, "The 'Headers' field cannot contain null values."),
+        ({**base, "Headers": {"X-A": {"k": "v"}}}, "The 'Headers' field cannot contain nested values."),
+        ({**base, "Headers": {"X-A": 123}}, "'Header' values must be strings or arrays of strings."),
+        ({**base, "Headers": {"Authorization": "x"}}, "The 'Headers' field contains unsupported values: [authorization]"),
+        ({**base, "Method": "TRACE"}, "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
+        ({**base, "InvocationConfig": {"ConnectionArn": conn}},
+         "The field 'InvocationConfig' cannot be used with 'Authentication'"),
+    ]
+    good = json.dumps({"StartAt": "Call", "States": {"Call": {"Type": "Pass", "End": True}}})
+    arn = sfn.create_state_machine(name=f"sfn-http-val-{_uuid_mod.uuid4().hex[:8]}", definition=good,
+                                   roleArn=role)["stateMachineArn"]
+    try:
+        for params, msg in bad_cases:
+            body = make_def(params)
+            expected_err = f"Invalid State Machine Definition: 'SCHEMA_VALIDATION_FAILED: {msg} at /States/Call/Parameters'"
+            with pytest.raises(ClientError) as exc:
+                sfn.create_state_machine(name=f"sfn-http-bad-{_uuid_mod.uuid4().hex[:8]}", definition=body, roleArn=role)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "InvalidDefinition", expected_err)
+            with pytest.raises(ClientError) as exc:
+                sfn.update_state_machine(stateMachineArn=arn, definition=body)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "InvalidDefinition", expected_err)
+            with pytest.raises(ClientError) as exc:
+                sfn_sync.test_state(definition=json.dumps({
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True,
+                }), roleArn=role)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "InvalidDefinition",
+                f"Invalid State Machine Definition: 'SCHEMA_VALIDATION_FAILED: {msg} at /States/StateName/Parameters'")
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+    # Nested Parallel / Map states and JSONata Arguments report their exact locations; dynamic .$ fields pass.
+    nested_parallel = json.dumps({"StartAt": "P", "States": {"P": {
+        "Type": "Parallel",
+        "Branches": [{"StartAt": "Sub", "States": {"Sub": {
+            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {**base, "Headers": {"Authorization": "x"}}, "End": True,
+        }}}],
+        "End": True,
+    }}})
+    assert sfn.validate_state_machine_definition(definition=nested_parallel)["diagnostics"] == [{
+        "severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+        "message": "The 'Headers' field contains unsupported values: [authorization]",
+        "location": "/States/P/Branches[0]/States/Sub/Parameters",
+    }]
+
+    nested_map = json.dumps({"StartAt": "M", "States": {"M": {
+        "Type": "Map",
+        "ItemProcessor": {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "Sub", "States": {"Sub": {
+            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {**base, "Headers": {"Authorization": "x"}}, "End": True,
+        }}},
+        "End": True,
+    }}})
+    assert sfn.validate_state_machine_definition(definition=nested_map)["diagnostics"] == [{
+        "severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+        "message": "The 'Headers' field contains unsupported values: [authorization]",
+        "location": "/States/M/ItemProcessor/States/Sub/Parameters",
+    }]
+
+    jsonata_def = json.dumps({"QueryLanguage": "JSONata", "StartAt": "Call", "States": {"Call": {
+        "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+        "Arguments": {**base, "Headers": {"Authorization": "x"}}, "End": True,
+    }}})
+    assert sfn.validate_state_machine_definition(definition=jsonata_def)["diagnostics"] == [{
+        "severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+        "message": "The 'Headers' field contains unsupported values: [authorization]",
+        "location": "/States/Call/Arguments",
+    }]
+
+    for ok_params in (
+        {**base, "Headers": None},
+        {**base, "Headers": {"X-Multi": ["a", "b"]}},
+        {**base, "Headers.$": "$.h"},
+        {**base, "Headers": {"Authorization.$": "$.a"}},
+    ):
+        assert sfn.validate_state_machine_definition(definition=make_def(ok_params))["result"] == "OK"

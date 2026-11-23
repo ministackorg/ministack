@@ -407,6 +407,7 @@ def _structure_diagnostics(definition_str) -> list:
                             f"/States/{_pointer(name)}"))
     if not any(s.get("Type") in ("Succeed", "Fail") or s.get("End") is True for s in states.values()):
         out.append(diag("MISSING_END_STATE", "Workflow has no terminal state"))
+    out.extend(_http_task_tree_diagnostics(states, "/States", definition.get("QueryLanguage", "JSONPath")))
     return out
 
 
@@ -1631,6 +1632,16 @@ def _test_state(data):
     state_type = state_def.get("Type")
     if not state_type:
         return error_response_json("InvalidDefinition", "State must have a Type", 400)
+    state_loc = f"/States/{_pointer(state_name)}" if "States" in definition else "/States/StateName"
+    http_diags = _http_task_state_diagnostics(
+        state_def, state_loc, definition.get("QueryLanguage", "JSONPath"))
+    if http_diags:
+        return error_response_json(
+            "InvalidDefinition",
+            "Invalid State Machine Definition: '" + ", ".join(
+                f"{d['code']}: {d['message']} at {d.get('location', 'null')}" for d in http_diags) + "'",
+            400,
+        )
 
     # Build context
     user_ctx = data.get("context")
@@ -6065,11 +6076,180 @@ def _invoke_events_put_events(resource, input_data):
 
 _HTTP_TASK_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 _HTTP_TASK_TIMEOUT_SECONDS = 60
-_HTTP_TASK_DENIED_HEADERS = frozenset({
+# Headers Step Functions rejects during schema validation: ValidateStateMachineDefinition,
+# CreateStateMachine, UpdateStateMachine, TestState (for static Parameters), and at runtime
+# inside the wrapped "The Parameters '...' could not be used to start the Task: [...]" error.
+_HTTP_TASK_SCHEMA_DENIED_HEADERS = frozenset({
     "authorization", "connection", "content-md5", "expect", "host", "max-forwards", "proxy-authenticate", "server",
     "te", "trailer", "transfer-encoding", "upgrade", "via", "www-authenticate",
 })
 _HTTP_TASK_DENIED_HEADER_PREFIXES = ("x-amz-", "x-amzn-", "x-forwarded-")
+# Headers Step Functions accepts in a state machine definition but rejects at runtime with a
+# bare States.Runtime cause "The 'Headers' field contains unsupported values: [...]"
+# (AWS capture 2026-11-22, us-west-2).
+_HTTP_TASK_RUNTIME_DENIED_HEADERS = frozenset({
+    "a-im", "accept-charset", "accept-datetime", "accept-encoding", "cache-control", "content-encoding", "date",
+    "forwarded", "from", "http2-settings", "origin", "pragma", "proxy-authorization", "referer", "warning",
+})
+
+
+def _is_jsonata_expr(value):
+    return isinstance(value, str) and value.startswith("{%") and value.endswith("%}")
+
+
+def _http_task_headers_error(headers, *, static=False, jsonata=False) -> str | None:
+    """First schema error for an HTTP Task's Headers field, or None (AWS capture 2026-11-22, us-west-2)."""
+    if headers is None:
+        return None
+    if static and jsonata and _is_jsonata_expr(headers):
+        return None
+    if not isinstance(headers, dict):
+        return "The value of the field 'Headers' has an invalid format"
+    denied = []
+    for key, val in headers.items():
+        if static and not jsonata and isinstance(key, str) and key.endswith(".$"):
+            continue
+        if static and jsonata and _is_jsonata_expr(val):
+            continue
+        if not isinstance(key, str) or not key.strip():
+            return "The 'Headers' field cannot contain empty keys."
+        if val is None:
+            return "The 'Headers' field cannot contain null values."
+        if isinstance(val, dict):
+            return "The 'Headers' field cannot contain nested values."
+        if isinstance(val, list):
+            if any(isinstance(item, (dict, list)) for item in val):
+                return "The 'Headers' field cannot contain nested values."
+            if any(not isinstance(item, str) for item in val):
+                return "'Header' values must be strings or arrays of strings."
+        elif not isinstance(val, str):
+            return "'Header' values must be strings or arrays of strings."
+        lower = key.lower()
+        if lower in _HTTP_TASK_SCHEMA_DENIED_HEADERS or lower.startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES):
+            if lower not in denied:
+                denied.append(lower)
+    if denied:
+        return f"The 'Headers' field contains unsupported values: [{', '.join(denied)}]"
+    return None
+
+
+def _http_task_schema_errors(params, *, static=False, jsonata=False) -> list[str]:
+    """Schema-level errors for an HTTP Task's Parameters or Arguments (AWS capture 2026-11-22, us-west-2)."""
+    import urllib.parse
+
+    if not isinstance(params, dict):
+        if static:
+            return []
+        return [
+            "The field 'ApiEndpoint' is required but was missing",
+            "The field 'Method' is required but was missing",
+        ]
+
+    def has_field(obj, name):
+        return name in obj or (static and not jsonata and f"{name}.$" in obj)
+
+    def static_skip(obj, name):
+        if not static:
+            return False
+        if not jsonata and f"{name}.$" in obj and name not in obj:
+            return True
+        if jsonata and name in obj and _is_jsonata_expr(obj[name]):
+            return True
+        return False
+
+    missing = []
+    if not has_field(params, "ApiEndpoint"):
+        missing.append("The field 'ApiEndpoint' is required but was missing")
+    if not has_field(params, "Method"):
+        missing.append("The field 'Method' is required but was missing")
+    if missing:
+        return missing
+
+    if not static_skip(params, "Method") and params.get("Method") not in _HTTP_TASK_METHODS:
+        return ["The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"]
+
+    errors = []
+    if "Headers" in params and not static_skip(params, "Headers"):
+        hdr_err = _http_task_headers_error(params["Headers"], static=static, jsonata=jsonata)
+        if hdr_err:
+            errors.append(hdr_err)
+
+    if not static_skip(params, "ApiEndpoint"):
+        endpoint = params.get("ApiEndpoint")
+        url = urllib.parse.urlsplit(endpoint) if isinstance(endpoint, str) else None
+        if url is None or not url.scheme or not url.netloc:
+            errors.append("The value for the 'ApiEndpoint' field is not valid")
+        elif url.scheme not in ("http", "https"):
+            errors.append("The value for the 'ApiEndpoint' field must have the scheme 'https'")
+        elif url.query:
+            errors.append("The value for the 'ApiEndpoint' field must not contain query parameters")
+
+    has_inv = has_field(params, "InvocationConfig")
+    has_auth = has_field(params, "Authentication")
+    if has_inv and has_auth:
+        errors.append("The field 'InvocationConfig' cannot be used with 'Authentication'")
+    elif not has_inv and not has_auth:
+        errors.append("The field must contain exactly one of 'InvocationConfig' or 'Authentication'")
+        errors.append("The field 'InvocationConfig.ConnectionArn' is required but was missing")
+    else:
+        auth_key = "InvocationConfig" if has_inv else "Authentication"
+        if not static_skip(params, auth_key):
+            auth_obj = params.get(auth_key)
+            if not isinstance(auth_obj, dict):
+                errors.append("The field 'InvocationConfig.ConnectionArn' is required but was missing")
+            elif not static_skip(auth_obj, "ConnectionArn"):
+                if not has_field(auth_obj, "ConnectionArn") or auth_obj.get("ConnectionArn") is None:
+                    errors.append("The field 'InvocationConfig.ConnectionArn' is required but was missing")
+                elif not isinstance(auth_obj.get("ConnectionArn"), str) or not auth_obj["ConnectionArn"]:
+                    errors.append("The value for the 'ConnectionArn' field must have a minimum length of 1")
+
+    return errors
+
+
+def _http_task_state_diagnostics(state, state_path, query_language) -> list:
+    if state.get("Type") != "Task" or state.get("Resource") != "arn:aws:states:::http:invoke":
+        return []
+    ql = state.get("QueryLanguage") or query_language
+    is_jsonata = ql == "JSONata"
+    field = "Arguments" if is_jsonata else "Parameters"
+    if field not in state:
+        if is_jsonata:
+            return []
+        return [{"severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+                 "message": "Parameters field is required for resource ARN: arn:aws:states:::http:invoke",
+                 "location": f"{state_path}/Resource"}]
+    params = state.get(field)
+    if is_jsonata and _is_jsonata_expr(params):
+        return []
+    return [
+        {"severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+         "message": message, "location": f"{state_path}/{field}"}
+        for message in _http_task_schema_errors(params, static=True, jsonata=is_jsonata)
+    ]
+
+
+def _http_task_tree_diagnostics(states, states_path, query_language) -> list:
+    out = []
+    for name, state in states.items():
+        if not isinstance(state, dict):
+            continue
+        state_path = f"{states_path}/{_pointer(name)}"
+        out.extend(_http_task_state_diagnostics(state, state_path, query_language))
+        state_ql = state.get("QueryLanguage") or query_language
+        if state.get("Type") == "Parallel" and isinstance(state.get("Branches"), list):
+            for idx, branch in enumerate(state["Branches"]):
+                if isinstance(branch, dict) and isinstance(branch.get("States"), dict):
+                    out.extend(_http_task_tree_diagnostics(
+                        branch["States"], f"{state_path}/Branches[{idx}]/States",
+                        branch.get("QueryLanguage") or state_ql))
+        elif state.get("Type") == "Map":
+            for sub_key in ("ItemProcessor", "Iterator"):
+                sub = state.get(sub_key)
+                if isinstance(sub, dict) and isinstance(sub.get("States"), dict):
+                    out.extend(_http_task_tree_diagnostics(
+                        sub["States"], f"{state_path}/{sub_key}/States",
+                        sub.get("QueryLanguage") or state_ql))
+    return out
 # Step Functions' own phrase for a status code: the StatusText of a result and the Cause of a failed call. It is not
 # the phrase the server sent, and a code that is not here (418, 599) has none.
 _HTTP_TASK_STATUS_TEXT = {
@@ -6121,32 +6301,29 @@ def _invoke_http_endpoint(resource, input_data):
         return _ExecutionError(
             "States.Runtime", f"The Parameters '{parameters}' could not be used to start the Task: [{message}]")
 
-    endpoint = input_data.get("ApiEndpoint")
-    conn_arn = (input_data.get("InvocationConfig") or input_data.get("Authentication") or {}).get("ConnectionArn")
+    schema_errors = _http_task_schema_errors(input_data)
+    if schema_errors:
+        raise parameter_error(", ".join(schema_errors))
     task_headers = input_data.get("Headers") or {}
-    # QueryParameters that are not an object are left out of the request.
-    task_query = input_data.get("QueryParameters") if isinstance(input_data.get("QueryParameters"), dict) else {}
-    if conn_arn is None:
-        raise parameter_error("The field 'InvocationConfig.ConnectionArn' is required but was missing")
-    if not conn_arn:
-        raise parameter_error("The value for the 'ConnectionArn' field must have a minimum length of 1")
-    if input_data.get("Method") not in _HTTP_TASK_METHODS:
-        raise parameter_error(
-            "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]")
-    url = urllib.parse.urlsplit(endpoint) if isinstance(endpoint, str) else None
-    if url is None or not url.scheme or not url.netloc:
-        raise parameter_error("The value for the 'ApiEndpoint' field is not valid")
-    if url.scheme not in ("http", "https"):
-        raise parameter_error("The value for the 'ApiEndpoint' field must have the scheme 'https'")
-    if url.query:
-        raise parameter_error("The value for the 'ApiEndpoint' field must not contain query parameters")
-    denied = [name.lower() for name in task_headers
-              if name.lower() in _HTTP_TASK_DENIED_HEADERS or name.lower().startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES)]
-    if denied:
-        raise parameter_error(f"The 'Headers' field contains unsupported values: [{', '.join(denied)}]")
-    if (input_data.get("Transform") or {}).get("RequestBodyEncoding", "NONE") != "NONE":
+    runtime_denied = list(dict.fromkeys(
+        name.lower() for name in task_headers if name.lower() in _HTTP_TASK_RUNTIME_DENIED_HEADERS
+    ))
+    if runtime_denied:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The 'Headers' field contains unsupported values: [{', '.join(runtime_denied)}]",
+        )
+    transform = input_data.get("Transform")
+    if isinstance(transform, dict) and transform.get("RequestBodyEncoding", "NONE") != "NONE":
         raise _ExecutionError(
             "States.Runtime", "Transform.RequestBodyEncoding is not yet implemented in MiniStack's HTTP Task")
+
+    endpoint = input_data["ApiEndpoint"]
+    url = urllib.parse.urlsplit(endpoint)
+    auth_cfg = input_data.get("InvocationConfig") or input_data.get("Authentication")
+    conn_arn = auth_cfg["ConnectionArn"]
+    # QueryParameters that are not an object are left out of the request.
+    task_query = input_data.get("QueryParameters") if isinstance(input_data.get("QueryParameters"), dict) else {}
 
     # arn:aws:events:<region>:<account>:connection/<name>[/<uuid>]
     conn_name = conn_arn.split(":connection/", 1)[-1].split("/", 1)[0]
@@ -6162,7 +6339,10 @@ def _invoke_http_endpoint(resource, input_data):
     invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
     conn_query = eventbridge._connection_params_map(invocation.get("QueryStringParameters"))
     conn_body = eventbridge._connection_params_map(invocation.get("BodyParameters"))
-    headers = {name.lower(): (name, value) for name, value in task_headers.items()}
+    headers = {
+        name.lower(): (name, ", ".join(value) if isinstance(value, list) else value)
+        for name, value in task_headers.items()
+    }
     headers.update((name.lower(), (name, value)) for name, value in
                    eventbridge._connection_params_map(invocation.get("HeaderParameters")).items())
 
