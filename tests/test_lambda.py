@@ -35,7 +35,7 @@ from conftest import (
     routed_request,
 )
 
-from ministack.core.responses import AccountRegionScopedDict, request_scope
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, request_scope
 from ministack.services import lambda_svc as _lambda_mod
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
@@ -8285,7 +8285,8 @@ def test_lambda_container_maps_host_docker_internal_to_host_gateway(monkeypatch)
     assert captured["environment"]["AWS_ENDPOINT_URL"] == (
         "http://host.docker.internal:4566"
     )
-    assert captured["extra_hosts"] == {"host.docker.internal": "host-gateway"}
+    assert captured["extra_hosts"] == {"host.docker.internal": "host-gateway",
+                                       "s3.us-east-1.host.docker.internal": "host-gateway"}
 
 
 def test_lambda_container_host_gateway_yields_to_an_explicit_add_host(monkeypatch):
@@ -8296,7 +8297,8 @@ def test_lambda_container_host_gateway_yields_to_an_explicit_add_host(monkeypatc
         docker_flags="--add-host host.docker.internal:10.5.0.1",
     )
 
-    assert captured["extra_hosts"] == {"host.docker.internal": "10.5.0.1"}
+    assert captured["extra_hosts"] == {"host.docker.internal": "10.5.0.1",
+                                       "s3.us-east-1.host.docker.internal": "10.5.0.1"}
 
 
 def test_lambda_container_without_host_docker_internal_gets_no_mapping(monkeypatch):
@@ -8379,6 +8381,7 @@ def test_lambda_docker_flags_applied_to_run_kwargs(monkeypatch):
     # The host-gateway mapping is merged in alongside an explicit --add-host.
     assert captured["extra_hosts"] == {
         "myhost": "10.0.0.1", "host.docker.internal": "host-gateway",
+        "s3.us-east-1.host.docker.internal": "host-gateway",
     }
     assert captured["tmpfs"] == {"/run": "size=100m"}
     assert captured["privileged"] is True
@@ -16550,3 +16553,60 @@ def test_lambda_node_worker_reaches_an_ipv4_gateway_through_prefixed_hosts(tmp_p
         server.shutdown()
     assert out.stdout.strip() == "200", out.stdout + out.stderr
     assert seen == [f"{host}:{port}"]
+
+
+def test_lambda_container_gets_regional_s3_endpoint_and_bucket_hosts(monkeypatch):
+    from ministack.services import lambda_svc
+    from ministack.services import s3 as s3_svc
+
+    buckets = AccountScopedDict()
+    with request_scope("111111111111", "us-east-2"):
+        buckets["own-bucket"] = {}
+        buckets["Not_DNS"] = {}
+    with request_scope("222222222222", "eu-west-1"):
+        buckets["other.account.bucket"] = {}
+    monkeypatch.setattr(s3_svc, "_buckets", buckets)
+    run_kwargs = {"extra_hosts": {"host.docker.internal": "host-gateway"}}
+    env = {"AWS_REGION": "us-east-2"}
+    with request_scope("111111111111", "us-east-2"):
+        s3_host, names = lambda_svc._plumb_s3_regional_endpoint(run_kwargs, env, {}, "http://host.docker.internal:4566")
+    assert s3_host == "s3.us-east-2.host.docker.internal"
+    assert env["AWS_ENDPOINT_URL_S3"] == "http://s3.us-east-2.host.docker.internal:4566"
+    assert names == ["own-bucket"]
+    assert run_kwargs["extra_hosts"] == {
+        "host.docker.internal": "host-gateway", s3_host: "host-gateway", f"own-bucket.{s3_host}": "host-gateway"}
+
+    assert lambda_svc._plumb_s3_regional_endpoint(
+        {"extra_hosts": {"host.docker.internal": "host-gateway"}}, {"AWS_REGION": "us-east-2"},
+        {"AWS_ENDPOINT_URL_S3": "http://mine:1"}, "http://host.docker.internal:4566") == (None, None)
+    assert lambda_svc._plumb_s3_regional_endpoint(
+        {"extra_hosts": {}}, {"AWS_REGION": "us-east-2"}, {}, "http://10.0.0.5:4566") == (None, None)
+    assert lambda_svc._plumb_s3_regional_endpoint(
+        {}, {"AWS_REGION": "us-east-2"}, {}, "http://ministack:4566") == (None, None)
+
+
+def test_lambda_bucket_hosts_only_grow():
+    from ministack.services import lambda_svc
+
+    class _Exec:
+        def __init__(self, output=b"", exit_code=0):
+            self.output, self.exit_code = output, exit_code
+
+    class _Container:
+        id = "c1"
+
+        def __init__(self, hosts):
+            self.hosts, self.writes = hosts, 0
+
+        def exec_run(self, cmd, environment=None, user=None):
+            if cmd == ["cat", "/etc/hosts"]:
+                return _Exec(self.hosts.encode())
+            self.hosts, self.writes = environment["H"] + "\n", self.writes + 1
+            return _Exec()
+
+    h = "s3.us-east-2.host.docker.internal"
+    c = _Container(f"127.0.0.1\tlocalhost\n192.168.65.254\t{h}\nfdc4::254\t{h}\n192.168.65.254\told.{h}\n")
+    assert lambda_svc._write_s3_bucket_hosts(c, h, ["new"])
+    assert f"192.168.65.254\tnew.{h}" in c.hosts and f"fdc4::254\tnew.{h}" in c.hosts
+    assert f"192.168.65.254\told.{h}" in c.hosts and "127.0.0.1\tlocalhost" in c.hosts
+    assert lambda_svc._write_s3_bucket_hosts(c, h, ["new", "old"]) and c.writes == 1

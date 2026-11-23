@@ -42,6 +42,7 @@ import re
 import shutil
 import string
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -3398,6 +3399,7 @@ def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region
         # here created a spurious empty folder at DATA_DIR/<bucket> (#824).
         os.makedirs(os.path.join(DATA_DIR, get_account_id(), name), exist_ok=True)
     logger.info("S3 bucket created: %s%s", name, f" (region={region})" if region else "")
+    _refresh_lambda_bucket_hosts()
     return 200, {"Location": f"/{name}"}, b""
 
 
@@ -3408,6 +3410,15 @@ def _bucket_has_versions(name: str) -> bool:
     markers still holds every one of those versions, and AWS refuses to
     delete it until they are removed by version id."""
     return any(bn == name and versions for (bn, _), versions in _object_versions.items())
+
+
+def _refresh_lambda_bucket_hosts():
+    lambda_svc = sys.modules.get("ministack.services.lambda_svc")
+    if lambda_svc is not None:
+        try:
+            lambda_svc.refresh_s3_bucket_hosts()
+        except Exception as exc:
+            logger.debug("Lambda bucket hosts refresh failed: %s", exc)
 
 
 def _delete_bucket(name: str):

@@ -4754,6 +4754,94 @@ def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | 
     return shim_handler
 
 
+_S3_VHOST_BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+_s3_hosts_containers: dict = {}
+_s3_hosts_lock = threading.Lock()
+
+
+def _s3_vhost_buckets(account_id: str) -> list[str]:
+    from ministack.services import s3 as s3_svc
+    names = {k[-1] for k in list(s3_svc._buckets._data) if isinstance(k, tuple) and k[0] == account_id}
+    return sorted(n for n in names if _S3_VHOST_BUCKET_RE.fullmatch(n) and ".." not in n)
+
+
+def _is_ip_literal(host: str) -> bool:
+    import ipaddress
+
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _plumb_s3_regional_endpoint(run_kwargs, container_env, env_vars, endpoint):
+    from urllib.parse import urlparse
+
+    if "AWS_ENDPOINT_URL_S3" in env_vars:
+        return None, None
+    host = urlparse(endpoint).hostname or ""
+    target = (run_kwargs.get("extra_hosts") or {}).get(host)
+    if not host or not target or _is_ip_literal(host):
+        return None, None
+    s3_host = f"s3.{container_env['AWS_REGION']}.{host}"
+    buckets = _s3_vhost_buckets(get_account_id())
+    hosts = run_kwargs["extra_hosts"]
+    hosts.setdefault(s3_host, target)
+    for name in buckets:
+        hosts.setdefault(f"{name}.{s3_host}", target)
+    container_env["AWS_ENDPOINT_URL_S3"] = endpoint.replace(f"//{host}", f"//{s3_host}", 1)
+    return s3_host, buckets
+
+
+def _write_s3_bucket_hosts(container, s3_host: str, buckets: list[str]) -> bool:
+    current = container.exec_run(["cat", "/etc/hosts"]).output.decode("utf-8", "replace")
+    suffix = "." + s3_host
+    listed, ips = set(), []
+    for line in current.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1].endswith(suffix):
+            listed.add(fields[1][:-len(suffix)])
+        elif len(fields) >= 2 and fields[1] == s3_host:
+            ips.append(fields[0])
+    missing = [name for name in buckets if name not in listed]
+    if not ips or not missing:
+        return True
+    lines = current.splitlines() + [f"{ip}\t{name}{suffix}" for name in missing for ip in ips]
+    result = container.exec_run(["sh", "-c", 'printf "%s\\n" "$H" > /etc/hosts'],
+                                environment={"H": "\n".join(lines)}, user="root")
+    return result.exit_code == 0
+
+
+def _register_s3_hosts_container(container, s3_host: str, buckets: list[str]) -> None:
+    account_id = get_account_id()
+    with _s3_hosts_lock:
+        _s3_hosts_containers[container.id] = (container, s3_host, account_id)
+        current = _s3_vhost_buckets(account_id)
+        if set(current) - set(buckets):
+            try:
+                _write_s3_bucket_hosts(container, s3_host, current)
+            except Exception as exc:
+                logger.debug("Lambda container %s: S3 bucket hosts not updated: %s", container.id, exc)
+
+
+def refresh_s3_bucket_hosts() -> None:
+    with _s3_hosts_lock:
+        if not _s3_hosts_containers:
+            return
+        by_account: dict = {}
+        for cid, (container, s3_host, account_id) in list(_s3_hosts_containers.items()):
+            if account_id not in by_account:
+                by_account[account_id] = _s3_vhost_buckets(account_id)
+            try:
+                _write_s3_bucket_hosts(container, s3_host, by_account[account_id])
+            except Exception as exc:
+                if "No such container" in str(exc) or "is not running" in str(exc):
+                    _s3_hosts_containers.pop(cid, None)
+                else:
+                    logger.debug("Lambda container %s: S3 bucket hosts not updated: %s", cid, exc)
+
+
 def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
                                  _pin_platform: bool):
     """Create and start a Lambda container for the given config.
@@ -5013,6 +5101,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         run_kwargs.setdefault("extra_hosts", {}).setdefault(
             "host.docker.internal", "host-gateway"
         )
+    s3_host, s3_buckets = _plumb_s3_regional_endpoint(run_kwargs, container_env, env_vars, endpoint)
 
     from ministack.services import ecr
     if package_type == "Image" and ecr._held_image(image) is not None:
@@ -5084,6 +5173,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             for target, source in trust_copies or ():
                 _docker_cp_file(container, source, target)
         container.start()
+        if s3_host:
+            _register_s3_hosts_container(container, s3_host, s3_buckets)
     except Exception as exc:
         try:
             container.remove(force=True, v=True)
