@@ -11548,6 +11548,16 @@ def test_sfn_http_task_failed_calls(sfn, eb):
     ({"Headers": {"X-Del": "a\x7fb"}}, "The 'Headers' field must not contain control characters"),
     ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
     ({"InvocationConfig": {"ConnectionArn": ""}}, "The value for the 'ConnectionArn' field must have a minimum length of 1"),
+    ({"InvocationConfig": {"ConnectionArn": "not-an-arn"}}, "The value for the 'ConnectionArn' field is not valid"),
+    ({"InvocationConfig": {"ConnectionArn": "arn:aws:events:us-west-2:000000000000:connection/none"}},
+     "The value for the 'ConnectionArn' field has region us-west-2 but must be the same region as the state machine (us-east-1)"),
+    ({"InvocationConfig": {"ConnectionArn": "arn:aws:events:us-east-1:000000000000:connection/none", "Extra": 1}},
+     "The value of the field 'InvocationConfig' has an invalid format"),
+    ({"ExtraBogus": "x"}, 'The field "ExtraBogus" is not supported by Step Functions'),
+    ({"Transform": "URL_ENCODED"}, "The value of the field 'Transform' has an invalid format"),
+    ({"Transform": {"RequestBodyEncoding": "BOGUS"}}, "The value of the field 'Transform' has an invalid format"),
+    ({"Transform": {"RequestBodyEncoding": "URL_ENCODED", "RequestEncodingOptions": {"ArrayFormat": "BAD"}}},
+     "The value of the field 'Transform' has an invalid format"),
     ({"ApiEndpoint": "ftp://example.com/echo"}, "The value for the 'ApiEndpoint' field must have the scheme 'https'"),
     ({"ApiEndpoint": "http://127.0.0.1:9/echo?a=1", "Method": "TRACE"},
      "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
@@ -11636,6 +11646,17 @@ def test_sfn_http_task_definition_validation(sfn, sfn_sync):
         ({**base, "Method": "TRACE"}, "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
         ({**base, "InvocationConfig": {"ConnectionArn": conn}},
          "The field 'InvocationConfig' cannot be used with 'Authentication'"),
+        ({**base, "ExtraBogus": "1"}, 'The field "ExtraBogus" is not supported by Step Functions'),
+        ({**base, "Authentication": {"ConnectionArn": "not-an-arn"}},
+         "The value for the 'ConnectionArn' field is not valid"),
+        ({**base, "Authentication": {"ConnectionArn": "arn:aws:events:us-west-2:000000000000:connection/none"}},
+         "The value for the 'ConnectionArn' field has region us-west-2 but must be the same region as the state machine (us-east-1)"),
+        ({**base, "Authentication": {"ConnectionArn": conn, "Extra": 1}},
+         "The value of the field 'Authentication' has an invalid format"),
+        ({**base, "Transform": {"RequestBodyEncoding": "BOGUS"}},
+         "The value of the field 'Transform' has an invalid format"),
+        ({**base, "Transform": {"RequestBodyEncoding": "URL_ENCODED", "RequestEncodingOptions": {"ArrayFormat": "BAD"}}},
+         "The value of the field 'Transform' has an invalid format"),
     ]
     good = json.dumps({"StartAt": "Call", "States": {"Call": {"Type": "Pass", "End": True}}})
     arn = sfn.create_state_machine(name=f"sfn-http-val-{_uuid_mod.uuid4().hex[:8]}", definition=good,
@@ -12059,3 +12080,307 @@ def test_sfn_http_task_test_state_trace(sfn_sync, eb):
         assert (r_ip["status"], r_ip["error"]) == ("FAILED", "States.Http.IpError")
         assert "request" in r_ip["inspectionData"]
         assert "response" not in r_ip["inspectionData"]
+
+
+def test_sfn_http_task_empty_charset_and_binary_responses(sfn, sfn_sync, eb):
+    """Empty 200/201/202/205 responses return ResponseBody='', while 204/304/HEAD omit it; responses decode using the
+    Content-Type charset or strict UTF-8 and fail on invalid bytes; Content-Type checks are exact/case-sensitive and
+    only reject non-empty bodies; responses >262144 bytes fail with States.DataLimitExceeded (AWS capture 2026-11-24)."""
+    import base64
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            parts = [p for p in self.path.split("?", 1)[0].strip("/").split("/") if p]
+            if parts[0] == "large":
+                raw = b"x" * int(parts[1])
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(raw)
+                return
+            status = int(parts[1])
+            ct = base64.urlsafe_b64decode(parts[2] + "===").decode("utf-8")
+            raw = base64.urlsafe_b64decode(parts[3] + "===") if len(parts) > 3 and parts[3] != "-" else b""
+            self.send_response(status)
+            if ct != "NONE":
+                self.send_header("Content-Type", ct)
+            if status not in (204, 304):
+                self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            if self.command != "HEAD" and status not in (204, 304) and raw:
+                self.wfile.write(raw)
+
+        do_GET = do_HEAD = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    def b64u(val):
+        data = val.encode("utf-8") if isinstance(val, str) else val
+        return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    invalid_utf8_cause = (
+        "Response from HTTP request cannot be read as a valid String. "
+        "This is likely caused by the response being binary/image/video/audio data."
+    )
+    try:
+        with _http_task_connection(eb) as (_, conn):
+            def call(path, method="GET"):
+                st = {
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {"ApiEndpoint": f"{url}/{path}", "Method": method,
+                                   "Authentication": {"ConnectionArn": conn}},
+                    "End": True,
+                }
+                return sfn_sync.test_state(definition=json.dumps(st), roleArn=role, inspectionLevel="TRACE")
+
+            def rpath(status, ct, raw=b""):
+                return f"raw/{status}/{b64u(ct)}/{b64u(raw) if raw else '-'}"
+
+            # Empty bodies: 200/201/202/205 keep ResponseBody="" and trace.response.body=""; 204/304/HEAD omit both.
+            for status, ct in ((200, "text/plain"), (200, "application/json"), (201, "text/plain"),
+                               (202, "application/json"), (205, "text/plain"), (200, "application/octet-stream"),
+                               (200, "image/png")):
+                r = call(rpath(status, ct))
+                assert r["status"] == "SUCCEEDED"
+                assert json.loads(r["output"])["ResponseBody"] == ""
+                assert r["inspectionData"]["response"]["body"] == ""
+
+            for status, ct, method in ((204, "text/plain", "GET"), (204, "application/octet-stream", "GET"),
+                                       (200, "application/json", "HEAD")):
+                r = call(rpath(status, ct), method=method)
+                assert r["status"] == "SUCCEEDED"
+                assert "ResponseBody" not in json.loads(r["output"])
+                assert "body" not in r["inspectionData"]["response"]
+
+            r_304 = call(rpath(304, "text/plain"))
+            assert (r_304["status"], r_304["error"]) == ("FAILED", "States.Http.StatusCode.304")
+            assert "body" not in r_304["inspectionData"]["response"]
+
+            r_404_empty = call(rpath(404, "text/plain"))
+            assert (r_404_empty["status"], r_404_empty["error"]) == ("FAILED", "States.Http.StatusCode.404")
+            assert r_404_empty["inspectionData"]["response"]["body"] == ""
+
+            # Whitespace-only JSON body parses to null; text/plain keeps whitespace.
+            r_ws_json = call(rpath(200, "application/json", b"  \t\n "))
+            assert json.loads(r_ws_json["output"])["ResponseBody"] is None
+            assert r_ws_json["inspectionData"]["response"]["body"] == "  \t\n "
+            r_ws_txt = call(rpath(200, "text/plain", b"   "))
+            assert json.loads(r_ws_txt["output"])["ResponseBody"] == "   "
+
+            # Invalid UTF-8 & charset handling.
+            for ct, raw in (("text/plain", b"\xff\xfe\x80"), ("text/plain", b"caf\xe9"),
+                            ("application/json", b'{"a":"hi\xff"}'), ("application/pdf", b"\xff\xfe"),
+                            ("text/plain; charset=us-ascii", "café".encode("utf-8"))):
+                r_bad = call(rpath(200, ct, raw))
+                assert (r_bad["status"], r_bad["error"], r_bad["cause"]) == ("FAILED", "States.Runtime", invalid_utf8_cause)
+                assert "\ufffd" in r_bad["inspectionData"]["response"]["body"]
+
+            # Also verify StartExecution matches TestState on empty 200 and invalid UTF-8.
+            exec_empty = _run_http_task(sfn, {
+                "ApiEndpoint": f"{url}/{rpath(200, 'text/plain')}", "Method": "GET",
+                "Authentication": {"ConnectionArn": conn},
+            })
+            assert exec_empty["ResponseBody"] == ""
+            exec_bad = _run_http_task(sfn, {
+                "ApiEndpoint": f"{url}/{rpath(200, 'text/plain', b'hi\xff')}", "Method": "GET",
+                "Authentication": {"ConnectionArn": conn},
+            })
+            assert (exec_bad["error"], exec_bad["cause"]) == ("States.Runtime", invalid_utf8_cause)
+
+            # Explicit charsets decode accurately.
+            for ct, raw, expected in (
+                ("text/plain; charset=iso-8859-1", b"caf\xe9", "café"),
+                ('text/plain; charset="iso-8859-1"', b"caf\xe9", "café"),
+                ("text/plain; charset=windows-1252", b"\x80", "€"),
+                ("text/plain; charset=utf-16", "Hi".encode("utf-16"), "Hi"),
+                ("application/json; charset=iso-8859-1", b'{"a":"caf\xe9"}', {"a": "café"}),
+            ):
+                r_cs = call(rpath(200, ct, raw))
+                assert r_cs["status"] == "SUCCEEDED"
+                assert json.loads(r_cs["output"])["ResponseBody"] == expected
+
+            # UTF-8 without explicit charset decodes as UTF-8 in ResponseBody; unknown charset fails without trace body.
+            r_utf8_nocs = call(rpath(200, "text/plain", "café".encode("utf-8")))
+            assert json.loads(r_utf8_nocs["output"])["ResponseBody"] == "café"
+            assert r_utf8_nocs["inspectionData"]["response"]["body"] == "caf\ufffd\ufffd"
+            r_utf8_cs = call(rpath(200, "text/plain; charset=utf-8", "café".encode("utf-8")))
+            assert json.loads(r_utf8_cs["output"])["ResponseBody"] == "café"
+            assert r_utf8_cs["inspectionData"]["response"]["body"] == "café"
+
+            r_unk = call(rpath(200, "text/plain; charset=bogus-999", b"hello"))
+            assert (r_unk["status"], r_unk["error"], r_unk["cause"]) == (
+                "FAILED", "States.Runtime",
+                "AWS Step Functions experienced an internal failure while calling the service http",
+            )
+            assert "body" not in r_unk["inspectionData"]["response"]
+
+            # Non-2xx takes precedence over binary Content-Type and invalid UTF-8.
+            r_404_bin = call(rpath(404, "application/octet-stream", b"abc"))
+            assert (r_404_bin["status"], r_404_bin["error"]) == ("FAILED", "States.Http.StatusCode.404")
+            r_400_utf8 = call(rpath(400, "text/plain", b"bad\xff"))
+            assert (r_400_utf8["status"], r_400_utf8["error"]) == ("FAILED", "States.Http.StatusCode.400")
+
+            # Content-Type matching is case-sensitive and reports the full header value in the error cause.
+            assert json.loads(call(rpath(200, "APPLICATION/JSON", b'{"a":1}'))["output"])["ResponseBody"] == '{"a":1}'
+            for ct in ("APPLICATION/OCTET-STREAM", "IMAGE/PNG", "AUDIO/MPEG", "VIDEO/MP4"):
+                assert json.loads(call(rpath(200, ct, b"abc"))["output"])["ResponseBody"] == "abc"
+            r_oct_cs = call(rpath(200, "application/octet-stream; charset=utf-8", b"hello"))
+            assert (r_oct_cs["status"], r_oct_cs["error"], r_oct_cs["cause"]) == (
+                "FAILED", "States.Runtime",
+                "Unsupported response content-type 'application/octet-stream; charset=utf-8'. "
+                "Please see documentation for list of unsupported content-types.",
+            )
+
+            # Responses exceeding 262,144 bytes fail with States.DataLimitExceeded and omit trace.response.
+            r_big = call("large/262145")
+            assert (r_big["status"], r_big["error"], r_big["cause"]) == (
+                "FAILED", "States.DataLimitExceeded",
+                "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+            )
+            assert "response" not in r_big["inspectionData"]
+    finally:
+        server.shutdown()
+
+
+def test_sfn_http_task_transform_and_request_edge_cases(sfn, sfn_sync, eb):
+    """RequestBody: null sends 'null' (and refuses merge with connection BodyParameters); Transform URL_ENCODED
+    supports INDICES/BRACKETS/REPEAT/COMMAS; array QueryParameters, fragment/trailing-? stripping, duplicate-case
+    headers, Content-Length and OPTIONS+body runtime errors match real AWS (AWS capture 2026-11-24, us-west-2)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _EchoHandler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else None
+            path, _, query = self.path.partition("?")
+            payload = json.dumps({
+                "method": self.command, "path": path, "rawQueryString": query,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_POST = do_OPTIONS = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _EchoHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    try:
+        with _http_task_connection(eb) as (_, conn), _http_task_connection(
+            eb, InvocationHttpParameters={"BodyParameters": [{"Key": "cb", "Value": "cv", "IsValueSecret": True}]}
+        ) as (_, conn_body):
+            def ts(params, reveal=False):
+                st = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True}
+                return sfn_sync.test_state(
+                    definition=json.dumps(st), roleArn=role, inspectionLevel="TRACE", revealSecrets=reveal)
+
+            # RequestBody: null sends "null" with */*; charset=UTF-8 on POST and GET; fails merge with conn BodyParameters.
+            for method in ("POST", "GET"):
+                r_null = ts({"ApiEndpoint": f"{url}/echo", "Method": method, "RequestBody": None,
+                             "Authentication": {"ConnectionArn": conn}})
+                echo = json.loads(r_null["output"])["ResponseBody"]
+                assert (echo["body"], echo["headers"]["content-type"]) == ("null", "*/*; charset=UTF-8")
+                assert r_null["inspectionData"]["request"]["body"] == "null"
+
+            r_null_merge = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": None,
+                               "Authentication": {"ConnectionArn": conn_body}})
+            assert (r_null_merge["status"], r_null_merge["error"], r_null_merge["cause"]) == (
+                "FAILED", "States.Runtime", "Cannot merge connection body authorization parameters with request body.")
+
+            # Omitted RequestBody + connection BodyParameters sends */*; charset=UTF-8 on the wire.
+            r_omitted_cb = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST",
+                               "Authentication": {"ConnectionArn": conn_body}}, reveal=False)
+            echo_cb = json.loads(r_omitted_cb["output"])["ResponseBody"]
+            assert (echo_cb["body"], echo_cb["headers"]["content-type"]) == ('{"cb":"cv"}', "*/*; charset=UTF-8")
+            assert r_omitted_cb["inspectionData"]["request"]["body"] == "{}"
+
+            # Transform URL_ENCODED array formats, string/array bodies, and connection BodyParameters redaction.
+            for fmt, expected in (
+                ("INDICES", "a%5Bb%5D=c&d%5B0%5D=1&d%5B1%5D=2&e=null&f=true"),
+                ("BRACKETS", "a%5Bb%5D=c&d%5B%5D=1&d%5B%5D=2&e=null&f=true"),
+                ("REPEAT", "a%5Bb%5D=c&d=1&d=2&e=null&f=true"),
+                ("COMMAS", "a%5Bb%5D=c&d=1%2C2&e=null&f=true&g="),
+            ):
+                r_tr = ts({
+                    "ApiEndpoint": f"{url}/echo", "Method": "POST",
+                    "RequestBody": {"a": {"b": "c"}, "d": [1, 2], "e": None, "f": True, "g": []},
+                    "Transform": {"RequestBodyEncoding": "URL_ENCODED",
+                                  "RequestEncodingOptions": {"ArrayFormat": fmt}},
+                    "Authentication": {"ConnectionArn": conn},
+                })
+                echo_tr = json.loads(r_tr["output"])["ResponseBody"]
+                assert echo_tr["body"] == expected
+                assert echo_tr["headers"]["content-type"] == "application/json; charset=UTF-8"
+
+            r_tr_arr = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": ["a", "b"],
+                           "Transform": {"RequestBodyEncoding": "URL_ENCODED"},
+                           "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_tr_arr["output"])["ResponseBody"]["body"] == "0=a&1=b"
+
+            r_tr_str = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": "hello",
+                           "Transform": {"RequestBodyEncoding": "URL_ENCODED"},
+                           "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_tr_str["output"])["ResponseBody"]["body"] == "hello"
+
+            r_tr_cb = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": {"a": "1"},
+                          "Transform": {"RequestBodyEncoding": "URL_ENCODED"},
+                          "Authentication": {"ConnectionArn": conn_body}}, reveal=False)
+            assert json.loads(r_tr_cb["output"])["ResponseBody"]["body"] == "a=1&cb=cv"
+            assert r_tr_cb["inspectionData"]["request"]["body"] == "a=1"
+
+            # Array QueryParameters -> ?0=a; #fragment and trailing ? stripped from ApiEndpoint.
+            r_qparr = ts({"ApiEndpoint": f"{url}/echo", "Method": "GET", "QueryParameters": ["a"],
+                          "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_qparr["output"])["ResponseBody"]["rawQueryString"] == "0=a"
+
+            for ep in (f"{url}/echo#frag", f"{url}/echo?"):
+                r_ep = ts({"ApiEndpoint": ep, "Method": "GET", "Authentication": {"ConnectionArn": conn}})
+                assert r_ep["inspectionData"]["request"]["url"] == f"{url}/echo"
+
+            # Duplicate case-insensitive headers preserve both keys in TRACE and both values on the wire.
+            r_dup = ts({"ApiEndpoint": f"{url}/echo", "Method": "GET", "Headers": {"X-Dup": "1", "x-dup": "2"},
+                        "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_dup["output"])["ResponseBody"]["headers"]["x-dup"] == "1,2"
+            dup_trace_hdrs = json.loads(r_dup["inspectionData"]["request"]["headers"])
+            assert (dup_trace_hdrs["X-Dup"], dup_trace_hdrs["x-dup"]) == (["1"], ["2"])
+
+            # Content-Length header and OPTIONS with RequestBody fail cleanly as States.Runtime; OPTIONS without succeeds.
+            internal_err = "AWS Step Functions experienced an internal failure while calling the service http"
+            for bad_params in (
+                {"ApiEndpoint": f"{url}/echo", "Method": "GET", "Headers": {"Content-Length": "99"},
+                 "Authentication": {"ConnectionArn": conn}},
+                {"ApiEndpoint": f"{url}/echo", "Method": "POST", "Headers": {"Content-Length": "99"},
+                 "RequestBody": {"a": 1}, "Authentication": {"ConnectionArn": conn}},
+                {"ApiEndpoint": f"{url}/echo", "Method": "OPTIONS", "RequestBody": {"a": 1},
+                 "Authentication": {"ConnectionArn": conn}},
+            ):
+                r_fail = ts(bad_params)
+                assert (r_fail["status"], r_fail["error"], r_fail["cause"]) == ("FAILED", "States.Runtime", internal_err)
+                assert "request" in r_fail["inspectionData"]
+
+            r_opt = ts({"ApiEndpoint": f"{url}/echo", "Method": "OPTIONS", "Authentication": {"ConnectionArn": conn}})
+            assert r_opt["status"] == "SUCCEEDED"
+            assert json.loads(r_opt["output"])["ResponseBody"]["method"] == "OPTIONS"
+    finally:
+        server.shutdown()
