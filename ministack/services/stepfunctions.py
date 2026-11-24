@@ -1762,8 +1762,15 @@ def _test_state(data):
             else:
                 # Real execution
                 resource = state_def.get("Resource", "")
+                http_trace = {} if (inspection_level == "TRACE" and resource == "arn:aws:states:::http:invoke") else None
                 try:
-                    task_result = _invoke_resource(resource, effective)
+                    if http_trace is not None:
+                        task_result = _invoke_http_endpoint(
+                            resource, effective, trace=http_trace,
+                            reveal_secrets=bool(data.get("revealSecrets")),
+                        )
+                    else:
+                        task_result = _invoke_resource(resource, effective)
                     task_result = _apply_result_selector(state_def, task_result)
 
                     if inspection_level in ("DEBUG", "TRACE"):
@@ -1791,11 +1798,20 @@ def _test_state(data):
                             "status": "CAUGHT_ERROR",
                             "output": json.dumps(output),
                             "error": err.error,
-                            "cause": err.cause,
                             "nextState": catcher["Next"],
                         }
+                        if err.cause is not None:
+                            result["cause"] = err.cause
                     else:
-                        result = {"status": "FAILED", "error": err.error, "cause": err.cause}
+                        result = {"status": "FAILED", "error": err.error}
+                        if err.cause is not None:
+                            result["cause"] = err.cause
+                finally:
+                    if http_trace:
+                        if "request" in http_trace:
+                            inspection_data["request"] = http_trace["request"]
+                        if "response" in http_trace:
+                            inspection_data["response"] = http_trace["response"]
         else:
             return error_response_json("InvalidDefinition", f"Unsupported state type: {state_type}", 400)
 
@@ -6122,8 +6138,16 @@ def _http_task_headers_error(headers, *, static=False, jsonata=False) -> str | N
                 return "The 'Headers' field cannot contain nested values."
             if any(not isinstance(item, str) for item in val):
                 return "'Header' values must be strings or arrays of strings."
+            texts = [key, *val]
         elif not isinstance(val, str):
             return "'Header' values must be strings or arrays of strings."
+        else:
+            texts = [key, val]
+        # AWS schema-validates Headers as printable US-ASCII (capture 2026-11-24, us-west-2).
+        if any(ord(ch) > 127 for text in texts for ch in text):
+            return "The 'Headers' field must only contain US-ASCII characters"
+        if any(ord(ch) < 32 or ord(ch) == 127 for text in texts for ch in text):
+            return "The 'Headers' field must not contain control characters"
         lower = key.lower()
         if lower in _HTTP_TASK_SCHEMA_DENIED_HEADERS or lower.startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES):
             if lower not in denied:
@@ -6282,7 +6306,7 @@ def _http_task_query_pairs(key, value):
         yield key, value if isinstance(value, str) else json.dumps(value)
 
 
-def _invoke_http_endpoint(resource, input_data):
+def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=False):
     """arn:aws:states:::http:invoke — call an HTTP API through an EventBridge connection.
 
     Where MiniStack differs from AWS on purpose: AWS takes only an https ApiEndpoint on a public domain name with no
@@ -6318,8 +6342,8 @@ def _invoke_http_endpoint(resource, input_data):
         raise _ExecutionError(
             "States.Runtime", "Transform.RequestBodyEncoding is not yet implemented in MiniStack's HTTP Task")
 
-    endpoint = input_data["ApiEndpoint"]
-    url = urllib.parse.urlsplit(endpoint)
+    base_endpoint = input_data["ApiEndpoint"]
+    url = urllib.parse.urlsplit(base_endpoint)
     auth_cfg = input_data.get("InvocationConfig") or input_data.get("Authentication")
     conn_arn = auth_cfg["ConnectionArn"]
     # QueryParameters that are not an object are left out of the request.
@@ -6339,57 +6363,135 @@ def _invoke_http_endpoint(resource, input_data):
     invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
     conn_query = eventbridge._connection_params_map(invocation.get("QueryStringParameters"))
     conn_body = eventbridge._connection_params_map(invocation.get("BodyParameters"))
-    headers = {
+    fixed_headers = {
+        "user-agent": ("User-Agent", f"Amazon|StepFunctions|HttpInvoke|{get_region()}"),
+        "range": ("Range", "bytes=0-262144"),
+    }
+    # A task cannot replace User-Agent or Range: its own values are dropped.
+    task_trace_headers = {
         name.lower(): (name, ", ".join(value) if isinstance(value, list) else value)
         for name, value in task_headers.items()
     }
+    task_trace_headers.update(fixed_headers)
+    headers = dict(task_trace_headers)
     headers.update((name.lower(), (name, value)) for name, value in
                    eventbridge._connection_params_map(invocation.get("HeaderParameters")).items())
+    headers.update(fixed_headers)
 
-    body = input_data.get("RequestBody")
+    task_body = input_data.get("RequestBody")
+    body = task_body
     if conn_body:
         if body is not None and not isinstance(body, dict):
             raise _ExecutionError(
                 "States.Runtime", "Cannot merge connection body authorization parameters with request body.")
         body = {**(body or {}), **conn_body}
     data = None
+    body_text = None
+    task_body_text = None
+    default_content_type = None
     if body is not None:
-        data = (body if isinstance(body, str) else json.dumps(body, separators=(",", ":"))).encode("utf-8")
-        content_type = "application/json; charset=UTF-8" if isinstance(body, dict) else "*/*; charset=UTF-8"
-        headers.setdefault("content-type", ("Content-Type", content_type))
-    # A task cannot replace these two: its own User-Agent or Range is dropped.
-    headers["user-agent"] = ("User-Agent", f"Amazon|StepFunctions|HttpInvoke|{get_region()}")
-    headers["range"] = ("Range", "bytes=0-262144")
+        body_text = body if isinstance(body, str) else json.dumps(body, separators=(",", ":"))
+        data = body_text.encode("utf-8")
+        default_content_type = "application/json; charset=UTF-8" if isinstance(body, dict) else "*/*; charset=UTF-8"
+        task_body_text = (
+            "{}" if task_body is None
+            else (task_body if isinstance(task_body, str) else json.dumps(task_body, separators=(",", ":")))
+        )
 
-    query = {name: value for name, value in task_query.items() if name not in conn_query} | conn_query
-    pairs = [pair for name, value in query.items() for pair in _http_task_query_pairs(name, value)]
-    if pairs:
-        endpoint += "?" + "&".join(
+    def build_url(query_map):
+        pairs = [pair for name, value in query_map.items() for pair in _http_task_query_pairs(name, value)]
+        if not pairs:
+            return base_endpoint
+        return base_endpoint + "?" + "&".join(
             f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(text, safe='')}" for name, text in pairs)
-    request = urllib.request.Request(
-        endpoint, data=data, method=input_data["Method"],
-        headers={**dict(headers.values()),
-                 **eventbridge._connection_auth_headers(conn, (get_account_id(), get_region(), conn_name))})
+
+    task_endpoint = build_url(task_query)
+    endpoint = build_url({name: value for name, value in task_query.items() if name not in conn_query} | conn_query)
+    token_key = (get_account_id(), get_region(), conn_name)
+    is_oauth = conn.get("AuthorizationType") == "OAUTH_CLIENT_CREDENTIALS"
+
+    def send(auth_headers):
+        wire_headers = dict(headers)
+        wire_headers.update((name.lower(), (name, value)) for name, value in auth_headers.items())
+        wire_headers.update(fixed_headers)
+        if trace is not None:
+            # TestState TRACE omits all connection-supplied headers, query params, and body params unless
+            # revealSecrets=True, and does not list the auto-defaulted Content-Type (AWS capture 2026-11-24, us-west-2).
+            shown_headers = wire_headers if reveal_secrets else task_trace_headers
+            req_trace = {
+                "protocol": url.scheme,
+                "method": input_data["Method"],
+                "url": endpoint if reveal_secrets else task_endpoint,
+                "headers": json.dumps({name: [value] for name, value in shown_headers.values()}, separators=(",", ":")),
+            }
+            shown_body = body_text if reveal_secrets else task_body_text
+            if shown_body is not None:
+                req_trace["body"] = shown_body
+            trace["request"] = req_trace
+        req_headers = dict(wire_headers.values())
+        if default_content_type and "content-type" not in wire_headers:
+            req_headers["Content-Type"] = default_content_type
+        request = urllib.request.Request(endpoint, data=data, method=input_data["Method"], headers=req_headers)
+        try:
+            try:
+                with eventbridge._http_open(request, timeout=_HTTP_TASK_TIMEOUT_SECONDS) as response:
+                    return response.status, response.headers, response.read()
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.headers, exc.read()
+        except OSError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, socket.gaierror):
+                raise _ExecutionError(
+                    "States.Http.IpError", f"Unable to resolve domain '{url.hostname}' to IpV4 address.") from None
+            if isinstance(reason, TimeoutError):
+                raise _ExecutionError("States.Http.Socket", "Request timed out.") from None
+            # AWS cannot reach a closed local port (it refuses localhost and ports), so it has no answer to copy here.
+            raise _ExecutionError("States.Http.Socket", str(reason)) from None
+        except Exception as exc:
+            raise _ExecutionError("States.Http.Socket", str(exc)) from None
+
     try:
-        with eventbridge._http_open(request, timeout=_HTTP_TASK_TIMEOUT_SECONDS) as response:
-            status, response_headers, raw = response.status, response.headers, response.read()
-    except urllib.error.HTTPError as exc:
-        status, response_headers, raw = exc.code, exc.headers, exc.read()
-    except OSError as exc:
-        reason = getattr(exc, "reason", exc)
-        if isinstance(reason, socket.gaierror):
-            raise _ExecutionError(
-                "States.Http.IpError", f"Unable to resolve domain '{url.hostname}' to IpV4 address.") from None
-        if isinstance(reason, TimeoutError):
-            raise _ExecutionError("States.Http.Socket", "Request timed out.") from None
-        # AWS cannot reach a closed local port (it refuses localhost and ports), so it has no answer to copy here.
-        raise _ExecutionError("States.Http.Socket", str(reason)) from None
+        auth_headers = eventbridge._connection_auth_headers(conn, token_key)
+    except Exception:
+        eventbridge._evict_oauth_token(conn_name)
+        raise _ExecutionError(
+            "Events.ConnectionResource.InvalidConnectionState",
+            "Connection resource is not authorized. This is likely a configuration issue with your connection.",
+        ) from None
+
+    status, response_headers, raw = send(auth_headers)
+    if status == 401 and is_oauth:
+        # On 401 with OAuth, real AWS retries once and triggers EventBridge token refresh rather than immediately
+        # deauthorizing the connection (AWS capture 2026-11-24, us-west-2). Refresh synchronously here, matching
+        # EventBridge API destinations.
+        try:
+            refreshed = eventbridge._connection_auth_headers(conn, token_key, force_refresh=True)
+        except Exception:
+            eventbridge._evict_oauth_token(conn_name)
+        else:
+            status, response_headers, raw = send(refreshed)
 
     status_text = _HTTP_TASK_STATUS_TEXT.get(status)
-    if status == 401:
+    if trace is not None:
+        resp_trace = {
+            "protocol": url.scheme,
+            "statusCode": str(status),
+            "headers": json.dumps(
+                {name: response_headers.get_all(name) for name in dict.fromkeys(response_headers.keys())},
+                separators=(",", ":"),
+            ),
+        }
+        if status_text:
+            resp_trace["statusMessage"] = status_text
+        if raw:
+            resp_trace["body"] = raw.decode("utf-8", errors="replace")
+        trace["response"] = resp_trace
+
+    if status == 401 and not is_oauth:
         conn["ConnectionState"] = "DEAUTHORIZED"
         conn["StateReason"] = ("Request failed due to Unauthorized access. Authorization could not be granted "
                                "using the credentials provided in the request.")
+        eventbridge._evict_oauth_token(conn_name)
     if not 200 <= status < 300:
         raise _ExecutionError(f"States.Http.StatusCode.{status}", status_text)
     media_type = response_headers.get_content_type()

@@ -11538,6 +11538,14 @@ def test_sfn_http_task_failed_calls(sfn, eb):
     ({"Headers": {"X-A": True}}, "'Header' values must be strings or arrays of strings."),
     ({"Headers": {"X-A": [1, 2]}}, "'Header' values must be strings or arrays of strings."),
     ({"Headers": {"X-A": [None]}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-Cyrillic": "привет"}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-Lat": "café"}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-é": "v"}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-Lat": ["ok", "café"]}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-Tab": "a\tb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X-Cr": "a\rb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X-Lf": "a\nb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X-Del": "a\x7fb"}}, "The 'Headers' field must not contain control characters"),
     ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
     ({"InvocationConfig": {"ConnectionArn": ""}}, "The value for the 'ConnectionArn' field must have a minimum length of 1"),
     ({"ApiEndpoint": "ftp://example.com/echo"}, "The value for the 'ApiEndpoint' field must have the scheme 'https'"),
@@ -11621,6 +11629,9 @@ def test_sfn_http_task_definition_validation(sfn, sfn_sync):
         ({**base, "Headers": {"X-A": None}}, "The 'Headers' field cannot contain null values."),
         ({**base, "Headers": {"X-A": {"k": "v"}}}, "The 'Headers' field cannot contain nested values."),
         ({**base, "Headers": {"X-A": 123}}, "'Header' values must be strings or arrays of strings."),
+        ({**base, "Headers": {"X-Cyrillic": "привет"}}, "The 'Headers' field must only contain US-ASCII characters"),
+        ({**base, "Headers": {"X-Lat": "café"}}, "The 'Headers' field must only contain US-ASCII characters"),
+        ({**base, "Headers": {"X-Tab": "a\tb"}}, "The 'Headers' field must not contain control characters"),
         ({**base, "Headers": {"Authorization": "x"}}, "The 'Headers' field contains unsupported values: [authorization]"),
         ({**base, "Method": "TRACE"}, "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
         ({**base, "InvocationConfig": {"ConnectionArn": conn}},
@@ -11697,3 +11708,354 @@ def test_sfn_http_task_definition_validation(sfn, sfn_sync):
         {**base, "Headers": {"Authorization.$": "$.a"}},
     ):
         assert sfn.validate_state_machine_definition(definition=make_def(ok_params))["result"] == "OK"
+
+
+def test_sfn_http_task_oauth_refresh_and_failures(sfn, sfn_sync, eb):
+    """OAuth connections refresh on 401 and retry once without deauthorizing on target-API 401; 407 does not retry;
+    API_KEY 401 deauthorizes; OAuth token endpoint errors and truncated HTTP responses become catchable task errors
+    instead of escaping Retry/Catch or 500ing TestState (AWS capture 2026-11-24, us-west-2)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state = {"token_mode": "ok", "token_calls": 0, "api_auths": []}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            path = self.path.split("?", 1)[0]
+            if path == "/oauth/token":
+                state["token_calls"] += 1
+                mode = state["token_mode"]
+                if mode == "500":
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"server_error"}')
+                    return
+                if mode == "badjson":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"not-json{{{")
+                    return
+                body = json.dumps({
+                    "access_token": f"tok-{state['token_calls']}",
+                    "token_type": "Bearer",
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            auth = self.headers.get("Authorization", "")
+            state["api_auths"].append(auth)
+
+            if path == "/truncated":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "200")
+                self.end_headers()
+                self.wfile.write(b'{"cut')
+                self.close_connection = True
+                return
+
+            if path == "/require-tok-2":
+                code = 200 if auth == "Bearer tok-2" else 401
+            elif path == "/always-401":
+                code = 401
+            elif path == "/always-407":
+                code = 407
+            else:
+                code = 200
+            body = json.dumps({"auth": auth, "code": code}).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    oauth_name = f"sfn-oauth-{_uuid_mod.uuid4().hex[:8]}"
+    bad_oauth_name = f"sfn-oauth-bad-{_uuid_mod.uuid4().hex[:8]}"
+    apikey_name = f"sfn-apikey-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        oauth_arn = eb.create_connection(
+            Name=oauth_name,
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters={"OAuthParameters": {
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                "AuthorizationEndpoint": f"{url}/oauth/token",
+                "HttpMethod": "POST",
+            }},
+        )["ConnectionArn"]
+
+        # 1. Stale OAuth token gets 401 -> refreshes with force_refresh=True and retries once -> succeeds.
+        res = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/require-tok-2", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        })
+        assert res["StatusCode"] == 200
+        assert res["ResponseBody"]["auth"] == "Bearer tok-2"
+        assert state["token_calls"] == 2
+        assert state["api_auths"] == ["Bearer tok-1", "Bearer tok-2"]
+        assert eb.describe_connection(Name=oauth_name)["ConnectionState"] == "AUTHORIZED"
+
+        # 2. Target API always returns 401 -> retries once with fresh token, fails 401, stays AUTHORIZED.
+        state["api_auths"].clear()
+        caught = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-401", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        assert state["token_calls"] == 3
+        assert state["api_auths"] == ["Bearer tok-2", "Bearer tok-3"]
+        assert eb.describe_connection(Name=oauth_name)["ConnectionState"] == "AUTHORIZED"
+
+        # 3. 407 on OAuth does NOT refresh or retry (1 API call, stays AUTHORIZED).
+        state["api_auths"].clear()
+        caught_407 = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-407", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_407 == {"Error": "States.Http.StatusCode.407", "Cause": "Proxy Authentication Required"}
+        assert state["token_calls"] == 3
+        assert state["api_auths"] == ["Bearer tok-3"]
+        assert eb.describe_connection(Name=oauth_name)["ConnectionState"] == "AUTHORIZED"
+
+        # 4. OAuth token refresh fails on 401 -> evicts stale token, fails 401, recovers when IdP returns.
+        state["token_mode"] = "500"
+        caught_ref = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-401", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_ref == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        # Cached token was evicted, so next call while IdP is still 500 fails cleanly & is catchable.
+        caught_down = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_down["Error"] == "Events.ConnectionResource.InvalidConnectionState"
+        # Non-JSON token response is also caught cleanly (and TestState returns FAILED, not 500).
+        state["token_mode"] = "badjson"
+        ts_bad = sfn_sync.test_state(
+            definition=json.dumps({
+                "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                               "Authentication": {"ConnectionArn": oauth_arn}},
+                "End": True,
+            }),
+            roleArn=role,
+        )
+        assert ts_bad["status"] == "FAILED"
+        assert ts_bad["error"] == "Events.ConnectionResource.InvalidConnectionState"
+        # Once IdP recovers, connection works without needing UpdateConnection.
+        state["token_mode"] = "ok"
+        recovered = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        })
+        assert recovered["StatusCode"] == 200
+
+        # 5. Unreachable OAuth token endpoint is catchable (never leaks raw exception).
+        bad_oauth_arn = eb.create_connection(
+            Name=bad_oauth_name,
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters={"OAuthParameters": {
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                "AuthorizationEndpoint": "http://127.0.0.1:1/oauth/token",
+                "HttpMethod": "POST",
+            }},
+        )["ConnectionArn"]
+        caught_unreach = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "Authentication": {"ConnectionArn": bad_oauth_arn},
+        }, catch=True)
+        assert caught_unreach["Error"] == "Events.ConnectionResource.InvalidConnectionState"
+
+        # 6. Server dying partway through body (IncompleteRead) is caught as States.Http.Socket, not 500.
+        caught_trunc = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/truncated", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_trunc["Error"] == "States.Http.Socket"
+        ts_trunc = sfn_sync.test_state(
+            definition=json.dumps({
+                "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {"ApiEndpoint": f"{url}/truncated", "Method": "GET",
+                               "Authentication": {"ConnectionArn": oauth_arn}},
+                "End": True,
+            }),
+            roleArn=role,
+            inspectionLevel="TRACE",
+        )
+        assert ts_trunc["status"] == "FAILED"
+        assert ts_trunc["error"] == "States.Http.Socket"
+        assert "request" in ts_trunc["inspectionData"]
+        assert "response" not in ts_trunc["inspectionData"]
+
+        # 7. API_KEY connection 401 deauthorizes immediately (same as BASIC, AWS capture 2026-11-24).
+        apikey_arn = eb.create_connection(
+            Name=apikey_name,
+            AuthorizationType="API_KEY",
+            AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "secret"}},
+        )["ConnectionArn"]
+        assert _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-401", "Method": "GET",
+            "Authentication": {"ConnectionArn": apikey_arn},
+        }, catch=True) == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        ak_desc = eb.describe_connection(Name=apikey_name)
+        assert ak_desc["ConnectionState"] == "DEAUTHORIZED"
+        assert ak_desc["StateReason"] == (
+            "Request failed due to Unauthorized access. Authorization could not be granted using the credentials "
+            "provided in the request.")
+    finally:
+        server.shutdown()
+        for cname in (oauth_name, bad_oauth_name, apikey_name):
+            try:
+                eb.delete_connection(Name=cname)
+            except ClientError:
+                pass
+
+
+def test_sfn_http_task_test_state_trace(sfn_sync, eb):
+    """TestState at TRACE populates inspectionData.request and inspectionData.response, hiding all connection-supplied
+    auth/header/query/body parameters unless revealSecrets=True (AWS capture 2026-11-24, us-west-2)."""
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    invocation = {
+        "HeaderParameters": [
+            {"Key": "X-Conn-Plain", "Value": "plainval", "IsValueSecret": False},
+            {"Key": "X-Conn-Secret", "Value": "secretval", "IsValueSecret": True},
+            {"Key": "X-Overlap", "Value": "conn-wins", "IsValueSecret": False},
+        ],
+        "QueryStringParameters": [
+            {"Key": "qplain", "Value": "qv1", "IsValueSecret": False},
+            {"Key": "qoverlap", "Value": "conn-q", "IsValueSecret": False},
+        ],
+        "BodyParameters": [
+            {"Key": "bplain", "Value": "bv1", "IsValueSecret": False},
+            {"Key": "boverlap", "Value": "conn-b", "IsValueSecret": False},
+        ],
+    }
+    with _http_task_endpoint() as url, _http_task_connection(eb, InvocationHttpParameters=invocation) as (_, conn):
+        post_state = {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {
+                "ApiEndpoint": f"{url}/echo",
+                "Method": "POST",
+                "Authentication": {"ConnectionArn": conn},
+                "Headers": {"X-Task-Hdr": "tval", "X-Overlap": "task-val", "X-Multi": ["a", "b"]},
+                "QueryParameters": {"qt": "tv", "qoverlap": "task-q"},
+                "RequestBody": {"hello": "world", "boverlap": "task-b"},
+            },
+            "End": True,
+        }
+
+        # TRACE with revealSecrets omitted/False omits all connection headers/query/body and auto Content-Type.
+        r_hidden = sfn_sync.test_state(definition=json.dumps(post_state), roleArn=role, inspectionLevel="TRACE")
+        assert r_hidden["status"] == "SUCCEEDED"
+        req_hidden = r_hidden["inspectionData"]["request"]
+        assert req_hidden["protocol"] == "http"
+        assert req_hidden["method"] == "POST"
+        assert req_hidden["url"] == f"{url}/echo?qt=tv&qoverlap=task-q"
+        hdrs_hidden = json.loads(req_hidden["headers"])
+        assert hdrs_hidden == {
+            "X-Task-Hdr": ["tval"],
+            "X-Overlap": ["task-val"],
+            "X-Multi": ["a, b"],
+            "User-Agent": ["Amazon|StepFunctions|HttpInvoke|us-east-1"],
+            "Range": ["bytes=0-262144"],
+        }
+        assert "Authorization" not in hdrs_hidden
+        assert "Content-Type" not in hdrs_hidden
+        assert req_hidden["body"] == '{"hello":"world","boverlap":"task-b"}'
+        resp_hidden = r_hidden["inspectionData"]["response"]
+        assert (resp_hidden["protocol"], resp_hidden["statusCode"], resp_hidden["statusMessage"]) == ("http", "200", "OK")
+        assert json.loads(resp_hidden["headers"])["Content-Type"] == ["application/json; charset=utf-8"]
+        assert json.loads(resp_hidden["body"])["headers"]["authorization"] == "Basic dTpw"
+
+        # TRACE with revealSecrets=True reveals auth header and connection header/query/body params.
+        r_shown = sfn_sync.test_state(
+            definition=json.dumps(post_state), roleArn=role, inspectionLevel="TRACE", revealSecrets=True)
+        req_shown = r_shown["inspectionData"]["request"]
+        assert req_shown["url"] == f"{url}/echo?qt=tv&qplain=qv1&qoverlap=conn-q"
+        hdrs_shown = json.loads(req_shown["headers"])
+        assert hdrs_shown["Authorization"] == ["Basic dTpw"]
+        assert hdrs_shown["X-Conn-Plain"] == ["plainval"]
+        assert hdrs_shown["X-Conn-Secret"] == ["secretval"]
+        assert hdrs_shown["X-Overlap"] == ["conn-wins"]
+        assert "Content-Type" not in hdrs_shown
+        assert req_shown["body"] == '{"hello":"world","boverlap":"conn-b","bplain":"bv1"}'
+
+        # DEBUG does NOT include request/response even with revealSecrets=True.
+        r_debug = sfn_sync.test_state(
+            definition=json.dumps(post_state), roleArn=role, inspectionLevel="DEBUG", revealSecrets=True)
+        assert "request" not in r_debug["inspectionData"]
+        assert "response" not in r_debug["inspectionData"]
+
+        # GET with only connection BodyParameters: revealSecrets=False reports body="{}", True reports conn body.
+        get_only_conn_body = {
+            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn}},
+            "End": True,
+        }
+        assert sfn_sync.test_state(
+            definition=json.dumps(get_only_conn_body), roleArn=role, inspectionLevel="TRACE", revealSecrets=False,
+        )["inspectionData"]["request"]["body"] == "{}"
+        assert sfn_sync.test_state(
+            definition=json.dumps(get_only_conn_body), roleArn=role, inspectionLevel="TRACE", revealSecrets=True,
+        )["inspectionData"]["request"]["body"] == '{"bplain":"bv1","boverlap":"conn-b"}'
+
+    # Connection without BodyParameters: GET omits request.body; 204 omits response.body; 422/418/Catch/binary/IpError.
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (_, conn):
+        def trace_call(path, *, catch=None, endpoint=None):
+            st = {
+                "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {"ApiEndpoint": endpoint or f"{url}/{path}", "Method": "GET",
+                               "Authentication": {"ConnectionArn": conn}},
+                "End": True,
+            }
+            if catch:
+                st["Catch"] = catch
+            return sfn_sync.test_state(
+                definition=json.dumps(st), roleArn=role, inspectionLevel="TRACE", revealSecrets=True)
+
+        r_204 = trace_call("empty")
+        assert "body" not in r_204["inspectionData"]["request"]
+        assert (r_204["inspectionData"]["response"]["statusCode"], r_204["inspectionData"]["response"]["statusMessage"]) == ("204", "No Content")
+        assert "body" not in r_204["inspectionData"]["response"]
+
+        r_422 = trace_call("status/422")
+        assert (r_422["status"], r_422["error"], r_422["cause"]) == ("FAILED", "States.Http.StatusCode.422", "Unprocessable Content")
+        assert (r_422["inspectionData"]["response"]["statusCode"], r_422["inspectionData"]["response"]["statusMessage"]) == ("422", "Unprocessable Content")
+
+        r_418 = trace_call("status/418")
+        assert (r_418["status"], r_418["error"]) == ("FAILED", "States.Http.StatusCode.418")
+        assert "cause" not in r_418
+        assert r_418["inspectionData"]["response"]["statusCode"] == "418"
+        assert "statusMessage" not in r_418["inspectionData"]["response"]
+
+        r_caught = trace_call("status/404", catch=[{"ErrorEquals": ["States.ALL"], "Next": "Done"}])
+        assert r_caught["status"] == "CAUGHT_ERROR"
+        assert r_caught["inspectionData"]["response"]["statusCode"] == "404"
+
+        r_bin = trace_call("binary")
+        assert (r_bin["status"], r_bin["error"]) == ("FAILED", "States.Runtime")
+        assert r_bin["inspectionData"]["response"]["statusCode"] == "200"
+
+        r_ip = trace_call("", endpoint=f"https://sfn-http-{_uuid_mod.uuid4().hex[:8]}.invalid/echo")
+        assert (r_ip["status"], r_ip["error"]) == ("FAILED", "States.Http.IpError")
+        assert "request" in r_ip["inspectionData"]
+        assert "response" not in r_ip["inspectionData"]
