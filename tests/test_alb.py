@@ -1030,6 +1030,83 @@ def test_elbv2_dataplane_lambda_target_gets_the_host_as_sent(elbv2, lam):
         _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, "dp-alb-lhost-fn")
 
 
+_ENTITY_TOO_LARGE_PAGE = (
+    b"<html>\r\n"
+    b"<head><title>413 Request Entity Too Large</title></head>\r\n"
+    b"<body>\r\n"
+    b"<center><h1>413 Request Entity Too Large</h1></center>\r\n"
+    b"</body>\r\n"
+    b"</html>\r\n"
+    + b"<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n" * 6
+)
+
+
+@pytest.mark.serial
+def test_elbv2_dataplane_lambda_target_rejects_a_body_over_1_mib(elbv2, lam, cw):
+    """A body over 1,048,576 bytes gets the load balancer's own 413 page; the function is not invoked."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    lb_name = f"alb-413-{suffix}"
+    fn_name = f"alb-413-fn-{suffix}"
+    fn_code = ("def handler(event, context):\n"
+               "    return {'statusCode': 200, 'body': str(len(event['body']))}\n")
+    lb_arn, tg_arn, l_arn, _fn_arn = _alb_setup(elbv2, lam, lb_name, fn_name, fn_code)
+    try:
+        url = f"{_endpoint}/_alb/{lb_name}/upload"
+        with pytest.raises(HTTPError) as exc_info:
+            _req.urlopen(_req.Request(url, data=b"a" * 1_048_577, method="POST"))
+        assert exc_info.value.code == 413
+        assert exc_info.value.headers["Content-Type"] == "text/html"
+        assert exc_info.value.headers["Server"] == "awselb/2.0"
+        assert exc_info.value.headers["Content-Length"] == "550"
+        page = exc_info.value.read()
+        assert len(page) == 550
+        assert page == _ENTITY_TOO_LARGE_PAGE
+
+        end = time.time() + 60
+        invocations = cw.get_metric_statistics(
+            Namespace="AWS/Lambda", MetricName="Invocations",
+            Dimensions=[{"Name": "FunctionName", "Value": fn_name}],
+            StartTime=end - 600, EndTime=end, Period=60, Statistics=["Sum"],
+        )
+        assert sum(p["Sum"] for p in invocations["Datapoints"]) == 0
+
+        resp = _req.urlopen(_req.Request(url, data=b"a" * 1_048_576, method="POST"))
+        assert resp.status == 200
+        assert resp.read() == b"1048576"
+    finally:
+        _alb_teardown(elbv2, lam, lb_arn, tg_arn, l_arn, fn_name)
+
+
+def test_elbv2_dataplane_ip_target_accepts_a_body_over_1_mib(elbv2):
+    """The 1 MiB limit applies to Lambda targets only."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received = len(self.rfile.read(int(self.headers["Content-Length"])))
+            body = str(received).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    lb_name = f"dp-alb-big-{_uuid_mod.uuid4().hex[:8]}"
+    lb_arn, tg_arn, l_arn = _alb_http_target_setup(elbv2, lb_name, "127.0.0.1", server.server_address[1])
+    try:
+        resp = _req.urlopen(_req.Request(f"{_endpoint}/_alb/{lb_name}/upload", data=b"a" * 1_048_577, method="POST"))
+        assert resp.status == 200
+        assert resp.read() == b"1048577"
+    finally:
+        _alb_http_target_teardown(elbv2, lb_arn, tg_arn, l_arn)
+        _stop_server(server)
+
+
 def test_oidc_redirect_uri_on_a_443_listener_drops_the_clients_port(elbv2, lam):
     name = "oidc-dp-443"
     lb_arn, tg_arn, l_arn = _alb_with_oidc(elbv2, lam, name)

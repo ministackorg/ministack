@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ALB — a Lambda target refuses a body over 1 MiB** — a request to a Lambda target invoked the function whatever its body size. A raw request body over 1,048,576 bytes (the whole HTTP body, e.g. a complete multipart form, not the base64 size in the event) now gets the load balancer's `413` HTML page with `Server: awselb/2.0` and the function is not invoked; a body of exactly 1,048,576 bytes still reaches it. Instance and ip targets are unchanged. Measured against a real ALB with a Lambda target.
+
 ## [1.5.44] — 2026-11-23
 
 ### Added
