@@ -1695,12 +1695,18 @@ def _test_state(data):
             result = {"status": "FAILED", "error": error, "cause": cause}
 
         elif state_type == "Task":
-            effective = _apply_input_path(state_def, input_data, ctx)
-            effective = _apply_parameters(state_def, effective, ctx)
-
-            if inspection_level in ("DEBUG", "TRACE"):
-                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data, ctx))
-                inspection_data["afterParameters"] = json.dumps(effective)
+            state_ql = state_def.get("QueryLanguage") or definition.get("QueryLanguage", "JSONPath")
+            is_jsonata_task = state_ql == "JSONata"
+            if is_jsonata_task:
+                effective = _apply_jsonata_arguments(state_def, input_data, ctx)
+                if inspection_level in ("DEBUG", "TRACE"):
+                    inspection_data["afterArguments"] = json.dumps(effective)
+            else:
+                after_input = _apply_input_path(state_def, input_data, ctx)
+                effective = _apply_parameters(state_def, after_input, ctx)
+                if inspection_level in ("DEBUG", "TRACE"):
+                    inspection_data["afterInputPath"] = json.dumps(after_input)
+                    inspection_data["afterParameters"] = json.dumps(effective)
 
             # Mock support
             if mock:
@@ -1771,18 +1777,24 @@ def _test_state(data):
                         )
                     else:
                         task_result = _invoke_resource(resource, effective)
-                    task_result = _apply_result_selector(state_def, task_result)
+                    if is_jsonata_task:
+                        if inspection_level in ("DEBUG", "TRACE"):
+                            inspection_data["result"] = json.dumps(task_result)
+                        output = _apply_jsonata_output(
+                            state_def, input_data, ctx, result=task_result, default=task_result)
+                    else:
+                        task_result = _apply_result_selector(state_def, task_result)
 
-                    if inspection_level in ("DEBUG", "TRACE"):
-                        inspection_data["result"] = json.dumps(task_result)
-                        inspection_data["afterResultSelector"] = json.dumps(task_result)
+                        if inspection_level in ("DEBUG", "TRACE"):
+                            inspection_data["result"] = json.dumps(task_result)
+                            inspection_data["afterResultSelector"] = json.dumps(task_result)
 
-                    output = _apply_result_path(state_def, input_data, task_result)
+                        output = _apply_result_path(state_def, input_data, task_result)
 
-                    if inspection_level in ("DEBUG", "TRACE"):
-                        inspection_data["afterResultPath"] = json.dumps(output)
+                        if inspection_level in ("DEBUG", "TRACE"):
+                            inspection_data["afterResultPath"] = json.dumps(output)
 
-                    output = _apply_output_path(state_def, output, ctx)
+                        output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -2160,12 +2172,26 @@ def _execute_task(state_def, raw_input, execution, ctx):
             if query_language == "JSONata":
                 effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
 
-            _add_event(execution, "TaskScheduled", {
-                "taskScheduledEventDetails": {
-                    "resourceType": "lambda" if "lambda" in resource else "states",
-                    "resource": resource,
-                },
-            })
+            if resource == "arn:aws:states:::http:invoke":
+                sched_details = {
+                    "resourceType": "http",
+                    "resource": "invoke",
+                    "region": get_region(),
+                    "parameters": json.dumps(effective, separators=(",", ":")),
+                }
+                if "TimeoutSeconds" in state_def:
+                    sched_details["timeoutInSeconds"] = state_def["TimeoutSeconds"]
+                _add_event(execution, "TaskScheduled", {"taskScheduledEventDetails": sched_details})
+                _add_event(execution, "TaskStarted", {
+                    "taskStartedEventDetails": {"resourceType": "http", "resource": "invoke"},
+                })
+            else:
+                _add_event(execution, "TaskScheduled", {
+                    "taskScheduledEventDetails": {
+                        "resourceType": "lambda" if "lambda" in resource else "states",
+                        "resource": resource,
+                    },
+                })
 
             if _mock_throw is not None:
                 raise _mock_throw
@@ -2180,12 +2206,21 @@ def _execute_task(state_def, raw_input, execution, ctx):
             else:
                 task_result = _invoke_resource(resource, effective)
 
-            _add_event(execution, "TaskSucceeded", {
-                "taskSucceededEventDetails": {
-                    "output": json.dumps(task_result),
-                    "resource": resource,
-                },
-            })
+            if resource == "arn:aws:states:::http:invoke":
+                _add_event(execution, "TaskSucceeded", {
+                    "taskSucceededEventDetails": {
+                        "resourceType": "http",
+                        "resource": "invoke",
+                        "output": json.dumps(task_result),
+                    },
+                })
+            else:
+                _add_event(execution, "TaskSucceeded", {
+                    "taskSucceededEventDetails": {
+                        "output": json.dumps(task_result),
+                        "resource": resource,
+                    },
+                })
 
             if query_language == "JSONata":
                 output = _apply_jsonata_output(
@@ -2207,12 +2242,22 @@ def _execute_task(state_def, raw_input, execution, ctx):
 
         except _ExecutionError as err:
             last_error = err
-            _add_event(execution, "TaskFailed", {
-                "taskFailedEventDetails": {
-                    "error": err.error, "cause": err.cause,
-                    "resource": resource,
-                },
-            })
+            if resource == "arn:aws:states:::http:invoke":
+                _add_event(execution, "TaskFailed", {
+                    "taskFailedEventDetails": {
+                        "resourceType": "http",
+                        "resource": "invoke",
+                        "error": err.error,
+                        "cause": err.cause,
+                    },
+                })
+            else:
+                _add_event(execution, "TaskFailed", {
+                    "taskFailedEventDetails": {
+                        "error": err.error, "cause": err.cause,
+                        "resource": resource,
+                    },
+                })
 
             retrier, retrier_idx = _find_matching_retrier(
                 retriers, err.error, retry_counts)
@@ -6247,6 +6292,8 @@ def _http_task_schema_errors(params, *, static=False, jsonata=False) -> list[str
     for k in params:
         if static and not jsonata and isinstance(k, str) and k.endswith(".$"):
             continue
+        if static and jsonata and _is_jsonata_expr(params[k]):
+            continue
         if k not in _HTTP_TASK_ALLOWED_FIELDS:
             errors.append(f'The field "{k}" is not supported by Step Functions')
 
@@ -6729,8 +6776,65 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
     if status_text:
         result["StatusText"] = status_text
     if has_resp_body:
+        body_bytes = raw
+        content_encodings = [
+            enc.strip().lower()
+            for hdr_val in (response_headers.get_all("Content-Encoding") or [])
+            for enc in hdr_val.split(",")
+            if enc.strip()
+        ]
+        if content_encodings and body_bytes:
+            import zlib
+
+            for enc in reversed(content_encodings):
+                if enc == "identity":
+                    continue
+                if enc in ("gzip", "x-gzip"):
+                    try:
+                        decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                        body_bytes = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
+                        if len(body_bytes) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
+                            body_bytes += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(body_bytes))
+                        if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
+                            raise _ExecutionError(
+                                "States.DataLimitExceeded",
+                                "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+                            )
+                    except zlib.error:
+                        raise _ExecutionError(
+                            "States.Http.InvalidCompressionType",
+                            "Invalid Compression type received from the server",
+                        ) from None
+                elif enc == "deflate":
+                    decompressed = None
+                    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                        try:
+                            decomp = zlib.decompressobj(wbits)
+                            out = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
+                            if len(out) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
+                                out += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(out))
+                            if len(out) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
+                                raise _ExecutionError(
+                                    "States.DataLimitExceeded",
+                                    "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+                                )
+                            decompressed = out
+                            break
+                        except zlib.error:
+                            continue
+                    if decompressed is None:
+                        raise _ExecutionError(
+                            "States.Http.InvalidCompressionType",
+                            "Invalid Compression type received from the server",
+                        )
+                    body_bytes = decompressed
+                else:
+                    raise _ExecutionError(
+                        "States.Http.InvalidCompressionType",
+                        "Invalid Compression type received from the server",
+                    )
         try:
-            decoded = raw.decode(explicit_charset or "utf-8", errors="strict")
+            decoded = body_bytes.decode(explicit_charset or "utf-8", errors="strict")
         except UnicodeDecodeError:
             raise _ExecutionError(
                 "States.Runtime",
@@ -6738,11 +6842,12 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
                 "This is likely caused by the response being binary/image/video/audio data.",
             ) from None
         if raw_media_type == "application/json" and decoded != "":
-            if decoded.strip() == "":
+            stripped = decoded.lstrip()
+            if not stripped:
                 result["ResponseBody"] = None
             else:
                 try:
-                    result["ResponseBody"] = json.loads(decoded)
+                    result["ResponseBody"], _ = json.JSONDecoder().raw_decode(stripped)
                 except ValueError:
                     result["ResponseBody"] = decoded
         else:

@@ -12384,3 +12384,139 @@ def test_sfn_http_task_transform_and_request_edge_cases(sfn, sfn_sync, eb):
             assert json.loads(r_opt["output"])["ResponseBody"]["method"] == "OPTIONS"
     finally:
         server.shutdown()
+
+
+def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync, eb):
+    """gzip/deflate responses are transparently decompressed while keeping raw bytes in TRACE and headers; unknown
+    Content-Encoding fails with States.Http.InvalidCompressionType; application/json parses the first JSON value
+    (tolerating trailing tokens, leaving BOM-prefixed bodies as strings); JSONata dynamic extra fields validate at
+    runtime; execution history records resourceType='http' and resource='invoke' (AWS capture 2026-11-24)."""
+    import gzip
+    import threading
+    import zlib
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            path = self.path.split("?", 1)[0]
+            headers = {}
+            if path == "/gzip-json":
+                body = gzip.compress(b'{"compressed":"gzip"}')
+                ct = "application/json"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/gzip-text":
+                body = gzip.compress(b"hello gzip")
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/deflate-json":
+                body = zlib.compress(b'{"compressed":"deflate"}')
+                ct = "application/json"
+                headers["Content-Encoding"] = "deflate"
+            elif path == "/ce-bogus":
+                body = b"plain text"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "bogus-enc"
+            elif path == "/json-two":
+                body = b'{"a":1}{"b":2}'
+                ct = "application/json"
+            elif path == "/json-trailing":
+                body = b'{"a":1} trailing'
+                ct = "application/json"
+            elif path == "/json-bom":
+                body = b'\xef\xbb\xbf{"a":1}'
+                ct = "application/json"
+            else:
+                body = b'{"ok":true}'
+                ct = "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    try:
+        with _http_task_connection(eb) as (_, conn):
+            def ts(path, *, ql=None, extra_params=None, inp="{}"):
+                params = {"ApiEndpoint": f"{url}{path}", "Method": "GET", "Authentication": {"ConnectionArn": conn}}
+                if extra_params:
+                    params.update(extra_params)
+                st = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "End": True}
+                if ql == "JSONata":
+                    st["QueryLanguage"] = "JSONata"
+                    st["Arguments"] = params
+                else:
+                    st["Parameters"] = params
+                return sfn_sync.test_state(
+                    definition=json.dumps(st), roleArn=role, input=inp, inspectionLevel="TRACE")
+
+            # Transparent gzip and deflate decompression; Headers retain Content-Encoding.
+            r_gz = ts("/gzip-json")
+            out_gz = json.loads(r_gz["output"])
+            assert out_gz["ResponseBody"] == {"compressed": "gzip"}
+            assert out_gz["Headers"]["Content-Encoding"] == ["gzip"]
+            assert "\ufffd" in r_gz["inspectionData"]["response"]["body"]
+
+            assert json.loads(ts("/gzip-text")["output"])["ResponseBody"] == "hello gzip"
+            assert json.loads(ts("/deflate-json")["output"])["ResponseBody"] == {"compressed": "deflate"}
+
+            r_bogus = ts("/ce-bogus")
+            assert (r_bogus["status"], r_bogus["error"], r_bogus["cause"]) == (
+                "FAILED", "States.Http.InvalidCompressionType", "Invalid Compression type received from the server")
+            assert r_bogus["inspectionData"]["response"]["body"] == "plain text"
+
+            # Jackson-compatible JSON parsing: first JSON value wins over trailing tokens; UTF-8 BOM stays string.
+            assert json.loads(ts("/json-two")["output"])["ResponseBody"] == {"a": 1}
+            assert json.loads(ts("/json-trailing")["output"])["ResponseBody"] == {"a": 1}
+            assert json.loads(ts("/json-bom")["output"])["ResponseBody"] == '\ufeff{"a":1}'
+
+            # JSONata dynamic extra field passes definition validation and fails at runtime with States.Runtime.
+            r_jexpr = ts("/echo", ql="JSONata", extra_params={"ExtraField": "{% $states.input.x %}"},
+                         inp=json.dumps({"x": "hi"}))
+            assert r_jexpr["status"] == "FAILED"
+            assert r_jexpr["error"] == "States.Runtime"
+            assert 'The field "ExtraField" is not supported by Step Functions' in r_jexpr["cause"]
+
+            # Execution history records resourceType='http', resource='invoke', region, and parameters.
+            sm_arn = sfn.create_state_machine(
+                name=f"sfn-http-hist-{_uuid_mod.uuid4().hex[:8]}",
+                definition=json.dumps({
+                    "StartAt": "Call",
+                    "States": {"Call": {
+                        "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                        "TimeoutSeconds": 10,
+                        "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                                       "Authentication": {"ConnectionArn": conn}},
+                        "End": True,
+                    }},
+                }),
+                roleArn=role,
+            )["stateMachineArn"]
+            try:
+                exec_arn = sfn.start_execution(stateMachineArn=sm_arn, input="{}")["executionArn"]
+                desc = _wait_sfn(sfn, exec_arn)
+                assert desc["status"] == "SUCCEEDED"
+                events = {e["type"]: e for e in sfn.get_execution_history(executionArn=exec_arn)["events"]}
+                sched = events["TaskScheduled"]["taskScheduledEventDetails"]
+                assert (sched["resourceType"], sched["resource"], sched["timeoutInSeconds"]) == ("http", "invoke", 10)
+                assert json.loads(sched["parameters"])["ApiEndpoint"] == f"{url}/echo"
+                assert events["TaskStarted"]["taskStartedEventDetails"] == {"resourceType": "http", "resource": "invoke"}
+                succ = events["TaskSucceeded"]["taskSucceededEventDetails"]
+                assert (succ["resourceType"], succ["resource"]) == ("http", "invoke")
+            finally:
+                sfn.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        server.shutdown()
