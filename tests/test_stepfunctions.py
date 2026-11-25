@@ -11548,6 +11548,9 @@ def test_sfn_http_task_failed_calls(sfn, eb):
     ({"Headers": {"X-Del": "a\x7fb"}}, "The 'Headers' field must not contain control characters"),
     ({"Headers": {"X Foo": "bar"}}, "The 'Headers' field name must not contain illegal whitespace"),
     ({"Headers": {"X:Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [:]"),
+    ({"Headers": {"X%Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [%]"),
+    ({"Headers": {"X:%Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [%, :]"),
+    ({"Headers": {"X :Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [:]"),
     ({"ApiEndpoint": ""}, "The value for the 'ApiEndpoint' field cannot be empty"),
     ({"ApiEndpoint": 123}, "The value for the field 'ApiEndpoint' must be a STRING"),
     ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
@@ -12449,6 +12452,13 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
                 body = c.compress(b'{"raw":true}') + c.flush()
                 ct = "application/json"
                 headers["Content-Encoding"] = "deflate"
+            elif path == "/ce-double-gzip":
+                body = gzip.compress(gzip.compress(b'{"double":true}'))
+                ct = "application/json"
+                headers["Content-Encoding"] = "gzip, gzip"
+            elif path == "/size-262000":
+                body = b"x" * 262000
+                ct = "text/plain"
             elif path == "/json-two":
                 body = b'{"a":1}{"b":2}'
                 ct = "application/json"
@@ -12470,9 +12480,20 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
             elif path == "/json-ctrl":
                 body = b'{"a":"\x01"}'
                 ct = "application/json"
+            elif path == "/json-123abc":
+                body = b"123abc"
+                ct = "application/json"
+            elif path == "/json-truefalse":
+                body = b"truefalse"
+                ct = "application/json"
+            elif path == "/json-arr-junk":
+                body = b"[1,2]junk"
+                ct = "application/json"
             else:
+                path_only, _, qs = self.path.partition("?")
                 body = json.dumps({
-                    "path": path,
+                    "path": path_only,
+                    "rawQueryString": qs,
                     "headers": {k.lower(): v for k, v in self.headers.items()},
                 }).encode("utf-8")
                 ct = "application/json"
@@ -12523,7 +12544,7 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
                 "FAILED", "States.Http.InvalidCompressionType", "Invalid Compression type received from the server")
             assert r_bogus["inspectionData"]["response"]["body"] == "plain text"
 
-            for bad_ce in ("/ce-upper-gzip", "/ce-identity"):
+            for bad_ce in ("/ce-upper-gzip", "/ce-identity", "/ce-double-gzip"):
                 r_inv = ts(bad_ce)
                 assert (r_inv["status"], r_inv["error"]) == ("FAILED", "States.Http.InvalidCompressionType")
 
@@ -12534,44 +12555,109 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
 
             assert json.loads(ts("/ce-empty-gzip")["output"])["ResponseBody"] == ""
 
-            r_bomb = ts("/ce-bomb-gzip")
-            assert (r_bomb["status"], r_bomb["error"]) == ("FAILED", "States.DataLimitExceeded")
-            assert "response" in r_bomb["inspectionData"]
+            for big_path in ("/ce-bomb-gzip", "/size-262000"):
+                r_bomb = ts(big_path)
+                assert (r_bomb["status"], r_bomb["error"]) == ("FAILED", "States.DataLimitExceeded")
+                assert "response" in r_bomb["inspectionData"]
 
-            # Jackson-compatible JSON parsing: first value wins; BOM, NaN, Infinity, and control chars stay strings.
+            # Jackson-compatible JSON parsing: first value wins; BOM, NaN, Infinity, 123abc, truefalse stay strings.
             assert json.loads(ts("/json-two")["output"])["ResponseBody"] == {"a": 1}
             assert json.loads(ts("/json-trailing")["output"])["ResponseBody"] == {"a": 1}
+            assert json.loads(ts("/json-arr-junk")["output"])["ResponseBody"] == [1, 2]
             assert json.loads(ts("/json-bom")["output"])["ResponseBody"] == '\ufeff{"a":1}'
             assert json.loads(ts("/json-nan")["output"])["ResponseBody"] == "NaN"
             assert json.loads(ts("/json-inf")["output"])["ResponseBody"] == "Infinity"
             assert json.loads(ts("/json-obj-nan")["output"])["ResponseBody"] == '{"x":NaN}'
             assert json.loads(ts("/json-ctrl")["output"])["ResponseBody"] == '{"a":"\x01"}'
+            assert json.loads(ts("/json-123abc")["output"])["ResponseBody"] == "123abc"
+            assert json.loads(ts("/json-truefalse")["output"])["ResponseBody"] == "truefalse"
 
-            # Leading/trailing spaces on header keys are trimmed; spaces and non-ASCII in ApiEndpoint path are encoded.
-            r_trim = ts("/echo/a b", extra_params={"Headers": {" X-Foo ": "bar"}})
+            # Leading/trailing spaces on header keys are trimmed; spaces, non-ASCII, and ';' in path are encoded;
+            # empty path normalizes to '/'.
+            r_trim = ts("/echo/a b", extra_params={"Headers": {" X-Foo ": "bar", "X/Ok": "1"}})
             assert json.loads(r_trim["output"])["ResponseBody"]["headers"]["x-foo"] == "bar"
+            assert json.loads(r_trim["output"])["ResponseBody"]["headers"]["x/ok"] == "1"
             assert json.loads(r_trim["inspectionData"]["request"]["headers"])["X-Foo"] == ["bar"]
             assert r_trim["inspectionData"]["request"]["url"].endswith("/echo/a%20b")
+            assert ts("/echo/café")["inspectionData"]["request"]["url"].endswith("/echo/caf%C3%A9")
+            assert ts("/echo;v=1")["inspectionData"]["request"]["url"].endswith("/echo%3Bv%3D1")
+            assert ts("")["inspectionData"]["request"]["url"] == f"{url}/"
 
-            r_nonascii_ep = ts("/echo/café")
-            assert r_nonascii_ep["inspectionData"]["request"]["url"].endswith("/echo/caf%C3%A9")
+            # Dynamic null Method/ApiEndpoint produce bare Required fields error; Transform RequestBodyEncoding=None ok.
+            r_null_both = sfn_sync.test_state(
+                definition=json.dumps({
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {"ApiEndpoint.$": "$.u", "Method.$": "$.m", "Authentication": {"ConnectionArn": conn}},
+                    "End": True,
+                }),
+                roleArn=role, input=json.dumps({"u": None, "m": None}),
+            )
+            assert (r_null_both["status"], r_null_both["error"], r_null_both["cause"]) == (
+                "FAILED", "States.Runtime", "Required fields [ApiEndpoint, Method] are missing.")
 
-            # Connection HeaderParameters with runtime-denied headers fail cleanly after populating TRACE request.
+            assert ts("/echo", extra_params={"Transform": {"RequestBodyEncoding": None}})["status"] == "SUCCEEDED"
+            assert ts("/echo", extra_params={
+                "Transform": {"RequestBodyEncoding": "URL_ENCODED", "RequestEncodingOptions": {"ArrayFormat": None}},
+            })["status"] == "SUCCEEDED"
+
+            r_retriable = sfn_sync.test_state(
+                definition=json.dumps({
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {"ApiEndpoint": f"{url}/ce-bogus", "Method": "GET",
+                                   "Authentication": {"ConnectionArn": conn}},
+                    "Retry": [{"ErrorEquals": ["States.Http.InvalidCompressionType"],
+                               "IntervalSeconds": 2, "MaxAttempts": 3}],
+                    "End": True,
+                }),
+                roleArn=role, inspectionLevel="TRACE",
+            )
+            assert (r_retriable["status"], r_retriable["error"]) == ("RETRIABLE", "States.Http.InvalidCompressionType")
+            assert r_retriable["inspectionData"]["errorDetails"] == {
+                "retryIndex": 0, "retryBackoffIntervalSeconds": 2,
+            }
+
+            # Connection HeaderParameters: denied headers fail (even x-amz-*), unless overridden by auth header;
+            # query override is case-sensitive on flattened keys.
             with _http_task_connection(
                 eb, InvocationHttpParameters={"HeaderParameters": [{"Key": "Origin", "Value": "https://a.example"}]}
-            ) as (_, conn_origin):
-                r_co = sfn_sync.test_state(
+            ) as (_, conn_origin), _http_task_connection(
+                eb, InvocationHttpParameters={"HeaderParameters": [{"Key": "X-Amz-Custom", "Value": "v"}]}
+            ) as (_, conn_xamz), _http_task_connection(
+                eb, InvocationHttpParameters={
+                    "HeaderParameters": [{"Key": "Authorization", "Value": "Bearer override"}],
+                    "QueryStringParameters": [{"Key": "foo", "Value": "c"}, {"Key": "arr", "Value": "ca"}],
+                }
+            ) as (_, conn_auth_qp):
+                for c_bad, expected_name in ((conn_origin, "origin"), (conn_xamz, "x-amz-custom")):
+                    r_co = sfn_sync.test_state(
+                        definition=json.dumps({
+                            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                            "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                                           "Authentication": {"ConnectionArn": c_bad}},
+                            "End": True,
+                        }),
+                        roleArn=role, inspectionLevel="TRACE",
+                    )
+                    assert (r_co["status"], r_co["error"], r_co["cause"]) == (
+                        "FAILED", "States.Runtime", f"The 'Headers' field contains unsupported values: [{expected_name}]")
+                    assert "request" in r_co["inspectionData"]
+
+                r_ok_auth = sfn_sync.test_state(
                     definition=json.dumps({
                         "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
-                        "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
-                                       "Authentication": {"ConnectionArn": conn_origin}},
+                        "Parameters": {
+                            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+                            "QueryParameters": {"Foo": "T", "arr": ["x", "y"]},
+                            "Authentication": {"ConnectionArn": conn_auth_qp},
+                        },
                         "End": True,
                     }),
-                    roleArn=role, inspectionLevel="TRACE",
+                    roleArn=role, inspectionLevel="TRACE", revealSecrets=True,
                 )
-                assert (r_co["status"], r_co["error"], r_co["cause"]) == (
-                    "FAILED", "States.Runtime", "The 'Headers' field contains unsupported values: [origin]")
-                assert "request" in r_co["inspectionData"]
+                assert r_ok_auth["status"] == "SUCCEEDED"
+                echo_ok = json.loads(r_ok_auth["output"])["ResponseBody"]
+                assert echo_ok["headers"]["authorization"] == "Basic dTpw"
+                assert echo_ok["rawQueryString"] == "Foo=T&arr%5B0%5D=x&arr%5B1%5D=y&foo=c&arr=ca"
 
             # JSONata dynamic extra field passes definition validation and fails at runtime with States.Runtime.
             r_jexpr = ts("/echo", ql="JSONata", extra_params={"ExtraField": "{% $states.input.x %}"},
