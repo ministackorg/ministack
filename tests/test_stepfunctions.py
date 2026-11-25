@@ -11546,8 +11546,13 @@ def test_sfn_http_task_failed_calls(sfn, eb):
     ({"Headers": {"X-Cr": "a\rb"}}, "The 'Headers' field must not contain control characters"),
     ({"Headers": {"X-Lf": "a\nb"}}, "The 'Headers' field must not contain control characters"),
     ({"Headers": {"X-Del": "a\x7fb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X Foo": "bar"}}, "The 'Headers' field name must not contain illegal whitespace"),
+    ({"Headers": {"X:Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [:]"),
+    ({"ApiEndpoint": ""}, "The value for the 'ApiEndpoint' field cannot be empty"),
+    ({"ApiEndpoint": 123}, "The value for the field 'ApiEndpoint' must be a STRING"),
     ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
     ({"InvocationConfig": {"ConnectionArn": ""}}, "The value for the 'ConnectionArn' field must have a minimum length of 1"),
+    ({"InvocationConfig": {"ConnectionArn": 123}}, "The value of the field 'InvocationConfig' has an invalid format"),
     ({"InvocationConfig": {"ConnectionArn": "not-an-arn"}}, "The value for the 'ConnectionArn' field is not valid"),
     ({"InvocationConfig": {"ConnectionArn": "arn:aws:events:us-west-2:000000000000:connection/none"}},
      "The value for the 'ConnectionArn' field has region us-west-2 but must be the same region as the state machine (us-east-1)"),
@@ -12419,6 +12424,31 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
                 body = b"plain text"
                 ct = "text/plain"
                 headers["Content-Encoding"] = "bogus-enc"
+            elif path == "/ce-corrupt-gzip":
+                body = b"not valid gzip"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/ce-empty-gzip":
+                body = b""
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/ce-bomb-gzip":
+                body = gzip.compress(b"x" * 300000)
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/ce-upper-gzip":
+                body = gzip.compress(b'{"ok":true}')
+                ct = "application/json"
+                headers["Content-Encoding"] = "GZIP"
+            elif path == "/ce-identity":
+                body = b"plain"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "identity"
+            elif path == "/ce-raw-deflate":
+                c = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+                body = c.compress(b'{"raw":true}') + c.flush()
+                ct = "application/json"
+                headers["Content-Encoding"] = "deflate"
             elif path == "/json-two":
                 body = b'{"a":1}{"b":2}'
                 ct = "application/json"
@@ -12428,8 +12458,23 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
             elif path == "/json-bom":
                 body = b'\xef\xbb\xbf{"a":1}'
                 ct = "application/json"
+            elif path == "/json-nan":
+                body = b"NaN"
+                ct = "application/json"
+            elif path == "/json-inf":
+                body = b"Infinity"
+                ct = "application/json"
+            elif path == "/json-obj-nan":
+                body = b'{"x":NaN}'
+                ct = "application/json"
+            elif path == "/json-ctrl":
+                body = b'{"a":"\x01"}'
+                ct = "application/json"
             else:
-                body = b'{"ok":true}'
+                body = json.dumps({
+                    "path": path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                }).encode("utf-8")
                 ct = "application/json"
             self.send_response(200)
             self.send_header("Content-Type", ct)
@@ -12478,10 +12523,55 @@ def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync
                 "FAILED", "States.Http.InvalidCompressionType", "Invalid Compression type received from the server")
             assert r_bogus["inspectionData"]["response"]["body"] == "plain text"
 
-            # Jackson-compatible JSON parsing: first JSON value wins over trailing tokens; UTF-8 BOM stays string.
+            for bad_ce in ("/ce-upper-gzip", "/ce-identity"):
+                r_inv = ts(bad_ce)
+                assert (r_inv["status"], r_inv["error"]) == ("FAILED", "States.Http.InvalidCompressionType")
+
+            for corrupt_ce in ("/ce-corrupt-gzip", "/ce-raw-deflate"):
+                r_parse = ts(corrupt_ce)
+                assert (r_parse["status"], r_parse["error"], r_parse["cause"]) == (
+                    "FAILED", "States.Http.FailedToParseResponse", "Failed to parse HTTP response")
+
+            assert json.loads(ts("/ce-empty-gzip")["output"])["ResponseBody"] == ""
+
+            r_bomb = ts("/ce-bomb-gzip")
+            assert (r_bomb["status"], r_bomb["error"]) == ("FAILED", "States.DataLimitExceeded")
+            assert "response" in r_bomb["inspectionData"]
+
+            # Jackson-compatible JSON parsing: first value wins; BOM, NaN, Infinity, and control chars stay strings.
             assert json.loads(ts("/json-two")["output"])["ResponseBody"] == {"a": 1}
             assert json.loads(ts("/json-trailing")["output"])["ResponseBody"] == {"a": 1}
             assert json.loads(ts("/json-bom")["output"])["ResponseBody"] == '\ufeff{"a":1}'
+            assert json.loads(ts("/json-nan")["output"])["ResponseBody"] == "NaN"
+            assert json.loads(ts("/json-inf")["output"])["ResponseBody"] == "Infinity"
+            assert json.loads(ts("/json-obj-nan")["output"])["ResponseBody"] == '{"x":NaN}'
+            assert json.loads(ts("/json-ctrl")["output"])["ResponseBody"] == '{"a":"\x01"}'
+
+            # Leading/trailing spaces on header keys are trimmed; spaces and non-ASCII in ApiEndpoint path are encoded.
+            r_trim = ts("/echo/a b", extra_params={"Headers": {" X-Foo ": "bar"}})
+            assert json.loads(r_trim["output"])["ResponseBody"]["headers"]["x-foo"] == "bar"
+            assert json.loads(r_trim["inspectionData"]["request"]["headers"])["X-Foo"] == ["bar"]
+            assert r_trim["inspectionData"]["request"]["url"].endswith("/echo/a%20b")
+
+            r_nonascii_ep = ts("/echo/café")
+            assert r_nonascii_ep["inspectionData"]["request"]["url"].endswith("/echo/caf%C3%A9")
+
+            # Connection HeaderParameters with runtime-denied headers fail cleanly after populating TRACE request.
+            with _http_task_connection(
+                eb, InvocationHttpParameters={"HeaderParameters": [{"Key": "Origin", "Value": "https://a.example"}]}
+            ) as (_, conn_origin):
+                r_co = sfn_sync.test_state(
+                    definition=json.dumps({
+                        "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                        "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                                       "Authentication": {"ConnectionArn": conn_origin}},
+                        "End": True,
+                    }),
+                    roleArn=role, inspectionLevel="TRACE",
+                )
+                assert (r_co["status"], r_co["error"], r_co["cause"]) == (
+                    "FAILED", "States.Runtime", "The 'Headers' field contains unsupported values: [origin]")
+                assert "request" in r_co["inspectionData"]
 
             # JSONata dynamic extra field passes definition validation and fails at runtime with States.Runtime.
             r_jexpr = ts("/echo", ql="JSONata", extra_params={"ExtraField": "{% $states.input.x %}"},

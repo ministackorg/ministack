@@ -6143,6 +6143,7 @@ _HTTP_TASK_ALLOWED_FIELDS = frozenset({
     "Headers", "QueryParameters", "RequestBody", "Transform",
 })
 _HTTP_TASK_ARRAY_FORMATS = ("INDICES", "BRACKETS", "REPEAT", "COMMAS")
+_HTTP_TASK_ILLEGAL_HEADER_CHARS = frozenset('()<>@,;:\\"/[]?={}')
 # Real AWS ConnectionArns carry a trailing /<uuid>; MiniStack's eventbridge.create_connection omits it, so accept both.
 _HTTP_TASK_CONN_ARN_RE = re.compile(
     r"^arn:aws[a-z-]*:events:([a-z0-9-]+):(\d{12}):connection/[^/\s]+(?:/[^/\s]+)?$"
@@ -6198,12 +6199,18 @@ def _http_task_headers_error(headers, *, static=False, jsonata=False) -> str | N
             return "'Header' values must be strings or arrays of strings."
         else:
             texts = [key, val]
-        # AWS schema-validates Headers as printable US-ASCII (capture 2026-11-24, us-west-2).
+        # AWS schema-validates Headers as printable US-ASCII and RFC 7230 token names (captures 2026-11-24).
         if any(ord(ch) > 127 for text in texts for ch in text):
             return "The 'Headers' field must only contain US-ASCII characters"
         if any(ord(ch) < 32 or ord(ch) == 127 for text in texts for ch in text):
             return "The 'Headers' field must not contain control characters"
-        lower = key.lower()
+        trimmed = key.strip()
+        if " " in trimmed:
+            return "The 'Headers' field name must not contain illegal whitespace"
+        bad_chars = list(dict.fromkeys(ch for ch in trimmed if ch in _HTTP_TASK_ILLEGAL_HEADER_CHARS))
+        if bad_chars:
+            return f"The 'Headers' field name must not contain illegal characters [{', '.join(bad_chars)}]"
+        lower = trimmed.lower()
         if lower in _HTTP_TASK_SCHEMA_DENIED_HEADERS or lower.startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES):
             if lower not in denied:
                 denied.append(lower)
@@ -6285,8 +6292,10 @@ def _http_task_schema_errors(params, *, static=False, jsonata=False) -> list[str
     if missing:
         return missing
 
-    if not static_skip(params, "Method") and params.get("Method") not in _HTTP_TASK_METHODS:
-        return ["The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"]
+    if not static_skip(params, "Method"):
+        method_val = params.get("Method")
+        if not (static and method_val is None) and method_val not in _HTTP_TASK_METHODS:
+            return ["The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"]
 
     errors = []
     for k in params:
@@ -6309,16 +6318,27 @@ def _http_task_schema_errors(params, *, static=False, jsonata=False) -> list[str
 
     if not static_skip(params, "ApiEndpoint"):
         endpoint = params.get("ApiEndpoint")
-        url = urllib.parse.urlsplit(endpoint) if isinstance(endpoint, str) else None
-        if url is None or not url.scheme or not url.netloc:
-            errors.append("The value for the 'ApiEndpoint' field is not valid")
-        elif url.scheme not in ("http", "https"):
-            errors.append("The value for the 'ApiEndpoint' field must have the scheme 'https'")
-        elif url.query:
-            errors.append("The value for the 'ApiEndpoint' field must not contain query parameters")
+        if static and endpoint is None:
+            pass
+        elif not isinstance(endpoint, str):
+            errors.append("The value for the field 'ApiEndpoint' must be a STRING")
+        elif not endpoint:
+            errors.append("The value for the 'ApiEndpoint' field cannot be empty")
+        else:
+            url = urllib.parse.urlsplit(endpoint)
+            if not url.scheme or not url.netloc:
+                errors.append("The value for the 'ApiEndpoint' field is not valid")
+            elif url.scheme not in ("http", "https"):
+                errors.append("The value for the 'ApiEndpoint' field must have the scheme 'https'")
+            elif url.query:
+                errors.append("The value for the 'ApiEndpoint' field must not contain query parameters")
 
-    has_inv = has_field(params, "InvocationConfig")
-    has_auth = has_field(params, "Authentication")
+    has_inv = (params.get("InvocationConfig") is not None) or (
+        static and not jsonata and "InvocationConfig.$" in params
+    )
+    has_auth = (params.get("Authentication") is not None) or (
+        static and not jsonata and "Authentication.$" in params
+    )
     if has_inv and has_auth:
         errors.append("The field 'InvocationConfig' cannot be used with 'Authentication'")
     elif not has_inv and not has_auth:
@@ -6341,7 +6361,9 @@ def _http_task_schema_errors(params, *, static=False, jsonata=False) -> list[str
                 elif not static_skip(auth_obj, "ConnectionArn"):
                     if not has_field(auth_obj, "ConnectionArn") or auth_obj.get("ConnectionArn") is None:
                         errors.append("The field 'InvocationConfig.ConnectionArn' is required but was missing")
-                    elif not isinstance(auth_obj.get("ConnectionArn"), str) or not auth_obj["ConnectionArn"]:
+                    elif not isinstance(auth_obj.get("ConnectionArn"), str):
+                        errors.append(f"The value of the field '{auth_key}' has an invalid format")
+                    elif not auth_obj["ConnectionArn"]:
                         errors.append("The value for the 'ConnectionArn' field must have a minimum length of 1")
                     else:
                         m = _HTTP_TASK_CONN_ARN_RE.match(auth_obj["ConnectionArn"])
@@ -6493,7 +6515,8 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
         )
 
     url = urllib.parse.urlsplit(input_data["ApiEndpoint"])
-    base_endpoint = urllib.parse.urlunsplit((url.scheme, url.netloc, url.path, "", ""))
+    encoded_path = urllib.parse.quote(url.path, safe="/:@!$&'()*+,;=-._~")
+    base_endpoint = urllib.parse.urlunsplit((url.scheme, url.netloc, encoded_path, "", ""))
     auth_cfg = input_data.get("InvocationConfig") or input_data.get("Authentication")
     conn_arn = auth_cfg["ConnectionArn"]
     # QueryParameters accepts an object or array (0=v0&1=v1); other shapes are ignored (AWS capture 2026-11-24).
@@ -6524,11 +6547,11 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
         ("Range", "bytes=0-262144"),
     ]
     fixed_lower = {"user-agent", "range"}
-    # A task cannot replace User-Agent or Range; distinct-case duplicate task headers are both kept.
+    # A task cannot replace User-Agent or Range; leading/trailing whitespace on keys is trimmed.
     task_hdr_pairs = [
-        (name, ", ".join(value) if isinstance(value, list) else value)
+        (name.strip(), ", ".join(value) if isinstance(value, list) else value)
         for name, value in task_headers.items()
-        if name.lower() not in fixed_lower
+        if name.strip().lower() not in fixed_lower
     ]
     conn_hdr_map = {
         name.lower(): (name, value)
@@ -6621,6 +6644,13 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
             if shown_body is not None:
                 req_trace["body"] = shown_body
             trace["request"] = req_trace
+
+        conn_denied = [low for low in conn_hdr_map if low in _HTTP_TASK_RUNTIME_DENIED_HEADERS]
+        if conn_denied:
+            raise _ExecutionError(
+                "States.Runtime",
+                f"The 'Headers' field contains unsupported values: [{', '.join(conn_denied)}]",
+            )
 
         if any(name.lower() == "content-length" for name in wire_trace_dict) or (
             input_data["Method"] == "OPTIONS" and data is not None
@@ -6778,7 +6808,7 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
     if has_resp_body:
         body_bytes = raw
         content_encodings = [
-            enc.strip().lower()
+            enc.strip()
             for hdr_val in (response_headers.get_all("Content-Encoding") or [])
             for enc in hdr_val.split(",")
             if enc.strip()
@@ -6787,52 +6817,49 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
             import zlib
 
             for enc in reversed(content_encodings):
-                if enc == "identity":
-                    continue
-                if enc in ("gzip", "x-gzip"):
+                if enc == "gzip":
+                    wbits = 16 + zlib.MAX_WBITS
+                elif enc == "deflate":
+                    wbits = zlib.MAX_WBITS
+                elif enc == "br":
                     try:
-                        decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                        body_bytes = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
-                        if len(body_bytes) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
-                            body_bytes += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(body_bytes))
-                        if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
-                            raise _ExecutionError(
-                                "States.DataLimitExceeded",
-                                "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
-                            )
-                    except zlib.error:
+                        import brotli
+                    except ImportError:
                         raise _ExecutionError(
                             "States.Http.InvalidCompressionType",
                             "Invalid Compression type received from the server",
                         ) from None
-                elif enc == "deflate":
-                    decompressed = None
-                    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
-                        try:
-                            decomp = zlib.decompressobj(wbits)
-                            out = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
-                            if len(out) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
-                                out += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(out))
-                            if len(out) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
-                                raise _ExecutionError(
-                                    "States.DataLimitExceeded",
-                                    "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
-                                )
-                            decompressed = out
-                            break
-                        except zlib.error:
-                            continue
-                    if decompressed is None:
+                    try:
+                        body_bytes = brotli.decompress(body_bytes)
+                    except Exception:
                         raise _ExecutionError(
-                            "States.Http.InvalidCompressionType",
-                            "Invalid Compression type received from the server",
+                            "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
+                        ) from None
+                    if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES:
+                        raise _ExecutionError(
+                            "States.DataLimitExceeded",
+                            "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
                         )
-                    body_bytes = decompressed
+                    continue
                 else:
                     raise _ExecutionError(
                         "States.Http.InvalidCompressionType",
                         "Invalid Compression type received from the server",
                     )
+                try:
+                    decomp = zlib.decompressobj(wbits)
+                    body_bytes = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
+                    if len(body_bytes) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
+                        body_bytes += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(body_bytes))
+                    if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
+                        raise _ExecutionError(
+                            "States.DataLimitExceeded",
+                            "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+                        )
+                except zlib.error:
+                    raise _ExecutionError(
+                        "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
+                    ) from None
         try:
             decoded = body_bytes.decode(explicit_charset or "utf-8", errors="strict")
         except UnicodeDecodeError:
@@ -6846,8 +6873,11 @@ def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=Fa
             if not stripped:
                 result["ResponseBody"] = None
             else:
+                def _reject_constant(token):
+                    raise ValueError(f"Unsupported JSON constant: {token}")
+
                 try:
-                    result["ResponseBody"], _ = json.JSONDecoder().raw_decode(stripped)
+                    result["ResponseBody"], _ = json.JSONDecoder(parse_constant=_reject_constant).raw_decode(stripped)
                 except ValueError:
                     result["ResponseBody"] = decoded
         else:
