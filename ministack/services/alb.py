@@ -59,6 +59,19 @@ TARGET_IDLE_TIMEOUT = float(os.environ.get("ALB_TARGET_IDLE_TIMEOUT_SECONDS", "6
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
+# ALB rejects a request to a Lambda target whose raw body exceeds 1 MiB with 413
+# and does not invoke the function; instance/ip targets have no such limit.
+LAMBDA_TARGET_MAX_BODY_BYTES = 1_048_576
+_ENTITY_TOO_LARGE_BODY = (
+    b"<html>\r\n"
+    b"<head><title>413 Request Entity Too Large</title></head>\r\n"
+    b"<body>\r\n"
+    b"<center><h1>413 Request Entity Too Large</h1></center>\r\n"
+    b"</body>\r\n"
+    b"</html>\r\n"
+    + b"<!-- a padding to disable MSIE and Chrome friendly error page -->\r\n" * 6
+)
+
 # authenticate-oidc defaults, matching the AWS API.
 OIDC_DEFAULT_COOKIE_NAME = "AWSELBAuthSessionCookie"
 OIDC_DEFAULT_SESSION_TIMEOUT = 604800  # 7 days, as AWS documents
@@ -2466,6 +2479,8 @@ async def _forward_to_tg(tg_arn, method, path, headers, body, query_params, raw_
     target_type = tg.get("TargetType", "instance")
 
     if target_type == "lambda":
+        if body and len(body) > LAMBDA_TARGET_MAX_BODY_BYTES:
+            return 413, {"Content-Type": "text/html"}, _ENTITY_TOO_LARGE_BODY
         func_id = registered[0]["Id"]
         return await _invoke_lambda_target(func_id, tg_arn, method, path,
                                            headers, body, query_params, raw_query_string)
