@@ -87,12 +87,13 @@ def _frame(type_byte, payload):
     return type_byte + struct.pack("!I", len(payload) + 4) + payload
 
 
-def _error_response(sqlstate, message, detail=None):
+def _error_response(sqlstate, message, detail=None, hint=None):
     payload = (
         b"SERROR\0VERROR\0"
         + b"C" + sqlstate.encode() + b"\0"
         + b"M" + message.encode() + b"\0"
         + (b"D" + detail.encode() + b"\0" if detail else b"")
+        + (b"H" + hint.encode() + b"\0" if hint else b"")
         + b"\0"
     )
     return _frame(b"E", payload)
@@ -437,10 +438,11 @@ def _sql_tokens(sql):
 class DsqlError:
     """Validator rejection: rendered as a PG ErrorResponse."""
 
-    def __init__(self, sqlstate, message, detail=None):
+    def __init__(self, sqlstate, message, detail=None, hint=None):
         self.sqlstate = sqlstate
         self.message = message
         self.detail = detail
+        self.hint = hint
 
     def __repr__(self):
         return f"DsqlError({self.sqlstate!r}, {self.message!r})"
@@ -914,6 +916,10 @@ def _check_column_types(sql):
 def _check_alter_table(sql):
     if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
         return None
+    if (re.search(r"\bVALIDATE\s+CONSTRAINT\b", sql, re.I)
+            and not re.match(r"\s*ALTER\s+TABLE\s+ASYNC\b", sql, re.I)):
+        # Real DSQL (eu-north-1, 2026-11-25): only ALTER TABLE ASYNC validates a constraint.
+        return DsqlError("0A000", "unsupported ALTER TABLE VALIDATE CONSTRAINT statement")
     if re.search(
         r"\bALTER\s+COLUMN\s+[\w\"]+\s+(?:SET\s+DATA\s+)?TYPE\b", sql, re.I
     ):
@@ -1740,7 +1746,7 @@ def _reject(conn, c_writer, err):
     """
     if conn.txn.in_txn:
         conn.txn.synthetic_abort = True
-    c_writer.write(_error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn)))
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail, getattr(err, "hint", None)) + _ready(_status(conn)))
 
 
 _ABORTED_ERR = DsqlError(
@@ -2257,6 +2263,10 @@ async def _plan_statement(conn, s, b_writer, allow_probe=True):
     job_id = match_wait_for_job(s)
     if job_id is not None:
         call = _wait_is_call(s)
+        if not call:
+            # Real DSQL (eu-north-1, 2026-11-25): wait_for_job is a procedure (prokind 'p').
+            return "error", DsqlError("42809", "sys.wait_for_job(unknown) is a procedure",
+                                      hint="To call a procedure, use CALL.")
         if isinstance(job_id, BindParam):
             return "rows", _deferred(
                 _wait_columns(call), job_id,
@@ -2379,7 +2389,7 @@ async def _handle_query(conn, sql, b_writer, c_writer):
         err, forward_sql = _abort_gate(conn, s)
         if err:
             c_writer.write(
-                _error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn))
+                _error_response(err.sqlstate, err.message, err.detail, getattr(err, "hint", None)) + _ready(_status(conn))
             )
             await c_writer.drain()
             return
@@ -2570,7 +2580,7 @@ async def _ext_error(conn, c_writer, err):
     if conn.txn.in_txn:
         conn.txn.synthetic_abort = True
     conn.ext_skip = True
-    c_writer.write(_error_response(err.sqlstate, err.message, err.detail))
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail, getattr(err, "hint", None)))
     await c_writer.drain()
 
 

@@ -88,6 +88,20 @@ def _account_region_from_function_config(config: dict) -> tuple[str, str]:
     return _lambda_function_account_region_from_arn(arn)
 
 
+# Host variables a process needs to start and find temp space; nothing else of the host's environment
+# reaches a function, which on AWS sees only the runtime's own variables.
+_HOST_PROCESS_ENV = ("PATH", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT")
+
+
+def host_process_env() -> dict[str, str]:
+    """The base environment of a local function process: LANG and TZ as on AWS (capture), plus _HOST_PROCESS_ENV."""
+    env = {k: os.environ[k] for k in _HOST_PROCESS_ENV if k in os.environ}
+    env["LANG"] = "en_US.UTF-8"
+    if os.name != "nt":
+        env["TZ"] = ":UTC"
+    return env
+
+
 def execution_credentials(config: dict) -> dict[str, str]:
     """Return account credentials or an AUTH execution-role session."""
     account_id, _region = _account_region_from_function_config(config)
@@ -1409,7 +1423,7 @@ class Worker:
             for key, value in self.config.get("Environment", {}).get("Variables", {}).items()
             if key not in _RESERVED_RUNTIME_ENV_VARS
         }
-        spawn_env = {**os.environ, **env_vars}
+        spawn_env = {**host_process_env(), **env_vars}
         # Inject standard Lambda runtime env vars to match the Docker and
         # provided-runtime execution paths in lambda_svc.py.  Real AWS
         # Lambda always injects these; the warm-worker path was missing them.

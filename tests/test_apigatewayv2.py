@@ -5373,3 +5373,27 @@ def test_apigwv2_route_without_authorization_answers_any_caller_account_contract
     finally:
         owner.delete_api(ApiId=api_id)
         server.shutdown()
+
+
+@pytest.mark.parametrize("route_key", [None, "GET /x"])
+def test_apigwv2_quick_create_makes_managed_integration_route_and_stage(apigw, route_key):
+    """CreateApi with Target makes an HTTP_PROXY integration, a route to it and an auto-deployed $default stage,
+    each ApiGatewayManaged (AWS capture, 2026-11-25)."""
+    kwargs = {"RouteKey": route_key} if route_key else {}
+    api_id = apigw.create_api(Name="quick", ProtocolType="HTTP", Target="https://example.com", **kwargs)["ApiId"]
+    try:
+        (integration,) = apigw.get_integrations(ApiId=api_id)["Items"]
+        assert {k: integration[k] for k in ("ApiGatewayManaged", "ConnectionType", "IntegrationMethod",
+                                            "IntegrationType", "IntegrationUri", "PayloadFormatVersion",
+                                            "TimeoutInMillis")} == {
+            "ApiGatewayManaged": True, "ConnectionType": "INTERNET", "IntegrationMethod": "ANY",
+            "IntegrationType": "HTTP_PROXY", "IntegrationUri": "https://example.com", "PayloadFormatVersion": "1.0",
+            "TimeoutInMillis": 30000}
+        (route,) = apigw.get_routes(ApiId=api_id)["Items"]
+        assert (route["RouteKey"], route["Target"], route["ApiGatewayManaged"], route["AuthorizationType"]) == (
+            route_key or "$default", f"integrations/{integration['IntegrationId']}", True, "NONE")
+        (stage,) = apigw.get_stages(ApiId=api_id)["Items"]
+        assert (stage["StageName"], stage["AutoDeploy"], stage["ApiGatewayManaged"],
+                stage["DefaultRouteSettings"]) == ("$default", True, True, {"DetailedMetricsEnabled": False})
+    finally:
+        apigw.delete_api(ApiId=api_id)

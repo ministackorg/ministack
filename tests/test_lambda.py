@@ -4072,8 +4072,23 @@ def test_lambda_event_invoke_config_crud(lam):
 
     lam.delete_function_event_invoke_config(FunctionName="eic-fn")
     from botocore.exceptions import ClientError
-    with pytest.raises(ClientError):
+    with pytest.raises(ClientError) as exc:
         lam.get_function_event_invoke_config(FunctionName="eic-fn")
+    arn = lam.get_function(FunctionName="eic-fn")["Configuration"]["FunctionArn"] + ":$LATEST"
+    assert exc.value.response["Error"]["Message"] == f"The function {arn} doesn't have an EventInvokeConfig"
+
+    # A setting never given is left out, Update merges, and a Put with no setting is refused (AWS capture).
+    put = lam.put_function_event_invoke_config(FunctionName="eic-fn", MaximumRetryAttempts=1)
+    assert (put["FunctionArn"], put["MaximumRetryAttempts"], put["DestinationConfig"]) == (
+        arn, 1, {"OnSuccess": {}, "OnFailure": {}})
+    assert "MaximumEventAgeInSeconds" not in lam.get_function_event_invoke_config(FunctionName="eic-fn")
+    updated = lam.update_function_event_invoke_config(FunctionName="eic-fn", MaximumEventAgeInSeconds=120)
+    assert (updated["MaximumRetryAttempts"], updated["MaximumEventAgeInSeconds"]) == (1, 120)
+    with pytest.raises(ClientError) as exc:
+        lam.put_function_event_invoke_config(FunctionName="eic-fn")
+    assert exc.value.response["Error"] == {
+        "Code": "InvalidParameterValueException",
+        "Message": "You must specify at least one of error handling or destination setting."}
 
     lam.delete_function(FunctionName="eic-fn")
 
@@ -14965,7 +14980,7 @@ def test_provided_dispatch_preserves_other_executors(monkeypatch, mode, target):
         result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
     finally:
         lambda_svc._durable_ctx.reset(token)
-    assert result == {"body": target}
+    assert result["body"] == target
     for name, executor in executors.items():
         assert executor.call_count == (1 if name == target else 0)
     if mode == "local":
@@ -14998,7 +15013,7 @@ def test_python_and_nodejs_dispatch_to_the_warm_pool_durable_or_not(
         result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
     finally:
         lambda_svc._durable_ctx.reset(token)
-    assert result == {"body": "_execute_function_warm"}
+    assert result["body"] == "_execute_function_warm"
     for name, executor in executors.items():
         assert executor.call_count == (1 if name == "_execute_function_warm" else 0)
 
@@ -15672,15 +15687,15 @@ def test_invoke_preserves_log_provenance_and_tail(monkeypatch, log_state, log_so
     assert status == 200
     assert ("X-Amz-Function-Error" in headers) == error
     tail = base64.b64decode(headers["X-Amz-Log-Result"]).decode().splitlines()
-    assert tail == raw.splitlines()
     messages = _messages(func)
-    # User-written platform-looking lines remain user logs without RIE metadata.
-    assert (messages if log_source == "rie" else messages[1:-2]) == tail
+    # The Tail carries the lines CloudWatch gets; user-written platform-looking lines remain user logs.
+    assert tail == messages
+    assert (messages if log_source == "rie" else messages[1:-2]) == raw.splitlines()
     if log_source == "rie":
         _assert_platform_lines(messages, "same-id")
     else:
         _assert_platform_lines([messages[0], *messages[-2:]], "same-id")
-        assert len(messages) == len(tail) + 3
+        assert len(messages) == len(raw.splitlines()) + 3
     forwarded = cwl._fanout_to_subscription_filters.call_args.args[2]
     assert [e["message"] for e in forwarded] == messages
 
@@ -15989,8 +16004,11 @@ exports.handler = async () => {
     assert status == 200
     assert "X-Amz-Function-Error" not in headers
     assert json.loads(payload) == {"ok": True}
-    expected_logs = ["invoke-console-message", "invoke-stderr-message"]
-    assert base64.b64decode(headers["X-Amz-Log-Result"]).decode().splitlines() == expected_logs
+    tail = base64.b64decode(headers["X-Amz-Log-Result"]).decode().splitlines()
+    # The handler output sits between START, and END and REPORT, as on AWS.
+    assert tail[1:-2] == ["invoke-console-message", "invoke-stderr-message"]
+    assert tail[0].startswith("START RequestId: ") and tail[-2].startswith("END RequestId: ")
+    assert tail[-1].startswith("REPORT RequestId: ")
 
 
 def _regional(service, region):

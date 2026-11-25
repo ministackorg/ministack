@@ -22,6 +22,7 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
           ListEventSources, PutPartnerEvents.
 """
 
+import base64
 import calendar
 import copy
 import functools
@@ -1219,6 +1220,25 @@ def _put_events_through_endpoint(data, endpoint):
     return status, headers, body
 
 
+_PUT_EVENTS_MAX_BYTES = 1024 * 1024
+
+
+def _put_events_size(entries):
+    """Entry size as the EventBridge User Guide counts it: 14 bytes for a Time, then the UTF-8 bytes of Source,
+    DetailType, Detail and each Resources ARN."""
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Time") is not None:
+            total += 14
+        for field in ("Source", "DetailType", "Detail"):
+            if isinstance(entry.get(field), str):
+                total += len(entry[field].encode("utf-8"))
+        total += sum(len(r.encode("utf-8")) for r in entry.get("Resources") or [] if isinstance(r, str))
+    return total
+
+
 def _put_events(data, allow_aws_source=False):
     """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
     if data.get("EndpointId") and (endpoint := _endpoint_by_id(data["EndpointId"])):
@@ -1233,6 +1253,9 @@ def _put_events(data, allow_aws_source=False):
             "Member must have length less than or equal to 10" % len(entries),
             400,
         )
+    if _put_events_size(entries) >= _PUT_EVENTS_MAX_BYTES:
+        # Captured on AWS: one 1100 KB entry, or two of 600 KB, fail the whole request; 1000 KB passes.
+        return error_response_json("ValidationException", "Total size of the entries in the request is over the limit.", 400)
     if any(_event_bus_in_other_region(entry.get("EventBusName")) for entry in entries):
         # Captured on AWS: a bus ARN in another region fails the whole request.
         return error_response_json("ValidationException", "Cross-region api call is not allowed.", 400)
@@ -1307,9 +1330,42 @@ def _archive_event(event, view=None):
         archive["EventCount"] = archive.get("EventCount", 0) + 1
 
 
+def _bus_key_refusal(bus_name, view):
+    """With the bus's customer managed key disabled, no rule sees the event: it goes to the bus dead-letter
+    queue as an "Encrypted Events" envelope (AWS capture). True when the event was held back."""
+    from ministack.services import kms
+    bus = _event_buses.get(bus_name) or {}
+    key = bus.get("KmsKeyIdentifier")
+    if not key or kms.held_key_state(key) != "Disabled":
+        return False
+    if not any(r.get("EventBusName", "default") == bus_name and r.get("State") == "ENABLED" for r in _rules.values()):
+        return False
+    logger.warning("EventBridge: bus %s not delivering: its KMS key %s is disabled", bus_name, key)
+    dlq_arn = (bus.get("DeadLetterConfig") or {}).get("Arn")
+    if not dlq_arn:
+        return True
+    event_json = view.event_with_detail()
+    envelope = {
+        "version": "0", "id": event_json.get("id"), "detail-type": "Encrypted Events", "source": "aws.events",
+        "account": event_json.get("account"), "time": event_json.get("time"), "region": event_json.get("region"),
+        "resources": [],
+        "detail": {"event-bus-arn": bus.get("Arn"), "kms-key-arn": kms.key_arn_for_request(key),
+                   "encrypted-payload": base64.b64encode(json.dumps(event_json).encode()).decode()},
+    }
+    attributes = {"ERROR_CODE": "EVENT_DECRYPTION_FAILURE", "ERROR_MESSAGE": "Unable to decrypt events using the Kms key."}
+    try:
+        _dispatch_to_sqs(parse_arn(dlq_arn), json.dumps(envelope), {},
+                         {k: {"DataType": "String", "StringValue": v} for k, v in attributes.items()})
+    except (ArnParseError, _TargetDeliveryError) as exc:
+        logger.warning("EventBridge: bus dead-letter queue %s not delivered: %s", dlq_arn, exc)
+    return True
+
+
 def _dispatch_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
     view = view or _pattern_event_view(event)
+    if _bus_key_refusal(bus_name, view):
+        return
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
@@ -2485,6 +2541,28 @@ def _matches_content_filter(value, filter_rule):
     return False
 
 
+class _TargetDeliveryError(Exception):
+    """A delivery the target refused, with the ERROR_CODE and ERROR_MESSAGE EventBridge records for it."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+def _send_to_target_dlq(target, event_json, rule, failure):
+    """Put the undelivered event on the target's dead-letter queue with AWS's four attributes (AWS capture)."""
+    dlq_arn = (target.get("DeadLetterConfig") or {}).get("Arn")
+    if not dlq_arn:
+        return
+    attributes = {"ERROR_CODE": failure.code, "ERROR_MESSAGE": failure.message,
+                  "RULE_ARN": rule.get("Arn", ""), "TARGET_ARN": target.get("Arn", "")}
+    try:
+        _dispatch_to_sqs(parse_arn(dlq_arn), event_json, {},
+                         {k: {"DataType": "String", "StringValue": v} for k, v in attributes.items()})
+    except (ArnParseError, _TargetDeliveryError) as exc:
+        logger.warning("EventBridge: dead-letter queue %s not delivered: %s", dlq_arn, exc)
+
+
 def _invoke_target(target, event, rule, view=None, from_rule=True):
     """Deliver ``event`` to ``target``; a schedule passes ``from_rule`` False and itself as ``rule``."""
     arn = target.get("Arn", "")
@@ -2553,6 +2631,10 @@ def _invoke_target(target, event, rule, view=None, from_rule=True):
             _dispatch_to_log_group(spec, event_payload, event, rule)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
+    except _TargetDeliveryError as failure:
+        logger.warning("EventBridge: target %s not delivered: %s %s", arn, failure.code, failure.message)
+        if from_rule:
+            _send_to_target_dlq(target, json.dumps(view.event_with_detail()), rule, failure)
     except Exception as e:
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
@@ -2834,14 +2916,12 @@ def _dispatch_to_lambda(arn, payload):
     if not func or not config:
         logger.warning("EventBridge → Lambda: function %s not found", func_name)
         return
-    exec_record = lambda_svc._execution_record_for_config(func, config)
-    threading.Thread(
-        target=lambda_svc._execute_function_with_config_scope, args=(exec_record, event), daemon=True
-    ).start()
+    # EventBridge invokes Lambda asynchronously: Lambda's event queue retries errors and throttles.
+    lambda_svc.invoke_async_with_retry(lambda_svc._execution_record_for_config(func, config), event)
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 
 
-def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
+def _dispatch_to_sqs(spec, payload, sqs_parameters=None, message_attributes=None):
     """Dispatch an EventBridge event to an SQS queue.
 
     ``sqs_parameters`` carries the target's ``SqsParameters`` block from the
@@ -2856,8 +2936,10 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     queue_name = spec.resource
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
-        logger.warning("EventBridge → SQS: queue %s not found", queue_name)
-        return
+        raise _TargetDeliveryError(
+            "NO_RESOURCE", "The specified queue does not exist or you do not have access to it. (Service: AmazonSQS; "
+            f"Status Code: 400; Error Code: AWS.SimpleQueueService.NonExistentQueue; Request ID: {new_uuid()}; "
+            "Proxy: null)")
 
     sqs_parameters = sqs_parameters or {}
     msg_id = new_uuid()
@@ -2872,7 +2954,8 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
         "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
         "attributes": {},
-        "message_attributes": {},
+        "message_attributes": dict(message_attributes or {}),
+        "md5_attrs": _sqs._md5_msg_attrs(message_attributes),
         "sys": {
             "SenderId": "AROAEXAMPLE",
             "SentTimestamp": str(int(now * 1000)),

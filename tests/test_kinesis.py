@@ -20,6 +20,13 @@ from botocore.exceptions import ClientError
 from ministack.core.responses import AccountRegionScopedDict, request_scope
 from ministack.services import kinesis
 
+
+def _cbor_loads(raw):
+    """Decode a CBOR body the way the Java SDK v2 does: a tag-1 timestamp is integer epoch milliseconds."""
+    out = bytearray()
+    kinesis._copy_without_epoch_tags(raw, 0, out)
+    return cbor2.loads(bytes(out))
+
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
 
@@ -414,7 +421,7 @@ def test_kinesis_subscribe_to_shard_cbor_events(kin):
     assert messages[0].headers[":event-type"] == "initial-response"
     event = messages[1]
     assert event.headers[":content-type"] == "application/x-amz-cbor-1.1"
-    record = cbor2.loads(event.payload)["Records"][0]
+    record = _cbor_loads(event.payload)["Records"][0]
     assert record["Data"] == b"\x00\x01"
     kin.delete_stream(StreamName=sname)
 
@@ -679,7 +686,7 @@ def test_kinesis_cbor_epoch_timestamps_past_year_9999(kin):
         req = urllib.request.Request(endpoint, data=body, method="POST", headers={
             "Content-Type": "application/x-amz-cbor-1.1", "X-Amz-Target": f"Kinesis_20131202.{target}"})
         with urllib.request.urlopen(req) as resp:
-            return cbor2.loads(resp.read())
+            return _cbor_loads(resp.read())
 
     def text(s):
         b = s.encode()
@@ -694,6 +701,50 @@ def test_kinesis_cbor_epoch_timestamps_past_year_9999(kin):
             + text("ShardIteratorType") + text("AT_TIMESTAMP") + text("Timestamp") + b"\xc1\x1a" + struct.pack(">I", 1700000000))
     it = call("GetShardIterator", body)["ShardIterator"]
     assert len(kin.get_records(ShardIterator=it)["Records"]) == 1
+
+
+def test_kinesis_cbor_timestamps_are_epoch_millis(kin):
+    """The Java SDK v2 writes and reads CBOR payload timestamps as tag 1 over integer epoch milliseconds."""
+    import struct
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    name = f"cbor-millis-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    before = time.time()
+    kin.put_record(StreamName=name, Data=b"a", PartitionKey="k")
+
+    def call(target, payload):
+        req = urllib.request.Request(endpoint, data=payload if isinstance(payload, bytes) else cbor2.dumps(payload),
+                                     method="POST", headers={"Content-Type": "application/x-amz-cbor-1.1",
+                                                             "X-Amz-Target": f"Kinesis_20131202.{target}"})
+        with urllib.request.urlopen(req) as resp:
+            return resp.read()
+
+    shard = {"StreamName": name, "ShardId": "shardId-000000000000"}
+    it = _cbor_loads(call("GetShardIterator", {**shard, "ShardIteratorType": "TRIM_HORIZON"}))["ShardIterator"]
+    raw = call("GetRecords", {"ShardIterator": it})
+    # Each timestamp is tag 1 (0xc1) over an 8-byte unsigned integer of epoch milliseconds.
+    tags = [int.from_bytes(raw[i + 2:i + 10], "big") for i in range(len(raw) - 9) if raw[i:i + 2] == b"\xc1\x1b"]
+    assert len(tags) == 1 and isinstance(tags[0], int)
+    assert before - 1 <= tags[0] / 1000 <= time.time() + 1
+    assert _cbor_loads(raw)["Records"][0]["ApproximateArrivalTimestamp"] == tags[0]
+    summary = call("DescribeStreamSummary", {"StreamName": name})
+    created = _cbor_loads(summary)["StreamDescriptionSummary"]["StreamCreationTimestamp"]
+    assert b"\xc1\x1b" + created.to_bytes(8, "big") in summary and before - 60 <= created / 1000 <= time.time()
+
+    def text(s):
+        return (bytes([0x60 + len(s)]) if len(s) < 24 else bytes([0x78, len(s)])) + s.encode()
+
+    def at(millis):
+        body = (b"\xa4" + text("StreamName") + text(name) + text("ShardId") + text("shardId-000000000000")
+                + text("ShardIteratorType") + text("AT_TIMESTAMP") + text("Timestamp") + b"\xc1\x1b"
+                + struct.pack(">Q", millis))
+        return kin.get_records(ShardIterator=_cbor_loads(call("GetShardIterator", body))["ShardIterator"])["Records"]
+
+    assert len(at(int((before - 60) * 1000))) == 1
+    assert at(int((time.time() + 60) * 1000)) == []
+    kin.delete_stream(StreamName=name)
 
 
 def test_kinesis_cbor_put_record(kin):
@@ -724,7 +775,7 @@ def test_kinesis_cbor_put_record(kin):
     )
     with urllib.request.urlopen(req) as resp:
         assert resp.status == 200
-        resp_body = cbor2.loads(resp.read())
+        resp_body = _cbor_loads(resp.read())
         assert "ShardId" in resp_body
         assert "SequenceNumber" in resp_body
 
@@ -799,7 +850,7 @@ async def _sub_call(action, data, is_cbor=False):
     assert result[0] == 200, result
     if action == "SubscribeToShard":
         return result[2]
-    return cbor2.loads(result[2]) if is_cbor else json.loads(result[2])
+    return _cbor_loads(result[2]) if is_cbor else json.loads(result[2])
 
 
 async def _sub_setup():
@@ -844,7 +895,7 @@ async def _sub_run(response, is_cbor, on_event):
             if frame.headers[":event-type"] == "initial-response":
                 continue
             assert frame.headers[":event-type"] == "SubscribeToShardEvent"
-            event = cbor2.loads(frame.payload) if is_cbor else json.loads(frame.payload)
+            event = _cbor_loads(frame.payload) if is_cbor else json.loads(frame.payload)
             events.append(event)
             if await on_event(event, len(events)):
                 disconnect.set()

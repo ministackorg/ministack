@@ -361,7 +361,7 @@ def _structure_diagnostics(definition_str) -> list:
     except (TypeError, ValueError):
         return []
     states = definition.get("States") if isinstance(definition, dict) else None
-    if not isinstance(states, dict) or not states or not all(isinstance(s, dict) for s in states.values()):
+    if not isinstance(states, dict) or not all(isinstance(s, dict) for s in states.values()):
         return []
 
     def diag(code, message, location=None):
@@ -370,7 +370,7 @@ def _structure_diagnostics(definition_str) -> list:
             d["location"] = location
         return d
 
-    out = []
+    out = [] if states else [diag("SCHEMA_VALIDATION_FAILED", "Value cannot be empty", "/States")]
     for name, state in states.items():
         if state.get("Type") in _NEXT_OR_END_TYPES:
             has_next, has_end = "Next" in state, "End" in state

@@ -2646,6 +2646,8 @@ def _update_item(data):
             _near = " ".join(_ue_tokens[:2])
             return error_response_json("ValidationException",
                 f'Invalid UpdateExpression: Syntax error; token: "{_ue_tokens[0]}", near: "{_near}"', 400)
+        if syntax := _update_syntax_error(_ue_pre):
+            return error_response_json("ValidationException", "1 validation error detected: " + syntax, 400)
     err = _envelope_condition_refs(_validate_expression_attrs(data, ("ConditionExpression", "UpdateExpression"), "envelope"))
     if err:
         return err
@@ -7590,6 +7592,117 @@ def _condition_syntax_error(expr: str, slot: str) -> str | None:
     except _ConditionSyntaxError as exc:
         return str(exc)
     return None
+
+
+_UPDATE_TOKEN_RE = re.compile(
+    r"\s*(?:(?P<op>[=(),.\[\]+-])|(?P<name>#?[A-Za-z0-9_]+)|(?P<value>:[A-Za-z0-9_]+)|(?P<other>\S))")
+_UPDATE_CLAUSES = {"SET", "REMOVE", "ADD", "DELETE"}
+
+
+def _update_syntax_error(expr: str) -> str | None:
+    """Grammar check of an UpdateExpression, reported as DynamoDB does: the token it stops at, and the text
+    from the token before it to the token after it (AWS capture, 2026-11-25). Other faults are left to the
+    evaluator."""
+    tokens = []
+    for m in _UPDATE_TOKEN_RE.finditer(expr):
+        if m.group("other"):
+            return None
+        group = "op" if m.group("op") else ("value" if m.group("value") else "name")
+        text = m.group(group)
+        kind = "clause" if group == "name" and text.upper() in _UPDATE_CLAUSES else group
+        tokens.append((kind, text, m.start(group), m.end(group)))
+    pos = 0
+
+    def peek(offset=0):
+        i = pos + offset
+        return tokens[i] if i < len(tokens) else ("EOF", "<EOF>", len(expr), len(expr))
+
+    def fail():
+        start = tokens[pos - 1][2] if pos > 0 else (tokens[pos][2] if pos < len(tokens) else len(expr))
+        end = tokens[pos + 1][3] if pos + 1 < len(tokens) else (tokens[pos][3] if pos < len(tokens) else len(expr))
+        raise _ConditionSyntaxError(f'Invalid UpdateExpression: Syntax error; token: "{peek()[1]}", near: "{expr[start:end]}"')
+
+    def take(kind=None, text=None):
+        nonlocal pos
+        tok = peek()
+        if (kind and tok[0] != kind) or (text and tok[1] != text):
+            fail()
+        pos += 1
+        return tok
+
+    def path():
+        if peek()[0] == "clause":
+            raise _UpdateSyntaxDeferred  # a keyword as a name is the reserved-word check's to report
+        if peek()[0] != "name" or peek()[1][0].isdigit():
+            fail()
+        take()
+        while peek()[1] in (".", "["):
+            if take()[1] == ".":
+                if peek()[0] != "name" or peek()[1][0].isdigit():
+                    fail()
+                take()
+            else:
+                if not peek()[1].isdigit():
+                    fail()
+                take()
+                take("op", "]")
+
+    def operand():
+        tok = peek()
+        if tok[0] == "value":
+            take()
+        elif tok[0] == "name" and peek(1)[1] == "(":
+            take()
+            take("op", "(")
+            operand()
+            while peek()[1] == ",":
+                take()
+                operand()
+            take("op", ")")
+        else:
+            path()
+
+    def term():
+        if peek()[1] == "(":
+            take()
+            value()
+            take("op", ")")
+        else:
+            operand()
+
+    def value():
+        term()
+        if peek()[1] in ("+", "-"):
+            take()
+            term()
+
+    def action(clause):
+        path()
+        if clause == "SET":
+            take("op", "=")
+            value()
+        elif clause in ("ADD", "DELETE"):
+            take("value")
+
+    try:
+        while True:
+            clause = take("clause")[1].upper()
+            action(clause)
+            while peek()[1] == ",":
+                take()
+                action(clause)
+            if peek()[0] == "EOF":
+                return None
+            if peek()[0] != "clause":
+                fail()
+    except _ConditionSyntaxError as exc:
+        return str(exc)
+    except _UpdateSyntaxDeferred:
+        return None
+
+
+class _UpdateSyntaxDeferred(Exception):
+    pass
 
 
 def _evaluate_condition(expr, item, attr_values, attr_names,

@@ -1981,6 +1981,30 @@ def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list
     return arns
 
 
+def eventbridge_entry_checks(body: bytes, region: str, account_id: str) -> list[tuple[str, dict]]:
+    """``(bus ARN, condition keys)`` for each ``PutEvents`` entry, in request order: AWS checks every entry against
+    its own bus with its ``events:source`` and ``events:detail-type``."""
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    entries = data.get("Entries") if isinstance(data, dict) else None
+    checks = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        bus = entry.get("EventBusName")
+        if not isinstance(bus, str) or not bus:
+            bus = "default"
+        arn = bus if bus.startswith("arn:") else f"arn:aws:events:{region}:{account_id}:event-bus/{bus}"
+        context = {"events:eventbusinvocation": "false"}
+        for key, field in (("events:source", "Source"), ("events:detail-type", "DetailType")):
+            if isinstance(entry.get(field), str):
+                context[key] = entry[field]
+        checks.append((arn, context))
+    return checks
+
+
 def _dynamodb_table_arn(table: str, region: str, account_id: str) -> str:
     """TableName also accepts the table's ARN."""
     if table.startswith("arn:"):
@@ -2448,6 +2472,10 @@ def request_field_context(service: str, iam_action: str, body: bytes, params: di
     if not isinstance(data, dict):
         data = {}
     context: dict = {}
+    if service == "events" and action == "PutEvents":
+        checks = eventbridge_entry_checks(body, region, get_account_id())
+        if checks:
+            context.update(checks[0][1])
     if service == "kms":
         context["kms:CallerAccount"] = get_account_id()
         encryption_context = data.get("EncryptionContext")
@@ -2718,6 +2746,13 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         return (
             400, {"Content-Type": content_type, "x-amzn-errortype": "AccessDeniedException"},
             json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
+        )
+    if service == "events" and action == "events:PutEvents" and not error_code and resource_arn.startswith("arn:"):
+        # A refused PutEvents is HTTP 400 and names the bus (AWS capture).
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "message": message or identity_denial_message(
+                action, principal_arn, resource_arn, explicit_deny)}).encode(),
         )
     if service == "iot-data":
         # The IoT data plane answers every refusal ForbiddenException: "Forbidden"

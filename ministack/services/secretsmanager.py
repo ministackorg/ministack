@@ -652,6 +652,25 @@ def _foreign_key_refusal(action, secret, owner):
     return None
 
 
+def _kms_value_error(kms_key_id, operation):
+    """The error a value read ("decrypt"), write ("encrypt") or CreateSecret ("create") gets when the secret's
+    customer managed key is disabled or pending deletion (AWS capture), or None."""
+    from ministack.services import kms
+    state = kms.held_key_state_error(kms_key_id) if kms_key_id else None
+    if state is None:
+        return None
+    code, message = state
+    if operation == "create" and code == "DisabledException":
+        return error_response_json("InvalidParameterException",
+                                   "The operation failed because the specified KMS key is disabled.", 400)
+    detail = f"{message} (Service: AWSKMS; Status Code: 400; Error Code: {code}; Request ID: {new_uuid()}; Proxy: null)"
+    if operation == "create":
+        return error_response_json("PreconditionNotMetException", detail, 400)
+    if operation == "decrypt":
+        return error_response_json("DecryptionFailure", f"Secrets Manager can't decrypt the secret value: {detail}", 400)
+    return error_response_json("EncryptionFailure", f"Secrets Manager can't encrypt the secret value: {detail}", 400)
+
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
@@ -702,6 +721,10 @@ def _create_secret(data):
             "ResourceExistsException",
             f"The operation failed because the secret {name} already exists.", 400,
         )
+    if data.get("SecretString") is not None or data.get("SecretBinary") is not None:
+        kms_error = _kms_value_error(data.get("KmsKeyId"), "create")
+        if kms_error:
+            return kms_error
 
     arn, vid = _store_new_secret(
         name,
@@ -740,6 +763,9 @@ def _get_secret_value(data):
             "InvalidRequestException",
             "You can't perform this operation on the secret because it was marked for deletion.", 400,
         )
+    kms_error = _kms_value_error(secret.get("KmsKeyId"), "decrypt")
+    if kms_error:
+        return kms_error
 
     secret["LastAccessedDate"] = int(time.time())
 
@@ -1091,6 +1117,9 @@ def _put_secret_value(data):
         )
     if _is_replica(secret):
         return _replica_mutation_error()
+    kms_error = _kms_value_error(secret.get("KmsKeyId"), "encrypt")
+    if kms_error:
+        return kms_error
 
     vid = data.get("ClientRequestToken", new_uuid())
     stages = data.get("VersionStages", ["AWSCURRENT"])

@@ -3175,6 +3175,7 @@ async def _dispatch_service_request(
             dynamodb_service_context,
             dynamodb_transaction_checks,
             dynamodb_transaction_items,
+            eventbridge_entry_checks,
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
@@ -3337,13 +3338,16 @@ async def _dispatch_service_request(
                 if endpoint_arn:
                     denied = enforce(access_key, iam_action, service, region, resource_arn=endpoint_arn)
             if service == "events" and not denied:
-                for extra_arn in eventbridge_resource_arns(
-                        body, region, get_account_id())[1:]:
+                extra_checks = (eventbridge_entry_checks(body, region, get_account_id())[1:]
+                                if iam_action == "events:PutEvents"
+                                else [(arn, {}) for arn in eventbridge_resource_arns(body, region, get_account_id())[1:]])
+                for extra_arn, entry_context in extra_checks:
                     denied = enforce(
                         access_key, iam_action, service, region,
-                        resource_arn=extra_arn,
+                        resource_arn=extra_arn, service_context={**service_context, **entry_context},
                     )
                     if denied:
+                        resource_arn = extra_arn
                         break
             # A thing-group membership call is also checked on the thing it names.
             if service == "iot" and not denied:

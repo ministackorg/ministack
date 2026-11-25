@@ -624,6 +624,19 @@ def held_key_state(key_ref):
     return rec["KeyState"] if rec else None
 
 
+def held_key_state_error(key_ref):
+    """``(error code, message)`` KMS answers a cryptographic call on the held key *key_ref* in this state, or None."""
+    rec = _resolve_key(key_ref)
+    if rec is None:
+        return None
+    state = rec["KeyState"]
+    if state == "Disabled":
+        return "DisabledException", f"{rec['Arn']} is disabled."
+    if state in ("PendingDeletion", "PendingImport"):
+        return "KMSInvalidStateException", f"{rec['Arn']} is {'pending deletion' if state == 'PendingDeletion' else 'pending import'}."
+    return None
+
+
 def key_policy_names(key_ref, action, principal_arn):
     """Whether the key policy of the customer managed key *key_ref* allows *principal_arn* ``kms:<action>`` by naming
     it; an account principal only delegates to IAM. An AWS managed or unheld key returns True."""

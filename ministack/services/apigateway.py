@@ -1920,7 +1920,29 @@ def _create_api(data):
     _stages[api_id] = {}
     _deployments[api_id] = {}
     _api_tags[_api_arn(api_id)] = dict(data.get("tags", {}))
+    if data.get("target") and protocol == "HTTP":
+        _quick_create(api_id, data)
     return _apigw_response(api, 201)
+
+
+def _quick_create(api_id, data):
+    """Quick create: an integration with the target, a route to it and an auto-deployed $default stage, each
+    marked apiGatewayManaged (AWS capture)."""
+    target = data["target"]
+    spec = {"integrationType": "AWS_PROXY", "integrationUri": target}
+    if target.startswith(("http://", "https://")):
+        spec = {"integrationType": "HTTP_PROXY", "integrationUri": target, "integrationMethod": "ANY",
+                "payloadFormatVersion": "1.0"}
+    if data.get("credentialsArn"):
+        spec["credentialsArn"] = data["credentialsArn"]
+    integration = json.loads(_create_integration(api_id, spec)[2])
+    route = json.loads(_create_route(api_id, {"routeKey": data.get("routeKey", "$default"),
+                                              "target": f"integrations/{integration['integrationId']}"})[2])
+    _create_stage(api_id, {"stageName": "$default", "autoDeploy": True,
+                           "defaultRouteSettings": {"detailedMetricsEnabled": False}})
+    _integrations[api_id][integration["integrationId"]]["apiGatewayManaged"] = True
+    _routes[api_id][route["routeId"]]["apiGatewayManaged"] = True
+    _stages[api_id]["$default"]["apiGatewayManaged"] = True
 
 
 def _get_api(api_id):
