@@ -11319,3 +11319,1380 @@ def test_sfn_definition_structure_errors(sfn, definition, expected):
     finally:
         sfn.delete_state_machine(stateMachineArn=arn)
     assert sfn.validate_state_machine_definition(definition=good)["result"] == "OK"
+
+
+@contextmanager
+def _http_task_endpoint():
+    """A local API for the HTTP Task to call, the same one the AWS captures used. The first path segment picks the
+    answer: /status/<code>, /text, /jsonastext, /empty, /binary, /video, and anything else echoes the request as JSON.
+    Yields its URL."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            path, _, query = self.path.partition("?")
+            kind, _, arg = path.strip("/").partition("/")
+            seen = json.dumps({
+                "method": self.command, "path": path, "rawQueryString": query,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": self.rfile.read(length).decode("utf-8") if length else None,
+            })
+            status, content_type, payload = {
+                "status": (int(arg) if kind == "status" else 200, "application/json", seen),
+                "text": (200, "text/plain", "plain text answer"),
+                "jsonastext": (200, "text/plain", '{"a":1}'),
+                "empty": (204, "application/json", ""),
+                "binary": (200, "application/octet-stream", "\x00\x01"),
+                "video": (200, "video/mp4", "\x00\x01"),
+            }.get(kind, (200, "application/json; charset=utf-8", seen))
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload.encode())
+
+        do_GET = do_PATCH = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+
+
+@contextmanager
+def _http_task_connection(eb, **auth_parameters):
+    name = f"sfn-http-conn-{_uuid_mod.uuid4().hex[:8]}"
+    arn = eb.create_connection(
+        Name=name, AuthorizationType="BASIC",
+        AuthParameters={"BasicAuthParameters": {"Username": "u", "Password": "p"}, **auth_parameters},
+    )["ConnectionArn"]
+    try:
+        yield name, arn
+    finally:
+        eb.delete_connection(Name=name)
+
+
+def _run_http_task(sfn, parameters, catch=False, execution_input=None):
+    """Run one HTTP Task. Returns its output, or the catcher's when catch is set; a failed execution's description
+    otherwise."""
+    task = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": parameters, "End": True}
+    states = {"Call": task}
+    if catch:
+        task["Catch"] = [{"ErrorEquals": ["States.TaskFailed"], "Next": "Caught"}]
+        states["Caught"] = {"Type": "Pass", "End": True}
+    arn = sfn.create_state_machine(
+        name=f"sfn-http-{_uuid_mod.uuid4().hex[:8]}",
+        definition=json.dumps({"StartAt": "Call", "States": states}),
+        roleArn="arn:aws:iam::000000000000:role/sfn-role",
+    )["stateMachineArn"]
+    try:
+        payload = {"orderId": "o-1"} if execution_input is None else execution_input
+        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(payload))
+        desc = _wait_sfn(sfn, execution["executionArn"])
+        return json.loads(desc["output"]) if desc["status"] == "SUCCEEDED" else desc
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def test_sfn_http_task_request_and_result(sfn, eb):
+    """The request AWS builds and the result it returns: the connection wins a duplicate header, query or body key,
+    array header values are comma-joined, null Headers is accepted, and a task cannot replace User-Agent or Range
+    (AWS captures 2026-11-20 & 2026-11-22, us-west-2)."""
+    invocation = {
+        "HeaderParameters": [{"Key": "X-Source", "Value": "connection"}],
+        "QueryStringParameters": [{"Key": "tenant", "Value": "connection"}],
+        "BodyParameters": [{"Key": "mode", "Value": "connection"}],
+    }
+    with _http_task_endpoint() as url, _http_task_connection(eb, InvocationHttpParameters=invocation) as (_, conn):
+        output = _run_http_task(sfn, {
+            "ApiEndpoint.$": f"States.Format('{url}/v1/orders/{{}}', $.orderId)",
+            "Method": "PATCH",
+            "InvocationConfig": {"ConnectionArn": conn},
+            "Headers": {
+                "x-source": "task", "X-Request-Id": "r-1", "X-Multi": ["v1", "v2"], "X-Empty": [],
+                "User-Agent": "mine", "Range": "bytes=0-1",
+            },
+            "QueryParameters": {"tenant": "task", "fields": "status"},
+            "RequestBody": {"status": "SHIPPED", "mode": "task"},
+        })
+        assert output["StatusCode"] == 200
+        assert output["StatusText"] == "OK"
+        assert output["Headers"]["Content-Type"] == ["application/json; charset=utf-8"]
+        request = output["ResponseBody"]
+        assert request["method"] == "PATCH"
+        assert (request["path"], request["rawQueryString"]) == ("/v1/orders/o-1", "fields=status&tenant=connection")
+        assert request["body"] == '{"status":"SHIPPED","mode":"connection"}'
+        assert request["headers"]["authorization"] == "Basic dTpw"  # base64("u:p")
+        assert request["headers"]["x-source"] == "connection"
+        assert request["headers"]["x-request-id"] == "r-1"
+        assert request["headers"]["x-multi"] == "v1, v2"
+        assert request["headers"]["x-empty"] == ""
+        assert request["headers"]["content-type"] == "application/json; charset=UTF-8"
+        assert request["headers"]["user-agent"] == "Amazon|StepFunctions|HttpInvoke|us-east-1"
+        assert request["headers"]["range"] == "bytes=0-262144"
+        null_headers = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "InvocationConfig": {"ConnectionArn": conn}, "Headers": None,
+        })
+        assert null_headers["StatusCode"] == 200
+
+
+def test_sfn_http_task_query_and_body_encoding(sfn, eb):
+    """Query values are percent-encoded with a[0] and a[k] keys, an empty list is left out, and a body that is not
+    an object goes out as '*/*; charset=UTF-8', also on a GET (AWS capture 2026-11-20)."""
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (_, conn):
+        request = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn},
+            "QueryParameters": {"q": "a b&c", "list": ["x", "y"], "o": {"k": "v"}, "n": 5, "b": True, "s": "é/+",
+                                "z": None, "e": "", "f": 1.5, "none": []},
+            "RequestBody": "plain string",
+        })["ResponseBody"]
+        assert request["rawQueryString"] == (
+            "q=a%20b%26c&list%5B0%5D=x&list%5B1%5D=y&o%5Bk%5D=v&n=5&b=true&s=%C3%A9%2F%2B&z=null&e=&f=1.5")
+        assert request["body"] == "plain string"
+        assert request["headers"]["content-type"] == "*/*; charset=UTF-8"
+        ignored = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn},
+            "QueryParameters": "a=1&b=2",
+        })["ResponseBody"]
+        assert ignored["rawQueryString"] == ""
+
+
+def test_sfn_http_task_response_body(sfn, eb):
+    """Only an application/json body is parsed, an empty body leaves ResponseBody out, and a binary one fails the
+    task (AWS capture 2026-11-20)."""
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (_, conn):
+        def call(path):
+            return _run_http_task(
+                sfn, {"ApiEndpoint": f"{url}/{path}", "Method": "GET", "InvocationConfig": {"ConnectionArn": conn}})
+
+        assert call("text")["ResponseBody"] == "plain text answer"
+        assert call("jsonastext")["ResponseBody"] == '{"a":1}'
+        assert call("status/201")["StatusText"] == "Created"
+        empty = call("empty")
+        assert (empty["StatusCode"], empty["StatusText"], "ResponseBody" in empty) == (204, "No Content", False)
+        assert "StatusText" not in call("status/299")
+        for path, media_type in (("binary", "application/octet-stream"), ("video", "video/mp4")):
+            failed = call(path)
+            assert (failed["error"], failed["cause"]) == (
+                "States.Runtime",
+                f"Unsupported response content-type '{media_type}'. "
+                "Please see documentation for list of unsupported content-types.")
+
+
+def test_sfn_http_task_failed_calls(sfn, eb):
+    """A non-2xx answer fails as States.Http.StatusCode.<code> with Step Functions' phrase for the code as Cause,
+    or none when it has no phrase. A 401 also deauthorizes the connection (AWS capture 2026-11-20)."""
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (name, conn):
+        def call(endpoint, arn=conn):
+            return _run_http_task(
+                sfn, {"ApiEndpoint": endpoint, "Method": "GET", "InvocationConfig": {"ConnectionArn": arn}}, catch=True)
+
+        assert call(f"{url}/status/404") == {"Error": "States.Http.StatusCode.404", "Cause": "Not Found"}
+        assert call(f"{url}/status/422") == {"Error": "States.Http.StatusCode.422", "Cause": "Unprocessable Content"}
+        assert call(f"{url}/status/301") == {"Error": "States.Http.StatusCode.301", "Cause": "Moved Permanently"}
+        assert call(f"{url}/status/418") == {"Error": "States.Http.StatusCode.418", "Cause": None}
+        assert call(f"https://sfn-http-{_uuid_mod.uuid4().hex[:8]}.invalid/echo")["Error"] == "States.Http.IpError"
+        assert call(f"{url}/echo", arn=conn.replace(name, "sfn-http-none")) == {
+            "Error": "Events.ConnectionResource.ResourceNotFound", "Cause": "Connection resource not found."}
+
+        assert call(f"{url}/status/401") == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        described = eb.describe_connection(Name=name)
+        assert described["ConnectionState"] == "DEAUTHORIZED"
+        assert described["StateReason"] == (
+            "Request failed due to Unauthorized access. Authorization could not be granted using the credentials "
+            "provided in the request.")
+        assert call(f"{url}/echo") == {
+            "Error": "Events.ConnectionResource.InvalidConnectionState",
+            "Cause": "Connection resource is not authorized. This is likely a configuration issue with your connection."}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"Method": "TRACE"}, "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
+    ({"ApiEndpoint": "not a url"}, "The value for the 'ApiEndpoint' field is not valid"),
+    ({"ApiEndpoint": "http://127.0.0.1:9/echo?a=1"}, "The value for the 'ApiEndpoint' field must not contain query parameters"),
+    ({"Headers": {"Authorization": "Bearer x", "X-Amz-Date": "x", "Accept": "x"}},
+     "The 'Headers' field contains unsupported values: [authorization, x-amz-date]"),
+    ({"Headers": {"Origin": "https://a.example", "Authorization": "Bearer x"}},
+     "The 'Headers' field contains unsupported values: [authorization]"),
+    ({"Headers": "X-Foo: bar"}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": ""}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": ["X-Foo: bar"]}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": []}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": 123}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": True}, "The value of the field 'Headers' has an invalid format"),
+    ({"Headers": {"": "v"}}, "The 'Headers' field cannot contain empty keys."),
+    ({"Headers": {"   ": "v"}}, "The 'Headers' field cannot contain empty keys."),
+    ({"Headers": {"X-A": None}}, "The 'Headers' field cannot contain null values."),
+    ({"Headers": {"X-A": {"k": "v"}}}, "The 'Headers' field cannot contain nested values."),
+    ({"Headers": {"X-A": [{"k": "v"}]}}, "The 'Headers' field cannot contain nested values."),
+    ({"Headers": {"X-A": [["a"]]}}, "The 'Headers' field cannot contain nested values."),
+    ({"Headers": {"X-A": 123}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-A": True}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-A": [1, 2]}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-A": [None]}}, "'Header' values must be strings or arrays of strings."),
+    ({"Headers": {"X-Cyrillic": "привет"}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-Lat": "café"}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-é": "v"}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-Lat": ["ok", "café"]}}, "The 'Headers' field must only contain US-ASCII characters"),
+    ({"Headers": {"X-Tab": "a\tb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X-Cr": "a\rb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X-Lf": "a\nb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X-Del": "a\x7fb"}}, "The 'Headers' field must not contain control characters"),
+    ({"Headers": {"X Foo": "bar"}}, "The 'Headers' field name must not contain illegal whitespace"),
+    ({"Headers": {"X:Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [:]"),
+    ({"Headers": {"X%Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [%]"),
+    ({"Headers": {"X:%Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [%, :]"),
+    ({"Headers": {"X :Foo": "bar"}}, "The 'Headers' field name must not contain illegal characters [:]"),
+    ({"ApiEndpoint": ""}, "The value for the 'ApiEndpoint' field cannot be empty"),
+    ({"ApiEndpoint": 123}, "The value for the field 'ApiEndpoint' must be a STRING"),
+    ({"InvocationConfig": {}}, "The field 'InvocationConfig.ConnectionArn' is required but was missing"),
+    ({"InvocationConfig": {"ConnectionArn": ""}}, "The value for the 'ConnectionArn' field must have a minimum length of 1"),
+    ({"InvocationConfig": {"ConnectionArn": 123}}, "The value of the field 'InvocationConfig' has an invalid format"),
+    ({"InvocationConfig": {"ConnectionArn": "not-an-arn"}}, "The value for the 'ConnectionArn' field is not valid"),
+    ({"InvocationConfig": {"ConnectionArn": "arn:aws:events:us-west-2:000000000000:connection/none"}},
+     "The value for the 'ConnectionArn' field has region us-west-2 but must be the same region as the state machine (us-east-1)"),
+    ({"InvocationConfig": {"ConnectionArn": "arn:aws:events:us-east-1:000000000000:connection/none", "Extra": 1}},
+     "The value of the field 'InvocationConfig' has an invalid format"),
+    ({"ExtraBogus": "x"}, 'The field "ExtraBogus" is not supported by Step Functions'),
+    ({"Transform": "URL_ENCODED"}, "The value of the field 'Transform' has an invalid format"),
+    ({"Transform": {"RequestBodyEncoding": "BOGUS"}}, "The value of the field 'Transform' has an invalid format"),
+    ({"Transform": {"RequestBodyEncoding": "URL_ENCODED", "RequestEncodingOptions": {"ArrayFormat": "BAD"}}},
+     "The value of the field 'Transform' has an invalid format"),
+    ({"ApiEndpoint": "ftp://example.com/echo"}, "The value for the 'ApiEndpoint' field must have the scheme 'https'"),
+    ({"ApiEndpoint": "http://127.0.0.1:9/echo?a=1", "Method": "TRACE"},
+     "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
+])
+def test_sfn_http_task_refuses_parameters(sfn, change, message):
+    """Dynamic parameters that fail schema checks fail the task as States.Runtime (AWS captures 2026-11-20 & 2026-11-22)."""
+    resolved = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+                "InvocationConfig": {"ConnectionArn": "arn:aws:events:us-east-1:000000000000:connection/none"},
+                **change}
+    template = {f"{k}.$": f"$.{k}" for k in resolved}
+    failed = _run_http_task(sfn, template, execution_input=resolved)
+    assert failed["error"] == "States.Runtime"
+    assert failed["cause"] == (
+        f"The Parameters '{json.dumps(resolved, separators=(',', ':'))}' could not be used to start the Task: "
+        f"[{message}]")
+
+
+def test_sfn_http_task_runtime_denied_headers(sfn):
+    """The 15 runtime-only denied headers pass definition validation and fail at runtime with a bare
+    States.Runtime cause (AWS capture 2026-11-22, us-west-2)."""
+    conn = "arn:aws:events:us-east-1:000000000000:connection/none"
+    runtime_only = [
+        "A-IM", "Accept-Charset", "Accept-Datetime", "Accept-Encoding", "Cache-Control", "Content-Encoding",
+        "Date", "Forwarded", "From", "HTTP2-Settings", "Origin", "Pragma", "Proxy-Authorization", "Referer", "Warning",
+    ]
+    for header in runtime_only:
+        params = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+                  "InvocationConfig": {"ConnectionArn": conn}, "Headers": {header: "v"}}
+        defn = json.dumps({"StartAt": "Call", "States": {
+            "Call": {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True},
+        }})
+        assert sfn.validate_state_machine_definition(definition=defn)["result"] == "OK"
+        failed = _run_http_task(sfn, params)
+        assert (failed["error"], failed["cause"]) == (
+            "States.Runtime", f"The 'Headers' field contains unsupported values: [{header.lower()}]")
+
+    multi = _run_http_task(sfn, {
+        "ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET",
+        "InvocationConfig": {"ConnectionArn": conn},
+        "Headers": {"Origin": "https://a.example", "Cache-Control": "no-cache", "Accept-Encoding": "gzip"},
+    })
+    assert (multi["error"], multi["cause"]) == (
+        "States.Runtime", "The 'Headers' field contains unsupported values: [origin, cache-control, accept-encoding]")
+
+
+def test_sfn_http_task_definition_validation(sfn, sfn_sync):
+    """ValidateStateMachineDefinition, CreateStateMachine, UpdateStateMachine, and TestState reject static
+    schema-denied headers, malformed Headers, and invalid HTTP Task parameters (AWS capture 2026-11-22, us-west-2)."""
+    conn = "arn:aws:events:us-east-1:000000000000:connection/none"
+    base = {"ApiEndpoint": "http://127.0.0.1:9/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn}}
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+
+    def make_def(params):
+        return json.dumps({"StartAt": "Call", "States": {
+            "Call": {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True},
+        }})
+
+    schema_denied = [
+        "Authorization", "Connection", "Content-MD5", "Expect", "Host", "Max-Forwards", "Proxy-Authenticate",
+        "Server", "TE", "Trailer", "Transfer-Encoding", "Upgrade", "Via", "WWW-Authenticate",
+        "X-Amz-Date", "X-Amzn-Trace-Id", "X-Forwarded-For",
+    ]
+    for header in schema_denied:
+        expected_msg = f"The 'Headers' field contains unsupported values: [{header.lower()}]"
+        resp = sfn.validate_state_machine_definition(definition=make_def({**base, "Headers": {header: "v"}}))
+        assert resp == {
+            "result": "FAIL",
+            "diagnostics": [{"severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+                             "message": expected_msg, "location": "/States/Call/Parameters"}],
+            "truncated": False,
+            **({"ResponseMetadata": resp["ResponseMetadata"]}),
+        }
+
+    bad_cases = [
+        ({**base, "Headers": "foo"}, "The value of the field 'Headers' has an invalid format"),
+        ({**base, "Headers": ["a"]}, "The value of the field 'Headers' has an invalid format"),
+        ({**base, "Headers": []}, "The value of the field 'Headers' has an invalid format"),
+        ({**base, "Headers": {"": "v"}}, "The 'Headers' field cannot contain empty keys."),
+        ({**base, "Headers": {"X-A": None}}, "The 'Headers' field cannot contain null values."),
+        ({**base, "Headers": {"X-A": {"k": "v"}}}, "The 'Headers' field cannot contain nested values."),
+        ({**base, "Headers": {"X-A": 123}}, "'Header' values must be strings or arrays of strings."),
+        ({**base, "Headers": {"X-Cyrillic": "привет"}}, "The 'Headers' field must only contain US-ASCII characters"),
+        ({**base, "Headers": {"X-Lat": "café"}}, "The 'Headers' field must only contain US-ASCII characters"),
+        ({**base, "Headers": {"X-Tab": "a\tb"}}, "The 'Headers' field must not contain control characters"),
+        ({**base, "Headers": {"Authorization": "x"}}, "The 'Headers' field contains unsupported values: [authorization]"),
+        ({**base, "Method": "TRACE"}, "The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"),
+        ({**base, "InvocationConfig": {"ConnectionArn": conn}},
+         "The field 'InvocationConfig' cannot be used with 'Authentication'"),
+        ({**base, "ExtraBogus": "1"}, 'The field "ExtraBogus" is not supported by Step Functions'),
+        ({**base, "Authentication": {"ConnectionArn": "not-an-arn"}},
+         "The value for the 'ConnectionArn' field is not valid"),
+        ({**base, "Authentication": {"ConnectionArn": "arn:aws:events:us-west-2:000000000000:connection/none"}},
+         "The value for the 'ConnectionArn' field has region us-west-2 but must be the same region as the state machine (us-east-1)"),
+        ({**base, "Authentication": {"ConnectionArn": conn, "Extra": 1}},
+         "The value of the field 'Authentication' has an invalid format"),
+        ({**base, "Transform": {"RequestBodyEncoding": "BOGUS"}},
+         "The value of the field 'Transform' has an invalid format"),
+        ({**base, "Transform": {"RequestBodyEncoding": "URL_ENCODED", "RequestEncodingOptions": {"ArrayFormat": "BAD"}}},
+         "The value of the field 'Transform' has an invalid format"),
+    ]
+    good = json.dumps({"StartAt": "Call", "States": {"Call": {"Type": "Pass", "End": True}}})
+    arn = sfn.create_state_machine(name=f"sfn-http-val-{_uuid_mod.uuid4().hex[:8]}", definition=good,
+                                   roleArn=role)["stateMachineArn"]
+    try:
+        for params, msg in bad_cases:
+            body = make_def(params)
+            expected_err = f"Invalid State Machine Definition: 'SCHEMA_VALIDATION_FAILED: {msg} at /States/Call/Parameters'"
+            with pytest.raises(ClientError) as exc:
+                sfn.create_state_machine(name=f"sfn-http-bad-{_uuid_mod.uuid4().hex[:8]}", definition=body, roleArn=role)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "InvalidDefinition", expected_err)
+            with pytest.raises(ClientError) as exc:
+                sfn.update_state_machine(stateMachineArn=arn, definition=body)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "InvalidDefinition", expected_err)
+            with pytest.raises(ClientError) as exc:
+                sfn_sync.test_state(definition=json.dumps({
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True,
+                }), roleArn=role)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "InvalidDefinition",
+                f"Invalid State Machine Definition: 'SCHEMA_VALIDATION_FAILED: {msg} at /States/StateName/Parameters'")
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+    # Nested Parallel / Map states and JSONata Arguments report their exact locations; dynamic .$ fields pass.
+    nested_parallel = json.dumps({"StartAt": "P", "States": {"P": {
+        "Type": "Parallel",
+        "Branches": [{"StartAt": "Sub", "States": {"Sub": {
+            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {**base, "Headers": {"Authorization": "x"}}, "End": True,
+        }}}],
+        "End": True,
+    }}})
+    assert sfn.validate_state_machine_definition(definition=nested_parallel)["diagnostics"] == [{
+        "severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+        "message": "The 'Headers' field contains unsupported values: [authorization]",
+        "location": "/States/P/Branches[0]/States/Sub/Parameters",
+    }]
+
+    nested_map = json.dumps({"StartAt": "M", "States": {"M": {
+        "Type": "Map",
+        "ItemProcessor": {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "Sub", "States": {"Sub": {
+            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {**base, "Headers": {"Authorization": "x"}}, "End": True,
+        }}},
+        "End": True,
+    }}})
+    assert sfn.validate_state_machine_definition(definition=nested_map)["diagnostics"] == [{
+        "severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+        "message": "The 'Headers' field contains unsupported values: [authorization]",
+        "location": "/States/M/ItemProcessor/States/Sub/Parameters",
+    }]
+
+    jsonata_def = json.dumps({"QueryLanguage": "JSONata", "StartAt": "Call", "States": {"Call": {
+        "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+        "Arguments": {**base, "Headers": {"Authorization": "x"}}, "End": True,
+    }}})
+    assert sfn.validate_state_machine_definition(definition=jsonata_def)["diagnostics"] == [{
+        "severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+        "message": "The 'Headers' field contains unsupported values: [authorization]",
+        "location": "/States/Call/Arguments",
+    }]
+
+    for ok_params in (
+        {**base, "Headers": None},
+        {**base, "Headers": {"X-Multi": ["a", "b"]}},
+        {**base, "Headers.$": "$.h"},
+        {**base, "Headers": {"Authorization.$": "$.a"}},
+    ):
+        assert sfn.validate_state_machine_definition(definition=make_def(ok_params))["result"] == "OK"
+
+
+def test_sfn_http_task_oauth_refresh_and_failures(sfn, sfn_sync, eb):
+    """OAuth connections refresh on 401 and retry once without deauthorizing on target-API 401; 407 does not retry;
+    API_KEY 401 deauthorizes; OAuth token endpoint errors and truncated HTTP responses become catchable task errors
+    instead of escaping Retry/Catch or 500ing TestState (AWS capture 2026-11-24, us-west-2)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state = {"token_mode": "ok", "token_calls": 0, "api_auths": []}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            path = self.path.split("?", 1)[0]
+            if path == "/oauth/token":
+                state["token_calls"] += 1
+                mode = state["token_mode"]
+                if mode == "500":
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"server_error"}')
+                    return
+                if mode == "badjson":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"not-json{{{")
+                    return
+                body = json.dumps({
+                    "access_token": f"tok-{state['token_calls']}",
+                    "token_type": "Bearer",
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            auth = self.headers.get("Authorization", "")
+            state["api_auths"].append(auth)
+
+            if path == "/truncated":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "200")
+                self.end_headers()
+                self.wfile.write(b'{"cut')
+                self.close_connection = True
+                return
+
+            if path == "/require-tok-2":
+                code = 200 if auth == "Bearer tok-2" else 401
+            elif path == "/always-401":
+                code = 401
+            elif path == "/always-407":
+                code = 407
+            else:
+                code = 200
+            body = json.dumps({"auth": auth, "code": code}).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    oauth_name = f"sfn-oauth-{_uuid_mod.uuid4().hex[:8]}"
+    bad_oauth_name = f"sfn-oauth-bad-{_uuid_mod.uuid4().hex[:8]}"
+    apikey_name = f"sfn-apikey-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        oauth_arn = eb.create_connection(
+            Name=oauth_name,
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters={"OAuthParameters": {
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                "AuthorizationEndpoint": f"{url}/oauth/token",
+                "HttpMethod": "POST",
+            }},
+        )["ConnectionArn"]
+
+        # 1. Stale OAuth token gets 401 -> refreshes with force_refresh=True and retries once -> succeeds.
+        res = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/require-tok-2", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        })
+        assert res["StatusCode"] == 200
+        assert res["ResponseBody"]["auth"] == "Bearer tok-2"
+        assert state["token_calls"] == 2
+        assert state["api_auths"] == ["Bearer tok-1", "Bearer tok-2"]
+        assert eb.describe_connection(Name=oauth_name)["ConnectionState"] == "AUTHORIZED"
+
+        # 2. Target API always returns 401 -> retries once with fresh token, fails 401, stays AUTHORIZED.
+        state["api_auths"].clear()
+        caught = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-401", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        assert state["token_calls"] == 3
+        assert state["api_auths"] == ["Bearer tok-2", "Bearer tok-3"]
+        assert eb.describe_connection(Name=oauth_name)["ConnectionState"] == "AUTHORIZED"
+
+        # 3. 407 on OAuth does NOT refresh or retry (1 API call, stays AUTHORIZED).
+        state["api_auths"].clear()
+        caught_407 = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-407", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_407 == {"Error": "States.Http.StatusCode.407", "Cause": "Proxy Authentication Required"}
+        assert state["token_calls"] == 3
+        assert state["api_auths"] == ["Bearer tok-3"]
+        assert eb.describe_connection(Name=oauth_name)["ConnectionState"] == "AUTHORIZED"
+
+        # 4. OAuth token refresh fails on 401 -> evicts stale token, fails 401, recovers when IdP returns.
+        state["token_mode"] = "500"
+        caught_ref = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-401", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_ref == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        # Cached token was evicted, so next call while IdP is still 500 fails cleanly & is catchable.
+        caught_down = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_down["Error"] == "Events.ConnectionResource.InvalidConnectionState"
+        # Non-JSON token response is also caught cleanly (and TestState returns FAILED, not 500).
+        state["token_mode"] = "badjson"
+        ts_bad = sfn_sync.test_state(
+            definition=json.dumps({
+                "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                               "Authentication": {"ConnectionArn": oauth_arn}},
+                "End": True,
+            }),
+            roleArn=role,
+        )
+        assert ts_bad["status"] == "FAILED"
+        assert ts_bad["error"] == "Events.ConnectionResource.InvalidConnectionState"
+        # Once IdP recovers, connection works without needing UpdateConnection.
+        state["token_mode"] = "ok"
+        recovered = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        })
+        assert recovered["StatusCode"] == 200
+
+        # 5. Unreachable OAuth token endpoint is catchable (never leaks raw exception).
+        bad_oauth_arn = eb.create_connection(
+            Name=bad_oauth_name,
+            AuthorizationType="OAUTH_CLIENT_CREDENTIALS",
+            AuthParameters={"OAuthParameters": {
+                "ClientParameters": {"ClientID": "cid", "ClientSecret": "csec"},
+                "AuthorizationEndpoint": "http://127.0.0.1:1/oauth/token",
+                "HttpMethod": "POST",
+            }},
+        )["ConnectionArn"]
+        caught_unreach = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+            "Authentication": {"ConnectionArn": bad_oauth_arn},
+        }, catch=True)
+        assert caught_unreach["Error"] == "Events.ConnectionResource.InvalidConnectionState"
+
+        # 6. Server dying partway through body (IncompleteRead) is caught as States.Http.Socket, not 500.
+        caught_trunc = _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/truncated", "Method": "GET",
+            "Authentication": {"ConnectionArn": oauth_arn},
+        }, catch=True)
+        assert caught_trunc["Error"] == "States.Http.Socket"
+        ts_trunc = sfn_sync.test_state(
+            definition=json.dumps({
+                "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {"ApiEndpoint": f"{url}/truncated", "Method": "GET",
+                               "Authentication": {"ConnectionArn": oauth_arn}},
+                "End": True,
+            }),
+            roleArn=role,
+            inspectionLevel="TRACE",
+        )
+        assert ts_trunc["status"] == "FAILED"
+        assert ts_trunc["error"] == "States.Http.Socket"
+        assert "request" in ts_trunc["inspectionData"]
+        assert "response" not in ts_trunc["inspectionData"]
+
+        # 7. API_KEY connection 401 deauthorizes immediately (same as BASIC, AWS capture 2026-11-24).
+        apikey_arn = eb.create_connection(
+            Name=apikey_name,
+            AuthorizationType="API_KEY",
+            AuthParameters={"ApiKeyAuthParameters": {"ApiKeyName": "X-Api-Key", "ApiKeyValue": "secret"}},
+        )["ConnectionArn"]
+        assert _run_http_task(sfn, {
+            "ApiEndpoint": f"{url}/always-401", "Method": "GET",
+            "Authentication": {"ConnectionArn": apikey_arn},
+        }, catch=True) == {"Error": "States.Http.StatusCode.401", "Cause": "Unauthorized"}
+        ak_desc = eb.describe_connection(Name=apikey_name)
+        assert ak_desc["ConnectionState"] == "DEAUTHORIZED"
+        assert ak_desc["StateReason"] == (
+            "Request failed due to Unauthorized access. Authorization could not be granted using the credentials "
+            "provided in the request.")
+    finally:
+        server.shutdown()
+        for cname in (oauth_name, bad_oauth_name, apikey_name):
+            try:
+                eb.delete_connection(Name=cname)
+            except ClientError:
+                pass
+
+
+def test_sfn_http_task_test_state_trace(sfn_sync, eb):
+    """TestState at TRACE populates inspectionData.request and inspectionData.response, hiding all connection-supplied
+    auth/header/query/body parameters unless revealSecrets=True (AWS capture 2026-11-24, us-west-2)."""
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    invocation = {
+        "HeaderParameters": [
+            {"Key": "X-Conn-Plain", "Value": "plainval", "IsValueSecret": False},
+            {"Key": "X-Conn-Secret", "Value": "secretval", "IsValueSecret": True},
+            {"Key": "X-Overlap", "Value": "conn-wins", "IsValueSecret": False},
+        ],
+        "QueryStringParameters": [
+            {"Key": "qplain", "Value": "qv1", "IsValueSecret": False},
+            {"Key": "qoverlap", "Value": "conn-q", "IsValueSecret": False},
+        ],
+        "BodyParameters": [
+            {"Key": "bplain", "Value": "bv1", "IsValueSecret": False},
+            {"Key": "boverlap", "Value": "conn-b", "IsValueSecret": False},
+        ],
+    }
+    with _http_task_endpoint() as url, _http_task_connection(eb, InvocationHttpParameters=invocation) as (_, conn):
+        post_state = {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {
+                "ApiEndpoint": f"{url}/echo",
+                "Method": "POST",
+                "Authentication": {"ConnectionArn": conn},
+                "Headers": {"X-Task-Hdr": "tval", "X-Overlap": "task-val", "X-Multi": ["a", "b"]},
+                "QueryParameters": {"qt": "tv", "qoverlap": "task-q"},
+                "RequestBody": {"hello": "world", "boverlap": "task-b"},
+            },
+            "End": True,
+        }
+
+        # TRACE with revealSecrets omitted/False omits all connection headers/query/body and auto Content-Type.
+        r_hidden = sfn_sync.test_state(definition=json.dumps(post_state), roleArn=role, inspectionLevel="TRACE")
+        assert r_hidden["status"] == "SUCCEEDED"
+        req_hidden = r_hidden["inspectionData"]["request"]
+        assert req_hidden["protocol"] == "http"
+        assert req_hidden["method"] == "POST"
+        assert req_hidden["url"] == f"{url}/echo?qt=tv&qoverlap=task-q"
+        hdrs_hidden = json.loads(req_hidden["headers"])
+        assert hdrs_hidden == {
+            "X-Task-Hdr": ["tval"],
+            "X-Overlap": ["task-val"],
+            "X-Multi": ["a, b"],
+            "User-Agent": ["Amazon|StepFunctions|HttpInvoke|us-east-1"],
+            "Range": ["bytes=0-262144"],
+        }
+        assert "Authorization" not in hdrs_hidden
+        assert "Content-Type" not in hdrs_hidden
+        assert req_hidden["body"] == '{"hello":"world","boverlap":"task-b"}'
+        resp_hidden = r_hidden["inspectionData"]["response"]
+        assert (resp_hidden["protocol"], resp_hidden["statusCode"], resp_hidden["statusMessage"]) == ("http", "200", "OK")
+        assert json.loads(resp_hidden["headers"])["Content-Type"] == ["application/json; charset=utf-8"]
+        assert json.loads(resp_hidden["body"])["headers"]["authorization"] == "Basic dTpw"
+
+        # TRACE with revealSecrets=True reveals auth header and connection header/query/body params.
+        r_shown = sfn_sync.test_state(
+            definition=json.dumps(post_state), roleArn=role, inspectionLevel="TRACE", revealSecrets=True)
+        req_shown = r_shown["inspectionData"]["request"]
+        assert req_shown["url"] == f"{url}/echo?qt=tv&qplain=qv1&qoverlap=conn-q"
+        hdrs_shown = json.loads(req_shown["headers"])
+        assert hdrs_shown["Authorization"] == ["Basic dTpw"]
+        assert hdrs_shown["X-Conn-Plain"] == ["plainval"]
+        assert hdrs_shown["X-Conn-Secret"] == ["secretval"]
+        assert hdrs_shown["X-Overlap"] == ["conn-wins"]
+        assert "Content-Type" not in hdrs_shown
+        assert req_shown["body"] == '{"hello":"world","boverlap":"conn-b","bplain":"bv1"}'
+
+        # DEBUG does NOT include request/response even with revealSecrets=True.
+        r_debug = sfn_sync.test_state(
+            definition=json.dumps(post_state), roleArn=role, inspectionLevel="DEBUG", revealSecrets=True)
+        assert "request" not in r_debug["inspectionData"]
+        assert "response" not in r_debug["inspectionData"]
+
+        # GET with only connection BodyParameters: revealSecrets=False reports body="{}", True reports conn body.
+        get_only_conn_body = {
+            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+            "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET", "Authentication": {"ConnectionArn": conn}},
+            "End": True,
+        }
+        assert sfn_sync.test_state(
+            definition=json.dumps(get_only_conn_body), roleArn=role, inspectionLevel="TRACE", revealSecrets=False,
+        )["inspectionData"]["request"]["body"] == "{}"
+        assert sfn_sync.test_state(
+            definition=json.dumps(get_only_conn_body), roleArn=role, inspectionLevel="TRACE", revealSecrets=True,
+        )["inspectionData"]["request"]["body"] == '{"bplain":"bv1","boverlap":"conn-b"}'
+
+    # Connection without BodyParameters: GET omits request.body; 204 omits response.body; 422/418/Catch/binary/IpError.
+    with _http_task_endpoint() as url, _http_task_connection(eb) as (_, conn):
+        def trace_call(path, *, catch=None, endpoint=None):
+            st = {
+                "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                "Parameters": {"ApiEndpoint": endpoint or f"{url}/{path}", "Method": "GET",
+                               "Authentication": {"ConnectionArn": conn}},
+                "End": True,
+            }
+            if catch:
+                st["Catch"] = catch
+            return sfn_sync.test_state(
+                definition=json.dumps(st), roleArn=role, inspectionLevel="TRACE", revealSecrets=True)
+
+        r_204 = trace_call("empty")
+        assert "body" not in r_204["inspectionData"]["request"]
+        assert (r_204["inspectionData"]["response"]["statusCode"], r_204["inspectionData"]["response"]["statusMessage"]) == ("204", "No Content")
+        assert "body" not in r_204["inspectionData"]["response"]
+
+        r_422 = trace_call("status/422")
+        assert (r_422["status"], r_422["error"], r_422["cause"]) == ("FAILED", "States.Http.StatusCode.422", "Unprocessable Content")
+        assert (r_422["inspectionData"]["response"]["statusCode"], r_422["inspectionData"]["response"]["statusMessage"]) == ("422", "Unprocessable Content")
+
+        r_418 = trace_call("status/418")
+        assert (r_418["status"], r_418["error"]) == ("FAILED", "States.Http.StatusCode.418")
+        assert "cause" not in r_418
+        assert r_418["inspectionData"]["response"]["statusCode"] == "418"
+        assert "statusMessage" not in r_418["inspectionData"]["response"]
+
+        r_caught = trace_call("status/404", catch=[{"ErrorEquals": ["States.ALL"], "Next": "Done"}])
+        assert r_caught["status"] == "CAUGHT_ERROR"
+        assert r_caught["inspectionData"]["response"]["statusCode"] == "404"
+
+        r_bin = trace_call("binary")
+        assert (r_bin["status"], r_bin["error"]) == ("FAILED", "States.Runtime")
+        assert r_bin["inspectionData"]["response"]["statusCode"] == "200"
+
+        r_ip = trace_call("", endpoint=f"https://sfn-http-{_uuid_mod.uuid4().hex[:8]}.invalid/echo")
+        assert (r_ip["status"], r_ip["error"]) == ("FAILED", "States.Http.IpError")
+        assert "request" in r_ip["inspectionData"]
+        assert "response" not in r_ip["inspectionData"]
+
+
+def test_sfn_http_task_empty_charset_and_binary_responses(sfn, sfn_sync, eb):
+    """Empty 200/201/202/205 responses return ResponseBody='', while 204/304/HEAD omit it; responses decode using the
+    Content-Type charset or strict UTF-8 and fail on invalid bytes; Content-Type checks are exact/case-sensitive and
+    only reject non-empty bodies; responses >262144 bytes fail with States.DataLimitExceeded (AWS capture 2026-11-24)."""
+    import base64
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            parts = [p for p in self.path.split("?", 1)[0].strip("/").split("/") if p]
+            if parts[0] == "large":
+                raw = b"x" * int(parts[1])
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(raw)
+                return
+            status = int(parts[1])
+            ct = base64.urlsafe_b64decode(parts[2] + "===").decode("utf-8")
+            raw = base64.urlsafe_b64decode(parts[3] + "===") if len(parts) > 3 and parts[3] != "-" else b""
+            self.send_response(status)
+            if ct != "NONE":
+                self.send_header("Content-Type", ct)
+            if status not in (204, 304):
+                self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            if self.command != "HEAD" and status not in (204, 304) and raw:
+                self.wfile.write(raw)
+
+        do_GET = do_HEAD = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    def b64u(val):
+        data = val.encode("utf-8") if isinstance(val, str) else val
+        return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    invalid_utf8_cause = (
+        "Response from HTTP request cannot be read as a valid String. "
+        "This is likely caused by the response being binary/image/video/audio data."
+    )
+    try:
+        with _http_task_connection(eb) as (_, conn):
+            def call(path, method="GET"):
+                st = {
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {"ApiEndpoint": f"{url}/{path}", "Method": method,
+                                   "Authentication": {"ConnectionArn": conn}},
+                    "End": True,
+                }
+                return sfn_sync.test_state(definition=json.dumps(st), roleArn=role, inspectionLevel="TRACE")
+
+            def rpath(status, ct, raw=b""):
+                return f"raw/{status}/{b64u(ct)}/{b64u(raw) if raw else '-'}"
+
+            # Empty bodies: 200/201/202/205 keep ResponseBody="" and trace.response.body=""; 204/304/HEAD omit both.
+            for status, ct in ((200, "text/plain"), (200, "application/json"), (201, "text/plain"),
+                               (202, "application/json"), (205, "text/plain"), (200, "application/octet-stream"),
+                               (200, "image/png")):
+                r = call(rpath(status, ct))
+                assert r["status"] == "SUCCEEDED"
+                assert json.loads(r["output"])["ResponseBody"] == ""
+                assert r["inspectionData"]["response"]["body"] == ""
+
+            for status, ct, method in ((204, "text/plain", "GET"), (204, "application/octet-stream", "GET"),
+                                       (200, "application/json", "HEAD")):
+                r = call(rpath(status, ct), method=method)
+                assert r["status"] == "SUCCEEDED"
+                assert "ResponseBody" not in json.loads(r["output"])
+                assert "body" not in r["inspectionData"]["response"]
+
+            r_304 = call(rpath(304, "text/plain"))
+            assert (r_304["status"], r_304["error"]) == ("FAILED", "States.Http.StatusCode.304")
+            assert "body" not in r_304["inspectionData"]["response"]
+
+            r_404_empty = call(rpath(404, "text/plain"))
+            assert (r_404_empty["status"], r_404_empty["error"]) == ("FAILED", "States.Http.StatusCode.404")
+            assert r_404_empty["inspectionData"]["response"]["body"] == ""
+
+            # Whitespace-only JSON body parses to null; text/plain keeps whitespace.
+            r_ws_json = call(rpath(200, "application/json", b"  \t\n "))
+            assert json.loads(r_ws_json["output"])["ResponseBody"] is None
+            assert r_ws_json["inspectionData"]["response"]["body"] == "  \t\n "
+            r_ws_txt = call(rpath(200, "text/plain", b"   "))
+            assert json.loads(r_ws_txt["output"])["ResponseBody"] == "   "
+
+            # Invalid UTF-8 & charset handling.
+            for ct, raw in (("text/plain", b"\xff\xfe\x80"), ("text/plain", b"caf\xe9"),
+                            ("application/json", b'{"a":"hi\xff"}'), ("application/pdf", b"\xff\xfe"),
+                            ("text/plain; charset=us-ascii", "café".encode("utf-8"))):
+                r_bad = call(rpath(200, ct, raw))
+                assert (r_bad["status"], r_bad["error"], r_bad["cause"]) == ("FAILED", "States.Runtime", invalid_utf8_cause)
+                assert "\ufffd" in r_bad["inspectionData"]["response"]["body"]
+
+            # Also verify StartExecution matches TestState on empty 200 and invalid UTF-8.
+            exec_empty = _run_http_task(sfn, {
+                "ApiEndpoint": f"{url}/{rpath(200, 'text/plain')}", "Method": "GET",
+                "Authentication": {"ConnectionArn": conn},
+            })
+            assert exec_empty["ResponseBody"] == ""
+            exec_bad = _run_http_task(sfn, {
+                "ApiEndpoint": f"{url}/{rpath(200, 'text/plain', b'hi\xff')}", "Method": "GET",
+                "Authentication": {"ConnectionArn": conn},
+            })
+            assert (exec_bad["error"], exec_bad["cause"]) == ("States.Runtime", invalid_utf8_cause)
+
+            # Explicit charsets decode accurately.
+            for ct, raw, expected in (
+                ("text/plain; charset=iso-8859-1", b"caf\xe9", "café"),
+                ('text/plain; charset="iso-8859-1"', b"caf\xe9", "café"),
+                ("text/plain; charset=windows-1252", b"\x80", "€"),
+                ("text/plain; charset=utf-16", "Hi".encode("utf-16"), "Hi"),
+                ("application/json; charset=iso-8859-1", b'{"a":"caf\xe9"}', {"a": "café"}),
+            ):
+                r_cs = call(rpath(200, ct, raw))
+                assert r_cs["status"] == "SUCCEEDED"
+                assert json.loads(r_cs["output"])["ResponseBody"] == expected
+
+            # UTF-8 without explicit charset decodes as UTF-8 in ResponseBody; unknown charset fails without trace body.
+            r_utf8_nocs = call(rpath(200, "text/plain", "café".encode("utf-8")))
+            assert json.loads(r_utf8_nocs["output"])["ResponseBody"] == "café"
+            assert r_utf8_nocs["inspectionData"]["response"]["body"] == "caf\ufffd\ufffd"
+            r_utf8_cs = call(rpath(200, "text/plain; charset=utf-8", "café".encode("utf-8")))
+            assert json.loads(r_utf8_cs["output"])["ResponseBody"] == "café"
+            assert r_utf8_cs["inspectionData"]["response"]["body"] == "café"
+
+            r_unk = call(rpath(200, "text/plain; charset=bogus-999", b"hello"))
+            assert (r_unk["status"], r_unk["error"], r_unk["cause"]) == (
+                "FAILED", "States.Runtime",
+                "AWS Step Functions experienced an internal failure while calling the service http",
+            )
+            assert "body" not in r_unk["inspectionData"]["response"]
+
+            # Non-2xx takes precedence over binary Content-Type and invalid UTF-8.
+            r_404_bin = call(rpath(404, "application/octet-stream", b"abc"))
+            assert (r_404_bin["status"], r_404_bin["error"]) == ("FAILED", "States.Http.StatusCode.404")
+            r_400_utf8 = call(rpath(400, "text/plain", b"bad\xff"))
+            assert (r_400_utf8["status"], r_400_utf8["error"]) == ("FAILED", "States.Http.StatusCode.400")
+
+            # Content-Type matching is case-sensitive and reports the full header value in the error cause.
+            assert json.loads(call(rpath(200, "APPLICATION/JSON", b'{"a":1}'))["output"])["ResponseBody"] == '{"a":1}'
+            for ct in ("APPLICATION/OCTET-STREAM", "IMAGE/PNG", "AUDIO/MPEG", "VIDEO/MP4"):
+                assert json.loads(call(rpath(200, ct, b"abc"))["output"])["ResponseBody"] == "abc"
+            r_oct_cs = call(rpath(200, "application/octet-stream; charset=utf-8", b"hello"))
+            assert (r_oct_cs["status"], r_oct_cs["error"], r_oct_cs["cause"]) == (
+                "FAILED", "States.Runtime",
+                "Unsupported response content-type 'application/octet-stream; charset=utf-8'. "
+                "Please see documentation for list of unsupported content-types.",
+            )
+
+            # Responses exceeding 262,144 bytes fail with States.DataLimitExceeded and omit trace.response.
+            r_big = call("large/262145")
+            assert (r_big["status"], r_big["error"], r_big["cause"]) == (
+                "FAILED", "States.DataLimitExceeded",
+                "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+            )
+            assert "response" not in r_big["inspectionData"]
+    finally:
+        server.shutdown()
+
+
+def test_sfn_http_task_transform_and_request_edge_cases(sfn, sfn_sync, eb):
+    """RequestBody: null sends 'null' (and refuses merge with connection BodyParameters); Transform URL_ENCODED
+    supports INDICES/BRACKETS/REPEAT/COMMAS; array QueryParameters, fragment/trailing-? stripping, duplicate-case
+    headers, Content-Length and OPTIONS+body runtime errors match real AWS (AWS capture 2026-11-24, us-west-2)."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _EchoHandler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else None
+            path, _, query = self.path.partition("?")
+            payload = json.dumps({
+                "method": self.command, "path": path, "rawQueryString": query,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_POST = do_OPTIONS = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _EchoHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    try:
+        with _http_task_connection(eb) as (_, conn), _http_task_connection(
+            eb, InvocationHttpParameters={"BodyParameters": [{"Key": "cb", "Value": "cv", "IsValueSecret": True}]}
+        ) as (_, conn_body):
+            def ts(params, reveal=False):
+                st = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "Parameters": params, "End": True}
+                return sfn_sync.test_state(
+                    definition=json.dumps(st), roleArn=role, inspectionLevel="TRACE", revealSecrets=reveal)
+
+            # RequestBody: null sends "null" with */*; charset=UTF-8 on POST and GET; fails merge with conn BodyParameters.
+            for method in ("POST", "GET"):
+                r_null = ts({"ApiEndpoint": f"{url}/echo", "Method": method, "RequestBody": None,
+                             "Authentication": {"ConnectionArn": conn}})
+                echo = json.loads(r_null["output"])["ResponseBody"]
+                assert (echo["body"], echo["headers"]["content-type"]) == ("null", "*/*; charset=UTF-8")
+                assert r_null["inspectionData"]["request"]["body"] == "null"
+
+            r_null_merge = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": None,
+                               "Authentication": {"ConnectionArn": conn_body}})
+            assert (r_null_merge["status"], r_null_merge["error"], r_null_merge["cause"]) == (
+                "FAILED", "States.Runtime", "Cannot merge connection body authorization parameters with request body.")
+
+            # Omitted RequestBody + connection BodyParameters sends */*; charset=UTF-8 on the wire.
+            r_omitted_cb = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST",
+                               "Authentication": {"ConnectionArn": conn_body}}, reveal=False)
+            echo_cb = json.loads(r_omitted_cb["output"])["ResponseBody"]
+            assert (echo_cb["body"], echo_cb["headers"]["content-type"]) == ('{"cb":"cv"}', "*/*; charset=UTF-8")
+            assert r_omitted_cb["inspectionData"]["request"]["body"] == "{}"
+
+            # Transform URL_ENCODED array formats, string/array bodies, and connection BodyParameters redaction.
+            for fmt, expected in (
+                ("INDICES", "a%5Bb%5D=c&d%5B0%5D=1&d%5B1%5D=2&e=null&f=true"),
+                ("BRACKETS", "a%5Bb%5D=c&d%5B%5D=1&d%5B%5D=2&e=null&f=true"),
+                ("REPEAT", "a%5Bb%5D=c&d=1&d=2&e=null&f=true"),
+                ("COMMAS", "a%5Bb%5D=c&d=1%2C2&e=null&f=true&g="),
+            ):
+                r_tr = ts({
+                    "ApiEndpoint": f"{url}/echo", "Method": "POST",
+                    "RequestBody": {"a": {"b": "c"}, "d": [1, 2], "e": None, "f": True, "g": []},
+                    "Transform": {"RequestBodyEncoding": "URL_ENCODED",
+                                  "RequestEncodingOptions": {"ArrayFormat": fmt}},
+                    "Authentication": {"ConnectionArn": conn},
+                })
+                echo_tr = json.loads(r_tr["output"])["ResponseBody"]
+                assert echo_tr["body"] == expected
+                assert echo_tr["headers"]["content-type"] == "application/json; charset=UTF-8"
+
+            r_tr_arr = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": ["a", "b"],
+                           "Transform": {"RequestBodyEncoding": "URL_ENCODED"},
+                           "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_tr_arr["output"])["ResponseBody"]["body"] == "0=a&1=b"
+
+            r_tr_str = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": "hello",
+                           "Transform": {"RequestBodyEncoding": "URL_ENCODED"},
+                           "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_tr_str["output"])["ResponseBody"]["body"] == "hello"
+
+            r_tr_cb = ts({"ApiEndpoint": f"{url}/echo", "Method": "POST", "RequestBody": {"a": "1"},
+                          "Transform": {"RequestBodyEncoding": "URL_ENCODED"},
+                          "Authentication": {"ConnectionArn": conn_body}}, reveal=False)
+            assert json.loads(r_tr_cb["output"])["ResponseBody"]["body"] == "a=1&cb=cv"
+            assert r_tr_cb["inspectionData"]["request"]["body"] == "a=1"
+
+            # Array QueryParameters -> ?0=a; #fragment and trailing ? stripped from ApiEndpoint.
+            r_qparr = ts({"ApiEndpoint": f"{url}/echo", "Method": "GET", "QueryParameters": ["a"],
+                          "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_qparr["output"])["ResponseBody"]["rawQueryString"] == "0=a"
+
+            for ep in (f"{url}/echo#frag", f"{url}/echo?"):
+                r_ep = ts({"ApiEndpoint": ep, "Method": "GET", "Authentication": {"ConnectionArn": conn}})
+                assert r_ep["inspectionData"]["request"]["url"] == f"{url}/echo"
+
+            # Duplicate case-insensitive headers preserve both keys in TRACE and both values on the wire.
+            r_dup = ts({"ApiEndpoint": f"{url}/echo", "Method": "GET", "Headers": {"X-Dup": "1", "x-dup": "2"},
+                        "Authentication": {"ConnectionArn": conn}})
+            assert json.loads(r_dup["output"])["ResponseBody"]["headers"]["x-dup"] == "1,2"
+            dup_trace_hdrs = json.loads(r_dup["inspectionData"]["request"]["headers"])
+            assert (dup_trace_hdrs["X-Dup"], dup_trace_hdrs["x-dup"]) == (["1"], ["2"])
+
+            # Content-Length header and OPTIONS with RequestBody fail cleanly as States.Runtime; OPTIONS without succeeds.
+            internal_err = "AWS Step Functions experienced an internal failure while calling the service http"
+            for bad_params in (
+                {"ApiEndpoint": f"{url}/echo", "Method": "GET", "Headers": {"Content-Length": "99"},
+                 "Authentication": {"ConnectionArn": conn}},
+                {"ApiEndpoint": f"{url}/echo", "Method": "POST", "Headers": {"Content-Length": "99"},
+                 "RequestBody": {"a": 1}, "Authentication": {"ConnectionArn": conn}},
+                {"ApiEndpoint": f"{url}/echo", "Method": "OPTIONS", "RequestBody": {"a": 1},
+                 "Authentication": {"ConnectionArn": conn}},
+            ):
+                r_fail = ts(bad_params)
+                assert (r_fail["status"], r_fail["error"], r_fail["cause"]) == ("FAILED", "States.Runtime", internal_err)
+                assert "request" in r_fail["inspectionData"]
+
+            r_opt = ts({"ApiEndpoint": f"{url}/echo", "Method": "OPTIONS", "Authentication": {"ConnectionArn": conn}})
+            assert r_opt["status"] == "SUCCEEDED"
+            assert json.loads(r_opt["output"])["ResponseBody"]["method"] == "OPTIONS"
+    finally:
+        server.shutdown()
+
+
+def test_sfn_http_task_compression_json_quirks_jsonata_and_history(sfn, sfn_sync, eb):
+    """gzip/deflate responses are transparently decompressed while keeping raw bytes in TRACE and headers; unknown
+    Content-Encoding fails with States.Http.InvalidCompressionType; application/json parses the first JSON value
+    (tolerating trailing tokens, leaving BOM-prefixed bodies as strings); JSONata dynamic extra fields validate at
+    runtime; execution history records resourceType='http' and resource='invoke' (AWS capture 2026-11-24)."""
+    import gzip
+    import threading
+    import zlib
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _handle(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            path = self.path.split("?", 1)[0]
+            headers = {}
+            if path == "/gzip-json":
+                body = gzip.compress(b'{"compressed":"gzip"}')
+                ct = "application/json"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/gzip-text":
+                body = gzip.compress(b"hello gzip")
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/deflate-json":
+                body = zlib.compress(b'{"compressed":"deflate"}')
+                ct = "application/json"
+                headers["Content-Encoding"] = "deflate"
+            elif path == "/ce-bogus":
+                body = b"plain text"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "bogus-enc"
+            elif path == "/ce-corrupt-gzip":
+                body = b"not valid gzip"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/ce-empty-gzip":
+                body = b""
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/ce-bomb-gzip":
+                body = gzip.compress(b"x" * 300000)
+                ct = "text/plain"
+                headers["Content-Encoding"] = "gzip"
+            elif path == "/ce-upper-gzip":
+                body = gzip.compress(b'{"ok":true}')
+                ct = "application/json"
+                headers["Content-Encoding"] = "GZIP"
+            elif path == "/ce-identity":
+                body = b"plain"
+                ct = "text/plain"
+                headers["Content-Encoding"] = "identity"
+            elif path == "/ce-raw-deflate":
+                c = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+                body = c.compress(b'{"raw":true}') + c.flush()
+                ct = "application/json"
+                headers["Content-Encoding"] = "deflate"
+            elif path == "/ce-double-gzip":
+                body = gzip.compress(gzip.compress(b'{"double":true}'))
+                ct = "application/json"
+                headers["Content-Encoding"] = "gzip, gzip"
+            elif path == "/size-262000":
+                body = b"x" * 262000
+                ct = "text/plain"
+            elif path == "/json-two":
+                body = b'{"a":1}{"b":2}'
+                ct = "application/json"
+            elif path == "/json-trailing":
+                body = b'{"a":1} trailing'
+                ct = "application/json"
+            elif path == "/json-bom":
+                body = b'\xef\xbb\xbf{"a":1}'
+                ct = "application/json"
+            elif path == "/json-nan":
+                body = b"NaN"
+                ct = "application/json"
+            elif path == "/json-inf":
+                body = b"Infinity"
+                ct = "application/json"
+            elif path == "/json-obj-nan":
+                body = b'{"x":NaN}'
+                ct = "application/json"
+            elif path == "/json-ctrl":
+                body = b'{"a":"\x01"}'
+                ct = "application/json"
+            elif path == "/json-123abc":
+                body = b"123abc"
+                ct = "application/json"
+            elif path == "/json-truefalse":
+                body = b"truefalse"
+                ct = "application/json"
+            elif path == "/json-arr-junk":
+                body = b"[1,2]junk"
+                ct = "application/json"
+            else:
+                path_only, _, qs = self.path.partition("?")
+                body = json.dumps({
+                    "path": path_only,
+                    "rawQueryString": qs,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                }).encode("utf-8")
+                ct = "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _handle
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    role = "arn:aws:iam::000000000000:role/sfn-role"
+    try:
+        with _http_task_connection(eb) as (_, conn):
+            def ts(path, *, ql=None, extra_params=None, inp="{}"):
+                params = {"ApiEndpoint": f"{url}{path}", "Method": "GET", "Authentication": {"ConnectionArn": conn}}
+                if extra_params:
+                    params.update(extra_params)
+                st = {"Type": "Task", "Resource": "arn:aws:states:::http:invoke", "End": True}
+                if ql == "JSONata":
+                    st["QueryLanguage"] = "JSONata"
+                    st["Arguments"] = params
+                else:
+                    st["Parameters"] = params
+                return sfn_sync.test_state(
+                    definition=json.dumps(st), roleArn=role, input=inp, inspectionLevel="TRACE")
+
+            # Transparent gzip and deflate decompression; Headers retain Content-Encoding.
+            r_gz = ts("/gzip-json")
+            out_gz = json.loads(r_gz["output"])
+            assert out_gz["ResponseBody"] == {"compressed": "gzip"}
+            assert out_gz["Headers"]["Content-Encoding"] == ["gzip"]
+            assert "\ufffd" in r_gz["inspectionData"]["response"]["body"]
+
+            assert json.loads(ts("/gzip-text")["output"])["ResponseBody"] == "hello gzip"
+            assert json.loads(ts("/deflate-json")["output"])["ResponseBody"] == {"compressed": "deflate"}
+
+            r_bogus = ts("/ce-bogus")
+            assert (r_bogus["status"], r_bogus["error"], r_bogus["cause"]) == (
+                "FAILED", "States.Http.InvalidCompressionType", "Invalid Compression type received from the server")
+            assert r_bogus["inspectionData"]["response"]["body"] == "plain text"
+
+            for bad_ce in ("/ce-upper-gzip", "/ce-identity", "/ce-double-gzip"):
+                r_inv = ts(bad_ce)
+                assert (r_inv["status"], r_inv["error"]) == ("FAILED", "States.Http.InvalidCompressionType")
+
+            for corrupt_ce in ("/ce-corrupt-gzip", "/ce-raw-deflate"):
+                r_parse = ts(corrupt_ce)
+                assert (r_parse["status"], r_parse["error"], r_parse["cause"]) == (
+                    "FAILED", "States.Http.FailedToParseResponse", "Failed to parse HTTP response")
+
+            assert json.loads(ts("/ce-empty-gzip")["output"])["ResponseBody"] == ""
+
+            for big_path in ("/ce-bomb-gzip", "/size-262000"):
+                r_bomb = ts(big_path)
+                assert (r_bomb["status"], r_bomb["error"]) == ("FAILED", "States.DataLimitExceeded")
+                assert "response" in r_bomb["inspectionData"]
+
+            # Jackson-compatible JSON parsing: first value wins; BOM, NaN, Infinity, 123abc, truefalse stay strings.
+            assert json.loads(ts("/json-two")["output"])["ResponseBody"] == {"a": 1}
+            assert json.loads(ts("/json-trailing")["output"])["ResponseBody"] == {"a": 1}
+            assert json.loads(ts("/json-arr-junk")["output"])["ResponseBody"] == [1, 2]
+            assert json.loads(ts("/json-bom")["output"])["ResponseBody"] == '\ufeff{"a":1}'
+            assert json.loads(ts("/json-nan")["output"])["ResponseBody"] == "NaN"
+            assert json.loads(ts("/json-inf")["output"])["ResponseBody"] == "Infinity"
+            assert json.loads(ts("/json-obj-nan")["output"])["ResponseBody"] == '{"x":NaN}'
+            assert json.loads(ts("/json-ctrl")["output"])["ResponseBody"] == '{"a":"\x01"}'
+            assert json.loads(ts("/json-123abc")["output"])["ResponseBody"] == "123abc"
+            assert json.loads(ts("/json-truefalse")["output"])["ResponseBody"] == "truefalse"
+
+            # Leading/trailing spaces on header keys are trimmed; spaces, non-ASCII, and ';' in path are encoded;
+            # empty path normalizes to '/'.
+            r_trim = ts("/echo/a b", extra_params={"Headers": {" X-Foo ": "bar", "X/Ok": "1"}})
+            assert json.loads(r_trim["output"])["ResponseBody"]["headers"]["x-foo"] == "bar"
+            assert json.loads(r_trim["output"])["ResponseBody"]["headers"]["x/ok"] == "1"
+            assert json.loads(r_trim["inspectionData"]["request"]["headers"])["X-Foo"] == ["bar"]
+            assert r_trim["inspectionData"]["request"]["url"].endswith("/echo/a%20b")
+            assert ts("/echo/café")["inspectionData"]["request"]["url"].endswith("/echo/caf%C3%A9")
+            assert ts("/echo;v=1")["inspectionData"]["request"]["url"].endswith("/echo%3Bv%3D1")
+            assert ts("")["inspectionData"]["request"]["url"] == f"{url}/"
+
+            # Dynamic null Method/ApiEndpoint produce bare Required fields error; Transform RequestBodyEncoding=None ok.
+            r_null_both = sfn_sync.test_state(
+                definition=json.dumps({
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {"ApiEndpoint.$": "$.u", "Method.$": "$.m", "Authentication": {"ConnectionArn": conn}},
+                    "End": True,
+                }),
+                roleArn=role, input=json.dumps({"u": None, "m": None}),
+            )
+            assert (r_null_both["status"], r_null_both["error"], r_null_both["cause"]) == (
+                "FAILED", "States.Runtime", "Required fields [ApiEndpoint, Method] are missing.")
+
+            assert ts("/echo", extra_params={"Transform": {"RequestBodyEncoding": None}})["status"] == "SUCCEEDED"
+            assert ts("/echo", extra_params={
+                "Transform": {"RequestBodyEncoding": "URL_ENCODED", "RequestEncodingOptions": {"ArrayFormat": None}},
+            })["status"] == "SUCCEEDED"
+
+            r_retriable = sfn_sync.test_state(
+                definition=json.dumps({
+                    "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {"ApiEndpoint": f"{url}/ce-bogus", "Method": "GET",
+                                   "Authentication": {"ConnectionArn": conn}},
+                    "Retry": [{"ErrorEquals": ["States.Http.InvalidCompressionType"],
+                               "IntervalSeconds": 2, "MaxAttempts": 3}],
+                    "End": True,
+                }),
+                roleArn=role, inspectionLevel="TRACE",
+            )
+            assert (r_retriable["status"], r_retriable["error"]) == ("RETRIABLE", "States.Http.InvalidCompressionType")
+            assert r_retriable["inspectionData"]["errorDetails"] == {
+                "retryIndex": 0, "retryBackoffIntervalSeconds": 2,
+            }
+
+            # Connection HeaderParameters: denied headers fail (even x-amz-*), unless overridden by auth header;
+            # query override is case-sensitive on flattened keys.
+            with _http_task_connection(
+                eb, InvocationHttpParameters={"HeaderParameters": [{"Key": "Origin", "Value": "https://a.example"}]}
+            ) as (_, conn_origin), _http_task_connection(
+                eb, InvocationHttpParameters={"HeaderParameters": [{"Key": "X-Amz-Custom", "Value": "v"}]}
+            ) as (_, conn_xamz), _http_task_connection(
+                eb, InvocationHttpParameters={
+                    "HeaderParameters": [{"Key": "Authorization", "Value": "Bearer override"}],
+                    "QueryStringParameters": [{"Key": "foo", "Value": "c"}, {"Key": "arr", "Value": "ca"}],
+                }
+            ) as (_, conn_auth_qp):
+                for c_bad, expected_name in ((conn_origin, "origin"), (conn_xamz, "x-amz-custom")):
+                    r_co = sfn_sync.test_state(
+                        definition=json.dumps({
+                            "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                            "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                                           "Authentication": {"ConnectionArn": c_bad}},
+                            "End": True,
+                        }),
+                        roleArn=role, inspectionLevel="TRACE",
+                    )
+                    assert (r_co["status"], r_co["error"], r_co["cause"]) == (
+                        "FAILED", "States.Runtime", f"The 'Headers' field contains unsupported values: [{expected_name}]")
+                    assert "request" in r_co["inspectionData"]
+
+                r_ok_auth = sfn_sync.test_state(
+                    definition=json.dumps({
+                        "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                        "Parameters": {
+                            "ApiEndpoint": f"{url}/echo", "Method": "GET",
+                            "QueryParameters": {"Foo": "T", "arr": ["x", "y"]},
+                            "Authentication": {"ConnectionArn": conn_auth_qp},
+                        },
+                        "End": True,
+                    }),
+                    roleArn=role, inspectionLevel="TRACE", revealSecrets=True,
+                )
+                assert r_ok_auth["status"] == "SUCCEEDED"
+                echo_ok = json.loads(r_ok_auth["output"])["ResponseBody"]
+                assert echo_ok["headers"]["authorization"] == "Basic dTpw"
+                assert echo_ok["rawQueryString"] == "Foo=T&arr%5B0%5D=x&arr%5B1%5D=y&foo=c&arr=ca"
+
+            # JSONata dynamic extra field passes definition validation and fails at runtime with States.Runtime.
+            r_jexpr = ts("/echo", ql="JSONata", extra_params={"ExtraField": "{% $states.input.x %}"},
+                         inp=json.dumps({"x": "hi"}))
+            assert r_jexpr["status"] == "FAILED"
+            assert r_jexpr["error"] == "States.Runtime"
+            assert 'The field "ExtraField" is not supported by Step Functions' in r_jexpr["cause"]
+
+            # Execution history records resourceType='http', resource='invoke', region, and parameters.
+            sm_arn = sfn.create_state_machine(
+                name=f"sfn-http-hist-{_uuid_mod.uuid4().hex[:8]}",
+                definition=json.dumps({
+                    "StartAt": "Call",
+                    "States": {"Call": {
+                        "Type": "Task", "Resource": "arn:aws:states:::http:invoke",
+                        "TimeoutSeconds": 10,
+                        "Parameters": {"ApiEndpoint": f"{url}/echo", "Method": "GET",
+                                       "Authentication": {"ConnectionArn": conn}},
+                        "End": True,
+                    }},
+                }),
+                roleArn=role,
+            )["stateMachineArn"]
+            try:
+                exec_arn = sfn.start_execution(stateMachineArn=sm_arn, input="{}")["executionArn"]
+                desc = _wait_sfn(sfn, exec_arn)
+                assert desc["status"] == "SUCCEEDED"
+                events = {e["type"]: e for e in sfn.get_execution_history(executionArn=exec_arn)["events"]}
+                sched = events["TaskScheduled"]["taskScheduledEventDetails"]
+                assert (sched["resourceType"], sched["resource"], sched["timeoutInSeconds"]) == ("http", "invoke", 10)
+                assert json.loads(sched["parameters"])["ApiEndpoint"] == f"{url}/echo"
+                assert events["TaskStarted"]["taskStartedEventDetails"] == {"resourceType": "http", "resource": "invoke"}
+                succ = events["TaskSucceeded"]["taskSucceededEventDetails"]
+                assert (succ["resourceType"], succ["resource"]) == ("http", "invoke")
+            finally:
+                sfn.delete_state_machine(stateMachineArn=sm_arn)
+    finally:
+        server.shutdown()

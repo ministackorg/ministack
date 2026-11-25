@@ -407,6 +407,7 @@ def _structure_diagnostics(definition_str) -> list:
                             f"/States/{_pointer(name)}"))
     if not any(s.get("Type") in ("Succeed", "Fail") or s.get("End") is True for s in states.values()):
         out.append(diag("MISSING_END_STATE", "Workflow has no terminal state"))
+    out.extend(_http_task_tree_diagnostics(states, "/States", definition.get("QueryLanguage", "JSONPath")))
     return out
 
 
@@ -1631,6 +1632,16 @@ def _test_state(data):
     state_type = state_def.get("Type")
     if not state_type:
         return error_response_json("InvalidDefinition", "State must have a Type", 400)
+    state_loc = f"/States/{_pointer(state_name)}" if "States" in definition else "/States/StateName"
+    http_diags = _http_task_state_diagnostics(
+        state_def, state_loc, definition.get("QueryLanguage", "JSONPath"))
+    if http_diags:
+        return error_response_json(
+            "InvalidDefinition",
+            "Invalid State Machine Definition: '" + ", ".join(
+                f"{d['code']}: {d['message']} at {d.get('location', 'null')}" for d in http_diags) + "'",
+            400,
+        )
 
     # Build context
     user_ctx = data.get("context")
@@ -1684,12 +1695,18 @@ def _test_state(data):
             result = {"status": "FAILED", "error": error, "cause": cause}
 
         elif state_type == "Task":
-            effective = _apply_input_path(state_def, input_data, ctx)
-            effective = _apply_parameters(state_def, effective, ctx)
-
-            if inspection_level in ("DEBUG", "TRACE"):
-                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data, ctx))
-                inspection_data["afterParameters"] = json.dumps(effective)
+            state_ql = state_def.get("QueryLanguage") or definition.get("QueryLanguage", "JSONPath")
+            is_jsonata_task = state_ql == "JSONata"
+            if is_jsonata_task:
+                effective = _apply_jsonata_arguments(state_def, input_data, ctx)
+                if inspection_level in ("DEBUG", "TRACE"):
+                    inspection_data["afterArguments"] = json.dumps(effective)
+            else:
+                after_input = _apply_input_path(state_def, input_data, ctx)
+                effective = _apply_parameters(state_def, after_input, ctx)
+                if inspection_level in ("DEBUG", "TRACE"):
+                    inspection_data["afterInputPath"] = json.dumps(after_input)
+                    inspection_data["afterParameters"] = json.dumps(effective)
 
             # Mock support
             if mock:
@@ -1751,20 +1768,33 @@ def _test_state(data):
             else:
                 # Real execution
                 resource = state_def.get("Resource", "")
+                http_trace = {} if (inspection_level == "TRACE" and resource == "arn:aws:states:::http:invoke") else None
                 try:
-                    task_result = _invoke_resource(resource, effective)
-                    task_result = _apply_result_selector(state_def, task_result)
+                    if http_trace is not None:
+                        task_result = _invoke_http_endpoint(
+                            resource, effective, trace=http_trace,
+                            reveal_secrets=bool(data.get("revealSecrets")),
+                        )
+                    else:
+                        task_result = _invoke_resource(resource, effective)
+                    if is_jsonata_task:
+                        if inspection_level in ("DEBUG", "TRACE"):
+                            inspection_data["result"] = json.dumps(task_result)
+                        output = _apply_jsonata_output(
+                            state_def, input_data, ctx, result=task_result, default=task_result)
+                    else:
+                        task_result = _apply_result_selector(state_def, task_result)
 
-                    if inspection_level in ("DEBUG", "TRACE"):
-                        inspection_data["result"] = json.dumps(task_result)
-                        inspection_data["afterResultSelector"] = json.dumps(task_result)
+                        if inspection_level in ("DEBUG", "TRACE"):
+                            inspection_data["result"] = json.dumps(task_result)
+                            inspection_data["afterResultSelector"] = json.dumps(task_result)
 
-                    output = _apply_result_path(state_def, input_data, task_result)
+                        output = _apply_result_path(state_def, input_data, task_result)
 
-                    if inspection_level in ("DEBUG", "TRACE"):
-                        inspection_data["afterResultPath"] = json.dumps(output)
+                        if inspection_level in ("DEBUG", "TRACE"):
+                            inspection_data["afterResultPath"] = json.dumps(output)
 
-                    output = _apply_output_path(state_def, output, ctx)
+                        output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1780,11 +1810,36 @@ def _test_state(data):
                             "status": "CAUGHT_ERROR",
                             "output": json.dumps(output),
                             "error": err.error,
-                            "cause": err.cause,
                             "nextState": catcher["Next"],
                         }
+                        if err.cause is not None:
+                            result["cause"] = err.cause
                     else:
-                        result = {"status": "FAILED", "error": err.error, "cause": err.cause}
+                        retriers = state_def.get("Retry", [])
+                        retrier, retrier_idx = _find_matching_retrier(retriers, err.error, {})
+                        retry_config = data.get("stateConfiguration", {})
+                        retry_count = retry_config.get("retrierRetryCount", 0)
+                        if retrier is not None and retry_count < retrier.get("MaxAttempts", 3):
+                            interval = retrier.get("IntervalSeconds", 1)
+                            backoff = retrier.get("BackoffRate", 2.0)
+                            result = {"status": "RETRIABLE", "error": err.error}
+                            if err.cause is not None:
+                                result["cause"] = err.cause
+                            if inspection_level in ("DEBUG", "TRACE"):
+                                inspection_data["errorDetails"] = {
+                                    "retryBackoffIntervalSeconds": int(interval * (backoff ** retry_count)),
+                                    "retryIndex": retrier_idx,
+                                }
+                        else:
+                            result = {"status": "FAILED", "error": err.error}
+                            if err.cause is not None:
+                                result["cause"] = err.cause
+                finally:
+                    if http_trace:
+                        if "request" in http_trace:
+                            inspection_data["request"] = http_trace["request"]
+                        if "response" in http_trace:
+                            inspection_data["response"] = http_trace["response"]
         else:
             return error_response_json("InvalidDefinition", f"Unsupported state type: {state_type}", 400)
 
@@ -2133,12 +2188,26 @@ def _execute_task(state_def, raw_input, execution, ctx):
             if query_language == "JSONata":
                 effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
 
-            _add_event(execution, "TaskScheduled", {
-                "taskScheduledEventDetails": {
-                    "resourceType": "lambda" if "lambda" in resource else "states",
-                    "resource": resource,
-                },
-            })
+            if resource == "arn:aws:states:::http:invoke":
+                sched_details = {
+                    "resourceType": "http",
+                    "resource": "invoke",
+                    "region": get_region(),
+                    "parameters": json.dumps(effective, separators=(",", ":")),
+                }
+                if "TimeoutSeconds" in state_def:
+                    sched_details["timeoutInSeconds"] = state_def["TimeoutSeconds"]
+                _add_event(execution, "TaskScheduled", {"taskScheduledEventDetails": sched_details})
+                _add_event(execution, "TaskStarted", {
+                    "taskStartedEventDetails": {"resourceType": "http", "resource": "invoke"},
+                })
+            else:
+                _add_event(execution, "TaskScheduled", {
+                    "taskScheduledEventDetails": {
+                        "resourceType": "lambda" if "lambda" in resource else "states",
+                        "resource": resource,
+                    },
+                })
 
             if _mock_throw is not None:
                 raise _mock_throw
@@ -2153,12 +2222,21 @@ def _execute_task(state_def, raw_input, execution, ctx):
             else:
                 task_result = _invoke_resource(resource, effective)
 
-            _add_event(execution, "TaskSucceeded", {
-                "taskSucceededEventDetails": {
-                    "output": json.dumps(task_result),
-                    "resource": resource,
-                },
-            })
+            if resource == "arn:aws:states:::http:invoke":
+                _add_event(execution, "TaskSucceeded", {
+                    "taskSucceededEventDetails": {
+                        "resourceType": "http",
+                        "resource": "invoke",
+                        "output": json.dumps(task_result),
+                    },
+                })
+            else:
+                _add_event(execution, "TaskSucceeded", {
+                    "taskSucceededEventDetails": {
+                        "output": json.dumps(task_result),
+                        "resource": resource,
+                    },
+                })
 
             if query_language == "JSONata":
                 output = _apply_jsonata_output(
@@ -2180,12 +2258,22 @@ def _execute_task(state_def, raw_input, execution, ctx):
 
         except _ExecutionError as err:
             last_error = err
-            _add_event(execution, "TaskFailed", {
-                "taskFailedEventDetails": {
-                    "error": err.error, "cause": err.cause,
-                    "resource": resource,
-                },
-            })
+            if resource == "arn:aws:states:::http:invoke":
+                _add_event(execution, "TaskFailed", {
+                    "taskFailedEventDetails": {
+                        "resourceType": "http",
+                        "resource": "invoke",
+                        "error": err.error,
+                        "cause": err.cause,
+                    },
+                })
+            else:
+                _add_event(execution, "TaskFailed", {
+                    "taskFailedEventDetails": {
+                        "error": err.error, "cause": err.cause,
+                        "resource": resource,
+                    },
+                })
 
             retrier, retrier_idx = _find_matching_retrier(
                 retriers, err.error, retry_counts)
@@ -6063,7 +6151,793 @@ def _invoke_events_put_events(resource, input_data):
     return result
 
 
+_HTTP_TASK_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
+_HTTP_TASK_TIMEOUT_SECONDS = 60
+_HTTP_TASK_MAX_RESPONSE_BYTES = 262144
+_HTTP_TASK_ALLOWED_FIELDS = frozenset({
+    "ApiEndpoint", "Method", "Authentication", "InvocationConfig",
+    "Headers", "QueryParameters", "RequestBody", "Transform",
+})
+_HTTP_TASK_ARRAY_FORMATS = ("INDICES", "BRACKETS", "REPEAT", "COMMAS")
+# Exhaustive printable-ASCII sweep on real AWS (2026-11-24, us-west-2): only '%' and ':' are rejected in header names.
+_HTTP_TASK_ILLEGAL_HEADER_CHARS = ("%", ":")
+# Real AWS ConnectionArns carry a trailing /<uuid>; MiniStack's eventbridge.create_connection omits it, so accept both.
+_HTTP_TASK_CONN_ARN_RE = re.compile(
+    r"^arn:aws[a-z-]*:events:([a-z0-9-]+):(\d{12}):connection/[^/\s]+(?:/[^/\s]+)?$"
+)
+# Headers Step Functions rejects during schema validation: ValidateStateMachineDefinition,
+# CreateStateMachine, UpdateStateMachine, TestState (for static Parameters), and at runtime
+# inside the wrapped "The Parameters '...' could not be used to start the Task: [...]" error.
+_HTTP_TASK_SCHEMA_DENIED_HEADERS = frozenset({
+    "authorization", "connection", "content-md5", "expect", "host", "max-forwards", "proxy-authenticate", "server",
+    "te", "trailer", "transfer-encoding", "upgrade", "via", "www-authenticate",
+})
+_HTTP_TASK_DENIED_HEADER_PREFIXES = ("x-amz-", "x-amzn-", "x-forwarded-")
+# Headers Step Functions accepts in a state machine definition but rejects at runtime with a
+# bare States.Runtime cause "The 'Headers' field contains unsupported values: [...]"
+# (AWS capture 2026-11-22, us-west-2).
+_HTTP_TASK_RUNTIME_DENIED_HEADERS = frozenset({
+    "a-im", "accept-charset", "accept-datetime", "accept-encoding", "cache-control", "content-encoding", "date",
+    "forwarded", "from", "http2-settings", "origin", "pragma", "proxy-authorization", "referer", "warning",
+})
+
+
+def _is_jsonata_expr(value):
+    return isinstance(value, str) and value.startswith("{%") and value.endswith("%}")
+
+
+def _http_task_headers_error(headers, *, static=False, jsonata=False) -> str | None:
+    """First schema error for an HTTP Task's Headers field, or None (AWS capture 2026-11-22, us-west-2)."""
+    if headers is None:
+        return None
+    if static and jsonata and _is_jsonata_expr(headers):
+        return None
+    if not isinstance(headers, dict):
+        return "The value of the field 'Headers' has an invalid format"
+    denied = []
+    for key, val in headers.items():
+        if static and not jsonata and isinstance(key, str) and key.endswith(".$"):
+            continue
+        if static and jsonata and _is_jsonata_expr(val):
+            continue
+        if not isinstance(key, str) or not key.strip():
+            return "The 'Headers' field cannot contain empty keys."
+        if val is None:
+            return "The 'Headers' field cannot contain null values."
+        if isinstance(val, dict):
+            return "The 'Headers' field cannot contain nested values."
+        if isinstance(val, list):
+            if any(isinstance(item, (dict, list)) for item in val):
+                return "The 'Headers' field cannot contain nested values."
+            if any(not isinstance(item, str) for item in val):
+                return "'Header' values must be strings or arrays of strings."
+            texts = [key, *val]
+        elif not isinstance(val, str):
+            return "'Header' values must be strings or arrays of strings."
+        else:
+            texts = [key, val]
+        # AWS schema-validates Headers as printable US-ASCII and RFC 7230 token names (captures 2026-11-24).
+        if any(ord(ch) > 127 for text in texts for ch in text):
+            return "The 'Headers' field must only contain US-ASCII characters"
+        if any(ord(ch) < 32 or ord(ch) == 127 for text in texts for ch in text):
+            return "The 'Headers' field must not contain control characters"
+        trimmed = key.strip()
+        bad_chars = [ch for ch in _HTTP_TASK_ILLEGAL_HEADER_CHARS if ch in trimmed]
+        if bad_chars:
+            return f"The 'Headers' field name must not contain illegal characters [{', '.join(bad_chars)}]"
+        if " " in trimmed:
+            return "The 'Headers' field name must not contain illegal whitespace"
+        lower = trimmed.lower()
+        if lower in _HTTP_TASK_SCHEMA_DENIED_HEADERS or lower.startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES):
+            if lower not in denied:
+                denied.append(lower)
+    if denied:
+        return f"The 'Headers' field contains unsupported values: [{', '.join(denied)}]"
+    return None
+
+
+def _http_task_transform_error(transform, *, static=False, jsonata=False) -> str | None:
+    """Schema error for an HTTP Task's Transform field, or None (AWS capture 2026-11-24, us-west-2)."""
+    if transform is None:
+        return None
+    if static and jsonata and _is_jsonata_expr(transform):
+        return None
+    if not isinstance(transform, dict):
+        return "The value of the field 'Transform' has an invalid format"
+
+    def base_key(k):
+        return k[:-2] if (static and not jsonata and isinstance(k, str) and k.endswith(".$")) else k
+
+    def skipped(obj, name):
+        if not static:
+            return False
+        if not jsonata and f"{name}.$" in obj and name not in obj:
+            return True
+        if jsonata and name in obj and _is_jsonata_expr(obj[name]):
+            return True
+        return False
+
+    for k in transform:
+        if base_key(k) not in ("RequestBodyEncoding", "RequestEncodingOptions"):
+            return "The value of the field 'Transform' has an invalid format"
+    if "RequestBodyEncoding" in transform and not skipped(transform, "RequestBodyEncoding"):
+        if transform["RequestBodyEncoding"] not in (None, "NONE", "URL_ENCODED"):
+            return "The value of the field 'Transform' has an invalid format"
+    if "RequestEncodingOptions" in transform and not skipped(transform, "RequestEncodingOptions"):
+        opts = transform["RequestEncodingOptions"]
+        if opts is not None:
+            if not isinstance(opts, dict):
+                return "The value of the field 'Transform' has an invalid format"
+            for k in opts:
+                if base_key(k) != "ArrayFormat":
+                    return "The value of the field 'Transform' has an invalid format"
+            if "ArrayFormat" in opts and not skipped(opts, "ArrayFormat"):
+                if opts["ArrayFormat"] not in (None, *_HTTP_TASK_ARRAY_FORMATS):
+                    return "The value of the field 'Transform' has an invalid format"
+    return None
+
+
+def _http_task_schema_errors(params, *, static=False, jsonata=False) -> list[str]:
+    """Schema-level errors for an HTTP Task's Parameters or Arguments (AWS captures 2026-11-22 & 2026-11-24)."""
+    import urllib.parse
+
+    if not isinstance(params, dict):
+        if static:
+            return []
+        return [
+            "The field 'ApiEndpoint' is required but was missing",
+            "The field 'Method' is required but was missing",
+        ]
+
+    def has_field(obj, name):
+        return name in obj or (static and not jsonata and f"{name}.$" in obj)
+
+    def static_skip(obj, name):
+        if not static:
+            return False
+        if not jsonata and f"{name}.$" in obj and name not in obj:
+            return True
+        if jsonata and name in obj and _is_jsonata_expr(obj[name]):
+            return True
+        return False
+
+    missing = []
+    if not has_field(params, "ApiEndpoint"):
+        missing.append("The field 'ApiEndpoint' is required but was missing")
+    if not has_field(params, "Method"):
+        missing.append("The field 'Method' is required but was missing")
+    if missing:
+        return missing
+
+    if not static_skip(params, "Method"):
+        method_val = params.get("Method")
+        if not (static and method_val is None) and method_val not in _HTTP_TASK_METHODS:
+            return ["The value of the field 'Method' must be one of [GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS]"]
+
+    errors = []
+    for k in params:
+        if static and not jsonata and isinstance(k, str) and k.endswith(".$"):
+            continue
+        if static and jsonata and _is_jsonata_expr(params[k]):
+            continue
+        if k not in _HTTP_TASK_ALLOWED_FIELDS:
+            errors.append(f'The field "{k}" is not supported by Step Functions')
+
+    if "Headers" in params and not static_skip(params, "Headers"):
+        hdr_err = _http_task_headers_error(params["Headers"], static=static, jsonata=jsonata)
+        if hdr_err:
+            errors.append(hdr_err)
+
+    if "Transform" in params and not static_skip(params, "Transform"):
+        tr_err = _http_task_transform_error(params["Transform"], static=static, jsonata=jsonata)
+        if tr_err:
+            errors.append(tr_err)
+
+    if not static_skip(params, "ApiEndpoint"):
+        endpoint = params.get("ApiEndpoint")
+        if static and endpoint is None:
+            pass
+        elif not isinstance(endpoint, str):
+            errors.append("The value for the field 'ApiEndpoint' must be a STRING")
+        elif not endpoint:
+            errors.append("The value for the 'ApiEndpoint' field cannot be empty")
+        else:
+            url = urllib.parse.urlsplit(endpoint)
+            if not url.scheme or not url.netloc:
+                errors.append("The value for the 'ApiEndpoint' field is not valid")
+            elif url.scheme not in ("http", "https"):
+                errors.append("The value for the 'ApiEndpoint' field must have the scheme 'https'")
+            elif url.query:
+                errors.append("The value for the 'ApiEndpoint' field must not contain query parameters")
+
+    has_inv = (params.get("InvocationConfig") is not None) or (
+        static and not jsonata and "InvocationConfig.$" in params
+    )
+    has_auth = (params.get("Authentication") is not None) or (
+        static and not jsonata and "Authentication.$" in params
+    )
+    if has_inv and has_auth:
+        errors.append("The field 'InvocationConfig' cannot be used with 'Authentication'")
+    elif not has_inv and not has_auth:
+        errors.append("The field must contain exactly one of 'InvocationConfig' or 'Authentication'")
+        errors.append("The field 'InvocationConfig.ConnectionArn' is required but was missing")
+    else:
+        auth_key = "InvocationConfig" if has_inv else "Authentication"
+        if not static_skip(params, auth_key):
+            auth_obj = params.get(auth_key)
+            if not isinstance(auth_obj, dict):
+                errors.append("The field 'InvocationConfig.ConnectionArn' is required but was missing")
+            else:
+                extra_auth = [
+                    k for k in auth_obj
+                    if (k[:-2] if (static and not jsonata and isinstance(k, str) and k.endswith(".$")) else k)
+                    != "ConnectionArn"
+                ]
+                if extra_auth:
+                    errors.append(f"The value of the field '{auth_key}' has an invalid format")
+                elif not static_skip(auth_obj, "ConnectionArn"):
+                    if not has_field(auth_obj, "ConnectionArn") or auth_obj.get("ConnectionArn") is None:
+                        errors.append(f"The field '{auth_key}.ConnectionArn' is required but was missing")
+                    elif not isinstance(auth_obj.get("ConnectionArn"), str):
+                        errors.append(f"The value of the field '{auth_key}' has an invalid format")
+                    elif not auth_obj["ConnectionArn"]:
+                        errors.append("The value for the 'ConnectionArn' field must have a minimum length of 1")
+                    else:
+                        m = _HTTP_TASK_CONN_ARN_RE.match(auth_obj["ConnectionArn"])
+                        if not m:
+                            errors.append("The value for the 'ConnectionArn' field is not valid")
+                        elif m.group(1) != get_region():
+                            errors.append(
+                                f"The value for the 'ConnectionArn' field has region {m.group(1)} "
+                                f"but must be the same region as the state machine ({get_region()})"
+                            )
+
+    return errors
+
+
+def _http_task_state_diagnostics(state, state_path, query_language) -> list:
+    if state.get("Type") != "Task" or state.get("Resource") != "arn:aws:states:::http:invoke":
+        return []
+    ql = state.get("QueryLanguage") or query_language
+    is_jsonata = ql == "JSONata"
+    field = "Arguments" if is_jsonata else "Parameters"
+    if field not in state:
+        if is_jsonata:
+            return []
+        return [{"severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+                 "message": "Parameters field is required for resource ARN: arn:aws:states:::http:invoke",
+                 "location": f"{state_path}/Resource"}]
+    params = state.get(field)
+    if is_jsonata and _is_jsonata_expr(params):
+        return []
+    return [
+        {"severity": "ERROR", "code": "SCHEMA_VALIDATION_FAILED",
+         "message": message, "location": f"{state_path}/{field}"}
+        for message in _http_task_schema_errors(params, static=True, jsonata=is_jsonata)
+    ]
+
+
+def _http_task_tree_diagnostics(states, states_path, query_language) -> list:
+    out = []
+    for name, state in states.items():
+        if not isinstance(state, dict):
+            continue
+        state_path = f"{states_path}/{_pointer(name)}"
+        out.extend(_http_task_state_diagnostics(state, state_path, query_language))
+        state_ql = state.get("QueryLanguage") or query_language
+        if state.get("Type") == "Parallel" and isinstance(state.get("Branches"), list):
+            for idx, branch in enumerate(state["Branches"]):
+                if isinstance(branch, dict) and isinstance(branch.get("States"), dict):
+                    out.extend(_http_task_tree_diagnostics(
+                        branch["States"], f"{state_path}/Branches[{idx}]/States",
+                        branch.get("QueryLanguage") or state_ql))
+        elif state.get("Type") == "Map":
+            for sub_key in ("ItemProcessor", "Iterator"):
+                sub = state.get(sub_key)
+                if isinstance(sub, dict) and isinstance(sub.get("States"), dict):
+                    out.extend(_http_task_tree_diagnostics(
+                        sub["States"], f"{state_path}/{sub_key}/States",
+                        sub.get("QueryLanguage") or state_ql))
+    return out
+# Step Functions' own phrase for a status code: the StatusText of a result and the Cause of a failed call. It is not
+# the phrase the server sent, and a code that is not here (418, 599) has none.
+_HTTP_TASK_STATUS_TEXT = {
+    200: "OK", 201: "Created", 202: "Accepted", 203: "Non Authoritative Information", 204: "No Content",
+    205: "Reset Content", 206: "Partial Content", 207: "Multi-Status", 208: "Already Reported", 226: "IM Used",
+    300: "Multiple Choices", 301: "Moved Permanently", 302: "Moved Temporarily", 303: "See Other",
+    304: "Not Modified", 305: "Use Proxy", 307: "Temporary Redirect", 308: "Permanent Redirect",
+    400: "Bad Request", 401: "Unauthorized", 402: "Payment Required", 403: "Forbidden", 404: "Not Found",
+    405: "Method Not Allowed", 406: "Not Acceptable", 407: "Proxy Authentication Required", 408: "Request Timeout",
+    409: "Conflict", 410: "Gone", 411: "Length Required", 412: "Precondition Failed", 413: "Request Too Long",
+    414: "Request-URI Too Long", 415: "Unsupported Media Type", 416: "Requested Range Not Satisfiable",
+    417: "Expectation Failed", 421: "Misdirected Request", 422: "Unprocessable Content", 423: "Locked",
+    424: "Failed Dependency", 425: "Too Early", 426: "Upgrade Required", 428: "Precondition Required",
+    429: "Too Many Requests", 431: "Request Header Fields Too Large", 451: "Unavailable For Legal Reasons",
+    500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable",
+    504: "Gateway Timeout", 505: "Http Version Not Supported", 506: "Variant Also Negotiates",
+    507: "Insufficient Storage", 508: "Loop Detected", 510: "Not Extended", 511: "Network Authentication Required",
+}
+
+
+def _http_task_query_pairs(key, value, array_format="INDICES"):
+    """One QueryParameters / URL_ENCODED entry as (name, text) pairs."""
+    if isinstance(value, dict):
+        for name, item in value.items():
+            yield from _http_task_query_pairs(f"{key}[{name}]", item, array_format)
+    elif isinstance(value, list):
+        if array_format == "COMMAS":
+            yield key, ",".join(
+                item if isinstance(item, str) else json.dumps(item, separators=(",", ":")) for item in value
+            )
+        elif array_format == "BRACKETS":
+            for item in value:
+                yield from _http_task_query_pairs(f"{key}[]", item, array_format)
+        elif array_format == "REPEAT":
+            for item in value:
+                yield from _http_task_query_pairs(key, item, array_format)
+        else:
+            for index, item in enumerate(value):
+                yield from _http_task_query_pairs(f"{key}[{index}]", item, array_format)
+    else:
+        yield key, value if isinstance(value, str) else json.dumps(value, separators=(",", ":"))
+
+
+def _http_task_form_encode(value, array_format="INDICES") -> str:
+    import urllib.parse
+
+    if isinstance(value, dict):
+        items = value.items()
+    elif isinstance(value, list):
+        items = ((str(i), item) for i, item in enumerate(value))
+    else:
+        return ""
+    pairs = [pair for name, item in items for pair in _http_task_query_pairs(name, item, array_format)]
+    return "&".join(
+        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(text, safe='')}" for name, text in pairs
+    )
+
+
+def _invoke_http_endpoint(resource, input_data, *, trace=None, reveal_secrets=False):
+    """arn:aws:states:::http:invoke — call an HTTP API through an EventBridge connection.
+
+    Where MiniStack differs from AWS on purpose: AWS takes only an https ApiEndpoint on a public domain name with no
+    port, and refuses http, an IP address, localhost and a port. A local API is none of those, so they are accepted
+    here, as API destinations accept them. ConnectionArn also accepts MiniStack's name-only format alongside AWS's
+    /<uuid> format.
+    """
+    import codecs
+    import socket
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from ministack.services import eventbridge
+
+    def parameter_error(message):
+        parameters = json.dumps(input_data, separators=(",", ":"))
+        return _ExecutionError(
+            "States.Runtime", f"The Parameters '{parameters}' could not be used to start the Task: [{message}]")
+
+    if isinstance(input_data, dict):
+        null_required = [f for f in ("ApiEndpoint", "Method") if f in input_data and input_data[f] is None]
+        if null_required:
+            raise _ExecutionError("States.Runtime", f"Required fields [{', '.join(null_required)}] are missing.")
+
+    schema_errors = _http_task_schema_errors(input_data)
+    if schema_errors:
+        raise parameter_error(", ".join(schema_errors))
+    task_headers = input_data.get("Headers") or {}
+    runtime_denied = list(dict.fromkeys(
+        name.lower() for name in task_headers if name.lower() in _HTTP_TASK_RUNTIME_DENIED_HEADERS
+    ))
+    if runtime_denied:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The 'Headers' field contains unsupported values: [{', '.join(runtime_denied)}]",
+        )
+
+    url = urllib.parse.urlsplit(input_data["ApiEndpoint"])
+    raw_path = url.path or "/"
+    encoded_path = urllib.parse.quote(raw_path, safe="/:@!$&'()*+,-._~")
+    base_endpoint = urllib.parse.urlunsplit((url.scheme, url.netloc, encoded_path, "", ""))
+    auth_cfg = input_data.get("InvocationConfig") or input_data.get("Authentication")
+    conn_arn = auth_cfg["ConnectionArn"]
+    # QueryParameters accepts an object or array (0=v0&1=v1); other shapes are ignored (AWS capture 2026-11-24).
+    raw_qp = input_data.get("QueryParameters")
+    if isinstance(raw_qp, dict):
+        task_query = raw_qp
+    elif isinstance(raw_qp, list):
+        task_query = {str(i): v for i, v in enumerate(raw_qp)}
+    else:
+        task_query = {}
+
+    # arn:aws:events:<region>:<account>:connection/<name>[/<uuid>]
+    conn_name = conn_arn.split(":connection/", 1)[-1].split("/", 1)[0]
+    conn = eventbridge._connections.get(conn_name)
+    if conn is None:
+        raise _ExecutionError("Events.ConnectionResource.ResourceNotFound", "Connection resource not found.")
+    if conn.get("ConnectionState") != "AUTHORIZED":
+        raise _ExecutionError(
+            "Events.ConnectionResource.InvalidConnectionState",
+            "Connection resource is not authorized. This is likely a configuration issue with your connection.")
+
+    # The connection's own parameters win over the task's, for a header whatever its case.
+    invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
+    conn_query = eventbridge._connection_params_map(invocation.get("QueryStringParameters"))
+    conn_body = eventbridge._connection_params_map(invocation.get("BodyParameters"))
+    fixed_headers = [
+        ("User-Agent", f"Amazon|StepFunctions|HttpInvoke|{get_region()}"),
+        ("Range", "bytes=0-262144"),
+    ]
+    fixed_lower = {"user-agent", "range"}
+    # A task cannot replace User-Agent or Range; leading/trailing whitespace on keys is trimmed.
+    task_hdr_pairs = [
+        (name.strip(), ", ".join(value) if isinstance(value, list) else value)
+        for name, value in task_headers.items()
+        if name.strip().lower() not in fixed_lower
+    ]
+    conn_hdr_map = {
+        name.lower(): (name, value)
+        for name, value in eventbridge._connection_params_map(invocation.get("HeaderParameters")).items()
+        if name.lower() not in fixed_lower
+    }
+
+    has_task_body = "RequestBody" in input_data
+    task_body = input_data.get("RequestBody")
+    if conn_body:
+        if has_task_body and not isinstance(task_body, dict):
+            raise _ExecutionError(
+                "States.Runtime", "Cannot merge connection body authorization parameters with request body.")
+        body = {**(task_body if has_task_body else {}), **conn_body}
+        has_body_to_send = True
+    else:
+        body = task_body
+        has_body_to_send = has_task_body
+
+    transform = input_data.get("Transform") or {}
+    url_encoded = isinstance(transform, dict) and transform.get("RequestBodyEncoding") == "URL_ENCODED"
+    array_format = (
+        ((transform.get("RequestEncodingOptions") or {}).get("ArrayFormat") or "INDICES")
+        if isinstance(transform, dict)
+        else "INDICES"
+    )
+
+    def serialize_body(val):
+        if url_encoded and isinstance(val, (dict, list)):
+            return _http_task_form_encode(val, array_format)
+        if isinstance(val, str):
+            return val
+        return json.dumps(val, separators=(",", ":"))
+
+    data = None
+    body_text = None
+    task_body_text = None
+    default_content_type = None
+    if has_body_to_send:
+        body_text = serialize_body(body)
+        data = body_text.encode("utf-8")
+        default_content_type = (
+            "application/json; charset=UTF-8" if (has_task_body and isinstance(task_body, dict)) else "*/*; charset=UTF-8"
+        )
+        task_body_text = serialize_body(task_body if has_task_body else {})
+
+    def build_url_pairs(pairs):
+        if not pairs:
+            return base_endpoint
+        encoded = "&".join(
+            f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(text, safe='')}" for name, text in pairs
+        )
+        return f"{base_endpoint}?{encoded}"
+
+    task_query_pairs = [
+        pair for name, value in task_query.items() for pair in _http_task_query_pairs(name, value)
+    ]
+    conn_query_pairs = [
+        pair for name, value in conn_query.items() for pair in _http_task_query_pairs(name, value)
+    ]
+    conn_query_keys = {name for name, _ in conn_query_pairs}
+    task_endpoint = build_url_pairs(task_query_pairs)
+    endpoint = build_url_pairs([p for p in task_query_pairs if p[0] not in conn_query_keys] + conn_query_pairs)
+    token_key = (get_account_id(), get_region(), conn_name)
+    is_oauth = conn.get("AuthorizationType") == "OAUTH_CLIENT_CREDENTIALS"
+
+    def send(auth_headers):
+        auth_hdr_map = {
+            name.lower(): (name, value)
+            for name, value in auth_headers.items()
+            if name.lower() not in fixed_lower
+        }
+        task_trace_dict = {name: [value] for name, value in task_hdr_pairs}
+        for name, value in fixed_headers:
+            task_trace_dict[name] = [value]
+
+        wire_trace_dict = {
+            name: [value]
+            for name, value in task_hdr_pairs
+            if name.lower() not in conn_hdr_map and name.lower() not in auth_hdr_map
+        }
+        for low, (name, value) in conn_hdr_map.items():
+            if low not in auth_hdr_map:
+                wire_trace_dict[name] = [value]
+        for name, value in auth_hdr_map.values():
+            wire_trace_dict[name] = [value]
+        for name, value in fixed_headers:
+            wire_trace_dict[name] = [value]
+
+        if trace is not None:
+            # TestState TRACE omits all connection-supplied headers, query params, and body params unless
+            # revealSecrets=True, and does not list the auto-defaulted Content-Type (AWS capture 2026-11-24, us-west-2).
+            shown_headers = wire_trace_dict if reveal_secrets else task_trace_dict
+            req_trace = {
+                "protocol": url.scheme,
+                "method": input_data["Method"],
+                "url": endpoint if reveal_secrets else task_endpoint,
+                "headers": json.dumps(shown_headers, separators=(",", ":")),
+            }
+            shown_body = body_text if reveal_secrets else task_body_text
+            if shown_body is not None:
+                req_trace["body"] = shown_body
+            trace["request"] = req_trace
+
+        conn_denied = [
+            low for low in conn_hdr_map
+            if low not in auth_hdr_map and (
+                low in _HTTP_TASK_RUNTIME_DENIED_HEADERS
+                or low in _HTTP_TASK_SCHEMA_DENIED_HEADERS
+                or low.startswith(_HTTP_TASK_DENIED_HEADER_PREFIXES)
+            )
+        ]
+        if conn_denied:
+            raise _ExecutionError(
+                "States.Runtime",
+                f"The 'Headers' field contains unsupported values: [{', '.join(conn_denied)}]",
+            )
+
+        if any(name.lower() == "content-length" for name in wire_trace_dict) or (
+            input_data["Method"] == "OPTIONS" and data is not None
+        ):
+            raise _ExecutionError(
+                "States.Runtime", "AWS Step Functions experienced an internal failure while calling the service http"
+            )
+
+        # Collapse duplicate-case task headers with ',' for urllib (matches AWS wire behavior on {"X-Dup":"1","x-dup":"2"}).
+        wire_by_lower = {}
+        for name, value in task_hdr_pairs:
+            low = name.lower()
+            if low in conn_hdr_map or low in auth_hdr_map:
+                continue
+            if low in wire_by_lower:
+                prev_name, prev_val = wire_by_lower[low]
+                wire_by_lower[low] = (prev_name, f"{prev_val},{value}")
+            else:
+                wire_by_lower[low] = (name, value)
+        for low, pair in conn_hdr_map.items():
+            if low not in auth_hdr_map:
+                wire_by_lower[low] = pair
+        for low, pair in auth_hdr_map.items():
+            wire_by_lower[low] = pair
+        for name, value in fixed_headers:
+            wire_by_lower[name.lower()] = (name, value)
+
+        req_headers = dict(wire_by_lower.values())
+        if default_content_type and "content-type" not in wire_by_lower:
+            req_headers["Content-Type"] = default_content_type
+        def read_capped(resp):
+            import http.client
+
+            limit = _HTTP_TASK_MAX_RESPONSE_BYTES + 1
+            chunks = []
+            total = 0
+            while total < limit:
+                chunk = resp.read(min(65536, limit - total))
+                if not chunk:
+                    remaining = getattr(resp, "length", None)
+                    if remaining is None:
+                        remaining = getattr(getattr(resp, "fp", None), "length", None)
+                    if remaining is not None and remaining > 0:
+                        raise http.client.IncompleteRead(b"".join(chunks), remaining)
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            return b"".join(chunks)
+
+        request = urllib.request.Request(endpoint, data=data, method=input_data["Method"], headers=req_headers)
+        try:
+            try:
+                with eventbridge._http_open(request, timeout=_HTTP_TASK_TIMEOUT_SECONDS) as response:
+                    return response.status, response.headers, read_capped(response)
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.headers, read_capped(exc)
+        except OSError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, socket.gaierror):
+                raise _ExecutionError(
+                    "States.Http.IpError", f"Unable to resolve domain '{url.hostname}' to IpV4 address.") from None
+            if isinstance(reason, TimeoutError):
+                raise _ExecutionError("States.Http.Socket", "Request timed out.") from None
+            # AWS cannot reach a closed local port (it refuses localhost and ports), so it has no answer to copy here.
+            raise _ExecutionError("States.Http.Socket", str(reason)) from None
+        except Exception as exc:
+            raise _ExecutionError("States.Http.Socket", str(exc)) from None
+
+    try:
+        auth_headers = eventbridge._connection_auth_headers(conn, token_key)
+    except Exception:
+        eventbridge._evict_oauth_token(conn_name)
+        raise _ExecutionError(
+            "Events.ConnectionResource.InvalidConnectionState",
+            "Connection resource is not authorized. This is likely a configuration issue with your connection.",
+        ) from None
+
+    status, response_headers, raw = send(auth_headers)
+    if status == 401 and is_oauth:
+        # On 401 with OAuth, real AWS retries once and triggers EventBridge token refresh rather than immediately
+        # deauthorizing the connection (AWS capture 2026-11-24, us-west-2). Refresh synchronously here, matching
+        # EventBridge API destinations.
+        try:
+            refreshed = eventbridge._connection_auth_headers(conn, token_key, force_refresh=True)
+        except Exception:
+            eventbridge._evict_oauth_token(conn_name)
+        else:
+            status, response_headers, raw = send(refreshed)
+
+    if len(raw) > _HTTP_TASK_MAX_RESPONSE_BYTES:
+        raise _ExecutionError(
+            "States.DataLimitExceeded",
+            "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+        )
+
+    resp_hdr_map = {}
+    seen_resp_lower = set()
+    for name in response_headers.keys():
+        low = name.lower()
+        if low not in seen_resp_lower:
+            seen_resp_lower.add(low)
+            resp_hdr_map[name] = response_headers.get_all(name)
+
+    has_resp_body = input_data["Method"] != "HEAD" and status not in (204, 304)
+    raw_ct = response_headers.get("Content-Type")
+    raw_media_type = raw_ct.split(";", 1)[0].strip() if raw_ct else ""
+    explicit_charset = response_headers.get_content_charset()
+    charset_valid = True
+    if explicit_charset:
+        try:
+            codecs.lookup(explicit_charset)
+        except LookupError:
+            charset_valid = False
+
+    status_text = _HTTP_TASK_STATUS_TEXT.get(status)
+    if trace is not None:
+        resp_trace = {
+            "protocol": url.scheme,
+            "statusCode": str(status),
+            "headers": json.dumps(resp_hdr_map, separators=(",", ":")),
+        }
+        if status_text:
+            resp_trace["statusMessage"] = status_text
+        if has_resp_body and charset_valid:
+            # AWS TRACE decodes response.body using the explicit charset, or ASCII with replacement when omitted.
+            resp_trace["body"] = raw.decode(explicit_charset or "ascii", errors="replace")
+        trace["response"] = resp_trace
+
+    if status == 401 and not is_oauth:
+        conn["ConnectionState"] = "DEAUTHORIZED"
+        conn["StateReason"] = ("Request failed due to Unauthorized access. Authorization could not be granted "
+                               "using the credentials provided in the request.")
+        eventbridge._evict_oauth_token(conn_name)
+    if not 200 <= status < 300:
+        raise _ExecutionError(f"States.Http.StatusCode.{status}", status_text)
+    if has_resp_body and not charset_valid:
+        raise _ExecutionError(
+            "States.Runtime", "AWS Step Functions experienced an internal failure while calling the service http"
+        )
+    if raw and (
+        raw_media_type == "application/octet-stream"
+        or raw_media_type.startswith(("image/", "video/", "audio/"))
+    ):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Unsupported response content-type '{raw_ct}'. Please see documentation for list of unsupported content-types.",
+        )
+
+    result = {
+        "Headers": resp_hdr_map,
+        "StatusCode": status,
+    }
+    if status_text:
+        result["StatusText"] = status_text
+    if has_resp_body:
+        body_bytes = raw
+        raw_ce = response_headers.get("Content-Encoding")
+        if raw_ce and body_bytes:
+            import zlib
+
+            enc = raw_ce.strip()
+            if enc == "gzip":
+                wbits = 16 + zlib.MAX_WBITS
+            elif enc == "deflate":
+                wbits = zlib.MAX_WBITS
+            elif enc == "br":
+                try:
+                    import brotli
+                except ImportError:
+                    raise _ExecutionError(
+                        "States.Http.InvalidCompressionType",
+                        "Invalid Compression type received from the server",
+                    ) from None
+                try:
+                    body_bytes = brotli.decompress(body_bytes)
+                except Exception:
+                    raise _ExecutionError(
+                        "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
+                    ) from None
+                if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES:
+                    raise _ExecutionError(
+                        "States.DataLimitExceeded",
+                        "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+                    )
+                wbits = None
+            else:
+                raise _ExecutionError(
+                    "States.Http.InvalidCompressionType",
+                    "Invalid Compression type received from the server",
+                )
+            if wbits is not None:
+                try:
+                    decomp = zlib.decompressobj(wbits)
+                    body_bytes = decomp.decompress(body_bytes, _HTTP_TASK_MAX_RESPONSE_BYTES + 1)
+                    if len(body_bytes) <= _HTTP_TASK_MAX_RESPONSE_BYTES:
+                        body_bytes += decomp.flush(_HTTP_TASK_MAX_RESPONSE_BYTES + 1 - len(body_bytes))
+                    if len(body_bytes) > _HTTP_TASK_MAX_RESPONSE_BYTES or decomp.unconsumed_tail:
+                        raise _ExecutionError(
+                            "States.DataLimitExceeded",
+                            "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+                        )
+                except zlib.error:
+                    raise _ExecutionError(
+                        "States.Http.FailedToParseResponse", "Failed to parse HTTP response"
+                    ) from None
+        try:
+            decoded = body_bytes.decode(explicit_charset or "utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise _ExecutionError(
+                "States.Runtime",
+                "Response from HTTP request cannot be read as a valid String. "
+                "This is likely caused by the response being binary/image/video/audio data.",
+            ) from None
+        if raw_media_type == "application/json" and decoded != "":
+            stripped = decoded.lstrip()
+            if not stripped:
+                result["ResponseBody"] = None
+            else:
+                def _reject_constant(token):
+                    raise ValueError(f"Unsupported JSON constant: {token}")
+
+                try:
+                    parsed, end = json.JSONDecoder(parse_constant=_reject_constant).raw_decode(stripped)
+                    if (
+                        (isinstance(parsed, (int, float, bool)) or parsed is None)
+                        and end < len(stripped)
+                        and not stripped[end].isspace()
+                        and stripped[end] not in '{["}],:'
+                    ):
+                        result["ResponseBody"] = decoded
+                    else:
+                        result["ResponseBody"] = parsed
+                except ValueError:
+                    result["ResponseBody"] = decoded
+        else:
+            result["ResponseBody"] = decoded
+    if len(json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > _HTTP_TASK_MAX_RESPONSE_BYTES:
+        raise _ExecutionError(
+            "States.DataLimitExceeded",
+            "The state/task 'http' returned a result with a size exceeding the maximum number of bytes service limit.",
+        )
+    return result
+
+
 _SERVICE_DISPATCH = {
+    "arn:aws:states:::http:invoke": _invoke_http_endpoint,
     "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
     "arn:aws:states:::sns:publish": _invoke_sns_publish,
     "arn:aws:states:::events:putEvents": _invoke_events_put_events,
